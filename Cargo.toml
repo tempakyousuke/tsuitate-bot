@@ -2,7 +2,7 @@
 name = "tsuitate-bot"
 version = "0.1.0"
 edition = "2024"
-description = "ついたて将棋オンライン用の外部bot（Socket.IOクライアント）"
+description = "王様のかくれんぼ用の外部bot（Socket.IOクライアント）"
 
 [dependencies]
 rust_socketio = "0.6"

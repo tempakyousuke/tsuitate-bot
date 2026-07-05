@@ -1,6 +1,6 @@
 # tsuitate-bot
 
-ついたて将棋オンライン（tsuitate リポジトリ）用の外部bot。
+王様のかくれんぼ（tsuitate リポジトリ）用の外部bot。
 Socket.IO クライアントとしてサイトに接続し、ランダムマッチに参加して人間と対戦する。
 
 接続プロトコルの詳細は tsuitate リポジトリの `docs/bot-api.md` を参照。

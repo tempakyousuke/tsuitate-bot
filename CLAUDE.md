@@ -1,6 +1,6 @@
 # tsuitate-bot
 
-ついたて将棋オンライン（`~/Develop/tsuitate`）に外部bot APIで接続して対戦するRust製bot。
+王様のかくれんぼ（`~/Develop/tsuitate`）に外部bot APIで接続して対戦するRust製bot。
 サイト・ソルバー（`~/Develop/tsuitate-resolver`）とは**意図的に独立**したプロジェクト（cargo依存もしない）。
 
 ## コマンド
