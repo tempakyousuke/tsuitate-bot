@@ -63,7 +63,7 @@ pub fn make_usi_drop(role: Role, to: Coord) -> Option<String> {
 }
 
 /// [dFile, dRank] 先手視点（rank減少=前進）
-type Delta = (i8, i8);
+pub(crate) type Delta = (i8, i8);
 
 const GOLD_STEPS: &[Delta] = &[(0, -1), (1, -1), (-1, -1), (1, 0), (-1, 0), (0, 1)];
 const KING_STEPS: &[Delta] = &[
@@ -79,7 +79,7 @@ const KING_STEPS: &[Delta] = &[
 const DIAGONALS: &[Delta] = &[(1, -1), (-1, -1), (1, 1), (-1, 1)];
 const ORTHOGONALS: &[Delta] = &[(0, -1), (0, 1), (1, 0), (-1, 0)];
 
-fn steps(role: Role) -> &'static [Delta] {
+pub(crate) fn steps(role: Role) -> &'static [Delta] {
     match role {
         Role::Pawn => &[(0, -1)],
         Role::Knight => &[(1, -2), (-1, -2)],
@@ -97,7 +97,7 @@ fn steps(role: Role) -> &'static [Delta] {
     }
 }
 
-fn rays(role: Role) -> &'static [Delta] {
+pub(crate) fn rays(role: Role) -> &'static [Delta] {
     match role {
         Role::Lance => &[(0, -1)],
         Role::Bishop | Role::Horse => DIAGONALS,
@@ -106,12 +106,12 @@ fn rays(role: Role) -> &'static [Delta] {
     }
 }
 
-fn on_board(c: Coord) -> bool {
+pub(crate) fn on_board(c: Coord) -> bool {
     (1..=9).contains(&c.file) && (1..=9).contains(&c.rank)
 }
 
 /// 先手視点のデルタを自分の色に合わせる（後手は前後反転）
-fn orient((df, dr): Delta, color: Color) -> Delta {
+pub(crate) fn orient((df, dr): Delta, color: Color) -> Delta {
     match color {
         Color::Sente => (df, dr),
         Color::Gote => (-df, -dr),

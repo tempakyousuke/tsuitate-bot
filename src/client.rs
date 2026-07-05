@@ -13,12 +13,13 @@ use rust_socketio::{ClientBuilder, Event, Payload, RawClient, TransportType};
 use serde::de::DeserializeOwned;
 use serde_json::json;
 
+use crate::model::GameModel;
 use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{
     Ack, Color, GameEndPayload, GameStatus, MatchFoundPayload, MoveAck, MoveAcceptedPayload,
     OpponentMovedPayload, PlayerView, SyncAck,
 };
-use crate::strategy::choose_move;
+use crate::strategy::{self, Strategy};
 
 pub struct Config {
     pub url: String,
@@ -27,6 +28,8 @@ pub struct Config {
     pub think_delay_ms: u64,
     /// 終局後に再度キューへ並ぶまでの待ち時間
     pub requeue_delay_ms: u64,
+    /// 戦略名（strategy::make が知っている名前）
+    pub strategy_name: String,
 }
 
 #[derive(Debug)]
@@ -139,6 +142,8 @@ struct BotState {
     /// 直近に送った手（moveAccepted の記録用）
     last_sent: Option<String>,
     log: ObservationLog,
+    /// 対局ごとに作り直す（推定系の戦略は対局内の内部状態を持つ）
+    strategy: Box<dyn Strategy>,
 }
 
 /// 接続して対局し続ける。復帰不能なエラーでのみ返る。
@@ -146,6 +151,10 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
     let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
     let socket = connect(&config, &tx)?;
 
+    let make_strategy = || {
+        strategy::make(&config.strategy_name)
+            .expect("main で検証済みの戦略名") // main.rs が起動時に検証する
+    };
     let mut state = BotState {
         game_id: None,
         foul_tried: HashSet::new(),
@@ -153,7 +162,9 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
         pending_move_number: None,
         last_sent: None,
         log: ObservationLog::default(),
+        strategy: make_strategy(),
     };
+    println!("戦略: {}", state.strategy.name());
 
     let join_queue = |socket: &Client, tx: &Sender<Msg>| {
         let tx = tx.clone();
@@ -220,6 +231,7 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
                 state.pending_move_number = None;
                 state.last_sent = None;
                 state.log.clear();
+                state.strategy = make_strategy();
             }
             Msg::ThinkTrigger => {
                 if let Some(game_id) = state.game_id.clone() {
@@ -304,7 +316,12 @@ fn handle_sync(socket: &Client, tx: &Sender<Msg>, state: &mut BotState, view: Pl
         state.foul_tried.clear();
     }
 
-    match choose_move(&view, &state.foul_tried) {
+    // 観測履歴からの再構成と sync を照合（切断中の取りこぼし等の検出）
+    if let Some(diff) = GameModel::from_log(view.your_color, &state.log).diff_view(&view) {
+        eprintln!("観測モデルと sync がズレています（再接続などで観測が欠けた可能性）: {diff}");
+    }
+
+    match state.strategy.choose(&view, &state.log, &state.foul_tried) {
         None => {
             // 候補が尽きた（すべて反則）→ 投了
             println!("指せる手がありません。投了します");

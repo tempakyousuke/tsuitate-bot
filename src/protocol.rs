@@ -25,7 +25,7 @@ impl Color {
 }
 
 /// shogiops と同じ駒種名（サイト側 PieceRole と同一の文字列表現）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     Pawn,
