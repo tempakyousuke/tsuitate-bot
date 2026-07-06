@@ -10,9 +10,9 @@
 - `cargo run --release --bin arena -- [対局数] [候補] [基準1] [基準2] ...` — 戦略同士のローカル対戦。
   基準を複数並べるとガントレット（候補が各基準と対局数ずつ対戦）。
   戦略の変更は必ずこれで**全凍結版**（`src/frozen/` の `estimator_vN`）に有意に
-  勝ち越すことを確認する（例: `cargo run --release --bin arena -- 200 estimator estimator_v2`）。
-  50%付近の信頼区間は 200局で±7pt / 1000局で±3.1pt。当面（開発最初期）は
-  200局を既定とし、効果が数pt程度の僅差に見えるときだけ1000局以上に増やす
+  勝ち越すことを確認する（例: `cargo run --release --bin arena -- 100 estimator estimator_v3`）。
+  50%付近の信頼区間は 100局で±10pt / 200局で±7pt / 1000局で±3.1pt。当面（開発最初期）は
+  100局を既定とし、結果が信頼区間内で判定できない僅差のときだけ局数を増やす
 - `cargo build` / `cargo run --release` — 実行には環境変数が必要:
   - `TSUITATE_BOT_TOKEN`（必須）: サイトのマイページ「bot管理」で発行する `tsb_...` トークン
   - `TSUITATE_URL`（既定 `http://localhost:5173`）
