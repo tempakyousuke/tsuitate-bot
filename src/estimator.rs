@@ -26,6 +26,8 @@ const TARGET_PARTICLES: usize = 400;
 /// 1回の update での再生成リプレイ試行の上限（時間予算の担保）。
 /// 複製よりリプレイのほうが粒子の多様性を保てるので多めに取る
 const REGEN_ATTEMPTS: usize = 120;
+/// リプレイ中バックトラックの1決定点あたりの再サンプル回数
+const BACKTRACK_ATTEMPTS: u32 = 4;
 
 /// 観測列を推定に使える形に正規化した制約
 #[derive(Debug, Clone)]
@@ -210,11 +212,26 @@ impl Estimator {
         }
     }
 
-    /// 制約列を最初からリプレイして整合する粒子を1つ作る
+    /// 制約列を最初からリプレイして整合する粒子を1つ作る。
+    ///
+    /// 相手手のサンプルは確率的なので、後続の制約（自分の手の合法性・反則・
+    /// 取られたマス・王手宣言）と矛盾して失敗しうる。全部やり直すと手数に対して
+    /// 成功率が指数的に落ちるため、失敗したら直近の決定点（相手手）まで戻って
+    /// 引き直す限定バックトラックにする。ステップ予算で最悪時間を抑える
     fn replay_once(&mut self) -> Option<Position> {
+        let n = self.constraints.len();
+        let step_budget = n * 4 + 32;
+        let mut steps = 0usize;
         let mut pos = Position::initial();
-        for constraint in &self.constraints {
-            let ok = match constraint {
+        // 決定点スタック: (制約index, 適用前の局面, これまでの再試行回数)
+        let mut stack: Vec<(usize, Position, u32)> = vec![];
+        let mut i = 0;
+        while i < n {
+            steps += 1;
+            if steps > step_budget {
+                return None;
+            }
+            let ok = match &self.constraints[i] {
                 Constraint::MyMove {
                     mv,
                     captured,
@@ -224,16 +241,41 @@ impl Estimator {
                 Constraint::OppMove {
                     captured_at,
                     gives_check,
-                } => sample_opp_move(
-                    &mut pos,
-                    self.my_color,
-                    *captured_at,
-                    *gives_check,
-                    &mut self.rng,
-                ),
+                } => {
+                    // バックトラックで戻ってきた再訪なら積み直さない
+                    let is_retry = stack.last().is_some_and(|(j, _, _)| *j == i);
+                    if !is_retry {
+                        stack.push((i, pos.clone(), 0));
+                    }
+                    sample_opp_move(
+                        &mut pos,
+                        self.my_color,
+                        *captured_at,
+                        *gives_check,
+                        &mut self.rng,
+                    )
+                }
             };
-            if !ok {
-                return None;
+            if ok {
+                i += 1;
+                continue;
+            }
+            // 失敗: 直近の決定点に戻って引き直す。試行を使い切った点はさらに前へ
+            loop {
+                let Some((j, snapshot, attempts)) = stack.pop() else {
+                    return None;
+                };
+                // 失敗した制約自身が決定点なら、同じ局面からの再試行は無意味
+                // （整合候補ゼロは決定的）なのでさらに前へ戻る
+                if j == i {
+                    continue;
+                }
+                if attempts + 1 < BACKTRACK_ATTEMPTS {
+                    pos = snapshot.clone();
+                    stack.push((j, snapshot, attempts + 1));
+                    i = j;
+                    break;
+                }
             }
         }
         Some(pos)
@@ -445,6 +487,39 @@ mod tests {
         assert!(est.healthy(), "王手と整合する粒子が残るはず");
         for pos in est.particles() {
             assert!(pos.in_check(Color::Gote));
+        }
+    }
+
+    #[test]
+    fn replay_backtracking_still_satisfies_all_constraints() {
+        // 王手宣言つきの長め制約列でも、バックトラックで作った粒子が
+        // 全制約と整合していること（check_declaration と同じ設定で枯渇→再生成）
+        let mut est = Estimator::with_seed(Color::Sente, 23);
+        let mut log = ObservationLog::default();
+        record_my_move(&mut log, "7g7f", None);
+        record_opp_move(&mut log, None);
+        record_my_move(&mut log, "8h3c+", Some(Role::Pawn));
+        log.record(Observation::Check {
+            in_check: Color::Gote,
+        });
+        record_opp_move(&mut log, None);
+        // 相手が金の合駒（4a4b）をした粒子だけが次の制約と整合する。
+        // 4b の金を取ると馬が 5a の玉に再度王手になる
+        record_my_move(&mut log, "3c4b", Some(Role::Gold));
+        log.record(Observation::Check {
+            in_check: Color::Gote,
+        });
+        est.update(&log);
+        est.particles.clear();
+        est.replenish();
+        assert!(est.healthy(), "バックトラック付きリプレイで再生成できるはず");
+        for pos in est.particles() {
+            // 最終制約まで適用済み: 4b に自分の馬、相手の盤上駒は18枚（歩と金を取った）
+            assert_eq!(
+                pos.piece_at(Coord { file: 4, rank: 2 }).map(|p| p.role),
+                Some(crate::protocol::Role::Horse)
+            );
+            assert_eq!(pos.pieces_of(Color::Gote).len(), 18);
         }
     }
 

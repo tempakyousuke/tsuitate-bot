@@ -12,3 +12,4 @@
 //!   （ルールのバグ修正は全バージョンに反映されるべきなので）
 
 pub mod estimator_v2;
+pub mod estimator_v3;

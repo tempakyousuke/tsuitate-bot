@@ -41,6 +41,7 @@ pub fn make(name: &str) -> Option<Box<dyn Strategy>> {
         "heuristic" => Some(Box::new(Heuristic)),
         "estimator" => Some(Box::new(EstimatorStrategy::new())),
         "estimator_v2" => Some(Box::new(crate::frozen::estimator_v2::EstimatorV2::new())),
+        "estimator_v3" => Some(Box::new(crate::frozen::estimator_v3::EstimatorV3::new())),
         _ => None,
     }
 }
@@ -594,5 +595,6 @@ mod tests {
     fn make_knows_frozen_versions() {
         assert!(make("estimator").is_some());
         assert!(make("estimator_v2").is_some());
+        assert!(make("estimator_v3").is_some());
     }
 }
