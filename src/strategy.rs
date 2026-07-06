@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use rand::Rng;
 
 use crate::board::{
-    Promotion, drop_targets, make_usi_drop, make_usi_move, move_targets, parse_usi_square,
+    Coord, Promotion, drop_targets, make_usi_drop, make_usi_move, move_targets, parse_usi_square,
     promotion_choice,
 };
 use crate::estimator::Estimator;
@@ -40,7 +40,7 @@ pub fn make(name: &str) -> Option<Box<dyn Strategy>> {
     match name {
         "heuristic" => Some(Box::new(Heuristic)),
         "estimator" => Some(Box::new(EstimatorStrategy::new())),
-        "estimator_v1" => Some(Box::new(crate::frozen::estimator_v1::EstimatorV1::new())),
+        "estimator_v2" => Some(Box::new(crate::frozen::estimator_v2::EstimatorV2::new())),
         _ => None,
     }
 }
@@ -153,7 +153,20 @@ impl Strategy for EstimatorStrategy {
             .get_or_insert_with(|| Estimator::new(view.your_color));
         est.update(log);
 
-        let candidates = candidate_moves(view, foul_tried);
+        let mut candidates = candidate_moves(view, foul_tried);
+        if view.you_in_check {
+            // 王手中: 解消しえない手は（王手駒がどこにいても）王手放置で必ず反則に
+            // なるので候補から外す。全滅したら元の候補に戻す（投了よりは反則のほうが
+            // 手番を失わないぶんまし。真に詰みならサーバー側で終局している）
+            let filtered: Vec<_> = candidates
+                .iter()
+                .filter(|(_, mv)| may_resolve_check(view, mv))
+                .cloned()
+                .collect();
+            if !filtered.is_empty() {
+                candidates = filtered;
+            }
+        }
         if candidates.is_empty() {
             return None;
         }
@@ -183,7 +196,12 @@ impl Strategy for EstimatorStrategy {
         let mut rng = rand::rng();
         let mut best: Option<(String, f64)> = None;
         for (usi, mv) in candidates {
-            let prior = prior_legal(view, &mv, opp_board_n);
+            let mut prior = prior_legal(view, &mv, opp_board_n);
+            if view.you_in_check {
+                // 王手駒の位置は不明なので、粒子が枯渇していても
+                // 「玉移動 > 取り/合駒の候補」の順に並ぶ事前確率にする
+                prior *= in_check_prior(view, &mv);
+            }
             let score = evaluate(view, &mv, &sample, prior) + rng.random_range(0.0..0.01);
             if best.as_ref().is_none_or(|(_, s)| score > *s) {
                 best = Some((usi, score));
@@ -234,6 +252,57 @@ fn candidate_moves(view: &PlayerView, foul_tried: &HashSet<String>) -> Vec<(Stri
         }
     }
     out
+}
+
+/// 自玉のマス（PlayerView の自駒リストから引く）
+fn king_square(view: &PlayerView) -> Option<Coord> {
+    view.your_pieces
+        .iter()
+        .find(|p| p.role == Role::King)
+        .and_then(|p| parse_usi_square(&p.square))
+}
+
+/// 王手されているとき、この手が王手を解消しうるか（自分に見える情報だけで判定）。
+/// 解消手段は (a) 玉を動かす (b) 王手駒を取る (c) 合駒。王手駒の位置は不明でも
+/// (b) の着地点は自玉に利きが通るマス（クイーンライン上か桂の利き元）、
+/// (c) は玉と王手駒の間（クイーンライン上）に限られる。
+/// どれにも該当しない手は王手放置で必ず反則になる
+fn may_resolve_check(view: &PlayerView, mv: &ShogiMove) -> bool {
+    let Some(king) = king_square(view) else {
+        return true; // 玉が見つからないなら判定不能（除外しない）
+    };
+    let on_ray = |to: Coord| {
+        let df = to.file - king.file;
+        let dr = to.rank - king.rank;
+        (df != 0 || dr != 0) && (df == 0 || dr == 0 || df.abs() == dr.abs())
+    };
+    // 相手の桂が自玉に利くマス（桂の王手は取るしかなく、合駒では防げない）
+    let knight_source = |to: Coord| {
+        let dr = match view.your_color {
+            Color::Sente => -2, // 相手（後手）の桂は rank+2 へ利く → 利き元は rank-2 側
+            Color::Gote => 2,
+        };
+        (to.file - king.file).abs() == 1 && to.rank - king.rank == dr
+    };
+    match *mv {
+        ShogiMove::Board { from, to, .. } => {
+            if from == king {
+                return true; // 玉を動かす
+            }
+            on_ray(to) || knight_source(to)
+        }
+        // 打ちは駒を取れないので合駒（ライン上）のみ
+        ShogiMove::Drop { to, .. } => on_ray(to),
+    }
+}
+
+/// 王手中の p(合法) 補正係数。玉移動が最も解消しやすく、
+/// 取り/合駒は王手駒の位置に当たっている必要があるので低め
+fn in_check_prior(view: &PlayerView, mv: &ShogiMove) -> f64 {
+    match *mv {
+        ShogiMove::Board { from, .. } if Some(from) == king_square(view) => 0.5,
+        _ => 0.25,
+    }
 }
 
 /// 観測ゼロでも成り立つ p(合法) の事前確率。
@@ -447,6 +516,75 @@ mod tests {
     }
 
     #[test]
+    fn may_resolve_check_filters_hopeless_moves() {
+        // 先手玉 5i。ライン外への手・桂の利き元以外は王手を解消しえない
+        let view = minimal_view(
+            vec![
+                VisiblePiece {
+                    square: "5i".into(),
+                    role: Role::King,
+                },
+                VisiblePiece {
+                    square: "7g".into(),
+                    role: Role::Pawn,
+                },
+            ],
+            HashMap::new(),
+        );
+        let ok = |usi: &str| may_resolve_check(&view, &parse_usi(usi).unwrap());
+        assert!(ok("5i5h"), "玉移動は常に候補");
+        assert!(ok("7g5g"), "自玉と同段（ライン上）への移動は合駒/取りになりうる");
+        assert!(ok("7g5e"), "架空の手でも判定対象はライン（5筋）上の着地点");
+        assert!(!ok("7g7f"), "ライン外への移動は王手放置が確定");
+    }
+
+    #[test]
+    fn may_resolve_check_knight_source_and_drops() {
+        let view = minimal_view(
+            vec![VisiblePiece {
+                square: "5i".into(),
+                role: Role::King,
+            }],
+            HashMap::new(),
+        );
+        let mv = |usi: &str| parse_usi(usi).unwrap();
+        // 4g/6g は相手桂の利き元 → 盤上の駒での取りは候補
+        assert!(may_resolve_check(&view, &mv("4f4g")));
+        // 打ちは駒を取れないので桂の利き元でも解消しえない
+        assert!(!may_resolve_check(&view, &mv("P*4g")));
+        // ライン上への打ちは合駒
+        assert!(may_resolve_check(&view, &mv("P*5e")));
+        assert!(!may_resolve_check(&view, &mv("P*4e")));
+    }
+
+    #[test]
+    fn estimator_in_check_prefers_resolving_moves() {
+        // 粒子が王手を反映していなくても（空ログ = 初期局面粒子）、
+        // you_in_check なら解消しうる手（ここでは玉移動のみ）しか指さない
+        let mut view = minimal_view(
+            vec![
+                VisiblePiece {
+                    square: "5i".into(),
+                    role: Role::King,
+                },
+                VisiblePiece {
+                    square: "7g".into(),
+                    role: Role::Pawn,
+                },
+            ],
+            HashMap::new(),
+        );
+        view.you_in_check = true;
+        let mut strat = EstimatorStrategy::new();
+        let log = ObservationLog::default();
+        let usi = strat.choose(&view, &log, &HashSet::new()).unwrap();
+        assert!(
+            usi.starts_with("5i"),
+            "王手中は玉移動を選ぶはず（選ばれた手: {usi}）"
+        );
+    }
+
+    #[test]
     fn make_knows_heuristic() {
         assert!(make("heuristic").is_some());
         assert!(make("nonsense").is_none());
@@ -455,6 +593,6 @@ mod tests {
     #[test]
     fn make_knows_frozen_versions() {
         assert!(make("estimator").is_some());
-        assert!(make("estimator_v1").is_some());
+        assert!(make("estimator_v2").is_some());
     }
 }

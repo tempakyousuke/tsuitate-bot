@@ -1,10 +1,12 @@
-//! estimator の凍結版 v1（2026-07-06 凍結、コミット 3983f4f 時点）。
+//! estimator の凍結版 v2（2026-07-06 凍結）。
 //!
 //! **このファイルは編集しない**（frozen/mod.rs の運用ルール参照）。
-//! 当時の estimator.rs（パーティクルフィルタ）と strategy.rs の
-//! EstimatorStrategy（粒子平均の候補手評価）の自己完結コピー。
+//! v1 との差分: 王手回避の修正 — you_in_check のとき王手を解消しえない手
+//! （玉移動・自玉ラインへの着地・桂の利き元への移動のどれでもない手）を
+//! 候補から除外し、王手中の事前確率を玉移動優先に補正する。
+//! 粒子枯渇時のフォールバックが王手を無視して反則を連発する問題への対処。
 //!
-//! 参考強度: vs heuristic 86.5%±4.7%（200局、平均反則 2.2 vs 9.0、2026-07 時点）
+//! 参考強度: vs estimator_v1 80.9%±5.7%（200局、平均反則 3.75 vs 8.38、2026-07-06）
 
 use std::collections::HashSet;
 
@@ -323,24 +325,24 @@ const EVAL_PARTICLES: usize = 96;
 /// 事前確率の重み（擬似観測数）。粒子が少ない・偏っているときほど事前が効く
 const PRIOR_WEIGHT: f64 = 4.0;
 
-/// estimator v1（凍結）。観測履歴から相手局面を推定し、候補手を粒子平均で評価する
-pub struct EstimatorV1 {
+/// estimator v2（凍結）。観測履歴から相手局面を推定し、候補手を粒子平均で評価する
+pub struct EstimatorV2 {
     est: Option<Estimator>,
 }
 
-impl EstimatorV1 {
+impl EstimatorV2 {
     pub fn new() -> Self {
-        EstimatorV1 { est: None }
+        EstimatorV2 { est: None }
     }
 }
 
-impl Default for EstimatorV1 {
+impl Default for EstimatorV2 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Strategy for EstimatorV1 {
+impl Strategy for EstimatorV2 {
     fn choose(
         &mut self,
         view: &PlayerView,
@@ -352,7 +354,19 @@ impl Strategy for EstimatorV1 {
             .get_or_insert_with(|| Estimator::new(view.your_color));
         est.update(log);
 
-        let candidates = candidate_moves(view, foul_tried);
+        let mut candidates = candidate_moves(view, foul_tried);
+        if view.you_in_check {
+            // 王手中: 解消しえない手は（王手駒がどこにいても）王手放置で必ず反則に
+            // なるので候補から外す。全滅したら元の候補に戻す
+            let filtered: Vec<_> = candidates
+                .iter()
+                .filter(|(_, mv)| may_resolve_check(view, mv))
+                .cloned()
+                .collect();
+            if !filtered.is_empty() {
+                candidates = filtered;
+            }
+        }
         if candidates.is_empty() {
             return None;
         }
@@ -378,7 +392,10 @@ impl Strategy for EstimatorV1 {
         let mut rng = rand::rng();
         let mut best: Option<(String, f64)> = None;
         for (usi, mv) in candidates {
-            let prior = prior_legal(view, &mv, opp_board_n);
+            let mut prior = prior_legal(view, &mv, opp_board_n);
+            if view.you_in_check {
+                prior *= in_check_prior(view, &mv);
+            }
             let score = evaluate(view, &mv, &sample, prior) + rng.random_range(0.0..0.01);
             if best.as_ref().is_none_or(|(_, s)| score > *s) {
                 best = Some((usi, score));
@@ -388,7 +405,7 @@ impl Strategy for EstimatorV1 {
     }
 
     fn name(&self) -> &'static str {
-        "estimator_v1"
+        "estimator_v2"
     }
 }
 
@@ -427,6 +444,50 @@ fn candidate_moves(view: &PlayerView, foul_tried: &HashSet<String>) -> Vec<(Stri
         }
     }
     out
+}
+
+/// 自玉のマス（PlayerView の自駒リストから引く）
+fn king_square(view: &PlayerView) -> Option<Coord> {
+    view.your_pieces
+        .iter()
+        .find(|p| p.role == Role::King)
+        .and_then(|p| parse_usi_square(&p.square))
+}
+
+/// 王手されているとき、この手が王手を解消しうるか（自分に見える情報だけで判定）
+fn may_resolve_check(view: &PlayerView, mv: &ShogiMove) -> bool {
+    let Some(king) = king_square(view) else {
+        return true;
+    };
+    let on_ray = |to: Coord| {
+        let df = to.file - king.file;
+        let dr = to.rank - king.rank;
+        (df != 0 || dr != 0) && (df == 0 || dr == 0 || df.abs() == dr.abs())
+    };
+    let knight_source = |to: Coord| {
+        let dr = match view.your_color {
+            Color::Sente => -2,
+            Color::Gote => 2,
+        };
+        (to.file - king.file).abs() == 1 && to.rank - king.rank == dr
+    };
+    match *mv {
+        ShogiMove::Board { from, to, .. } => {
+            if from == king {
+                return true;
+            }
+            on_ray(to) || knight_source(to)
+        }
+        ShogiMove::Drop { to, .. } => on_ray(to),
+    }
+}
+
+/// 王手中の p(合法) 補正係数。玉移動が最も解消しやすい
+fn in_check_prior(view: &PlayerView, mv: &ShogiMove) -> f64 {
+    match *mv {
+        ShogiMove::Board { from, .. } if Some(from) == king_square(view) => 0.5,
+        _ => 0.25,
+    }
 }
 
 fn prior_legal(view: &PlayerView, mv: &ShogiMove, opp_board_n: f64) -> f64 {
