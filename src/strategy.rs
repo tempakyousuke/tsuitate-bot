@@ -34,11 +34,13 @@ pub trait Strategy {
 
 pub const DEFAULT_STRATEGY: &str = "estimator";
 
-/// 戦略名からインスタンスを作る。未知の名前は None
+/// 戦略名からインスタンスを作る。未知の名前は None。
+/// `estimator_vN` はアリーナ比較用の凍結版（src/frozen/）
 pub fn make(name: &str) -> Option<Box<dyn Strategy>> {
     match name {
         "heuristic" => Some(Box::new(Heuristic)),
         "estimator" => Some(Box::new(EstimatorStrategy::new())),
+        "estimator_v1" => Some(Box::new(crate::frozen::estimator_v1::EstimatorV1::new())),
         _ => None,
     }
 }
@@ -448,5 +450,11 @@ mod tests {
     fn make_knows_heuristic() {
         assert!(make("heuristic").is_some());
         assert!(make("nonsense").is_none());
+    }
+
+    #[test]
+    fn make_knows_frozen_versions() {
+        assert!(make("estimator").is_some());
+        assert!(make("estimator_v1").is_some());
     }
 }

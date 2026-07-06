@@ -5,6 +5,7 @@
 pub mod board;
 pub mod client;
 pub mod estimator;
+pub mod frozen;
 pub mod model;
 pub mod observation;
 pub mod protocol;
