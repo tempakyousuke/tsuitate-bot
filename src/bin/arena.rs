@@ -55,6 +55,9 @@ struct MatchStats {
     total_plies: u64,
     fouls_a: u64,
     fouls_b: u64,
+    /// うち王手を受けている局面での反則（王手ソルバーの効果測定用）
+    fouls_in_check_a: u64,
+    fouls_in_check_b: u64,
     /// 1手ごとの思考時間（マイクロ秒）。時間切れ検証と改善の副作用チェック用
     think_us_a: Vec<u64>,
     think_us_b: Vec<u64>,
@@ -77,6 +80,7 @@ struct PlayerState {
     strategy: Box<dyn Strategy>,
     log: ObservationLog,
     fouls: u32,
+    fouls_in_check: u32,
     foul_tried: HashSet<String>,
     clock_ms: i64,
     think_us: Vec<u64>,
@@ -144,8 +148,12 @@ fn play_game(players: &mut [PlayerState; 2], game_no: u32) -> (GameResult, &'sta
         let legal = parse_usi(&usi).is_some_and(|mv| pos.is_legal(&mv));
         if !legal {
             // 反則: 手番は変わらない（judge.ts と同じ）。フィッシャー加算もしない
+            let in_check = pos.in_check(side);
             let mover = &mut players[idx(side)];
             mover.fouls += 1;
+            if in_check {
+                mover.fouls_in_check += 1;
+            }
             mover.foul_tried.insert(usi.clone());
             let foul_count = mover.fouls;
             mover.log.record(Observation::MyFoul {
@@ -220,6 +228,8 @@ fn record_game(
     };
     stats.fouls_a += pa.fouls as u64;
     stats.fouls_b += pb.fouls as u64;
+    stats.fouls_in_check_a += pa.fouls_in_check as u64;
+    stats.fouls_in_check_b += pb.fouls_in_check as u64;
     stats.think_us_a.extend(pa.think_us);
     stats.think_us_b.extend(pb.think_us);
     stats.total_plies += plies as u64;
@@ -278,6 +288,7 @@ fn run_match(games: u32, name_a: &str, name_b: &str) -> MatchStats {
                             strategy: strategy::make(name).unwrap(),
                             log: ObservationLog::default(),
                             fouls: 0,
+                            fouls_in_check: 0,
                             foul_tried: HashSet::new(),
                             clock_ms: FISCHER_INITIAL_MS,
                             think_us: Vec::new(),
@@ -311,6 +322,8 @@ fn run_match(games: u32, name_a: &str, name_b: &str) -> MatchStats {
             merged.total_plies += local.total_plies;
             merged.fouls_a += local.fouls_a;
             merged.fouls_b += local.fouls_b;
+            merged.fouls_in_check_a += local.fouls_in_check_a;
+            merged.fouls_in_check_b += local.fouls_in_check_b;
             merged.think_us_a.extend(local.think_us_a);
             merged.think_us_b.extend(local.think_us_b);
         }
@@ -346,10 +359,12 @@ fn print_match(stats: &MatchStats, name_a: &str, name_b: &str) {
         stats.max_plies
     );
     println!(
-        "平均手数 {:.1} / 平均反則 A {:.2} B {:.2}",
+        "平均手数 {:.1} / 平均反則 A {:.2}（うち王手中 {:.2}） B {:.2}（うち王手中 {:.2}）",
         stats.total_plies as f64 / stats.games.max(1) as f64,
         stats.fouls_a as f64 / stats.games.max(1) as f64,
-        stats.fouls_b as f64 / stats.games.max(1) as f64
+        stats.fouls_in_check_a as f64 / stats.games.max(1) as f64,
+        stats.fouls_b as f64 / stats.games.max(1) as f64,
+        stats.fouls_in_check_b as f64 / stats.games.max(1) as f64
     );
     println!("思考時間 A: {}", think_summary(&stats.think_us_a));
     println!("思考時間 B: {}", think_summary(&stats.think_us_b));

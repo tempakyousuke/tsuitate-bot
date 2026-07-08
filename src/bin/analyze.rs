@@ -6,18 +6,27 @@
 //! - タダ取られ（守られていない駒を只で取られた）
 //! - 1手詰みの存在（参考値: botからは玉位置が見えないため「逃し」を責める指標ではなく、
 //!   玉位置推定が当たっていれば勝てた機会の総量を測る）
+//! - 王手ソルバー（check.rs）の再現検証: 記録上の王手中の反則それぞれについて、
+//!   その時点の観測だけからソルバーが選んだ手が真の局面で合法だったかを判定する
 //!
 //! 使い方: cargo run --release --bin analyze -- records/*.jsonl
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use tsuitate_bot::protocol::{Color, FoulRecord, GameEndPayload};
-use tsuitate_bot::shogi::{Outcome, ShogiMove, Position, parse_usi, piece_value};
+use tsuitate_bot::check::CheckSolver;
+use tsuitate_bot::model::GameModel;
+use tsuitate_bot::observation::{Observation, ObservationLog};
+use tsuitate_bot::protocol::{
+    ClockState, Color, FoulCounts, FoulRecord, GameEndPayload, GameStatus, PlayerView,
+};
+use tsuitate_bot::shogi::{Outcome, Position, ShogiMove, parse_usi, piece_value};
+use tsuitate_bot::strategy::candidate_moves;
 
 struct GameRecord {
     file: String,
     bot_color: Color,
     strategy: String,
+    observations: Vec<Observation>,
     end: GameEndPayload,
 }
 
@@ -25,6 +34,7 @@ fn load(path: &str) -> Option<GameRecord> {
     let content = std::fs::read_to_string(path).ok()?;
     let mut bot_color = None;
     let mut strategy = String::new();
+    let mut observations = vec![];
     let mut end = None;
     for line in content.lines() {
         let v: serde_json::Value = serde_json::from_str(line).ok()?;
@@ -32,6 +42,11 @@ fn load(path: &str) -> Option<GameRecord> {
             Some("match") => {
                 bot_color = serde_json::from_value(v["your_color"].clone()).ok();
                 strategy = v["strategy"].as_str().unwrap_or("?").to_string();
+            }
+            Some("obs") => {
+                if let Ok(obs) = serde_json::from_value(v["event"].clone()) {
+                    observations.push(obs);
+                }
             }
             Some("end") => {
                 end = serde_json::from_value(v["payload"].clone()).ok();
@@ -43,8 +58,109 @@ fn load(path: &str) -> Option<GameRecord> {
         file: path.to_string(),
         bot_color: bot_color?,
         strategy,
+        observations,
         end: end?,
     })
+}
+
+/// 観測ログの復元から PlayerView 相当を作る（王手ソルバーの再現検証用）
+fn view_from_model(model: &GameModel, in_check: bool) -> PlayerView {
+    PlayerView {
+        game_id: "replay".into(),
+        your_color: model.my_color(),
+        your_pieces: model.my_pieces(),
+        your_hand: model.my_hand(),
+        turn: model.my_color(),
+        move_number: 0,
+        clocks: ClockState {
+            sente_ms: 0,
+            gote_ms: 0,
+            running: None,
+            server_time: 0,
+        },
+        fouls: FoulCounts {
+            you: model.my_fouls(),
+            opponent: model.opponent_fouls(),
+        },
+        you_in_check: in_check,
+        opponent_in_check: false,
+        status: GameStatus::Playing,
+    }
+}
+
+/// 記録上「王手中に反則した手番」それぞれを、ソルバー方策（解消確率の argmax）で
+/// 最初から指し直し、合法手に到達するまでの反則回数を実際の反則回数と比較する。
+/// 実運用と同じく、反則するたびにその手を仮説消去へ回して選び直す。
+/// 戻り値: (検証した手番数, 実際の反則合計, ソルバー方策での反則合計)
+fn simulate_check_solver(rec: &GameRecord, positions: &[Position], bot: Color) -> (u32, u32, u32) {
+    // 手番ごとの実際の反則回数と、その手番の最初の反則の直前までの観測数
+    let mut turns: Vec<(u32, usize, u32)> = vec![]; // (move_number, obs_prefix, actual_fouls)
+    for (i, obs) in rec.observations.iter().enumerate() {
+        let Observation::MyFoul { move_number, .. } = obs else {
+            continue;
+        };
+        match turns.last_mut() {
+            Some((mn, _, n)) if *mn == *move_number => *n += 1,
+            _ => turns.push((*move_number, i, 1)),
+        }
+    }
+
+    let mut tested = 0;
+    let mut actual_total = 0;
+    let mut solver_total = 0;
+    for (move_number, prefix, actual) in turns {
+        let idx = (move_number as usize).saturating_sub(1);
+        let Some(truth) = positions.get(idx) else {
+            continue;
+        };
+        if !truth.in_check(bot) {
+            continue; // 王手以外の反則（経路封鎖など）はソルバーの対象外
+        }
+        let mut log = ObservationLog::default();
+        for prev in &rec.observations[..prefix] {
+            log.record(prev.clone());
+        }
+        let model = GameModel::from_log(bot, &log);
+        let view = view_from_model(&model, true);
+
+        let mut fouls: Vec<ShogiMove> = vec![];
+        let mut tried: HashSet<String> = HashSet::new();
+        let mut sim_fouls = 0u32;
+        let mut sequence: Vec<String> = vec![];
+        loop {
+            if sim_fouls >= 10 {
+                break; // 反則負け相当
+            }
+            let candidates = candidate_moves(&view, &tried);
+            if candidates.is_empty() {
+                break;
+            }
+            let Some(mut solver) = CheckSolver::new(&view, &[], &fouls, &log) else {
+                break;
+            };
+            let best = candidates
+                .iter()
+                .map(|(usi, mv)| (usi.clone(), *mv, solver.resolve_probability(mv)))
+                .max_by(|a, b| a.2.total_cmp(&b.2));
+            let Some((usi, mv, p)) = best else { break };
+            if truth.is_legal(&mv) {
+                sequence.push(format!("{usi}(p{p:.2})○"));
+                break;
+            }
+            sequence.push(format!("{usi}(p{p:.2})×"));
+            sim_fouls += 1;
+            fouls.push(mv);
+            tried.insert(usi);
+        }
+        tested += 1;
+        actual_total += actual;
+        solver_total += sim_fouls;
+        println!(
+            "  王手手番 {move_number}手目: 実際の反則 {actual}回 → ソルバー方策 {sim_fouls}回 [{}]",
+            sequence.join(" ")
+        );
+    }
+    (tested, actual_total, solver_total)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -127,6 +243,8 @@ fn main() {
     let mut total_free_losses = 0.0;
     let mut total_bad_trades = 0.0;
     let mut total_missed_mates = 0;
+    let mut total_check_tested = 0;
+    let mut total_check_solved = 0;
     let mut total_recap_ops = 0;
     let mut total_recap_taken = 0;
     let mut total_recap_missed_good = 0;
@@ -266,6 +384,12 @@ fn main() {
         }
         println!("  駒得収支: 取った {bot_captured:.0} / 取られた {bot_lost:.0}（歩=1換算）");
 
+        // 王手ソルバーの再現検証（王手中に反則した手番それぞれを指し直す）
+        let (tested, actual, sim) = simulate_check_solver(&rec, &positions, bot);
+        let _ = tested;
+        total_check_tested += actual;
+        total_check_solved += sim;
+
         // 取り返し機会: 相手に駒を取られた直後の bot 手番で、そのマスを合法に
         // 取り返せたか（bot は取られたマス = 相手駒の現在地を正確に知っている）
         for (i, m) in rec.end.moves.iter().enumerate() {
@@ -363,4 +487,9 @@ fn main() {
         "取り返し: 機会{total_recap_ops}回中 実行{total_recap_taken}回 / 得だったのに逃した{total_recap_missed_good}回"
     );
     println!("1手詰みの存在（参考値・玉位置は不可視）: {total_missed_mates}回");
+    if total_check_tested > 0 {
+        println!(
+            "王手中の反則: 実際 {total_check_tested}回 → ソルバー方策なら {total_check_solved}回"
+        );
+    }
 }
