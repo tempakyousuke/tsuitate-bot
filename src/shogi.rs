@@ -354,7 +354,9 @@ impl Position {
     }
 
     /// 疑似合法か（自玉の安全・打ち歩詰めは見ない）
-    fn is_pseudo_legal(&self, mv: &ShogiMove) -> bool {
+    /// 疑似合法（利き・経路・打ちマスの空き等。自玉の王手放置は見ない）。
+    /// 記録分析（bin/analyze.rs）が反則の原因分類にも使う
+    pub fn is_pseudo_legal(&self, mv: &ShogiMove) -> bool {
         match *mv {
             ShogiMove::Board { from, to, promote } => {
                 if !on_board(from) || !on_board(to) {

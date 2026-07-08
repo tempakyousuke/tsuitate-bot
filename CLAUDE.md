@@ -13,12 +13,19 @@
   勝ち越すことを確認する（例: `cargo run --release --bin arena -- 100 estimator estimator_v4`）。
   50%付近の信頼区間は 100局で±10pt / 200局で±7pt / 1000局で±3.1pt。当面（開発最初期）は
   100局を既定とし、結果が信頼区間内で判定できない僅差のときだけ局数を増やす
+- `cargo run --release --bin analyze -- records/*.jsonl` — 対局記録の事後分析。
+  game:end の全公開棋譜をリプレイし、反則の原因分類（王手解消失敗/飛び込み/経路封鎖/打ちマス）・
+  駒得収支・只取られ・損な交換・取り返し逃し・詰み逃しを集計する
 - `cargo build` / `cargo run --release` — 実行には環境変数が必要:
   - `TSUITATE_BOT_TOKEN`（必須）: サイトのマイページ「bot管理」で発行する `tsb_...` トークン
   - `TSUITATE_URL`（既定 `http://localhost:5173`）
   - `TSUITATE_THINK_MS`（既定 600）: 着手前の待ち時間
   - `TSUITATE_STRATEGY`（既定 `estimator`。旧来の単純botは `heuristic`）
   - `TSUITATE_QUEUE_RETRY_MS`（既定 60000）: キュー参加拒否・受付終了後の再試行間隔
+  - `TSUITATE_RECORD_DIR`（既定 `records`。空文字で無効）: 対局記録（JSONL）の出力先。
+    1対局1ファイルで、botの観測イベント全量・選択した手と思考時間・終局結果を記録する
+    （`src/record.rs`）。相手の実際の手は含まれない。ローカルdevサーバー対局なら
+    サーバーDBの `games.moves` に全手順（真実）が残るので、分析にはDBダンプと突き合わせる
 
 ## アーキテクチャ
 
