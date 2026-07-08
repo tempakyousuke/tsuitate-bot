@@ -1,0 +1,53 @@
+name: Arena
+
+# ローカルマシンを熱くせずに戦略同士のアリーナ対局をGitHub Actions上で実行する。
+# 手動起動のみ（push/PRトリガーなし）。 引数はCLAUDE.mdの `cargo run --release --bin arena` と同じ体系。
+on:
+  workflow_dispatch:
+    inputs:
+      games:
+        description: "対局数（基準ごと）"
+        required: false
+        default: "100"
+      candidate:
+        description: "候補戦略"
+        required: false
+        default: "estimator"
+      baselines:
+        description: "基準戦略（スペース区切り。複数でガントレット）"
+        required: false
+        default: "estimator_v2 estimator_v3"
+
+jobs:
+  arena:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run arena
+        run: |
+          cargo run --release --bin arena -- \
+            "${{ inputs.games }}" \
+            "${{ inputs.candidate }}" \
+            ${{ inputs.baselines }} \
+            | tee arena-result.txt
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo '```'
+            cat arena-result.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload result log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arena-result
+          path: arena-result.txt
