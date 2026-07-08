@@ -18,6 +18,12 @@ cargo run --release
 
 キューに自動で並び、マッチしたら対局し、終局したらまた並ぶ。Ctrl-C で終了。
 
+常駐運用を想定しており、以下は自動で処理される:
+
+- ランダムマッチの受付時間外（`queue:join` 拒否・`queue:closed`）は
+  `TSUITATE_QUEUE_RETRY_MS` 間隔で再試行して開場を待つ
+- サーバー再起動などで対局が消えた場合（`game:sync` が対局を返さない）はキューへ戻る
+
 ### 環境変数
 
 | 変数 | 既定値 | 説明 |
@@ -25,6 +31,7 @@ cargo run --release
 | `TSUITATE_URL` | `http://localhost:5173` | 接続先サイト |
 | `TSUITATE_BOT_TOKEN` | （必須） | マイページで発行したAPIトークン |
 | `TSUITATE_THINK_MS` | `600` | 着手前の待ち時間 ms |
+| `TSUITATE_QUEUE_RETRY_MS` | `60000` | キュー参加拒否（受付時間外など）後の再試行間隔 ms |
 
 ## 構成
 

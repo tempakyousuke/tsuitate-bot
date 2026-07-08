@@ -28,6 +28,10 @@ pub struct Config {
     pub think_delay_ms: u64,
     /// 終局後に再度キューへ並ぶまでの待ち時間
     pub requeue_delay_ms: u64,
+    /// queue:join 拒否（受付時間外など）・queue:closed 後に再試行するまでの待ち時間。
+    /// 受付時間（平日21-22時 / 土日21-24時 JST）外は拒否され続けるので、
+    /// この間隔でポーリングして開場を待つ
+    pub queue_retry_ms: u64,
     /// 戦略名（strategy::make が知っている名前）
     pub strategy_name: String,
 }
@@ -38,6 +42,8 @@ enum Msg {
     Closed,
     SocketError(String),
     QueueAck(Ack),
+    /// 受付時間の終了で待機列から外された（サーバーの queue:closed）
+    QueueClosed(String),
     MatchFound(MatchFoundPayload),
     /// game:state / 反則リトライなど「考え直すべき」合図
     ThinkTrigger,
@@ -107,6 +113,12 @@ fn connect(config: &Config, tx: &Sender<Msg>) -> Result<Client, rust_socketio::E
         .on(Event::Error, move |payload, _| {
             let _ = tx_err.send(Msg::SocketError(format!("{payload:?}")));
         })
+        .on(
+            "queue:closed",
+            forward(tx, |v: serde_json::Value| {
+                Msg::QueueClosed(v["reason"].as_str().unwrap_or("").to_string())
+            }),
+        )
         .on("match:found", forward(tx, Msg::MatchFound))
         .on("game:state", move |_: Payload, _| {
             // 中身は game:sync で取り直すので合図だけ流す
@@ -217,8 +229,23 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
                 if ack.ok {
                     println!("キューに参加しました");
                 } else {
-                    eprintln!("キュー参加失敗: {:?}", ack.error);
+                    // 受付時間外など。開場を待って再試行し続ける（常駐運用）
+                    eprintln!(
+                        "キュー参加失敗: {:?}（{}秒後に再試行）",
+                        ack.error,
+                        config.queue_retry_ms / 1000
+                    );
+                    sleep(Duration::from_millis(config.queue_retry_ms));
+                    join_queue(&socket, &tx);
                 }
+            }
+            Msg::QueueClosed(reason) => {
+                println!(
+                    "受付終了で待機列から外されました: {reason}（{}秒間隔で再試行）",
+                    config.queue_retry_ms / 1000
+                );
+                sleep(Duration::from_millis(config.queue_retry_ms));
+                join_queue(&socket, &tx);
             }
             Msg::MatchFound(m) => {
                 println!(
@@ -240,7 +267,18 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
                 }
             }
             Msg::Sync(Some(view)) => handle_sync(&socket, &tx, &mut state, view),
-            Msg::Sync(None) => {}
+            Msg::Sync(None) => {
+                // 対局中のはずなのにサーバーが対局を知らない
+                // → サーバー再起動などで対局が消えた。キューへ戻る
+                if state.game_id.take().is_some() {
+                    println!("対局が見つかりませんでした（サーバー再起動？）。キューへ戻ります");
+                    state.foul_tried.clear();
+                    state.pending_move_number = None;
+                    state.last_sent = None;
+                    sleep(Duration::from_millis(config.requeue_delay_ms));
+                    join_queue(&socket, &tx);
+                }
+            }
             Msg::MoveAccepted(p) => {
                 if let Some(usi) = state.last_sent.take() {
                     if let Some(role) = p.captured {

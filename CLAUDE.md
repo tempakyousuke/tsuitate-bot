@@ -18,6 +18,7 @@
   - `TSUITATE_URL`（既定 `http://localhost:5173`）
   - `TSUITATE_THINK_MS`（既定 600）: 着手前の待ち時間
   - `TSUITATE_STRATEGY`（既定 `estimator`。旧来の単純botは `heuristic`）
+  - `TSUITATE_QUEUE_RETRY_MS`（既定 60000）: キュー参加拒否・受付終了後の再試行間隔
 
 ## アーキテクチャ
 
@@ -47,7 +48,12 @@
   凍結後は編集しない。改善が確定したらその時点のコピーを `estimator_vN` として追加登録する。
   明らかに弱くなった古い凍結版は破棄してよい（v1 は王手放置癖が強すぎたため破棄済み）
 - `client.rs` — 接続と対局ループ。反則リトライ（同じ手を繰り返さない）、
-  `pending_move_number` による二重着手ガード、再接続時の `game:sync` 復帰、終局後の自動再キュー
+  `pending_move_number` による二重着手ガード、再接続時の `game:sync` 復帰、終局後の自動再キュー。
+  常駐運用対応: 受付時間外の `queue:join` 拒否と `queue:closed` は `TSUITATE_QUEUE_RETRY_MS`
+  間隔で再試行して開場を待ち、サーバー再起動で対局が消えた場合（sync が state=null）は
+  キューへ戻る。本番（VPS）では systemd サービス `tsuitate-bot` として常駐
+  （設置は tsuitate リポジトリの `scripts/server/setup/07-bot.sh`、更新は
+  `npm run deploy -- --bot`）
 
 ## ルール上の前提（サイト側仕様）
 
