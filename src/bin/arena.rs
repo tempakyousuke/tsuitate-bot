@@ -27,8 +27,10 @@ use tsuitate_bot::shogi::{Outcome, Position, parse_usi, unpromote_role};
 use tsuitate_bot::strategy::{self, Strategy};
 
 const MAX_FOULS: u32 = 10;
-/// これを超えたら引き分け扱い（千日手検出は未実装のため）
-const MAX_PLIES: u32 = 400;
+/// これを超えたら引き分け扱い（千日手検出は未実装のため）。
+/// 400手だと1ガントレットの実時間が長すぎるため200手に短縮
+/// （200手を超える対局は膠着がほとんどで、勝敗の判別力への寄与が薄い）
+const MAX_PLIES: u32 = 200;
 /// フィッシャー時計（サイト仕様: 300秒+3秒）
 const FISCHER_INITIAL_MS: i64 = 300_000;
 const FISCHER_INCREMENT_MS: i64 = 3_000;
