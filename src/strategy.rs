@@ -42,6 +42,7 @@ pub fn make(name: &str) -> Option<Box<dyn Strategy>> {
         "estimator" => Some(Box::new(EstimatorStrategy::new())),
         "estimator_v2" => Some(Box::new(crate::frozen::estimator_v2::EstimatorV2::new())),
         "estimator_v3" => Some(Box::new(crate::frozen::estimator_v3::EstimatorV3::new())),
+        "estimator_v4" => Some(Box::new(crate::frozen::estimator_v4::EstimatorV4::new())),
         _ => None,
     }
 }
@@ -116,8 +117,10 @@ pub fn choose_move(view: &PlayerView, foul_tried: &HashSet<String>) -> Option<St
     best.map(|(usi, _)| usi)
 }
 
-/// 評価に使う粒子数の上限（思考時間の予算。粒子は estimator 側で最大400）
-const EVAL_PARTICLES: usize = 96;
+/// 評価に使う粒子数の上限（思考時間の予算。粒子は estimator 側で最大400）。
+/// フィッシャー300秒+3秒に対し1手1〜2秒が目安。96粒子で平均370ms程度だったので
+/// 精度側（反則率の低下）に予算を振る
+const EVAL_PARTICLES: usize = 192;
 
 /// 観測履歴から相手局面を推定して指す戦略。
 ///
@@ -194,6 +197,12 @@ impl Strategy for EstimatorStrategy {
             .count();
         let opp_board_n = (20 - my_captures.min(19)) as f64;
 
+        // 直前に受理された自分の手（手戻りシャッフルの抑制に使う）
+        let last_my_move = log.events().iter().rev().find_map(|e| match e {
+            Observation::MyMove { usi, .. } => parse_usi(usi),
+            _ => None,
+        });
+
         let mut rng = rand::rng();
         let mut best: Option<(String, f64)> = None;
         for (usi, mv) in candidates {
@@ -203,7 +212,18 @@ impl Strategy for EstimatorStrategy {
                 // 「玉移動 > 取り/合駒の候補」の順に並ぶ事前確率にする
                 prior *= in_check_prior(view, &mv);
             }
-            let score = evaluate(view, &mv, &sample, prior) + rng.random_range(0.0..0.01);
+            let mut score = evaluate(view, &mv, &sample, prior) + rng.random_range(0.0..0.01);
+            // 手戻り（直前の手をそのまま逆に戻す）は膠着の典型なので減点。
+            // 手数上限の引き分けを崩す側に倒す
+            if let (
+                Some(ShogiMove::Board { from: pf, to: pt, .. }),
+                ShogiMove::Board { from, to, .. },
+            ) = (last_my_move, mv)
+            {
+                if from == pt && to == pf {
+                    score -= 0.35;
+                }
+            }
             if best.as_ref().is_none_or(|(_, s)| score > *s) {
                 best = Some((usi, score));
             }
@@ -342,6 +362,7 @@ fn evaluate(view: &PlayerView, mv: &ShogiMove, particles: &[&Position], prior: f
     // 少数の粒子でだけ測って平均する
     const PRESSURE_SAMPLES: usize = 16;
     let mut pressure_sum = 0.0;
+    let mut attack_sum = 0.0;
     let mut pressure_n = 0usize;
 
     for pos in particles {
@@ -352,32 +373,50 @@ fn evaluate(view: &PlayerView, mv: &ShogiMove, particles: &[&Position], prior: f
         let mut v = 0.0;
 
         // 駒得（盤上価値で数える。成駒を取れば大きい）
+        let mut captured_value = 0.0;
         if let ShogiMove::Board { to, .. } = *mv {
             if let Some(p) = pos.piece_at(to) {
                 if p.color == opp {
-                    v += piece_value(p.role);
+                    captured_value = piece_value(p.role);
                 }
             }
         }
+        v += captured_value;
 
         let mut next = (*pos).clone();
         next.play_unchecked(mv);
 
-        // 王手・詰み
+        // 王手・詰み。ついたて将棋では王手された側は王手駒の位置が見えず
+        // 手探りの反則をしやすい（反則10回で負け）ので、王手自体が得点源。
+        // 相手の反則が溜まっているほど価値が上がる
         if next.in_check(opp) {
-            v += 0.8;
+            v += 0.9 + 0.12 * f64::from(view.fouls.opponent);
             if next.legal_moves().is_empty() {
                 v += 1000.0; // 詰み（真の局面がこの粒子なら勝ち）
             }
         }
 
-        // 取り返され・タダ取られリスク: 利きの当たっている自駒の最大値。
-        // 相手にはこちらの駒が見えないので、確実に取られるわけではない → 割引き
-        v -= 0.6 * exposed_capture_risk(&next, me);
+        // 取られリスクは「相手がこの駒の位置を知っているか」で重みを分ける。
+        // 駒を取った直後は取られたマスが相手に通知される → 着手駒の位置は確実にバレて
+        // いて、取り返しはほぼ実行される。それ以外の駒への当たりは相手から見えない
+        // （推定はされうる）ので薄く見積もる
+        let to = match *mv {
+            ShogiMove::Board { to, .. } => to,
+            ShogiMove::Drop { to, .. } => to,
+        };
+        // 相手が取れるのは1手で1枚なので、重み付きリスクの最大値だけを引く
+        let mover_w = if captured_value > 0.0 { 0.9 } else { 0.45 };
+        let mover_risk = mover_w * recapture_risk(&next, me, to);
+        let hidden_risk = 0.35 * exposed_capture_risk(&next, me, Some(to));
+        v -= mover_risk.max(hidden_risk);
 
-        // 王の安全度: 自玉の周囲8マスに当たっている相手の利きの数
+        // 王の安全度と攻撃圧力（利き走査が重いので少数の粒子でだけ測って平均する）
         if pressure_n < PRESSURE_SAMPLES {
-            pressure_sum += king_zone_pressure(&next, me);
+            // 自玉の周囲に当たっている相手の利き（守り）
+            pressure_sum += king_zone_pressure(&next, me, opp);
+            // 相手玉の周囲に当たっている自分の利き（攻め）。王手にならない攻め駒の
+            // 集結にも報酬を与える（王手/詰みボーナスだけだと攻めを組み立てない）
+            attack_sum += king_zone_pressure(&next, opp, me);
             pressure_n += 1;
         }
 
@@ -388,7 +427,8 @@ fn evaluate(view: &PlayerView, mv: &ShogiMove, particles: &[&Position], prior: f
     let n = particles.len() as f64;
     let p_legal = (legal as f64 + prior * PRIOR_WEIGHT) / (n + PRIOR_WEIGHT);
     let expected = if legal > 0 {
-        value_sum / legal as f64 - 0.2 * pressure_sum / pressure_n.max(1) as f64
+        value_sum / legal as f64
+            + (0.12 * attack_sum - 0.2 * pressure_sum) / pressure_n.max(1) as f64
     } else {
         0.0
     };
@@ -413,15 +453,33 @@ fn evaluate(view: &PlayerView, mv: &ShogiMove, particles: &[&Position], prior: f
     p_legal * (expected + advance_bias) - (1.0 - p_legal) * foul_cost
 }
 
+/// 着手駒（マス to にいる自駒）が次の相手番で取られるリスク。
+/// 紐つきなら取り返せるぶん割り引く（相手のどの駒で取るかは不明なので近似）
+fn recapture_risk(pos: &Position, me: Color, to: Coord) -> f64 {
+    let opp = me.other();
+    let Some(piece) = pos.piece_at(to).filter(|p| p.color == me) else {
+        return 0.0;
+    };
+    if piece.role == Role::King || !pos.is_attacked(to, opp) {
+        return 0.0;
+    }
+    let defended = pos.is_attacked(to, me);
+    piece_value(piece.role) * if defended { 0.45 } else { 1.0 }
+}
+
 /// 次の相手番で失いうる駒の概算: 相手の利きが当たっている自駒の最大価値。
 /// 自分の利きも当たっている（紐つき）なら取り返せるぶん割り引く。
+/// exclude（着手駒のマス）は recapture_risk 側で別の重みで数えるので除外する。
 /// 合法手の完全列挙（ピン考慮など）はコストに見合わないので利きベースの近似
-fn exposed_capture_risk(pos: &Position, me: Color) -> f64 {
+fn exposed_capture_risk(pos: &Position, me: Color, exclude: Option<Coord>) -> f64 {
     let opp = me.other();
     let mut worst = 0.0f64;
     for (sq, piece) in pos.pieces() {
         if piece.color != me || piece.role == Role::King {
             continue; // 玉が当たっているなら王手なので合法性の側で処理される
+        }
+        if exclude == Some(sq) {
+            continue;
         }
         if !pos.is_attacked(sq, opp) {
             continue;
@@ -433,12 +491,11 @@ fn exposed_capture_risk(pos: &Position, me: Color) -> f64 {
     worst
 }
 
-/// 自玉の周囲8マス（と玉のマス）に当たっている相手の利きの数
-fn king_zone_pressure(pos: &Position, me: Color) -> f64 {
-    let Some(king) = pos.king_square(me) else {
+/// owner 玉の周囲8マス（と玉のマス）に当たっている by 側の利きの数
+fn king_zone_pressure(pos: &Position, owner: Color, by: Color) -> f64 {
+    let Some(king) = pos.king_square(owner) else {
         return 0.0;
     };
-    let opp = me.other();
     let mut pressure = 0;
     for df in -1..=1i8 {
         for dr in -1..=1i8 {
@@ -448,7 +505,7 @@ fn king_zone_pressure(pos: &Position, me: Color) -> f64 {
             };
             if (1..=9).contains(&c.file)
                 && (1..=9).contains(&c.rank)
-                && pos.is_attacked(c, opp)
+                && pos.is_attacked(c, by)
             {
                 pressure += 1;
             }
@@ -596,5 +653,6 @@ mod tests {
         assert!(make("estimator").is_some());
         assert!(make("estimator_v2").is_some());
         assert!(make("estimator_v3").is_some());
+        assert!(make("estimator_v4").is_some());
     }
 }

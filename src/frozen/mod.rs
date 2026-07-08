@@ -13,3 +13,4 @@
 
 pub mod estimator_v2;
 pub mod estimator_v3;
+pub mod estimator_v4;
