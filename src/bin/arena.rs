@@ -21,7 +21,7 @@ use std::time::Instant;
 
 use tsuitate_bot::observation::{Observation, ObservationLog};
 use tsuitate_bot::protocol::{
-    ClockState, Color, FoulCounts, GameStatus, OpponentInfo, PlayerView,
+    ClockState, Color, FoulCounts, GameStatus, PlayerView,
 };
 use tsuitate_bot::shogi::{Outcome, Position, parse_usi, unpromote_role};
 use tsuitate_bot::strategy::{self, Strategy};
@@ -93,11 +93,6 @@ fn make_view(
     PlayerView {
         game_id: format!("arena-{game_no}"),
         your_color: color,
-        opponent: OpponentInfo {
-            username: "arena".into(),
-            rating: 1500,
-            is_bot: true,
-        },
         your_pieces: pos.pieces_of(color),
         your_hand: pos.hand_map(color),
         turn: pos.turn(),

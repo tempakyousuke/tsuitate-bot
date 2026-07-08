@@ -519,17 +519,12 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::protocol::{ClockState, FoulCounts, GameStatus, OpponentInfo, VisiblePiece};
+    use crate::protocol::{ClockState, FoulCounts, GameStatus, VisiblePiece};
 
     pub(crate) fn minimal_view(pieces: Vec<VisiblePiece>, hand: HashMap<Role, u32>) -> PlayerView {
         PlayerView {
             game_id: "g".into(),
             your_color: Color::Sente,
-            opponent: OpponentInfo {
-                username: "aite".into(),
-                rating: 1500,
-                is_bot: false,
-            },
             your_pieces: pieces,
             your_hand: hand,
             turn: Color::Sente,

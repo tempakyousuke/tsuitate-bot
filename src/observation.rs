@@ -8,9 +8,12 @@
 //! 現フェーズでは記録と終局時のサマリ出力のみ（フィールドは将来のエンジンが読む）。
 #![allow(dead_code)]
 
+use serde::Serialize;
+
 use crate::protocol::{Color, Role};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Observation {
     /// 受理された自分の指し手
     MyMove {

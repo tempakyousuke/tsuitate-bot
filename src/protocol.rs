@@ -51,7 +51,7 @@ pub struct VisiblePiece {
     pub role: Role,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpponentInfo {
     pub username: String,
@@ -82,13 +82,13 @@ pub enum GameStatus {
     Ended,
 }
 
-/// 対局中に自分へ送られる可視情報の全量（PlayerView）
+/// 対局中に自分へ送られる可視情報の全量（PlayerView）。
+/// 匿名対局のため相手の身元は含まれない（game:end で初めて公開される）
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PlayerView {
     pub game_id: String,
     pub your_color: Color,
-    pub opponent: OpponentInfo,
     pub your_pieces: Vec<VisiblePiece>,
     pub your_hand: HashMap<Role, u32>,
     pub turn: Color,
@@ -100,12 +100,12 @@ pub struct PlayerView {
     pub status: GameStatus,
 }
 
+/// マッチ成立の通知。匿名対局のため相手の身元は含まない
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MatchFoundPayload {
     pub game_id: String,
     pub your_color: Color,
-    pub opponent: OpponentInfo,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -124,11 +124,50 @@ pub struct OpponentMovedPayload {
     pub captured_your_piece_at: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+/// 棋譜の1手（正規手のみ）。終局時に全公開される
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MoveRecord {
+    pub usi: String,
+    pub by_color: Color,
+    /// この手の消費時間
+    pub ms: u64,
+    /// この手を指す前の反則累計
+    pub fouls_before: u32,
+}
+
+/// 反則試行の記録
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FoulRecord {
+    pub move_number: u32,
+    pub by_color: Color,
+    pub usi: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RatingChange {
+    pub before: i32,
+    pub after: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RatingChangePair {
+    pub you: RatingChange,
+    pub opponent: RatingChange,
+}
+
+/// 終局通知。終局後は全公開: 完全棋譜・反則試行・終局図・相手の身元が届く
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GameEndPayload {
     pub result: String,
     pub reason: String,
+    pub final_sfen: String,
+    pub moves: Vec<MoveRecord>,
+    pub foul_attempts: Vec<FoulRecord>,
+    pub rating_change: RatingChangePair,
+    pub opponent: OpponentInfo,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -172,7 +211,6 @@ mod tests {
         let json = r#"{
             "gameId": "g1",
             "yourColor": "sente",
-            "opponent": { "username": "aite", "rating": 1500, "isBot": false },
             "yourPieces": [{ "square": "7g", "role": "pawn" }],
             "yourHand": { "pawn": 2 },
             "turn": "sente",

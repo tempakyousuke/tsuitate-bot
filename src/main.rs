@@ -6,6 +6,7 @@
 //! - TSUITATE_THINK_MS: 着手前の待ち時間 ms（既定 600）
 //! - TSUITATE_STRATEGY: 戦略名（既定は strategy::DEFAULT_STRATEGY）
 //! - TSUITATE_QUEUE_RETRY_MS: キュー参加拒否（受付時間外）後の再試行間隔 ms（既定 60000）
+//! - TSUITATE_RECORD_DIR: 対局記録（JSONL）の出力先（既定 records。空文字で記録しない）
 
 use std::process::exit;
 
@@ -33,6 +34,12 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(60_000);
 
+    let record_dir = match std::env::var("TSUITATE_RECORD_DIR") {
+        Ok(dir) if dir.is_empty() => None,
+        Ok(dir) => Some(dir),
+        Err(_) => Some("records".into()),
+    };
+
     let config = client::Config {
         url,
         token,
@@ -40,6 +47,7 @@ fn main() {
         requeue_delay_ms: 3_000,
         queue_retry_ms,
         strategy_name,
+        record_dir,
     };
 
     if let Err(e) = client::run(config) {

@@ -9,5 +9,6 @@ pub mod frozen;
 pub mod model;
 pub mod observation;
 pub mod protocol;
+pub mod record;
 pub mod shogi;
 pub mod strategy;
