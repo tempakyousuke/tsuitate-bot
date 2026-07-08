@@ -1,0 +1,337 @@
+//! 王手中の回避手選択のための制約推論。
+//!
+//! 対人対局の分析（records/ 2026-07-08）で、反則の86%が「王手中に攻め駒の位置が
+//! 分からず回避候補を手探りで試す」ことによるバーストだった。粒子が枯渇する終盤に
+//! 集中するため、粒子に依存しない専用の推論を用意する:
+//!
+//! - 王手駒の仮説 = 自玉を攻撃しうる（マス, 駒種）の全列挙。自駒の配置は既知なので、
+//!   自駒に遮られる仮説は除外できる
+//! - この手番で出した反則1つごとに「その手が合法になるはずだった仮説」を減衰させる
+//!   （硬い消去にしないのは、反則の原因が別の隠れ駒でもありうるため）
+//! - 粒子が生きていれば、粒子中の実際の王手駒に投票させて仮説を重み付けする
+//! - 各回避候補の「仮説の下で王手を解消する確率」を返し、評価側が事前確率に使う
+//!
+//! 両王手・王手駒が紐つきの場合は単一駒仮説では表せないが、反則のたびに減衰が
+//! かかるので数手で正しい回避に収束する（従来は同型の反則を繰り返していた）。
+
+use std::collections::HashMap;
+
+use crate::board::Coord;
+use crate::model::GameModel;
+use crate::observation::ObservationLog;
+use crate::protocol::{Color, PlayerView, Role};
+use crate::shogi::{Position, ShogiMove, unpromote_role};
+
+/// 王手駒になりうる駒種（玉は王手できない）
+const CHECKER_ROLES: [Role; 13] = [
+    Role::Pawn,
+    Role::Lance,
+    Role::Knight,
+    Role::Silver,
+    Role::Gold,
+    Role::Bishop,
+    Role::Rook,
+    Role::Tokin,
+    Role::Promotedlance,
+    Role::Promotedknight,
+    Role::Promotedsilver,
+    Role::Horse,
+    Role::Dragon,
+];
+
+/// 反則が仮説で説明できない（仮説の下では合法だったはず）ときの減衰係数。
+/// 0にしない: 反則の真因が別の隠れ駒（経路封鎖・別の利き）の可能性があるため
+const UNEXPLAINED_FOUL_DECAY: f64 = 0.15;
+
+/// 粒子投票の強さ（全粒子が一致した仮説は一様仮説の 1+PARTICLE_VOTE_W 倍）
+const PARTICLE_VOTE_W: f64 = 8.0;
+
+struct Hypothesis {
+    square: Coord,
+    role: Role,
+    weight: f64,
+}
+
+pub struct CheckSolver {
+    /// 自駒＋持ち駒だけを置いたスパース盤面（手番=自分）。仮説の駒を載せて使う
+    base: Position,
+    my_color: Color,
+    hypotheses: Vec<Hypothesis>,
+}
+
+impl CheckSolver {
+    /// 王手中の view から作る。自玉が見つからない等で推論できなければ None
+    pub fn new(
+        view: &PlayerView,
+        particles: &[&Position],
+        fouls_this_turn: &[ShogiMove],
+        log: &ObservationLog,
+    ) -> Option<CheckSolver> {
+        let my_color = view.your_color;
+        let mut base = Position::empty(my_color);
+        for piece in &view.your_pieces {
+            let sq = crate::board::parse_usi_square(&piece.square)?;
+            base.set(
+                sq,
+                Some(crate::shogi::Piece {
+                    color: my_color,
+                    role: piece.role,
+                }),
+            );
+        }
+        for (&role, &count) in &view.your_hand {
+            base.set_hand(my_color, role, count as u8);
+        }
+        base.king_square(my_color)?;
+
+        let mut solver = CheckSolver {
+            base,
+            my_color,
+            hypotheses: vec![],
+        };
+        solver.enumerate(&opponent_role_counts(view, log));
+        if solver.hypotheses.is_empty() {
+            return None;
+        }
+        solver.vote_by_particles(particles);
+        for foul in fouls_this_turn {
+            solver.observe_foul(foul);
+        }
+        Some(solver)
+    }
+
+    /// 自玉を攻撃しうる（マス, 駒種）を全列挙する。
+    /// 相手が1枚も持ちえない駒種（総数制約）は仮説から外す
+    fn enumerate(&mut self, opp_counts: &HashMap<Role, i32>) {
+        let opp = self.my_color.other();
+        let king = self.base.king_square(self.my_color).expect("new で確認済み");
+        for file in 1..=9i8 {
+            for rank in 1..=9i8 {
+                let sq = Coord { file, rank };
+                if self.base.piece_at(sq).is_some() {
+                    continue; // 自駒のあるマスに王手駒はいない
+                }
+                if sq == king {
+                    continue;
+                }
+                for role in CHECKER_ROLES {
+                    if opp_counts
+                        .get(&unpromote_role(role))
+                        .is_none_or(|&n| n <= 0)
+                    {
+                        continue;
+                    }
+                    self.base.set(
+                        sq,
+                        Some(crate::shogi::Piece { color: opp, role }),
+                    );
+                    let checks = self.base.in_check(self.my_color);
+                    self.base.set(sq, None);
+                    if checks {
+                        self.hypotheses.push(Hypothesis {
+                            square: sq,
+                            role,
+                            weight: 1.0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// 粒子中の実際の王手駒に投票させる（粒子が健全なら仮説が鋭くなる）
+    fn vote_by_particles(&mut self, particles: &[&Position]) {
+        let opp = self.my_color.other();
+        let mut voters = 0usize;
+        let mut votes: Vec<usize> = vec![0; self.hypotheses.len()];
+        for pos in particles {
+            if !pos.in_check(self.my_color) {
+                continue; // 王手を反映していない粒子は情報にならない
+            }
+            voters += 1;
+            for (i, h) in self.hypotheses.iter().enumerate() {
+                if pos.piece_at(h.square)
+                    .is_some_and(|p| p.color == opp && p.role == h.role)
+                {
+                    // 粒子上でその駒が実際に王を攻撃しているかまでは見ない
+                    // （enumerate 済みの仮説は自駒配置的に攻撃可能）
+                    votes[i] += 1;
+                }
+            }
+        }
+        if voters == 0 {
+            return;
+        }
+        for (h, &v) in self.hypotheses.iter_mut().zip(&votes) {
+            h.weight *= 1.0 + PARTICLE_VOTE_W * (v as f64 / voters as f64);
+        }
+    }
+
+    /// この手番の反則を観測: 仮説の下で合法だったはずの手が反則になった
+    /// → その仮説の重みを減衰させる
+    fn observe_foul(&mut self, foul: &ShogiMove) {
+        for i in 0..self.hypotheses.len() {
+            if self.legal_under(i, foul) {
+                self.hypotheses[i].weight *= UNEXPLAINED_FOUL_DECAY;
+            }
+        }
+    }
+
+    /// 仮説 i の下で（他の隠れ駒を無視して）mv が合法か = 王手を解消するか
+    fn legal_under(&mut self, i: usize, mv: &ShogiMove) -> bool {
+        let h = &self.hypotheses[i];
+        let piece = crate::shogi::Piece {
+            color: self.my_color.other(),
+            role: h.role,
+        };
+        let sq = h.square;
+        self.base.set(sq, Some(piece));
+        let legal = self.base.is_legal(mv);
+        self.base.set(sq, None);
+        legal
+    }
+
+    /// 候補手が王手を解消する確率（仮説の重み付き割合）
+    pub fn resolve_probability(&mut self, mv: &ShogiMove) -> f64 {
+        let mut total = 0.0;
+        let mut resolved = 0.0;
+        for i in 0..self.hypotheses.len() {
+            let w = self.hypotheses[i].weight;
+            total += w;
+            if self.legal_under(i, mv) {
+                resolved += w;
+            }
+        }
+        if total <= 0.0 {
+            return 0.5; // 全仮説が死んだ（両王手など）: 情報なしに戻す
+        }
+        resolved / total
+    }
+
+    #[cfg(test)]
+    fn hypothesis_count(&self) -> usize {
+        self.hypotheses.len()
+    }
+}
+
+/// 相手が盤上・持ち駒に持ちうる駒種の枚数（基本駒種で数える）。
+/// = 初期枚数 + こちらが取られた枚数 − こちらが取った枚数（自分の持ち駒）
+fn opponent_role_counts(view: &PlayerView, log: &ObservationLog) -> HashMap<Role, i32> {
+    let mut counts: HashMap<Role, i32> = [
+        (Role::Pawn, 9),
+        (Role::Lance, 2),
+        (Role::Knight, 2),
+        (Role::Silver, 2),
+        (Role::Gold, 2),
+        (Role::Bishop, 1),
+        (Role::Rook, 1),
+    ]
+    .into();
+    for (_, role) in GameModel::from_log(view.your_color, log).lost_pieces() {
+        *counts.entry(unpromote_role(*role)).or_default() += 1;
+    }
+    for (&role, &n) in &view.your_hand {
+        *counts.entry(unpromote_role(role)).or_default() -= n as i32;
+    }
+    counts
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::protocol::VisiblePiece;
+    use crate::shogi::parse_usi;
+
+    fn view_with(pieces: Vec<(&str, Role)>) -> PlayerView {
+        let pieces = pieces
+            .into_iter()
+            .map(|(sq, role)| VisiblePiece {
+                square: sq.into(),
+                role,
+            })
+            .collect();
+        let mut view = crate::strategy::tests::minimal_view(pieces, HashMap::new());
+        view.you_in_check = true;
+        view
+    }
+
+    fn mv(usi: &str) -> ShogiMove {
+        parse_usi(usi).unwrap()
+    }
+
+    #[test]
+    fn enumerates_plausible_checkers() {
+        // 中央の裸玉: 隣接・桂・遠距離の攻撃仮説が多数列挙される
+        let view = view_with(vec![("5e", Role::King)]);
+        let solver = CheckSolver::new(&view, &[], &[], &ObservationLog::default()).unwrap();
+        assert!(solver.hypothesis_count() > 50);
+    }
+
+    #[test]
+    fn own_pieces_block_hypotheses() {
+        // 5d に自分の歩がいれば「5c の香/飛が王手」仮説は成立しない
+        let open = CheckSolver::new(
+            &view_with(vec![("5e", Role::King)]),
+            &[],
+            &[],
+            &ObservationLog::default(),
+        )
+        .unwrap();
+        let blocked = CheckSolver::new(
+            &view_with(vec![("5e", Role::King), ("5d", Role::Pawn)]),
+            &[],
+            &[],
+            &ObservationLog::default(),
+        )
+        .unwrap();
+        assert!(blocked.hypothesis_count() < open.hypothesis_count());
+    }
+
+    #[test]
+    fn fouls_shift_probability_toward_consistent_evasions() {
+        // 裸玉 5e。縦の移動 5e5d と 5e5f が両方反則
+        // → 「5筋の縦利き（飛/香/竜）」仮説が支配的になり、横へ逃げる手の
+        //    解消確率が縦に留まる手より高くなる
+        let view = view_with(vec![("5e", Role::King)]);
+        let fouls = [mv("5e5d"), mv("5e5f")];
+        let mut solver = CheckSolver::new(&view, &[], &fouls, &ObservationLog::default()).unwrap();
+        let side = solver.resolve_probability(&mv("5e4e"));
+        assert!(
+            side > 0.7,
+            "縦筋仮説の下で横逃げは解消するはず（p={side:.2}）"
+        );
+    }
+
+    #[test]
+    fn particles_sharpen_hypotheses() {
+        // 粒子が「5a の飛が王手」で一致していれば、5筋から外れる手の確率が上がり、
+        // 5筋に留まる手（5d への合駒など）は下がる
+        let view = view_with(vec![("5e", Role::King)]);
+        let mut truth = Position::empty(Color::Sente);
+        truth.set(
+            Coord { file: 5, rank: 5 },
+            Some(crate::shogi::Piece {
+                color: Color::Sente,
+                role: Role::King,
+            }),
+        );
+        truth.set(
+            Coord { file: 5, rank: 1 },
+            Some(crate::shogi::Piece {
+                color: Color::Gote,
+                role: Role::Rook,
+            }),
+        );
+        let particles: Vec<&Position> = vec![&truth; 8];
+        let mut solver =
+            CheckSolver::new(&view, &particles, &[], &ObservationLog::default()).unwrap();
+        let away = solver.resolve_probability(&mv("5e4d"));
+        let stay = solver.resolve_probability(&mv("5e5d"));
+        assert!(
+            away > stay,
+            "飛車仮説が支配的なら5筋から外れる手が有利（away={away:.2} stay={stay:.2}）"
+        );
+    }
+}

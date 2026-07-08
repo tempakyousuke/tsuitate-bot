@@ -3,6 +3,7 @@
 //! main.rs（本番bot）と bin/arena.rs（戦略同士のローカル対戦）が共有する。
 
 pub mod board;
+pub mod check;
 pub mod client;
 pub mod estimator;
 pub mod frozen;

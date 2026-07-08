@@ -72,14 +72,22 @@ impl GameRecorder {
         self.write_line(&json!({ "type": "obs", "ts": now_ms(), "event": obs }));
     }
 
-    /// 自分が選んだ手（受理/反則が確定する前）と思考時間
-    pub fn chosen(&mut self, move_number: u32, usi: &str, think_ms: u64) {
+    /// 自分が選んだ手（受理/反則が確定する前）と思考時間。
+    /// debug は戦略の内部状態サマリ（推定の健全性・相手玉分布など。ないなら None）
+    pub fn chosen(
+        &mut self,
+        move_number: u32,
+        usi: &str,
+        think_ms: u64,
+        debug: Option<&serde_json::Value>,
+    ) {
         self.write_line(&json!({
             "type": "chose",
             "ts": now_ms(),
             "move_number": move_number,
             "usi": usi,
             "think_ms": think_ms,
+            "debug": debug,
         }));
     }
 
@@ -126,7 +134,7 @@ mod tests {
             usi: "7g7f".into(),
             captured: Some(Role::Pawn),
         });
-        rec.chosen(1, "7g7f", 123);
+        rec.chosen(1, "7g7f", 123, None);
         rec.end(
             &GameEndPayload {
                 result: "sente_win".into(),

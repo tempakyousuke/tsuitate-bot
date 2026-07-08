@@ -5,14 +5,15 @@
 //! - `EstimatorStrategy`: 観測履歴から相手局面の粒子集合を維持し（estimator.rs）、
 //!   候補手を粒子平均で評価する
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rand::Rng;
 
 use crate::board::{
-    Coord, Promotion, drop_targets, make_usi_drop, make_usi_move, move_targets, parse_usi_square,
-    promotion_choice,
+    Coord, Promotion, drop_targets, make_usi_drop, make_usi_move, make_usi_square, move_targets,
+    parse_usi_square, promotion_choice,
 };
+use crate::check::CheckSolver;
 use crate::estimator::Estimator;
 use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{Color, PlayerView, Role};
@@ -30,6 +31,11 @@ pub trait Strategy {
     ) -> Option<String>;
 
     fn name(&self) -> &'static str;
+
+    /// 直近の choose 時点の内部状態（対局記録のデバッグ用）。推定系のみ実装する
+    fn debug_state(&self) -> Option<serde_json::Value> {
+        None
+    }
 }
 
 pub const DEFAULT_STRATEGY: &str = "estimator";
@@ -131,11 +137,16 @@ const EVAL_PARTICLES: usize = 192;
 /// - 王手・詰みボーナス
 pub struct EstimatorStrategy {
     est: Option<Estimator>,
+    /// 直近の choose 時点の内部状態（記録用）
+    last_debug: Option<serde_json::Value>,
 }
 
 impl EstimatorStrategy {
     pub fn new() -> Self {
-        EstimatorStrategy { est: None }
+        EstimatorStrategy {
+            est: None,
+            last_debug: None,
+        }
     }
 }
 
@@ -203,16 +214,33 @@ impl Strategy for EstimatorStrategy {
             _ => None,
         });
 
+        // 王手中は粒子に依存しない制約推論で「王手を解消する確率」を出す
+        // （粒子が枯渇する終盤の反則バースト対策。check.rs 参照）
+        let mut check_solver = if view.you_in_check {
+            let fouls: Vec<ShogiMove> =
+                foul_tried.iter().filter_map(|u| parse_usi(u)).collect();
+            CheckSolver::new(view, &sample, &fouls, log)
+        } else {
+            None
+        };
+
+        // 相手が位置を知っている自駒（露出）の地図
+        let known = knownness_map(view, log);
+
         let mut rng = rand::rng();
         let mut best: Option<(String, f64)> = None;
         for (usi, mv) in candidates {
             let mut prior = prior_legal(view, &mv, opp_board_n);
             if view.you_in_check {
-                // 王手駒の位置は不明なので、粒子が枯渇していても
-                // 「玉移動 > 取り/合駒の候補」の順に並ぶ事前確率にする
-                prior *= in_check_prior(view, &mv);
+                prior *= match check_solver.as_mut() {
+                    Some(solver) => solver.resolve_probability(&mv).clamp(0.02, 1.0),
+                    // ソルバーが作れないときは従来の粗い事前確率
+                    // （玉移動 > 取り/合駒の順）に落とす
+                    None => in_check_prior(view, &mv),
+                };
             }
-            let mut score = evaluate(view, &mv, &sample, prior) + rng.random_range(0.0..0.01);
+            let mut score =
+                evaluate(view, &mv, &sample, prior, &known) + rng.random_range(0.0..0.01);
             // 手戻り（直前の手をそのまま逆に戻す）は膠着の典型なので減点。
             // 手数上限の引き分けを崩す側に倒す
             if let (
@@ -228,16 +256,52 @@ impl Strategy for EstimatorStrategy {
                 best = Some((usi, score));
             }
         }
+
+        self.last_debug = Some(debug_summary(est, &sample));
         best.map(|(usi, _)| usi)
     }
 
     fn name(&self) -> &'static str {
         "estimator"
     }
+
+    fn debug_state(&self) -> Option<serde_json::Value> {
+        self.last_debug.clone()
+    }
 }
 
-/// 自分に見える範囲の候補手（foul_tried を除く）
-fn candidate_moves(view: &PlayerView, foul_tried: &HashSet<String>) -> Vec<(String, ShogiMove)> {
+/// 記録用の推定サマリ: 粒子の健全性・ユニーク数・相手玉の位置分布（上位）。
+/// 事後分析で「推定が外れていたのか、評価が悪かったのか」を切り分けるために残す
+fn debug_summary(est: &Estimator, sample: &[&Position]) -> serde_json::Value {
+    let opp = est.my_color().other();
+    let mut king_votes: HashMap<Coord, u32> = HashMap::new();
+    for pos in sample {
+        if let Some(sq) = pos.king_square(opp) {
+            *king_votes.entry(sq).or_default() += 1;
+        }
+    }
+    let mut top: Vec<(Coord, u32)> = king_votes.into_iter().collect();
+    top.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+    let n = sample.len().max(1) as f64;
+    let opp_king_top: Vec<serde_json::Value> = top
+        .iter()
+        .take(3)
+        .map(|(sq, votes)| {
+            serde_json::json!({
+                "sq": make_usi_square(*sq),
+                "p": *votes as f64 / n,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "healthy": est.healthy(),
+        "unique_particles": sample.len(),
+        "opp_king_top": opp_king_top,
+    })
+}
+
+/// 自分に見える範囲の候補手（foul_tried を除く）。bin/analyze の検証でも使う
+pub fn candidate_moves(view: &PlayerView, foul_tried: &HashSet<String>) -> Vec<(String, ShogiMove)> {
     let color = view.your_color;
     let mut out = vec![];
     let push = |usi: String, out: &mut Vec<(String, ShogiMove)>| {
@@ -349,11 +413,100 @@ fn prior_legal(view: &PlayerView, mv: &ShogiMove, opp_board_n: f64) -> f64 {
     }
 }
 
+/// 相手が位置を知っている自駒の地図（マス → 既知度 0.0〜1.0）。
+///
+/// 対人対局の分析（records/ 2026-07-08）より: 相手は (a) 自駒が死んだマス =
+/// こちらの駒がいるマス、(b) 初期配置から動いていない駒、に当たりを付けて
+/// 一方的に駒を回収してくる。ついたて将棋で相手に漏れる自駒の位置情報は
+/// この2種類が主なので、露出リスクの重み付けに使う
+/// - 1.0: 駒を取って位置が暴露し、以降動いていない駒
+/// - 0.55: 初期配置から一度も動いていない駒（相手は初期配置を知っている）
+fn knownness_map(view: &PlayerView, log: &ObservationLog) -> HashMap<Coord, f64> {
+    let mut revealed: HashSet<Coord> = HashSet::new();
+    let mut touched: HashSet<Coord> = HashSet::new();
+    for e in log.events() {
+        match e {
+            Observation::MyMove { usi, captured, .. } => match parse_usi(usi) {
+                Some(ShogiMove::Board { from, to, .. }) => {
+                    revealed.remove(&from);
+                    if captured.is_some() {
+                        revealed.insert(to);
+                    } else {
+                        revealed.remove(&to);
+                    }
+                    touched.insert(from);
+                    touched.insert(to);
+                }
+                Some(ShogiMove::Drop { to, .. }) => {
+                    // 打った駒の位置は相手から見えない
+                    revealed.remove(&to);
+                    touched.insert(to);
+                }
+                None => {}
+            },
+            Observation::OpponentMoved {
+                captured_my_piece_at: Some(sq),
+                ..
+            } => {
+                if let Some(c) = parse_usi_square(sq) {
+                    revealed.remove(&c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let initial = Position::initial();
+    let mut map = HashMap::new();
+    for piece in &view.your_pieces {
+        let Some(sq) = parse_usi_square(&piece.square) else {
+            continue;
+        };
+        let k = if revealed.contains(&sq) {
+            1.0
+        } else if !touched.contains(&sq)
+            && initial
+                .piece_at(sq)
+                .is_some_and(|p| p.color == view.your_color && p.role == piece.role)
+        {
+            0.55
+        } else {
+            0.0
+        };
+        if k > 0.0 {
+            map.insert(sq, k);
+        }
+    }
+    map
+}
+
+/// 敵陣のマスが（見えない駒に）守られている事前確率。
+/// 粒子が枯渇・偏っていて守り駒を見落としていても、敵陣への単騎突入
+/// （対人5局で歩→高価な駒の損な交換が9回）を抑えるための下限に使う
+fn camp_defended_prior(to: Coord, me: Color) -> f64 {
+    let depth_from_back = match me {
+        Color::Sente => to.rank,     // 相手（後手）の陣は rank 1..=3
+        Color::Gote => 10 - to.rank, // 相手（先手）の陣は rank 7..=9
+    };
+    match depth_from_back {
+        1 => 0.4,
+        2 => 0.35,
+        3 => 0.3,
+        _ => 0.0,
+    }
+}
+
 /// 事前確率の重み（擬似観測数）。粒子が少ない・偏っているときほど事前が効く
 const PRIOR_WEIGHT: f64 = 4.0;
 
 /// 候補手をユニーク粒子の平均で評価する
-fn evaluate(view: &PlayerView, mv: &ShogiMove, particles: &[&Position], prior: f64) -> f64 {
+fn evaluate(
+    view: &PlayerView,
+    mv: &ShogiMove,
+    particles: &[&Position],
+    prior: f64,
+    known: &HashMap<Coord, f64>,
+) -> f64 {
     let me = view.your_color;
     let opp = me.other();
     let mut legal = 0usize;
@@ -404,10 +557,19 @@ fn evaluate(view: &PlayerView, mv: &ShogiMove, particles: &[&Position], prior: f
             ShogiMove::Board { to, .. } => to,
             ShogiMove::Drop { to, .. } => to,
         };
-        // 相手が取れるのは1手で1枚なので、重み付きリスクの最大値だけを引く
+        // 相手が取れるのは1手で1枚なので、重み付きリスクの最大値だけを引く。
+        // 敵陣への着手は「粒子には見えない守り駒がいる」事前確率を下限に敷く
+        // （駒を取った直後は位置が確実にバレているので下限をフルに、静かな
+        // 進入は相手からまだ見えないので薄く適用する）
         let mover_w = if captured_value > 0.0 { 0.9 } else { 0.45 };
-        let mover_risk = mover_w * recapture_risk(&next, me, to);
-        let hidden_risk = 0.35 * exposed_capture_risk(&next, me, Some(to));
+        let own_after = next
+            .piece_at(to)
+            .map(|p| piece_value(p.role))
+            .unwrap_or(0.0);
+        let known_factor = if captured_value > 0.0 { 1.0 } else { 0.35 };
+        let floor = own_after * camp_defended_prior(to, me) * known_factor;
+        let mover_risk = mover_w * recapture_risk(&next, me, to).max(floor);
+        let hidden_risk = exposed_capture_risk(&next, me, Some(to), known);
         v -= mover_risk.max(hidden_risk);
 
         // 王の安全度と攻撃圧力（利き走査が重いので少数の粒子でだけ測って平均する）
@@ -450,7 +612,12 @@ fn evaluate(view: &PlayerView, mv: &ShogiMove, particles: &[&Position], prior: f
         ShogiMove::Drop { .. } => -0.05,
     };
 
-    p_legal * (expected + advance_bias) - (1.0 - p_legal) * foul_cost
+    // 期待値が負の手を p_legal で割り引かない（min の形）。
+    // 割り引くと「合法確率が低いほどスコアが高い」= わざと反則に寄る手が
+    // 選ばれてしまう。反則しても手番は残るので悪い局面からは逃げられず、
+    // 反則の価値は「次善手の価値 − 反則コスト」でしかない
+    let gain = expected + advance_bias;
+    (p_legal * gain).min(gain) - (1.0 - p_legal) * foul_cost
 }
 
 /// 着手駒（マス to にいる自駒）が次の相手番で取られるリスク。
@@ -467,11 +634,18 @@ fn recapture_risk(pos: &Position, me: Color, to: Coord) -> f64 {
     piece_value(piece.role) * if defended { 0.45 } else { 1.0 }
 }
 
-/// 次の相手番で失いうる駒の概算: 相手の利きが当たっている自駒の最大価値。
+/// 次の相手番で失いうる駒の概算: 相手の利きが当たっている自駒の最大重み付き価値。
 /// 自分の利きも当たっている（紐つき）なら取り返せるぶん割り引く。
+/// 相手がその駒の位置を知っているほど（knownness_map）実際に取られやすいので
+/// 重みを引き上げる。位置が漏れていない駒は従来通り薄く見積もる。
 /// exclude（着手駒のマス）は recapture_risk 側で別の重みで数えるので除外する。
 /// 合法手の完全列挙（ピン考慮など）はコストに見合わないので利きベースの近似
-fn exposed_capture_risk(pos: &Position, me: Color, exclude: Option<Coord>) -> f64 {
+fn exposed_capture_risk(
+    pos: &Position,
+    me: Color,
+    exclude: Option<Coord>,
+    known: &HashMap<Coord, f64>,
+) -> f64 {
     let opp = me.other();
     let mut worst = 0.0f64;
     for (sq, piece) in pos.pieces() {
@@ -485,7 +659,9 @@ fn exposed_capture_risk(pos: &Position, me: Color, exclude: Option<Coord>) -> f6
             continue;
         }
         let defended = pos.is_attacked(sq, me);
-        let loss = piece_value(piece.role) * if defended { 0.4 } else { 1.0 };
+        let knownness = known.get(&sq).copied().unwrap_or(0.0);
+        let weight = 0.35 + 0.55 * knownness;
+        let loss = piece_value(piece.role) * if defended { 0.4 } else { 1.0 } * weight;
         worst = worst.max(loss);
     }
     worst
@@ -515,7 +691,7 @@ fn king_zone_pressure(pos: &Position, owner: Color, by: Color) -> f64 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
 
     use super::*;

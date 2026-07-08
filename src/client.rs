@@ -440,7 +440,8 @@ fn handle_sync(
         }
         Some(usi) => {
             if let Some(rec) = &mut state.recorder {
-                rec.chosen(view.move_number, &usi, think_ms);
+                let debug = state.strategy.debug_state();
+                rec.chosen(view.move_number, &usi, think_ms, debug.as_ref());
             }
             state.pending_move_number = Some(view.move_number);
             state.last_sent = Some(usi.clone());
