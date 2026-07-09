@@ -469,7 +469,7 @@ fn knownness_map(view: &PlayerView, log: &ObservationLog) -> HashMap<Coord, f64>
                 .piece_at(sq)
                 .is_some_and(|p| p.color == view.your_color && p.role == piece.role)
         {
-            0.55
+            0.4
         } else {
             0.0
         };
@@ -489,9 +489,9 @@ fn camp_defended_prior(to: Coord, me: Color) -> f64 {
         Color::Gote => 10 - to.rank, // 相手（先手）の陣は rank 7..=9
     };
     match depth_from_back {
-        1 => 0.4,
-        2 => 0.35,
-        3 => 0.3,
+        1 => 0.25,
+        2 => 0.2,
+        3 => 0.15,
         _ => 0.0,
     }
 }
@@ -660,7 +660,7 @@ fn exposed_capture_risk(
         }
         let defended = pos.is_attacked(sq, me);
         let knownness = known.get(&sq).copied().unwrap_or(0.0);
-        let weight = 0.35 + 0.55 * knownness;
+        let weight = 0.35 + 0.3 * knownness;
         let loss = piece_value(piece.role) * if defended { 0.4 } else { 1.0 } * weight;
         worst = worst.max(loss);
     }
