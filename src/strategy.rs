@@ -15,6 +15,7 @@ use crate::board::{
 };
 use crate::check::CheckSolver;
 use crate::estimator::Estimator;
+use crate::opening::OpeningBook;
 use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{Color, PlayerView, Role};
 use crate::shogi::{Position, ShogiMove, parse_usi, piece_value};
@@ -46,17 +47,6 @@ pub fn make(name: &str) -> Option<Box<dyn Strategy>> {
     match name {
         "heuristic" => Some(Box::new(Heuristic)),
         "estimator" => Some(Box::new(EstimatorStrategy::new())),
-        // アブレーション用: 露出評価・敵陣下限を無効化（= v4評価 + 王手ソルバー + min修正）。
-        // vs v4 の負け越し原因の切り分けに使う一時的な変種
-        "estimator_min_solver" => {
-            let params = EvalParams {
-                camp_scale: 0.0,
-                exposed_known: 0.0,
-                home_knownness: 0.0,
-                ..EvalParams::default()
-            };
-            Some(Box::new(EstimatorStrategy::with_params(params)))
-        }
         "estimator_v2" => Some(Box::new(crate::frozen::estimator_v2::EstimatorV2::new())),
         "estimator_v3" => Some(Box::new(crate::frozen::estimator_v3::EstimatorV3::new())),
         "estimator_v4" => Some(Box::new(crate::frozen::estimator_v4::EstimatorV4::new())),
@@ -181,6 +171,19 @@ pub struct EvalParams {
     pub drop_bias: f64,
     /// p(合法) 事前確率の擬似観測数
     pub prior_weight: f64,
+    /// 粒子退化時に prior_weight へ加算する上限（ユニーク粒子が減るほど事前を信じる。
+    /// 少数の複製・偏った粒子への過信 = 「自信過剰な間違い」を防ぐ）
+    pub prior_weight_degen: f64,
+    /// 着手後に自分が当たりを付けている敵駒の価値への重み（露出リスクの鏡像）。
+    /// 1手読みでは見えない「次の駒得」（飛車頭への歩打ち等）を作る手に価値を与える
+    pub threat_w: f64,
+    /// 探索ボーナス: 着地マスの敵駒有無について粒子が割れているほど加点。
+    /// 取れても空振りでも観測が推定を絞る（情報の価値）
+    pub info_bonus: f64,
+    /// 大駒（飛・角）が初期位置に残っていることへのペナルティ（1枚あたり）。
+    /// 初期位置の大駒は位置が予測可能で、開いた筋の背後を歩・桂で狙われる
+    /// （対人50局で頻発）。展開を促す勾配を作り、動かせば消える
+    pub big_home_penalty: f64,
     /// 手戻り減点
     pub backtrack_penalty: f64,
 }
@@ -211,6 +214,10 @@ impl Default for EvalParams {
             promote_bias: 0.1,
             drop_bias: -0.05,
             prior_weight: 4.0,
+            prior_weight_degen: 8.0,
+            threat_w: 0.25,
+            info_bonus: 0.6,
+            big_home_penalty: 0.25,
             backtrack_penalty: 0.35,
         }
     }
@@ -224,7 +231,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 20] = [
+    pub const SPECS: [ParamSpec; 24] = [
         ParamSpec { name: "check_bonus", lo: 0.0, hi: 3.0 },
         ParamSpec { name: "check_foul_scale", lo: 0.0, hi: 0.5 },
         ParamSpec { name: "mover_w_captured", lo: 0.0, hi: 1.5 },
@@ -244,6 +251,10 @@ impl EvalParams {
         ParamSpec { name: "promote_bias", lo: -0.2, hi: 0.6 },
         ParamSpec { name: "drop_bias", lo: -0.5, hi: 0.3 },
         ParamSpec { name: "prior_weight", lo: 0.5, hi: 16.0 },
+        ParamSpec { name: "prior_weight_degen", lo: 0.0, hi: 32.0 },
+        ParamSpec { name: "threat_w", lo: 0.0, hi: 1.0 },
+        ParamSpec { name: "info_bonus", lo: 0.0, hi: 2.0 },
+        ParamSpec { name: "big_home_penalty", lo: 0.0, hi: 1.5 },
         ParamSpec { name: "backtrack_penalty", lo: 0.0, hi: 1.5 },
     ];
 
@@ -268,6 +279,10 @@ impl EvalParams {
             self.promote_bias,
             self.drop_bias,
             self.prior_weight,
+            self.prior_weight_degen,
+            self.threat_w,
+            self.info_bonus,
+            self.big_home_penalty,
             self.backtrack_penalty,
         ]
     }
@@ -294,7 +309,11 @@ impl EvalParams {
             promote_bias: v[16],
             drop_bias: v[17],
             prior_weight: v[18],
-            backtrack_penalty: v[19],
+            prior_weight_degen: v[19],
+            threat_w: v[20],
+            info_bonus: v[21],
+            big_home_penalty: v[22],
+            backtrack_penalty: v[23],
         }
     }
 }
@@ -308,6 +327,7 @@ impl EvalParams {
 /// - 王手・詰みボーナス
 pub struct EstimatorStrategy {
     est: Option<Estimator>,
+    book: Option<OpeningBook>,
     params: EvalParams,
     /// 直近の choose 時点の内部状態（記録用）
     last_debug: Option<serde_json::Value>,
@@ -322,6 +342,7 @@ impl EstimatorStrategy {
     pub fn with_params(params: EvalParams) -> Self {
         EstimatorStrategy {
             est: None,
+            book: None,
             params,
             last_debug: None,
         }
@@ -345,6 +366,14 @@ impl Strategy for EstimatorStrategy {
             .est
             .get_or_insert_with(|| Estimator::new(view.your_color));
         est.update(log);
+
+        // 序盤定跡（静かな間だけ）。ブック中も推定器の update は回して粒子を保つ
+        let book = self
+            .book
+            .get_or_insert_with(|| OpeningBook::new(view.your_color));
+        if let Some(usi) = book.next(view, log, foul_tried) {
+            return Some(usi);
+        }
 
         let mut candidates = candidate_moves(view, foul_tried);
         if view.you_in_check {
@@ -692,6 +721,8 @@ fn evaluate(
     let opp = me.other();
     let mut legal = 0usize;
     let mut value_sum = 0.0;
+    // 着地マスに敵駒がいた（=駒を取れた）粒子数。探索ボーナスの不一致度に使う
+    let mut capture_hits = 0usize;
     // 王周辺の圧力は粒子間の分散が小さいわりに計算が重い（9マス×利き走査）ので
     // 少数の粒子でだけ測って平均する
     const PRESSURE_SAMPLES: usize = 16;
@@ -716,6 +747,9 @@ fn evaluate(
             }
         }
         v += captured_value;
+        if captured_value > 0.0 {
+            capture_hits += 1;
+        }
 
         let mut next = (*pos).clone();
         next.play_unchecked(mv);
@@ -762,6 +796,10 @@ fn evaluate(
         let hidden_risk = exposed_capture_risk(&next, me, Some(to), known, params);
         v -= mover_risk.max(hidden_risk);
 
+        // 自分が敵駒に当たりを付けている価値（露出リスクの鏡像）。
+        // 1手読みでは見えない「次の駒得」を作る手（大駒の頭への歩打ち等）に価値を与える
+        v += params.threat_w * threat_value(&next, me);
+
         // 王の安全度と攻撃圧力（利き走査が重いので少数の粒子でだけ測って平均する）
         if pressure_n < PRESSURE_SAMPLES {
             // 自玉の周囲に当たっている相手の利き（守り）
@@ -775,11 +813,19 @@ fn evaluate(
         value_sum += v;
     }
 
-    // 粒子の証拠と事前確率のブレンド（粒子ゼロなら事前そのもの）
+    // 粒子の証拠と事前確率のブレンド（粒子ゼロなら事前そのもの）。
+    // 粒子が退化している（ユニーク数が評価上限に届かない）ほど事前の重みを
+    // 増やし、少数の偏った粒子への過信を防ぐ
     let n = particles.len() as f64;
-    let p_legal = (legal as f64 + prior * params.prior_weight) / (n + params.prior_weight);
+    let degen = 1.0 - (n / EVAL_PARTICLES as f64).min(1.0);
+    let w = params.prior_weight + params.prior_weight_degen * degen;
+    let p_legal = (legal as f64 + prior * w) / (n + w);
     let expected = if legal > 0 {
+        // 探索ボーナス: 着地マスの敵駒有無について粒子が割れているほど、
+        // 指せば（取れても空でも）推定が絞れる。捕獲の期待値とは別の情報の価値
+        let p_hit = capture_hits as f64 / legal as f64;
         value_sum / legal as f64
+            + params.info_bonus * p_hit * (1.0 - p_hit)
             + (params.attack_w * attack_sum - params.pressure_w * pressure_sum)
                 / pressure_n.max(1) as f64
     } else {
@@ -803,12 +849,60 @@ fn evaluate(
         ShogiMove::Drop { .. } => params.drop_bias,
     };
 
+    // 大駒を初期位置に置き続けるペナルティ（この手の後に残る枚数分）。
+    // 動かす手だけペナルティが軽くなるので、展開への勾配になる
+    let development = -params.big_home_penalty * big_home_after(view, mv);
+
     // 期待値が負の手を p_legal で割り引かない（min の形）。
     // 割り引くと「合法確率が低いほどスコアが高い」= わざと反則に寄る手が
     // 選ばれてしまう。反則しても手番は残るので悪い局面からは逃げられず、
     // 反則の価値は「次善手の価値 − 反則コスト」でしかない
-    let gain = expected + advance_bias;
+    let gain = expected + advance_bias + development;
     (p_legal * gain).min(gain) - (1.0 - p_legal) * foul_cost
+}
+
+/// この手の後も初期位置に残っている自分の大駒（飛・角）の枚数
+fn big_home_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
+    let (rook_home, bishop_home) = match view.your_color {
+        Color::Sente => (Coord { file: 2, rank: 8 }, Coord { file: 8, rank: 8 }),
+        Color::Gote => (Coord { file: 8, rank: 2 }, Coord { file: 2, rank: 2 }),
+    };
+    let from = match *mv {
+        ShogiMove::Board { from, .. } => Some(from),
+        ShogiMove::Drop { .. } => None,
+    };
+    let mut n = 0.0;
+    for piece in &view.your_pieces {
+        let Some(sq) = parse_usi_square(&piece.square) else {
+            continue;
+        };
+        let home = (piece.role == Role::Rook && sq == rook_home)
+            || (piece.role == Role::Bishop && sq == bishop_home);
+        if home && from != Some(sq) {
+            n += 1.0;
+        }
+    }
+    n
+}
+
+/// 自分が当たりを付けている敵駒の最大価値（露出リスクの鏡像）。
+/// 紐つき（相手が守っている）なら取ったときに取り返されるぶん割り引く。
+/// 玉への当たりは王手であり合法性・王手ボーナス側で扱うので除く
+fn threat_value(pos: &Position, me: Color) -> f64 {
+    let opp = me.other();
+    let mut best = 0.0f64;
+    for (sq, piece) in pos.pieces() {
+        if piece.color != opp || piece.role == Role::King {
+            continue;
+        }
+        if !pos.is_attacked(sq, me) {
+            continue;
+        }
+        let defended = pos.is_attacked(sq, opp);
+        let gain = piece_value(piece.role) * if defended { 0.45 } else { 1.0 };
+        best = best.max(gain);
+    }
+    best
 }
 
 /// 着手駒（マス to にいる自駒）が次の相手番で取られるリスク。

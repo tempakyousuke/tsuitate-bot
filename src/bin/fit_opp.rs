@@ -23,14 +23,16 @@ use tsuitate_bot::board::Coord;
 use tsuitate_bot::protocol::{Color, GameEndPayload};
 use tsuitate_bot::shogi::{Position, ShogiMove, parse_usi};
 
-const FEATURE_NAMES: [&str; 4] = [
+const FEATURE_NAMES: [&str; 5] = [
     "advance",      // 前進量（段）
     "promote",      // 成り
     "is_drop",      // 持ち駒を打つ
     "threat_known", // 位置が既知の相手駒（自分の駒が死んだマス）へ新たに当たりを付ける
+    "threat_home",  // 初期位置から動いていない相手駒へ新たに当たりを付ける
+                    // （筋が開いた背後の飛車を狙う歩打ち等。相手は推論で位置を当ててくる）
 ];
 
-const D: usize = 4;
+const D: usize = 5;
 
 struct Sample {
     /// 観測クラス内の各候補手の特徴量
@@ -55,17 +57,40 @@ fn to_square(mv: &ShogiMove) -> Coord {
     }
 }
 
-/// 位置が既知の相手駒（human_lost_at のマス）へ新たに当たりを付ける手か
-fn threatens_known(
+/// 動かした駒（着地点 to）が対象マスのどれかへ新たに利きを付けたか。
+/// 「新たに」= 移動元からは利いていなかった（打ちは常に新規）。
+/// 全盤面の利き走査ではなく駒単位の判定にする（estimator 側の実行コスト都合。
+/// 定義は estimator.rs の threat 特徴量と一致させること）
+fn newly_threatens(
     pos: &Position,
     next: &Position,
-    human: Color,
-    to: Coord,
-    human_lost_at: &HashSet<Coord>,
+    mv: &ShogiMove,
+    targets: &HashSet<Coord>,
 ) -> bool {
-    human_lost_at.iter().any(|&s| {
-        s != to && !pos.is_attacked(s, human) && next.is_attacked(s, human)
+    let to = to_square(mv);
+    targets.iter().any(|&s| {
+        if s == to || !next.attacks(to, s) {
+            return false;
+        }
+        match *mv {
+            ShogiMove::Board { from, .. } => !pos.attacks(from, s),
+            ShogiMove::Drop { .. } => true,
+        }
     })
+}
+
+/// 初期位置から一度も動いていない bot 駒のマス（相手はここを推論で狙ってくる）
+fn home_squares(pos: &Position, bot: Color, bot_touched: &HashSet<Coord>) -> HashSet<Coord> {
+    let initial = Position::initial();
+    initial
+        .pieces()
+        .filter(|(sq, p)| {
+            p.color == bot
+                && !bot_touched.contains(sq)
+                && pos.piece_at(*sq).is_some_and(|cur| cur.color == bot && cur.role == p.role)
+        })
+        .map(|(sq, _)| sq)
+        .collect()
 }
 
 /// 1局から（人間手番の局面, 選択手）のサンプル列を作る。
@@ -75,10 +100,13 @@ fn extract_samples(bot: Color, end: &GameEndPayload, samples: &mut Vec<Sample>) 
     let mut pos = Position::initial();
     // 人間側の駒が死んだマス（人間はそこに bot 駒がいることを知っている）
     let mut human_lost_at: HashSet<Coord> = HashSet::new();
+    // bot の駒が動いたマス（初期位置のまま動いていない駒の判定に使う）
+    let mut bot_touched: HashSet<Coord> = HashSet::new();
 
     for m in &end.moves {
         let Some(mv) = parse_usi(&m.usi) else { return };
         if m.by_color == human && pos.turn() == human {
+            let homes = home_squares(&pos, bot, &bot_touched);
             // 選ばれた手の観測クラス
             let chosen_to = to_square(&mv);
             let chosen_capture = pos
@@ -105,11 +133,13 @@ fn extract_samples(bot: Color, end: &GameEndPayload, samples: &mut Vec<Sample>) 
                 if lm == mv {
                     chosen = Some(features.len());
                 }
+                let _ = to;
                 features.push([
                     advance_of(&lm, human),
                     matches!(lm, ShogiMove::Board { promote: true, .. }) as u8 as f64,
                     matches!(lm, ShogiMove::Drop { .. }) as u8 as f64,
-                    threatens_known(&pos, &next, human, to, &human_lost_at) as u8 as f64,
+                    newly_threatens(&pos, &next, &lm, &human_lost_at) as u8 as f64,
+                    newly_threatens(&pos, &next, &lm, &homes) as u8 as f64,
                 ]);
             }
             if let Some(chosen) = chosen {
@@ -124,6 +154,12 @@ fn extract_samples(bot: Color, end: &GameEndPayload, samples: &mut Vec<Sample>) 
         let captured_color = pos.piece_at(to).map(|p| p.color);
         if m.by_color == bot && captured_color == Some(human) {
             human_lost_at.insert(to);
+        }
+        if m.by_color == bot {
+            if let ShogiMove::Board { from, .. } = mv {
+                bot_touched.insert(from);
+            }
+            bot_touched.insert(to);
         }
         pos.play_unchecked(&mv);
     }

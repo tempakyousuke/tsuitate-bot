@@ -404,6 +404,15 @@ impl Position {
         })
     }
 
+    /// from にいる駒が target マスへ利いているか（間の駒に遮られない移動可能性）。
+    /// 相手手の事前分布の threat 特徴量（fit_opp / estimator）が使う
+    pub fn attacks(&self, from: Coord, target: Coord) -> bool {
+        match self.piece_at(from) {
+            Some(piece) => self.reachable(piece, from, target),
+            None => false,
+        }
+    }
+
     /// piece が from から to へ（間の駒に遮られず）動けるか
     fn reachable(&self, piece: Piece, from: Coord, to: Coord) -> bool {
         for &delta in steps(piece.role) {

@@ -22,10 +22,13 @@ use crate::protocol::{Color, Role};
 use crate::shogi::{Position, ShogiMove, parse_usi, unpromote_role};
 
 /// 粒子の目標数。1手あたりの計算量はこれ*候補手数に比例する
-const TARGET_PARTICLES: usize = 400;
+const TARGET_PARTICLES: usize = 512;
 /// 1回の update での再生成リプレイ試行の上限（時間予算の担保）。
-/// 複製よりリプレイのほうが粒子の多様性を保てるので多めに取る
-const REGEN_ATTEMPTS: usize = 120;
+/// 複製よりリプレイのほうが粒子の多様性を保てるので多めに取る。
+/// v6: 相手モデルのフィット（2026-07-09）で提案分布の打率が上がったぶん
+/// 試行回数の効果が大きくなったので、思考予算の余り（平均360ms/目安1〜2秒）を
+/// リプレイに振る
+const REGEN_ATTEMPTS: usize = 320;
 /// リプレイ中バックトラックの1決定点あたりの再サンプル回数
 const BACKTRACK_ATTEMPTS: u32 = 4;
 
@@ -55,6 +58,10 @@ pub struct Estimator {
     /// 相手手の事前分布の threat_known 特徴量に使う。idx は制約列上の位置
     my_capture_idx: Vec<usize>,
     my_capture_sq: Vec<Coord>,
+    /// 自分の手が触れたマス（from/to）。初期配置から動いていない自駒
+    /// （相手が推論で狙ってくる = threat_home 特徴量）の判定に使う
+    my_touched_idx: Vec<usize>,
+    my_touched_sq: Vec<Coord>,
     /// ObservationLog の消化済みイベント数
     cursor: usize,
     /// 観測との矛盾（リプレイでも整合局面を作れない等）で信頼できなくなったら false
@@ -74,6 +81,8 @@ impl Estimator {
             constraints: vec![],
             my_capture_idx: vec![],
             my_capture_sq: vec![],
+            my_touched_idx: vec![],
+            my_touched_sq: vec![],
             cursor: 0,
             healthy: true,
             rng: StdRng::seed_from_u64(seed),
@@ -103,15 +112,21 @@ impl Estimator {
                 continue;
             };
             self.apply_constraint(&constraint);
-            if let Constraint::MyMove {
-                mv, captured: Some(_), ..
-            } = &constraint
-            {
+            if let Constraint::MyMove { mv, captured, .. } = &constraint {
+                let idx = self.constraints.len();
                 let to = match *mv {
                     ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
                 };
-                self.my_capture_idx.push(self.constraints.len());
-                self.my_capture_sq.push(to);
+                if captured.is_some() {
+                    self.my_capture_idx.push(idx);
+                    self.my_capture_sq.push(to);
+                }
+                if let ShogiMove::Board { from, .. } = *mv {
+                    self.my_touched_idx.push(idx);
+                    self.my_touched_sq.push(from);
+                }
+                self.my_touched_idx.push(idx);
+                self.my_touched_sq.push(to);
             }
             self.constraints.push(constraint);
         }
@@ -189,6 +204,7 @@ impl Estimator {
                     *captured_at,
                     *gives_check,
                     &self.my_capture_sq,
+                    &self.my_touched_sq,
                     &mut self.rng,
                 ),
             };
@@ -204,7 +220,7 @@ impl Estimator {
     /// リプレイ1回のコストは手数に比例するため、回数と時間の両方で打ち切る
     fn replenish(&mut self) {
         let start = std::time::Instant::now();
-        let regen_deadline = start + std::time::Duration::from_millis(250);
+        let regen_deadline = start + std::time::Duration::from_millis(500);
         if self.particles.len() < TARGET_PARTICLES {
             for _ in 0..REGEN_ATTEMPTS {
                 if self.particles.len() >= TARGET_PARTICLES
@@ -217,7 +233,7 @@ impl Estimator {
                 }
             }
         }
-        let deadline = start + std::time::Duration::from_millis(450);
+        let deadline = start + std::time::Duration::from_millis(900);
         while self.particles.is_empty() && std::time::Instant::now() < deadline {
             if let Some(pos) = self.replay_once() {
                 self.particles.push(pos);
@@ -270,14 +286,16 @@ impl Estimator {
                     if !is_retry {
                         stack.push((i, pos.clone(), 0));
                     }
-                    // この時点までに自分が駒を取ったマス（相手にとって既知の自駒位置）
+                    // この時点までに自分が駒を取ったマス／触れたマス
                     let k = self.my_capture_idx.partition_point(|&j| j < i);
+                    let t = self.my_touched_idx.partition_point(|&j| j < i);
                     sample_opp_move(
                         &mut pos,
                         self.my_color,
                         *captured_at,
                         *gives_check,
                         &self.my_capture_sq[..k],
+                        &self.my_touched_sq[..t],
                         &mut self.rng,
                     )
                 }
@@ -331,26 +349,55 @@ fn foul_consistent(pos: &Position, my_color: Color, mv: &ShogiMove) -> bool {
     pos.turn() == my_color && !pos.is_legal(mv)
 }
 
+/// 動かした駒（着地点）が対象マスのどれかへ新たに利きを付けたか。
+/// 「新たに」= 移動元からは利いていなかった（打ちは常に新規）。
+/// **定義は bin/fit_opp の newly_threatens と一致させること**（学習と推論の整合）
+fn newly_threatens(pos: &Position, next: &Position, mv: &ShogiMove, targets: &[Coord]) -> bool {
+    let to = match *mv {
+        ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+    };
+    targets.iter().any(|&s| {
+        if s == to || !next.attacks(to, s) {
+            return false;
+        }
+        match *mv {
+            ShogiMove::Board { from, .. } => !pos.attacks(from, s),
+            ShogiMove::Drop { .. } => true,
+        }
+    })
+}
+
 /// 観測と整合する相手の合法手をサンプルして適用する。整合手がなければ false。
-/// known_squares は自分が駒を取ったマス（相手は自駒がそこで死んだことを知っている
-/// = 相手から見て「そこに敵駒がいる」と分かっているマス）
+/// - known_squares: 自分が駒を取ったマス（相手は自駒がそこで死んだことを知っている）
+/// - my_touched: 自分の手が触れたマス（初期配置のまま動いていない自駒の判定用。
+///   相手はそれらを推論で狙ってくる = 飛車頭への歩打ち等）
 fn sample_opp_move(
     pos: &mut Position,
     my_color: Color,
     captured_at: Option<Coord>,
     gives_check: bool,
     known_squares: &[Coord],
+    my_touched: &[Coord],
     rng: &mut StdRng,
 ) -> bool {
     let opp = my_color.other();
     if pos.turn() != opp {
         return false;
     }
-    // threat_known の差分判定用: 着手前から既に当たっているマスは除外する
-    let already_attacked: Vec<bool> = known_squares
-        .iter()
-        .map(|&sq| pos.is_attacked(sq, opp))
+    // 初期配置から動いていない自駒のマス（粒子内の実配置と突き合わせる）
+    let initial = Position::initial();
+    let homes: Vec<Coord> = initial
+        .pieces()
+        .filter(|(sq, p)| {
+            p.color == my_color
+                && !my_touched.contains(sq)
+                && pos
+                    .piece_at(*sq)
+                    .is_some_and(|cur| cur.color == my_color && cur.role == p.role)
+        })
+        .map(|(sq, _)| sq)
         .collect();
+
     let mut candidates: Vec<(ShogiMove, f64)> = vec![];
     for mv in pos.legal_moves() {
         // 取られたマスとの整合（取りがなかったなら自駒のあるマスへは来ていない）
@@ -371,14 +418,9 @@ fn sample_opp_move(
         if next.in_check(my_color) != gives_check {
             continue;
         }
-        let to = match mv {
-            ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
-        };
-        let threat_known = known_squares
-            .iter()
-            .zip(&already_attacked)
-            .any(|(&sq, &was)| sq != to && !was && next.is_attacked(sq, opp));
-        candidates.push((mv, opp_move_weight(opp, &mv, threat_known)));
+        let threat_known = newly_threatens(pos, &next, &mv, known_squares);
+        let threat_home = newly_threatens(pos, &next, &mv, &homes);
+        candidates.push((mv, opp_move_weight(opp, &mv, threat_known, threat_home)));
     }
     let Some(chosen) = weighted_choice(&candidates, rng) else {
         return false;
@@ -387,11 +429,11 @@ fn sample_opp_move(
     true
 }
 
-/// 相手の手の尤度づけ。対人55局の条件付き最尤推定（bin/fit_opp, 2026-07-09）:
-/// パープレキシティ 27.8（旧手調整）→ 25.5。
+/// 相手の手の尤度づけ。対人55局の条件付き最尤推定（bin/fit_opp, 2026-07-09、
+/// 駒単位threat定義）: パープレキシティ 27.7（旧手調整）→ 24.9。
 /// 駒取り・王手の有無は観測との整合ですでに絞り込まれているため、
 /// 事前分布には「観測クラス内で判別できる特徴量」だけが現れる
-fn opp_move_weight(opp: Color, mv: &ShogiMove, threat_known: bool) -> f64 {
+fn opp_move_weight(opp: Color, mv: &ShogiMove, threat_known: bool, threat_home: bool) -> f64 {
     let mut s = 0.0;
     match *mv {
         ShogiMove::Board { from, to, promote } => {
@@ -399,15 +441,18 @@ fn opp_move_weight(opp: Color, mv: &ShogiMove, threat_known: bool) -> f64 {
                 Color::Sente => (from.rank - to.rank) as f64,
                 Color::Gote => (to.rank - from.rank) as f64,
             };
-            s += 0.173 * advance;
+            s += 0.144 * advance;
             if promote {
-                s += 1.510;
+                s += 1.413;
             }
         }
-        ShogiMove::Drop { .. } => s += -1.314,
+        ShogiMove::Drop { .. } => s += -1.411,
     }
     if threat_known {
-        s += 0.634;
+        s += 0.488;
+    }
+    if threat_home {
+        s += 0.581;
     }
     s.exp()
 }
