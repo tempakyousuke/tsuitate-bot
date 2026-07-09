@@ -46,6 +46,17 @@ pub fn make(name: &str) -> Option<Box<dyn Strategy>> {
     match name {
         "heuristic" => Some(Box::new(Heuristic)),
         "estimator" => Some(Box::new(EstimatorStrategy::new())),
+        // アブレーション用: 露出評価・敵陣下限を無効化（= v4評価 + 王手ソルバー + min修正）。
+        // vs v4 の負け越し原因の切り分けに使う一時的な変種
+        "estimator_min_solver" => {
+            let params = EvalParams {
+                camp_scale: 0.0,
+                exposed_known: 0.0,
+                home_knownness: 0.0,
+                ..EvalParams::default()
+            };
+            Some(Box::new(EstimatorStrategy::with_params(params)))
+        }
         "estimator_v2" => Some(Box::new(crate::frozen::estimator_v2::EstimatorV2::new())),
         "estimator_v3" => Some(Box::new(crate::frozen::estimator_v3::EstimatorV3::new())),
         "estimator_v4" => Some(Box::new(crate::frozen::estimator_v4::EstimatorV4::new())),
