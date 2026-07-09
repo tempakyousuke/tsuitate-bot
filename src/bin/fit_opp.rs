@@ -23,16 +23,19 @@ use tsuitate_bot::board::Coord;
 use tsuitate_bot::protocol::{Color, GameEndPayload};
 use tsuitate_bot::shogi::{Position, ShogiMove, parse_usi};
 
-const FEATURE_NAMES: [&str; 5] = [
+const FEATURE_NAMES: [&str; 7] = [
     "advance",      // 前進量（段）
     "promote",      // 成り
     "is_drop",      // 持ち駒を打つ
     "threat_known", // 位置が既知の相手駒（自分の駒が死んだマス）へ新たに当たりを付ける
     "threat_home",  // 初期位置から動いていない相手駒へ新たに当たりを付ける
                     // （筋が開いた背後の飛車を狙う歩打ち等。相手は推論で位置を当ててくる）
+    "is_king_move", // 玉を動かす（基礎傾向）
+    "king_flee",    // 玉が危険地点（自駒が死んだマス = 相手駒の露見地点）から遠ざかる
+                    // （守りを剥がされた玉は座り続けない、という行動予測）
 ];
 
-const D: usize = 5;
+const D: usize = 7;
 
 struct Sample {
     /// 観測クラス内の各候補手の特徴量
@@ -77,6 +80,20 @@ fn newly_threatens(
             ShogiMove::Drop { .. } => true,
         }
     })
+}
+
+/// チェビシェフ距離（玉の歩数）
+fn dist(a: Coord, b: Coord) -> i8 {
+    (a.file - b.file).abs().max((a.rank - b.rank).abs())
+}
+
+/// 玉の移動が危険地点集合から遠ざかる手か（最近接距離が増える）
+fn flees_danger(from: Coord, to: Coord, danger: &HashSet<Coord>) -> bool {
+    let near = |sq: Coord| danger.iter().map(|&d| dist(sq, d)).min();
+    match (near(from), near(to)) {
+        (Some(a), Some(b)) => b > a,
+        _ => false,
+    }
 }
 
 /// 初期位置から一度も動いていない bot 駒のマス（相手はここを推論で狙ってくる）
@@ -134,12 +151,23 @@ fn extract_samples(bot: Color, end: &GameEndPayload, samples: &mut Vec<Sample>) 
                     chosen = Some(features.len());
                 }
                 let _ = to;
+                let (is_king, flee) = match lm {
+                    ShogiMove::Board { from, to, .. } => {
+                        let is_king = pos
+                            .piece_at(from)
+                            .is_some_and(|p| p.role == tsuitate_bot::protocol::Role::King);
+                        (is_king, is_king && flees_danger(from, to, &human_lost_at))
+                    }
+                    ShogiMove::Drop { .. } => (false, false),
+                };
                 features.push([
                     advance_of(&lm, human),
                     matches!(lm, ShogiMove::Board { promote: true, .. }) as u8 as f64,
                     matches!(lm, ShogiMove::Drop { .. }) as u8 as f64,
                     newly_threatens(&pos, &next, &lm, &human_lost_at) as u8 as f64,
                     newly_threatens(&pos, &next, &lm, &homes) as u8 as f64,
+                    is_king as u8 as f64,
+                    flee as u8 as f64,
                 ]);
             }
             if let Some(chosen) = chosen {

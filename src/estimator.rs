@@ -420,7 +420,17 @@ fn sample_opp_move(
         }
         let threat_known = newly_threatens(pos, &next, &mv, known_squares);
         let threat_home = newly_threatens(pos, &next, &mv, &homes);
-        candidates.push((mv, opp_move_weight(opp, &mv, threat_known, threat_home)));
+        let (is_king, flee) = match mv {
+            ShogiMove::Board { from, to, .. } => {
+                let is_king = pos.piece_at(from).is_some_and(|p| p.role == Role::King);
+                (is_king, is_king && flees_danger(from, to, known_squares))
+            }
+            ShogiMove::Drop { .. } => (false, false),
+        };
+        candidates.push((
+            mv,
+            opp_move_weight(opp, &mv, threat_known, threat_home, is_king, flee),
+        ));
     }
     let Some(chosen) = weighted_choice(&candidates, rng) else {
         return false;
@@ -429,11 +439,34 @@ fn sample_opp_move(
     true
 }
 
-/// 相手の手の尤度づけ。対人55局の条件付き最尤推定（bin/fit_opp, 2026-07-09、
-/// 駒単位threat定義）: パープレキシティ 27.7（旧手調整）→ 24.9。
+/// チェビシェフ距離（玉の歩数）
+fn dist(a: Coord, b: Coord) -> i8 {
+    (a.file - b.file).abs().max((a.rank - b.rank).abs())
+}
+
+/// 玉の移動が危険地点集合（自分が駒を取ったマス = 相手にとっての露見地点）から
+/// 遠ざかる手か。**定義は bin/fit_opp の flees_danger と一致させること**
+fn flees_danger(from: Coord, to: Coord, danger: &[Coord]) -> bool {
+    let near = |sq: Coord| danger.iter().map(|&d| dist(sq, d)).min();
+    match (near(from), near(to)) {
+        (Some(a), Some(b)) => b > a,
+        _ => false,
+    }
+}
+
+/// 相手の手の尤度づけ。対人57局の条件付き最尤推定（bin/fit_opp, 2026-07-10、
+/// 駒単位threat定義）: パープレキシティ 28.2（旧手調整）→ 25.3。
 /// 駒取り・王手の有無は観測との整合ですでに絞り込まれているため、
-/// 事前分布には「観測クラス内で判別できる特徴量」だけが現れる
-fn opp_move_weight(opp: Color, mv: &ShogiMove, threat_known: bool, threat_home: bool) -> f64 {
+/// 事前分布には「観測クラス内で判別できる特徴量」だけが現れる。
+/// king_flee がわずかに負なのは実測（守りを剥がされても玉は特に逃げない）
+fn opp_move_weight(
+    opp: Color,
+    mv: &ShogiMove,
+    threat_known: bool,
+    threat_home: bool,
+    is_king_move: bool,
+    king_flee: bool,
+) -> f64 {
     let mut s = 0.0;
     match *mv {
         ShogiMove::Board { from, to, promote } => {
@@ -441,18 +474,24 @@ fn opp_move_weight(opp: Color, mv: &ShogiMove, threat_known: bool, threat_home: 
                 Color::Sente => (from.rank - to.rank) as f64,
                 Color::Gote => (to.rank - from.rank) as f64,
             };
-            s += 0.144 * advance;
+            s += 0.139 * advance;
             if promote {
-                s += 1.413;
+                s += 1.422;
             }
         }
-        ShogiMove::Drop { .. } => s += -1.411,
+        ShogiMove::Drop { .. } => s += -1.437,
     }
     if threat_known {
-        s += 0.488;
+        s += 0.507;
     }
     if threat_home {
-        s += 0.581;
+        s += 0.574;
+    }
+    if is_king_move {
+        s += 0.136;
+    }
+    if king_flee {
+        s += -0.159;
     }
     s.exp()
 }

@@ -84,6 +84,30 @@ impl CheckSolver {
         }
         base.king_square(my_color)?;
 
+        // 位置が既知の敵駒（自駒が死んだマス = 敵駒がそこへ来た。取り返し済みは除く）を
+        // 盤に載せる。回避先がこれらの利きに覆われているかを全仮説共通で判定できる
+        // （対人実戦: 5三の既知の成駒が 4二/5二/6二 を覆っているのに順に試して4反則）。
+        // 駒種は不明なので粒子の多数決、なければ成駒の最頻・金動き（と金）で近似する
+        for sq in known_enemy_squares(my_color, log) {
+            if base.piece_at(sq).is_some() {
+                continue;
+            }
+            let role = particle_majority_role(particles, my_color.other(), sq)
+                .unwrap_or(Role::Tokin);
+            base.set(
+                sq,
+                Some(crate::shogi::Piece {
+                    color: my_color.other(),
+                    role,
+                }),
+            );
+            // 近似駒種が王を攻撃してしまう（本物の王手駒と区別できない）配置は
+            // 仮説列挙を壊すので載せない
+            if base.in_check(my_color) {
+                base.set(sq, None);
+            }
+        }
+
         let mut solver = CheckSolver {
             base,
             my_color,
@@ -109,7 +133,9 @@ impl CheckSolver {
             for rank in 1..=9i8 {
                 let sq = Coord { file, rank };
                 if self.base.piece_at(sq).is_some() {
-                    continue; // 自駒のあるマスに王手駒はいない
+                    // 自駒・既知の敵駒のあるマスに（新たな）王手駒はいない
+                    // （既知の敵駒が王手していたなら以前から王手宣言されているはず）
+                    continue;
                 }
                 if sq == king {
                     continue;
@@ -214,6 +240,57 @@ impl CheckSolver {
     }
 }
 
+/// 位置が既知の敵駒のマス: 自駒が取られたマス（敵駒がそこへ来た事実）のうち、
+/// その後に自分が取り返していないもの
+fn known_enemy_squares(my_color: Color, log: &ObservationLog) -> Vec<Coord> {
+    let _ = my_color;
+    let mut set: std::collections::HashSet<Coord> = std::collections::HashSet::new();
+    for e in log.events() {
+        match e {
+            crate::observation::Observation::OpponentMoved {
+                captured_my_piece_at: Some(sq),
+                ..
+            } => {
+                if let Some(c) = crate::board::parse_usi_square(sq) {
+                    set.insert(c);
+                }
+            }
+            crate::observation::Observation::MyMove {
+                usi,
+                captured: Some(_),
+                ..
+            } => {
+                if let Some(ShogiMove::Board { to, .. }) = crate::shogi::parse_usi(usi) {
+                    set.remove(&to);
+                }
+            }
+            _ => {}
+        }
+    }
+    set.into_iter().collect()
+}
+
+/// 粒子の多数決でそのマスの敵駒の駒種を推定する（過半に満たなければ None）
+fn particle_majority_role(particles: &[&Position], opp: Color, sq: Coord) -> Option<Role> {
+    if particles.is_empty() {
+        return None;
+    }
+    let mut counts: HashMap<Role, usize> = HashMap::new();
+    for pos in particles {
+        if let Some(p) = pos.piece_at(sq) {
+            if p.color == opp {
+                *counts.entry(p.role).or_default() += 1;
+            }
+        }
+    }
+    let (role, n) = counts.into_iter().max_by_key(|(_, n)| *n)?;
+    if n * 2 > particles.len() {
+        Some(role)
+    } else {
+        None
+    }
+}
+
 /// 相手が盤上・持ち駒に持ちうる駒種の枚数（基本駒種で数える）。
 /// = 初期枚数 + こちらが取られた枚数 − こちらが取った枚数（自分の持ち駒）
 fn opponent_role_counts(view: &PlayerView, log: &ObservationLog) -> HashMap<Role, i32> {
@@ -302,6 +379,27 @@ mod tests {
             side > 0.7,
             "縦筋仮説の下で横逃げは解消するはず（p={side:.2}）"
         );
+    }
+
+    #[test]
+    fn known_enemy_piece_rules_out_covered_escapes() {
+        // 裸玉 5e。自駒が 5g で取られた → 敵駒（と金近似）が 5g にいると分かっている。
+        // 後手のと金は 5g から 5f（後ろ）にも利くので、5e5f はどの王手駒仮説の
+        // 下でも非合法（p=0）になるはず。4e への横逃げは生きている
+        let view = view_with(vec![("5e", Role::King)]);
+        let mut log = ObservationLog::default();
+        log.record(crate::observation::Observation::OpponentMoved {
+            move_number: 10,
+            captured_my_piece_at: Some("5g".into()),
+        });
+        let mut solver = CheckSolver::new(&view, &[], &[], &log).unwrap();
+        let covered = solver.resolve_probability(&mv("5e5f"));
+        let side = solver.resolve_probability(&mv("5e4e"));
+        assert!(
+            covered == 0.0,
+            "既知の敵駒に覆われたマスへの逃げは全仮説で非合法のはず（p={covered:.2}）"
+        );
+        assert!(side > 0.0, "覆われていない逃げは生きているはず（p={side:.2}）");
     }
 
     #[test]

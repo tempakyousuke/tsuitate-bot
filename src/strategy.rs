@@ -142,6 +142,15 @@ pub struct EvalParams {
     pub mover_w_captured: f64,
     /// 着手駒の取られリスク重み（静かな手）
     pub mover_w_quiet: f64,
+    /// 着手駒の取られリスク重み（王手をかけた手）。王手宣言は「王を攻撃できる
+    /// （マス,駒種）」まで仮説を絞らせるので、相手は反則覚悟の探り取りで
+    /// 王手駒を高確率で回収できる（対人実戦: 竜の王手→2反則で竜を取られた）
+    pub mover_w_check: f64,
+    /// 捕獲後の残留露見リスク（自駒価値に掛ける割合）。取ったマスは相手に
+    /// 通知されるため、粒子に守り駒が見えなくても取り返しの下限リスクを敷く。
+    /// 等価な取りなら安い駒で取る、というタイブレークにもなる
+    /// （対人実戦: 成桂でも取れる角を竜で取って竜を回収された）
+    pub capture_reveal_risk: f64,
     /// 敵陣リスク下限の「静かな進入」係数（捕獲時は 1.0）
     pub camp_known_quiet: f64,
     /// 敵陣の守られ事前確率のスケール（1.0 で 0.25/0.2/0.15）
@@ -187,6 +196,9 @@ pub struct EvalParams {
     pub big_home_penalty: f64,
     /// 手戻り減点
     pub backtrack_penalty: f64,
+    /// 直前に動かした駒をまた動かす手の減点（雑なシャッフルの抑制。
+    /// 駒得や王手が絡む手は期待値側が勝つので実質影響しない）
+    pub shuffle_penalty: f64,
 }
 
 impl Default for EvalParams {
@@ -196,6 +208,8 @@ impl Default for EvalParams {
             check_foul_scale: 0.12,
             mover_w_captured: 0.9,
             mover_w_quiet: 0.45,
+            mover_w_check: 0.85,
+            capture_reveal_risk: 0.12,
             camp_known_quiet: 0.35,
             // 露出評価（knownness）と敵陣リスク下限は既定で無効。
             // アブレーション（2026-07-09）で vs v4 40.7% → 無効化で 56.1% と
@@ -220,6 +234,7 @@ impl Default for EvalParams {
             info_bonus: 0.6,
             big_home_penalty: 0.25,
             backtrack_penalty: 0.35,
+            shuffle_penalty: 0.2,
         }
     }
 }
@@ -232,11 +247,13 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 24] = [
+    pub const SPECS: [ParamSpec; 27] = [
         ParamSpec { name: "check_bonus", lo: 0.0, hi: 3.0 },
         ParamSpec { name: "check_foul_scale", lo: 0.0, hi: 0.5 },
         ParamSpec { name: "mover_w_captured", lo: 0.0, hi: 1.5 },
         ParamSpec { name: "mover_w_quiet", lo: 0.0, hi: 1.5 },
+        ParamSpec { name: "mover_w_check", lo: 0.0, hi: 1.5 },
+        ParamSpec { name: "capture_reveal_risk", lo: 0.0, hi: 0.6 },
         ParamSpec { name: "camp_known_quiet", lo: 0.0, hi: 1.0 },
         ParamSpec { name: "camp_scale", lo: 0.0, hi: 3.0 },
         ParamSpec { name: "exposed_base", lo: 0.0, hi: 1.5 },
@@ -257,6 +274,7 @@ impl EvalParams {
         ParamSpec { name: "info_bonus", lo: 0.0, hi: 2.0 },
         ParamSpec { name: "big_home_penalty", lo: 0.0, hi: 1.5 },
         ParamSpec { name: "backtrack_penalty", lo: 0.0, hi: 1.5 },
+        ParamSpec { name: "shuffle_penalty", lo: 0.0, hi: 1.0 },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -265,6 +283,8 @@ impl EvalParams {
             self.check_foul_scale,
             self.mover_w_captured,
             self.mover_w_quiet,
+            self.mover_w_check,
+            self.capture_reveal_risk,
             self.camp_known_quiet,
             self.camp_scale,
             self.exposed_base,
@@ -285,6 +305,7 @@ impl EvalParams {
             self.info_bonus,
             self.big_home_penalty,
             self.backtrack_penalty,
+            self.shuffle_penalty,
         ]
     }
 
@@ -295,26 +316,29 @@ impl EvalParams {
             check_foul_scale: v[1],
             mover_w_captured: v[2],
             mover_w_quiet: v[3],
-            camp_known_quiet: v[4],
-            camp_scale: v[5],
-            exposed_base: v[6],
-            exposed_known: v[7],
-            home_knownness: v[8],
-            recapture_defended: v[9],
-            exposed_defended: v[10],
-            attack_w: v[11],
-            pressure_w: v[12],
-            foul_cost_base: v[13],
-            foul_cost_pow: v[14],
-            advance_w: v[15],
-            promote_bias: v[16],
-            drop_bias: v[17],
-            prior_weight: v[18],
-            prior_weight_degen: v[19],
-            threat_w: v[20],
-            info_bonus: v[21],
-            big_home_penalty: v[22],
-            backtrack_penalty: v[23],
+            mover_w_check: v[4],
+            capture_reveal_risk: v[5],
+            camp_known_quiet: v[6],
+            camp_scale: v[7],
+            exposed_base: v[8],
+            exposed_known: v[9],
+            home_knownness: v[10],
+            recapture_defended: v[11],
+            exposed_defended: v[12],
+            attack_w: v[13],
+            pressure_w: v[14],
+            foul_cost_base: v[15],
+            foul_cost_pow: v[16],
+            advance_w: v[17],
+            promote_bias: v[18],
+            drop_bias: v[19],
+            prior_weight: v[20],
+            prior_weight_degen: v[21],
+            threat_w: v[22],
+            info_bonus: v[23],
+            big_home_penalty: v[24],
+            backtrack_penalty: v[25],
+            shuffle_penalty: v[26],
         }
     }
 }
@@ -450,7 +474,7 @@ impl Strategy for EstimatorStrategy {
             let mut score = evaluate(view, &mv, &sample, prior, &known, &self.params)
                 + rng.random_range(0.0..0.01);
             // 手戻り（直前の手をそのまま逆に戻す）は膠着の典型なので減点。
-            // 手数上限の引き分けを崩す側に倒す
+            // 直前に動かした駒をまた動かすだけの手も雑なシャッフルとして軽く減点
             if let (
                 Some(ShogiMove::Board { from: pf, to: pt, .. }),
                 ShogiMove::Board { from, to, .. },
@@ -458,6 +482,8 @@ impl Strategy for EstimatorStrategy {
             {
                 if from == pt && to == pf {
                     score -= self.params.backtrack_penalty;
+                } else if from == pt {
+                    score -= self.params.shuffle_penalty;
                 }
             }
             if best.as_ref().is_none_or(|(_, s)| score > *s) {
@@ -758,7 +784,8 @@ fn evaluate(
         // 王手・詰み。ついたて将棋では王手された側は王手駒の位置が見えず
         // 手探りの反則をしやすい（反則10回で負け）ので、王手自体が得点源。
         // 相手の反則が溜まっているほど価値が上がる
-        if next.in_check(opp) {
+        let gives_check = next.in_check(opp);
+        if gives_check {
             v += params.check_bonus + params.check_foul_scale * f64::from(view.fouls.opponent);
             if next.legal_moves().is_empty() {
                 v += 1000.0; // 詰み（真の局面がこの粒子なら勝ち）
@@ -777,11 +804,16 @@ fn evaluate(
         // 敵陣への着手は「粒子には見えない守り駒がいる」事前確率を下限に敷く
         // （駒を取った直後は位置が確実にバレているので下限をフルに、静かな
         // 進入は相手からまだ見えないので薄く適用する）
-        let mover_w = if captured_value > 0.0 {
+        // 王手をかけた手は王手宣言で位置の仮説が絞られ、相手は反則覚悟の
+        // 探り取りで回収に来る（人間の実証済み戦術）ので、露見扱いにする
+        let mut mover_w = if captured_value > 0.0 {
             params.mover_w_captured
         } else {
             params.mover_w_quiet
         };
+        if gives_check {
+            mover_w = mover_w.max(params.mover_w_check);
+        }
         let own_after = next
             .piece_at(to)
             .map(|p| piece_value(p.role))
@@ -791,7 +823,12 @@ fn evaluate(
         } else {
             params.camp_known_quiet
         };
-        let floor = own_after * camp_defended_prior(to, me, params.camp_scale) * known_factor;
+        let mut floor = own_after * camp_defended_prior(to, me, params.camp_scale) * known_factor;
+        if captured_value > 0.0 {
+            // 取ったマスは相手に通知される。粒子に守りが見えなくても
+            // 取り返しの残留リスクを敷く（= 等価な取りは安い駒で取る）
+            floor = floor.max(own_after * params.capture_reveal_risk);
+        }
         let mover_risk =
             mover_w * recapture_risk(&next, me, to, params.recapture_defended).max(floor);
         let hidden_risk = exposed_capture_risk(&next, me, Some(to), known, params);
@@ -825,9 +862,13 @@ fn evaluate(
         // 探索ボーナス: 着地マスの敵駒有無について粒子が割れているほど、
         // 指せば（取れても空でも）推定が絞れる。捕獲の期待値とは別の情報の価値
         let p_hit = capture_hits as f64 / legal as f64;
+        // 攻め圧力は粒子の健全度でゲートする。退化した粒子は間違った玉位置に
+        // 固まりやすく、「誰もいない場所への攻め」が加点され続ける
+        // （対人実戦: 終盤の成桂の徘徊）。健全度が低いときは確実な項だけ残す
+        let confidence = (n / EVAL_PARTICLES as f64).min(1.0);
         value_sum / legal as f64
             + params.info_bonus * p_hit * (1.0 - p_hit)
-            + (params.attack_w * attack_sum - params.pressure_w * pressure_sum)
+            + (params.attack_w * confidence * attack_sum - params.pressure_w * pressure_sum)
                 / pressure_n.max(1) as f64
     } else {
         0.0
