@@ -1,0 +1,604 @@
+<title>ついたて定跡エディタ</title>
+<style>
+  :root {
+    --bg: #F3EEE4;
+    --panel: #FBF8F1;
+    --ink: #2B2620;
+    --muted: #7A7062;
+    --line: #DDD4C2;
+    --board: #D9A55E;
+    --board-edge: #8A5A28;
+    --grid: #5A3E1F;
+    --piece: #F6E7C3;
+    --piece-edge: #B08D4F;
+    --accent: #AE3B24;
+    --accent-ink: #FFF6EF;
+    --ok: #3E6B3A;
+    --hint: rgba(174, 59, 36, 0.28);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #201D18;
+      --panel: #2A2620;
+      --ink: #EDE5D4;
+      --muted: #A2988A;
+      --line: #453E33;
+      --board: #B88743;
+      --board-edge: #6E4517;
+      --grid: #3E2A10;
+      --piece: #EFDDB4;
+      --piece-edge: #93743C;
+      --accent: #D45A3E;
+      --accent-ink: #2A130D;
+      --hint: rgba(212, 90, 62, 0.35);
+    }
+  }
+  :root[data-theme="light"] {
+    --bg: #F3EEE4; --panel: #FBF8F1; --ink: #2B2620; --muted: #7A7062;
+    --line: #DDD4C2; --board: #D9A55E; --board-edge: #8A5A28; --grid: #5A3E1F;
+    --piece: #F6E7C3; --piece-edge: #B08D4F; --accent: #AE3B24; --accent-ink: #FFF6EF;
+    --ok: #3E6B3A; --hint: rgba(174, 59, 36, 0.28);
+  }
+  :root[data-theme="dark"] {
+    --bg: #201D18; --panel: #2A2620; --ink: #EDE5D4; --muted: #A2988A;
+    --line: #453E33; --board: #B88743; --board-edge: #6E4517; --grid: #3E2A10;
+    --piece: #EFDDB4; --piece-edge: #93743C; --accent: #D45A3E; --accent-ink: #2A130D;
+    --ok: #5F9457; --hint: rgba(212, 90, 62, 0.35);
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: "Hiragino Kaku Gothic ProN", "Yu Gothic", system-ui, sans-serif;
+    line-height: 1.6;
+    margin: 0;
+    padding: 24px;
+  }
+  h1, h2 {
+    font-family: "Hiragino Mincho ProN", "Yu Mincho", serif;
+    text-wrap: balance;
+    margin: 0;
+  }
+  h1 { font-size: 1.5rem; letter-spacing: 0.06em; }
+  h2 { font-size: 1.05rem; letter-spacing: 0.04em; }
+  .sub { color: var(--muted); font-size: 0.85rem; margin: 4px 0 0; }
+  .wrap { max-width: 1060px; margin: 0 auto; display: flex; flex-direction: column; gap: 20px; }
+  .cols { display: flex; gap: 24px; flex-wrap: wrap; align-items: flex-start; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+  .left { flex: 0 0 auto; }
+  .right { flex: 1 1 320px; min-width: 300px; display: flex; flex-direction: column; gap: 20px; }
+
+  /* 盤 */
+  .board-frame {
+    background: var(--board);
+    border: 3px solid var(--board-edge);
+    border-radius: 4px;
+    padding: 6px;
+    width: max-content;
+  }
+  table.board { border-collapse: collapse; }
+  table.board td.cell {
+    width: 46px; height: 50px;
+    border: 1px solid var(--grid);
+    padding: 0;
+    position: relative;
+    cursor: default;
+  }
+  table.board td.cell.movable { cursor: pointer; }
+  table.board td.cell.hint::after {
+    content: "";
+    position: absolute; inset: 0;
+    background: var(--hint);
+  }
+  table.board td.cell:focus-visible { outline: 3px solid var(--accent); outline-offset: -3px; }
+  .coord { color: var(--grid); font-size: 0.7rem; text-align: center; font-family: "Hiragino Mincho ProN", serif; }
+  .piece {
+    position: absolute; inset: 4px 6px 2px;
+    background: var(--piece);
+    border: 1px solid var(--piece-edge);
+    clip-path: polygon(50% 0%, 88% 22%, 100% 100%, 0% 100%, 12% 22%);
+    display: flex; align-items: center; justify-content: center;
+    font-family: "Hiragino Mincho ProN", "Yu Mincho", serif;
+    font-size: 1.35rem;
+    font-weight: 600;
+    user-select: none;
+  }
+  .piece.promoted { color: var(--accent); }
+  .piece.ghost { opacity: 0.3; transform: rotate(180deg); }
+  .piece.selected { box-shadow: 0 0 0 3px var(--accent) inset; }
+
+  /* 手順・ボタン */
+  .movelist { display: flex; flex-wrap: wrap; gap: 6px; min-height: 34px; }
+  .move-chip {
+    background: var(--bg);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 2px 8px;
+    font-size: 0.9rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .move-chip .usi { color: var(--muted); font-family: ui-monospace, monospace; font-size: 0.75rem; margin-left: 4px; }
+  button {
+    font: inherit;
+    border: 1px solid var(--line);
+    background: var(--bg);
+    color: var(--ink);
+    border-radius: 4px;
+    padding: 6px 14px;
+    cursor: pointer;
+  }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+  button:disabled { opacity: 0.45; cursor: default; }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  input[type="text"] {
+    font: inherit;
+    background: var(--bg);
+    color: var(--ink);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 6px 10px;
+    flex: 1;
+    min-width: 140px;
+  }
+  input[type="text"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .warn { color: var(--accent); font-size: 0.85rem; }
+  .note { color: var(--muted); font-size: 0.8rem; }
+
+  /* 保存済みライン */
+  .saved { display: flex; flex-direction: column; gap: 8px; }
+  .saved-line {
+    display: flex; gap: 10px; align-items: baseline;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 8px 10px;
+    background: var(--bg);
+  }
+  .saved-line .name { font-weight: 600; }
+  .saved-line .moves { color: var(--muted); font-size: 0.82rem; flex: 1; overflow-x: auto; white-space: nowrap; }
+  .saved-line button { padding: 2px 8px; font-size: 0.8rem; }
+  textarea {
+    font-family: ui-monospace, monospace;
+    font-size: 0.78rem;
+    width: 100%;
+    box-sizing: border-box;
+    height: 130px;
+    background: var(--bg);
+    color: var(--ink);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 8px;
+  }
+  /* 成り選択 */
+  .promo {
+    position: absolute; z-index: 5;
+    display: flex; gap: 6px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 8px;
+    box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .piece { transition: box-shadow 0.12s ease; }
+  }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>ついたて定跡エディタ</h1>
+    <p class="sub">先手視点で自分の手順だけを作る（相手の手には依存しない）。後手用はbotが自動で点対称ミラーする。薄い駒は相手の初期配置の参考表示で、経路は塞がない（ついたて将棋の候補手仕様と同じ）。</p>
+  </header>
+
+  <div class="cols">
+    <div class="left panel">
+      <div class="board-frame"><table class="board" id="board"></table></div>
+      <div>
+        <div class="row" style="justify-content: space-between;">
+          <h2>手順</h2>
+          <div class="row">
+            <button id="undo">◀ 1手戻す</button>
+            <button id="redo">進む ▶</button>
+            <button id="clear">最初から</button>
+          </div>
+        </div>
+        <div class="movelist" id="movelist"></div>
+        <p class="warn" id="capture-warn" hidden>⚠ 駒取りが起きる手です。実戦ではここでブックを抜けるため、以降の手は使われない可能性があります。</p>
+      </div>
+      <div class="row">
+        <input type="text" id="line-name" placeholder="ラインの名前（例: 居飛車速攻）">
+        <button class="primary" id="save-line">ラインを保存</button>
+      </div>
+    </div>
+
+    <div class="right">
+      <div class="panel">
+        <h2>保存済みライン</h2>
+        <div class="saved" id="saved"></div>
+        <p class="note">保存はこのブラウザ内（localStorage）。botに反映するには下のJSONを joseki.json として渡す。</p>
+      </div>
+      <div class="panel">
+        <h2>joseki.json</h2>
+        <textarea id="json" spellcheck="false"></textarea>
+        <div class="row">
+          <button class="primary" id="copy">コピー</button>
+          <button id="download">ダウンロード</button>
+          <button id="import">↑の内容を取り込む</button>
+          <span class="note" id="io-status"></span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+(() => {
+  "use strict";
+  // ---- 駒の定義（先手が上向き = 行indexが減る方向） ----
+  const KANJI = { P:"歩", L:"香", N:"桂", S:"銀", G:"金", B:"角", R:"飛", K:"玉",
+                  "+P":"と", "+L":"杏", "+N":"圭", "+S":"全", "+B":"馬", "+R":"竜" };
+  const GOLD_STEPS = [[0,-1],[-1,-1],[1,-1],[-1,0],[1,0],[0,1]];
+  const STEPS = {
+    P: [[0,-1]],
+    N: [[-1,-2],[1,-2]],
+    S: [[0,-1],[-1,-1],[1,-1],[-1,1],[1,1]],
+    G: GOLD_STEPS, "+P": GOLD_STEPS, "+L": GOLD_STEPS, "+N": GOLD_STEPS, "+S": GOLD_STEPS,
+    K: [[0,-1],[-1,-1],[1,-1],[-1,0],[1,0],[0,1],[-1,1],[1,1]],
+    "+B": [[0,-1],[-1,0],[1,0],[0,1]],
+    "+R": [[-1,-1],[1,-1],[-1,1],[1,1]],
+    L: [], B: [], R: [],
+  };
+  const RAYS = {
+    L: [[0,-1]],
+    B: [[-1,-1],[1,-1],[-1,1],[1,1]], "+B": [[-1,-1],[1,-1],[-1,1],[1,1]],
+    R: [[0,-1],[0,1],[-1,0],[1,0]], "+R": [[0,-1],[0,1],[-1,0],[1,0]],
+  };
+  const PROMOTABLE = new Set(["P","L","N","S","B","R"]);
+  const ZKD = "０１２３４５６７８９";
+  const KRANK = ["一","二","三","四","五","六","七","八","九"];
+
+  // ---- 盤状態 ----
+  // cell: null | { role, mine } 。ghost（相手初期配置）は別レイヤで持つ
+  let board, ghosts, moves, history, redoStack = [];
+  function initState() {
+    redoStack = [];
+    board = Array.from({ length: 9 }, () => Array(9).fill(null));
+    ghosts = Array.from({ length: 9 }, () => Array(9).fill(null));
+    const back = ["L","N","S","G","K","G","S","N","L"];
+    for (let c = 0; c < 9; c++) {
+      board[8][c] = { role: back[c], mine: true };
+      board[6][c] = { role: "P", mine: true };
+      ghosts[0][c] = back[c];
+      ghosts[2][c] = "P";
+    }
+    board[7][1] = { role: "B", mine: true }; // 8h
+    board[7][7] = { role: "R", mine: true }; // 2h
+    ghosts[1][1] = "R"; // 8b
+    ghosts[1][7] = "B"; // 2b
+    moves = [];
+    history = [];
+  }
+
+  const fileOf = c => 9 - c;
+  const rankChar = r => "abcdefghi"[r];
+  const usiSq = (c, r) => `${fileOf(c)}${rankChar(r)}`;
+  function jpMove(role, c, r, promote) {
+    const base = KANJI[role] + (promote ? "成" : "");
+    return `☗${ZKD[fileOf(c)]}${KRANK[r]}${base}`;
+  }
+
+  function legalTargets(c, r) {
+    const piece = board[r][c];
+    if (!piece) return [];
+    const out = [];
+    const free = (cc, rr) => cc >= 0 && cc < 9 && rr >= 0 && rr < 9 && !board[rr][cc];
+    for (const [df, dr] of STEPS[piece.role] || []) {
+      if (free(c + df, r + dr)) out.push([c + df, r + dr]);
+    }
+    for (const [df, dr] of RAYS[piece.role] || []) {
+      let cc = c + df, rr = r + dr;
+      while (cc >= 0 && cc < 9 && rr >= 0 && rr < 9 && !board[rr][cc]) {
+        out.push([cc, rr]);
+        cc += df; rr += dr;
+      }
+    }
+    return out;
+  }
+  function promotionChoice(role, fromR, toR) {
+    if (!PROMOTABLE.has(role)) return "none";
+    if (toR > 2 && fromR > 2) return "none";
+    if ((role === "P" || role === "L") && toR === 0) return "forced";
+    if (role === "N" && toR <= 1) return "forced";
+    return "optional";
+  }
+
+  // ---- 描画 ----
+  const boardEl = document.getElementById("board");
+  let selected = null;
+  function render() {
+    boardEl.innerHTML = "";
+    const head = document.createElement("tr");
+    head.innerHTML = "<td></td>" +
+      Array.from({ length: 9 }, (_, c) => `<td class="coord">${fileOf(c)}</td>`).join("");
+    boardEl.appendChild(head);
+    const targets = selected ? legalTargets(...selected) : [];
+    for (let r = 0; r < 9; r++) {
+      const tr = document.createElement("tr");
+      const rc = document.createElement("td");
+      rc.className = "coord";
+      rc.textContent = KRANK[r];
+      tr.appendChild(rc);
+      for (let c = 0; c < 9; c++) {
+        const td = document.createElement("td");
+        td.className = "cell";
+        const isTarget = targets.some(([tc, tr2]) => tc === c && tr2 === r);
+        if (isTarget) td.classList.add("hint", "movable");
+        const piece = board[r][c];
+        if (piece) {
+          const el = document.createElement("div");
+          el.className = "piece" + (piece.role.startsWith("+") ? " promoted" : "");
+          if (selected && selected[0] === c && selected[1] === r) el.classList.add("selected");
+          el.textContent = KANJI[piece.role];
+          td.appendChild(el);
+          td.classList.add("movable");
+          td.tabIndex = 0;
+        } else if (ghosts[r][c]) {
+          const el = document.createElement("div");
+          el.className = "piece ghost";
+          el.textContent = KANJI[ghosts[r][c]];
+          td.appendChild(el);
+          if (isTarget) td.tabIndex = 0;
+        } else if (isTarget) {
+          td.tabIndex = 0;
+        }
+        const act = () => onCell(c, r, isTarget);
+        td.addEventListener("click", act);
+        td.addEventListener("keydown", e => {
+          if (e.key === "Enter" || e.key === " ") { e.preventDefault(); act(); }
+        });
+        tr.appendChild(td);
+      }
+      boardEl.appendChild(tr);
+    }
+    renderMoves();
+  }
+  function renderMoves() {
+    const list = document.getElementById("movelist");
+    list.innerHTML = "";
+    for (const m of moves) {
+      const chip = document.createElement("span");
+      chip.className = "move-chip";
+      chip.innerHTML = `${m.jp}<span class="usi">${m.usi}</span>`;
+      list.appendChild(chip);
+    }
+    document.getElementById("capture-warn").hidden = !moves.some(m => m.capture);
+    document.getElementById("undo").disabled = moves.length === 0;
+    document.getElementById("redo").disabled = redoStack.length === 0;
+  }
+
+  function onCell(c, r, isTarget) {
+    if (selected && isTarget) {
+      const [fc, fr] = selected;
+      const piece = board[fr][fc];
+      const choice = promotionChoice(piece.role, fr, r);
+      if (choice === "optional") {
+        askPromotion(c, r, ok => { applyMove(fc, fr, c, r, ok); render(); });
+      } else {
+        applyMove(fc, fr, c, r, choice === "forced");
+        render();
+      }
+      return;
+    }
+    if (board[r][c] && board[r][c].mine) {
+      selected = (selected && selected[0] === c && selected[1] === r) ? null : [c, r];
+    } else {
+      selected = null;
+    }
+    render();
+  }
+  function askPromotion(c, r, cb) {
+    const menu = document.createElement("div");
+    menu.className = "promo";
+    for (const [label, val] of [["成", true], ["不成", false]]) {
+      const b = document.createElement("button");
+      b.textContent = label;
+      b.addEventListener("click", () => { menu.remove(); cb(val); });
+      menu.appendChild(b);
+    }
+    const cells = boardEl.rows[r + 1].cells[c + 1];
+    cells.appendChild(menu);
+    menu.querySelector("button").focus();
+  }
+  function applyMove(fc, fr, c, r, promote, keepRedo) {
+    if (!keepRedo) redoStack = [];
+    history.push({ board: board.map(row => row.map(x => x && { ...x })),
+                   ghosts: ghosts.map(row => row.slice()) });
+    const piece = board[fr][fc];
+    const capture = !!ghosts[r][c];
+    const usi = usiSq(fc, fr) + usiSq(c, r) + (promote ? "+" : "");
+    const newRole = promote ? "+" + piece.role : piece.role;
+    board[r][c] = { role: newRole, mine: true };
+    board[fr][fc] = null;
+    if (capture) ghosts[r][c] = null;
+    moves.push({ usi, jp: jpMove(piece.role, c, r, promote), capture });
+    selected = null;
+  }
+
+  /// USI手（例 "2g2f", "2d2c+"）を現在の盤に適用する。指せなければ false
+  function applyUsi(usi) {
+    const m = usi.match(/^([1-9])([a-i])([1-9])([a-i])(\+?)$/);
+    if (!m) return false;
+    const fc = 9 - Number(m[1]), fr = "abcdefghi".indexOf(m[2]);
+    const c = 9 - Number(m[3]), r = "abcdefghi".indexOf(m[4]);
+    const piece = board[fr] && board[fr][fc];
+    if (!piece || !piece.mine || (board[r][c])) return false;
+    applyMove(fc, fr, c, r, m[5] === "+", true);
+    return true;
+  }
+
+  /// 保存済みラインを盤に読み込んで全手再生する（◀▶で確認できる状態にする）
+  function loadLine(i) {
+    const line = lines[i];
+    initState();
+    selected = null;
+    for (const usi of line.moves) {
+      if (!applyUsi(usi)) {
+        setStatus(`「${line.name}」の ${usi} を再生できません（手順が壊れている可能性）`);
+        break;
+      }
+    }
+    document.getElementById("line-name").value = line.name;
+    render();
+    setStatus(`「${line.name}」を盤に読み込みました。◀▶で確認、そのまま編集して保存も可能`);
+  }
+
+  /// 表示用: USI列を日本語棋譜に変換（再生に失敗したらUSIのまま返す）
+  function lineToJp(usis) {
+    const savedBoard = board, savedGhosts = ghosts, savedMoves = moves,
+          savedHistory = history, savedRedo = redoStack;
+    initState();
+    let ok = true;
+    for (const usi of usis) {
+      if (!applyUsi(usi)) { ok = false; break; }
+    }
+    const jp = ok ? moves.map(m => m.jp) : null;
+    board = savedBoard; ghosts = savedGhosts; moves = savedMoves;
+    history = savedHistory; redoStack = savedRedo;
+    return jp;
+  }
+
+  // ---- ライン管理 ----
+  const STORAGE = "tsuitate-joseki-lines";
+  const DEFAULTS = [
+    { name: "居飛車速攻", moves: ["2g2f", "2f2e", "2e2d", "2d2c+"] },
+    { name: "玉の右逃げ", moves: ["5i4h", "4h3h", "7i6h", "5g5f"] },
+    { name: "中住まい風", moves: ["5i5h", "3i4h", "7i6h", "5g5f"] },
+    { name: "左囲い", moves: ["5i6h", "7i7h", "6h7i", "5g5f"] },
+  ];
+  let lines;
+  try {
+    lines = JSON.parse(localStorage.getItem(STORAGE)) || DEFAULTS;
+  } catch { lines = DEFAULTS; }
+
+  function persist() {
+    localStorage.setItem(STORAGE, JSON.stringify(lines));
+    renderSaved();
+    renderJson();
+  }
+  function renderSaved() {
+    const box = document.getElementById("saved");
+    box.innerHTML = "";
+    if (lines.length === 0) {
+      box.innerHTML = '<p class="note">まだラインがありません。盤で手順を作って保存してください。</p>';
+    }
+    lines.forEach((line, i) => {
+      const row = document.createElement("div");
+      row.className = "saved-line";
+      const up = document.createElement("button");
+      up.textContent = "▲";
+      up.title = "上へ";
+      up.disabled = i === 0;
+      up.addEventListener("click", () => {
+        [lines[i - 1], lines[i]] = [lines[i], lines[i - 1]];
+        persist();
+      });
+      const down = document.createElement("button");
+      down.textContent = "▼";
+      down.title = "下へ";
+      down.disabled = i === lines.length - 1;
+      down.addEventListener("click", () => {
+        [lines[i], lines[i + 1]] = [lines[i + 1], lines[i]];
+        persist();
+      });
+      const show = document.createElement("button");
+      show.textContent = "確認";
+      show.addEventListener("click", () => loadLine(i));
+      const del = document.createElement("button");
+      del.textContent = "削除";
+      del.addEventListener("click", () => { lines.splice(i, 1); persist(); });
+      const name = document.createElement("span");
+      name.className = "name";
+      name.textContent = line.name;
+      const mv = document.createElement("span");
+      mv.className = "moves";
+      const jp = lineToJp(line.moves);
+      mv.textContent = jp ? jp.join("　") : `⚠ ${line.moves.join(" ")}`;
+      mv.title = line.moves.join(" ");
+      row.append(up, down, name, mv, show, del);
+      box.appendChild(row);
+    });
+  }
+  function renderJson() {
+    document.getElementById("json").value = JSON.stringify({ lines }, null, 2);
+  }
+
+  document.getElementById("save-line").addEventListener("click", () => {
+    if (moves.length === 0) return setStatus("手順が空です");
+    const name = document.getElementById("line-name").value.trim() || `ライン${lines.length + 1}`;
+    lines.push({ name, moves: moves.map(m => m.usi) });
+    persist();
+    setStatus(`「${name}」を保存しました`);
+    document.getElementById("line-name").value = "";
+    initState(); selected = null; render();
+  });
+  document.getElementById("undo").addEventListener("click", () => {
+    const prev = history.pop();
+    if (!prev) return;
+    redoStack.push({
+      board: board.map(row => row.map(x => x && { ...x })),
+      ghosts: ghosts.map(row => row.slice()),
+      move: moves[moves.length - 1],
+    });
+    board = prev.board; ghosts = prev.ghosts; moves.pop(); selected = null; render();
+  });
+  document.getElementById("redo").addEventListener("click", () => {
+    const nxt = redoStack.pop();
+    if (!nxt) return;
+    history.push({
+      board: board.map(row => row.map(x => x && { ...x })),
+      ghosts: ghosts.map(row => row.slice()),
+    });
+    board = nxt.board; ghosts = nxt.ghosts; moves.push(nxt.move); selected = null; render();
+  });
+  document.getElementById("clear").addEventListener("click", () => { initState(); selected = null; render(); });
+  document.getElementById("copy").addEventListener("click", async () => {
+    await navigator.clipboard.writeText(document.getElementById("json").value);
+    setStatus("コピーしました");
+  });
+  document.getElementById("download").addEventListener("click", () => {
+    const blob = new Blob([document.getElementById("json").value], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "joseki.json";
+    a.click();
+    URL.revokeObjectURL(a.href);
+  });
+  document.getElementById("import").addEventListener("click", () => {
+    try {
+      const v = JSON.parse(document.getElementById("json").value);
+      if (!Array.isArray(v.lines)) throw new Error("lines がありません");
+      lines = v.lines.filter(l => l.name && Array.isArray(l.moves));
+      persist();
+      setStatus(`${lines.length}本のラインを取り込みました`);
+    } catch (e) {
+      setStatus(`取り込めません: ${e.message}`);
+    }
+  });
+  function setStatus(msg) {
+    document.getElementById("io-status").textContent = msg;
+  }
+
+  initState();
+  render();
+  renderSaved();
+  renderJson();
+})();
+</script>
