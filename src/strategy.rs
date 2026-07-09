@@ -50,6 +50,7 @@ pub fn make(name: &str) -> Option<Box<dyn Strategy>> {
         "estimator_v2" => Some(Box::new(crate::frozen::estimator_v2::EstimatorV2::new())),
         "estimator_v3" => Some(Box::new(crate::frozen::estimator_v3::EstimatorV3::new())),
         "estimator_v4" => Some(Box::new(crate::frozen::estimator_v4::EstimatorV4::new())),
+        "estimator_v5" => Some(Box::new(crate::frozen::estimator_v5::EstimatorV5::new())),
         _ => None,
     }
 }
@@ -1113,5 +1114,6 @@ pub(crate) mod tests {
         assert!(make("estimator_v2").is_some());
         assert!(make("estimator_v3").is_some());
         assert!(make("estimator_v4").is_some());
+        assert!(make("estimator_v5").is_some());
     }
 }
