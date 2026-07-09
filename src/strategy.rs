@@ -193,10 +193,14 @@ impl Default for EvalParams {
             mover_w_captured: 0.9,
             mover_w_quiet: 0.45,
             camp_known_quiet: 0.35,
-            camp_scale: 1.0,
+            // 露出評価（knownness）と敵陣リスク下限は既定で無効。
+            // アブレーション（2026-07-09）で vs v4 40.7% → 無効化で 56.1% と
+            // アリーナで明確に有害、対人50局でも只取られは改善しなかった。
+            // 器は残すので SPSA（bin/tune）が非ゼロの最適値を探すことはできる
+            camp_scale: 0.0,
             exposed_base: 0.35,
-            exposed_known: 0.3,
-            home_knownness: 0.4,
+            exposed_known: 0.0,
+            home_knownness: 0.0,
             recapture_defended: 0.45,
             exposed_defended: 0.4,
             attack_w: 0.12,
