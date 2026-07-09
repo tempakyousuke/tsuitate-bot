@@ -13,6 +13,11 @@
   勝ち越すことを確認する（例: `cargo run --release --bin arena -- 100 estimator estimator_v4`）。
   50%付近の信頼区間は 100局で±10pt / 200局で±7pt / 1000局で±3.1pt。当面（開発最初期）は
   100局を既定とし、結果が信頼区間内で判定できない僅差のときだけ局数を増やす
+- `cargo run --release --bin tune -- [反復数] [評価あたり対局数] [基準...]` — 評価パラメータ
+  （`strategy::EvalParams`）のSPSA自動チューニング。目的関数はアリーナのスコア率
+  （引き分け=0.5勝）。進捗は `tune-log.jsonl`（gitignore済み）。出力された最終パラメータを
+  採用するときは `EvalParams::default` を書き換えてフルガントレットで確認する。
+  対局ループは `selfplay.rs`（arena と共用）
 - `cargo run --release --bin analyze -- records/*.jsonl` — 対局記録の事後分析。
   game:end の全公開棋譜をリプレイし、反則の原因分類（王手解消失敗/飛び込み/経路封鎖/打ちマス）・
   駒得収支・只取られ・損な交換・取り返し逃し・詰み逃しを集計する

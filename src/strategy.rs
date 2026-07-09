@@ -128,6 +128,162 @@ pub fn choose_move(view: &PlayerView, foul_tried: &HashSet<String>) -> Option<St
 /// 精度側（反則率の低下）に予算を振る
 const EVAL_PARTICLES: usize = 192;
 
+/// evaluate() まわりの調整可能パラメータ。Default が現行の手調整値。
+/// bin/tune.rs の SPSA がこれを最適化する（凍結版は各自のコピーを持ち依存しない）
+#[derive(Debug, Clone)]
+pub struct EvalParams {
+    /// 王手ボーナスの基本値
+    pub check_bonus: f64,
+    /// 王手ボーナスの相手反則数スケール
+    pub check_foul_scale: f64,
+    /// 着手駒の取られリスク重み（駒を取った直後 = 位置がバレている）
+    pub mover_w_captured: f64,
+    /// 着手駒の取られリスク重み（静かな手）
+    pub mover_w_quiet: f64,
+    /// 敵陣リスク下限の「静かな進入」係数（捕獲時は 1.0）
+    pub camp_known_quiet: f64,
+    /// 敵陣の守られ事前確率のスケール（1.0 で 0.25/0.2/0.15）
+    pub camp_scale: f64,
+    /// 露出リスクの基本重み
+    pub exposed_base: f64,
+    /// 露出リスクの既知度係数
+    pub exposed_known: f64,
+    /// 初期配置から動いていない駒の既知度
+    pub home_knownness: f64,
+    /// 紐つき割引（着手駒）
+    pub recapture_defended: f64,
+    /// 紐つき割引（露出駒）
+    pub exposed_defended: f64,
+    /// 相手玉周辺への攻め圧力の重み
+    pub attack_w: f64,
+    /// 自玉周辺への相手圧力の重み
+    pub pressure_w: f64,
+    /// 反則コストの基本値
+    pub foul_cost_base: f64,
+    /// 反則コストの急峻さ（残り反則数に対する冪）
+    pub foul_cost_pow: f64,
+    /// 前進バイアス
+    pub advance_w: f64,
+    /// 成りバイアス
+    pub promote_bias: f64,
+    /// 打ちバイアス
+    pub drop_bias: f64,
+    /// p(合法) 事前確率の擬似観測数
+    pub prior_weight: f64,
+    /// 手戻り減点
+    pub backtrack_penalty: f64,
+}
+
+impl Default for EvalParams {
+    fn default() -> Self {
+        EvalParams {
+            check_bonus: 0.9,
+            check_foul_scale: 0.12,
+            mover_w_captured: 0.9,
+            mover_w_quiet: 0.45,
+            camp_known_quiet: 0.35,
+            camp_scale: 1.0,
+            exposed_base: 0.35,
+            exposed_known: 0.3,
+            home_knownness: 0.4,
+            recapture_defended: 0.45,
+            exposed_defended: 0.4,
+            attack_w: 0.12,
+            pressure_w: 0.2,
+            foul_cost_base: 1.5,
+            foul_cost_pow: 1.5,
+            advance_w: 0.05,
+            promote_bias: 0.1,
+            drop_bias: -0.05,
+            prior_weight: 4.0,
+            backtrack_penalty: 0.35,
+        }
+    }
+}
+
+/// SPSA用のパラメータ仕様（名前と探索範囲）。to_vec/from_vec と同じ順序
+pub struct ParamSpec {
+    pub name: &'static str,
+    pub lo: f64,
+    pub hi: f64,
+}
+
+impl EvalParams {
+    pub const SPECS: [ParamSpec; 20] = [
+        ParamSpec { name: "check_bonus", lo: 0.0, hi: 3.0 },
+        ParamSpec { name: "check_foul_scale", lo: 0.0, hi: 0.5 },
+        ParamSpec { name: "mover_w_captured", lo: 0.0, hi: 1.5 },
+        ParamSpec { name: "mover_w_quiet", lo: 0.0, hi: 1.5 },
+        ParamSpec { name: "camp_known_quiet", lo: 0.0, hi: 1.0 },
+        ParamSpec { name: "camp_scale", lo: 0.0, hi: 3.0 },
+        ParamSpec { name: "exposed_base", lo: 0.0, hi: 1.5 },
+        ParamSpec { name: "exposed_known", lo: 0.0, hi: 1.5 },
+        ParamSpec { name: "home_knownness", lo: 0.0, hi: 1.0 },
+        ParamSpec { name: "recapture_defended", lo: 0.0, hi: 1.0 },
+        ParamSpec { name: "exposed_defended", lo: 0.0, hi: 1.0 },
+        ParamSpec { name: "attack_w", lo: 0.0, hi: 0.5 },
+        ParamSpec { name: "pressure_w", lo: 0.0, hi: 0.6 },
+        ParamSpec { name: "foul_cost_base", lo: 0.2, hi: 6.0 },
+        ParamSpec { name: "foul_cost_pow", lo: 0.5, hi: 3.0 },
+        ParamSpec { name: "advance_w", lo: -0.1, hi: 0.3 },
+        ParamSpec { name: "promote_bias", lo: -0.2, hi: 0.6 },
+        ParamSpec { name: "drop_bias", lo: -0.5, hi: 0.3 },
+        ParamSpec { name: "prior_weight", lo: 0.5, hi: 16.0 },
+        ParamSpec { name: "backtrack_penalty", lo: 0.0, hi: 1.5 },
+    ];
+
+    pub fn to_vec(&self) -> Vec<f64> {
+        vec![
+            self.check_bonus,
+            self.check_foul_scale,
+            self.mover_w_captured,
+            self.mover_w_quiet,
+            self.camp_known_quiet,
+            self.camp_scale,
+            self.exposed_base,
+            self.exposed_known,
+            self.home_knownness,
+            self.recapture_defended,
+            self.exposed_defended,
+            self.attack_w,
+            self.pressure_w,
+            self.foul_cost_base,
+            self.foul_cost_pow,
+            self.advance_w,
+            self.promote_bias,
+            self.drop_bias,
+            self.prior_weight,
+            self.backtrack_penalty,
+        ]
+    }
+
+    pub fn from_vec(v: &[f64]) -> EvalParams {
+        assert_eq!(v.len(), Self::SPECS.len());
+        EvalParams {
+            check_bonus: v[0],
+            check_foul_scale: v[1],
+            mover_w_captured: v[2],
+            mover_w_quiet: v[3],
+            camp_known_quiet: v[4],
+            camp_scale: v[5],
+            exposed_base: v[6],
+            exposed_known: v[7],
+            home_knownness: v[8],
+            recapture_defended: v[9],
+            exposed_defended: v[10],
+            attack_w: v[11],
+            pressure_w: v[12],
+            foul_cost_base: v[13],
+            foul_cost_pow: v[14],
+            advance_w: v[15],
+            promote_bias: v[16],
+            drop_bias: v[17],
+            prior_weight: v[18],
+            backtrack_penalty: v[19],
+        }
+    }
+}
+
 /// 観測履歴から相手局面を推定して指す戦略。
 ///
 /// 候補手（自分に見える範囲の疑似合法手）を、推定粒子の平均で評価する:
@@ -137,14 +293,21 @@ const EVAL_PARTICLES: usize = 192;
 /// - 王手・詰みボーナス
 pub struct EstimatorStrategy {
     est: Option<Estimator>,
+    params: EvalParams,
     /// 直近の choose 時点の内部状態（記録用）
     last_debug: Option<serde_json::Value>,
 }
 
 impl EstimatorStrategy {
     pub fn new() -> Self {
+        Self::with_params(EvalParams::default())
+    }
+
+    /// パラメータを差し替えて作る（bin/tune.rs のSPSA評価用）
+    pub fn with_params(params: EvalParams) -> Self {
         EstimatorStrategy {
             est: None,
+            params,
             last_debug: None,
         }
     }
@@ -225,7 +388,7 @@ impl Strategy for EstimatorStrategy {
         };
 
         // 相手が位置を知っている自駒（露出）の地図
-        let known = knownness_map(view, log);
+        let known = knownness_map(view, log, self.params.home_knownness);
 
         let mut rng = rand::rng();
         let mut best: Option<(String, f64)> = None;
@@ -239,8 +402,8 @@ impl Strategy for EstimatorStrategy {
                     None => in_check_prior(view, &mv),
                 };
             }
-            let mut score =
-                evaluate(view, &mv, &sample, prior, &known) + rng.random_range(0.0..0.01);
+            let mut score = evaluate(view, &mv, &sample, prior, &known, &self.params)
+                + rng.random_range(0.0..0.01);
             // 手戻り（直前の手をそのまま逆に戻す）は膠着の典型なので減点。
             // 手数上限の引き分けを崩す側に倒す
             if let (
@@ -249,7 +412,7 @@ impl Strategy for EstimatorStrategy {
             ) = (last_my_move, mv)
             {
                 if from == pt && to == pf {
-                    score -= 0.35;
+                    score -= self.params.backtrack_penalty;
                 }
             }
             if best.as_ref().is_none_or(|(_, s)| score > *s) {
@@ -420,8 +583,12 @@ fn prior_legal(view: &PlayerView, mv: &ShogiMove, opp_board_n: f64) -> f64 {
 /// 一方的に駒を回収してくる。ついたて将棋で相手に漏れる自駒の位置情報は
 /// この2種類が主なので、露出リスクの重み付けに使う
 /// - 1.0: 駒を取って位置が暴露し、以降動いていない駒
-/// - 0.55: 初期配置から一度も動いていない駒（相手は初期配置を知っている）
-fn knownness_map(view: &PlayerView, log: &ObservationLog) -> HashMap<Coord, f64> {
+/// - home_knownness: 初期配置から一度も動いていない駒（相手は初期配置を知っている）
+fn knownness_map(
+    view: &PlayerView,
+    log: &ObservationLog,
+    home_knownness: f64,
+) -> HashMap<Coord, f64> {
     let mut revealed: HashSet<Coord> = HashSet::new();
     let mut touched: HashSet<Coord> = HashSet::new();
     for e in log.events() {
@@ -469,7 +636,7 @@ fn knownness_map(view: &PlayerView, log: &ObservationLog) -> HashMap<Coord, f64>
                 .piece_at(sq)
                 .is_some_and(|p| p.color == view.your_color && p.role == piece.role)
         {
-            0.4
+            home_knownness
         } else {
             0.0
         };
@@ -483,21 +650,19 @@ fn knownness_map(view: &PlayerView, log: &ObservationLog) -> HashMap<Coord, f64>
 /// 敵陣のマスが（見えない駒に）守られている事前確率。
 /// 粒子が枯渇・偏っていて守り駒を見落としていても、敵陣への単騎突入
 /// （対人5局で歩→高価な駒の損な交換が9回）を抑えるための下限に使う
-fn camp_defended_prior(to: Coord, me: Color) -> f64 {
+fn camp_defended_prior(to: Coord, me: Color, camp_scale: f64) -> f64 {
     let depth_from_back = match me {
         Color::Sente => to.rank,     // 相手（後手）の陣は rank 1..=3
         Color::Gote => 10 - to.rank, // 相手（先手）の陣は rank 7..=9
     };
-    match depth_from_back {
-        1 => 0.25,
-        2 => 0.2,
-        3 => 0.15,
-        _ => 0.0,
-    }
+    camp_scale
+        * match depth_from_back {
+            1 => 0.25,
+            2 => 0.2,
+            3 => 0.15,
+            _ => 0.0,
+        }
 }
-
-/// 事前確率の重み（擬似観測数）。粒子が少ない・偏っているときほど事前が効く
-const PRIOR_WEIGHT: f64 = 4.0;
 
 /// 候補手をユニーク粒子の平均で評価する
 fn evaluate(
@@ -506,6 +671,7 @@ fn evaluate(
     particles: &[&Position],
     prior: f64,
     known: &HashMap<Coord, f64>,
+    params: &EvalParams,
 ) -> f64 {
     let me = view.your_color;
     let opp = me.other();
@@ -543,7 +709,7 @@ fn evaluate(
         // 手探りの反則をしやすい（反則10回で負け）ので、王手自体が得点源。
         // 相手の反則が溜まっているほど価値が上がる
         if next.in_check(opp) {
-            v += 0.9 + 0.12 * f64::from(view.fouls.opponent);
+            v += params.check_bonus + params.check_foul_scale * f64::from(view.fouls.opponent);
             if next.legal_moves().is_empty() {
                 v += 1000.0; // 詰み（真の局面がこの粒子なら勝ち）
             }
@@ -561,15 +727,24 @@ fn evaluate(
         // 敵陣への着手は「粒子には見えない守り駒がいる」事前確率を下限に敷く
         // （駒を取った直後は位置が確実にバレているので下限をフルに、静かな
         // 進入は相手からまだ見えないので薄く適用する）
-        let mover_w = if captured_value > 0.0 { 0.9 } else { 0.45 };
+        let mover_w = if captured_value > 0.0 {
+            params.mover_w_captured
+        } else {
+            params.mover_w_quiet
+        };
         let own_after = next
             .piece_at(to)
             .map(|p| piece_value(p.role))
             .unwrap_or(0.0);
-        let known_factor = if captured_value > 0.0 { 1.0 } else { 0.35 };
-        let floor = own_after * camp_defended_prior(to, me) * known_factor;
-        let mover_risk = mover_w * recapture_risk(&next, me, to).max(floor);
-        let hidden_risk = exposed_capture_risk(&next, me, Some(to), known);
+        let known_factor = if captured_value > 0.0 {
+            1.0
+        } else {
+            params.camp_known_quiet
+        };
+        let floor = own_after * camp_defended_prior(to, me, params.camp_scale) * known_factor;
+        let mover_risk =
+            mover_w * recapture_risk(&next, me, to, params.recapture_defended).max(floor);
+        let hidden_risk = exposed_capture_risk(&next, me, Some(to), known, params);
         v -= mover_risk.max(hidden_risk);
 
         // 王の安全度と攻撃圧力（利き走査が重いので少数の粒子でだけ測って平均する）
@@ -587,10 +762,11 @@ fn evaluate(
 
     // 粒子の証拠と事前確率のブレンド（粒子ゼロなら事前そのもの）
     let n = particles.len() as f64;
-    let p_legal = (legal as f64 + prior * PRIOR_WEIGHT) / (n + PRIOR_WEIGHT);
+    let p_legal = (legal as f64 + prior * params.prior_weight) / (n + params.prior_weight);
     let expected = if legal > 0 {
         value_sum / legal as f64
-            + (0.12 * attack_sum - 0.2 * pressure_sum) / pressure_n.max(1) as f64
+            + (params.attack_w * attack_sum - params.pressure_w * pressure_sum)
+                / pressure_n.max(1) as f64
     } else {
         0.0
     };
@@ -598,7 +774,7 @@ fn evaluate(
     // 反則コスト: 手番は失わないが反則数を消費する。残りが少ないほど急激に高価。
     // 序盤の「安い反則で情報を得る」は低コスト側で自然に許容される
     let fouls_left = (10u32.saturating_sub(view.fouls.you)).max(1) as f64;
-    let foul_cost = 1.5 * (10.0 / fouls_left).powf(1.5);
+    let foul_cost = params.foul_cost_base * (10.0 / fouls_left).powf(params.foul_cost_pow);
 
     // 前進の弱い事前バイアス（推定が薄い序盤に駒をぶつけに行くため）
     let advance_bias = match *mv {
@@ -607,9 +783,9 @@ fn evaluate(
                 Color::Sente => (from.rank - to.rank) as f64,
                 Color::Gote => (to.rank - from.rank) as f64,
             };
-            0.05 * adv + if promote { 0.1 } else { 0.0 }
+            params.advance_w * adv + if promote { params.promote_bias } else { 0.0 }
         }
-        ShogiMove::Drop { .. } => -0.05,
+        ShogiMove::Drop { .. } => params.drop_bias,
     };
 
     // 期待値が負の手を p_legal で割り引かない（min の形）。
@@ -622,7 +798,7 @@ fn evaluate(
 
 /// 着手駒（マス to にいる自駒）が次の相手番で取られるリスク。
 /// 紐つきなら取り返せるぶん割り引く（相手のどの駒で取るかは不明なので近似）
-fn recapture_risk(pos: &Position, me: Color, to: Coord) -> f64 {
+fn recapture_risk(pos: &Position, me: Color, to: Coord, defended_discount: f64) -> f64 {
     let opp = me.other();
     let Some(piece) = pos.piece_at(to).filter(|p| p.color == me) else {
         return 0.0;
@@ -631,7 +807,7 @@ fn recapture_risk(pos: &Position, me: Color, to: Coord) -> f64 {
         return 0.0;
     }
     let defended = pos.is_attacked(to, me);
-    piece_value(piece.role) * if defended { 0.45 } else { 1.0 }
+    piece_value(piece.role) * if defended { defended_discount } else { 1.0 }
 }
 
 /// 次の相手番で失いうる駒の概算: 相手の利きが当たっている自駒の最大重み付き価値。
@@ -645,6 +821,7 @@ fn exposed_capture_risk(
     me: Color,
     exclude: Option<Coord>,
     known: &HashMap<Coord, f64>,
+    params: &EvalParams,
 ) -> f64 {
     let opp = me.other();
     let mut worst = 0.0f64;
@@ -660,8 +837,10 @@ fn exposed_capture_risk(
         }
         let defended = pos.is_attacked(sq, me);
         let knownness = known.get(&sq).copied().unwrap_or(0.0);
-        let weight = 0.35 + 0.3 * knownness;
-        let loss = piece_value(piece.role) * if defended { 0.4 } else { 1.0 } * weight;
+        let weight = params.exposed_base + params.exposed_known * knownness;
+        let loss = piece_value(piece.role)
+            * if defended { params.exposed_defended } else { 1.0 }
+            * weight;
         worst = worst.max(loss);
     }
     worst

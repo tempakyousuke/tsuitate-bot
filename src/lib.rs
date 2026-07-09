@@ -11,5 +11,6 @@ pub mod model;
 pub mod observation;
 pub mod protocol;
 pub mod record;
+pub mod selfplay;
 pub mod shogi;
 pub mod strategy;
