@@ -7,11 +7,13 @@
 //! 「100局±10pt」のアリーナを目的関数にする用途に向く。
 //!
 //! 使い方:
-//!   cargo run --release --bin tune -- [反復数=40] [評価あたり対局数=60] [基準...=estimator_v4]
+//!   cargo run --release --bin tune -- [反復数=40] [評価あたり対局数=60] [基準...=estimator_v5]
 //!
-//! - 進捗と各反復のパラメータは tune-log.jsonl に追記する（分析・再開の材料）
-//! - 最後に「最良評価点のパラメータ」を EvalParams のリテラル形式で出力する。
-//!   採用は人間が判断し、strategy.rs の Default を書き換えてガントレットで確認する
+//! - 進捗と各反復のパラメータは tune-log.jsonl に追記する
+//! - **再開**: tune-log.jsonl が存在すれば最後の反復のθから自動で続きを実行する
+//!   （反復番号も引き継ぐ。最初からやり直すときはファイルを削除する）
+//! - 最後に「最終パラメータ」を出力する。採用は人間が判断し、
+//!   strategy.rs の Default を書き換えてガントレットで確認する
 
 use rand::Rng;
 use rand::rngs::StdRng;
@@ -72,6 +74,36 @@ fn params_json(params: &EvalParams) -> serde_json::Value {
     serde_json::Value::Object(map)
 }
 
+/// params_json の逆変換。ログに無いパラメータ（旧バージョンのログ等）は既定値のまま
+fn params_from_json(v: &serde_json::Value) -> Option<EvalParams> {
+    let obj = v.as_object()?;
+    let mut vals = EvalParams::default().to_vec();
+    for (i, spec) in EvalParams::SPECS.iter().enumerate() {
+        if let Some(x) = obj.get(spec.name).and_then(|x| x.as_f64()) {
+            vals[i] = x;
+        }
+    }
+    Some(EvalParams::from_vec(&vals))
+}
+
+/// tune-log.jsonl の最後の反復から（次の反復番号, θ）を復元する
+fn resume_state() -> Option<(u32, EvalParams)> {
+    let content = std::fs::read_to_string("tune-log.jsonl").ok()?;
+    let mut last: Option<(u32, EvalParams)> = None;
+    for line in content.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v["type"] == "iter" {
+            let k = v["k"].as_u64().unwrap_or(0) as u32;
+            if let Some(p) = params_from_json(&v["theta"]) {
+                last = Some((k + 1, p));
+            }
+        }
+    }
+    last
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let iterations: u32 = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(40);
@@ -79,7 +111,7 @@ fn main() {
     let baselines: Vec<String> = if args.len() > 3 {
         args[3..].to_vec()
     } else {
-        vec!["estimator_v4".into()]
+        vec!["estimator_v5".into()]
     };
     for name in &baselines {
         if strategy::make(name).is_none() {
@@ -97,6 +129,18 @@ fn main() {
 
     let d = EvalParams::SPECS.len();
     let mut u = to_unit(&EvalParams::default());
+    let mut start_k = 1u32;
+    if let Some((next_k, params)) = resume_state() {
+        u = to_unit(&params);
+        start_k = next_k;
+        println!(
+            "tune-log.jsonl から再開: 反復{start_k}〜（最初からやり直すときはファイルを削除）"
+        );
+    }
+    if start_k > iterations {
+        println!("指定の反復数（{iterations}）は既に完了しています");
+        return;
+    }
     let mut rng = StdRng::seed_from_u64(rand::rng().random());
     let mut log = std::fs::OpenOptions::new()
         .create(true)
@@ -105,7 +149,7 @@ fn main() {
         .expect("tune-log.jsonl を開けない");
 
     println!(
-        "SPSA開始: {iterations}反復 × 2評価 × {games_per_eval}局, 基準 {baselines:?}, {d}次元"
+        "SPSA開始: 反復{start_k}〜{iterations} × 2評価 × {games_per_eval}局, 基準 {baselines:?}, {d}次元"
     );
     log_line(
         &mut log,
@@ -122,7 +166,7 @@ fn main() {
     let mut best_score = f64::MIN;
     let mut best_params = EvalParams::default();
 
-    for k in 1..=iterations {
+    for k in start_k..=iterations {
         let ck = c0 / (k as f64).powf(gamma);
         let ak = a0 / (big_a + k as f64).powf(alpha);
         let delta: Vec<f64> = (0..d)
