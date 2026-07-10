@@ -208,7 +208,8 @@ impl Default for EvalParams {
             check_foul_scale: 0.12,
             mover_w_captured: 0.9,
             mover_w_quiet: 0.45,
-            mover_w_check: 0.85,
+            // アブレーション: 王手露見リスクを無効化（quiet と同値 = max が効かない）
+            mover_w_check: 0.45,
             capture_reveal_risk: 0.12,
             camp_known_quiet: 0.35,
             // 露出評価（knownness）と敵陣リスク下限は既定で無効。
