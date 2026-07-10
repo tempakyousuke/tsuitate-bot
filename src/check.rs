@@ -87,8 +87,10 @@ impl CheckSolver {
         // 位置が既知の敵駒（自駒が死んだマス = 敵駒がそこへ来た。取り返し済みは除く）を
         // 盤に載せる。回避先がこれらの利きに覆われているかを全仮説共通で判定できる
         // （対人実戦: 5三の既知の成駒が 4二/5二/6二 を覆っているのに順に試して4反則）。
+        // **直近8手以内**の新鮮な情報に限定する: 古いマスは駒が動いて陳腐化しやすく、
+        // 幻の駒が合法な逃げ場を塞ぐ害が実測で上回った（vs v5 アブレーション 2026-07-10）。
         // 駒種は不明なので粒子の多数決、なければ成駒の最頻・金動き（と金）で近似する
-        for sq in known_enemy_squares(my_color, log) {
+        for sq in known_enemy_squares(log, view.move_number.saturating_sub(8)) {
             if base.piece_at(sq).is_some() {
                 continue;
             }
@@ -241,18 +243,17 @@ impl CheckSolver {
 }
 
 /// 位置が既知の敵駒のマス: 自駒が取られたマス（敵駒がそこへ来た事実）のうち、
-/// その後に自分が取り返していないもの
-fn known_enemy_squares(my_color: Color, log: &ObservationLog) -> Vec<Coord> {
-    let _ = my_color;
-    let mut set: std::collections::HashSet<Coord> = std::collections::HashSet::new();
+/// その後に自分が取り返しておらず、かつ since_move 手目以降の新しいもの
+fn known_enemy_squares(log: &ObservationLog, since_move: u32) -> Vec<Coord> {
+    let mut map: HashMap<Coord, u32> = HashMap::new();
     for e in log.events() {
         match e {
             crate::observation::Observation::OpponentMoved {
+                move_number,
                 captured_my_piece_at: Some(sq),
-                ..
             } => {
                 if let Some(c) = crate::board::parse_usi_square(sq) {
-                    set.insert(c);
+                    map.insert(c, *move_number);
                 }
             }
             crate::observation::Observation::MyMove {
@@ -261,13 +262,16 @@ fn known_enemy_squares(my_color: Color, log: &ObservationLog) -> Vec<Coord> {
                 ..
             } => {
                 if let Some(ShogiMove::Board { to, .. }) = crate::shogi::parse_usi(usi) {
-                    set.remove(&to);
+                    map.remove(&to);
                 }
             }
             _ => {}
         }
     }
-    set.into_iter().collect()
+    map.into_iter()
+        .filter(|(_, mn)| *mn >= since_move)
+        .map(|(c, _)| c)
+        .collect()
 }
 
 /// 粒子の多数決でそのマスの敵駒の駒種を推定する（過半に満たなければ None）
@@ -386,7 +390,8 @@ mod tests {
         // 裸玉 5e。自駒が 5g で取られた → 敵駒（と金近似）が 5g にいると分かっている。
         // 後手のと金は 5g から 5f（後ろ）にも利くので、5e5f はどの王手駒仮説の
         // 下でも非合法（p=0）になるはず。4e への横逃げは生きている
-        let view = view_with(vec![("5e", Role::King)]);
+        let mut view = view_with(vec![("5e", Role::King)]);
+        view.move_number = 12; // 直近8手以内の捕獲情報として扱われる
         let mut log = ObservationLog::default();
         log.record(crate::observation::Observation::OpponentMoved {
             move_number: 10,

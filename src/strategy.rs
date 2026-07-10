@@ -208,7 +208,9 @@ impl Default for EvalParams {
             check_foul_scale: 0.12,
             mover_w_captured: 0.9,
             mover_w_quiet: 0.45,
-            mover_w_check: 0.85,
+            // 0.85 は bot 対戦で王手を封印しすぎた（vs v5 アブレーション 2026-07-10）。
+            // 対人の露見効果と bot 対戦の王手価値の折衷で 0.6
+            mover_w_check: 0.6,
             capture_reveal_risk: 0.12,
             camp_known_quiet: 0.35,
             // 露出評価（knownness）と敵陣リスク下限は既定で無効。
