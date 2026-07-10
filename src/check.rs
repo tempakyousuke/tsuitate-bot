@@ -84,11 +84,9 @@ impl CheckSolver {
         }
         base.king_square(my_color)?;
 
-        // 位置が既知の敵駒（自駒が死んだマス = 敵駒がそこへ来た。取り返し済みは除く）を
-        // 盤に載せる。回避先がこれらの利きに覆われているかを全仮説共通で判定できる
-        // （対人実戦: 5三の既知の成駒が 4二/5二/6二 を覆っているのに順に試して4反則）。
-        // 駒種は不明なので粒子の多数決、なければ成駒の最頻・金動き（と金）で近似する
-        for sq in known_enemy_squares(my_color, log) {
+        // アブレーション: 既知敵駒の盤面組み込みを無効化（vs v5 回帰の犯人切り分け）
+        #[allow(clippy::never_loop)]
+        for sq in Vec::<Coord>::new() {
             if base.piece_at(sq).is_some() {
                 continue;
             }
@@ -382,6 +380,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "アブレーションブランチでは既知敵駒の組み込みを無効化している"]
     fn known_enemy_piece_rules_out_covered_escapes() {
         // 裸玉 5e。自駒が 5g で取られた → 敵駒（と金近似）が 5g にいると分かっている。
         // 後手のと金は 5g から 5f（後ろ）にも利くので、5e5f はどの王手駒仮説の
