@@ -196,6 +196,11 @@ pub struct EvalParams {
     /// 初期位置の大駒は位置が予測可能で、開いた筋の背後を歩・桂で狙われる
     /// （対人50局で頻発）。展開を促す勾配を作り、動かせば消える
     pub big_home_penalty: f64,
+    /// 相手の持ち駒による「打ち込み王手の受け入れ面積」への重み。
+    /// 相手の持ち駒は既知（=取られた自駒）で、飛を持たれたら玉への開いた直線、
+    /// 金銀なら玉の隣接空きマスがすべて王手打ちの入口になる。
+    /// 持ち駒が空なら居玉でもコストゼロ（一律の玉移動推奨はしない）
+    pub hand_drop_w: f64,
     /// 手戻り減点
     pub backtrack_penalty: f64,
     /// 直前に動かした駒をまた動かす手の減点（雑なシャッフルの抑制。
@@ -237,6 +242,7 @@ impl Default for EvalParams {
             threat_w: 0.25,
             info_bonus: 0.6,
             big_home_penalty: 0.25,
+            hand_drop_w: 0.08,
             backtrack_penalty: 0.35,
             shuffle_penalty: 0.2,
         }
@@ -251,7 +257,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 27] = [
+    pub const SPECS: [ParamSpec; 28] = [
         ParamSpec { name: "check_bonus", lo: 0.0, hi: 3.0 },
         ParamSpec { name: "check_foul_scale", lo: 0.0, hi: 0.5 },
         ParamSpec { name: "mover_w_captured", lo: 0.0, hi: 1.5 },
@@ -277,6 +283,7 @@ impl EvalParams {
         ParamSpec { name: "threat_w", lo: 0.0, hi: 1.0 },
         ParamSpec { name: "info_bonus", lo: 0.0, hi: 2.0 },
         ParamSpec { name: "big_home_penalty", lo: 0.0, hi: 1.5 },
+        ParamSpec { name: "hand_drop_w", lo: 0.0, hi: 0.5 },
         ParamSpec { name: "backtrack_penalty", lo: 0.0, hi: 1.5 },
         ParamSpec { name: "shuffle_penalty", lo: 0.0, hi: 1.0 },
     ];
@@ -308,6 +315,7 @@ impl EvalParams {
             self.threat_w,
             self.info_bonus,
             self.big_home_penalty,
+            self.hand_drop_w,
             self.backtrack_penalty,
             self.shuffle_penalty,
         ]
@@ -341,8 +349,9 @@ impl EvalParams {
             threat_w: v[22],
             info_bonus: v[23],
             big_home_penalty: v[24],
-            backtrack_penalty: v[25],
-            shuffle_penalty: v[26],
+            hand_drop_w: v[25],
+            backtrack_penalty: v[26],
+            shuffle_penalty: v[27],
         }
     }
 }
@@ -759,6 +768,7 @@ fn evaluate(
     const PRESSURE_SAMPLES: usize = 16;
     let mut pressure_sum = 0.0;
     let mut attack_sum = 0.0;
+    let mut danger_sum = 0.0;
     let mut pressure_n = 0usize;
 
     for pos in particles {
@@ -849,6 +859,9 @@ fn evaluate(
             // 相手玉の周囲に当たっている自分の利き（攻め）。王手にならない攻め駒の
             // 集結にも報酬を与える（王手/詰みボーナスだけだと攻めを組み立てない）
             attack_sum += king_zone_pressure(&next, opp, me);
+            // 相手の持ち駒による王手打ちの受け入れ面積（対局実験の教訓:
+            // 飛車を持たれた瞬間、玉への開いた直線はすべて即王手の入口になる）
+            danger_sum += drop_check_danger(&next, me);
             pressure_n += 1;
         }
 
@@ -872,7 +885,9 @@ fn evaluate(
         let confidence = (n / EVAL_PARTICLES as f64).min(1.0);
         value_sum / legal as f64
             + params.info_bonus * p_hit * (1.0 - p_hit)
-            + (params.attack_w * confidence * attack_sum - params.pressure_w * pressure_sum)
+            + (params.attack_w * confidence * attack_sum
+                - params.pressure_w * pressure_sum
+                - params.hand_drop_w * danger_sum)
                 / pressure_n.max(1) as f64
     } else {
         0.0
@@ -999,6 +1014,69 @@ fn exposed_capture_risk(
         worst = worst.max(loss);
     }
     worst
+}
+
+/// 相手の持ち駒による「王手打ちの受け入れ面積」。
+/// 相手の持ち駒はこの粒子上で正確に分かる（取られた自駒 − 打たれた駒）。
+/// - 飛: 玉からの縦横の空き直線の長さ（その各マスが王手打ちの入口）
+/// - 角: 斜めの空き直線の長さ
+/// - 香: 相手の香が王手できる側の1直線
+/// - 金/銀: 玉の隣接空きマス（打てば即王手）
+/// - 歩: 玉頭の1マス
+/// 持ち駒が空ならゼロ = 居玉そのものは咎めない
+fn drop_check_danger(pos: &Position, me: Color) -> f64 {
+    let Some(king) = pos.king_square(me) else {
+        return 0.0;
+    };
+    let opp = me.other();
+    let on_board = |c: &Coord| (1..=9).contains(&c.file) && (1..=9).contains(&c.rank);
+    let ray_len = |df: i8, dr: i8| -> f64 {
+        let mut n = 0;
+        let mut c = Coord { file: king.file + df, rank: king.rank + dr };
+        while on_board(&c) && pos.piece_at(c).is_none() {
+            n += 1;
+            c = Coord { file: c.file + df, rank: c.rank + dr };
+        }
+        n as f64
+    };
+
+    let mut danger = 0.0;
+    if pos.hand_count(opp, Role::Rook) > 0 {
+        danger += ray_len(1, 0) + ray_len(-1, 0) + ray_len(0, 1) + ray_len(0, -1);
+    }
+    if pos.hand_count(opp, Role::Bishop) > 0 {
+        danger += ray_len(1, 1) + ray_len(1, -1) + ray_len(-1, 1) + ray_len(-1, -1);
+    }
+    // 相手の香・歩は「相手から見て前へ」利くので、自玉側から見ると
+    // 自分の陣の奥方向の直線・玉頭が入口になる
+    let toward = if me == Color::Sente { -1 } else { 1 };
+    if pos.hand_count(opp, Role::Lance) > 0 {
+        danger += ray_len(0, toward);
+    }
+    if pos.hand_count(opp, Role::Pawn) > 0 {
+        let head = Coord { file: king.file, rank: king.rank + toward };
+        if on_board(&head) && pos.piece_at(head).is_none() {
+            danger += 1.0;
+        }
+    }
+    let generals =
+        pos.hand_count(opp, Role::Gold) > 0 || pos.hand_count(opp, Role::Silver) > 0;
+    if generals {
+        let mut air = 0.0;
+        for df in -1..=1i8 {
+            for dr in -1..=1i8 {
+                if df == 0 && dr == 0 {
+                    continue;
+                }
+                let c = Coord { file: king.file + df, rank: king.rank + dr };
+                if on_board(&c) && pos.piece_at(c).is_none() {
+                    air += 0.5;
+                }
+            }
+        }
+        danger += air;
+    }
+    danger
 }
 
 /// owner 玉の周囲8マス（と玉のマス）に当たっている by 側の利きの数
