@@ -7,12 +7,17 @@
 
 - `cargo test` — ユニットテスト（候補手生成・プロトコル・エンジン・推定器）
 - `cargo test --release -- --ignored` — 遅い検証（shogi.rs の perft depth 4/5）
-- `cargo run --release --bin arena -- [対局数] [候補] [基準1] [基準2] ...` — 戦略同士のローカル対戦。
+- `cargo run --release --bin arena -- [対局数] [候補] [基準1] [基準2] ...` — 戦略同士の対戦。
   基準を複数並べるとガントレット（候補が各基準と対局数ずつ対戦）。
   戦略の変更は必ずこれで**全凍結版**（`src/frozen/` の `estimator_vN`）に有意に
-  勝ち越すことを確認する（例: `cargo run --release --bin arena -- 100 estimator estimator_v4`）。
+  勝ち越すことを確認する。
   50%付近の信頼区間は 100局で±10pt / 200局で±7pt / 1000局で±3.1pt。当面（開発最初期）は
-  100局を既定とし、結果が信頼区間内で判定できない僅差のときだけ局数を増やす
+  100局を既定とし、結果が信頼区間内で判定できない僅差のときだけ局数を増やす。
+  **実行はローカルでなく GitHub Actions で行う**（`.github/workflows/arena.yml`、手動起動のみ）:
+  対象ブランチを push して
+  `gh workflow run arena.yml --ref <ブランチ> -f games=100 -f candidate=estimator -f baselines="estimator_v2 estimator_v3 estimator_v4 estimator_v5"`。
+  結果はジョブのサマリー（および artifact `arena-result`）に出る。
+  baselines の既定値は凍結版を追加したら手動で更新すること
 - `cargo run --release --bin tune -- [反復数] [評価あたり対局数] [基準...]` — 評価パラメータ
   （`strategy::EvalParams`）のSPSA自動チューニング。目的関数はアリーナのスコア率
   （引き分け=0.5勝）。進捗は `tune-log.jsonl`（gitignore済み）。出力された最終パラメータを

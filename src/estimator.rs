@@ -12,6 +12,13 @@
 //! - 王手宣言（の有無）… 手の直後の王手状態と一致しない粒子を棄却
 //!
 //! 粒子が枯渇したら、制約列を最初からリプレイして再生成する（回数上限つき）。
+//!
+//! ソフト粒子（POMCP の particle reinvigoration の変種）:
+//! 厳密整合の生存粒子が SOFT_MIN を下回ったときは、棄却された粒子を
+//! 「情報系の制約だけを緩和した」判定で救済し、penalty を加算して残す。
+//! 緩和するのは王手宣言の一致と自分の反則の説明のみで、物理的な制約
+//! （自手の合法性・取った駒種・取られたマス）は緩和しない。評価側は
+//! penalty に応じた重み（0.5^penalty）で加重する。
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -31,6 +38,11 @@ const TARGET_PARTICLES: usize = 512;
 const REGEN_ATTEMPTS: usize = 320;
 /// リプレイ中バックトラックの1決定点あたりの再サンプル回数
 const BACKTRACK_ATTEMPTS: u32 = 4;
+/// 厳密整合の生存粒子がこれを下回ったらソフト救済を発動する
+const SOFT_MIN: usize = TARGET_PARTICLES / 4;
+/// ソフト救済の累積回数の上限。超えた粒子は棄却する
+/// （観測と何度も矛盾した粒子は近似としても信用できない）
+const PENALTY_CAP: u8 = 3;
 
 /// 観測列を推定に使える形に正規化した制約
 #[derive(Debug, Clone)]
@@ -53,6 +65,8 @@ enum Constraint {
 pub struct Estimator {
     my_color: Color,
     particles: Vec<Position>,
+    /// particles と同じ並びのソフト救済回数（0 = 全制約と厳密整合）
+    penalties: Vec<u8>,
     constraints: Vec<Constraint>,
     /// 自分が駒を取ったマス（= 相手は自駒がそこで死んだことを知っている）。
     /// 相手手の事前分布の threat_known 特徴量に使う。idx は制約列上の位置
@@ -78,6 +92,7 @@ impl Estimator {
         Estimator {
             my_color,
             particles: vec![Position::initial(); TARGET_PARTICLES],
+            penalties: vec![0; TARGET_PARTICLES],
             constraints: vec![],
             my_capture_idx: vec![],
             my_capture_sq: vec![],
@@ -93,9 +108,15 @@ impl Estimator {
         self.my_color
     }
 
-    /// 現在の粒子集合。空なら推定は信頼できない（呼び出し側でフォールバック）
+    /// 現在の粒子集合。空なら推定は信頼できない（呼び出し側でフォールバック）。
+    /// replenish 後は penalty 昇順（厳密整合が先頭側）に並んでいる
     pub fn particles(&self) -> &[Position] {
         &self.particles
+    }
+
+    /// particles() と同じ並びのソフト救済回数。評価側の重み付けに使う
+    pub fn penalties(&self) -> &[u8] {
+        &self.penalties
     }
 
     pub fn healthy(&self) -> bool {
@@ -185,15 +206,21 @@ impl Estimator {
 
     fn apply_constraint(&mut self, constraint: &Constraint) {
         let my_color = self.my_color;
-        let mut survivors = Vec::with_capacity(self.particles.len());
         let particles = std::mem::take(&mut self.particles);
-        for mut pos in particles {
+        let penalties = std::mem::take(&mut self.penalties);
+        let mut surv_pos = Vec::with_capacity(particles.len());
+        let mut surv_pen = Vec::with_capacity(particles.len());
+        // 棄却された粒子は適用前の局面を保持しておく（ソフト救済のやり直し用。
+        // apply_my_move / sample_opp_move は失敗時も局面を汚しうる）
+        let mut failed: Vec<(Position, u8)> = vec![];
+        for (mut pos, pen) in particles.into_iter().zip(penalties) {
+            let backup = pos.clone();
             let ok = match constraint {
                 Constraint::MyMove {
                     mv,
                     captured,
                     gives_check,
-                } => apply_my_move(&mut pos, my_color, mv, *captured, *gives_check),
+                } => apply_my_move(&mut pos, my_color, mv, *captured, Some(*gives_check)),
                 Constraint::MyFoul { mv } => foul_consistent(&pos, my_color, mv),
                 Constraint::OppMove {
                     captured_at,
@@ -202,17 +229,57 @@ impl Estimator {
                     &mut pos,
                     my_color,
                     *captured_at,
-                    *gives_check,
+                    Some(*gives_check),
                     &self.my_capture_sq,
                     &self.my_touched_sq,
                     &mut self.rng,
                 ),
             };
             if ok {
-                survivors.push(pos);
+                surv_pos.push(pos);
+                surv_pen.push(pen);
+            } else {
+                failed.push((backup, pen));
             }
         }
-        self.particles = survivors;
+        // ソフト救済: 厳密整合の生存が少ないときだけ、情報系の制約を緩和して
+        // 棄却粒子を penalty+1 で生かす（枯渇からの回復を初期局面リプレイに
+        // 頼らない = POMCP の particle reinvigoration に相当）
+        if surv_pos.len() < SOFT_MIN {
+            for (mut pos, pen) in failed {
+                if pen >= PENALTY_CAP {
+                    continue;
+                }
+                if self.apply_soft(&mut pos, constraint) {
+                    surv_pos.push(pos);
+                    surv_pen.push(pen + 1);
+                }
+            }
+        }
+        self.particles = surv_pos;
+        self.penalties = surv_pen;
+    }
+
+    /// 情報系の制約（王手宣言の一致・自分の反則の説明）だけを緩和した適用。
+    /// 物理的な制約（自手の合法性・取った駒種・取られたマス）は緩和しない
+    fn apply_soft(&mut self, pos: &mut Position, constraint: &Constraint) -> bool {
+        match constraint {
+            Constraint::MyMove { mv, captured, .. } => {
+                apply_my_move(pos, self.my_color, mv, *captured, None)
+            }
+            // 粒子上では合法だった手が実際は反則だった: この粒子は反則を
+            // 説明できないが、盤面自体は生かす（反則手は実行されていない）
+            Constraint::MyFoul { .. } => true,
+            Constraint::OppMove { captured_at, .. } => sample_opp_move(
+                pos,
+                self.my_color,
+                *captured_at,
+                None,
+                &self.my_capture_sq,
+                &self.my_touched_sq,
+                &mut self.rng,
+            ),
+        }
     }
 
     /// 粒子が減っていたら、制約列のリプレイ（多様性）と生存粒子の複製（安価）で補充。
@@ -221,15 +288,18 @@ impl Estimator {
     fn replenish(&mut self) {
         let start = std::time::Instant::now();
         let regen_deadline = start + std::time::Duration::from_millis(500);
-        if self.particles.len() < TARGET_PARTICLES {
+        // リプレイの目標は「厳密整合の粒子数」。ソフト粒子で頭数が足りていても
+        // 厳密粒子が薄ければリプレイで置き換えにいく（ソフトはあくまで近似）
+        let mut strict = self.penalties.iter().filter(|&&p| p == 0).count();
+        if strict < TARGET_PARTICLES {
             for _ in 0..REGEN_ATTEMPTS {
-                if self.particles.len() >= TARGET_PARTICLES
-                    || std::time::Instant::now() > regen_deadline
-                {
+                if strict >= TARGET_PARTICLES || std::time::Instant::now() > regen_deadline {
                     break;
                 }
                 if let Some(pos) = self.replay_once() {
                     self.particles.push(pos);
+                    self.penalties.push(0);
+                    strict += 1;
                 }
             }
         }
@@ -237,6 +307,7 @@ impl Estimator {
         while self.particles.is_empty() && std::time::Instant::now() < deadline {
             if let Some(pos) = self.replay_once() {
                 self.particles.push(pos);
+                self.penalties.push(0);
             }
         }
         // ラッチしない: 粒子が戻れば健全に戻る（呼び出し側は毎手 update する）
@@ -244,10 +315,32 @@ impl Estimator {
         if self.particles.is_empty() {
             return;
         }
-        while self.particles.len() < TARGET_PARTICLES {
-            let i = self.rng.random_range(0..self.particles.len());
-            let clone = self.particles[i].clone();
-            self.particles.push(clone);
+        // penalty 昇順に並べ、厳密整合の粒子を優先して TARGET まで絞る
+        let mut pairs: Vec<(u8, Position)> = std::mem::take(&mut self.penalties)
+            .into_iter()
+            .zip(std::mem::take(&mut self.particles))
+            .collect();
+        pairs.sort_by_key(|(p, _)| *p);
+        pairs.truncate(TARGET_PARTICLES);
+        for (pen, pos) in pairs {
+            self.penalties.push(pen);
+            self.particles.push(pos);
+        }
+        // 不足分は複製で埋める（低ペナルティ粒子を重み 0.5^penalty で優先）
+        let m = self.particles.len();
+        if m < TARGET_PARTICLES {
+            let mut cum = Vec::with_capacity(m);
+            let mut total = 0.0f64;
+            for &p in &self.penalties {
+                total += 0.5f64.powi(i32::from(p));
+                cum.push(total);
+            }
+            while self.particles.len() < TARGET_PARTICLES {
+                let t = self.rng.random_range(0.0..total);
+                let i = cum.partition_point(|&c| c < t).min(m - 1);
+                self.particles.push(self.particles[i].clone());
+                self.penalties.push(self.penalties[i]);
+            }
         }
     }
 
@@ -275,7 +368,7 @@ impl Estimator {
                     mv,
                     captured,
                     gives_check,
-                } => apply_my_move(&mut pos, self.my_color, mv, *captured, *gives_check),
+                } => apply_my_move(&mut pos, self.my_color, mv, *captured, Some(*gives_check)),
                 Constraint::MyFoul { mv } => foul_consistent(&pos, self.my_color, mv),
                 Constraint::OppMove {
                     captured_at,
@@ -293,7 +386,7 @@ impl Estimator {
                         &mut pos,
                         self.my_color,
                         *captured_at,
-                        *gives_check,
+                        Some(*gives_check),
                         &self.my_capture_sq[..k],
                         &self.my_touched_sq[..t],
                         &mut self.rng,
@@ -326,13 +419,14 @@ impl Estimator {
     }
 }
 
-/// 受理された自分の手を粒子に適用する。粒子と観測が矛盾したら false
+/// 受理された自分の手を粒子に適用する。粒子と観測が矛盾したら false。
+/// gives_check が None のときは王手宣言との一致を検査しない（ソフト救済用）
 fn apply_my_move(
     pos: &mut Position,
     my_color: Color,
     mv: &ShogiMove,
     captured: Option<Role>,
-    gives_check: bool,
+    gives_check: Option<bool>,
 ) -> bool {
     if pos.turn() != my_color || !pos.is_legal(mv) {
         return false;
@@ -341,7 +435,7 @@ fn apply_my_move(
     if actual != captured {
         return false;
     }
-    pos.in_check(my_color.other()) == gives_check
+    gives_check.is_none_or(|gc| pos.in_check(my_color.other()) == gc)
 }
 
 /// 反則になった手との整合: 粒子上でも非合法であること
@@ -368,6 +462,7 @@ fn newly_threatens(pos: &Position, next: &Position, mv: &ShogiMove, targets: &[C
 }
 
 /// 観測と整合する相手の合法手をサンプルして適用する。整合手がなければ false。
+/// - gives_check: None なら王手宣言との一致を検査しない（ソフト救済用）
 /// - known_squares: 自分が駒を取ったマス（相手は自駒がそこで死んだことを知っている）
 /// - my_touched: 自分の手が触れたマス（初期配置のまま動いていない自駒の判定用。
 ///   相手はそれらを推論で狙ってくる = 飛車頭への歩打ち等）
@@ -375,7 +470,7 @@ fn sample_opp_move(
     pos: &mut Position,
     my_color: Color,
     captured_at: Option<Coord>,
-    gives_check: bool,
+    gives_check: Option<bool>,
     known_squares: &[Coord],
     my_touched: &[Coord],
     rng: &mut StdRng,
@@ -415,7 +510,7 @@ fn sample_opp_move(
         }
         let mut next = pos.clone();
         next.play_unchecked(&mv);
-        if next.in_check(my_color) != gives_check {
+        if gives_check.is_some_and(|gc| next.in_check(my_color) != gc) {
             continue;
         }
         let threat_known = newly_threatens(pos, &next, &mv, known_squares);
@@ -639,6 +734,7 @@ mod tests {
         });
         est.update(&log);
         est.particles.clear();
+        est.penalties.clear();
         est.replenish();
         assert!(est.healthy(), "バックトラック付きリプレイで再生成できるはず");
         for pos in est.particles() {
@@ -660,8 +756,71 @@ mod tests {
         est.update(&log);
         // 人工的に枯渇させる
         est.particles.clear();
+        est.penalties.clear();
         est.replenish();
         assert!(est.healthy(), "リプレイで再生成できるはず");
         assert_eq!(est.particles().len(), TARGET_PARTICLES);
+    }
+
+    #[test]
+    fn strict_survivors_keep_zero_penalty() {
+        let mut est = Estimator::with_seed(Color::Sente, 42);
+        let mut log = ObservationLog::default();
+        record_my_move(&mut log, "7g7f", None);
+        record_opp_move(&mut log, None);
+        est.update(&log);
+        assert!(est.penalties().iter().all(|&p| p == 0));
+        assert_eq!(est.particles().len(), est.penalties().len());
+    }
+
+    #[test]
+    fn soft_pass_rescues_check_declaration_mismatch() {
+        // 初手 7g7f が王手になる粒子は存在しない → 厳密整合は全滅するが、
+        // ソフト救済が王手宣言の一致を緩和して penalty=1 で全粒子を生かす
+        let mut est = Estimator::with_seed(Color::Sente, 5);
+        let c = Constraint::MyMove {
+            mv: parse_usi("7g7f").unwrap(),
+            captured: None,
+            gives_check: true,
+        };
+        est.apply_constraint(&c);
+        assert_eq!(est.particles.len(), TARGET_PARTICLES);
+        assert!(est.penalties.iter().all(|&p| p == 1));
+        // 物理的な適用（着手そのもの）は行われている
+        for pos in est.particles() {
+            assert_eq!(
+                pos.piece_at(Coord { file: 7, rank: 6 }).map(|p| p.role),
+                Some(Role::Pawn)
+            );
+        }
+    }
+
+    #[test]
+    fn soft_pass_does_not_relax_physical_constraints() {
+        // 初手で 5e の駒を取ることはどの粒子でも物理的に不可能
+        // （5e への合法手自体がない）→ ソフト救済でも救えず全滅する
+        let mut est = Estimator::with_seed(Color::Sente, 5);
+        let c = Constraint::MyMove {
+            mv: parse_usi("5g5e").unwrap(),
+            captured: Some(Role::Pawn),
+            gives_check: false,
+        };
+        est.apply_constraint(&c);
+        assert!(est.particles.is_empty());
+    }
+
+    #[test]
+    fn penalty_cap_culls_repeated_violators() {
+        let mut est = Estimator::with_seed(Color::Sente, 5);
+        for p in est.penalties.iter_mut() {
+            *p = PENALTY_CAP;
+        }
+        let c = Constraint::MyMove {
+            mv: parse_usi("7g7f").unwrap(),
+            captured: None,
+            gives_check: true,
+        };
+        est.apply_constraint(&c);
+        assert!(est.particles.is_empty(), "上限到達の粒子は救済されない");
     }
 }

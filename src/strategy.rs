@@ -140,6 +140,9 @@ pub fn choose_move(view: &PlayerView, foul_tried: &HashSet<String>) -> Option<St
 /// 精度側（反則率の低下）に予算を振る
 const EVAL_PARTICLES: usize = 192;
 
+/// ソフト救済された粒子の評価重み（0.5^penalty）。厳密整合の粒子=1.0
+const SOFT_PARTICLE_DECAY: f64 = 0.5;
+
 /// evaluate() まわりの調整可能パラメータ。Default が現行の手調整値。
 /// bin/tune.rs の SPSA がこれを最適化する（凍結版は各自のコピーを持ち依存しない）
 #[derive(Debug, Clone)]
@@ -451,15 +454,17 @@ impl Strategy for EstimatorStrategy {
 
         // 複製粒子を指紋で除いたユニーク粒子だけを評価に使う
         // （複製は独立な証拠ではないので p(合法) を過信させる）。
+        // ソフト救済された粒子（penalty>0）は重み 0.5^penalty で薄く数える。
+        // 粒子は penalty 昇順なので厳密整合の粒子から先に採用される。
         // 粒子が完全に枯渇していても、事前確率だけで安全側の評価が成り立つ
         let mut seen = HashSet::new();
-        let mut sample: Vec<&Position> = vec![];
-        for pos in est.particles() {
+        let mut sample: Vec<(&Position, f64)> = vec![];
+        for (pos, pen) in est.particles().iter().zip(est.penalties()) {
             if sample.len() >= EVAL_PARTICLES {
                 break;
             }
             if seen.insert(pos.fingerprint()) {
-                sample.push(pos);
+                sample.push((pos, SOFT_PARTICLE_DECAY.powi(i32::from(*pen))));
             }
         }
 
@@ -482,7 +487,8 @@ impl Strategy for EstimatorStrategy {
         let mut check_solver = if view.you_in_check {
             let fouls: Vec<ShogiMove> =
                 foul_tried.iter().filter_map(|u| parse_usi(u)).collect();
-            CheckSolver::new(view, &sample, &fouls, log)
+            let positions: Vec<&Position> = sample.iter().map(|(p, _)| *p).collect();
+            CheckSolver::new(view, &positions, &fouls, log)
         } else {
             None
         };
@@ -537,10 +543,10 @@ impl Strategy for EstimatorStrategy {
 
 /// 記録用の推定サマリ: 粒子の健全性・ユニーク数・相手玉の位置分布（上位）。
 /// 事後分析で「推定が外れていたのか、評価が悪かったのか」を切り分けるために残す
-fn debug_summary(est: &Estimator, sample: &[&Position]) -> serde_json::Value {
+fn debug_summary(est: &Estimator, sample: &[(&Position, f64)]) -> serde_json::Value {
     let opp = est.my_color().other();
     let mut king_votes: HashMap<Coord, u32> = HashMap::new();
-    for pos in sample {
+    for (pos, _) in sample {
         if let Some(sq) = pos.king_square(opp) {
             *king_votes.entry(sq).or_default() += 1;
         }
@@ -561,6 +567,7 @@ fn debug_summary(est: &Estimator, sample: &[&Position]) -> serde_json::Value {
     serde_json::json!({
         "healthy": est.healthy(),
         "unique_particles": sample.len(),
+        "soft_particles": est.penalties().iter().filter(|&&p| p > 0).count(),
         "opp_king_top": opp_king_top,
     })
 }
@@ -766,21 +773,21 @@ fn camp_defended_prior(to: Coord, me: Color, camp_scale: f64) -> f64 {
         }
 }
 
-/// 候補手をユニーク粒子の平均で評価する
+/// 候補手をユニーク粒子の加重平均で評価する（重み = ソフト救済の減衰）
 fn evaluate(
     view: &PlayerView,
     mv: &ShogiMove,
-    particles: &[&Position],
+    particles: &[(&Position, f64)],
     prior: f64,
     known: &HashMap<Coord, f64>,
     params: &EvalParams,
 ) -> f64 {
     let me = view.your_color;
     let opp = me.other();
-    let mut legal = 0usize;
+    let mut legal = 0.0f64;
     let mut value_sum = 0.0;
-    // 着地マスに敵駒がいた（=駒を取れた）粒子数。探索ボーナスの不一致度に使う
-    let mut capture_hits = 0usize;
+    // 着地マスに敵駒がいた（=駒を取れた）粒子の重み。探索ボーナスの不一致度に使う
+    let mut capture_hits = 0.0f64;
     // 王周辺の圧力は粒子間の分散が小さいわりに計算が重い（9マス×利き走査）ので
     // 少数の粒子でだけ測って平均する
     const PRESSURE_SAMPLES: usize = 16;
@@ -789,11 +796,12 @@ fn evaluate(
     let mut danger_sum = 0.0;
     let mut pressure_n = 0usize;
 
-    for pos in particles {
+    for (pos, w) in particles {
+        let w = *w;
         if !pos.is_legal(mv) {
             continue;
         }
-        legal += 1;
+        legal += w;
         let mut v = 0.0;
 
         // 駒得（盤上価値で数える。成駒を取れば大きい）
@@ -807,7 +815,7 @@ fn evaluate(
         }
         v += captured_value;
         if captured_value > 0.0 {
-            capture_hits += 1;
+            capture_hits += w;
         }
 
         let mut next = (*pos).clone();
@@ -883,25 +891,26 @@ fn evaluate(
             pressure_n += 1;
         }
 
-        value_sum += v;
+        value_sum += w * v;
     }
 
     // 粒子の証拠と事前確率のブレンド（粒子ゼロなら事前そのもの）。
-    // 粒子が退化している（ユニーク数が評価上限に届かない）ほど事前の重みを
-    // 増やし、少数の偏った粒子への過信を防ぐ
-    let n = particles.len() as f64;
+    // 粒子が退化している（実効重みが評価上限に届かない）ほど事前の重みを
+    // 増やし、少数の偏った粒子への過信を防ぐ。ソフト粒子は重みぶんしか
+    // 数えないので、退化度にも自然に反映される
+    let n: f64 = particles.iter().map(|(_, w)| w).sum();
     let degen = 1.0 - (n / EVAL_PARTICLES as f64).min(1.0);
     let w = params.prior_weight + params.prior_weight_degen * degen;
-    let p_legal = (legal as f64 + prior * w) / (n + w);
-    let expected = if legal > 0 {
+    let p_legal = (legal + prior * w) / (n + w);
+    let expected = if legal > 0.0 {
         // 探索ボーナス: 着地マスの敵駒有無について粒子が割れているほど、
         // 指せば（取れても空でも）推定が絞れる。捕獲の期待値とは別の情報の価値
-        let p_hit = capture_hits as f64 / legal as f64;
+        let p_hit = capture_hits / legal;
         // 攻め圧力は粒子の健全度でゲートする。退化した粒子は間違った玉位置に
         // 固まりやすく、「誰もいない場所への攻め」が加点され続ける
         // （対人実戦: 終盤の成桂の徘徊）。健全度が低いときは確実な項だけ残す
         let confidence = (n / EVAL_PARTICLES as f64).min(1.0);
-        value_sum / legal as f64
+        value_sum / legal
             + params.info_bonus * p_hit * (1.0 - p_hit)
             + (params.attack_w * confidence * attack_sum
                 - params.pressure_w * pressure_sum
