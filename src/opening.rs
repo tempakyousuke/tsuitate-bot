@@ -111,7 +111,17 @@ pub struct OpeningBook {
 impl OpeningBook {
     pub fn new(my_color: Color) -> Self {
         let all = lines();
-        let raw = &all[rand::rng().random_range(0..all.len())];
+        // 既定はランダム選択（対局をまたいで人間に順番を読まれないため）。
+        // TSUITATE_BOOK_RR=1 のときは巡回選択にする: SPSA（bin/tune）の
+        // f+/f− 評価で定跡分布を揃え、「どの定跡を引いたか」のノイズが
+        // 勾配推定を汚さないようにする（共通乱数法）
+        static RR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let idx = if std::env::var("TSUITATE_BOOK_RR").as_deref() == Ok("1") {
+            RR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % all.len()
+        } else {
+            rand::rng().random_range(0..all.len())
+        };
+        let raw = &all[idx];
         let line = raw
             .iter()
             .filter_map(|usi| match my_color {

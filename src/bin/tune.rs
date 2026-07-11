@@ -105,6 +105,9 @@ fn resume_state() -> Option<(u32, EvalParams)> {
 }
 
 fn main() {
+    // 定跡選択を巡回にして f+/f− の定跡分布を揃える（opening.rs 参照）
+    unsafe { std::env::set_var("TSUITATE_BOOK_RR", "1") };
+
     let args: Vec<String> = std::env::args().collect();
     let iterations: u32 = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(40);
     let games_per_eval: u32 = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(60);
