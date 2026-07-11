@@ -218,41 +218,41 @@ pub struct EvalParams {
 
 impl Default for EvalParams {
     fn default() -> Self {
+        // SPSA第1ラウンドの収束点（2026-07-11、60反復×2×30局 vs estimator_v5）。
+        // 手調整からの主な学び: 反則コスト減（探り反則の価値）、info_bonus増、
+        // 打ちの一律減点は撤回（drop_bias正）、露出評価は小さい値で復活
+        // （camp_scale 0.16 / exposed_known 0.11 / home_knownness 0.15 —
+        // 手動で入れた0.25〜1.0は過剰、ゼロも過小だった）。
+        // hand_drop_w のみ未チューニング（第1ラウンド後に追加した項）
         EvalParams {
-            check_bonus: 0.9,
-            check_foul_scale: 0.12,
-            mover_w_captured: 0.9,
-            mover_w_quiet: 0.45,
-            // 0.85 は bot 対戦で王手を封印しすぎた（vs v5 アブレーション 2026-07-10）。
-            // 対人の露見効果と bot 対戦の王手価値の折衷で 0.6
-            mover_w_check: 0.6,
-            capture_reveal_risk: 0.12,
-            camp_known_quiet: 0.35,
-            // 露出評価（knownness）と敵陣リスク下限は既定で無効。
-            // アブレーション（2026-07-09）で vs v4 40.7% → 無効化で 56.1% と
-            // アリーナで明確に有害、対人50局でも只取られは改善しなかった。
-            // 器は残すので SPSA（bin/tune）が非ゼロの最適値を探すことはできる
-            camp_scale: 0.0,
-            exposed_base: 0.35,
-            exposed_known: 0.0,
-            home_knownness: 0.0,
-            recapture_defended: 0.45,
-            exposed_defended: 0.4,
-            attack_w: 0.12,
-            pressure_w: 0.2,
-            foul_cost_base: 1.5,
-            foul_cost_pow: 1.5,
-            advance_w: 0.05,
-            promote_bias: 0.1,
-            drop_bias: -0.05,
-            prior_weight: 4.0,
-            prior_weight_degen: 8.0,
-            threat_w: 0.25,
-            info_bonus: 0.6,
-            big_home_penalty: 0.25,
+            check_bonus: 0.748,
+            check_foul_scale: 0.047,
+            mover_w_captured: 0.988,
+            mover_w_quiet: 0.671,
+            mover_w_check: 0.506,
+            capture_reveal_risk: 0.155,
+            camp_known_quiet: 0.403,
+            camp_scale: 0.159,
+            exposed_base: 0.569,
+            exposed_known: 0.113,
+            home_knownness: 0.147,
+            recapture_defended: 0.323,
+            exposed_defended: 0.42,
+            attack_w: 0.062,
+            pressure_w: 0.151,
+            foul_cost_base: 1.005,
+            foul_cost_pow: 1.518,
+            advance_w: 0.057,
+            promote_bias: 0.175,
+            drop_bias: 0.16,
+            prior_weight: 4.649,
+            prior_weight_degen: 4.718,
+            threat_w: 0.305,
+            info_bonus: 0.832,
+            big_home_penalty: 0.352,
             hand_drop_w: 0.08,
-            backtrack_penalty: 0.35,
-            shuffle_penalty: 0.2,
+            backtrack_penalty: 0.363,
+            shuffle_penalty: 0.249,
         }
     }
 }
