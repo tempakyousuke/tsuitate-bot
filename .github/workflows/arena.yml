@@ -29,6 +29,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run arena
+        env:
+          # 候補(A)視点の対局記録。bin/analyze での敗着分析用に artifact で回収する
+          ARENA_RECORD_DIR: arena-records
         run: |
           cargo run --release --bin arena -- \
             "${{ inputs.games }}" \
@@ -51,3 +54,11 @@ jobs:
         with:
           name: arena-result
           path: arena-result.txt
+
+      - name: Upload game records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arena-records
+          path: arena-records/
+          if-no-files-found: ignore

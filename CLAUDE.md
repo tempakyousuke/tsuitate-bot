@@ -24,6 +24,9 @@
   採用するときは `EvalParams::default` を書き換えてフルガントレットで確認する。
   対局ループは `selfplay.rs`（arena と共用）
 - `cargo run --release --bin analyze -- records/*.jsonl` — 対局記録の事後分析。
+  アリーナも `ARENA_RECORD_DIR` を設定すると候補(A)視点の記録を同形式で出力する
+  （CIでは常時有効で artifact `arena-records` に上がる。真実の全手順つきなので
+  そのまま analyze にかけられる）。
   game:end の全公開棋譜をリプレイし、反則の原因分類（王手解消失敗/飛び込み/経路封鎖/打ちマス）・
   駒得収支・只取られ・損な交換・取り返し逃し・詰み逃しを集計する
 - `cargo build` / `cargo run --release` — 実行には環境変数が必要:

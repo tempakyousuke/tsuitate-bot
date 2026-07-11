@@ -12,7 +12,11 @@ use std::collections::HashSet;
 use std::time::Instant;
 
 use crate::observation::{Observation, ObservationLog};
-use crate::protocol::{ClockState, Color, FoulCounts, GameStatus, PlayerView};
+use crate::protocol::{
+    ClockState, Color, FoulCounts, FoulRecord, GameEndPayload, GameStatus, MoveRecord,
+    OpponentInfo, PlayerView, RatingChange, RatingChangePair,
+};
+use crate::record::GameRecorder;
 use crate::shogi::{Outcome, Position, parse_usi, unpromote_role};
 use crate::strategy::Strategy;
 
@@ -138,15 +142,29 @@ fn make_view(
     }
 }
 
+/// 審判だけが知る対局の真実（全手順・反則試行）。
+/// ARENA_RECORD_DIR 設定時に bin/analyze が読める記録として書き出す
+pub struct GameTruth {
+    pub moves: Vec<MoveRecord>,
+    pub foul_attempts: Vec<FoulRecord>,
+}
+
 /// 1局対戦する。players[0] が先手。
-fn play_game(players: &mut [PlayerState; 2], game_no: u32) -> (GameResult, &'static str, u32) {
+fn play_game(
+    players: &mut [PlayerState; 2],
+    game_no: u32,
+) -> (GameResult, &'static str, u32, GameTruth) {
     let mut pos = Position::initial();
     let idx = |c: Color| if c == Color::Sente { 0usize } else { 1usize };
     let mut plies = 0u32;
+    let mut truth = GameTruth {
+        moves: vec![],
+        foul_attempts: vec![],
+    };
 
     loop {
         if plies >= MAX_PLIES {
-            return (GameResult::Draw, "max_plies", plies);
+            return (GameResult::Draw, "max_plies", plies, truth);
         }
         let side = pos.turn();
         let fouls = [players[0].fouls, players[1].fouls];
@@ -160,10 +178,10 @@ fn play_game(players: &mut [PlayerState; 2], game_no: u32) -> (GameResult, &'sta
         mover.think_us.push(elapsed.as_micros() as u64);
         mover.clock_ms -= elapsed.as_millis() as i64;
         if mover.clock_ms <= 0 {
-            return (GameResult::Win(side.other()), "timeout", plies);
+            return (GameResult::Win(side.other()), "timeout", plies, truth);
         }
         let Some(usi) = choice else {
-            return (GameResult::Win(side.other()), "resign", plies);
+            return (GameResult::Win(side.other()), "resign", plies, truth);
         };
 
         let legal = parse_usi(&usi).is_some_and(|mv| pos.is_legal(&mv));
@@ -177,6 +195,11 @@ fn play_game(players: &mut [PlayerState; 2], game_no: u32) -> (GameResult, &'sta
             }
             mover.foul_tried.insert(usi.clone());
             let foul_count = mover.fouls;
+            truth.foul_attempts.push(FoulRecord {
+                move_number: pos.move_number(),
+                by_color: side,
+                usi: usi.clone(),
+            });
             mover.log.record(Observation::MyFoul {
                 move_number: pos.move_number(),
                 usi,
@@ -185,12 +208,18 @@ fn play_game(players: &mut [PlayerState; 2], game_no: u32) -> (GameResult, &'sta
                 .log
                 .record(Observation::OpponentFoul { count: foul_count });
             if foul_count >= MAX_FOULS {
-                return (GameResult::Win(side.other()), "foul_limit", plies);
+                return (GameResult::Win(side.other()), "foul_limit", plies, truth);
             }
             continue;
         }
 
         let mv = parse_usi(&usi).unwrap();
+        truth.moves.push(MoveRecord {
+            usi: usi.clone(),
+            by_color: side,
+            ms: elapsed.as_millis() as u64,
+            fouls_before: players[idx(side)].fouls,
+        });
         let captured = pos.play_unchecked(&mv);
         plies += 1;
         players[idx(side)].foul_tried.clear();
@@ -220,14 +249,71 @@ fn play_game(players: &mut [PlayerState; 2], game_no: u32) -> (GameResult, &'sta
 
         match pos.outcome() {
             Some(Outcome::Checkmate { winner }) => {
-                return (GameResult::Win(winner), "checkmate", plies);
+                return (GameResult::Win(winner), "checkmate", plies, truth);
             }
             Some(Outcome::Stalemate { winner }) => {
-                return (GameResult::Win(winner), "stalemate", plies);
+                return (GameResult::Win(winner), "stalemate", plies, truth);
             }
             None => {}
         }
     }
+}
+
+/// A視点の対局記録を ARENA_RECORD_DIR に書く（bin/analyze が読める形式）。
+/// 実対局と違い審判が真実を持っているので、end ペイロードの全手順は正確
+fn write_record(
+    dir: &str,
+    game_no: u32,
+    a_is_sente: bool,
+    players: &[PlayerState; 2],
+    result: GameResult,
+    reason: &str,
+    truth: GameTruth,
+) {
+    let a_color = if a_is_sente { Color::Sente } else { Color::Gote };
+    let idx = |c: Color| if c == Color::Sente { 0usize } else { 1usize };
+    let pa = &players[idx(a_color)];
+    let pb = &players[idx(a_color.other())];
+    let mut rec = match GameRecorder::create(
+        dir,
+        &format!("arena-{game_no}"),
+        a_color,
+        pa.strategy.name(),
+    ) {
+        Ok(rec) => rec,
+        Err(e) => {
+            eprintln!("対局記録を作成できません（{dir}）: {e}");
+            return;
+        }
+    };
+    for obs in pa.log.events() {
+        rec.observation(obs);
+    }
+    let result_str = match result {
+        GameResult::Draw => "draw",
+        GameResult::Win(Color::Sente) => "sente_win",
+        GameResult::Win(Color::Gote) => "gote_win",
+    };
+    let zero = RatingChange { before: 0, after: 0 };
+    rec.end(
+        &GameEndPayload {
+            result: result_str.into(),
+            reason: reason.into(),
+            final_sfen: String::new(),
+            moves: truth.moves,
+            foul_attempts: truth.foul_attempts,
+            rating_change: RatingChangePair {
+                you: zero.clone(),
+                opponent: zero,
+            },
+            opponent: OpponentInfo {
+                username: pb.strategy.name().into(),
+                rating: 0,
+                is_bot: true,
+            },
+        },
+        "arena",
+    );
 }
 
 /// 1局ぶんの結果を stats に集計する
@@ -298,6 +384,11 @@ where
     FB: Fn() -> Box<dyn Strategy> + Sync,
 {
     let threads = thread_count().min(games.max(1) as usize);
+    // 設定時は A 視点の対局記録を書き出す（bin/analyze 用。空文字は無効）
+    let record_dir = std::env::var("ARENA_RECORD_DIR")
+        .ok()
+        .filter(|s| !s.is_empty());
+    let record_dir = record_dir.as_deref();
     let mut stats = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
@@ -322,7 +413,10 @@ where
                             (make_b(), make_a())
                         };
                         let mut players = [new_player(sente), new_player(gote)];
-                        let (result, reason, plies) = play_game(&mut players, game_no);
+                        let (result, reason, plies, truth) = play_game(&mut players, game_no);
+                        if let Some(dir) = record_dir {
+                            write_record(dir, game_no, a_is_sente, &players, result, reason, truth);
+                        }
                         record_game(&mut local, a_is_sente, players, result, reason, plies);
                         game_no += threads as u32;
                     }
