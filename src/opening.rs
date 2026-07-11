@@ -38,49 +38,56 @@ const BUILTIN_LINES: [&[&str]; 4] = [
 /// 定跡ラインの読み込み（プロセス内で1回だけ）。
 /// TSUITATE_JOSEKI（既定 joseki.json）の {"lines":[{"name","moves":[usi...]}]} を読む。
 /// パースできない手を含むラインは警告してスキップする
-fn lines() -> &'static Vec<Vec<String>> {
-    static LINES: std::sync::OnceLock<Vec<Vec<String>>> = std::sync::OnceLock::new();
-    LINES.get_or_init(|| {
+fn load() -> &'static (Vec<String>, Vec<Vec<String>>) {
+    static LOADED: std::sync::OnceLock<(Vec<String>, Vec<Vec<String>>)> =
+        std::sync::OnceLock::new();
+    LOADED.get_or_init(|| {
         let path = std::env::var("TSUITATE_JOSEKI").unwrap_or_else(|_| "joseki.json".into());
         if let Ok(content) = std::fs::read_to_string(&path) {
             match serde_json::from_str::<serde_json::Value>(&content) {
                 Ok(v) => {
-                    let loaded: Vec<Vec<String>> = v["lines"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|line| {
-                                    let moves: Vec<String> = line["moves"]
-                                        .as_array()?
-                                        .iter()
-                                        .filter_map(|m| m.as_str().map(String::from))
-                                        .collect();
-                                    if moves.is_empty() || moves.iter().any(|u| parse_usi(u).is_none())
-                                    {
-                                        eprintln!(
-                                            "定跡ラインを解釈できずスキップ: {:?}",
-                                            line["name"]
-                                        );
-                                        return None;
-                                    }
-                                    Some(moves)
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    if !loaded.is_empty() {
-                        return loaded;
+                    let mut names = vec![];
+                    let mut lines = vec![];
+                    for line in v["lines"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+                        let moves: Vec<String> = line["moves"]
+                            .as_array()
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|m| m.as_str().map(String::from))
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        if moves.is_empty() || moves.iter().any(|u| parse_usi(u).is_none()) {
+                            eprintln!("定跡ラインを解釈できずスキップ: {:?}", line["name"]);
+                            continue;
+                        }
+                        names.push(line["name"].as_str().unwrap_or("?").to_string());
+                        lines.push(moves);
+                    }
+                    if !lines.is_empty() {
+                        return (names, lines);
                     }
                     eprintln!("{path} に有効なラインがないため組み込み定跡を使います");
                 }
                 Err(e) => eprintln!("{path} をパースできません（組み込み定跡を使用）: {e}"),
             }
         }
-        BUILTIN_LINES
-            .iter()
-            .map(|l| l.iter().map(|s| s.to_string()).collect())
-            .collect()
+        (
+            (1..=BUILTIN_LINES.len()).map(|i| format!("組み込み{i}")).collect(),
+            BUILTIN_LINES
+                .iter()
+                .map(|l| l.iter().map(|s| s.to_string()).collect())
+                .collect(),
+        )
     })
+}
+
+fn lines() -> &'static Vec<Vec<String>> {
+    &load().1
+}
+
+fn line_names() -> &'static Vec<String> {
+    &load().0
 }
 
 /// USI手を点対称にミラーする（先手ライン → 後手用）
@@ -109,6 +116,28 @@ pub struct OpeningBook {
 }
 
 impl OpeningBook {
+    /// 指定インデックスのラインに固定したブック（定跡特化チューニング用）
+    pub fn with_line(my_color: Color, index: usize) -> Self {
+        let all = lines();
+        let raw = &all[index % all.len()];
+        let line = raw
+            .iter()
+            .filter_map(|usi| match my_color {
+                Color::Sente => Some(usi.clone()),
+                Color::Gote => mirror_usi(usi),
+            })
+            .collect();
+        OpeningBook {
+            line,
+            exited: false,
+        }
+    }
+
+    /// ライン名（joseki.json の name）からインデックスを引く
+    pub fn line_index(name: &str) -> Option<usize> {
+        line_names().iter().position(|n| n == name)
+    }
+
     pub fn new(my_color: Color) -> Self {
         let all = lines();
         // 既定はランダム選択（対局をまたいで人間に順番を読まれないため）。

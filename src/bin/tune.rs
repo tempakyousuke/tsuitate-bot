@@ -14,13 +14,24 @@
 //!   （反復番号も引き継ぐ。最初からやり直すときはファイルを削除する）
 //! - 最後に「最終パラメータ」を出力する。採用は人間が判断し、
 //!   strategy.rs の Default を書き換えてガントレットで確認する
+//!
+//! 環境変数（定跡特化チューニング用）:
+//! - TUNE_LOG: ログファイルのパス（既定 tune-log.jsonl。実験ごとに分ける）
+//! - TUNE_CANDIDATE_LINE: 候補側の定跡をこのライン名に固定する
+//!   （例: 居飛車速攻。基準側を固定するには estimator_rush を基準に指定する）
 
 use rand::Rng;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 
+use tsuitate_bot::opening::OpeningBook;
 use tsuitate_bot::selfplay::run_match_with;
 use tsuitate_bot::strategy::{self, EstimatorStrategy, EvalParams};
+
+/// ログファイルのパス（実験ごとに分けられる）
+fn log_path() -> String {
+    std::env::var("TUNE_LOG").unwrap_or_else(|_| "tune-log.jsonl".into())
+}
 
 /// 正規化座標 u ∈ [0,1]^d とパラメータの相互変換
 fn to_params(u: &[f64]) -> EvalParams {
@@ -41,13 +52,23 @@ fn to_unit(params: &EvalParams) -> Vec<f64> {
 }
 
 /// スコア率（勝ち1 / 引き分け0.5）を基準戦略ごとに測って平均する
-fn fitness(params: &EvalParams, games_per_eval: u32, baselines: &[String]) -> f64 {
+fn fitness(
+    params: &EvalParams,
+    games_per_eval: u32,
+    baselines: &[String],
+    candidate_line: Option<usize>,
+) -> f64 {
     let per = (games_per_eval / baselines.len() as u32).max(2);
     let mut total = 0.0;
     for baseline in baselines {
         let stats = run_match_with(
             per,
-            &|| Box::new(EstimatorStrategy::with_params(params.clone())),
+            &|| {
+                Box::new(EstimatorStrategy::with_params_and_line(
+                    params.clone(),
+                    candidate_line,
+                ))
+            },
             &|| strategy::make(baseline).expect("検証済みの戦略名"),
         );
         total += stats.score_rate();
@@ -88,7 +109,7 @@ fn params_from_json(v: &serde_json::Value) -> Option<EvalParams> {
 
 /// tune-log.jsonl の最後の反復から（次の反復番号, θ）を復元する
 fn resume_state() -> Option<(u32, EvalParams)> {
-    let content = std::fs::read_to_string("tune-log.jsonl").ok()?;
+    let content = std::fs::read_to_string(log_path()).ok()?;
     let mut last: Option<(u32, EvalParams)> = None;
     for line in content.lines() {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
@@ -123,6 +144,21 @@ fn main() {
         }
     }
 
+    // 候補側の定跡固定（定跡特化チューニング）
+    let candidate_line = match std::env::var("TUNE_CANDIDATE_LINE") {
+        Ok(name) => match OpeningBook::line_index(&name) {
+            Some(idx) => {
+                println!("候補側の定跡を「{name}」に固定します");
+                Some(idx)
+            }
+            None => {
+                eprintln!("定跡ライン「{name}」が joseki.json にありません");
+                std::process::exit(1);
+            }
+        },
+        Err(_) => None,
+    };
+
     // SPSA係数（正規化座標）。c0: 摂動幅（範囲の8%）、a0/A/α/γ: 標準的な減衰
     let c0 = 0.08;
     let a0 = 0.15;
@@ -148,8 +184,8 @@ fn main() {
     let mut log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open("tune-log.jsonl")
-        .expect("tune-log.jsonl を開けない");
+        .open(log_path())
+        .expect("チューニングログを開けない");
 
     println!(
         "SPSA開始: 反復{start_k}〜{iterations} × 2評価 × {games_per_eval}局, 基準 {baselines:?}, {d}次元"
@@ -189,8 +225,8 @@ fn main() {
 
         let p_plus = to_params(&u_plus);
         let p_minus = to_params(&u_minus);
-        let f_plus = fitness(&p_plus, games_per_eval, &baselines);
-        let f_minus = fitness(&p_minus, games_per_eval, &baselines);
+        let f_plus = fitness(&p_plus, games_per_eval, &baselines, candidate_line);
+        let f_minus = fitness(&p_minus, games_per_eval, &baselines, candidate_line);
 
         // 勾配上昇（最大化）。Δ_i = ±1 なので 1/Δ_i = Δ_i
         let g = (f_plus - f_minus) / (2.0 * ck);

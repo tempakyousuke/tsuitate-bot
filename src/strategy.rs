@@ -49,6 +49,14 @@ pub fn make(name: &str) -> Option<Box<dyn Strategy>> {
         "estimator" => Some(Box::new(EstimatorStrategy::new())),
         // Claude（対話セッション）が直接指す実験用（bridge.rs）。アリーナでは使わない
         "bridge" => Some(Box::new(crate::bridge::FileBridge::new())),
+        // 定跡特化チューニングの基準用: 居飛車速攻ラインだけを指す現行estimator
+        "estimator_rush" => {
+            let idx = OpeningBook::line_index("居飛車速攻")?;
+            Some(Box::new(EstimatorStrategy::with_params_and_line(
+                EvalParams::default(),
+                Some(idx),
+            )))
+        }
         "estimator_v2" => Some(Box::new(crate::frozen::estimator_v2::EstimatorV2::new())),
         "estimator_v3" => Some(Box::new(crate::frozen::estimator_v3::EstimatorV3::new())),
         "estimator_v4" => Some(Box::new(crate::frozen::estimator_v4::EstimatorV4::new())),
@@ -366,6 +374,8 @@ impl EvalParams {
 pub struct EstimatorStrategy {
     est: Option<Estimator>,
     book: Option<OpeningBook>,
+    /// Some なら定跡をこのラインに固定する（定跡特化チューニング用）
+    book_line: Option<usize>,
     params: EvalParams,
     /// 直近の choose 時点の内部状態（記録用）
     last_debug: Option<serde_json::Value>,
@@ -378,9 +388,15 @@ impl EstimatorStrategy {
 
     /// パラメータを差し替えて作る（bin/tune.rs のSPSA評価用）
     pub fn with_params(params: EvalParams) -> Self {
+        Self::with_params_and_line(params, None)
+    }
+
+    /// パラメータと定跡ライン固定を指定して作る（定跡特化チューニング用）
+    pub fn with_params_and_line(params: EvalParams, book_line: Option<usize>) -> Self {
         EstimatorStrategy {
             est: None,
             book: None,
+            book_line,
             params,
             last_debug: None,
         }
@@ -406,9 +422,11 @@ impl Strategy for EstimatorStrategy {
         est.update(log);
 
         // 序盤定跡（静かな間だけ）。ブック中も推定器の update は回して粒子を保つ
-        let book = self
-            .book
-            .get_or_insert_with(|| OpeningBook::new(view.your_color));
+        let book_line = self.book_line;
+        let book = self.book.get_or_insert_with(|| match book_line {
+            Some(idx) => OpeningBook::with_line(view.your_color, idx),
+            None => OpeningBook::new(view.your_color),
+        });
         if let Some(usi) = book.next(view, log, foul_tried) {
             return Some(usi);
         }
