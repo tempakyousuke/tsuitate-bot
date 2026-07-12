@@ -18,7 +18,7 @@ use crate::estimator::{Estimator, predict_opp_reply};
 use crate::opening::OpeningBook;
 use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{Color, PlayerView, Role};
-use crate::shogi::{Position, ShogiMove, parse_usi, piece_value};
+use crate::shogi::{Position, ShogiMove, parse_usi, piece_value, unpromote_role};
 
 /// 1インスタンス = 1対局。対局開始ごとに `make` で作り直す。
 pub trait Strategy {
@@ -156,6 +156,45 @@ const DEPTH2_CHECK_PEN: f64 = 0.3;
 const DEPTH2_MATE_PEN: f64 = 30.0;
 /// 取り返し補償の割引（取り返し自体がさらに取り返されるリスクの近似）
 const DEPTH2_RECAP_DISCOUNT: f64 = 0.7;
+
+/// アンチドロー（終盤の寄せ）: 増幅を始める手数（plies）
+const ANTI_DRAW_START: f64 = 60.0;
+/// 増幅が最大になる手数。アリーナの手数上限200の手前で全開にする
+const ANTI_DRAW_FULL: f64 = 160.0;
+/// リードの正規化単位（歩換算。8 ≒ 飛車1枚のリードでほぼフル増幅）
+const ANTI_DRAW_LEAD_UNIT: f64 = 8.0;
+
+/// 終盤の攻め増幅係数。手数が進むほど・素材リードがあるほど大きくなる。
+/// 互角でも弱く掛けて膠着を破りにいくが、負けているときは掛けない
+/// （負けているときの引き分けは0.5勝ぶんの価値がある）
+fn endgame_push(move_number: u32, lead: f64) -> f64 {
+    let ramp = ((f64::from(move_number) - ANTI_DRAW_START) / (ANTI_DRAW_FULL - ANTI_DRAW_START))
+        .clamp(0.0, 1.0);
+    (ramp * (0.3 + (lead / ANTI_DRAW_LEAD_UNIT).clamp(-0.3, 1.2))).max(0.0)
+}
+
+/// 観測から確実に分かる素材リード（歩換算・相対値）。
+/// 自分の駒の増減は取った駒（持ち駒に入る）と取られた駒を両方含み、
+/// 相手側は鏡像（自分が+vなら相手は-v）なので、リード = 自分の変化×2。
+/// 成りは基本駒種で数える（成駒を取った得は過小評価だが単調な信号としては十分）
+fn material_lead(view: &PlayerView) -> f64 {
+    let current: f64 = view
+        .your_pieces
+        .iter()
+        .map(|p| piece_value(unpromote_role(p.role)))
+        .sum::<f64>()
+        + view
+            .your_hand
+            .iter()
+            .map(|(r, n)| piece_value(*r) * f64::from(*n))
+            .sum::<f64>();
+    let initial: f64 = Position::initial()
+        .pieces()
+        .filter(|(_, p)| p.color == view.your_color)
+        .map(|(_, p)| piece_value(p.role))
+        .sum();
+    2.0 * (current - initial)
+}
 
 /// evaluate() の結果。2手読みの再評価に必要な内訳つき
 struct EvalOut {
@@ -540,6 +579,21 @@ impl Strategy for EstimatorStrategy {
             }
         }
 
+        // アンチドロー: 終盤にリードがあるほど攻め項を増幅して膠着を破る。
+        // 手戻り/シャッフルの減点も同時に強めて「その場で回る」手を締め出す
+        let push = endgame_push(view.move_number, material_lead(view));
+        let params = {
+            let mut p = self.params.clone();
+            if push > 0.0 {
+                p.check_bonus *= 1.0 + push;
+                p.attack_w *= 1.0 + push;
+                p.advance_w *= 1.0 + 0.5 * push;
+                p.backtrack_penalty *= 1.0 + push;
+                p.shuffle_penalty *= 1.0 + push;
+            }
+            p
+        };
+
         let mut rng = rand::rng();
         // 1段目: 全候補を1手読み（静的リスク項つき）で評価する
         let mut scored: Vec<(String, ShogiMove, EvalOut, f64)> = vec![];
@@ -553,7 +607,7 @@ impl Strategy for EstimatorStrategy {
                     None => in_check_prior(view, &mv),
                 };
             }
-            let out = evaluate(view, &mv, &sample, prior, &known, &self.params);
+            let out = evaluate(view, &mv, &sample, prior, &known, &params);
             let mut score = out.score + rng.random_range(0.0..0.01);
             // 手戻り（直前の手をそのまま逆に戻す）は膠着の典型なので減点。
             // 直前に動かした駒をまた動かすだけの手も雑なシャッフルとして軽く減点
@@ -563,9 +617,9 @@ impl Strategy for EstimatorStrategy {
             ) = (last_my_move, mv)
             {
                 if from == pt && to == pf {
-                    score -= self.params.backtrack_penalty;
+                    score -= params.backtrack_penalty;
                 } else if from == pt {
-                    score -= self.params.shuffle_penalty;
+                    score -= params.shuffle_penalty;
                 }
             }
             scored.push((usi, mv, out, score));
@@ -585,7 +639,7 @@ impl Strategy for EstimatorStrategy {
                     &known,
                     &my_capture_squares,
                     &my_touched_squares,
-                    &self.params,
+                    &params,
                     &mut rng,
                 );
                 score + out.p_legal * DEPTH2_REPLACE * (out.risk_mean + delta)
@@ -597,7 +651,7 @@ impl Strategy for EstimatorStrategy {
             }
         }
 
-        self.last_debug = Some(debug_summary(est, &sample));
+        self.last_debug = Some(debug_summary(est, &sample, push));
         best.map(|(usi, _)| usi)
     }
 
@@ -612,7 +666,7 @@ impl Strategy for EstimatorStrategy {
 
 /// 記録用の推定サマリ: 粒子の健全性・ユニーク数・相手玉の位置分布（上位）。
 /// 事後分析で「推定が外れていたのか、評価が悪かったのか」を切り分けるために残す
-fn debug_summary(est: &Estimator, sample: &[(&Position, f64)]) -> serde_json::Value {
+fn debug_summary(est: &Estimator, sample: &[(&Position, f64)], push: f64) -> serde_json::Value {
     let opp = est.my_color().other();
     let mut king_votes: HashMap<Coord, u32> = HashMap::new();
     for (pos, _) in sample {
@@ -637,6 +691,7 @@ fn debug_summary(est: &Estimator, sample: &[(&Position, f64)]) -> serde_json::Va
         "healthy": est.healthy(),
         "unique_particles": sample.len(),
         "soft_particles": est.penalties().iter().filter(|&&p| p > 0).count(),
+        "endgame_push": (push * 100.0).round() / 100.0,
         "opp_king_top": opp_king_top,
     })
 }
@@ -1315,6 +1370,48 @@ pub(crate) mod tests {
             opponent_in_check: false,
             status: GameStatus::Playing,
         }
+    }
+
+    #[test]
+    fn endgame_push_ramps_with_moves_and_lead() {
+        // 序盤は掛けない
+        assert_eq!(endgame_push(1, 10.0), 0.0);
+        assert_eq!(endgame_push(59, 10.0), 0.0);
+        // 終盤リードありで強く掛かる
+        assert!(endgame_push(160, ANTI_DRAW_LEAD_UNIT) > 1.0);
+        // 互角でも弱く掛けて膠着を破りにいく
+        let even = endgame_push(160, 0.0);
+        assert!(even > 0.0 && even < 0.5, "even={even}");
+        // 負けているときは掛けない（引き分けは0.5勝の価値）
+        assert_eq!(endgame_push(160, -10.0), 0.0);
+        // 手数で単調増加
+        assert!(endgame_push(100, 8.0) < endgame_push(160, 8.0));
+    }
+
+    #[test]
+    fn material_lead_is_relative_and_symmetric() {
+        let initial_pieces: Vec<VisiblePiece> = Position::initial()
+            .pieces()
+            .filter(|(_, p)| p.color == Color::Sente)
+            .map(|(sq, p)| VisiblePiece {
+                square: crate::board::make_usi_square(sq),
+                role: p.role,
+            })
+            .collect();
+        // 歩を1枚取った（持ち駒+1、盤上そのまま）→ 相対リード+2
+        let mut hand = HashMap::new();
+        hand.insert(Role::Pawn, 1);
+        let view = minimal_view(initial_pieces.clone(), hand);
+        assert!((material_lead(&view) - 2.0).abs() < 1e-9);
+        // 飛車を1枚失った → 相対リードは飛車価値の2倍のマイナス
+        // （相手の持ち駒に飛車が入るぶんも含む）
+        let without_rook: Vec<VisiblePiece> = initial_pieces
+            .into_iter()
+            .filter(|p| p.role != Role::Rook)
+            .collect();
+        let view = minimal_view(without_rook, HashMap::new());
+        let expected = -2.0 * piece_value(Role::Rook);
+        assert!((material_lead(&view) - expected).abs() < 1e-9);
     }
 
     #[test]
