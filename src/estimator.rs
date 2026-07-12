@@ -534,6 +534,63 @@ fn sample_opp_move(
     true
 }
 
+/// 露見マス（自分が駒を取った=相手に通知されたマス）での取り返しブースト。
+/// 事前分布のフィットでは駒取りは観測条件で絞られるため学習されていない。
+/// 対人実戦では露見駒の回収はほぼ必ず実行されるので予測では強く優先する
+const PREDICT_RECAPTURE_BOOST: f64 = 8.0;
+
+/// 相手の応手を事前分布モデルで1手サンプルする（2手読み用の予測）。
+/// sample_opp_move と同じ尤度モデルだが、これから指される手の予測なので
+/// 観測（取られたマス・王手宣言）による絞り込みは行わない。
+/// known_squares / my_touched の意味は sample_opp_move と同じ
+pub fn predict_opp_reply<R: Rng>(
+    pos: &Position,
+    my_color: Color,
+    known_squares: &[Coord],
+    my_touched: &[Coord],
+    rng: &mut R,
+) -> Option<ShogiMove> {
+    let opp = my_color.other();
+    if pos.turn() != opp {
+        return None;
+    }
+    let initial = Position::initial();
+    let homes: Vec<Coord> = initial
+        .pieces()
+        .filter(|(sq, p)| {
+            p.color == my_color
+                && !my_touched.contains(sq)
+                && pos
+                    .piece_at(*sq)
+                    .is_some_and(|cur| cur.color == my_color && cur.role == p.role)
+        })
+        .map(|(sq, _)| sq)
+        .collect();
+    let mut candidates: Vec<(ShogiMove, f64)> = vec![];
+    for mv in pos.legal_moves() {
+        let mut next = pos.clone();
+        next.play_unchecked(&mv);
+        let threat_known = newly_threatens(pos, &next, &mv, known_squares);
+        let threat_home = newly_threatens(pos, &next, &mv, &homes);
+        let (is_king, flee) = match mv {
+            ShogiMove::Board { from, to, .. } => {
+                let is_king = pos.piece_at(from).is_some_and(|p| p.role == Role::King);
+                (is_king, is_king && flees_danger(from, to, known_squares))
+            }
+            ShogiMove::Drop { .. } => (false, false),
+        };
+        let mut w = opp_move_weight(opp, &mv, threat_known, threat_home, is_king, flee);
+        if let ShogiMove::Board { to, .. } = mv {
+            let captures_mine = pos.piece_at(to).is_some_and(|p| p.color == my_color);
+            if captures_mine && known_squares.contains(&to) {
+                w *= PREDICT_RECAPTURE_BOOST;
+            }
+        }
+        candidates.push((mv, w));
+    }
+    weighted_choice(&candidates, rng)
+}
+
 /// チェビシェフ距離（玉の歩数）
 fn dist(a: Coord, b: Coord) -> i8 {
     (a.file - b.file).abs().max((a.rank - b.rank).abs())
@@ -591,7 +648,7 @@ fn opp_move_weight(
     s.exp()
 }
 
-fn weighted_choice(candidates: &[(ShogiMove, f64)], rng: &mut StdRng) -> Option<ShogiMove> {
+fn weighted_choice<R: Rng>(candidates: &[(ShogiMove, f64)], rng: &mut R) -> Option<ShogiMove> {
     let total: f64 = candidates.iter().map(|(_, w)| w).sum();
     if candidates.is_empty() || total <= 0.0 {
         return None;
@@ -760,6 +817,19 @@ mod tests {
         est.replenish();
         assert!(est.healthy(), "リプレイで再生成できるはず");
         assert_eq!(est.particles().len(), TARGET_PARTICLES);
+    }
+
+    #[test]
+    fn predict_opp_reply_returns_legal_move() {
+        let mut rng = StdRng::seed_from_u64(3);
+        let mut pos = Position::initial();
+        pos.play_unchecked(&parse_usi("7g7f").unwrap());
+        let reply = predict_opp_reply(&pos, Color::Sente, &[], &[], &mut rng)
+            .expect("初期局面の相手に応手がないはずはない");
+        assert!(pos.is_legal(&reply));
+        // 手番が自分側の局面では予測しない
+        let initial = Position::initial();
+        assert!(predict_opp_reply(&initial, Color::Sente, &[], &[], &mut rng).is_none());
     }
 
     #[test]

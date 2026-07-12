@@ -14,7 +14,7 @@ use crate::board::{
     parse_usi_square, promotion_choice,
 };
 use crate::check::CheckSolver;
-use crate::estimator::Estimator;
+use crate::estimator::{Estimator, predict_opp_reply};
 use crate::opening::OpeningBook;
 use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{Color, PlayerView, Role};
@@ -142,6 +142,29 @@ const EVAL_PARTICLES: usize = 192;
 
 /// ソフト救済された粒子の評価重み（0.5^penalty）。厳密整合の粒子=1.0
 const SOFT_PARTICLE_DECAY: f64 = 0.5;
+
+/// 2手読み（相手応手のサンプル再評価）を行う上位候補数。
+/// 1手読みの静的リスク項は近似なので、有望手だけ実際の応手分布で検算する
+const DEPTH2_TOP_K: usize = 8;
+/// 2手読みに使う粒子数（1候補あたり）。応手の合法手列挙が重いので絞る
+const DEPTH2_PARTICLES: usize = 48;
+/// 静的リスク項をサンプル実測に置き換える割合（0=従来、1=全面置換）
+const DEPTH2_REPLACE: f64 = 0.7;
+/// 応手で王手を掛けられた場合のペナルティ（王手中は反則リスクが跳ねる）
+const DEPTH2_CHECK_PEN: f64 = 0.3;
+/// 応手で詰まされる場合のペナルティ
+const DEPTH2_MATE_PEN: f64 = 30.0;
+/// 取り返し補償の割引（取り返し自体がさらに取り返されるリスクの近似）
+const DEPTH2_RECAP_DISCOUNT: f64 = 0.7;
+
+/// evaluate() の結果。2手読みの再評価に必要な内訳つき
+struct EvalOut {
+    score: f64,
+    /// 静的な取られリスク項（mover/hidden の max）の粒子加重平均。
+    /// 2手読みがこの分をサンプル実測で置き換える
+    risk_mean: f64,
+    p_legal: f64,
+}
 
 /// evaluate() まわりの調整可能パラメータ。Default が現行の手調整値。
 /// bin/tune.rs の SPSA がこれを最適化する（凍結版は各自のコピーを持ち依存しない）
@@ -496,8 +519,30 @@ impl Strategy for EstimatorStrategy {
         // 相手が位置を知っている自駒（露出）の地図
         let known = knownness_map(view, log, self.params.home_knownness);
 
+        // 2手読み用: 自分が駒を取ったマス（露見）と自分の手が触れたマス
+        // （estimator の my_capture_sq / my_touched_sq と同じ定義）
+        let mut my_capture_squares: Vec<Coord> = vec![];
+        let mut my_touched_squares: Vec<Coord> = vec![];
+        for e in log.events() {
+            if let Observation::MyMove { usi, captured, .. } = e {
+                if let Some(mv) = parse_usi(usi) {
+                    let to = match mv {
+                        ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+                    };
+                    if captured.is_some() {
+                        my_capture_squares.push(to);
+                    }
+                    if let ShogiMove::Board { from, .. } = mv {
+                        my_touched_squares.push(from);
+                    }
+                    my_touched_squares.push(to);
+                }
+            }
+        }
+
         let mut rng = rand::rng();
-        let mut best: Option<(String, f64)> = None;
+        // 1段目: 全候補を1手読み（静的リスク項つき）で評価する
+        let mut scored: Vec<(String, ShogiMove, EvalOut, f64)> = vec![];
         for (usi, mv) in candidates {
             let mut prior = prior_legal(view, &mv, opp_board_n);
             if view.you_in_check {
@@ -508,8 +553,8 @@ impl Strategy for EstimatorStrategy {
                     None => in_check_prior(view, &mv),
                 };
             }
-            let mut score = evaluate(view, &mv, &sample, prior, &known, &self.params)
-                + rng.random_range(0.0..0.01);
+            let out = evaluate(view, &mv, &sample, prior, &known, &self.params);
+            let mut score = out.score + rng.random_range(0.0..0.01);
             // 手戻り（直前の手をそのまま逆に戻す）は膠着の典型なので減点。
             // 直前に動かした駒をまた動かすだけの手も雑なシャッフルとして軽く減点
             if let (
@@ -523,8 +568,32 @@ impl Strategy for EstimatorStrategy {
                     score -= self.params.shuffle_penalty;
                 }
             }
-            if best.as_ref().is_none_or(|(_, s)| score > *s) {
-                best = Some((usi, score));
+            scored.push((usi, mv, out, score));
+        }
+
+        // 2段目: 上位候補だけ相手の応手をサンプルして再評価。
+        // 静的リスク項の DEPTH2_REPLACE 分を実測の期待損失で置き換える
+        // （risk_mean を足し戻し、サンプルの delta を足す。両者が一致するなら無変化）
+        scored.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+        let mut best: Option<(String, f64)> = None;
+        for (i, (usi, mv, out, score)) in scored.into_iter().enumerate() {
+            let final_score = if i < DEPTH2_TOP_K {
+                let delta = depth2_delta(
+                    view,
+                    &mv,
+                    &sample,
+                    &known,
+                    &my_capture_squares,
+                    &my_touched_squares,
+                    &self.params,
+                    &mut rng,
+                );
+                score + out.p_legal * DEPTH2_REPLACE * (out.risk_mean + delta)
+            } else {
+                score
+            };
+            if best.as_ref().is_none_or(|(_, s)| final_score > *s) {
+                best = Some((usi, final_score));
             }
         }
 
@@ -781,11 +850,12 @@ fn evaluate(
     prior: f64,
     known: &HashMap<Coord, f64>,
     params: &EvalParams,
-) -> f64 {
+) -> EvalOut {
     let me = view.your_color;
     let opp = me.other();
     let mut legal = 0.0f64;
     let mut value_sum = 0.0;
+    let mut risk_sum = 0.0;
     // 着地マスに敵駒がいた（=駒を取れた）粒子の重み。探索ボーナスの不一致度に使う
     let mut capture_hits = 0.0f64;
     // 王周辺の圧力は粒子間の分散が小さいわりに計算が重い（9マス×利き走査）ので
@@ -872,7 +942,9 @@ fn evaluate(
         let mover_risk =
             mover_w * recapture_risk(&next, me, to, params.recapture_defended).max(floor);
         let hidden_risk = exposed_capture_risk(&next, me, Some(to), known, params);
-        v -= mover_risk.max(hidden_risk);
+        let risk = mover_risk.max(hidden_risk);
+        v -= risk;
+        risk_sum += w * risk;
 
         // 自分が敵駒に当たりを付けている価値（露出リスクの鏡像）。
         // 1手読みでは見えない「次の駒得」を作る手（大駒の頭への歩打ち等）に価値を与える
@@ -946,7 +1018,95 @@ fn evaluate(
     // 選ばれてしまう。反則しても手番は残るので悪い局面からは逃げられず、
     // 反則の価値は「次善手の価値 − 反則コスト」でしかない
     let gain = expected + advance_bias + development;
-    (p_legal * gain).min(gain) - (1.0 - p_legal) * foul_cost
+    EvalOut {
+        score: (p_legal * gain).min(gain) - (1.0 - p_legal) * foul_cost,
+        risk_mean: if legal > 0.0 { risk_sum / legal } else { 0.0 },
+        p_legal,
+    }
+}
+
+/// 2手読み: 候補手の後に相手の応手を粒子上でサンプルし、実測の期待損失
+/// （露見度で割引した駒損 − 取り返し補償、被王手/被詰みペナルティ）を返す。
+/// 静的リスク項（EvalOut::risk_mean）の置き換え先。値は「加点」方向（通常は負）
+#[allow(clippy::too_many_arguments)]
+fn depth2_delta(
+    view: &PlayerView,
+    mv: &ShogiMove,
+    particles: &[(&Position, f64)],
+    known: &HashMap<Coord, f64>,
+    my_captures: &[Coord],
+    my_touched: &[Coord],
+    params: &EvalParams,
+    rng: &mut impl rand::Rng,
+) -> f64 {
+    let me = view.your_color;
+    let to = match *mv {
+        ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+    };
+    let mut sum = 0.0;
+    let mut n = 0.0;
+    for (pos, w) in particles.iter().take(DEPTH2_PARTICLES) {
+        if !pos.is_legal(mv) {
+            continue;
+        }
+        let mut next = (*pos).clone();
+        let my_capture = next.play_unchecked(mv);
+        let gives_check = next.in_check(me.other());
+        n += w;
+        let Some(reply) = predict_opp_reply(&next, me, my_captures, my_touched, rng) else {
+            continue; // 応手なし（詰み/ステイルメイト）は stage1 のボーナス側で評価済み
+        };
+        let reply_to = match reply {
+            ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+        };
+        let lost = next
+            .piece_at(reply_to)
+            .filter(|p| p.color == me)
+            .map(|p| piece_value(p.role))
+            .unwrap_or(0.0);
+        let mut next2 = next.clone();
+        next2.play_unchecked(&reply);
+        let mut d = 0.0;
+        if lost > 0.0 {
+            // 露見度スケール: 着手駒は stage1 の mover_w と同じ規則、
+            // それ以外の駒は exposed_capture_risk と同じ knownness 重み。
+            // 粒子上の応手はこちらの駒が全部見えてしまうので、実戦で相手が
+            // その取りを狙える確率で割り引く（情報非対称の担保）
+            let scale = if reply_to == to {
+                let mut s = if my_capture.is_some() {
+                    params.mover_w_captured
+                } else {
+                    params.mover_w_quiet
+                };
+                if gives_check {
+                    s = s.max(params.mover_w_check);
+                }
+                s
+            } else {
+                let knownness = known.get(&reply_to).copied().unwrap_or(0.0);
+                params.exposed_base + params.exposed_known * knownness
+            };
+            // 取り返し補償: 応手の駒に自分の利きが残っていれば取り返せる
+            let comp = if !next2.in_check(me) && next2.is_attacked(reply_to, me) {
+                DEPTH2_RECAP_DISCOUNT
+                    * next2
+                        .piece_at(reply_to)
+                        .map(|p| piece_value(p.role))
+                        .unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            d -= scale * (lost - comp).max(0.0);
+        }
+        if next2.in_check(me) {
+            d -= DEPTH2_CHECK_PEN;
+            if next2.legal_moves().is_empty() {
+                d -= DEPTH2_MATE_PEN;
+            }
+        }
+        sum += w * d;
+    }
+    if n > 0.0 { sum / n } else { 0.0 }
 }
 
 /// この手の後も初期位置に残っている自分の大駒（飛・角）の枚数
