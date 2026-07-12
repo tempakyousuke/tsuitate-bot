@@ -17,8 +17,8 @@ use crate::check::CheckSolver;
 use crate::estimator::{Estimator, predict_opp_reply};
 use crate::opening::OpeningBook;
 use crate::observation::{Observation, ObservationLog};
-use crate::protocol::{Color, PlayerView, Role};
-use crate::shogi::{Position, ShogiMove, parse_usi, piece_value, unpromote_role};
+use crate::protocol::{Color, PlayerView, Role, VisiblePiece};
+use crate::shogi::{Position, ShogiMove, parse_usi, piece_value, promote_role, unpromote_role};
 
 /// 1インスタンス = 1対局。対局開始ごとに `make` で作り直す。
 pub trait Strategy {
@@ -161,6 +161,67 @@ const DEPTH2_RECAP_DISCOUNT: f64 = 0.7;
 /// 有無で相手玉の位置仮説が絞れる（capture の info_bonus の玉位置版）。
 /// 互角膠着の引き分け対策: 玉が見つからないと詰みも王手攻めも始まらない
 const KING_PROBE_BONUS: f64 = 0.4;
+
+/// 利き被覆1マスあたりの加点。広く索敵できる陣形への勾配で、
+/// 歩→と金の成り（利き1→6マス）にも自然に価値がつく
+const COVERAGE_W: f64 = 0.02;
+/// 成れる圏内への歩打ちのと金ポテンシャル加点
+const TOKIN_PROBE_W: f64 = 0.25;
+
+/// 駒交換で動く価値: 盤上価値と持ち駒価値（基本駒種）の平均。
+/// 素の駒は piece_value と一致し、成駒は取られても相手の持ち駒に入るのは
+/// 基本駒種ぶんなので割り引かれる（と金を取り返された反動 = (6+1)/2 = 3.5）。
+/// 逆に成駒を取る側の得も同じ理由で割り引く
+fn exchange_value(role: Role) -> f64 {
+    (piece_value(role) + piece_value(unpromote_role(role))) / 2.0
+}
+
+/// 着手後の自駒の利き被覆マス数（自分に見える盤面だけの近似）。
+/// 相手の駒は見えないため飛び駒は自駒にだけ遮られる楽観値
+fn coverage_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
+    let mut pieces: Vec<VisiblePiece> = view.your_pieces.clone();
+    match *mv {
+        ShogiMove::Board { from, to, promote } => {
+            let from_usi = make_usi_square(from);
+            let Some(p) = pieces.iter_mut().find(|p| p.square == from_usi) else {
+                return 0.0;
+            };
+            if promote {
+                if let Some(r) = promote_role(p.role) {
+                    p.role = r;
+                }
+            }
+            p.square = make_usi_square(to);
+        }
+        ShogiMove::Drop { role, to } => pieces.push(VisiblePiece {
+            square: make_usi_square(to),
+            role,
+        }),
+    }
+    let mut covered: HashSet<Coord> = HashSet::new();
+    for p in &pieces {
+        covered.extend(move_targets(&pieces, p, view.your_color));
+    }
+    covered.len() as f64
+}
+
+/// 持ち駒の歩を成れる圏内（敵陣＋一段手前）へ打つ手のと金ポテンシャル。
+/// 打った直後の利きは1マスだが、次に成れば利きが6マスへ広がる索敵ユニットになり、
+/// 取り返されても相手に渡るのは歩1枚で反動が最小
+fn tokin_probe(view: &PlayerView, mv: &ShogiMove) -> f64 {
+    let ShogiMove::Drop {
+        role: Role::Pawn,
+        to,
+    } = *mv
+    else {
+        return 0.0;
+    };
+    let depth_from_back = match view.your_color {
+        Color::Sente => to.rank,
+        Color::Gote => 10 - to.rank,
+    };
+    if depth_from_back <= 4 { TOKIN_PROBE_W } else { 0.0 }
+}
 
 /// アンチドロー（終盤の寄せ）: 増幅を始める手数（plies）
 const ANTI_DRAW_START: f64 = 60.0;
@@ -941,7 +1002,7 @@ fn evaluate(
         if let ShogiMove::Board { to, .. } = *mv {
             if let Some(p) = pos.piece_at(to) {
                 if p.color == opp {
-                    captured_value = piece_value(p.role);
+                    captured_value = exchange_value(p.role);
                 }
             }
         }
@@ -989,7 +1050,7 @@ fn evaluate(
         }
         let own_after = next
             .piece_at(to)
-            .map(|p| piece_value(p.role))
+            .map(|p| exchange_value(p.role))
             .unwrap_or(0.0);
         let known_factor = if captured_value > 0.0 {
             1.0
@@ -1080,11 +1141,16 @@ fn evaluate(
     // 動かす手だけペナルティが軽くなるので、展開への勾配になる
     let development = -params.big_home_penalty * big_home_after(view, mv);
 
+    // 利き被覆（広い索敵網）と、成れる圏内への歩打ち（と金ポテンシャル）。
+    // どちらも粒子に依存しない自明な情報だけで計算できる
+    let coverage = COVERAGE_W * coverage_after(view, mv);
+    let probe = tokin_probe(view, mv);
+
     // 期待値が負の手を p_legal で割り引かない（min の形）。
     // 割り引くと「合法確率が低いほどスコアが高い」= わざと反則に寄る手が
     // 選ばれてしまう。反則しても手番は残るので悪い局面からは逃げられず、
     // 反則の価値は「次善手の価値 − 反則コスト」でしかない
-    let gain = expected + advance_bias + development;
+    let gain = expected + advance_bias + development + coverage + probe;
     EvalOut {
         score: (p_legal * gain).min(gain) - (1.0 - p_legal) * foul_cost,
         risk_mean: if legal > 0.0 { risk_sum / legal } else { 0.0 },
@@ -1129,7 +1195,7 @@ fn depth2_delta(
         let lost = next
             .piece_at(reply_to)
             .filter(|p| p.color == me)
-            .map(|p| piece_value(p.role))
+            .map(|p| exchange_value(p.role))
             .unwrap_or(0.0);
         let mut next2 = next.clone();
         next2.play_unchecked(&reply);
@@ -1158,7 +1224,7 @@ fn depth2_delta(
                 DEPTH2_RECAP_DISCOUNT
                     * next2
                         .piece_at(reply_to)
-                        .map(|p| piece_value(p.role))
+                        .map(|p| exchange_value(p.role))
                         .unwrap_or(0.0)
             } else {
                 0.0
@@ -1214,7 +1280,7 @@ fn threat_value(pos: &Position, me: Color) -> f64 {
             continue;
         }
         let defended = pos.is_attacked(sq, opp);
-        let gain = piece_value(piece.role) * if defended { 0.45 } else { 1.0 };
+        let gain = exchange_value(piece.role) * if defended { 0.45 } else { 1.0 };
         best = best.max(gain);
     }
     best
@@ -1231,7 +1297,7 @@ fn recapture_risk(pos: &Position, me: Color, to: Coord, defended_discount: f64) 
         return 0.0;
     }
     let defended = pos.is_attacked(to, me);
-    piece_value(piece.role) * if defended { defended_discount } else { 1.0 }
+    exchange_value(piece.role) * if defended { defended_discount } else { 1.0 }
 }
 
 /// 次の相手番で失いうる駒の概算: 相手の利きが当たっている自駒の最大重み付き価値。
@@ -1262,7 +1328,7 @@ fn exposed_capture_risk(
         let defended = pos.is_attacked(sq, me);
         let knownness = known.get(&sq).copied().unwrap_or(0.0);
         let weight = params.exposed_base + params.exposed_known * knownness;
-        let loss = piece_value(piece.role)
+        let loss = exchange_value(piece.role)
             * if defended { params.exposed_defended } else { 1.0 }
             * weight;
         worst = worst.max(loss);
@@ -1424,6 +1490,43 @@ pub(crate) mod tests {
         let view = minimal_view(without_rook, HashMap::new());
         let expected = -2.0 * piece_value(Role::Rook);
         assert!((material_lead(&view) - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn exchange_value_discounts_promoted_pieces() {
+        // 素の駒は piece_value と一致
+        assert_eq!(exchange_value(Role::Silver), piece_value(Role::Silver));
+        // と金の反動は (盤上6 + 持ち駒1) / 2 = 3.5 で歩由来の駒として安い
+        assert!((exchange_value(Role::Tokin) - 3.5).abs() < 1e-9);
+        assert!(exchange_value(Role::Tokin) < exchange_value(Role::Silver));
+        // 龍も持ち駒に入るのは飛車ぶん
+        assert!(exchange_value(Role::Dragon) < piece_value(Role::Dragon));
+    }
+
+    #[test]
+    fn promotion_widens_coverage() {
+        // 3d の歩: 利きは 3c の1マス。成れば金の利き6マスに広がる
+        let view = minimal_view(
+            vec![VisiblePiece {
+                square: "3d".into(),
+                role: Role::Pawn,
+            }],
+            HashMap::new(),
+        );
+        let quiet = coverage_after(&view, &parse_usi("3d3c").unwrap());
+        let promo = coverage_after(&view, &parse_usi("3d3c+").unwrap());
+        assert_eq!(quiet, 1.0);
+        assert_eq!(promo, 6.0, "と金は金の利き（6マス）");
+    }
+
+    #[test]
+    fn tokin_probe_rewards_pawn_drops_near_promotion_zone() {
+        let view = minimal_view(vec![], HashMap::new());
+        // 成れる圏内（先手なら 4段目以浅）への歩打ちだけ加点
+        assert!(tokin_probe(&view, &parse_usi("P*3d").unwrap()) > 0.0);
+        assert_eq!(tokin_probe(&view, &parse_usi("P*3f").unwrap()), 0.0);
+        // 歩以外の打ちには付かない
+        assert_eq!(tokin_probe(&view, &parse_usi("G*3d").unwrap()), 0.0);
     }
 
     #[test]
