@@ -157,6 +157,11 @@ const DEPTH2_MATE_PEN: f64 = 30.0;
 /// 取り返し補償の割引（取り返し自体がさらに取り返されるリスクの近似）
 const DEPTH2_RECAP_DISCOUNT: f64 = 0.7;
 
+/// 王探しの情報利得。粒子間で「王手になるか」が割れる手は、指せば王手宣言の
+/// 有無で相手玉の位置仮説が絞れる（capture の info_bonus の玉位置版）。
+/// 互角膠着の引き分け対策: 玉が見つからないと詰みも王手攻めも始まらない
+const KING_PROBE_BONUS: f64 = 0.4;
+
 /// アンチドロー（終盤の寄せ）: 増幅を始める手数（plies）
 const ANTI_DRAW_START: f64 = 60.0;
 /// 増幅が最大になる手数。アリーナの手数上限200の手前で全開にする
@@ -913,6 +918,8 @@ fn evaluate(
     let mut risk_sum = 0.0;
     // 着地マスに敵駒がいた（=駒を取れた）粒子の重み。探索ボーナスの不一致度に使う
     let mut capture_hits = 0.0f64;
+    // 王手になった粒子の重み。王探しの情報利得（判定が割れるほど価値）に使う
+    let mut check_hits = 0.0f64;
     // 王周辺の圧力は粒子間の分散が小さいわりに計算が重い（9マス×利き走査）ので
     // 少数の粒子でだけ測って平均する
     const PRESSURE_SAMPLES: usize = 16;
@@ -952,6 +959,7 @@ fn evaluate(
         let gives_check = next.in_check(opp);
         if gives_check {
             v += params.check_bonus + params.check_foul_scale * f64::from(view.fouls.opponent);
+            check_hits += w;
             if next.legal_moves().is_empty() {
                 v += 1000.0; // 詰み（真の局面がこの粒子なら勝ち）
             }
@@ -1033,12 +1041,16 @@ fn evaluate(
         // 探索ボーナス: 着地マスの敵駒有無について粒子が割れているほど、
         // 指せば（取れても空でも）推定が絞れる。捕獲の期待値とは別の情報の価値
         let p_hit = capture_hits / legal;
+        // 王探し: 王手判定が粒子間で割れる手は、指せば王手宣言の有無で
+        // 玉位置仮説が絞れる（互角膠着で「玉が見つからない」を崩す勾配）
+        let p_chk = check_hits / legal;
         // 攻め圧力は粒子の健全度でゲートする。退化した粒子は間違った玉位置に
         // 固まりやすく、「誰もいない場所への攻め」が加点され続ける
         // （対人実戦: 終盤の成桂の徘徊）。健全度が低いときは確実な項だけ残す
         let confidence = (n / EVAL_PARTICLES as f64).min(1.0);
         value_sum / legal
             + params.info_bonus * p_hit * (1.0 - p_hit)
+            + KING_PROBE_BONUS * p_chk * (1.0 - p_chk)
             + (params.attack_w * confidence * attack_sum
                 - params.pressure_w * pressure_sum
                 - params.hand_drop_w * danger_sum)
