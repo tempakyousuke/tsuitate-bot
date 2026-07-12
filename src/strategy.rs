@@ -1501,6 +1501,10 @@ pub(crate) mod tests {
         assert!(exchange_value(Role::Tokin) < exchange_value(Role::Silver));
         // 龍も持ち駒に入るのは飛車ぶん
         assert!(exchange_value(Role::Dragon) < piece_value(Role::Dragon));
+        // 元手が安い成駒ほど反動が小さい（と金 < 成香 < 成桂 < 成銀）
+        assert!(exchange_value(Role::Tokin) < exchange_value(Role::Promotedlance));
+        assert!(exchange_value(Role::Promotedlance) < exchange_value(Role::Promotedknight));
+        assert!(exchange_value(Role::Promotedknight) < exchange_value(Role::Promotedsilver));
     }
 
     #[test]
