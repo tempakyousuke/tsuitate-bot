@@ -1624,6 +1624,22 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn combine_score_handles_gain_signs() {
+        // 正のgain: p_legal で割り引かれる
+        assert!((combine_score(2.0, 0.5, 0.0) - 1.0).abs() < 1e-9);
+        // 負のgain: 割り引かない（min形。反則に寄るインセンティブを作らない）
+        assert!((combine_score(-2.0, 0.5, 0.0) + 2.0).abs() < 1e-9);
+        // 反則コストは (1-p_legal) 倍で引かれる
+        assert!((combine_score(0.0, 0.75, 1.0) + 0.25).abs() < 1e-9);
+        // 2手読みのリスク置換で符号が変わるケース: gain=-0.5 → +0.5 に
+        // 再構築した場合、min形が正側の割引へ正しく切り替わる
+        let before = combine_score(-0.5, 0.5, 0.0);
+        let after = combine_score(0.5, 0.5, 0.0);
+        assert!((before + 0.5).abs() < 1e-9);
+        assert!((after - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
     fn search_budget_scales_with_think_time() {
         let base = SearchBudget::from_ms(900);
         assert_eq!(base.eval_particles, EVAL_PARTICLES);
