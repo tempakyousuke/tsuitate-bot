@@ -216,33 +216,13 @@ impl SearchBudget {
 /// 王周辺圧力を測る粒子数の基準値（スケール1.0時）
 const PRESSURE_SAMPLES: usize = 16;
 
-/// ソフト救済された粒子の評価重み（0.5^penalty）。厳密整合の粒子=1.0
-const SOFT_PARTICLE_DECAY: f64 = 0.5;
-
 /// 2手読み（相手応手のサンプル再評価）を行う上位候補数の基準値（スケール1.0時）。
 /// 1手読みの静的リスク項は近似なので、有望手だけ実際の応手分布で検算する
 const DEPTH2_TOP_K: usize = 8;
 /// 2手読みに使う粒子数の基準値（1候補あたり・スケール1.0時）
 const DEPTH2_PARTICLES: usize = 48;
-/// 静的リスク項をサンプル実測に置き換える割合（0=従来、1=全面置換）
-const DEPTH2_REPLACE: f64 = 0.7;
-/// 応手で王手を掛けられた場合のペナルティ（王手中は反則リスクが跳ねる）
-const DEPTH2_CHECK_PEN: f64 = 0.3;
-/// 応手で詰まされる場合のペナルティ
+/// 応手で詰まされる場合のペナルティ（壊滅的なのでSPSA対象にしない）
 const DEPTH2_MATE_PEN: f64 = 30.0;
-/// 取り返し補償の割引（取り返し自体がさらに取り返されるリスクの近似）
-const DEPTH2_RECAP_DISCOUNT: f64 = 0.7;
-
-/// 王探しの情報利得。粒子間で「王手になるか」が割れる手は、指せば王手宣言の
-/// 有無で相手玉の位置仮説が絞れる（capture の info_bonus の玉位置版）。
-/// 互角膠着の引き分け対策: 玉が見つからないと詰みも王手攻めも始まらない
-const KING_PROBE_BONUS: f64 = 0.4;
-
-/// 利き被覆1マスあたりの加点。広く索敵できる陣形への勾配で、
-/// 歩→と金の成り（利き1→6マス）にも自然に価値がつく
-const COVERAGE_W: f64 = 0.02;
-/// 成れる圏内への歩打ちのと金ポテンシャル加点
-const TOKIN_PROBE_W: f64 = 0.25;
 
 /// 駒交換で動く価値: 盤上価値と持ち駒価値（基本駒種）の平均。
 /// 素の駒は piece_value と一致し、成駒は取られても相手の持ち駒に入るのは
@@ -281,9 +261,9 @@ fn coverage_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
     covered.len() as f64
 }
 
-/// 持ち駒の歩を成れる圏内（敵陣＋一段手前）へ打つ手のと金ポテンシャル。
+/// 持ち駒の歩を成れる圏内（敵陣＋一段手前）へ打つ手か（1.0/0.0）。
 /// 打った直後の利きは1マスだが、次に成れば利きが6マスへ広がる索敵ユニットになり、
-/// 取り返されても相手に渡るのは歩1枚で反動が最小
+/// 取り返されても相手に渡るのは歩1枚で反動が最小。重みは params.tokin_probe_w
 fn tokin_probe(view: &PlayerView, mv: &ShogiMove) -> f64 {
     let ShogiMove::Drop {
         role: Role::Pawn,
@@ -296,7 +276,7 @@ fn tokin_probe(view: &PlayerView, mv: &ShogiMove) -> f64 {
         Color::Sente => to.rank,
         Color::Gote => 10 - to.rank,
     };
-    if depth_from_back <= 4 { TOKIN_PROBE_W } else { 0.0 }
+    if depth_from_back <= 4 { 1.0 } else { 0.0 }
 }
 
 /// アンチドロー（終盤の寄せ）: 増幅を始める手数（plies）
@@ -441,6 +421,20 @@ pub struct EvalParams {
     /// 直前に動かした駒をまた動かす手の減点（雑なシャッフルの抑制。
     /// 駒得や王手が絡む手は期待値側が勝つので実質影響しない）
     pub shuffle_penalty: f64,
+    /// ソフト救済粒子の評価重み減衰（重み = soft_decay^penalty。厳密整合=1.0）
+    pub soft_decay: f64,
+    /// 王探しの情報利得: 粒子間で王手判定が割れる手への p(1-p) 加点
+    pub king_probe_bonus: f64,
+    /// 利き被覆1マスあたりの加点（自駒のみ考慮の近似被覆）
+    pub coverage_w: f64,
+    /// 成れる圏内への歩打ちのと金ポテンシャル加点
+    pub tokin_probe_w: f64,
+    /// 2手読みで静的リスク項をサンプル実測に置き換える割合（0=従来、1=全面置換）
+    pub depth2_replace: f64,
+    /// 2手読みで応手に王手を掛けられた場合のペナルティ
+    pub depth2_check_pen: f64,
+    /// 2手読みの取り返し補償の割引（取り返し自体への反撃リスクの近似）
+    pub depth2_recap_discount: f64,
 }
 
 impl Default for EvalParams {
@@ -482,6 +476,15 @@ impl Default for EvalParams {
             hand_drop_w: 0.08,
             backtrack_penalty: 0.363,
             shuffle_penalty: 0.249,
+            // 以下はソフト粒子・2手読み・索敵項の導入時（2026-07-12〜13）の手置き値。
+            // SPSA第2ラウンドの調整対象
+            soft_decay: 0.5,
+            king_probe_bonus: 0.4,
+            coverage_w: 0.02,
+            tokin_probe_w: 0.25,
+            depth2_replace: 0.7,
+            depth2_check_pen: 0.3,
+            depth2_recap_discount: 0.7,
         }
     }
 }
@@ -494,7 +497,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 28] = [
+    pub const SPECS: [ParamSpec; 35] = [
         ParamSpec { name: "check_bonus", lo: 0.0, hi: 3.0 },
         ParamSpec { name: "check_foul_scale", lo: 0.0, hi: 0.5 },
         ParamSpec { name: "mover_w_captured", lo: 0.0, hi: 1.5 },
@@ -523,6 +526,13 @@ impl EvalParams {
         ParamSpec { name: "hand_drop_w", lo: 0.0, hi: 0.5 },
         ParamSpec { name: "backtrack_penalty", lo: 0.0, hi: 1.5 },
         ParamSpec { name: "shuffle_penalty", lo: 0.0, hi: 1.0 },
+        ParamSpec { name: "soft_decay", lo: 0.05, hi: 1.0 },
+        ParamSpec { name: "king_probe_bonus", lo: 0.0, hi: 1.5 },
+        ParamSpec { name: "coverage_w", lo: 0.0, hi: 0.1 },
+        ParamSpec { name: "tokin_probe_w", lo: 0.0, hi: 1.0 },
+        ParamSpec { name: "depth2_replace", lo: 0.0, hi: 1.0 },
+        ParamSpec { name: "depth2_check_pen", lo: 0.0, hi: 1.5 },
+        ParamSpec { name: "depth2_recap_discount", lo: 0.0, hi: 1.0 },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -555,6 +565,13 @@ impl EvalParams {
             self.hand_drop_w,
             self.backtrack_penalty,
             self.shuffle_penalty,
+            self.soft_decay,
+            self.king_probe_bonus,
+            self.coverage_w,
+            self.tokin_probe_w,
+            self.depth2_replace,
+            self.depth2_check_pen,
+            self.depth2_recap_discount,
         ]
     }
 
@@ -589,6 +606,13 @@ impl EvalParams {
             hand_drop_w: v[25],
             backtrack_penalty: v[26],
             shuffle_penalty: v[27],
+            soft_decay: v[28],
+            king_probe_bonus: v[29],
+            coverage_w: v[30],
+            tokin_probe_w: v[31],
+            depth2_replace: v[32],
+            depth2_check_pen: v[33],
+            depth2_recap_discount: v[34],
         }
     }
 }
@@ -716,7 +740,7 @@ impl Strategy for EstimatorStrategy {
                 break;
             }
             if seen.insert(pos.fingerprint()) {
-                sample.push((pos, SOFT_PARTICLE_DECAY.powi(i32::from(*pen))));
+                sample.push((pos, self.params.soft_decay.powi(i32::from(*pen))));
             }
         }
 
@@ -819,7 +843,7 @@ impl Strategy for EstimatorStrategy {
         }
 
         // 2段目: 上位候補だけ相手の応手をサンプルして再評価。
-        // gain 内の静的リスク項の DEPTH2_REPLACE 分を実測の期待損失で
+        // gain 内の静的リスク項の depth2_replace 分を実測の期待損失で
         // 置き換えて（一致するなら無変化）、最終式を適用し直す
         scored.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
         let mut best: Option<(String, f64)> = None;
@@ -836,7 +860,7 @@ impl Strategy for EstimatorStrategy {
                     budget,
                     &mut *rng,
                 );
-                let gain2 = out.gain + DEPTH2_REPLACE * (out.risk_mean + delta);
+                let gain2 = out.gain + params.depth2_replace * (out.risk_mean + delta);
                 combine_score(gain2, out.p_legal, out.foul_cost) + adjust
             } else {
                 score
@@ -1244,7 +1268,7 @@ fn evaluate(
         let confidence = (n / budget.eval_particles as f64).min(1.0);
         value_sum / legal
             + params.info_bonus * p_hit * (1.0 - p_hit)
-            + KING_PROBE_BONUS * p_chk * (1.0 - p_chk)
+            + params.king_probe_bonus * p_chk * (1.0 - p_chk)
             + (params.attack_w * confidence * attack_sum
                 - params.pressure_w * pressure_sum
                 - params.hand_drop_w * danger_sum)
@@ -1276,8 +1300,8 @@ fn evaluate(
 
     // 利き被覆（広い索敵網）と、成れる圏内への歩打ち（と金ポテンシャル）。
     // どちらも粒子に依存しない自明な情報だけで計算できる
-    let coverage = COVERAGE_W * coverage_after(view, mv);
-    let probe = tokin_probe(view, mv);
+    let coverage = params.coverage_w * coverage_after(view, mv);
+    let probe = params.tokin_probe_w * tokin_probe(view, mv);
 
     let gain = expected + advance_bias + development + coverage + probe;
     EvalOut {
@@ -1362,7 +1386,7 @@ fn depth2_delta(
             };
             // 取り返し補償: 応手の駒に自分の利きが残っていれば取り返せる
             let comp = if !next2.in_check(me) && next2.is_attacked(reply_to, me) {
-                DEPTH2_RECAP_DISCOUNT
+                params.depth2_recap_discount
                     * next2
                         .piece_at(reply_to)
                         .map(|p| exchange_value(p.role))
@@ -1373,7 +1397,7 @@ fn depth2_delta(
             d -= scale * (lost - comp).max(0.0);
         }
         if next2.in_check(me) {
-            d -= DEPTH2_CHECK_PEN;
+            d -= params.depth2_check_pen;
             if next2.legal_moves().is_empty() {
                 d -= DEPTH2_MATE_PEN;
             }
