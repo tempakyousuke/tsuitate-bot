@@ -135,18 +135,63 @@ pub fn choose_move(view: &PlayerView, foul_tried: &HashSet<String>) -> Option<St
     best.map(|(usi, _)| usi)
 }
 
-/// 評価に使う粒子数の上限（思考時間の予算。粒子は estimator 側で最大400）。
-/// フィッシャー300秒+3秒に対し1手1〜2秒が目安。96粒子で平均370ms程度だったので
-/// 精度側（反則率の低下）に予算を振る
+/// 評価に使う粒子数の基準値（スケール1.0時）。実際の値は思考予算に比例する
 const EVAL_PARTICLES: usize = 192;
+
+/// 1手の思考予算（ms）の既定値。TSUITATE_THINK_BUDGET_MS で上書きできる。
+/// このリポジトリのアリーナは 1000秒+3秒 なので既定はやや厚めに使う。
+/// 本番サイト（300秒+3秒）へのデプロイ時は環境変数で絞って
+/// 思考時間（=強さ）を調整する（例: 900 で v5 相当の予算）
+const DEFAULT_THINK_BUDGET_MS: u64 = 2000;
+/// スケール1.0の基準予算。v5 までの暗黙の実測上限（p99 ≒ 900ms）
+const REFERENCE_BUDGET_MS: f64 = 900.0;
+
+/// 思考予算（ms）。環境変数 > 既定値
+fn think_budget_ms() -> u64 {
+    std::env::var("TSUITATE_THINK_BUDGET_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_THINK_BUDGET_MS)
+}
+
+/// 思考予算に比例して各種の粒子数・読み幅を決める
+#[derive(Debug, Clone, Copy)]
+struct SearchBudget {
+    /// 推定器へ渡すスケール（粒子数・リプレイ予算）
+    scale: f64,
+    /// 評価に使うユニーク粒子数の上限
+    eval_particles: usize,
+    /// 王周辺圧力を測る粒子数
+    pressure_samples: usize,
+    /// 2手読みする上位候補数
+    depth2_top_k: usize,
+    /// 2手読みに使う粒子数
+    depth2_particles: usize,
+}
+
+impl SearchBudget {
+    fn from_ms(ms: u64) -> Self {
+        let scale = (ms as f64 / REFERENCE_BUDGET_MS).clamp(0.25, 8.0);
+        let f = |base: usize, lo: usize, hi: usize| {
+            ((base as f64 * scale) as usize).clamp(lo, hi)
+        };
+        SearchBudget {
+            scale,
+            eval_particles: f(EVAL_PARTICLES, 48, 2048),
+            pressure_samples: f(16, 8, 64),
+            depth2_top_k: f(8, 4, 32),
+            depth2_particles: f(48, 16, 384),
+        }
+    }
+}
 
 /// ソフト救済された粒子の評価重み（0.5^penalty）。厳密整合の粒子=1.0
 const SOFT_PARTICLE_DECAY: f64 = 0.5;
 
-/// 2手読み（相手応手のサンプル再評価）を行う上位候補数。
+/// 2手読み（相手応手のサンプル再評価）を行う上位候補数の基準値（スケール1.0時）。
 /// 1手読みの静的リスク項は近似なので、有望手だけ実際の応手分布で検算する
 const DEPTH2_TOP_K: usize = 8;
-/// 2手読みに使う粒子数（1候補あたり）。応手の合法手列挙が重いので絞る
+/// 2手読みに使う粒子数の基準値（1候補あたり・スケール1.0時）
 const DEPTH2_PARTICLES: usize = 48;
 /// 静的リスク項をサンプル実測に置き換える割合（0=従来、1=全面置換）
 const DEPTH2_REPLACE: f64 = 0.7;
@@ -508,6 +553,8 @@ pub struct EstimatorStrategy {
     /// Some なら定跡をこのラインに固定する（定跡特化チューニング用）
     book_line: Option<usize>,
     params: EvalParams,
+    /// 思考予算に応じた粒子数・読み幅（TSUITATE_THINK_BUDGET_MS 由来）
+    budget: SearchBudget,
     /// 直近の choose 時点の内部状態（記録用）
     last_debug: Option<serde_json::Value>,
 }
@@ -529,6 +576,7 @@ impl EstimatorStrategy {
             book: None,
             book_line,
             params,
+            budget: SearchBudget::from_ms(think_budget_ms()),
             last_debug: None,
         }
     }
@@ -547,9 +595,10 @@ impl Strategy for EstimatorStrategy {
         log: &ObservationLog,
         foul_tried: &HashSet<String>,
     ) -> Option<String> {
+        let budget = self.budget;
         let est = self
             .est
-            .get_or_insert_with(|| Estimator::new(view.your_color));
+            .get_or_insert_with(|| Estimator::with_scale(view.your_color, budget.scale));
         est.update(log);
 
         // 序盤定跡（静かな間だけ）。ブック中も推定器の update は回して粒子を保つ
@@ -588,7 +637,7 @@ impl Strategy for EstimatorStrategy {
         let mut seen = HashSet::new();
         let mut sample: Vec<(&Position, f64)> = vec![];
         for (pos, pen) in est.particles().iter().zip(est.penalties()) {
-            if sample.len() >= EVAL_PARTICLES {
+            if sample.len() >= budget.eval_particles {
                 break;
             }
             if seen.insert(pos.fingerprint()) {
@@ -673,7 +722,7 @@ impl Strategy for EstimatorStrategy {
                     None => in_check_prior(view, &mv),
                 };
             }
-            let out = evaluate(view, &mv, &sample, prior, &known, &params);
+            let out = evaluate(view, &mv, &sample, prior, &known, &params, budget);
             let mut score = out.score + rng.random_range(0.0..0.01);
             // 手戻り（直前の手をそのまま逆に戻す）は膠着の典型なので減点。
             // 直前に動かした駒をまた動かすだけの手も雑なシャッフルとして軽く減点
@@ -697,7 +746,7 @@ impl Strategy for EstimatorStrategy {
         scored.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
         let mut best: Option<(String, f64)> = None;
         for (i, (usi, mv, out, score)) in scored.into_iter().enumerate() {
-            let final_score = if i < DEPTH2_TOP_K {
+            let final_score = if i < budget.depth2_top_k {
                 let delta = depth2_delta(
                     view,
                     &mv,
@@ -706,6 +755,7 @@ impl Strategy for EstimatorStrategy {
                     &my_capture_squares,
                     &my_touched_squares,
                     &params,
+                    budget,
                     &mut rng,
                 );
                 score + out.p_legal * DEPTH2_REPLACE * (out.risk_mean + delta)
@@ -971,6 +1021,7 @@ fn evaluate(
     prior: f64,
     known: &HashMap<Coord, f64>,
     params: &EvalParams,
+    budget: SearchBudget,
 ) -> EvalOut {
     let me = view.your_color;
     let opp = me.other();
@@ -982,8 +1033,8 @@ fn evaluate(
     // 王手になった粒子の重み。王探しの情報利得（判定が割れるほど価値）に使う
     let mut check_hits = 0.0f64;
     // 王周辺の圧力は粒子間の分散が小さいわりに計算が重い（9マス×利き走査）ので
-    // 少数の粒子でだけ測って平均する
-    const PRESSURE_SAMPLES: usize = 16;
+    // 少数の粒子でだけ測って平均する（数は思考予算に比例）
+    let pressure_samples = budget.pressure_samples;
     let mut pressure_sum = 0.0;
     let mut attack_sum = 0.0;
     let mut danger_sum = 0.0;
@@ -1075,7 +1126,7 @@ fn evaluate(
         v += params.threat_w * threat_value(&next, me);
 
         // 王の安全度と攻撃圧力（利き走査が重いので少数の粒子でだけ測って平均する）
-        if pressure_n < PRESSURE_SAMPLES {
+        if pressure_n < pressure_samples {
             // 自玉の周囲に当たっている相手の利き（守り）
             pressure_sum += king_zone_pressure(&next, me, opp);
             // 相手玉の周囲に当たっている自分の利き（攻め）。王手にならない攻め駒の
@@ -1095,7 +1146,7 @@ fn evaluate(
     // 増やし、少数の偏った粒子への過信を防ぐ。ソフト粒子は重みぶんしか
     // 数えないので、退化度にも自然に反映される
     let n: f64 = particles.iter().map(|(_, w)| w).sum();
-    let degen = 1.0 - (n / EVAL_PARTICLES as f64).min(1.0);
+    let degen = 1.0 - (n / budget.eval_particles as f64).min(1.0);
     let w = params.prior_weight + params.prior_weight_degen * degen;
     let p_legal = (legal + prior * w) / (n + w);
     let expected = if legal > 0.0 {
@@ -1108,7 +1159,7 @@ fn evaluate(
         // 攻め圧力は粒子の健全度でゲートする。退化した粒子は間違った玉位置に
         // 固まりやすく、「誰もいない場所への攻め」が加点され続ける
         // （対人実戦: 終盤の成桂の徘徊）。健全度が低いときは確実な項だけ残す
-        let confidence = (n / EVAL_PARTICLES as f64).min(1.0);
+        let confidence = (n / budget.eval_particles as f64).min(1.0);
         value_sum / legal
             + params.info_bonus * p_hit * (1.0 - p_hit)
             + KING_PROBE_BONUS * p_chk * (1.0 - p_chk)
@@ -1170,6 +1221,7 @@ fn depth2_delta(
     my_captures: &[Coord],
     my_touched: &[Coord],
     params: &EvalParams,
+    budget: SearchBudget,
     rng: &mut impl rand::Rng,
 ) -> f64 {
     let me = view.your_color;
@@ -1178,7 +1230,7 @@ fn depth2_delta(
     };
     let mut sum = 0.0;
     let mut n = 0.0;
-    for (pos, w) in particles.iter().take(DEPTH2_PARTICLES) {
+    for (pos, w) in particles.iter().take(budget.depth2_particles) {
         if !pos.is_legal(mv) {
             continue;
         }
@@ -1490,6 +1542,22 @@ pub(crate) mod tests {
         let view = minimal_view(without_rook, HashMap::new());
         let expected = -2.0 * piece_value(Role::Rook);
         assert!((material_lead(&view) - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn search_budget_scales_with_think_time() {
+        let base = SearchBudget::from_ms(900);
+        assert_eq!(base.eval_particles, EVAL_PARTICLES);
+        assert_eq!(base.depth2_top_k, DEPTH2_TOP_K);
+        let big = SearchBudget::from_ms(2000);
+        assert!(big.eval_particles > base.eval_particles);
+        assert!(big.depth2_top_k > base.depth2_top_k);
+        assert!(big.depth2_particles > base.depth2_particles);
+        // 極端な予算でも上限で頭打ち
+        assert!(SearchBudget::from_ms(600_000).eval_particles <= 2048);
+        // 本番向けに絞れば従来より軽くなる
+        let small = SearchBudget::from_ms(450);
+        assert!(small.eval_particles < base.eval_particles);
     }
 
     #[test]

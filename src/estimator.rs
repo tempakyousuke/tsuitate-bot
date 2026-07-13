@@ -38,10 +38,9 @@ const TARGET_PARTICLES: usize = 512;
 const REGEN_ATTEMPTS: usize = 320;
 /// リプレイ中バックトラックの1決定点あたりの再サンプル回数
 const BACKTRACK_ATTEMPTS: u32 = 4;
-/// 厳密整合の生存粒子がこれを下回ったらソフト救済を発動する
-const SOFT_MIN: usize = TARGET_PARTICLES / 4;
 /// ソフト救済の累積回数の上限。超えた粒子は棄却する
-/// （観測と何度も矛盾した粒子は近似としても信用できない）
+/// （観測と何度も矛盾した粒子は近似としても信用できない）。
+/// ソフト救済の発動閾値は target/4（apply_constraint 参照）
 const PENALTY_CAP: u8 = 3;
 
 /// 観測列を推定に使える形に正規化した制約
@@ -67,6 +66,14 @@ pub struct Estimator {
     particles: Vec<Position>,
     /// particles と同じ並びのソフト救済回数（0 = 全制約と厳密整合）
     penalties: Vec<u8>,
+    /// 思考予算に応じた粒子の目標数（スケール1.0で TARGET_PARTICLES）
+    target: usize,
+    /// リプレイ試行回数の上限（スケール比例）
+    regen_attempts: usize,
+    /// 通常リプレイの時間打ち切り（ms、スケール比例）
+    regen_deadline_ms: u64,
+    /// 全滅時に粘る時間の上限（ms、スケール比例）
+    empty_deadline_ms: u64,
     constraints: Vec<Constraint>,
     /// 自分が駒を取ったマス（= 相手は自駒がそこで死んだことを知っている）。
     /// 相手手の事前分布の threat_known 特徴量に使う。idx は制約列上の位置
@@ -89,10 +96,27 @@ impl Estimator {
     }
 
     pub fn with_seed(my_color: Color, seed: u64) -> Self {
+        Estimator::with_seed_and_scale(my_color, seed, 1.0)
+    }
+
+    /// 思考予算スケールつきで作る（1.0 = 従来基準。strategy.rs の
+    /// TSUITATE_THINK_BUDGET_MS から渡される）。粒子数・リプレイ回数・
+    /// 時間打ち切りがスケールに比例する
+    pub fn with_scale(my_color: Color, scale: f64) -> Self {
+        Estimator::with_seed_and_scale(my_color, rand::rng().random(), scale)
+    }
+
+    pub fn with_seed_and_scale(my_color: Color, seed: u64, scale: f64) -> Self {
+        let scale = scale.clamp(0.25, 8.0);
+        let target = ((TARGET_PARTICLES as f64 * scale) as usize).clamp(128, 4096);
         Estimator {
             my_color,
-            particles: vec![Position::initial(); TARGET_PARTICLES],
-            penalties: vec![0; TARGET_PARTICLES],
+            particles: vec![Position::initial(); target],
+            penalties: vec![0; target],
+            target,
+            regen_attempts: (REGEN_ATTEMPTS as f64 * scale) as usize,
+            regen_deadline_ms: (500.0 * scale) as u64,
+            empty_deadline_ms: (900.0 * scale) as u64,
             constraints: vec![],
             my_capture_idx: vec![],
             my_capture_sq: vec![],
@@ -102,6 +126,11 @@ impl Estimator {
             healthy: true,
             rng: StdRng::seed_from_u64(seed),
         }
+    }
+
+    /// 粒子の目標数（思考予算に応じてスケール済み）
+    pub fn target(&self) -> usize {
+        self.target
     }
 
     pub fn my_color(&self) -> Color {
@@ -245,7 +274,7 @@ impl Estimator {
         // ソフト救済: 厳密整合の生存が少ないときだけ、情報系の制約を緩和して
         // 棄却粒子を penalty+1 で生かす（枯渇からの回復を初期局面リプレイに
         // 頼らない = POMCP の particle reinvigoration に相当）
-        if surv_pos.len() < SOFT_MIN {
+        if surv_pos.len() < self.target / 4 {
             for (mut pos, pen) in failed {
                 if pen >= PENALTY_CAP {
                     continue;
@@ -287,13 +316,13 @@ impl Estimator {
     /// リプレイ1回のコストは手数に比例するため、回数と時間の両方で打ち切る
     fn replenish(&mut self) {
         let start = std::time::Instant::now();
-        let regen_deadline = start + std::time::Duration::from_millis(500);
+        let regen_deadline = start + std::time::Duration::from_millis(self.regen_deadline_ms);
         // リプレイの目標は「厳密整合の粒子数」。ソフト粒子で頭数が足りていても
         // 厳密粒子が薄ければリプレイで置き換えにいく（ソフトはあくまで近似）
         let mut strict = self.penalties.iter().filter(|&&p| p == 0).count();
-        if strict < TARGET_PARTICLES {
-            for _ in 0..REGEN_ATTEMPTS {
-                if strict >= TARGET_PARTICLES || std::time::Instant::now() > regen_deadline {
+        if strict < self.target {
+            for _ in 0..self.regen_attempts {
+                if strict >= self.target || std::time::Instant::now() > regen_deadline {
                     break;
                 }
                 if let Some(pos) = self.replay_once() {
@@ -303,7 +332,7 @@ impl Estimator {
                 }
             }
         }
-        let deadline = start + std::time::Duration::from_millis(900);
+        let deadline = start + std::time::Duration::from_millis(self.empty_deadline_ms);
         while self.particles.is_empty() && std::time::Instant::now() < deadline {
             if let Some(pos) = self.replay_once() {
                 self.particles.push(pos);
@@ -315,27 +344,27 @@ impl Estimator {
         if self.particles.is_empty() {
             return;
         }
-        // penalty 昇順に並べ、厳密整合の粒子を優先して TARGET まで絞る
+        // penalty 昇順に並べ、厳密整合の粒子を優先して target まで絞る
         let mut pairs: Vec<(u8, Position)> = std::mem::take(&mut self.penalties)
             .into_iter()
             .zip(std::mem::take(&mut self.particles))
             .collect();
         pairs.sort_by_key(|(p, _)| *p);
-        pairs.truncate(TARGET_PARTICLES);
+        pairs.truncate(self.target);
         for (pen, pos) in pairs {
             self.penalties.push(pen);
             self.particles.push(pos);
         }
         // 不足分は複製で埋める（低ペナルティ粒子を重み 0.5^penalty で優先）
         let m = self.particles.len();
-        if m < TARGET_PARTICLES {
+        if m < self.target {
             let mut cum = Vec::with_capacity(m);
             let mut total = 0.0f64;
             for &p in &self.penalties {
                 total += 0.5f64.powi(i32::from(p));
                 cum.push(total);
             }
-            while self.particles.len() < TARGET_PARTICLES {
+            while self.particles.len() < self.target {
                 let t = self.rng.random_range(0.0..total);
                 let i = cum.partition_point(|&c| c < t).min(m - 1);
                 self.particles.push(self.particles[i].clone());

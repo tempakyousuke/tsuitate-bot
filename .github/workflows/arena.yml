@@ -1,7 +1,9 @@
 name: Arena
 
 # ローカルマシンを熱くせずに戦略同士のアリーナ対局をGitHub Actions上で実行する。
-# 手動起動のみ（push/PRトリガーなし）。 引数はCLAUDE.mdの `cargo run --release --bin arena` と同じ体系。
+# 手動起動のみ（push/PRトリガーなし）。引数はCLAUDE.mdの `cargo run --release --bin arena` と同じ体系。
+# 基準ごとに matrix で別ジョブに分割する（時計が1000秒+3秒になりジョブの
+# 6時間制限に収まらないため。分割により壁時計も最長カード分に縮む）。
 on:
   workflow_dispatch:
     inputs:
@@ -19,7 +21,20 @@ on:
         default: "estimator_v2 estimator_v3 estimator_v4 estimator_v5"
 
 jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      baselines: ${{ steps.split.outputs.list }}
+    steps:
+      - id: split
+        run: echo "list=$(echo '${{ inputs.baselines }}' | jq -R -c 'split(" ") | map(select(length > 0))')" >> "$GITHUB_OUTPUT"
+
   arena:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        baseline: ${{ fromJSON(needs.plan.outputs.baselines) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -36,7 +51,7 @@ jobs:
           cargo run --release --bin arena -- \
             "${{ inputs.games }}" \
             "${{ inputs.candidate }}" \
-            ${{ inputs.baselines }} \
+            "${{ matrix.baseline }}" \
             | tee arena-result.txt
 
       - name: Write job summary
@@ -52,13 +67,13 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: arena-result
+          name: arena-result-${{ matrix.baseline }}
           path: arena-result.txt
 
       - name: Upload game records
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: arena-records
+          name: arena-records-${{ matrix.baseline }}
           path: arena-records/
           if-no-files-found: ignore

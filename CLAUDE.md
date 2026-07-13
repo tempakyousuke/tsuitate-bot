@@ -16,8 +16,12 @@
   **実行はローカルでなく GitHub Actions で行う**（`.github/workflows/arena.yml`、手動起動のみ）:
   対象ブランチを push して
   `gh workflow run arena.yml --ref <ブランチ> -f games=100 -f candidate=estimator -f baselines="estimator_v2 estimator_v3 estimator_v4 estimator_v5"`。
-  結果はジョブのサマリー（および artifact `arena-result`）に出る。
-  baselines の既定値は凍結版を追加したら手動で更新すること
+  基準ごとに matrix ジョブへ分割され、結果は各ジョブのサマリー
+  （および artifact `arena-result-<基準>` / `arena-records-<基準>`）に出る。
+  baselines の既定値は凍結版を追加したら手動で更新すること。
+  **アリーナの時計は 1000秒+3秒**（本番サイトの300秒+3秒より厚い。思考予算を上げて
+  強さの上限を探るため）。本番へのデプロイ時は `TSUITATE_THINK_BUDGET_MS` を絞って
+  300秒+3秒に収める（強さと時間の調整ノブ）
 - `cargo run --release --bin tune -- [反復数] [評価あたり対局数] [基準...]` — 評価パラメータ
   （`strategy::EvalParams`）のSPSA自動チューニング。目的関数はアリーナのスコア率
   （引き分け=0.5勝）。進捗は `tune-log.jsonl`（gitignore済み）。出力された最終パラメータを
@@ -33,6 +37,11 @@
   - `TSUITATE_BOT_TOKEN`（必須）: サイトのマイページ「bot管理」で発行する `tsb_...` トークン
   - `TSUITATE_URL`（既定 `http://localhost:5173`）
   - `TSUITATE_THINK_MS`（既定 600）: 着手前の待ち時間
+  - `TSUITATE_THINK_BUDGET_MS`（既定 2000）: estimator の1手あたり思考予算。
+    粒子数（目標512×scale）・評価粒子数（192×scale）・2手読みの幅（上位8×scale/
+    粒子48×scale）・リプレイ予算（500/900ms×scale）が scale = 予算÷900ms に比例する。
+    アリーナ（1000秒+3秒）では既定のまま、本番（300秒+3秒）へは 900 前後に絞って
+    デプロイする（強さの調整ノブでもある）
   - `TSUITATE_STRATEGY`（既定 `estimator`。旧来の単純botは `heuristic`）
   - `TSUITATE_QUEUE_RETRY_MS`（既定 60000）: キュー参加拒否・受付終了後の再試行間隔
   - `TSUITATE_RECORD_DIR`（既定 `records`。空文字で無効）: 対局記録（JSONL）の出力先。
