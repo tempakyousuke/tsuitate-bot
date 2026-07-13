@@ -60,10 +60,11 @@ pub struct CheckSolver {
 }
 
 impl CheckSolver {
-    /// 王手中の view から作る。自玉が見つからない等で推論できなければ None
+    /// 王手中の view から作る。自玉が見つからない等で推論できなければ None。
+    /// particles はソフト救済の重みつき（strategy.rs の評価サンプルと同じ）
     pub fn new(
         view: &PlayerView,
-        particles: &[&Position],
+        particles: &[(&Position, f64)],
         fouls_this_turn: &[ShogiMove],
         log: &ObservationLog,
     ) -> Option<CheckSolver> {
@@ -167,31 +168,32 @@ impl CheckSolver {
         }
     }
 
-    /// 粒子中の実際の王手駒に投票させる（粒子が健全なら仮説が鋭くなる）
-    fn vote_by_particles(&mut self, particles: &[&Position]) {
+    /// 粒子中の実際の王手駒に投票させる（粒子が健全なら仮説が鋭くなる）。
+    /// ソフト救済の粒子は重みぶんだけ薄く投票する
+    fn vote_by_particles(&mut self, particles: &[(&Position, f64)]) {
         let opp = self.my_color.other();
-        let mut voters = 0usize;
-        let mut votes: Vec<usize> = vec![0; self.hypotheses.len()];
-        for pos in particles {
+        let mut voters = 0.0f64;
+        let mut votes: Vec<f64> = vec![0.0; self.hypotheses.len()];
+        for (pos, w) in particles {
             if !pos.in_check(self.my_color) {
                 continue; // 王手を反映していない粒子は情報にならない
             }
-            voters += 1;
+            voters += w;
             for (i, h) in self.hypotheses.iter().enumerate() {
                 if pos.piece_at(h.square)
                     .is_some_and(|p| p.color == opp && p.role == h.role)
                 {
                     // 粒子上でその駒が実際に王を攻撃しているかまでは見ない
                     // （enumerate 済みの仮説は自駒配置的に攻撃可能）
-                    votes[i] += 1;
+                    votes[i] += w;
                 }
             }
         }
-        if voters == 0 {
+        if voters <= 0.0 {
             return;
         }
         for (h, &v) in self.hypotheses.iter_mut().zip(&votes) {
-            h.weight *= 1.0 + PARTICLE_VOTE_W * (v as f64 / voters as f64);
+            h.weight *= 1.0 + PARTICLE_VOTE_W * (v / voters);
         }
     }
 
@@ -274,21 +276,25 @@ fn known_enemy_squares(log: &ObservationLog, since_move: u32) -> Vec<Coord> {
         .collect()
 }
 
-/// 粒子の多数決でそのマスの敵駒の駒種を推定する（過半に満たなければ None）
-fn particle_majority_role(particles: &[&Position], opp: Color, sq: Coord) -> Option<Role> {
+/// 粒子の加重多数決でそのマスの敵駒の駒種を推定する（過半に満たなければ None）。
+/// ソフト救済の粒子は重みぶんだけ薄く数える
+fn particle_majority_role(particles: &[(&Position, f64)], opp: Color, sq: Coord) -> Option<Role> {
     if particles.is_empty() {
         return None;
     }
-    let mut counts: HashMap<Role, usize> = HashMap::new();
-    for pos in particles {
+    let total: f64 = particles.iter().map(|(_, w)| w).sum();
+    let mut counts: HashMap<Role, f64> = HashMap::new();
+    for (pos, w) in particles {
         if let Some(p) = pos.piece_at(sq) {
             if p.color == opp {
-                *counts.entry(p.role).or_default() += 1;
+                *counts.entry(p.role).or_default() += w;
             }
         }
     }
-    let (role, n) = counts.into_iter().max_by_key(|(_, n)| *n)?;
-    if n * 2 > particles.len() {
+    let (role, n) = counts
+        .into_iter()
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))?;
+    if n * 2.0 > total {
         Some(role)
     } else {
         None
@@ -427,7 +433,7 @@ mod tests {
                 role: Role::Rook,
             }),
         );
-        let particles: Vec<&Position> = vec![&truth; 8];
+        let particles: Vec<(&Position, f64)> = vec![(&truth, 1.0); 8];
         let mut solver =
             CheckSolver::new(&view, &particles, &[], &ObservationLog::default()).unwrap();
         let away = solver.resolve_probability(&mv("5e4d"));
@@ -435,6 +441,55 @@ mod tests {
         assert!(
             away > stay,
             "飛車仮説が支配的なら5筋から外れる手が有利（away={away:.2} stay={stay:.2}）"
+        );
+    }
+
+    #[test]
+    fn soft_particles_vote_with_reduced_weight() {
+        // strict粒子（重み1.0）は「5aの飛」、soft粒子（重み0.1）は「2bの角」。
+        // 重みが効いていれば飛仮説が支配的になり、5筋に留まる手の解消確率は
+        // 重みを逆にしたソルバーより低くなる
+        let view = view_with(vec![("5e", Role::King)]);
+        let place = |sq: Coord, role: Role, pos: &mut Position| {
+            pos.set(
+                sq,
+                Some(crate::shogi::Piece {
+                    color: Color::Gote,
+                    role,
+                }),
+            );
+        };
+        let mut rook = Position::empty(Color::Sente);
+        place(Coord { file: 5, rank: 5 }, Role::King, &mut rook);
+        rook.set(
+            Coord { file: 5, rank: 5 },
+            Some(crate::shogi::Piece {
+                color: Color::Sente,
+                role: Role::King,
+            }),
+        );
+        place(Coord { file: 5, rank: 1 }, Role::Rook, &mut rook);
+        let mut bishop = Position::empty(Color::Sente);
+        bishop.set(
+            Coord { file: 5, rank: 5 },
+            Some(crate::shogi::Piece {
+                color: Color::Sente,
+                role: Role::King,
+            }),
+        );
+        place(Coord { file: 2, rank: 2 }, Role::Bishop, &mut bishop);
+
+        let rook_heavy: Vec<(&Position, f64)> = vec![(&rook, 1.0), (&bishop, 0.1)];
+        let bishop_heavy: Vec<(&Position, f64)> = vec![(&rook, 0.1), (&bishop, 1.0)];
+        let mut a =
+            CheckSolver::new(&view, &rook_heavy, &[], &ObservationLog::default()).unwrap();
+        let mut b =
+            CheckSolver::new(&view, &bishop_heavy, &[], &ObservationLog::default()).unwrap();
+        let stay_a = a.resolve_probability(&mv("5e5d"));
+        let stay_b = b.resolve_probability(&mv("5e5d"));
+        assert!(
+            stay_a < stay_b,
+            "重み付き投票なら飛重視側で5筋残留が不利（a={stay_a:.2} b={stay_b:.2}）"
         );
     }
 }

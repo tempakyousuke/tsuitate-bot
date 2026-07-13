@@ -17,6 +17,9 @@ use crate::check::CheckSolver;
 use crate::estimator::{Estimator, predict_opp_reply};
 use crate::opening::OpeningBook;
 use crate::observation::{Observation, ObservationLog};
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+
 use crate::protocol::{Color, PlayerView, Role, VisiblePiece};
 use crate::shogi::{Position, ShogiMove, parse_usi, piece_value, promote_role, unpromote_role};
 
@@ -43,6 +46,31 @@ pub const DEFAULT_STRATEGY: &str = "estimator";
 
 /// 戦略名からインスタンスを作る。未知の名前は None。
 /// `estimator_vN` はアリーナ比較用の凍結版（src/frozen/）
+/// シード付きで戦略を作る（SPSA の f+/f− 評価で対局条件を揃える共通乱数法用）。
+/// シード注入に対応していない戦略は通常の make にフォールバックする
+/// （その場合、その戦略側の乱数はペアリングされない）
+pub fn make_seeded(name: &str, seed: u64) -> Option<Box<dyn Strategy>> {
+    match name {
+        "estimator" => Some(Box::new(EstimatorStrategy::with_params_line_seed(
+            EvalParams::default(),
+            None,
+            Some(seed),
+        ))),
+        "estimator_rush" => {
+            let idx = OpeningBook::line_index("居飛車速攻")?;
+            Some(Box::new(EstimatorStrategy::with_params_line_seed(
+                EvalParams::default(),
+                Some(idx),
+                Some(seed),
+            )))
+        }
+        "estimator_v5" => Some(Box::new(
+            crate::frozen::estimator_v5::EstimatorV5::with_seed(seed),
+        )),
+        _ => make(name),
+    }
+}
+
 pub fn make(name: &str) -> Option<Box<dyn Strategy>> {
     match name {
         "heuristic" => Some(Box::new(Heuristic)),
@@ -178,12 +206,15 @@ impl SearchBudget {
         SearchBudget {
             scale,
             eval_particles: f(EVAL_PARTICLES, 48, 2048),
-            pressure_samples: f(16, 8, 64),
-            depth2_top_k: f(8, 4, 32),
-            depth2_particles: f(48, 16, 384),
+            pressure_samples: f(PRESSURE_SAMPLES, 8, 64),
+            depth2_top_k: f(DEPTH2_TOP_K, 4, 32),
+            depth2_particles: f(DEPTH2_PARTICLES, 16, 384),
         }
     }
 }
+
+/// 王周辺圧力を測る粒子数の基準値（スケール1.0時）
+const PRESSURE_SAMPLES: usize = 16;
 
 /// ソフト救済された粒子の評価重み（0.5^penalty）。厳密整合の粒子=1.0
 const SOFT_PARTICLE_DECAY: f64 = 0.5;
@@ -307,13 +338,31 @@ fn material_lead(view: &PlayerView) -> f64 {
     2.0 * (current - initial)
 }
 
-/// evaluate() の結果。2手読みの再評価に必要な内訳つき
+/// evaluate() の結果。最終スコアでなく内訳を保持し、2手読みが
+/// gain を組み替えた後に同じ最終式を適用し直せるようにする
+/// （min形の非線形式に対して後から線形補正すると負のgainで壊れるため）
 struct EvalOut {
-    score: f64,
+    /// 期待値＋バイアス項（合法確率・反則コストを含まない）
+    gain: f64,
     /// 静的な取られリスク項（mover/hidden の max）の粒子加重平均。
     /// 2手読みがこの分をサンプル実測で置き換える
     risk_mean: f64,
     p_legal: f64,
+    foul_cost: f64,
+}
+
+impl EvalOut {
+    fn score(&self) -> f64 {
+        combine_score(self.gain, self.p_legal, self.foul_cost)
+    }
+}
+
+/// 最終スコア: 期待値が負の手を p_legal で割り引かない（min の形）。
+/// 割り引くと「合法確率が低いほどスコアが高い」= わざと反則に寄る手が
+/// 選ばれてしまう。反則しても手番は残るので悪い局面からは逃げられず、
+/// 反則の価値は「次善手の価値 − 反則コスト」でしかない
+fn combine_score(gain: f64, p_legal: f64, foul_cost: f64) -> f64 {
+    (p_legal * gain).min(gain) - (1.0 - p_legal) * foul_cost
 }
 
 /// evaluate() まわりの調整可能パラメータ。Default が現行の手調整値。
@@ -328,10 +377,12 @@ pub struct EvalParams {
     pub mover_w_captured: f64,
     /// 着手駒の取られリスク重み（静かな手）
     pub mover_w_quiet: f64,
-    /// 着手駒の取られリスク重み（王手をかけた手）。王手宣言は「王を攻撃できる
-    /// （マス,駒種）」まで仮説を絞らせるので、相手は反則覚悟の探り取りで
-    /// 王手駒を高確率で回収できる（対人実戦: 竜の王手→2反則で竜を取られた）
-    pub mover_w_check: f64,
+    /// 着手駒の取られリスク重みへの加算（王手をかけた手）。王手宣言は「王を攻撃
+    /// できる（マス,駒種）」まで仮説を絞らせるので、相手は反則覚悟の探り取りで
+    /// 王手駒を高確率で回収できる（対人実戦: 竜の王手→2反則で竜を取られた）。
+    /// 旧 mover_w_check は quiet/captured との max で不感帯があった
+    /// （SPSAで勾配が立たない）ため、非負の加算に変更
+    pub mover_check_extra: f64,
     /// 捕獲後の残留露見リスク（自駒価値に掛ける割合）。取ったマスは相手に
     /// 通知されるため、粒子に守り駒が見えなくても取り返しの下限リスクを敷く。
     /// 等価な取りなら安い駒で取る、というタイブレークにもなる
@@ -405,7 +456,9 @@ impl Default for EvalParams {
             check_foul_scale: 0.047,
             mover_w_captured: 0.988,
             mover_w_quiet: 0.671,
-            mover_w_check: 0.506,
+            // 旧max形式の0.506はquiet/capturedに常に負けて実効ゼロだったため、
+            // 挙動を変えない0.0を新しい中心にする
+            mover_check_extra: 0.0,
             capture_reveal_risk: 0.155,
             camp_known_quiet: 0.403,
             camp_scale: 0.159,
@@ -446,7 +499,7 @@ impl EvalParams {
         ParamSpec { name: "check_foul_scale", lo: 0.0, hi: 0.5 },
         ParamSpec { name: "mover_w_captured", lo: 0.0, hi: 1.5 },
         ParamSpec { name: "mover_w_quiet", lo: 0.0, hi: 1.5 },
-        ParamSpec { name: "mover_w_check", lo: 0.0, hi: 1.5 },
+        ParamSpec { name: "mover_check_extra", lo: 0.0, hi: 1.0 },
         ParamSpec { name: "capture_reveal_risk", lo: 0.0, hi: 0.6 },
         ParamSpec { name: "camp_known_quiet", lo: 0.0, hi: 1.0 },
         ParamSpec { name: "camp_scale", lo: 0.0, hi: 3.0 },
@@ -478,7 +531,7 @@ impl EvalParams {
             self.check_foul_scale,
             self.mover_w_captured,
             self.mover_w_quiet,
-            self.mover_w_check,
+            self.mover_check_extra,
             self.capture_reveal_risk,
             self.camp_known_quiet,
             self.camp_scale,
@@ -512,7 +565,7 @@ impl EvalParams {
             check_foul_scale: v[1],
             mover_w_captured: v[2],
             mover_w_quiet: v[3],
-            mover_w_check: v[4],
+            mover_check_extra: v[4],
             capture_reveal_risk: v[5],
             camp_known_quiet: v[6],
             camp_scale: v[7],
@@ -555,6 +608,11 @@ pub struct EstimatorStrategy {
     params: EvalParams,
     /// 思考予算に応じた粒子数・読み幅（TSUITATE_THINK_BUDGET_MS 由来）
     budget: SearchBudget,
+    /// Some なら推定器・定跡選択・タイブレークの乱数をこのシードから導出する
+    /// （SPSA の共通乱数法用。None は従来どおりエントロピー由来）
+    seed: Option<u64>,
+    /// 評価タイブレーク用の乱数（seed があれば決定論的）
+    rng: StdRng,
     /// 直近の choose 時点の内部状態（記録用）
     last_debug: Option<serde_json::Value>,
 }
@@ -566,17 +624,31 @@ impl EstimatorStrategy {
 
     /// パラメータを差し替えて作る（bin/tune.rs のSPSA評価用）
     pub fn with_params(params: EvalParams) -> Self {
-        Self::with_params_and_line(params, None)
+        Self::with_params_line_seed(params, None, None)
     }
 
     /// パラメータと定跡ライン固定を指定して作る（定跡特化チューニング用）
     pub fn with_params_and_line(params: EvalParams, book_line: Option<usize>) -> Self {
+        Self::with_params_line_seed(params, book_line, None)
+    }
+
+    /// シードつきで作る（SPSA の f+/f− 評価で対局条件を揃える共通乱数法用）
+    pub fn with_params_line_seed(
+        params: EvalParams,
+        book_line: Option<usize>,
+        seed: Option<u64>,
+    ) -> Self {
         EstimatorStrategy {
             est: None,
             book: None,
             book_line,
             params,
             budget: SearchBudget::from_ms(think_budget_ms()),
+            seed,
+            rng: match seed {
+                Some(s) => StdRng::seed_from_u64(s ^ 0xA5A5_5A5A_DEAD_BEEF),
+                None => StdRng::seed_from_u64(rand::rng().random()),
+            },
             last_debug: None,
         }
     }
@@ -596,16 +668,19 @@ impl Strategy for EstimatorStrategy {
         foul_tried: &HashSet<String>,
     ) -> Option<String> {
         let budget = self.budget;
-        let est = self
-            .est
-            .get_or_insert_with(|| Estimator::with_scale(view.your_color, budget.scale));
+        let seed = self.seed;
+        let est = self.est.get_or_insert_with(|| match seed {
+            Some(s) => Estimator::with_seed_and_scale(view.your_color, s, budget.scale),
+            None => Estimator::with_scale(view.your_color, budget.scale),
+        });
         est.update(log);
 
         // 序盤定跡（静かな間だけ）。ブック中も推定器の update は回して粒子を保つ
         let book_line = self.book_line;
-        let book = self.book.get_or_insert_with(|| match book_line {
-            Some(idx) => OpeningBook::with_line(view.your_color, idx),
-            None => OpeningBook::new(view.your_color),
+        let book = self.book.get_or_insert_with(|| match (book_line, seed) {
+            (Some(idx), _) => OpeningBook::with_line(view.your_color, idx),
+            (None, Some(s)) => OpeningBook::with_seed(view.your_color, s),
+            (None, None) => OpeningBook::new(view.your_color),
         });
         if let Some(usi) = book.next(view, log, foul_tried) {
             return Some(usi);
@@ -664,8 +739,7 @@ impl Strategy for EstimatorStrategy {
         let mut check_solver = if view.you_in_check {
             let fouls: Vec<ShogiMove> =
                 foul_tried.iter().filter_map(|u| parse_usi(u)).collect();
-            let positions: Vec<&Position> = sample.iter().map(|(p, _)| *p).collect();
-            CheckSolver::new(view, &positions, &fouls, log)
+            CheckSolver::new(view, &sample, &fouls, log)
         } else {
             None
         };
@@ -709,9 +783,10 @@ impl Strategy for EstimatorStrategy {
             p
         };
 
-        let mut rng = rand::rng();
-        // 1段目: 全候補を1手読み（静的リスク項つき）で評価する
-        let mut scored: Vec<(String, ShogiMove, EvalOut, f64)> = vec![];
+        let rng = &mut self.rng;
+        // 1段目: 全候補を1手読み（静的リスク項つき）で評価する。
+        // (usi, mv, 内訳, gain外の補正, 1段目スコア)
+        let mut scored: Vec<(String, ShogiMove, EvalOut, f64, f64)> = vec![];
         for (usi, mv) in candidates {
             let mut prior = prior_legal(view, &mv, opp_board_n);
             if view.you_in_check {
@@ -723,7 +798,9 @@ impl Strategy for EstimatorStrategy {
                 };
             }
             let out = evaluate(view, &mv, &sample, prior, &known, &params, budget);
-            let mut score = out.score + rng.random_range(0.0..0.01);
+            // gain の外側の補正（タイブレーク乱数・手戻り/シャッフル減点）は
+            // 2手読み後の再計算でも同じ値を使うので分離して持つ
+            let mut adjust = rng.random_range(0.0..0.01);
             // 手戻り（直前の手をそのまま逆に戻す）は膠着の典型なので減点。
             // 直前に動かした駒をまた動かすだけの手も雑なシャッフルとして軽く減点
             if let (
@@ -732,20 +809,21 @@ impl Strategy for EstimatorStrategy {
             ) = (last_my_move, mv)
             {
                 if from == pt && to == pf {
-                    score -= params.backtrack_penalty;
+                    adjust -= params.backtrack_penalty;
                 } else if from == pt {
-                    score -= params.shuffle_penalty;
+                    adjust -= params.shuffle_penalty;
                 }
             }
-            scored.push((usi, mv, out, score));
+            let score = out.score() + adjust;
+            scored.push((usi, mv, out, adjust, score));
         }
 
         // 2段目: 上位候補だけ相手の応手をサンプルして再評価。
-        // 静的リスク項の DEPTH2_REPLACE 分を実測の期待損失で置き換える
-        // （risk_mean を足し戻し、サンプルの delta を足す。両者が一致するなら無変化）
-        scored.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal));
+        // gain 内の静的リスク項の DEPTH2_REPLACE 分を実測の期待損失で
+        // 置き換えて（一致するなら無変化）、最終式を適用し直す
+        scored.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
         let mut best: Option<(String, f64)> = None;
-        for (i, (usi, mv, out, score)) in scored.into_iter().enumerate() {
+        for (i, (usi, mv, out, adjust, score)) in scored.into_iter().enumerate() {
             let final_score = if i < budget.depth2_top_k {
                 let delta = depth2_delta(
                     view,
@@ -756,9 +834,10 @@ impl Strategy for EstimatorStrategy {
                     &my_touched_squares,
                     &params,
                     budget,
-                    &mut rng,
+                    &mut *rng,
                 );
-                score + out.p_legal * DEPTH2_REPLACE * (out.risk_mean + delta)
+                let gain2 = out.gain + DEPTH2_REPLACE * (out.risk_mean + delta);
+                combine_score(gain2, out.p_legal, out.foul_cost) + adjust
             } else {
                 score
             };
@@ -1039,6 +1118,8 @@ fn evaluate(
     let mut attack_sum = 0.0;
     let mut danger_sum = 0.0;
     let mut pressure_n = 0usize;
+    // 圧力項もソフト粒子の重みで加重する（他の項と同じ扱い）
+    let mut pressure_w_sum = 0.0f64;
 
     for (pos, w) in particles {
         let w = *w;
@@ -1097,7 +1178,7 @@ fn evaluate(
             params.mover_w_quiet
         };
         if gives_check {
-            mover_w = mover_w.max(params.mover_w_check);
+            mover_w += params.mover_check_extra;
         }
         let own_after = next
             .piece_at(to)
@@ -1128,13 +1209,14 @@ fn evaluate(
         // 王の安全度と攻撃圧力（利き走査が重いので少数の粒子でだけ測って平均する）
         if pressure_n < pressure_samples {
             // 自玉の周囲に当たっている相手の利き（守り）
-            pressure_sum += king_zone_pressure(&next, me, opp);
+            pressure_sum += w * king_zone_pressure(&next, me, opp);
             // 相手玉の周囲に当たっている自分の利き（攻め）。王手にならない攻め駒の
             // 集結にも報酬を与える（王手/詰みボーナスだけだと攻めを組み立てない）
-            attack_sum += king_zone_pressure(&next, opp, me);
+            attack_sum += w * king_zone_pressure(&next, opp, me);
             // 相手の持ち駒による王手打ちの受け入れ面積（対局実験の教訓:
             // 飛車を持たれた瞬間、玉への開いた直線はすべて即王手の入口になる）
-            danger_sum += drop_check_danger(&next, me);
+            danger_sum += w * drop_check_danger(&next, me);
+            pressure_w_sum += w;
             pressure_n += 1;
         }
 
@@ -1166,7 +1248,7 @@ fn evaluate(
             + (params.attack_w * confidence * attack_sum
                 - params.pressure_w * pressure_sum
                 - params.hand_drop_w * danger_sum)
-                / pressure_n.max(1) as f64
+                / pressure_w_sum.max(1e-9)
     } else {
         0.0
     };
@@ -1197,15 +1279,12 @@ fn evaluate(
     let coverage = COVERAGE_W * coverage_after(view, mv);
     let probe = tokin_probe(view, mv);
 
-    // 期待値が負の手を p_legal で割り引かない（min の形）。
-    // 割り引くと「合法確率が低いほどスコアが高い」= わざと反則に寄る手が
-    // 選ばれてしまう。反則しても手番は残るので悪い局面からは逃げられず、
-    // 反則の価値は「次善手の価値 − 反則コスト」でしかない
     let gain = expected + advance_bias + development + coverage + probe;
     EvalOut {
-        score: (p_legal * gain).min(gain) - (1.0 - p_legal) * foul_cost,
+        gain,
         risk_mean: if legal > 0.0 { risk_sum / legal } else { 0.0 },
         p_legal,
+        foul_cost,
     }
 }
 
@@ -1264,7 +1343,7 @@ fn depth2_delta(
                     params.mover_w_quiet
                 };
                 if gives_check {
-                    s = s.max(params.mover_w_check);
+                    s += params.mover_check_extra;
                 }
                 s
             } else {

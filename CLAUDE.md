@@ -24,11 +24,18 @@
   300秒+3秒に収める（強さと時間の調整ノブ）
 - `cargo run --release --bin tune -- [反復数] [評価あたり対局数] [基準...]` — 評価パラメータ
   （`strategy::EvalParams`）のSPSA自動チューニング。目的関数はアリーナのスコア率
-  （引き分け=0.5勝）。ログは `TUNE_LOG`（既定 `tune-log.jsonl`、gitignore済み）に追記し、
-  中断後は同ファイルから自動再開。ログの見方は `tuning/README.md`。
+  （引き分け=0.5勝）。**f+/f− は共通乱数法でペアリングされる**: 同じ対局シード列
+  （`TUNE_SEED` から決定論的に導出。定跡・推定器シード・タイブレークまで両陣営とも
+  ペアになる）で評価し、評価順も反復ごとに入れ替える。境界クリップ時は実際に動いた
+  距離を勾配の分母に使う。ログは `TUNE_LOG`（既定 `tune-log.jsonl`、gitignore済み）に
+  追記し、中断後は同ファイルから自動再開（**start イベントの設定と不一致なら停止**。
+  強行は `TUNE_FORCE_RESUME=1`）。eval イベントに対局内訳（勝敗・終局理由・max_plies・
+  反則数・思考時間）が残るので、引き分け化や時間浪費でスコアが上がる変質を監視できる。
+  ログの見方は `tuning/README.md`。
   `TUNE_CANDIDATE_LINE=<定跡名>` で候補側の定跡を固定できる（定跡特化チューニング。
-  基準側の固定は `estimator_rush` を基準に指定）。出力された最終パラメータ（done.final）を
-  採用するときは `EvalParams::default` を書き換えてフルガントレットで確認する。
+  基準側の固定は `estimator_rush` を基準に指定）。完走時に最終中心点を追加評価して
+  `done.final_score` に記録する。採用するときは `EvalParams::default` を書き換えて
+  フルガントレットで確認する。
   対局ループは `selfplay.rs`（arena と共用）。**長時間ランはローカルでなくGCEで回す**（下記）
 - `cargo run --release --bin analyze -- records/*.jsonl` — 対局記録の事後分析。
   アリーナも `ARENA_RECORD_DIR` を設定すると候補(A)視点の記録を同形式で出力する

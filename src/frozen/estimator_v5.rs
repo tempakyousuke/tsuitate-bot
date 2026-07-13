@@ -778,7 +778,13 @@ struct OpeningBook {
 impl OpeningBook {
     fn new(my_color: Color) -> Self {
         let all = lines();
-        let raw = &all[rand::rng().random_range(0..all.len())];
+        Self::with_index(my_color, rand::rng().random_range(0..all.len()))
+    }
+
+    /// 指定インデックスのライン（共通乱数法用の追加。選択分布は new と同じ一様）
+    fn with_index(my_color: Color, index: usize) -> Self {
+        let all = lines();
+        let raw = &all[index % all.len()];
         let line = raw
             .iter()
             .filter_map(|usi| match my_color {
@@ -967,11 +973,23 @@ pub struct EstimatorV5 {
     est: Option<Estimator>,
     book: Option<OpeningBook>,
     params: EvalParams,
+    /// Some なら推定器・定跡選択・タイブレークをこのシードから決定論化する。
+    /// 凍結後の唯一の追加（2026-07-13）: SPSA の共通乱数法（f+/f− の対局条件
+    /// ペアリング）のためのシード注入で、挙動の分布は変えない
+    seed: Option<u64>,
+    tiebreak: Option<rand::rngs::StdRng>,
 }
 
 impl EstimatorV5 {
     pub fn new() -> Self {
         Self::with_params(EvalParams::default())
+    }
+
+    /// シードつきで作る（bin/tune の共通乱数法用。挙動分布は new と同じ）
+    pub fn with_seed(seed: u64) -> Self {
+        let mut s = Self::with_params(EvalParams::default());
+        s.seed = Some(seed);
+        s
     }
 
     /// パラメータを差し替えて作る（bin/tune.rs のSPSA評価用）
@@ -980,6 +998,8 @@ impl EstimatorV5 {
             est: None,
             book: None,
             params,
+            seed: None,
+            tiebreak: None,
         }
     }
 }
@@ -997,15 +1017,20 @@ impl Strategy for EstimatorV5 {
         log: &ObservationLog,
         foul_tried: &HashSet<String>,
     ) -> Option<String> {
-        let est = self
-            .est
-            .get_or_insert_with(|| Estimator::new(view.your_color));
+        let seed = self.seed;
+        let est = self.est.get_or_insert_with(|| match seed {
+            Some(s) => Estimator::with_seed(view.your_color, s),
+            None => Estimator::new(view.your_color),
+        });
         est.update(log);
 
         // 序盤定跡（静かな間だけ）。ブック中も推定器の update は回して粒子を保つ
-        let book = self
-            .book
-            .get_or_insert_with(|| OpeningBook::new(view.your_color));
+        let book = self.book.get_or_insert_with(|| match seed {
+            Some(s) => {
+                OpeningBook::with_index(view.your_color, (s % lines().len() as u64) as usize)
+            }
+            None => OpeningBook::new(view.your_color),
+        });
         if let Some(usi) = book.next(view, log, foul_tried) {
             return Some(usi);
         }
@@ -1069,7 +1094,13 @@ impl Strategy for EstimatorV5 {
         // 相手が位置を知っている自駒（露出）の地図
         let known = knownness_map(view, log, self.params.home_knownness);
 
-        let mut rng = rand::rng();
+        let rng = self.tiebreak.get_or_insert_with(|| {
+            use rand::SeedableRng;
+            match seed {
+                Some(s) => StdRng::seed_from_u64(s ^ 0x7EA1_B00C),
+                None => StdRng::seed_from_u64(rand::rng().random()),
+            }
+        });
         let mut best: Option<(String, f64)> = None;
         for (usi, mv) in candidates {
             let mut prior = prior_legal(view, &mv, opp_board_n);

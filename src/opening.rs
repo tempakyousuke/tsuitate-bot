@@ -139,29 +139,15 @@ impl OpeningBook {
     }
 
     pub fn new(my_color: Color) -> Self {
-        let all = lines();
-        // 既定はランダム選択（対局をまたいで人間に順番を読まれないため）。
-        // TSUITATE_BOOK_RR=1 のときは巡回選択にする: SPSA（bin/tune）の
-        // f+/f− 評価で定跡分布を揃え、「どの定跡を引いたか」のノイズが
-        // 勾配推定を汚さないようにする（共通乱数法）
-        static RR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-        let idx = if std::env::var("TSUITATE_BOOK_RR").as_deref() == Ok("1") {
-            RR.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % all.len()
-        } else {
-            rand::rng().random_range(0..all.len())
-        };
-        let raw = &all[idx];
-        let line = raw
-            .iter()
-            .filter_map(|usi| match my_color {
-                Color::Sente => Some(usi.clone()),
-                Color::Gote => mirror_usi(usi),
-            })
-            .collect();
-        OpeningBook {
-            line,
-            exited: false,
-        }
+        // ランダム選択（対局をまたいで人間に順番を読まれないため）。
+        // SPSA（bin/tune）は with_seed で決定論的に選ぶ（共通乱数法）
+        Self::with_line(my_color, rand::rng().random_range(0..lines().len()))
+    }
+
+    /// シードから決定論的にラインを選ぶ（SPSA の f+/f− 評価で
+    /// 同じ対局番号に同じ定跡を割り当てるための共通乱数法用）
+    pub fn with_seed(my_color: Color, seed: u64) -> Self {
+        Self::with_line(my_color, (seed % lines().len() as u64) as usize)
     }
 
     /// ブックの次の一手。None ならブックを抜けた（通常思考へ）

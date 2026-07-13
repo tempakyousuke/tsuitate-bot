@@ -11,6 +11,8 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
+use rand::Rng;
+
 use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{
     ClockState, Color, FoulCounts, FoulRecord, GameEndPayload, GameStatus, MoveRecord,
@@ -361,6 +363,30 @@ fn record_game(
     }
 }
 
+/// 1対局・1プレイヤーぶんの決定論的な乱数コンテキスト。
+/// ランのシードと対局番号から導出され、スレッドのスケジューリングに依存しない。
+/// SPSA（bin/tune）の f+/f− 評価で同じ対局条件列を再利用する（共通乱数法）ために使う。
+/// 注意: 推定器の時間打ち切り（壁時計デッドライン）は決定論化できないため、
+/// CPU負荷によるわずかな非決定性は残る（定跡・手のサンプリング等の主要な乱数は揃う）
+#[derive(Debug, Clone, Copy)]
+pub struct GameSeeds {
+    pub game_no: u32,
+    /// このプレイヤー用のシード（推定器・タイブレーク・定跡選択の乱数源）
+    pub seed: u64,
+}
+
+/// SplitMix64。単純なXORや加算だとシード間に相関が残るため撹拌する
+fn mix(mut z: u64) -> u64 {
+    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+fn player_seed(match_seed: u64, game_no: u32, is_a: bool) -> u64 {
+    mix(match_seed ^ mix(u64::from(game_no) * 2 + u64::from(is_a)))
+}
+
 /// 対局の並列数。既定はコア数-2（推定器の時間予算・思考時間計測が
 /// コア競合で歪みすぎないよう全コアは使わない）。ARENA_THREADS で上書き可
 pub fn thread_count() -> usize {
@@ -377,13 +403,35 @@ pub fn thread_count() -> usize {
 }
 
 /// A と B を games 局（先後交代で）対戦させる。戦略はファクトリで対局ごとに作る。
-/// 対局同士は独立なのでスレッドに分散する。game_no の偶奇で先後を決めるため
-/// ラウンドロビンに割っても先後バランスは保たれる。
-/// 注意: 並列実行中の思考時間はコア競合ぶん逐次実行より長めに出る
+/// シードは不要な用途向け（アリーナ等）。ファクトリはシードを受け取らない
 pub fn run_match_with<FA, FB>(games: u32, make_a: &FA, make_b: &FB) -> MatchStats
 where
     FA: Fn() -> Box<dyn Strategy> + Sync,
     FB: Fn() -> Box<dyn Strategy> + Sync,
+{
+    run_match_with_seeds(
+        games,
+        rand::rng().random(),
+        &|_| make_a(),
+        &|_| make_b(),
+    )
+}
+
+/// A と B を games 局（先後交代で）対戦させる（シード付き）。
+/// 各対局・各プレイヤーの GameSeeds は (match_seed, game_no) から決定論的に
+/// 導出されるため、同じ match_seed で呼べば同じ対局条件列になる
+/// （SPSA の f+/f− ペアリング用）。対局同士は独立なのでスレッドに分散する。
+/// game_no の偶奇で先後を決めるためラウンドロビンに割っても先後バランスは保たれる。
+/// 注意: 並列実行中の思考時間はコア競合ぶん逐次実行より長めに出る
+pub fn run_match_with_seeds<FA, FB>(
+    games: u32,
+    match_seed: u64,
+    make_a: &FA,
+    make_b: &FB,
+) -> MatchStats
+where
+    FA: Fn(GameSeeds) -> Box<dyn Strategy> + Sync,
+    FB: Fn(GameSeeds) -> Box<dyn Strategy> + Sync,
 {
     let threads = thread_count().min(games.max(1) as usize);
     // 設定時は A 視点の対局記録を書き出す（bin/analyze 用。空文字は無効）
@@ -409,10 +457,18 @@ where
                             clock_ms: FISCHER_INITIAL_MS,
                             think_us: Vec::new(),
                         };
+                        let seeds_a = GameSeeds {
+                            game_no,
+                            seed: player_seed(match_seed, game_no, true),
+                        };
+                        let seeds_b = GameSeeds {
+                            game_no,
+                            seed: player_seed(match_seed, game_no, false),
+                        };
                         let (sente, gote) = if a_is_sente {
-                            (make_a(), make_b())
+                            (make_a(seeds_a), make_b(seeds_b))
                         } else {
-                            (make_b(), make_a())
+                            (make_b(seeds_b), make_a(seeds_a))
                         };
                         let mut players = [new_player(sente), new_player(gote)];
                         let (result, reason, plies, truth) = play_game(&mut players, game_no);
@@ -435,4 +491,65 @@ where
     });
     stats.games = games;
     stats
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    use super::*;
+
+    /// 即投了する戦略（シード配線のテスト用）
+    struct Resigner;
+    impl Strategy for Resigner {
+        fn choose(
+            &mut self,
+            _view: &PlayerView,
+            _log: &ObservationLog,
+            _foul_tried: &HashSet<String>,
+        ) -> Option<String> {
+            None
+        }
+        fn name(&self) -> &'static str {
+            "resigner"
+        }
+    }
+
+    /// 同じ match_seed なら、スレッド数や実行順に関係なく
+    /// 各対局・各プレイヤーに同じシードが割り当てられる（共通乱数法の土台）
+    #[test]
+    fn same_match_seed_reproduces_game_seeds() {
+        let collect = |match_seed: u64| -> Vec<(u32, u64, u64)> {
+            let a_seed: Mutex<HashMap<u32, u64>> = Mutex::new(HashMap::new());
+            let b_seed: Mutex<HashMap<u32, u64>> = Mutex::new(HashMap::new());
+            run_match_with_seeds(
+                8,
+                match_seed,
+                &|gs: GameSeeds| {
+                    a_seed.lock().unwrap().insert(gs.game_no, gs.seed);
+                    Box::new(Resigner)
+                },
+                &|gs: GameSeeds| {
+                    b_seed.lock().unwrap().insert(gs.game_no, gs.seed);
+                    Box::new(Resigner)
+                },
+            );
+            let a = a_seed.into_inner().unwrap();
+            let b = b_seed.into_inner().unwrap();
+            let mut v: Vec<(u32, u64, u64)> = (0..8u32)
+                .map(|g| (g, a[&g], b[&g]))
+                .collect();
+            v.sort();
+            v
+        };
+        let first = collect(42);
+        let second = collect(42);
+        assert_eq!(first, second, "同じシードなら同じ対局条件列");
+        for (game_no, a, b) in &first {
+            assert_ne!(a, b, "対局{game_no}でA/Bのシードが衝突");
+        }
+        let different = collect(43);
+        assert_ne!(first, different, "違うシードなら違う条件列");
+    }
 }
