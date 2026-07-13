@@ -52,6 +52,47 @@ fn print_match(stats: &MatchStats, name_a: &str, name_b: &str) {
     println!("思考時間 B: {}", think_summary(&stats.think_us_b));
 }
 
+/// 1マッチアップの集計を機械可読に書き出す（CIのシャード集約用）。
+/// think時間は生配列を持ち回れないため、シャード内の要約値だけを残す
+fn summary_json(candidate: &str, baseline: &str, stats: &MatchStats) -> serde_json::Value {
+    let quant = |us: &[u64]| -> (f64, f64) {
+        if us.is_empty() {
+            return (0.0, 0.0);
+        }
+        let mut sorted = us.to_vec();
+        sorted.sort_unstable();
+        (
+            sorted.iter().sum::<u64>() as f64 / sorted.len() as f64 / 1000.0,
+            sorted[(sorted.len() * 99 / 100).min(sorted.len() - 1)] as f64 / 1000.0,
+        )
+    };
+    let (a_avg, a_p99) = quant(&stats.think_us_a);
+    let (b_avg, b_p99) = quant(&stats.think_us_b);
+    serde_json::json!({
+        "candidate": candidate,
+        "baseline": baseline,
+        "games": stats.games,
+        "wins_a": stats.wins_a,
+        "wins_b": stats.wins_b,
+        "draws": stats.draws,
+        "checkmate": stats.checkmate,
+        "stalemate": stats.stalemate,
+        "foul_limit": stats.foul_limit,
+        "resign": stats.resign,
+        "timeout": stats.timeout,
+        "max_plies": stats.max_plies,
+        "total_plies": stats.total_plies,
+        "fouls_a": stats.fouls_a,
+        "fouls_b": stats.fouls_b,
+        "fouls_in_check_a": stats.fouls_in_check_a,
+        "fouls_in_check_b": stats.fouls_in_check_b,
+        "think_avg_ms_a": a_avg,
+        "think_p99_ms_a": a_p99,
+        "think_avg_ms_b": b_avg,
+        "think_p99_ms_b": b_p99,
+    })
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     // ARENA_MATCH_SEED: 対局条件（定跡・推定器シード等）を決定論化する共通seed。
@@ -102,6 +143,18 @@ fn main() {
         print_match(&stats, &candidate, opp);
         println!();
         results.push((opp.clone(), stats));
+    }
+
+    // ARENA_JSON: 集計をJSONL（1行=1マッチアップ）で書き出す（CIのシャード集約用）
+    if let Ok(path) = std::env::var("ARENA_JSON") {
+        if !path.is_empty() {
+            let lines: Vec<String> = results
+                .iter()
+                .map(|(opp, stats)| summary_json(&candidate, opp, stats).to_string())
+                .collect();
+            std::fs::write(&path, lines.join("\n") + "\n")
+                .unwrap_or_else(|e| eprintln!("ARENA_JSON を書き込めません（{path}）: {e}"));
+        }
     }
 
     // ガントレット時のみ総合サマリ（非推移性の一覧確認用）

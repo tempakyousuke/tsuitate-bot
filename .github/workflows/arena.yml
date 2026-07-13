@@ -2,13 +2,14 @@ name: Arena
 
 # ローカルマシンを熱くせずに戦略同士のアリーナ対局をGitHub Actions上で実行する。
 # 手動起動のみ（push/PRトリガーなし）。引数はCLAUDE.mdの `cargo run --release --bin arena` と同じ体系。
-# 基準ごとに matrix で別ジョブに分割する（時計が1000秒+3秒になりジョブの
-# 6時間制限に収まらないため。分割により壁時計も最長カード分に縮む）。
+# 「基準 × シャード」の matrix で並列化する: 単一基準の200局でも
+# shards=4 なら4ランナーに分かれ、壁時計は1/4になる。
+# 各ジョブは機械可読サマリー（ARENA_JSON）を出し、aggregate ジョブが合算する。
 on:
   workflow_dispatch:
     inputs:
       games:
-        description: "対局数（基準ごと）"
+        description: "対局数（基準ごと・全シャード合計）"
         required: false
         default: "100"
       candidate:
@@ -23,15 +24,28 @@ on:
         description: "共通seed（アブレーション比較用。空なら毎局ランダム）"
         required: false
         default: ""
+      shards:
+        description: "基準ごとの分割数（並列ランナー数）"
+        required: false
+        default: "4"
 
 jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
-      baselines: ${{ steps.split.outputs.list }}
+      baselines: ${{ steps.split.outputs.baselines }}
+      shards: ${{ steps.split.outputs.shards }}
+      games_per_shard: ${{ steps.split.outputs.games_per_shard }}
     steps:
       - id: split
-        run: echo "list=$(echo '${{ inputs.baselines }}' | jq -R -c 'split(" ") | map(select(length > 0))')" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "baselines=$(echo '${{ inputs.baselines }}' | jq -R -c 'split(" ") | map(select(length > 0))')" >> "$GITHUB_OUTPUT"
+          shards='${{ inputs.shards }}'
+          echo "shards=$(jq -n -c "[range(0; $shards)]")" >> "$GITHUB_OUTPUT"
+          games='${{ inputs.games }}'
+          per=$(( (games + shards - 1) / shards ))
+          per=$(( per + per % 2 ))   # 先後を揃えるため偶数化
+          echo "games_per_shard=$per" >> "$GITHUB_OUTPUT"
 
   arena:
     needs: plan
@@ -39,6 +53,7 @@ jobs:
       fail-fast: false
       matrix:
         baseline: ${{ fromJSON(needs.plan.outputs.baselines) }}
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -47,15 +62,20 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run arena
+      - name: Run arena shard
         env:
           # 候補(A)視点の対局記録。bin/analyze での敗着分析用に artifact で回収する
           ARENA_RECORD_DIR: arena-records
-          # 空なら毎局ランダム。指定するとアブレーション比較用に対局条件が決定論化される
-          ARENA_MATCH_SEED: ${{ inputs.match_seed }}
+          ARENA_JSON: arena-summary.json
         run: |
+          # 共通seed指定時はシャードごとにずらす（シャード間の対局重複を防ぎつつ、
+          # 同じ入力なら版をまたいで同じ対局条件列になる）
+          seed='${{ inputs.match_seed }}'
+          if [ -n "$seed" ]; then
+            export ARENA_MATCH_SEED=$(( seed + ${{ matrix.shard }} ))
+          fi
           cargo run --release --bin arena -- \
-            "${{ inputs.games }}" \
+            "${{ needs.plan.outputs.games_per_shard }}" \
             "${{ inputs.candidate }}" \
             "${{ matrix.baseline }}" \
             | tee arena-result.txt
@@ -73,13 +93,77 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: arena-result-${{ matrix.baseline }}
-          path: arena-result.txt
+          name: arena-result-${{ matrix.baseline }}-s${{ matrix.shard }}
+          path: |
+            arena-result.txt
+            arena-summary.json
 
       - name: Upload game records
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: arena-records-${{ matrix.baseline }}
+          name: arena-records-${{ matrix.baseline }}-s${{ matrix.shard }}
           path: arena-records/
           if-no-files-found: ignore
+
+  aggregate:
+    needs: arena
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: arena-result-*
+          path: shards
+
+      - name: Aggregate shards
+        run: |
+          cat shards/*/arena-summary.json > all.jsonl
+          jq -s '
+            group_by(.baseline) | map(
+              (map(.wins_a) | add) as $w |
+              (map(.wins_b) | add) as $l |
+              ($w + $l) as $dec |
+              {
+                baseline: .[0].baseline,
+                candidate: .[0].candidate,
+                games: (map(.games) | add),
+                wins: $w,
+                losses: $l,
+                draws: (map(.draws) | add),
+                checkmate: (map(.checkmate) | add),
+                foul_limit: (map(.foul_limit) | add),
+                timeout: (map(.timeout) | add),
+                max_plies: (map(.max_plies) | add),
+                avg_plies: ((map(.total_plies) | add) / (map(.games) | add)),
+                fouls_a_per_game: ((map(.fouls_a) | add) / (map(.games) | add)),
+                fouls_b_per_game: ((map(.fouls_b) | add) / (map(.games) | add)),
+                think_avg_ms_a: ((map(.think_avg_ms_a * .games) | add) / (map(.games) | add)),
+                think_p99_ms_a_max: (map(.think_p99_ms_a) | max),
+              } + (
+                if $dec > 0 then
+                  ($w / $dec) as $rate |
+                  { rate_pct: ($rate * 100),
+                    ci_pct: (1.96 * (($rate * (1 - $rate) / $dec) | sqrt) * 100) }
+                else
+                  { rate_pct: 50, ci_pct: 0 }
+                end
+              )
+            )
+          ' all.jsonl > combined.json
+          {
+            echo "## 総合（全シャード合算・candidate=${{ inputs.candidate }}）"
+            echo ""
+            echo '| 基準 | 勝率 | 勝-負-分 | 詰み | 反則負け | 手数上限 | 平均手数 | 反則/局(A) | think avg/p99max (A) |'
+            echo '|---|---|---|---|---|---|---|---|---|'
+            jq -r '.[] | "| \(.baseline) | \(.rate_pct | . * 10 | round / 10)% ± \(.ci_pct | . * 10 | round / 10)% | \(.wins)-\(.losses)-\(.draws) | \(.checkmate) | \(.foul_limit) | \(.max_plies) | \(.avg_plies | . * 10 | round / 10) | \(.fouls_a_per_game | . * 100 | round / 100) | \(.think_avg_ms_a | round)ms / \(.think_p99_ms_a_max | round)ms |"' combined.json
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload combined result
+        uses: actions/upload-artifact@v4
+        with:
+          name: arena-combined
+          path: |
+            combined.json
+            all.jsonl
