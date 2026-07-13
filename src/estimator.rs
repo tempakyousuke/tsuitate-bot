@@ -862,6 +862,38 @@ mod tests {
     }
 
     #[test]
+    fn recapture_boost_requires_known_square() {
+        // 7g7f / 3c3d / 8h2b+（角で2bの角を取って馬に）。手番は後手で、
+        // 3a銀による 2b の取り返しが合法。2b が既知地点なら取り返しが
+        // 強くブーストされ、既知でなければ他の手と同程度の頻度に留まる
+        let mut pos = Position::initial();
+        for usi in ["7g7f", "3c3d", "8h2b+"] {
+            pos.play_unchecked(&parse_usi(usi).unwrap());
+        }
+        let recapture = parse_usi("3a2b").unwrap();
+        let freq = |known: &[Coord]| -> f64 {
+            let mut rng = StdRng::seed_from_u64(99);
+            let n = 400;
+            let mut hits = 0;
+            for _ in 0..n {
+                if predict_opp_reply(&pos, Color::Sente, known, &[], &mut rng)
+                    == Some(recapture)
+                {
+                    hits += 1;
+                }
+            }
+            f64::from(hits) / f64::from(n)
+        };
+        let with_boost = freq(&[Coord { file: 2, rank: 2 }]);
+        let without = freq(&[]);
+        assert!(
+            with_boost > without * 3.0,
+            "既知地点の取り返しはブーストされるはず（with={with_boost:.3} without={without:.3}）"
+        );
+        assert!(with_boost > 0.10, "with={with_boost:.3}");
+    }
+
+    #[test]
     fn strict_survivors_keep_zero_penalty() {
         let mut est = Estimator::with_seed(Color::Sente, 42);
         let mut log = ObservationLog::default();

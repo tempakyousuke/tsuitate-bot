@@ -19,6 +19,10 @@ on:
         description: "基準戦略（スペース区切り。複数でガントレット）"
         required: false
         default: "estimator_v2 estimator_v3 estimator_v4 estimator_v5"
+      match_seed:
+        description: "共通seed（アブレーション比較用。空なら毎局ランダム）"
+        required: false
+        default: ""
 
 jobs:
   plan:
@@ -47,6 +51,8 @@ jobs:
         env:
           # 候補(A)視点の対局記録。bin/analyze での敗着分析用に artifact で回収する
           ARENA_RECORD_DIR: arena-records
+          # 空なら毎局ランダム。指定するとアブレーション比較用に対局条件が決定論化される
+          ARENA_MATCH_SEED: ${{ inputs.match_seed }}
         run: |
           cargo run --release --bin arena -- \
             "${{ inputs.games }}" \

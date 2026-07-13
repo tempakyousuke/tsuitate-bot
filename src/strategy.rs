@@ -1317,7 +1317,17 @@ fn depth2_delta(
         let my_capture = next.play_unchecked(mv);
         let gives_check = next.in_check(me.other());
         n += w;
-        let Some(reply) = predict_opp_reply(&next, me, my_captures, my_touched, rng) else {
+        // この候補手で駒を取った場合、捕獲通知でそのマスは相手に露見する。
+        // 応手予測の既知地点に加えないと、最有力の応手である「即時の取り返し」に
+        // PREDICT_RECAPTURE_BOOST が掛からず、捕獲手を過度に楽観視してしまう
+        let extended;
+        let known_for_reply: &[Coord] = if my_capture.is_some() {
+            extended = [my_captures, &[to]].concat();
+            &extended
+        } else {
+            my_captures
+        };
+        let Some(reply) = predict_opp_reply(&next, me, known_for_reply, my_touched, rng) else {
             continue; // 応手なし（詰み/ステイルメイト）は stage1 のボーナス側で評価済み
         };
         let reply_to = match reply {
