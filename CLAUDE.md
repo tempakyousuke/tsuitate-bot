@@ -24,9 +24,12 @@
   300秒+3秒に収める（強さと時間の調整ノブ）
 - `cargo run --release --bin tune -- [反復数] [評価あたり対局数] [基準...]` — 評価パラメータ
   （`strategy::EvalParams`）のSPSA自動チューニング。目的関数はアリーナのスコア率
-  （引き分け=0.5勝）。進捗は `tune-log.jsonl`（gitignore済み）。出力された最終パラメータを
+  （引き分け=0.5勝）。ログは `TUNE_LOG`（既定 `tune-log.jsonl`、gitignore済み）に追記し、
+  中断後は同ファイルから自動再開。ログの見方は `tuning/README.md`。
+  `TUNE_CANDIDATE_LINE=<定跡名>` で候補側の定跡を固定できる（定跡特化チューニング。
+  基準側の固定は `estimator_rush` を基準に指定）。出力された最終パラメータ（done.final）を
   採用するときは `EvalParams::default` を書き換えてフルガントレットで確認する。
-  対局ループは `selfplay.rs`（arena と共用）
+  対局ループは `selfplay.rs`（arena と共用）。**長時間ランはローカルでなくGCEで回す**（下記）
 - `cargo run --release --bin analyze -- records/*.jsonl` — 対局記録の事後分析。
   アリーナも `ARENA_RECORD_DIR` を設定すると候補(A)視点の記録を同形式で出力する
   （CIでは常時有効で artifact `arena-records` に上がる。真実の全手順つきなので
@@ -88,6 +91,27 @@
   キューへ戻る。本番（VPS）では systemd サービス `tsuitate-bot` として常駐
   （設置は tsuitate リポジトリの `scripts/server/setup/07-bot.sh`、更新は
   `npm run deploy -- --bot`）
+
+## SPSAチューニング（GCE）
+
+長時間のチューニングはローカルを熱くせず GCE の専用VMで回す（gcloud 認証済み前提）。
+
+- **VM**: `tsuitate-tune`（プロジェクト `tsuitate-solver` / `asia-northeast1-b` /
+  c2d-highcpu-16 **Spot**、約$0.1〜0.2/時）。使わないときは**停止**する（ディスクは残り課金は
+  ほぼゼロ。次回は start するだけ）:
+  `gcloud compute instances start|stop tsuitate-tune --project tsuitate-solver --zone asia-northeast1-b`
+- **コード転送**（VMにgit認証は無いのでtarで送る）:
+  `tar czf /tmp/tsuitate-bot.tar.gz -C ~/Develop --exclude tsuitate-bot/target --exclude tsuitate-bot/.git --exclude tsuitate-bot/records tsuitate-bot`
+  → `gcloud compute scp` で `/tmp/` へ、`scripts/gce/setup-tune.sh` も一緒に送って実行
+  （ビルド＋systemd常駐まで自動。引数と例はスクリプト冒頭参照）
+- **並列度**: 単発ランは `ARENA_THREADS=14`、2実験並走は 7 ずつ
+- **Spot停止への耐性**: 停止されたら `instances start` するだけ（systemd が tune を再起動し、
+  `TUNE_LOG` から続きを自動再開）。在庫切れ（resources エラー）は時間をおいて再試行。
+  監視するときは「復帰成功時のみ通知」の形にする
+- **進捗確認**: `gcloud compute ssh ... --command "journalctl -u <サービス名> --no-pager | tail"`
+- **回収**: 完走後（`最終パラメータ` 出力後は systemd が再起動ループになるので）
+  `systemctl disable --now <サービス名>` → `gcloud compute scp` で `tune-*.jsonl` を
+  `tuning/` へ回収 → VM停止。**採用判定は必ずCIの200局ガントレット**（100局は偽陽性事例あり）
 
 ## ルール上の前提（サイト側仕様）
 
