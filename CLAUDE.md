@@ -16,8 +16,12 @@
   **実行はローカルでなく GitHub Actions で行う**（`.github/workflows/arena.yml`、手動起動のみ）:
   対象ブランチを push して
   `gh workflow run arena.yml --ref <ブランチ> -f games=100 -f candidate=estimator -f baselines="estimator_v2 estimator_v3 estimator_v4 estimator_v5"`。
-  基準ごとに matrix ジョブへ分割され、結果は各ジョブのサマリー
-  （および artifact `arena-result-<基準>` / `arena-records-<基準>`）に出る。
+  「基準 × シャード」の matrix に分割され（`-f shards=4` 既定。単一基準の
+  200局も4ランナーに並列化される）、総合結果は **aggregate ジョブのサマリー**
+  （および artifact `arena-combined`）に合算表で出る。シャード個別は
+  `arena-result-<基準>-s<n>` / `arena-records-<基準>-s<n>`。
+  `-f match_seed=<数>` で対局条件列を決定論化できる（アブレーション比較用。
+  同じ入力なら版をまたいで同じ条件列。シャード間は自動で+shardずらし）。
   baselines の既定値は凍結版を追加したら手動で更新すること。
   **アリーナの時計は 1000秒+3秒**（本番サイトの300秒+3秒より厚い。思考予算を上げて
   強さの上限を探るため）。本番へのデプロイ時は `TSUITATE_THINK_BUDGET_MS` を絞って
