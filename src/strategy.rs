@@ -933,12 +933,20 @@ fn stratified_sample<'a>(
         strata[i].1 += w;
     }
     strata.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    // 層内シャッフル（Fisher–Yates）: 先頭 quota 件の採用が生存順に相関しないように
+    // 層内の並べ替え: 重み比例の非復元抽出（Efraimidis–Spirakis, key = u^(1/w) の降順）。
+    // 一様シャッフルだと quota が小さい層で soft 粒子（低重み）が strict 粒子と
+    // 同確率で層を代表し、層全体の質量を背負ってしまう。重み比例なら
+    // strict:soft の代表確率が重み比になる（生存順の相関もこれで切れる）
     for (members, _) in strata.iter_mut() {
-        for i in (1..members.len()).rev() {
-            let j = rng.random_range(0..=i);
-            members.swap(i, j);
-        }
+        let mut keyed: Vec<(f64, (&Position, f64))> = members
+            .iter()
+            .map(|&(p, w)| {
+                let u: f64 = rng.random_range(0.0..1.0);
+                (u.powf(1.0 / w.max(1e-9)), (p, w))
+            })
+            .collect();
+        keyed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+        *members = keyed.into_iter().map(|(_, e)| e).collect();
     }
 
     // 採用枠の配分（合計は eval_particles を超えない）:
@@ -1954,6 +1962,31 @@ pub(crate) mod tests {
         assert_eq!(sample.len(), 54);
         let mass: f64 = sample.iter().map(|(_, w)| w).sum();
         assert!((mass - 54.0).abs() < 1e-6, "mass={mass}");
+    }
+
+    #[test]
+    fn stratum_representative_is_weight_proportional() {
+        // 同一層に strict（w=1.0）と penalty=3（w=0.125, decay 0.5）の2粒子。
+        // quota=1 のとき層代表は重み比例（strict ≈ 89%）で選ばれるべき。
+        // 一様シャッフルだと 50% になる（回帰: 2026-07-15 追加レビュー）
+        let strict = synth_position(1, 2);
+        let soft = synth_position(1, 3); // 同じ玉位置 = 同じ層、別指紋
+        let particles = vec![strict.clone(), soft];
+        let penalties = vec![0u8, 3u8];
+        let strict_fp = strict.fingerprint();
+        let mut strict_hits = 0;
+        let trials = 400;
+        for seed in 0..trials {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let sample = stratified_sample(&particles, &penalties, Color::Gote, 0.5, 1, &mut rng);
+            assert_eq!(sample.len(), 1);
+            if sample[0].0.fingerprint() == strict_fp {
+                strict_hits += 1;
+            }
+        }
+        let share = strict_hits as f64 / trials as f64;
+        // 期待値 1.0/(1.0+0.125) ≒ 0.889。一様（0.5）とは明確に区別できる閾値で検証
+        assert!(share > 0.8, "strictの代表率が重み比例になっていない: {share}");
     }
 
     #[test]
