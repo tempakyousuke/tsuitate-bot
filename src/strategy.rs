@@ -936,8 +936,13 @@ pub fn candidate_moves(view: &PlayerView, foul_tried: &HashSet<String>) -> Vec<(
                 Promotion::None => push(make_usi_move(from, to, false), &mut out),
                 Promotion::Forced => push(make_usi_move(from, to, true), &mut out),
                 Promotion::Optional => {
-                    // 成れるなら成る（不成が有利な局面はまれなので候補を絞る）
                     push(make_usi_move(from, to, true), &mut out);
+                    // 銀・桂・香は成ると固有の利き（斜め後ろ・桂跳び・前方の走り）を
+                    // 失うので不成も候補に残す。歩・飛・角の不成が有利な局面は
+                    // まれなので従来どおり成りだけ（候補数の膨張を抑える）
+                    if matches!(piece.role, Role::Silver | Role::Knight | Role::Lance) {
+                        push(make_usi_move(from, to, false), &mut out);
+                    }
                 }
             }
         }
@@ -1729,6 +1734,38 @@ pub(crate) mod tests {
         assert_eq!(tokin_probe(&view, &parse_usi("P*3f").unwrap()), 0.0);
         // 歩以外の打ちには付かない
         assert_eq!(tokin_probe(&view, &parse_usi("G*3d").unwrap()), 0.0);
+    }
+
+    #[test]
+    fn optional_promotion_keeps_nonpromote_for_silver_knight_lance() {
+        // 敵陣に入る銀は成り・不成の両方が候補に出る
+        let view = minimal_view(
+            vec![VisiblePiece {
+                square: "4d".into(),
+                role: Role::Silver,
+            }],
+            HashMap::new(),
+        );
+        let moves: Vec<String> = candidate_moves(&view, &HashSet::new())
+            .into_iter()
+            .map(|(usi, _)| usi)
+            .collect();
+        assert!(moves.contains(&"4d4c+".to_string()));
+        assert!(moves.contains(&"4d4c".to_string()), "銀の不成も候補に残す");
+        // 歩は従来どおり成りのみ
+        let view = minimal_view(
+            vec![VisiblePiece {
+                square: "4d".into(),
+                role: Role::Pawn,
+            }],
+            HashMap::new(),
+        );
+        let moves: Vec<String> = candidate_moves(&view, &HashSet::new())
+            .into_iter()
+            .map(|(usi, _)| usi)
+            .collect();
+        assert!(moves.contains(&"4d4c+".to_string()));
+        assert!(!moves.contains(&"4d4c".to_string()), "歩の不成は出さない");
     }
 
     #[test]
