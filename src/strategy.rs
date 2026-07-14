@@ -1034,8 +1034,12 @@ fn debug_summary(est: &Estimator, sample: &[(&Position, f64)], push: f64) -> ser
     // 層化で少数派にも最低枠が付くため、件数でなく重みで集計する
     let mut king_votes: HashMap<Coord, f64> = HashMap::new();
     let mut total_w = 0.0f64;
+    // systematic resampling は同じ粒子を複数スロットに乗せうるので、
+    // ユニーク数はスロット数（sample.len()）と別に指紋で数える
+    let mut fingerprints = HashSet::new();
     for (pos, w) in sample {
         total_w += w;
+        fingerprints.insert(pos.fingerprint());
         if let Some(sq) = pos.king_square(opp) {
             *king_votes.entry(sq).or_default() += w;
         }
@@ -1055,7 +1059,8 @@ fn debug_summary(est: &Estimator, sample: &[(&Position, f64)], push: f64) -> ser
         .collect();
     serde_json::json!({
         "healthy": est.healthy(),
-        "unique_particles": sample.len(),
+        "unique_particles": fingerprints.len(),
+        "sample_slots": sample.len(),
         "soft_particles": est.penalties().iter().filter(|&&p| p > 0).count(),
         "endgame_push": (push * 100.0).round() / 100.0,
         "opp_king_top": opp_king_top,
