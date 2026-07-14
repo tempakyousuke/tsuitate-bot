@@ -933,21 +933,6 @@ fn stratified_sample<'a>(
         strata[i].1 += w;
     }
     strata.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    // 層内の並べ替え: 重み比例の非復元抽出（Efraimidis–Spirakis, key = u^(1/w) の降順）。
-    // 一様シャッフルだと quota が小さい層で soft 粒子（低重み）が strict 粒子と
-    // 同確率で層を代表し、層全体の質量を背負ってしまう。重み比例なら
-    // strict:soft の代表確率が重み比になる（生存順の相関もこれで切れる）
-    for (members, _) in strata.iter_mut() {
-        let mut keyed: Vec<(f64, (&Position, f64))> = members
-            .iter()
-            .map(|&(p, w)| {
-                let u: f64 = rng.random_range(0.0..1.0);
-                (u.powf(1.0 / w.max(1e-9)), (p, w))
-            })
-            .collect();
-        keyed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-        *members = keyed.into_iter().map(|(_, e)| e).collect();
-    }
 
     // 採用枠の配分（合計は eval_particles を超えない）:
     // まずカバレッジ枠（各層 MIN_STRATUM 件まで、質量降順のラウンドロビン）、
@@ -985,21 +970,46 @@ fn stratified_sample<'a>(
         budget -= 1;
     }
 
-    // 層内の再重み付け（層合計を保存）と、層をまたぐラウンドロビン出力
-    let scaled: Vec<Vec<(&Position, f64)>> = strata
+    // 層内の採用: 重み付き systematic resampling。
+    // 選択確率 ∝ 重みで quota 件を等間隔に引き、各出力へ**等重み**（層質量/quota）を
+    // 割り当てる。「重み比例で選び、さらに元の重みも配る」と二重適用になり
+    // 低重み粒子の期待寄与を過小評価する（2026-07-15 追加レビュー指摘）。
+    // 等重み割当なら任意の quota で E[粒子iの寄与] = w_i の不偏性が成り立つ
+    // （同一粒子が複数スロットに乗ることもあるが合計質量は固定）。
+    // 出力後に層内を一様シャッフル（等重みなので不偏のまま）して、
+    // prefix利用時の生存順相関を切る
+    let resampled: Vec<Vec<(&Position, f64)>> = strata
         .iter()
         .zip(&quotas)
         .map(|((members, mass), &q)| {
-            let taken = &members[..q];
-            let taken_mass: f64 = taken.iter().map(|(_, w)| w).sum();
-            let scale = if taken_mass > 0.0 { mass / taken_mass } else { 1.0 };
-            taken.iter().map(|(p, w)| (*p, w * scale)).collect()
+            if q == 0 || *mass <= 0.0 {
+                return vec![];
+            }
+            let unit = mass / q as f64;
+            let offset: f64 = rng.random_range(0.0..unit);
+            let mut out: Vec<(&Position, f64)> = Vec::with_capacity(q);
+            let mut cum = 0.0;
+            let mut idx = 0;
+            for k in 0..q {
+                let target = offset + k as f64 * unit;
+                while idx + 1 < members.len() && cum + members[idx].1 <= target {
+                    cum += members[idx].1;
+                    idx += 1;
+                }
+                out.push((members[idx].0, unit));
+            }
+            for i in (1..out.len()).rev() {
+                let j = rng.random_range(0..=i);
+                out.swap(i, j);
+            }
+            out
         })
         .collect();
+    // 層をまたぐラウンドロビン出力（prefixしか見ない評価でも層化が効く）
     let max_quota = quotas.iter().copied().max().unwrap_or(0);
     let mut sample: Vec<(&Position, f64)> = vec![];
     for round in 0..max_quota {
-        for stratum in &scaled {
+        for stratum in &resampled {
             if let Some(&entry) = stratum.get(round) {
                 sample.push(entry);
             }
@@ -1985,8 +1995,44 @@ pub(crate) mod tests {
             }
         }
         let share = strict_hits as f64 / trials as f64;
-        // 期待値 1.0/(1.0+0.125) ≒ 0.889。一様（0.5）とは明確に区別できる閾値で検証
-        assert!(share > 0.8, "strictの代表率が重み比例になっていない: {share}");
+        // 期待値 1.0/(1.0+0.125) ≒ 0.889。一様（0.5）とも過剰（→1.0）とも
+        // 区別できる両側の閾値で検証
+        assert!(
+            share > 0.84 && share < 0.94,
+            "strictの代表率が重み比例になっていない: {share}"
+        );
+    }
+
+    #[test]
+    fn resampling_does_not_double_apply_weights() {
+        // 同一層に [strict 1.0, strict 1.0, penalty3 0.125] の3粒子、quota=2。
+        // soft粒子の期待質量シェアは 0.125/2.125 ≒ 5.9%。
+        // 「重み比例で選び、さらに元の重みも配る」二重適用だと ~1.8% に沈む
+        // （2026-07-15 追加レビューの回帰テスト）
+        let s1 = synth_position(1, 2);
+        let s2 = synth_position(1, 4);
+        let soft = synth_position(1, 6); // 同じ玉位置 = 同じ層
+        let soft_fp = soft.fingerprint();
+        let particles = vec![s1, s2, soft];
+        let penalties = vec![0u8, 0u8, 3u8];
+        let trials = 400;
+        let mut share_sum = 0.0;
+        for seed in 0..trials {
+            let mut rng = StdRng::seed_from_u64(1000 + seed);
+            let sample = stratified_sample(&particles, &penalties, Color::Gote, 0.5, 2, &mut rng);
+            let total: f64 = sample.iter().map(|(_, w)| w).sum();
+            let soft_mass: f64 = sample
+                .iter()
+                .filter(|(p, _)| p.fingerprint() == soft_fp)
+                .map(|(_, w)| w)
+                .sum();
+            share_sum += soft_mass / total.max(1e-9);
+        }
+        let avg = share_sum / trials as f64;
+        assert!(
+            avg > 0.03 && avg < 0.09,
+            "soft粒子の期待寄与が歪んでいる: avg={avg}（期待 ≒ 0.059）"
+        );
     }
 
     #[test]
