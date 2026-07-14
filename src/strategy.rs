@@ -734,7 +734,14 @@ impl Strategy for EstimatorStrategy {
         // ソフト救済された粒子（penalty>0）は重み soft_decay^penalty で薄く数える。
         // 相手玉の位置で層化して抽出する（stratified_sample 参照）。
         // 粒子が完全に枯渇していても、事前確率だけで安全側の評価が成り立つ
-        let sample = stratified_sample(est, self.params.soft_decay, budget.eval_particles);
+        let sample = stratified_sample(
+            est.particles(),
+            est.penalties(),
+            view.your_color.other(),
+            self.params.soft_decay,
+            budget.eval_particles,
+            &mut self.rng,
+        );
 
         // 相手の盤上駒数の概算（取った枚数ぶん減る。相手の打ちで戻る分は無視）
         let my_captures = log
@@ -879,61 +886,122 @@ impl Strategy for EstimatorStrategy {
 ///
 /// 従来は penalty 昇順の先頭から eval_particles 件を採っていたが、層内の並びは
 /// 生存順で相関しており、少数の玉位置仮説群だけで候補を評価する偏りがあった。
-/// 層化: ユニーク粒子を玉位置ごとに束ね、各層に「質量比例＋最低枠」で採用枠を
-/// 配り、採らなかった質量は同じ層の採用粒子へ再配分する（層の合計重みを保存）。
-/// これで少数派の玉位置仮説も必ず評価に現れ、期待値は歪まない。
-/// 最後に全体の重み和を従来スケール（min(全質量, eval_particles)）へ正規化し、
-/// p(合法) の事前ブレンド係数（prior_weight）の較正を崩さない
+/// 設計（2026-07-15 のレビュー指摘対応込み）:
+/// - 採用数は**必ず eval_particles 以下**（カバレッジ枠→D'Hondt式の質量比例配分）
+/// - 層内は決定的シャッフルで代表抽出（生存順バイアスを切る。rng は対局シード由来）
+/// - 出力は層をまたぐ**ラウンドロビン順**: 先頭 k 件しか見ない評価
+///   （王周辺圧力・2手読み）でも玉位置の分布が近似される
+/// - 採らなかった質量は同層の採用粒子へ再配分（層合計の重みを保存）
+/// - 重み和は「旧方式＝penalty昇順の先頭 min(eval, unique) 件の重み和」へ正規化し、
+///   ソフト減衰による退化度・prior_weight の較正を変えない
 fn stratified_sample<'a>(
-    est: &'a Estimator,
+    particles: &'a [Position],
+    penalties: &[u8],
+    opp: Color,
     soft_decay: f64,
     eval_particles: usize,
+    rng: &mut StdRng,
 ) -> Vec<(&'a Position, f64)> {
-    let opp = est.my_color().other();
-    // ユニーク化（penalty 昇順の並びを保つ）と玉位置ごとの層への振り分け
+    // ユニーク化（penalty 昇順の並びを保つ）。旧方式の重み和もこの走査で計る
     let mut seen = HashSet::new();
-    let mut strata: HashMap<Option<Coord>, Vec<(&Position, f64)>> = HashMap::new();
-    let mut order: Vec<Option<Coord>> = vec![];
-    for (pos, pen) in est.particles().iter().zip(est.penalties()) {
+    let mut uniques: Vec<(&Position, f64)> = vec![];
+    let mut legacy_mass = 0.0;
+    for (pos, pen) in particles.iter().zip(penalties) {
         if !seen.insert(pos.fingerprint()) {
             continue;
         }
-        let k = pos.king_square(opp);
-        let entry = strata.entry(k).or_insert_with(|| {
-            order.push(k);
-            vec![]
-        });
-        entry.push((pos, soft_decay.powi(i32::from(*pen))));
+        let w = soft_decay.powi(i32::from(*pen));
+        if uniques.len() < eval_particles {
+            legacy_mass += w;
+        }
+        uniques.push((pos, w));
     }
-    if strata.is_empty() {
+    if uniques.is_empty() {
         return vec![];
     }
-    let total_mass: f64 = strata
-        .values()
-        .map(|v| v.iter().map(|(_, w)| w).sum::<f64>())
-        .sum();
-    // 各層の採用枠: 最低枠 + 質量比例（層サイズが上限）
-    const MIN_STRATUM: usize = 4;
-    let reserved = MIN_STRATUM * strata.len();
-    let proportional = eval_particles.saturating_sub(reserved);
-    let mut sample: Vec<(&Position, f64)> = vec![];
-    for k in &order {
-        let members = &strata[k];
-        let mass: f64 = members.iter().map(|(_, w)| w).sum();
-        let quota = (MIN_STRATUM
-            + (proportional as f64 * mass / total_mass.max(1e-9)) as usize)
-            .min(members.len());
-        let taken = &members[..quota];
-        let taken_mass: f64 = taken.iter().map(|(_, w)| w).sum();
-        // 採らなかった質量を採用粒子へ再配分（層の合計重みを保存）
-        let scale = if taken_mass > 0.0 { mass / taken_mass } else { 1.0 };
-        sample.extend(taken.iter().map(|(p, w)| (*p, w * scale)));
+
+    // 玉位置で層化（質量降順）
+    let mut index: HashMap<Option<Coord>, usize> = HashMap::new();
+    let mut strata: Vec<(Vec<(&Position, f64)>, f64)> = vec![];
+    for (pos, w) in uniques {
+        let k = pos.king_square(opp);
+        let i = *index.entry(k).or_insert_with(|| {
+            strata.push((vec![], 0.0));
+            strata.len() - 1
+        });
+        strata[i].0.push((pos, w));
+        strata[i].1 += w;
     }
-    // 全体スケールを従来（先頭 eval_particles 件、重み和 ≤ eval_particles）に合わせる
+    strata.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // 層内シャッフル（Fisher–Yates）: 先頭 quota 件の採用が生存順に相関しないように
+    for (members, _) in strata.iter_mut() {
+        for i in (1..members.len()).rev() {
+            let j = rng.random_range(0..=i);
+            members.swap(i, j);
+        }
+    }
+
+    // 採用枠の配分（合計は eval_particles を超えない）:
+    // まずカバレッジ枠（各層 MIN_STRATUM 件まで、質量降順のラウンドロビン）、
+    // 残り予算は D'Hondt（mass/(quota+1) が最大の層へ1件ずつ）で質量比例に配る
+    const MIN_STRATUM: usize = 4;
+    let n = strata.len();
+    let mut quotas = vec![0usize; n];
+    let mut budget = eval_particles;
+    'coverage: for _ in 0..MIN_STRATUM {
+        for i in 0..n {
+            if budget == 0 {
+                break 'coverage;
+            }
+            if quotas[i] < strata[i].0.len() {
+                quotas[i] += 1;
+                budget -= 1;
+            }
+        }
+    }
+    while budget > 0 {
+        let mut best: Option<(usize, f64)> = None;
+        for i in 0..n {
+            if quotas[i] >= strata[i].0.len() {
+                continue;
+            }
+            let score = strata[i].1 / (quotas[i] as f64 + 1.0);
+            if best.is_none_or(|(_, s)| score > s) {
+                best = Some((i, score));
+            }
+        }
+        let Some((i, _)) = best else {
+            break; // 全層が member 数まで採用済み
+        };
+        quotas[i] += 1;
+        budget -= 1;
+    }
+
+    // 層内の再重み付け（層合計を保存）と、層をまたぐラウンドロビン出力
+    let scaled: Vec<Vec<(&Position, f64)>> = strata
+        .iter()
+        .zip(&quotas)
+        .map(|((members, mass), &q)| {
+            let taken = &members[..q];
+            let taken_mass: f64 = taken.iter().map(|(_, w)| w).sum();
+            let scale = if taken_mass > 0.0 { mass / taken_mass } else { 1.0 };
+            taken.iter().map(|(p, w)| (*p, w * scale)).collect()
+        })
+        .collect();
+    let max_quota = quotas.iter().copied().max().unwrap_or(0);
+    let mut sample: Vec<(&Position, f64)> = vec![];
+    for round in 0..max_quota {
+        for stratum in &scaled {
+            if let Some(&entry) = stratum.get(round) {
+                sample.push(entry);
+            }
+        }
+    }
+
+    // 旧方式の重み和へ正規化（較正の維持）
     let sample_mass: f64 = sample.iter().map(|(_, w)| w).sum();
-    let target_mass = total_mass.min(eval_particles as f64);
     if sample_mass > 0.0 {
-        let norm = target_mass / sample_mass;
+        let norm = legacy_mass / sample_mass;
         for (_, w) in sample.iter_mut() {
             *w *= norm;
         }
@@ -945,22 +1013,25 @@ fn stratified_sample<'a>(
 /// 事後分析で「推定が外れていたのか、評価が悪かったのか」を切り分けるために残す
 fn debug_summary(est: &Estimator, sample: &[(&Position, f64)], push: f64) -> serde_json::Value {
     let opp = est.my_color().other();
-    let mut king_votes: HashMap<Coord, u32> = HashMap::new();
-    for (pos, _) in sample {
+    // 層化で少数派にも最低枠が付くため、件数でなく重みで集計する
+    let mut king_votes: HashMap<Coord, f64> = HashMap::new();
+    let mut total_w = 0.0f64;
+    for (pos, w) in sample {
+        total_w += w;
         if let Some(sq) = pos.king_square(opp) {
-            *king_votes.entry(sq).or_default() += 1;
+            *king_votes.entry(sq).or_default() += w;
         }
     }
-    let mut top: Vec<(Coord, u32)> = king_votes.into_iter().collect();
-    top.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-    let n = sample.len().max(1) as f64;
+    let mut top: Vec<(Coord, f64)> = king_votes.into_iter().collect();
+    top.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let n = total_w.max(1e-9);
     let opp_king_top: Vec<serde_json::Value> = top
         .iter()
         .take(3)
         .map(|(sq, votes)| {
             serde_json::json!({
                 "sq": make_usi_square(*sq),
-                "p": *votes as f64 / n,
+                "p": ((votes / n) * 1000.0).round() / 1000.0,
             })
         })
         .collect();
@@ -1788,36 +1859,77 @@ pub(crate) mod tests {
         assert_eq!(tokin_probe(&view, &parse_usi("G*3d").unwrap()), 0.0);
     }
 
+    /// 相手玉を kf筋・自陣に歩を1枚置いた盤（指紋がユニークになるよう pawn_sq を変える）
+    fn synth_position(king_file: i8, pawn_rank: i8) -> Position {
+        let mut pos = Position::empty(Color::Sente);
+        pos.set(
+            Coord { file: 5, rank: 9 },
+            Some(crate::shogi::Piece {
+                color: Color::Sente,
+                role: Role::King,
+            }),
+        );
+        pos.set(
+            Coord { file: king_file, rank: 1 },
+            Some(crate::shogi::Piece {
+                color: Color::Gote,
+                role: Role::King,
+            }),
+        );
+        pos.set(
+            Coord { file: 5, rank: pawn_rank },
+            Some(crate::shogi::Piece {
+                color: Color::Sente,
+                role: Role::Pawn,
+            }),
+        );
+        pos
+    }
+
     #[test]
-    fn stratified_sample_preserves_mass_and_cap() {
-        use crate::observation::Observation;
-        let mut est = Estimator::with_seed(Color::Sente, 9);
-        let mut log = ObservationLog::default();
-        log.record(Observation::MyMove {
-            move_number: 1,
-            usi: "7g7f".into(),
-            captured: None,
-        });
-        log.record(Observation::OpponentMoved {
-            move_number: 2,
-            captured_my_piece_at: None,
-        });
-        est.update(&log);
-        // ユニーク質量（全粒子 penalty=0 なので重み1×ユニーク数）
-        let mut seen = HashSet::new();
-        let unique = est
-            .particles()
+    fn stratified_sample_respects_count_cap_and_prefix_diversity() {
+        let mut rng = StdRng::seed_from_u64(1);
+        // 9層（玉位置 file 1..=9）× 各6粒子 = 54ユニーク
+        let mut particles = vec![];
+        for kf in 1..=9i8 {
+            for pr in 2..=7i8 {
+                particles.push(synth_position(kf, pr));
+            }
+        }
+        let penalties = vec![0u8; particles.len()];
+        // 上限16 < 層数9×最低枠4=36: 件数は必ず16以下
+        let sample = stratified_sample(&particles, &penalties, Color::Gote, 0.5, 16, &mut rng);
+        assert!(sample.len() <= 16, "len={}", sample.len());
+        // ラウンドロビン順: 先頭9件で9層すべての玉位置が現れる
+        let prefix_kings: HashSet<_> = sample
             .iter()
-            .filter(|p| seen.insert(p.fingerprint()))
-            .count() as f64;
-        // 上限が十分大きい: 全ユニーク質量を保存
-        let sample = stratified_sample(&est, 0.5, 512);
+            .take(9)
+            .map(|(p, _)| p.king_square(Color::Gote))
+            .collect();
+        assert_eq!(prefix_kings.len(), 9, "prefixが層化されていない");
+        // 上限が大きい場合も件数はユニーク数以下・重みは旧方式と一致
+        let sample = stratified_sample(&particles, &penalties, Color::Gote, 0.5, 512, &mut rng);
+        assert_eq!(sample.len(), 54);
         let mass: f64 = sample.iter().map(|(_, w)| w).sum();
-        assert!((mass - unique).abs() < 1e-6, "mass={mass} unique={unique}");
-        // 上限が小さい: 重み和は上限に正規化される（採用数も上限近傍）
-        let small = stratified_sample(&est, 0.5, 8);
-        let small_mass: f64 = small.iter().map(|(_, w)| w).sum();
-        assert!((small_mass - 8.0).abs() < 1e-6, "small_mass={small_mass}");
+        assert!((mass - 54.0).abs() < 1e-6, "mass={mass}");
+    }
+
+    #[test]
+    fn stratified_sample_keeps_soft_decay_calibration() {
+        let mut rng = StdRng::seed_from_u64(2);
+        // 20ユニーク全てが penalty=1（soft）。旧方式の重み和 = min(16,20)×0.5 = 8
+        let particles: Vec<Position> =
+            (2..=7).flat_map(|pr| (1..=4).map(move |kf| synth_position(kf, pr)))
+                .take(20)
+                .collect();
+        let penalties = vec![1u8; particles.len()];
+        let sample = stratified_sample(&particles, &penalties, Color::Gote, 0.5, 16, &mut rng);
+        assert!(sample.len() <= 16);
+        let mass: f64 = sample.iter().map(|(_, w)| w).sum();
+        assert!(
+            (mass - 8.0).abs() < 1e-6,
+            "ソフト減衰の較正が崩れている: mass={mass}（期待8.0）"
+        );
     }
 
     #[test]
