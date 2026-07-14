@@ -14,7 +14,7 @@ use crate::board::{
     parse_usi_square, promotion_choice,
 };
 use crate::check::CheckSolver;
-use crate::estimator::{Estimator, predict_opp_reply};
+use crate::estimator::{Estimator, opp_reply_weights};
 use crate::opening::OpeningBook;
 use crate::observation::{Observation, ObservationLog};
 use rand::SeedableRng;
@@ -1313,9 +1313,14 @@ fn evaluate(
     }
 }
 
-/// 2手読み: 候補手の後に相手の応手を粒子上でサンプルし、実測の期待損失
-/// （露見度で割引した駒損 − 取り返し補償、被王手/被詰みペナルティ）を返す。
-/// 静的リスク項（EvalOut::risk_mean）の置き換え先。値は「加点」方向（通常は負）
+/// 2手読み: 候補手の後の相手応手の損失を方策加重の**期待値**で評価する。
+/// （露見度で割引した駒損 − 取り返し補償、被王手/被詰みペナルティ）。
+/// 静的リスク項（EvalOut::risk_mean）の置き換え先。値は「加点」方向（通常は負）。
+///
+/// 旧実装は応手を1手サンプルしていたため、低確率の大損失を引いたかどうかで
+/// 候補順位が揺れた（モンテカルロノイズ）。応手の列挙と重みは既に計算している
+/// ので、駒損が出る応手（自駒を取る手）は全て厳密に評価して重み平均し、
+/// 静かな応手は駒損ゼロ・王手ペナルティのみを少数サンプルで近似する
 #[allow(clippy::too_many_arguments)]
 fn depth2_delta(
     view: &PlayerView,
@@ -1331,6 +1336,18 @@ fn depth2_delta(
     let me = view.your_color;
     let to = match *mv {
         ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+    };
+    // 被王手/被詰みの評価（clone+play が要るのでここに集約）
+    let check_pen = |next2: &mut Position| -> f64 {
+        if next2.in_check(me) {
+            let mut p = params.depth2_check_pen;
+            if next2.legal_moves().is_empty() {
+                p += DEPTH2_MATE_PEN;
+            }
+            p
+        } else {
+            0.0
+        }
     };
     let mut sum = 0.0;
     let mut n = 0.0;
@@ -1352,21 +1369,31 @@ fn depth2_delta(
         } else {
             my_captures
         };
-        let Some(reply) = predict_opp_reply(&next, me, known_for_reply, my_touched, rng) else {
+        let replies = opp_reply_weights(&next, me, known_for_reply, my_touched);
+        let total_rw: f64 = replies.iter().map(|(_, rw)| rw).sum();
+        if replies.is_empty() || total_rw <= 0.0 {
             continue; // 応手なし（詰み/ステイルメイト）は stage1 のボーナス側で評価済み
-        };
-        let reply_to = match reply {
-            ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
-        };
-        let lost = next
-            .piece_at(reply_to)
-            .filter(|p| p.color == me)
-            .map(|p| exchange_value(p.role))
-            .unwrap_or(0.0);
-        let mut next2 = next.clone();
-        next2.play_unchecked(&reply);
-        let mut d = 0.0;
-        if lost > 0.0 {
+        }
+        let mut exp_delta = 0.0;
+        // 静かな応手（駒損なし）: 重みを溜めて王手ペナルティだけ後でサンプル近似
+        let mut quiet: Vec<(ShogiMove, f64)> = vec![];
+        let mut quiet_w = 0.0;
+        for (reply, rw) in &replies {
+            let reply_to = match *reply {
+                ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+            };
+            let lost = next
+                .piece_at(reply_to)
+                .filter(|p| p.color == me)
+                .map(|p| exchange_value(p.role))
+                .unwrap_or(0.0);
+            if lost <= 0.0 {
+                quiet_w += rw;
+                quiet.push((*reply, *rw));
+                continue;
+            }
+            let mut next2 = next.clone();
+            next2.play_unchecked(reply);
             // 露見度スケール: 着手駒は stage1 の mover_w と同じ規則、
             // それ以外の駒は exposed_capture_risk と同じ knownness 重み。
             // 粒子上の応手はこちらの駒が全部見えてしまうので、実戦で相手が
@@ -1395,15 +1422,30 @@ fn depth2_delta(
             } else {
                 0.0
             };
-            d -= scale * (lost - comp).max(0.0);
+            let d = -scale * (lost - comp).max(0.0) - check_pen(&mut next2);
+            exp_delta += rw * d;
         }
-        if next2.in_check(me) {
-            d -= params.depth2_check_pen;
-            if next2.legal_moves().is_empty() {
-                d -= DEPTH2_MATE_PEN;
+        if quiet_w > 0.0 {
+            // 静かな応手の被王手率は低頻度なので2サンプルで近似する
+            let samples = quiet.len().min(2);
+            let mut pen = 0.0;
+            for _ in 0..samples {
+                let mut t = rng.random_range(0.0..quiet_w);
+                let mut chosen = &quiet[quiet.len() - 1].0;
+                for (r, rw) in &quiet {
+                    t -= rw;
+                    if t <= 0.0 {
+                        chosen = r;
+                        break;
+                    }
+                }
+                let mut next2 = next.clone();
+                next2.play_unchecked(chosen);
+                pen += check_pen(&mut next2);
             }
+            exp_delta -= quiet_w * pen / samples as f64;
         }
-        sum += w * d;
+        sum += w * (exp_delta / total_rw);
     }
     if n > 0.0 { sum / n } else { 0.0 }
 }
