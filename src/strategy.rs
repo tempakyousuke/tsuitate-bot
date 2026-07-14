@@ -439,52 +439,49 @@ pub struct EvalParams {
 
 impl Default for EvalParams {
     fn default() -> Self {
-        // SPSA第1ラウンドの収束点（2026-07-11、60反復×2×30局 vs estimator_v5）。
-        // 手調整からの主な学び: 反則コスト減（探り反則の価値）、info_bonus増、
-        // 打ちの一律減点は撤回（drop_bias正）、露出評価は小さい値で復活
-        // （camp_scale 0.16 / exposed_known 0.11 / home_knownness 0.15 —
-        // 手動で入れた0.25〜1.0は過剰、ゼロも過小だった）。
-        // hand_drop_w のみ未チューニング（第1ラウンド後に追加した項）
+        // SPSA第2ラウンドの収束点（2026-07-14、60反復×2×40局 vs estimator_v5、
+        // 共通乱数法・tuning/tune-round2.jsonl、最終中心点の追加評価 score=0.675）。
+        // 第1ラウンド（2026-07-11）からの主な動き: check_bonus 大幅減
+        // （0.75→0.16。王手自体より check_foul_scale 側=相手の反則蓄積で加点）、
+        // prior_weight_degen 増（4.7→8.0、退化時は事前をさらに信頼）、
+        // threat_w 増（0.31→0.46）、coverage_w はほぼゼロへ
+        // （利き被覆の一律加点は効かず、と金・王探しの個別項が残った）
         EvalParams {
-            check_bonus: 0.748,
-            check_foul_scale: 0.047,
-            mover_w_captured: 0.988,
-            mover_w_quiet: 0.671,
-            // 旧max形式の0.506はquiet/capturedに常に負けて実効ゼロだったため、
-            // 挙動を変えない0.0を新しい中心にする
-            mover_check_extra: 0.0,
-            capture_reveal_risk: 0.155,
-            camp_known_quiet: 0.403,
-            camp_scale: 0.159,
-            exposed_base: 0.569,
-            exposed_known: 0.113,
-            home_knownness: 0.147,
-            recapture_defended: 0.323,
-            exposed_defended: 0.42,
-            attack_w: 0.062,
-            pressure_w: 0.151,
-            foul_cost_base: 1.005,
-            foul_cost_pow: 1.518,
-            advance_w: 0.057,
-            promote_bias: 0.175,
-            drop_bias: 0.16,
-            prior_weight: 4.649,
-            prior_weight_degen: 4.718,
-            threat_w: 0.305,
-            info_bonus: 0.832,
-            big_home_penalty: 0.352,
-            hand_drop_w: 0.08,
-            backtrack_penalty: 0.363,
-            shuffle_penalty: 0.249,
-            // 以下はソフト粒子・2手読み・索敵項の導入時（2026-07-12〜13）の手置き値。
-            // SPSA第2ラウンドの調整対象
-            soft_decay: 0.5,
-            king_probe_bonus: 0.4,
-            coverage_w: 0.02,
-            tokin_probe_w: 0.25,
-            depth2_replace: 0.7,
-            depth2_check_pen: 0.3,
-            depth2_recap_discount: 0.7,
+            check_bonus: 0.1619,
+            check_foul_scale: 0.0983,
+            mover_w_captured: 0.8042,
+            mover_w_quiet: 0.7312,
+            mover_check_extra: 0.0622,
+            capture_reveal_risk: 0.1313,
+            camp_known_quiet: 0.4472,
+            camp_scale: 0.1252,
+            exposed_base: 0.4576,
+            exposed_known: 0.1659,
+            home_knownness: 0.0027,
+            recapture_defended: 0.4692,
+            exposed_defended: 0.3031,
+            attack_w: 0.0434,
+            pressure_w: 0.0918,
+            foul_cost_base: 0.637,
+            foul_cost_pow: 1.3331,
+            advance_w: 0.0699,
+            promote_bias: 0.1466,
+            drop_bias: 0.2616,
+            prior_weight: 4.9065,
+            prior_weight_degen: 7.9515,
+            threat_w: 0.4586,
+            info_bonus: 0.64,
+            big_home_penalty: 0.3156,
+            hand_drop_w: 0.0757,
+            backtrack_penalty: 0.3685,
+            shuffle_penalty: 0.2996,
+            soft_decay: 0.6753,
+            king_probe_bonus: 0.2451,
+            coverage_w: 0.0013,
+            tokin_probe_w: 0.2025,
+            depth2_replace: 0.6205,
+            depth2_check_pen: 0.178,
+            depth2_recap_discount: 0.7612,
         }
     }
 }
