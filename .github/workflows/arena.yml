@@ -19,7 +19,7 @@ on:
       baselines:
         description: "基準戦略（スペース区切り。複数でガントレット）"
         required: false
-        default: "estimator_v2 estimator_v3 estimator_v4 estimator_v5"
+        default: "estimator_v2 estimator_v3 estimator_v4 estimator_v5 estimator_v6"
       match_seed:
         description: "共通seed（アブレーション比較用。空なら毎局ランダム）"
         required: false
