@@ -50,21 +50,87 @@ fn mix(mut z: u64) -> u64 {
     z ^ (z >> 31)
 }
 
-/// 正規化座標 u ∈ [0,1]^d とパラメータの相互変換
-fn to_params(u: &[f64]) -> EvalParams {
-    let v: Vec<f64> = EvalParams::SPECS
+/// 調整空間: 各パラメータの調整対象マスクと有効範囲。
+/// - TUNE_PARAMS（カンマ区切りの名前）: 調整する項目だけを動かす。未指定なら全項目。
+///   方式変更に関係する項目に絞り、収束済み・無関係の項目を固定するために使う
+/// - TUNE_SPAN（0.01..=1.0、既定1.0）: 調整対象の有効範囲を「現在の既定値を中心に
+///   元範囲×span の幅」へ局所化する。広い旧範囲のままだと中心が端に近い項目は
+///   初回摂動から片側クリップになる（2026-07-15 レビュー指摘）
+struct TuneSpace {
+    active: Vec<bool>,
+    lo: Vec<f64>,
+    hi: Vec<f64>,
+    span: f64,
+}
+
+fn build_space(center: &EvalParams) -> Result<TuneSpace, String> {
+    let list = std::env::var("TUNE_PARAMS").ok();
+    let span: f64 = match std::env::var("TUNE_SPAN") {
+        Ok(v) => v
+            .parse()
+            .map_err(|_| format!("TUNE_SPAN を数値として読めません: {v}"))?,
+        Err(_) => 1.0,
+    };
+    build_space_from(list.as_deref(), span, center)
+}
+
+fn build_space_from(
+    list: Option<&str>,
+    span: f64,
+    center: &EvalParams,
+) -> Result<TuneSpace, String> {
+    let d = EvalParams::SPECS.len();
+    let mut active = vec![true; d];
+    if let Some(list) = list {
+        active = vec![false; d];
+        for name in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            let Some(i) = EvalParams::SPECS.iter().position(|s| s.name == name) else {
+                return Err(format!("TUNE_PARAMS に未知のパラメータ名: {name}"));
+            };
+            active[i] = true;
+        }
+        if !active.iter().any(|&a| a) {
+            return Err("TUNE_PARAMS に有効なパラメータ名がありません".into());
+        }
+    }
+    if !(0.01..=1.0).contains(&span) {
+        return Err(format!("TUNE_SPAN は 0.01..=1.0 の範囲で指定してください: {span}"));
+    }
+    let centers = center.to_vec();
+    let mut lo = Vec::with_capacity(d);
+    let mut hi = Vec::with_capacity(d);
+    for (i, spec) in EvalParams::SPECS.iter().enumerate() {
+        if active[i] && span < 1.0 {
+            let half = span * (spec.hi - spec.lo) / 2.0;
+            lo.push((centers[i] - half).max(spec.lo));
+            hi.push((centers[i] + half).min(spec.hi));
+        } else {
+            lo.push(spec.lo);
+            hi.push(spec.hi);
+        }
+    }
+    Ok(TuneSpace { active, lo, hi, span })
+}
+
+/// 正規化座標 u ∈ [0,1]^d とパラメータの相互変換（space の有効範囲上）
+fn to_params(u: &[f64], space: &TuneSpace) -> EvalParams {
+    let v: Vec<f64> = space
+        .lo
         .iter()
+        .zip(&space.hi)
         .zip(u)
-        .map(|(spec, &ui)| spec.lo + ui.clamp(0.0, 1.0) * (spec.hi - spec.lo))
+        .map(|((&lo, &hi), &ui)| lo + ui.clamp(0.0, 1.0) * (hi - lo))
         .collect();
     EvalParams::from_vec(&v)
 }
 
-fn to_unit(params: &EvalParams) -> Vec<f64> {
-    EvalParams::SPECS
+fn to_unit(params: &EvalParams, space: &TuneSpace) -> Vec<f64> {
+    space
+        .lo
         .iter()
+        .zip(&space.hi)
         .zip(params.to_vec())
-        .map(|(spec, v)| ((v - spec.lo) / (spec.hi - spec.lo)).clamp(0.0, 1.0))
+        .map(|((&lo, &hi), v)| ((v - lo) / (hi - lo)).clamp(0.0, 1.0))
         .collect()
 }
 
@@ -201,12 +267,20 @@ fn params_from_json(v: &serde_json::Value) -> Option<EvalParams> {
     Some(EvalParams::from_vec(&vals))
 }
 
-/// パラメータ空間の指紋（名前・範囲）。再開時の互換性検証に使う
-fn specs_json() -> serde_json::Value {
+/// パラメータ空間の指紋（名前・有効範囲・調整対象）。再開時の互換性検証に使う
+fn specs_json(space: &TuneSpace) -> serde_json::Value {
     serde_json::Value::Array(
         EvalParams::SPECS
             .iter()
-            .map(|s| serde_json::json!({ "name": s.name, "lo": s.lo, "hi": s.hi }))
+            .enumerate()
+            .map(|(i, s)| {
+                serde_json::json!({
+                    "name": s.name,
+                    "lo": space.lo[i],
+                    "hi": space.hi[i],
+                    "active": space.active[i],
+                })
+            })
             .collect(),
     )
 }
@@ -216,13 +290,15 @@ fn config_json(
     games_per_eval: u32,
     baselines: &[String],
     candidate_line_name: &Option<String>,
+    space: &TuneSpace,
 ) -> serde_json::Value {
     serde_json::json!({
         "games_per_eval": games_per_eval,
         "baselines": baselines,
         "candidate_line": candidate_line_name,
         "think_budget_ms": std::env::var("TSUITATE_THINK_BUDGET_MS").ok(),
-        "specs": specs_json(),
+        "span": space.span,
+        "specs": specs_json(space),
     })
 }
 
@@ -237,7 +313,7 @@ struct Resume {
 }
 
 /// ログから再開状態を復元する
-fn resume_state() -> Option<Resume> {
+fn resume_state(space: &TuneSpace) -> Option<Resume> {
     let content = std::fs::read_to_string(log_path()).ok()?;
     let mut resume: Option<Resume> = None;
     let mut run_seed = None;
@@ -263,7 +339,7 @@ fn resume_state() -> Option<Resume> {
                 let k = v["k"].as_u64().unwrap_or(0) as u32;
                 // 完全精度の u を優先し、旧形式ログは丸めた theta から復元
                 let u = unit_vec(&v["u"])
-                    .or_else(|| params_from_json(&v["theta"]).map(|p| to_unit(&p)));
+                    .or_else(|| params_from_json(&v["theta"]).map(|p| to_unit(&p, space)));
                 if let Some(u) = u {
                     resume = Some(Resume {
                         next_k: k + 1,
@@ -333,8 +409,16 @@ fn main() {
     let gamma = 0.101;
 
     let d = EvalParams::SPECS.len();
-    let config = config_json(games_per_eval, &baselines, &candidate_line_name);
-    let mut u = to_unit(&EvalParams::default());
+    let space = match build_space(&EvalParams::default()) {
+        Ok(space) => space,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    let active_count = space.active.iter().filter(|&&a| a).count();
+    let config = config_json(games_per_eval, &baselines, &candidate_line_name, &space);
+    let mut u = to_unit(&EvalParams::default(), &space);
     let mut start_k = 1u32;
     let mut run_seed: u64 = std::env::var("TUNE_SEED")
         .ok()
@@ -345,7 +429,7 @@ fn main() {
     let mut best_u = u.clone();
 
     let mut resumed = false;
-    if let Some(resume) = resume_state() {
+    if let Some(resume) = resume_state(&space) {
         // 設定の互換性を検証（不一致のまま続けると異なる目的関数を混ぜてしまう）
         if let Some(prev) = &resume.config {
             if *prev != config && std::env::var("TUNE_FORCE_RESUME").as_deref() != Ok("1") {
@@ -385,9 +469,10 @@ fn main() {
 
     let per = games_per_baseline(games_per_eval, baselines.len());
     println!(
-        "SPSA開始: 反復{start_k}〜{iterations} × 2評価 × {}局（{per}局×{}基準）, seed={run_seed}, {d}次元",
+        "SPSA開始: 反復{start_k}〜{iterations} × 2評価 × {}局（{per}局×{}基準）, seed={run_seed}, {active_count}/{d}次元, span={}",
         per * baselines.len() as u32,
         baselines.len(),
+        space.span,
     );
     if !resumed {
         log_line(
@@ -405,8 +490,12 @@ fn main() {
     for k in start_k..=iterations {
         let ck = c0 / (k as f64).powf(gamma);
         let ak = a0 / (big_a + k as f64).powf(alpha);
+        // 調整対象外の次元は摂動しない（u_plus=u_minus → 勾配0 → 更新なし）
         let delta: Vec<f64> = (0..d)
-            .map(|_| if rng.random_bool(0.5) { 1.0 } else { -1.0 })
+            .map(|i| {
+                let sign = if rng.random_bool(0.5) { 1.0 } else { -1.0 };
+                if space.active[i] { sign } else { 0.0 }
+            })
             .collect();
 
         let u_plus: Vec<f64> = u
@@ -428,8 +517,8 @@ fn main() {
             .collect();
         let plus_first = (iter_seed >> 7) & 1 == 0;
 
-        let p_plus = to_params(&u_plus);
-        let p_minus = to_params(&u_minus);
+        let p_plus = to_params(&u_plus, &space);
+        let p_minus = to_params(&u_minus, &space);
         let eval = |params: &EvalParams| {
             fitness(params, games_per_eval, &baselines, candidate_line, &match_seeds)
         };
@@ -476,13 +565,13 @@ fn main() {
                 "f_minus": f_minus,
                 "plus_first": plus_first,
                 "u": u,
-                "theta": params_json(&to_params(&u)),
+                "theta": params_json(&to_params(&u, &space)),
             }),
         );
     }
 
     // 最終中心点は勾配更新の結果であってまだ評価されていないので、ここで測る
-    let final_params = to_params(&u);
+    let final_params = to_params(&u, &space);
     let final_seeds: Vec<u64> = (0..baselines.len())
         .map(|i| mix(run_seed ^ 0x000F_17A1 ^ (i as u64 + 1)))
         .collect();
@@ -493,7 +582,7 @@ fn main() {
         candidate_line,
         &final_seeds,
     );
-    let best_params = to_params(&best_u);
+    let best_params = to_params(&best_u, &space);
     println!("\n=== 最終パラメータ（SPSA収束点、score={final_score:.3}） ===");
     println!("{}", serde_json::to_string_pretty(&params_json(&final_params)).unwrap());
     println!("\n=== 最良評価点（参考: score={best_score:.3}、ノイズ込み） ===");
@@ -545,9 +634,49 @@ mod tests {
     #[test]
     fn unit_roundtrip_preserves_params() {
         let p = EvalParams::default();
-        let u = to_unit(&p);
-        let q = to_params(&u);
+        let space = build_space_from(None, 1.0, &p).unwrap();
+        let u = to_unit(&p, &space);
+        let q = to_params(&u, &space);
         for (a, b) in p.to_vec().iter().zip(q.to_vec()) {
+            assert!((a - b).abs() < 1e-9);
+        }
+    }
+
+    #[test]
+    fn tune_space_masks_and_localizes() {
+        let center = EvalParams::default();
+        // マスク: 指定した項目だけ active
+        let space =
+            build_space_from(Some("soft_decay, depth2_replace"), 1.0, &center).unwrap();
+        let active: Vec<&str> = EvalParams::SPECS
+            .iter()
+            .zip(&space.active)
+            .filter(|(_, a)| **a)
+            .map(|(s, _)| s.name)
+            .collect();
+        assert_eq!(active, vec!["soft_decay", "depth2_replace"]);
+        // 未知の名前はエラー
+        assert!(build_space_from(Some("no_such_param"), 1.0, &center).is_err());
+        // span: active な項目の有効範囲が現在値の近傍に縮む（元範囲内にクランプ）
+        let space = build_space_from(Some("prior_weight"), 0.5, &center).unwrap();
+        let i = EvalParams::SPECS
+            .iter()
+            .position(|s| s.name == "prior_weight")
+            .unwrap();
+        let c = center.to_vec()[i];
+        let full = EvalParams::SPECS[i].hi - EvalParams::SPECS[i].lo;
+        assert!(space.hi[i] - space.lo[i] <= full * 0.5 + 1e-9);
+        assert!(space.lo[i] <= c && c <= space.hi[i]);
+        assert!(space.lo[i] >= EvalParams::SPECS[i].lo);
+        assert!(space.hi[i] <= EvalParams::SPECS[i].hi);
+        // 非activeの項目は元範囲のまま（中心点の値が保存される）
+        let j = EvalParams::SPECS.iter().position(|s| s.name == "check_bonus").unwrap();
+        assert_eq!(space.lo[j], EvalParams::SPECS[j].lo);
+        assert_eq!(space.hi[j], EvalParams::SPECS[j].hi);
+        // roundtrip が局所空間でも成り立つ
+        let u = to_unit(&center, &space);
+        let q = to_params(&u, &space);
+        for (a, b) in center.to_vec().iter().zip(q.to_vec()) {
             assert!((a - b).abs() < 1e-9);
         }
     }
