@@ -41,6 +41,12 @@ pub trait Strategy {
     fn debug_state(&self) -> Option<serde_json::Value> {
         None
     }
+
+    /// 観測ログを内部推定器に先行反映する（候補評価はしない）。
+    /// 実対局では choose が自分の手番ごとに呼ばれて推定器が逐次更新される
+    /// （リプレイ予算も手番ごとに与えられる）。局面再現実験（bin/scenario）が
+    /// 履歴の途中時点の update を再現するために使う。既定は何もしない
+    fn prewarm(&mut self, _view: &PlayerView, _log: &ObservationLog) {}
 }
 
 pub const DEFAULT_STRATEGY: &str = "estimator";
@@ -703,6 +709,16 @@ impl Default for EstimatorStrategy {
 }
 
 impl Strategy for EstimatorStrategy {
+    fn prewarm(&mut self, view: &PlayerView, log: &ObservationLog) {
+        let budget = self.budget;
+        let seed = self.seed;
+        let est = self.est.get_or_insert_with(|| match seed {
+            Some(s) => Estimator::with_seed_and_scale(view.your_color, s, budget.scale),
+            None => Estimator::with_scale(view.your_color, budget.scale),
+        });
+        est.update(log);
+    }
+
     fn choose(
         &mut self,
         view: &PlayerView,
