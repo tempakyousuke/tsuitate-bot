@@ -440,6 +440,12 @@ pub struct EvalParams {
     pub depth2_check_pen: f64,
     /// 2手読みの取り返し補償の割引（取り返し自体への反撃リスクの近似）
     pub depth2_recap_discount: f64,
+    /// 反則コストの残数差項: ×(相手残数/10)^pow。相手が反則上限に近いほど
+    /// 自分の反則は相対的に安い（反則レースの相対価値。0=従来）
+    pub foul_diff_pow: f64,
+    /// 王手の反則誘発価値の上限加速: check_foul_scale 項に ×(10/相手残数)^accel。
+    /// 相手が反則負けに近づくほど1回の誘発の限界価値が跳ねる（0=従来）
+    pub check_limit_accel: f64,
 }
 
 impl Default for EvalParams {
@@ -487,6 +493,10 @@ impl Default for EvalParams {
             depth2_replace: 0.6205,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
+            // 反則経済の新項（2026-07-16、オラクル測定で36ptの伸びしろを確認後に追加）。
+            // 0 = 従来と同一挙動。SPSA第4ラウンド（反則経済マスク）の調整対象
+            foul_diff_pow: 0.0,
+            check_limit_accel: 0.0,
         }
     }
 }
@@ -499,7 +509,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 35] = [
+    pub const SPECS: [ParamSpec; 37] = [
         ParamSpec { name: "check_bonus", lo: 0.0, hi: 3.0 },
         ParamSpec { name: "check_foul_scale", lo: 0.0, hi: 0.5 },
         ParamSpec { name: "mover_w_captured", lo: 0.0, hi: 1.5 },
@@ -535,6 +545,8 @@ impl EvalParams {
         ParamSpec { name: "depth2_replace", lo: 0.0, hi: 1.0 },
         ParamSpec { name: "depth2_check_pen", lo: 0.0, hi: 1.5 },
         ParamSpec { name: "depth2_recap_discount", lo: 0.0, hi: 1.0 },
+        ParamSpec { name: "foul_diff_pow", lo: 0.0, hi: 3.0 },
+        ParamSpec { name: "check_limit_accel", lo: 0.0, hi: 3.0 },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -574,6 +586,8 @@ impl EvalParams {
             self.depth2_replace,
             self.depth2_check_pen,
             self.depth2_recap_discount,
+            self.foul_diff_pow,
+            self.check_limit_accel,
         ]
     }
 
@@ -615,6 +629,8 @@ impl EvalParams {
             depth2_replace: v[32],
             depth2_check_pen: v[33],
             depth2_recap_discount: v[34],
+            foul_diff_pow: v[35],
+            check_limit_accel: v[36],
         }
     }
 }
@@ -1357,10 +1373,15 @@ fn evaluate(
 
         // 王手・詰み。ついたて将棋では王手された側は王手駒の位置が見えず
         // 手探りの反則をしやすい（反則10回で負け）ので、王手自体が得点源。
-        // 相手の反則が溜まっているほど価値が上がる
+        // 相手の反則が溜まっているほど価値が上がり、上限（反則負け）に
+        // 近づくほど1回の誘発の限界価値が跳ねるので check_limit_accel で加速する
+        // （オラクル測定 2026-07-16: 王手中反則の完全知識だけで vs v6 +9.5pt）
         let gives_check = next.in_check(opp);
         if gives_check {
-            v += params.check_bonus + params.check_foul_scale * f64::from(view.fouls.opponent);
+            let opp_fouls_left = f64::from(10u32.saturating_sub(view.fouls.opponent).max(1));
+            let accel = (10.0 / opp_fouls_left).powf(params.check_limit_accel);
+            v += params.check_bonus
+                + params.check_foul_scale * f64::from(view.fouls.opponent) * accel;
             check_hits += w;
             if next.legal_moves().is_empty() {
                 v += 1000.0; // 詰み（真の局面がこの粒子なら勝ち）
@@ -1463,9 +1484,15 @@ fn evaluate(
     };
 
     // 反則コスト: 手番は失わないが反則数を消費する。残りが少ないほど急激に高価。
-    // 序盤の「安い反則で情報を得る」は低コスト側で自然に許容される
+    // 序盤の「安い反則で情報を得る」は低コスト側で自然に許容される。
+    // 勝敗は反則レース（先に10回）なので、コストは絶対値でなく**残数差の相対価値**:
+    // 相手が上限間際（残数小）なら自分の1反則は相対的に安い（foul_diff_pow で調整。
+    // 0 = 従来どおり自分の残数のみ。tune-round3 の分析でスコアと反則差の相関0.75）
     let fouls_left = (10u32.saturating_sub(view.fouls.you)).max(1) as f64;
-    let foul_cost = params.foul_cost_base * (10.0 / fouls_left).powf(params.foul_cost_pow);
+    let opp_fouls_left = (10u32.saturating_sub(view.fouls.opponent)).max(1) as f64;
+    let foul_cost = params.foul_cost_base
+        * (10.0 / fouls_left).powf(params.foul_cost_pow)
+        * (opp_fouls_left / 10.0).powf(params.foul_diff_pow);
 
     // 前進の弱い事前バイアス（推定が薄い序盤に駒をぶつけに行くため）
     let advance_bias = match *mv {
