@@ -158,6 +158,16 @@ fn play_game(
     players: &mut [PlayerState; 2],
     game_no: u32,
 ) -> (GameResult, &'static str, u32, GameTruth) {
+    play_game_with_oracle(players, game_no, [None, None])
+}
+
+/// oracle[先手, 後手]: 診断用。Some の側は該当する反則手が「候補から外して
+/// 指し直し」になり、反則カウント・観測は発生しない（OracleMode 参照）
+fn play_game_with_oracle(
+    players: &mut [PlayerState; 2],
+    game_no: u32,
+    oracle: [Option<OracleMode>; 2],
+) -> (GameResult, &'static str, u32, GameTruth) {
     let mut pos = Position::initial();
     let idx = |c: Color| if c == Color::Sente { 0usize } else { 1usize };
     let mut plies = 0u32;
@@ -192,6 +202,17 @@ fn play_game(
         if !legal {
             // 反則: 手番は変わらない（judge.ts と同じ）。フィッシャー加算もしない
             let in_check = pos.in_check(side);
+            // 診断用オラクル: 該当する反則手は握りつぶして指し直させる
+            // （反則カウントも観測も発生しない = 完全な合法性知識の上限測定）
+            let skip = match oracle[idx(side)] {
+                Some(OracleMode::NoFoul) => true,
+                Some(OracleMode::CheckNoFoul) => in_check,
+                None => false,
+            };
+            if skip {
+                players[idx(side)].foul_tried.insert(usi);
+                continue;
+            }
             let mover = &mut players[idx(side)];
             mover.fouls += 1;
             if in_check {
@@ -363,6 +384,26 @@ fn record_game(
     }
 }
 
+/// 診断用オラクル（ARENA_ORACLE_A）。候補(A)の反則手を審判が握りつぶして
+/// 指し直させる = 「完全な合法性知識があったら」の上限を測る。
+/// 反則経済が勝敗をどれだけ支配しているかのシーリング測定専用で、
+/// 対局記録は書かない（観測列が実戦と異なり学習データを汚すため）
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OracleMode {
+    /// すべての反則手を候補から外して指し直させる（反則ゼロの上限）
+    NoFoul,
+    /// 王手中の反則だけ外す（王手解消の完全知識の上限）
+    CheckNoFoul,
+}
+
+fn oracle_from_env() -> Option<OracleMode> {
+    match std::env::var("ARENA_ORACLE_A").as_deref() {
+        Ok("nofoul") => Some(OracleMode::NoFoul),
+        Ok("check_nofoul") => Some(OracleMode::CheckNoFoul),
+        _ => None,
+    }
+}
+
 /// 1対局・1プレイヤーぶんの決定論的な乱数コンテキスト。
 /// ランのシードと対局番号から導出され、スレッドのスケジューリングに依存しない。
 /// SPSA（bin/tune）の f+/f− 評価で同じ対局条件列を再利用する（共通乱数法）ために使う。
@@ -434,10 +475,13 @@ where
     FB: Fn(GameSeeds) -> Box<dyn Strategy> + Sync,
 {
     let threads = thread_count().min(games.max(1) as usize);
+    // 診断用オラクル（A側のみ）。有効時は観測列が実戦と異なるため記録は書かない
+    let oracle_a = oracle_from_env();
     // 設定時は A 視点の対局記録を書き出す（bin/analyze 用。空文字は無効）
     let record_dir = std::env::var("ARENA_RECORD_DIR")
         .ok()
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .filter(|_| oracle_a.is_none());
     let record_dir = record_dir.as_deref();
     let mut stats = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
@@ -471,7 +515,13 @@ where
                             (make_b(seeds_b), make_a(seeds_a))
                         };
                         let mut players = [new_player(sente), new_player(gote)];
-                        let (result, reason, plies, truth) = play_game(&mut players, game_no);
+                        let oracle = if a_is_sente {
+                            [oracle_a, None]
+                        } else {
+                            [None, oracle_a]
+                        };
+                        let (result, reason, plies, truth) =
+                            play_game_with_oracle(&mut players, game_no, oracle);
                         if let Some(dir) = record_dir {
                             write_record(dir, game_no, a_is_sente, &players, result, reason, truth);
                         }

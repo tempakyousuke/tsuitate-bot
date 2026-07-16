@@ -28,6 +28,10 @@ on:
         description: "基準ごとの分割数（並列ランナー数）"
         required: false
         default: "4"
+      oracle:
+        description: "診断用オラクル（nofoul / check_nofoul。候補側の反則を審判が握りつぶす上限測定）"
+        required: false
+        default: ""
 
 jobs:
   plan:
@@ -65,8 +69,10 @@ jobs:
       - name: Run arena shard
         env:
           # 候補(A)視点の対局記録。bin/analyze での敗着分析用に artifact で回収する
+          # （オラクル有効時は selfplay 側が記録を自動で無効化する）
           ARENA_RECORD_DIR: arena-records
           ARENA_JSON: arena-summary.json
+          ARENA_ORACLE_A: ${{ inputs.oracle }}
         run: |
           # 共通seed指定時はシャードごとにずらす（シャード間の対局重複を防ぎつつ、
           # 同じ入力なら版をまたいで同じ対局条件列になる）
