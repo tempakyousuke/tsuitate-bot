@@ -8,6 +8,7 @@ pub mod check;
 pub mod client;
 pub mod estimator;
 pub mod frozen;
+pub mod likelihood;
 pub mod model;
 pub mod observation;
 pub mod opening;

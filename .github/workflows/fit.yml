@@ -48,10 +48,13 @@ jobs:
         env:
           FIT_MAX_POINTS_PER_GAME: ${{ inputs.max_points_per_game }}
         run: |
-          find training -name '*.jsonl' | shuf --random-source=<(yes) -n ${{ inputs.max_games }} > files.txt
+          # sort で入力順を固定してから決定論的に無作為抽出（再現性）
+          find training -name '*.jsonl' | sort | shuf --random-source=<(yes) -n ${{ inputs.max_games }} > files.txt
           echo "使用する対局数: $(wc -l < files.txt)"
           cargo build --release --bin fit_particles
-          xargs ./target/release/fit_particles < files.txt | tee fit-result.txt
+          # xargs は ARG_MAX 超過時に複数回起動へ分割されるので配列展開で1回起動する
+          mapfile -t files < files.txt
+          ./target/release/fit_particles "${files[@]}" | tee fit-result.txt
 
       - name: Write job summary
         if: always()

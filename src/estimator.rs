@@ -579,9 +579,23 @@ pub fn predict_opp_reply<R: Rng>(
     my_touched: &[Coord],
     rng: &mut R,
 ) -> Option<ShogiMove> {
+    weighted_choice(
+        &opp_reply_weights(pos, my_color, known_squares, my_touched),
+        rng,
+    )
+}
+
+/// 相手の全合法応手と方策重み（事前分布モデル＋露見マスの取り返しブースト）。
+/// 2手読みの期待値評価用: サンプルせず重み付き平均を取れる
+pub fn opp_reply_weights(
+    pos: &Position,
+    my_color: Color,
+    known_squares: &[Coord],
+    my_touched: &[Coord],
+) -> Vec<(ShogiMove, f64)> {
     let opp = my_color.other();
     if pos.turn() != opp {
-        return None;
+        return vec![];
     }
     let initial = Position::initial();
     let homes: Vec<Coord> = initial
@@ -617,7 +631,7 @@ pub fn predict_opp_reply<R: Rng>(
         }
         candidates.push((mv, w));
     }
-    weighted_choice(&candidates, rng)
+    candidates
 }
 
 /// チェビシェフ距離（玉の歩数）
@@ -859,6 +873,30 @@ mod tests {
         // 手番が自分側の局面では予測しない
         let initial = Position::initial();
         assert!(predict_opp_reply(&initial, Color::Sente, &[], &[], &mut rng).is_none());
+    }
+
+    #[test]
+    fn reply_weights_apply_recapture_boost_deterministically() {
+        // 7g7f / 3c3d / 8h2b+ の後、3a2b（取り返し）の重みは
+        // 2b が既知地点のときだけ PREDICT_RECAPTURE_BOOST 倍される
+        let mut pos = Position::initial();
+        for usi in ["7g7f", "3c3d", "8h2b+"] {
+            pos.play_unchecked(&parse_usi(usi).unwrap());
+        }
+        let recapture = parse_usi("3a2b").unwrap();
+        let weight_of = |known: &[Coord]| -> f64 {
+            opp_reply_weights(&pos, Color::Sente, known, &[])
+                .iter()
+                .find(|(mv, _)| *mv == recapture)
+                .map(|(_, w)| *w)
+                .expect("取り返しは合法応手のはず")
+        };
+        let with_boost = weight_of(&[Coord { file: 2, rank: 2 }]);
+        let without = weight_of(&[]);
+        assert!(
+            (with_boost / without - PREDICT_RECAPTURE_BOOST).abs() < 1e-6,
+            "with={with_boost} without={without}"
+        );
     }
 
     #[test]
