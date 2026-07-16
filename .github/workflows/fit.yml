@@ -1,0 +1,70 @@
+name: Fit particles
+
+# 粒子尤度モデル（bin/fit_particles）のフィットをCIで実行する。
+# 学習データは過去のアリーナ実行の arena-records-* アーティファクト
+# （観測列＋審判の真実）と、リポジトリの records/（対人対局）。
+# 出力（係数と指標）はジョブサマリーと artifact fit-result に出る。
+# 採用時は係数を src/likelihood.rs の FITTED_THETA へ手で反映する。
+on:
+  workflow_dispatch:
+    inputs:
+      run_ids:
+        description: "学習データにするアリーナ実行のrun ID（スペース区切り）"
+        required: true
+      max_games:
+        description: "使用する対局数の上限（無作為抽出。抽出コスト制御用）"
+        required: false
+        default: "600"
+      max_points_per_game:
+        description: "1局から取る決定点の上限"
+        required: false
+        default: "20"
+
+jobs:
+  fit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Download training records
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p training
+          for run_id in ${{ inputs.run_ids }}; do
+            gh run download "$run_id" -p "arena-records*" -D "training/$run_id" || \
+              echo "警告: run $run_id のrecordsを取得できません（期限切れ？）"
+          done
+          # リポジトリの対人記録も学習データに含める
+          mkdir -p training/repo
+          cp records/*.jsonl training/repo/ 2>/dev/null || true
+          find training -name '*.jsonl' | wc -l
+
+      - name: Fit
+        env:
+          FIT_MAX_POINTS_PER_GAME: ${{ inputs.max_points_per_game }}
+        run: |
+          find training -name '*.jsonl' | shuf --random-source=<(yes) -n ${{ inputs.max_games }} > files.txt
+          echo "使用する対局数: $(wc -l < files.txt)"
+          cargo build --release --bin fit_particles
+          xargs ./target/release/fit_particles < files.txt | tee fit-result.txt
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo '```'
+            cat fit-result.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fit-result
+          path: fit-result.txt
