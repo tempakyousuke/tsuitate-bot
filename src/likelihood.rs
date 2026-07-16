@@ -32,8 +32,21 @@ pub const FEATURE_NAMES: [&str; PARTICLE_FEATURES] = [
 ];
 
 /// フィット済み係数（bin/fit_particles の出力を反映する）。
-/// 全ゼロ = 重み1の恒等（フィット前は挙動に影響しない）
-pub const FITTED_THETA: [f64; PARTICLE_FEATURES] = [0.0; PARTICLE_FEATURES];
+/// 2026-07-16 フィット（CI run 29468501253、600局・6157決定点、
+/// 実効候補数 59.3→32.9、真実が上位半分に入る率 77.9%）。
+/// 主な補正: 実際の相手は粒子の想定より歩を突き駒を展開している
+/// （pawn_advance / pieces_home）、玉は想定ほど動かない（king_moved）、
+/// 大駒の中央線越えは過大評価だった（past_mid）
+pub const FITTED_THETA: [f64; PARTICLE_FEATURES] = [
+    -0.815, // king_moved
+    0.543,  // king_advance
+    0.248,  // king_shift
+    2.532,  // pawn_advance
+    -2.051, // pieces_home
+    -0.073, // at_my_death
+    -0.050, // in_my_camp
+    -1.377, // past_mid
+];
 
 /// 推論時に観測から分かる文脈
 #[derive(Debug, Clone, Copy, Default)]
@@ -172,6 +185,28 @@ mod tests {
     fn zero_theta_gives_zero_log_weight() {
         let pos = Position::initial();
         let f = particle_features(&pos, Color::Sente, &ParticleCtx::default());
-        assert_eq!(particle_log_weight(&f, &FITTED_THETA), 0.0);
+        assert_eq!(particle_log_weight(&f, &[0.0; PARTICLE_FEATURES]), 0.0);
+    }
+
+    #[test]
+    fn fitted_theta_prefers_developed_opponent() {
+        // フィット済み係数の健全性: 「歩を突いて駒が展開した」局面のほうが
+        // 初期局面のままより対数重みが高い（実対局の分布に合う方向）
+        let ctx = ParticleCtx::default();
+        let initial = Position::initial();
+        let mut developed = Position::initial();
+        for usi in ["7g7f", "3c3d", "2g2f", "8c8d"] {
+            developed.play_unchecked(&parse_usi(usi).unwrap());
+        }
+        let w_initial =
+            particle_log_weight(&particle_features(&initial, Color::Sente, &ctx), &FITTED_THETA);
+        let w_dev = particle_log_weight(
+            &particle_features(&developed, Color::Sente, &ctx),
+            &FITTED_THETA,
+        );
+        assert!(
+            w_dev > w_initial,
+            "展開した相手のほうが尤度が高いはず: dev={w_dev} initial={w_initial}"
+        );
     }
 }
