@@ -920,40 +920,38 @@ fn stratified_sample<'a>(
     rng: &mut StdRng,
 ) -> Vec<(&'a Position, f64)> {
     let opp = my_color.other();
-    // ユニーク化（penalty 昇順の並びを保つ）と尤度の対数重み
+    // ユニーク化（penalty 昇順の並びを保つ）と尤度の対数重み。
+    // 較正の正規化先（legacy_mass）は**尤度適用前**のベース重み
+    // （旧方式 = penalty昇順の先頭 min(eval, unique) 件の soft 重み和）で計る。
+    // 尤度適用後の重みで計ると p(合法) ブレンドに使う実効質量 n が尤度分布に
+    // 引きずられて prior_weight の較正が崩れる（2026-07-16 レビュー指摘）
     let mut seen = HashSet::new();
     let mut uniques: Vec<(&Position, f64, f64)> = vec![];
+    let mut legacy_mass = 0.0;
     for (pos, pen) in particles.iter().zip(penalties) {
         if !seen.insert(pos.fingerprint()) {
             continue;
         }
         let w = soft_decay.powi(i32::from(*pen));
+        if uniques.len() < eval_particles {
+            legacy_mass += w;
+        }
         let logl = particle_log_weight(&particle_features(pos, my_color, ctx), &FITTED_THETA);
         uniques.push((pos, w, logl));
     }
     if uniques.is_empty() {
         return vec![];
     }
-    // 尤度を平均1へ正規化して重みに乗じる（オーバーフロー対策で max を引く）
+    // 尤度を重みに乗じる（オーバーフロー対策で max を引く。全体スケールは
+    // 最後に legacy_mass へ正規化されるので相対値だけが意味を持つ）
     let max_logl = uniques
         .iter()
         .map(|(_, _, l)| *l)
         .fold(f64::MIN, f64::max);
-    let mean_like: f64 = uniques
-        .iter()
-        .map(|(_, _, l)| (l - max_logl).exp())
-        .sum::<f64>()
-        / uniques.len() as f64;
     let uniques: Vec<(&Position, f64)> = uniques
         .into_iter()
-        .map(|(p, w, l)| (p, w * (l - max_logl).exp() / mean_like.max(1e-12)))
+        .map(|(p, w, l)| (p, w * (l - max_logl).exp()))
         .collect();
-    // 旧方式（penalty昇順の先頭 min(eval, unique) 件）の重み和 = 較正の正規化先
-    let legacy_mass: f64 = uniques
-        .iter()
-        .take(eval_particles)
-        .map(|(_, w)| w)
-        .sum();
 
     // 玉位置で層化（質量降順）
     let mut index: HashMap<Option<Coord>, usize> = HashMap::new();

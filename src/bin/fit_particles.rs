@@ -26,8 +26,21 @@ use tsuitate_bot::shogi::{Position, parse_usi};
 struct Sample {
     /// 候補（粒子＋真の局面）の特徴量
     features: Vec<[f64; D]>,
+    /// 候補の固定対数オフセット（推論側のベース重み ln(soft_decay^penalty)。
+    /// 推論の重みは base×exp(θ·φ) なので、学習側の softmax にも同じオフセットを
+    /// 入れないと分布がずれる）
+    offsets: Vec<f64>,
     /// 真の局面のインデックス
     truth: usize,
+}
+
+/// 推論側と同じ思考予算スケール（strategy.rs の SearchBudget と同じ式）
+fn inference_scale() -> f64 {
+    let ms: f64 = std::env::var("TSUITATE_THINK_BUDGET_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2000.0);
+    (ms / 900.0).clamp(0.25, 8.0)
 }
 
 /// 1局から（観測時点の粒子群, 真の局面）のサンプル列を作る。
@@ -50,19 +63,27 @@ fn extract_samples(
         truth_positions.push(next);
     }
 
-    let mut est = Estimator::with_seed(bot, game_seed);
+    // 推論側と同じスケールの推定器で負例分布を合わせる
+    let mut est = Estimator::with_seed_and_scale(bot, game_seed, inference_scale());
+    let soft_decay = tsuitate_bot::strategy::EvalParams::default().soft_decay;
     let mut log = ObservationLog::default();
     let mut samples = vec![];
-    // 決定点が多い局は間引く（終盤に偏らないよう等間隔）
+    // 決定点の間引き: 固定周期（% stride）は初回を必ず落とし本数も過小になるので、
+    // 等間隔のインデックス集合 round((j+0.5)·n/k) を使う
     let opp_moves = observations
         .iter()
         .filter(|o| matches!(o, Observation::OpponentMoved { .. }))
         .count();
-    let stride = opp_moves.div_ceil(max_points).max(1);
+    let k = opp_moves.min(max_points.max(1));
+    let targets: HashSet<usize> = (0..k)
+        .map(|j| ((j as f64 + 0.5) * opp_moves as f64 / k as f64) as usize)
+        .collect();
     let mut opp_move_idx = 0usize;
     let mut opp_landed_last: Option<tsuitate_bot::board::Coord> = None;
 
-    for event in observations {
+    let mut i = 0usize;
+    while i < observations.len() {
+        let event = &observations[i];
         let measure = match event {
             Observation::OpponentMoved {
                 move_number,
@@ -76,6 +97,18 @@ fn extract_samples(
             _ => None,
         };
         log.record(event.clone());
+        // 着手直後の Check は同じ着手の観測なので、update の前に対で入れる
+        // （実戦では自分の手番でまとめて update するため常に対になっている。
+        //  着手だけ入れて update すると王手宣言の制約が丸ごと落ちる）
+        if matches!(
+            event,
+            Observation::OpponentMoved { .. } | Observation::MyMove { .. }
+        ) {
+            if let Some(check @ Observation::Check { .. }) = observations.get(i + 1) {
+                log.record(check.clone());
+                i += 1;
+            }
+        }
         let should_update = matches!(
             event,
             Observation::OpponentMoved { .. } | Observation::MyFoul { .. }
@@ -83,9 +116,11 @@ fn extract_samples(
         if should_update {
             est.update(&log);
         }
+        i += 1;
         let Some(mn) = measure else { continue };
+        let point = opp_move_idx;
         opp_move_idx += 1;
-        if opp_move_idx % stride != 0 {
+        if !targets.contains(&point) {
             continue;
         }
         // 観測 move_number = 適用後の値 → その時点までに mn-1 手が指されている
@@ -93,27 +128,36 @@ fn extract_samples(
             continue;
         };
         let ctx = ParticleCtx { opp_landed_last };
-        // ユニーク粒子（真実と同一指紋の粒子は truth 側に統合）
+        // ユニーク粒子（真実と同一指紋の粒子は truth 側に統合）。
+        // 各候補には推論側のベース重み ln(soft_decay^penalty) をオフセットとして持たせる
         let truth_fp = truth.fingerprint();
         let mut seen = HashSet::new();
         seen.insert(truth_fp);
         let mut features = vec![particle_features(truth, bot, &ctx)];
-        for pos in est.particles() {
+        let mut offsets = vec![0.0]; // 真実は完全整合 = penalty 0
+        for (pos, pen) in est.particles().iter().zip(est.penalties()) {
             if features.len() > 64 {
                 break;
             }
             if seen.insert(pos.fingerprint()) {
                 features.push(particle_features(pos, bot, &ctx));
+                offsets.push(f64::from(*pen) * soft_decay.ln());
             }
         }
         if features.len() >= 8 {
-            samples.push(Sample { features, truth: 0 });
+            samples.push(Sample {
+                features,
+                offsets,
+                truth: 0,
+            });
         }
     }
     samples
 }
 
-/// 対数尤度と勾配（ソフトマックス、L2つき）。fit_opp と同型
+/// 対数尤度と勾配（ソフトマックス、L2つき）。fit_opp と同型。
+/// score = 固定オフセット（推論側のベース重み）+ θ·φ。オフセットは定数なので
+/// 勾配の形は変わらない
 fn log_likelihood(samples: &[Sample], theta: &[f64; D], l2: f64) -> (f64, [f64; D]) {
     let mut ll = 0.0;
     let mut grad = [0.0f64; D];
@@ -121,7 +165,8 @@ fn log_likelihood(samples: &[Sample], theta: &[f64; D], l2: f64) -> (f64, [f64; 
         let scores: Vec<f64> = s
             .features
             .iter()
-            .map(|f| f.iter().zip(theta).map(|(a, b)| a * b).sum())
+            .zip(&s.offsets)
+            .map(|(f, off)| off + f.iter().zip(theta).map(|(a, b)| a * b).sum::<f64>())
             .collect();
         let max = scores.iter().cloned().fold(f64::MIN, f64::max);
         let exps: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
@@ -252,9 +297,16 @@ fn main() {
     let top_half = samples
         .iter()
         .filter(|s| {
-            let score = |f: &[f64; D]| -> f64 { f.iter().zip(&theta).map(|(a, b)| a * b).sum() };
-            let ts = score(&s.features[s.truth]);
-            let better = s.features.iter().filter(|f| score(f) > ts).count();
+            let score = |f: &[f64; D], off: f64| -> f64 {
+                off + f.iter().zip(&theta).map(|(a, b)| a * b).sum::<f64>()
+            };
+            let ts = score(&s.features[s.truth], s.offsets[s.truth]);
+            let better = s
+                .features
+                .iter()
+                .zip(&s.offsets)
+                .filter(|(f, off)| score(f, **off) > ts)
+                .count();
             better * 2 < s.features.len()
         })
         .count() as f64

@@ -73,7 +73,9 @@ fn main() {
 
         let mut est = Estimator::new(bot);
         let mut log = ObservationLog::default();
-        for event in &events {
+        let mut i = 0usize;
+        while i < events.len() {
+            let event = &events[i];
             let measure_at = match event {
                 Observation::OpponentMoved { move_number, .. } => Some(*move_number),
                 _ => None,
@@ -83,6 +85,18 @@ fn main() {
                 Observation::OpponentMoved { .. } | Observation::MyFoul { .. }
             );
             log.record(event.clone());
+            // 着手直後の Check は同じ着手の観測なので update の前に対で入れる
+            // （実戦では自分の手番でまとめて update するため常に対になっている）
+            if matches!(
+                event,
+                Observation::OpponentMoved { .. } | Observation::MyMove { .. }
+            ) {
+                if let Some(check @ Observation::Check { .. }) = events.get(i + 1) {
+                    log.record(check.clone());
+                    i += 1;
+                }
+            }
+            i += 1;
             if should_update {
                 est.update(&log);
             }
