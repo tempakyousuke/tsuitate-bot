@@ -41,6 +41,10 @@
   `done.final_score` に記録する。採用するときは `EvalParams::default` を書き換えて
   フルガントレットで確認する。
   対局ループは `selfplay.rs`（arena と共用）。**長時間ランはローカルでなくGCEで回す**（下記）
+- `cargo run --release --bin scenario -- <名前|suite>` — 実戦棋譜の局面再現実験。
+  `scenarios/*.kif`（Shogi Quest エクスポート + `*scenario ply=N` 行）を再生して
+  特定局面での選択・粒子の信念（diag）・終局までの遂行（continue）を測る。
+  追加手順は `scenarios/README.md`
 - `cargo run --release --bin analyze -- records/*.jsonl` — 対局記録の事後分析。
   アリーナも `ARENA_RECORD_DIR` を設定すると候補(A)視点の記録を同形式で出力する
   （CIでは常時有効で artifact `arena-records` に上がる。真実の全手順つきなので

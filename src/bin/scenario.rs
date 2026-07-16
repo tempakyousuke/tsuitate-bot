@@ -1,103 +1,107 @@
 //! 実対局の局面再現実験。
 //!
-//! Shogi Quest の実棋譜（真実の手順＋反則試行）をリプレイして特定局面を再現し、
-//! estimator の選択・信念分布・終盤遂行を調べる。シナリオ:
-//! - keima: 対 likealorigstorn 戦（2026-07）の29手目 ▲８五桂（王手）。
-//!   同歩(8d8e)で桂を取り返せるか。人間は反則1回（6d6e）ののち同歩だった
-//! - kakunari: 対 dkuhouho8 戦（2026-07）の70手目 △５七角成(7i5g+)。
-//!   馬捨てで５七に金を釣り出し、５八飛の成り込み（5h5g+）を通す決め手。
-//!   指せるか、その後勝ち切れるか（実戦は76手目まで指して先手の反則負け）
+//! Shogi Quest からエクスポートした棋譜（`scenarios/*.kif`。真実の手順＋反則試行）を
+//! リプレイして任意の局面を再現し、戦略の選択・粒子の信念分布・終盤遂行を調べる。
 //!
-//! 反則試行も MyFoul / OpponentFoul として両者の観測ログに再現する
+//! シナリオの追加手順:
+//! 1. Shogi Quest の棋譜をそのまま `scenarios/<名前>.kif` に保存する
+//! 2. `*scenario ply=<N> [diag=<マス,マス>] [target=<USI>] [desc=<説明>]` の1行を
+//!    ファイル内（どこでも可）に足す。ply=N は「N手目まで再生して N+1手目を
+//!    考えさせる」。target 省略時は棋譜で実際に指された N+1手目が注目手になる
+//! 3. `cargo run --release --bin scenario -- <名前>` で選択実験が走る
+//!    （リプレイ時に全手・全反則試行を裁定検証するので、棋譜の欠落や
+//!    パース誤りは即 panic で分かる）
+//!
+//! 反則試行は MyFoul / OpponentFoul として両者の観測ログに再現する
 //! （反則回数は foul_limit の残量と推定器の制約の両方に効く）。
+//! 推定器は実対局と同じく「自分の手番ごと」に逐次 update する（prewarm）。
 //!
 //! usage:
-//!   cargo run --release --bin scenario -- <シナリオ> [試行数=20] [戦略=estimator]
-//!   cargo run --release --bin scenario -- <シナリオ> diag [推定器数=10]
-//!   cargo run --release --bin scenario -- <シナリオ> continue [対局数=10] [手番側戦略] [相手戦略]
+//!   cargo run --release --bin scenario -- <名前|path.kif> [試行数=20] [戦略=estimator]
+//!   cargo run --release --bin scenario -- <名前> diag [推定器数=10]
+//!   cargo run --release --bin scenario -- <名前> continue [対局数=10] [手番側戦略] [相手戦略]
+//!   cargo run --release --bin scenario -- suite [試行数=10] [戦略=estimator]
+//!   共通フラグ: --ply N / --target USI / --diag 5g,4h （*scenario 行より優先）
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
-use tsuitate_bot::board::{make_usi_square, parse_usi_square};
+use tsuitate_bot::board::{make_usi_drop, make_usi_move, make_usi_square, parse_usi_square};
 use tsuitate_bot::estimator::Estimator;
+use tsuitate_bot::kifu::{Kifu, RawFoul, parse_kif};
 use tsuitate_bot::observation::{Observation, ObservationLog};
-use tsuitate_bot::protocol::{ClockState, Color, FoulCounts, GameStatus, PlayerView};
+use tsuitate_bot::protocol::{ClockState, Color, FoulCounts, GameStatus, PlayerView, Role};
 use tsuitate_bot::shogi::{Outcome, Position, ShogiMove, parse_usi, unpromote_role};
 use tsuitate_bot::strategy;
 
-/// 1手ぶんの真実: 受理された手と、その直前の同じ手番側の反則試行
-struct Ply {
-    usi: &'static str,
-    fouls: &'static [&'static str],
-}
-
-const fn p(usi: &'static str) -> Ply {
-    Ply { usi, fouls: &[] }
-}
-
-const fn pf(usi: &'static str, fouls: &'static [&'static str]) -> Ply {
-    Ply { usi, fouls }
-}
-
 struct Scenario {
-    name: &'static str,
-    desc: &'static str,
-    /// 注目している手（一致したら出力に印をつける）
-    target: &'static str,
-    plies: &'static [Ply],
-    /// diag で相手駒の利き枚数分布を測るマス（着地の安全性検証用）
-    diag_squares: &'static [&'static str],
+    name: String,
+    desc: String,
+    /// 注目している手（一致したら出力に印をつける）。既定は棋譜の ply+1 手目
+    target: String,
+    /// 何手目まで再生するか（ply+1 手目を考えさせる）
+    ply: usize,
+    /// diag で相手駒の利き枚数分布を測るマス
+    diag_squares: Vec<String>,
+    kifu: Kifu,
 }
 
-/// 対 likealorigstorn 戦の1〜29手目。29手目 7g8e が桂跳ね王手
-const KEIMA: &[Ply] = &[
-    p("7g7f"), p("3a3b"), p("5g5f"), p("2b3a"), p("5f5e"), p("5a6b"),
-    p("2h5h"), p("5c5d"), p("5i4h"), p("7c7d"), p("7i6h"), p("8c8d"),
-    p("6h5g"), p("6b7c"), p("5g5f"), p("6c6d"), p("4h3h"), p("9c9d"),
-    p("6i6h"), p("9d9e"), p("6h5g"), p("9e9f"), p("4g4f"), p("9f9g+"),
-    p("8h6f"), p("P*9h"), p("8i7g"), p("9h9i+"), p("7g8e"),
-];
+fn scenarios_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("scenarios")
+}
 
-/// 対 dkuhouho8 戦の1〜69手目。70手目 7i5g+（５七角成）が注目手
-const KAKUNARI: &[Ply] = &[
-    p("7g7f"), p("3a3b"), p("6i7h"), p("1c1d"), p("7h7g"), p("2b1c"),
-    p("4i5h"), p("5a4b"), p("6g6f"), p("7c7d"), p("5h6g"), p("8a7c"),
-    p("5g5f"), p("8c8d"), p("8g8f"), p("8d8e"), p("4g4f"), p("8e8f"),
-    p("7i7h"), p("8f8g+"), p("4f4e"),
-    pf("8g8h", &["P*8h"]),
-    p("4e4d"), p("8h8i"), p("4d4c+"), p("3b4c"), p("P*8c"),
-    pf("8b8c", &["8b8e", "P*8c"]),
-    p("7h8g"), p("8i7i"), p("2h8h"),
-    pf("7i6i", &["8c8i+"]),
-    p("5i5h"), p("P*8f"), p("8h8i"), p("8f8g+"), p("7g8g"), p("8c8g+"),
-    p("8i8g"), p("P*8e"),
-    pf("8g8i", &["8g8c+"]),
-    p("4c3d"), p("8i6i"), p("N*5g"), p("6i8i"), p("B*6i"), p("8i6i"),
-    p("5g6i+"), p("5h6i"), p("1c7i"),
-    pf("6i5h", &["6i6h"]),
-    p("R*6i"), p("P*4f"),
-    pf("P*4h", &["G*5h"]),
-    p("R*4e"), p("4b3b"), p("4e8e"), p("7c8e"), p("N*5d"), p("8e7g+"),
-    p("5h4g"), p("4h4i+"), p("B*2b"), p("6i5i+"), p("2b1a+"), p("R*5h"),
-    p("L*4c"), p("G*4e"), p("4c4a+"),
-];
-
-const SCENARIOS: &[Scenario] = &[
-    Scenario {
-        name: "keima",
-        desc: "29手目 ▲８五桂（王手）を受けた後手番。真の解消手は 8d8e（同歩・桂得）ほか玉逃げ",
-        target: "8d8e",
-        plies: KEIMA,
-        diag_squares: &[],
-    },
-    Scenario {
-        name: "kakunari",
-        desc: "70手目の後手番。注目手は 7i5g+（５七角成の馬捨て → 71同金に 5h5g+ で決まり）",
-        target: "7i5g+",
-        plies: KAKUNARI,
-        diag_squares: &["5g", "4h"],
-    },
-];
+fn load_scenario(
+    spec: &str,
+    ply_flag: Option<usize>,
+    target_flag: Option<String>,
+    diag_flag: Option<String>,
+) -> Result<Scenario, String> {
+    let path = if spec.contains('/') || spec.ends_with(".kif") {
+        PathBuf::from(spec)
+    } else {
+        scenarios_dir().join(format!("{spec}.kif"))
+    };
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| format!("{} を読めません: {e}", path.display()))?;
+    let kifu = parse_kif(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let directive_ply: Option<usize> = kifu.directives.get("ply").and_then(|s| s.parse().ok());
+    let ply = ply_flag
+        .or(directive_ply)
+        .ok_or("再生する手数が不明です（--ply か *scenario ply= を指定）")?;
+    if ply > kifu.plies.len() {
+        return Err(format!(
+            "ply={ply} が棋譜の手数 {} を超えています",
+            kifu.plies.len()
+        ));
+    }
+    let target = target_flag
+        .or_else(|| kifu.directives.get("target").cloned())
+        .or_else(|| kifu.plies.get(ply).map(|p| p.mv.to_usi()))
+        .unwrap_or_default();
+    let diag_squares: Vec<String> = diag_flag
+        .or_else(|| kifu.directives.get("diag").cloned())
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+        .unwrap_or_default();
+    let name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| spec.to_string());
+    // --ply で局面を変えたときは directive の説明（元の ply 前提）を使わない
+    let desc = kifu
+        .directives
+        .get("desc")
+        .filter(|_| Some(ply) == directive_ply)
+        .cloned()
+        .unwrap_or_else(|| format!("{ply}手目まで再生し、{}手目を考えさせる", ply + 1));
+    Ok(Scenario {
+        name,
+        desc,
+        target,
+        ply,
+        diag_squares,
+        kifu,
+    })
+}
 
 /// リプレイ結果: 真実の局面と両者の観測ログ・反則数。[0]=先手, [1]=後手
 struct Replayed {
@@ -111,28 +115,52 @@ fn side_idx(c: Color) -> usize {
     if c == Color::Sente { 0 } else { 1 }
 }
 
-/// 棋譜（反則試行込み）を裁定つきでリプレイし、selfplay.rs と同じ規約で
-/// 両者の観測ログを構築する
-fn replay(plies: &[Ply]) -> Replayed {
+/// 反則試行を USI に解決する。駒コードは「移動後の駒」なので、盤上の移動元が
+/// 生駒でコードが成駒なら成る手と判断する
+fn resolve_foul(pos: &Position, side: Color, f: &RawFoul) -> String {
+    match f {
+        RawFoul::Drop { role, to } => {
+            make_usi_drop(*role, *to).expect("打てない駒種の反則試行")
+        }
+        RawFoul::Board { from, to, role } => {
+            let piece = pos
+                .piece_at(*from)
+                .expect("反則試行の移動元に駒がない（棋譜とKIFの不整合）");
+            assert_eq!(piece.color, side, "反則試行の移動元が相手の駒");
+            assert_eq!(
+                unpromote_role(piece.role),
+                unpromote_role(*role),
+                "反則試行の駒コードと盤上の駒種が不一致"
+            );
+            make_usi_move(*from, *to, piece.role != *role)
+        }
+    }
+}
+
+/// 棋譜（反則試行込み）を upto 手まで裁定つきでリプレイし、selfplay.rs と
+/// 同じ規約で両者の観測ログを構築する
+fn replay(kifu: &Kifu, upto: usize) -> Replayed {
     let mut pos = Position::initial();
     let mut logs = [ObservationLog::default(), ObservationLog::default()];
     let mut fouls = [0u32; 2];
-    for ply in plies {
+    for ply in &kifu.plies[..upto] {
         let side = pos.turn();
-        for f in ply.fouls {
-            let mv = parse_usi(f).expect("反則試行のUSI解析失敗");
-            assert!(!pos.is_legal(&mv), "反則のはずの手が合法: {f}");
+        for f in &ply.fouls {
+            let usi = resolve_foul(&pos, side, f);
+            let mv = parse_usi(&usi).expect("反則試行のUSI解析失敗");
+            assert!(!pos.is_legal(&mv), "反則のはずの手が合法: {usi}");
             fouls[side_idx(side)] += 1;
             logs[side_idx(side)].record(Observation::MyFoul {
                 move_number: pos.move_number(),
-                usi: (*f).to_string(),
+                usi,
             });
             logs[side_idx(side.other())].record(Observation::OpponentFoul {
                 count: fouls[side_idx(side)],
             });
         }
-        let mv = parse_usi(ply.usi).expect("USI解析失敗");
-        assert!(pos.is_legal(&mv), "棋譜の手が非合法: {}", ply.usi);
+        let usi = ply.mv.to_usi();
+        let mv = parse_usi(&usi).expect("USI解析失敗");
+        assert!(pos.is_legal(&mv), "棋譜の手が非合法: {usi}");
         let captured = pos.play_unchecked(&mv);
         let move_number = pos.move_number();
         let captured_sq = captured.map(|_| match mv {
@@ -141,7 +169,7 @@ fn replay(plies: &[Ply]) -> Replayed {
         });
         logs[side_idx(side)].record(Observation::MyMove {
             move_number,
-            usi: ply.usi.to_string(),
+            usi,
             captured: captured.map(unpromote_role),
         });
         logs[side_idx(side.other())].record(Observation::OpponentMoved {
@@ -155,8 +183,12 @@ fn replay(plies: &[Ply]) -> Replayed {
             }
         }
     }
-    let plies = plies.len() as u32;
-    Replayed { pos, logs, fouls, plies }
+    Replayed {
+        pos,
+        logs,
+        fouls,
+        plies: upto as u32,
+    }
 }
 
 /// 実対局と同じ「自分の手番ごとの逐次 update」を再現して戦略の推定器を温める。
@@ -208,16 +240,42 @@ fn make_view(pos: &Position, color: Color, fouls: &[u32; 2]) -> PlayerView {
     }
 }
 
-/// 手番側の一手の選択を試行する。反則は観測として与えて指し直させる
-/// （実対局と同じ）。受理された手と反則列を返す
-fn choice_trials(sc: &Scenario, rep: &Replayed, trials: u64, name: &str) {
+struct ChoiceStats {
+    /// (受理された手, 回数) を回数降順で
+    tally: Vec<(String, u32)>,
+    total_fouls: u32,
+}
+
+impl ChoiceStats {
+    fn target_hits(&self, target: &str) -> u32 {
+        self.tally
+            .iter()
+            .find(|(usi, _)| usi == target)
+            .map(|(_, n)| *n)
+            .unwrap_or(0)
+    }
+}
+
+/// 手番側の一手の選択を試行する。反則は観測として与えて指し直させる（実対局と同じ）
+fn choice_trials(
+    sc: &Scenario,
+    rep: &Replayed,
+    trials: u64,
+    name: &str,
+    verbose: bool,
+) -> ChoiceStats {
     let side = rep.pos.turn();
-    println!("局面: {}", sc.desc);
-    println!(
-        "手番: {:?} / ここまでの反則 先手{} 後手{} / 戦略: {name} / 試行 {trials} 回",
-        side, rep.fouls[0], rep.fouls[1]
-    );
-    println!();
+    if verbose {
+        println!("局面: {}", sc.desc);
+        println!(
+            "手番: {:?}（{}手目）/ ここまでの反則 先手{} 後手{} / 戦略: {name} / 試行 {trials} 回",
+            side,
+            sc.ply + 1,
+            rep.fouls[0],
+            rep.fouls[1]
+        );
+        println!();
+    }
 
     let mut final_tally: HashMap<String, u32> = HashMap::new();
     let mut total_fouls = 0u32;
@@ -248,26 +306,31 @@ fn choice_trials(sc: &Scenario, rep: &Replayed, trials: u64, name: &str) {
                 break "foul_limit".to_string();
             }
         };
-        let note = if accepted == sc.target { "（注目手）" } else { "" };
-        let foul_note = if foul_seq.is_empty() {
-            String::new()
-        } else {
-            format!(" 反則: {}", foul_seq.join(", "))
-        };
-        println!("seed {seed:2}: {accepted}{note}{foul_note}");
+        if verbose {
+            let note = if accepted == sc.target { "（注目手）" } else { "" };
+            let foul_note = if foul_seq.is_empty() {
+                String::new()
+            } else {
+                format!(" 反則: {}", foul_seq.join(", "))
+            };
+            println!("seed {seed:2}: {accepted}{note}{foul_note}");
+        }
         *final_tally.entry(accepted).or_insert(0) += 1;
         total_fouls += foul_seq.len() as u32;
     }
 
-    println!();
-    let mut sorted: Vec<_> = final_tally.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
-    println!("受理された手の内訳:");
-    for (usi, n) in sorted {
-        let mark = if usi == sc.target { " ← 注目手" } else { "" };
-        println!("  {usi}: {n}/{trials}{mark}");
+    let mut tally: Vec<_> = final_tally.into_iter().collect();
+    tally.sort_by(|a, b| b.1.cmp(&a.1));
+    if verbose {
+        println!();
+        println!("受理された手の内訳:");
+        for (usi, n) in &tally {
+            let mark = if *usi == sc.target { " ← 注目手" } else { "" };
+            println!("  {usi}: {n}/{trials}{mark}");
+        }
+        println!("追加の反則の総数: {total_fouls}");
     }
-    println!("追加の反則の総数: {total_fouls}");
+    ChoiceStats { tally, total_fouls }
 }
 
 /// 粒子集合の診断: 王手駒の分布・相手玉位置の分布・注目マスへの相手利き枚数。
@@ -288,7 +351,12 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
     let diag_sqs: Vec<_> = sc
         .diag_squares
         .iter()
-        .map(|s| (*s, parse_usi_square(s).expect("diag_squares のマス解析失敗")))
+        .map(|s| {
+            (
+                s.clone(),
+                parse_usi_square(s).expect("diag のマス解析失敗"),
+            )
+        })
         .collect();
 
     let mut checker_tally: HashMap<String, u32> = HashMap::new();
@@ -348,16 +416,14 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
             }
             strict_unique += 1;
             if let Some(sq) = pp.king_square(side.other()) {
-                *opp_king_tally
-                    .entry(make_usi_square(sq))
-                    .or_insert(0) += 1;
+                *opp_king_tally.entry(make_usi_square(sq)).or_insert(0) += 1;
             }
             for (i, (_, sq)) in diag_sqs.iter().enumerate() {
                 let n = pp
                     .pieces()
                     .filter(|(from, pc)| {
                         pc.color == side.other()
-                            && pc.role != tsuitate_bot::protocol::Role::King
+                            && pc.role != Role::King
                             && pp.attacks(*from, *sq)
                     })
                     .count();
@@ -369,6 +435,10 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
     println!(
         "粒子診断: 推定器 {n_estimators} 個ぶんのユニーク粒子 {total_unique} 個（うち厳密整合 {strict_unique}。玉位置・利きは厳密のみで集計）"
     );
+    if strict_unique == 0 {
+        println!("厳密整合の粒子がありません（フィルタ死。seed0 の手番別トレースは stderr 参照）");
+        return;
+    }
     if rep.pos.in_check(side) {
         println!();
         println!("王手駒の分布（粒子内で手番側の玉に利いている相手駒）:");
@@ -549,37 +619,177 @@ fn continue_games(sc: &Scenario, rep: &Replayed, games: u64, name_me: &str, name
     }
 }
 
-fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    let sc_name = args.first().map(String::as_str).unwrap_or("keima");
-    let Some(sc) = SCENARIOS.iter().find(|s| s.name == sc_name) else {
-        eprintln!(
-            "未知のシナリオ: {sc_name}（候補: {}）",
-            SCENARIOS
-                .iter()
-                .map(|s| s.name)
-                .collect::<Vec<_>>()
-                .join(", ")
+/// scenarios/*.kif を全部回して注目手一致率を表にする（回帰テスト用）
+fn run_suite(trials: u64, name: &str) {
+    let dir = scenarios_dir();
+    let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
+        .unwrap_or_else(|e| panic!("{} を読めません: {e}", dir.display()))
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "kif"))
+        .collect();
+    paths.sort();
+    println!("スイート: {} 件 / 戦略 {name} / 各 {trials} 試行", paths.len());
+    println!();
+    for path in paths {
+        let sc = match load_scenario(&path.to_string_lossy(), None, None, None) {
+            Ok(sc) => sc,
+            Err(e) => {
+                println!("{}: 読み込み失敗: {e}", path.display());
+                continue;
+            }
+        };
+        let rep = replay(&sc.kifu, sc.ply);
+        let stats = choice_trials(&sc, &rep, trials, name, false);
+        let hits = stats.target_hits(&sc.target);
+        let others: Vec<String> = stats
+            .tally
+            .iter()
+            .filter(|(usi, _)| *usi != sc.target)
+            .take(3)
+            .map(|(usi, n)| format!("{usi}×{n}"))
+            .collect();
+        println!(
+            "{:<12} {}手目 注目手 {:<6} {hits}/{trials} 反則{} 他: {}",
+            sc.name,
+            sc.ply + 1,
+            sc.target,
+            stats.total_fouls,
+            others.join(" ")
         );
-        std::process::exit(1);
-    };
+    }
+}
 
-    let rep = replay(sc.plies);
+fn main() {
+    // フラグ（--ply N / --target USI / --diag 5g,4h）を先に抜き取る
+    let mut ply_flag: Option<usize> = None;
+    let mut target_flag: Option<String> = None;
+    let mut diag_flag: Option<String> = None;
+    let mut args: Vec<String> = vec![];
+    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i].as_str() {
+            "--ply" => {
+                ply_flag = raw.get(i + 1).and_then(|s| s.parse().ok());
+                i += 2;
+            }
+            "--target" => {
+                target_flag = raw.get(i + 1).cloned();
+                i += 2;
+            }
+            "--diag" => {
+                diag_flag = raw.get(i + 1).cloned();
+                i += 2;
+            }
+            _ => {
+                args.push(raw[i].clone());
+                i += 1;
+            }
+        }
+    }
+
+    let spec = args.first().map(String::as_str).unwrap_or("keima");
+    if spec == "suite" {
+        let trials = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
+        let name = args.get(2).map(String::as_str).unwrap_or("estimator");
+        run_suite(trials, name);
+        return;
+    }
+
+    let sc = match load_scenario(spec, ply_flag, target_flag, diag_flag) {
+        Ok(sc) => sc,
+        Err(e) => {
+            eprintln!("{e}");
+            eprintln!(
+                "シナリオは {} の .kif か、.kif ファイルパスで指定してください",
+                scenarios_dir().display()
+            );
+            std::process::exit(1);
+        }
+    };
+    let rep = replay(&sc.kifu, sc.ply);
+
     match args.get(1).map(String::as_str) {
         Some("diag") => {
             let n = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
-            diagnose_particles(sc, &rep, n);
+            diagnose_particles(&sc, &rep, n);
         }
         Some("continue") => {
             let games = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
             let name_me = args.get(3).map(String::as_str).unwrap_or("estimator");
             let name_opp = args.get(4).map(String::as_str).unwrap_or("estimator");
-            continue_games(sc, &rep, games, name_me, name_opp);
+            continue_games(&sc, &rep, games, name_me, name_opp);
         }
         mode => {
             let trials = mode.and_then(|s| s.parse().ok()).unwrap_or(20);
             let name = args.get(2).map(String::as_str).unwrap_or("estimator");
-            choice_trials(sc, &rep, trials, name);
+            choice_trials(&sc, &rep, trials, name, true);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn load(name: &str) -> Scenario {
+        load_scenario(name, None, None, None).unwrap()
+    }
+
+    /// 手動翻訳で検証済みだった USI 列とパーサーの出力が一致すること
+    #[test]
+    fn keimaの棋譜はUSI列と反則が既知の正解に一致する() {
+        let sc = load(&scenarios_dir().join("keima.kif").to_string_lossy());
+        let expected = [
+            "7g7f", "3a3b", "5g5f", "2b3a", "5f5e", "5a6b", "2h5h", "5c5d", "5i4h",
+            "7c7d", "7i6h", "8c8d", "6h5g", "6b7c", "5g5f", "6c6d", "4h3h", "9c9d",
+            "6i6h", "9d9e", "6h5g", "9e9f", "4g4f", "9f9g+", "8h6f", "P*9h", "8i7g",
+            "9h9i+", "7g8e", "8d8e",
+        ];
+        let usi: Vec<String> = sc.kifu.plies.iter().map(|p| p.mv.to_usi()).collect();
+        assert_eq!(usi, expected);
+        assert_eq!(sc.ply, 29);
+        assert_eq!(sc.target, "8d8e"); // 30手目（同歩）が自動導出される
+        // 30手目の前の反則試行 = 6465FU
+        assert_eq!(sc.kifu.plies[29].fouls.len(), 1);
+    }
+
+    #[test]
+    fn kakunariの棋譜はUSI列と反則が既知の正解に一致する() {
+        let sc = load(&scenarios_dir().join("kakunari.kif").to_string_lossy());
+        let expected = [
+            "7g7f", "3a3b", "6i7h", "1c1d", "7h7g", "2b1c", "4i5h", "5a4b", "6g6f",
+            "7c7d", "5h6g", "8a7c", "5g5f", "8c8d", "8g8f", "8d8e", "4g4f", "8e8f",
+            "7i7h", "8f8g+", "4f4e", "8g8h", "4e4d", "8h8i", "4d4c+", "3b4c", "P*8c",
+            "8b8c", "7h8g", "8i7i", "2h8h", "7i6i", "5i5h", "P*8f", "8h8i", "8f8g+",
+            "7g8g", "8c8g+", "8i8g", "P*8e", "8g8i", "4c3d", "8i6i", "N*5g", "6i8i",
+            "B*6i", "8i6i", "5g6i+", "5h6i", "1c7i", "6i5h", "R*6i", "P*4f", "P*4h",
+            "R*4e", "4b3b", "4e8e", "7c8e", "N*5d", "8e7g+", "5h4g", "4h4i+", "B*2b",
+            "6i5i+", "2b1a+", "R*5h", "L*4c", "G*4e", "4c4a+", "7i5g+", "6g5g",
+            "5h5g+", "4g3h", "4i3i", "3h2h", "5i4h",
+        ];
+        let usi: Vec<String> = sc.kifu.plies.iter().map(|p| p.mv.to_usi()).collect();
+        assert_eq!(usi, expected);
+        assert_eq!(sc.ply, 69);
+        assert_eq!(sc.target, "7i5g+"); // 70手目が自動導出される
+        // 反則試行の総数（69手目まで7件 + 71/73/75手目の前に4件。終局後の4件は trailing）
+        let n_fouls: usize = sc.kifu.plies.iter().map(|p| p.fouls.len()).sum();
+        assert_eq!(n_fouls, 11);
+        assert_eq!(sc.kifu.trailing_fouls.len(), 4);
+    }
+
+    /// リプレイの裁定検証（合法手は合法・反則試行は非合法）が全編通ること
+    #[test]
+    fn 収録シナリオは裁定つきリプレイが通る() {
+        for name in ["keima", "kakunari"] {
+            let sc = load(&scenarios_dir().join(format!("{name}.kif")).to_string_lossy());
+            let rep = replay(&sc.kifu, sc.kifu.plies.len());
+            assert!(rep.plies > 0);
+        }
+        // kakunari は後手5反則・先手2反則で70手目を迎える
+        let sc = load(&scenarios_dir().join("kakunari.kif").to_string_lossy());
+        let rep = replay(&sc.kifu, sc.ply);
+        assert_eq!(rep.fouls, [2, 5]);
+        assert_eq!(rep.pos.turn(), Color::Gote);
     }
 }
