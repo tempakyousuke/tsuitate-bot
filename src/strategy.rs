@@ -15,6 +15,7 @@ use crate::board::{
 };
 use crate::check::CheckSolver;
 use crate::estimator::{Estimator, opp_reply_weights};
+use crate::likelihood::{FITTED_THETA, ParticleCtx, particle_features, particle_log_weight};
 use crate::opening::OpeningBook;
 use crate::observation::{Observation, ObservationLog};
 use rand::SeedableRng;
@@ -731,13 +732,25 @@ impl Strategy for EstimatorStrategy {
 
         // 複製粒子を指紋で除いたユニーク粒子だけを評価に使う
         // （複製は独立な証拠ではないので p(合法) を過信させる）。
-        // ソフト救済された粒子（penalty>0）は重み soft_decay^penalty で薄く数える。
+        // ソフト救済された粒子（penalty>0）は重み soft_decay^penalty で薄く数え、
+        // 粒子尤度モデル（likelihood.rs）で真の局面に近い粒子を厚くする。
         // 相手玉の位置で層化して抽出する（stratified_sample 参照）。
         // 粒子が完全に枯渇していても、事前確率だけで安全側の評価が成り立つ
+        let particle_ctx = ParticleCtx {
+            // 直近で自駒が取られたマス（相手の駒がそこに着地した）
+            opp_landed_last: log.events().iter().rev().find_map(|e| match e {
+                Observation::OpponentMoved {
+                    captured_my_piece_at: Some(sq),
+                    ..
+                } => parse_usi_square(sq),
+                _ => None,
+            }),
+        };
         let sample = stratified_sample(
             est.particles(),
             est.penalties(),
-            view.your_color.other(),
+            view.your_color,
+            &particle_ctx,
             self.params.soft_decay,
             budget.eval_particles,
             &mut self.rng,
@@ -894,31 +907,53 @@ impl Strategy for EstimatorStrategy {
 /// - 採らなかった質量は同層の採用粒子へ再配分（層合計の重みを保存）
 /// - 重み和は「旧方式＝penalty昇順の先頭 min(eval, unique) 件の重み和」へ正規化し、
 ///   ソフト減衰による退化度・prior_weight の較正を変えない
+/// - 粒子尤度モデル（likelihood.rs、アリーナ真実で教師あり学習）の exp(θ·φ) を
+///   **平均1へ正規化して**乗じる: 真の局面に近い粒子ほど評価に効く。
+///   相対的な再重み付けなので合計質量（較正）は変えない
 fn stratified_sample<'a>(
     particles: &'a [Position],
     penalties: &[u8],
-    opp: Color,
+    my_color: Color,
+    ctx: &ParticleCtx,
     soft_decay: f64,
     eval_particles: usize,
     rng: &mut StdRng,
 ) -> Vec<(&'a Position, f64)> {
-    // ユニーク化（penalty 昇順の並びを保つ）。旧方式の重み和もこの走査で計る
+    let opp = my_color.other();
+    // ユニーク化（penalty 昇順の並びを保つ）と尤度の対数重み
     let mut seen = HashSet::new();
-    let mut uniques: Vec<(&Position, f64)> = vec![];
-    let mut legacy_mass = 0.0;
+    let mut uniques: Vec<(&Position, f64, f64)> = vec![];
     for (pos, pen) in particles.iter().zip(penalties) {
         if !seen.insert(pos.fingerprint()) {
             continue;
         }
         let w = soft_decay.powi(i32::from(*pen));
-        if uniques.len() < eval_particles {
-            legacy_mass += w;
-        }
-        uniques.push((pos, w));
+        let logl = particle_log_weight(&particle_features(pos, my_color, ctx), &FITTED_THETA);
+        uniques.push((pos, w, logl));
     }
     if uniques.is_empty() {
         return vec![];
     }
+    // 尤度を平均1へ正規化して重みに乗じる（オーバーフロー対策で max を引く）
+    let max_logl = uniques
+        .iter()
+        .map(|(_, _, l)| *l)
+        .fold(f64::MIN, f64::max);
+    let mean_like: f64 = uniques
+        .iter()
+        .map(|(_, _, l)| (l - max_logl).exp())
+        .sum::<f64>()
+        / uniques.len() as f64;
+    let uniques: Vec<(&Position, f64)> = uniques
+        .into_iter()
+        .map(|(p, w, l)| (p, w * (l - max_logl).exp() / mean_like.max(1e-12)))
+        .collect();
+    // 旧方式（penalty昇順の先頭 min(eval, unique) 件）の重み和 = 較正の正規化先
+    let legacy_mass: f64 = uniques
+        .iter()
+        .take(eval_particles)
+        .map(|(_, w)| w)
+        .sum();
 
     // 玉位置で層化（質量降順）
     let mut index: HashMap<Option<Coord>, usize> = HashMap::new();
@@ -1963,7 +1998,7 @@ pub(crate) mod tests {
         }
         let penalties = vec![0u8; particles.len()];
         // 上限16 < 層数9×最低枠4=36: 件数は必ず16以下
-        let sample = stratified_sample(&particles, &penalties, Color::Gote, 0.5, 16, &mut rng);
+        let sample = stratified_sample(&particles, &penalties, Color::Sente, &ParticleCtx::default(), 0.5, 16, &mut rng);
         assert!(sample.len() <= 16, "len={}", sample.len());
         // ラウンドロビン順: 先頭9件で9層すべての玉位置が現れる
         let prefix_kings: HashSet<_> = sample
@@ -1973,7 +2008,7 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(prefix_kings.len(), 9, "prefixが層化されていない");
         // 上限が大きい場合も件数はユニーク数以下・重みは旧方式と一致
-        let sample = stratified_sample(&particles, &penalties, Color::Gote, 0.5, 512, &mut rng);
+        let sample = stratified_sample(&particles, &penalties, Color::Sente, &ParticleCtx::default(), 0.5, 512, &mut rng);
         assert_eq!(sample.len(), 54);
         let mass: f64 = sample.iter().map(|(_, w)| w).sum();
         assert!((mass - 54.0).abs() < 1e-6, "mass={mass}");
@@ -1993,7 +2028,7 @@ pub(crate) mod tests {
         let trials = 400;
         for seed in 0..trials {
             let mut rng = StdRng::seed_from_u64(seed);
-            let sample = stratified_sample(&particles, &penalties, Color::Gote, 0.5, 1, &mut rng);
+            let sample = stratified_sample(&particles, &penalties, Color::Sente, &ParticleCtx::default(), 0.5, 1, &mut rng);
             assert_eq!(sample.len(), 1);
             if sample[0].0.fingerprint() == strict_fp {
                 strict_hits += 1;
@@ -2024,7 +2059,7 @@ pub(crate) mod tests {
         let mut share_sum = 0.0;
         for seed in 0..trials {
             let mut rng = StdRng::seed_from_u64(1000 + seed);
-            let sample = stratified_sample(&particles, &penalties, Color::Gote, 0.5, 2, &mut rng);
+            let sample = stratified_sample(&particles, &penalties, Color::Sente, &ParticleCtx::default(), 0.5, 2, &mut rng);
             let total: f64 = sample.iter().map(|(_, w)| w).sum();
             let soft_mass: f64 = sample
                 .iter()
@@ -2049,7 +2084,7 @@ pub(crate) mod tests {
                 .take(20)
                 .collect();
         let penalties = vec![1u8; particles.len()];
-        let sample = stratified_sample(&particles, &penalties, Color::Gote, 0.5, 16, &mut rng);
+        let sample = stratified_sample(&particles, &penalties, Color::Sente, &ParticleCtx::default(), 0.5, 16, &mut rng);
         assert!(sample.len() <= 16);
         let mass: f64 = sample.iter().map(|(_, w)| w).sum();
         assert!(
