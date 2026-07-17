@@ -409,18 +409,27 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
             .iter()
             .copied()
             .fold(f64::MIN, f64::max);
-        let mut seen: HashSet<u64> = HashSet::new();
+        // 重複局面は最良の評価重みの個体で代表させる（stratified_sample と同じ規約）
+        let mut best: HashMap<u64, (f64, u8)> = HashMap::new();
         for ((pp, &penalty), &lw) in est
             .particles()
             .iter()
             .zip(est.penalties())
             .zip(est.log_weights())
         {
+            let w = 0.5f64.powi(i32::from(penalty)) * (lw - max_logw).exp();
+            let e = best.entry(pp.fingerprint()).or_insert((w, penalty));
+            if w > e.0 {
+                *e = (w, penalty);
+            }
+        }
+        let mut seen: HashSet<u64> = HashSet::new();
+        for pp in est.particles() {
             if !seen.insert(pp.fingerprint()) {
                 continue;
             }
+            let (w, penalty) = best[&pp.fingerprint()];
             total_unique += 1;
-            let w = 0.5f64.powi(i32::from(penalty)) * (lw - max_logw).exp();
             if rep.pos.in_check(side) {
                 let checkers: Vec<String> = pp
                     .pieces()

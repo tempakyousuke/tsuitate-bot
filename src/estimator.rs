@@ -606,7 +606,10 @@ fn sample_opp_move(
         };
         let mut next = pos.clone();
         next.play_unchecked(&mv);
-        let check_ok = gives_check.is_none_or(|gc| next.in_check(my_color) == gc);
+        // 分母（total_mass）には全合法手の重みが要るが、王手判定はクラス判定に
+        // しか使わないので capture_ok の短絡で省く（in_check は比較的重い）
+        let consistent =
+            capture_ok && gives_check.is_none_or(|gc| next.in_check(my_color) == gc);
         let threat_known = newly_threatens(pos, &next, &mv, known_squares);
         let threat_home = newly_threatens(pos, &next, &mv, &homes);
         let (is_king, flee) = match mv {
@@ -625,9 +628,10 @@ fn sample_opp_move(
             flee,
             moved_is_minor(pos, &mv),
             deep_unsupported(&next, &mv, opp),
+            hangs_on_landing(pos, &next, &mv, opp),
         );
         total_mass += w;
-        if capture_ok && check_ok {
+        if consistent {
             candidates.push((mv, w));
         }
     }
@@ -706,6 +710,7 @@ pub fn opp_reply_weights(
             flee,
             moved_is_minor(pos, &mv),
             deep_unsupported(&next, &mv, opp),
+            hangs_on_landing(pos, &next, &mv, opp),
         );
         if let ShogiMove::Board { to, .. } = mv {
             let captures_mine = pos.piece_at(to).is_some_and(|p| p.color == my_color);
@@ -728,9 +733,29 @@ fn moved_is_minor(pos: &Position, mv: &ShogiMove) -> bool {
     matches!(role, Some(Role::Pawn | Role::Lance | Role::Knight))
 }
 
+/// 相手の利きがあるマスへの紐なし着地か（取りは除く = 交換ではなく差し出し）。
+/// 利き・紐とも着地後の盤面（next）で判定する（開き駒の利きを含む）。
+/// 相手の玉の利きも数える（紐がなければ玉に取られる）。銀以上の駒での該当は
+/// 実質タダの駒捨てで人間はほぼ指さない（馬@62 のような幻の飛び込み王手の
+/// 過大評価を抑える）。**定義は bin/fit_opp の hangs_on_landing と一致させること**
+fn hangs_on_landing(pos: &Position, next: &Position, mv: &ShogiMove, mover: Color) -> bool {
+    let to = match *mv {
+        ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+    };
+    if pos.piece_at(to).is_some() {
+        return false; // 取り（交換の文脈）は対象外
+    }
+    let opp = mover.other();
+    let attacked = next
+        .pieces()
+        .any(|(sq, p)| p.color == opp && next.attacks(sq, to));
+    attacked
+        && !next
+            .pieces()
+            .any(|(sq, p)| p.color == mover && sq != to && next.attacks(sq, to))
+}
+
 /// 敵陣（成れる3段）への紐なし着地か。着地点に自分の別の駒の利きが無い。
-/// 見えない敵陣は守備駒が濃く、大駒の紐なし深入りは事実上の駒捨てなので
-/// 人間はほとんど指さない（馬@62 のような幻の深部王手の過大評価を抑える）。
 /// **定義は bin/fit_opp の deep_unsupported と一致させること**
 fn deep_unsupported(next: &Position, mv: &ShogiMove, mover: Color) -> bool {
     let to = match *mv {
@@ -761,12 +786,13 @@ fn flees_danger(from: Coord, to: Coord, danger: &[Coord]) -> bool {
 }
 
 /// 相手の手の尤度づけ。対人59局の条件付き最尤推定（bin/fit_opp, 2026-07-17、
-/// 成り・敵陣深入りの駒種分割）: パープレキシティ 28.2（旧手調整）→ 24.8。
+/// 成り・敵陣深入り・ハングの駒種分割）: パープレキシティ 28.2（旧手調整）→ 24.2。
 /// 駒取り・王手の有無は観測との整合ですでに絞り込まれているため、
 /// 事前分布には「観測クラス内で判別できる特徴量」だけが現れる。
 /// king_flee がわずかに負なのは実測（守りを剥がされても玉は特に逃げない）。
-/// 成りと敵陣への紐なし着地は小駒（歩香桂）と銀以上で分割: 垂れ歩・と金作りは
-/// 好んで指されるが、大駒のブラインド成り込みは実質駒捨てで滅多に指されない
+/// 成り・深入り・ハングは小駒（歩香桂）と銀以上で分割: 垂れ歩・と金作りは
+/// 好んで指されるが、大駒を相手の利きに紐なしで差し出す手（hang_major）は
+/// 実質駒捨てで明確に避けられる（候補10.3%に対し選択3.6%）
 fn opp_move_weight(
     opp: Color,
     mv: &ShogiMove,
@@ -776,6 +802,7 @@ fn opp_move_weight(
     king_flee: bool,
     moved_minor: bool,
     deep_unsup: bool,
+    hang: bool,
 ) -> f64 {
     let mut s = 0.0;
     match *mv {
@@ -784,27 +811,30 @@ fn opp_move_weight(
                 Color::Sente => (from.rank - to.rank) as f64,
                 Color::Gote => (to.rank - from.rank) as f64,
             };
-            s += 0.156 * advance;
+            s += 0.162 * advance;
             if promote {
-                s += if moved_minor { 1.697 } else { 0.666 };
+                s += if moved_minor { 1.647 } else { 0.659 };
             }
         }
-        ShogiMove::Drop { .. } => s += -1.472,
+        ShogiMove::Drop { .. } => s += -1.451,
     }
     if threat_known {
-        s += 0.539;
+        s += 0.561;
     }
     if threat_home {
-        s += 0.609;
+        s += 0.670;
     }
     if is_king_move {
-        s += 0.130;
+        s += 0.131;
     }
     if king_flee {
-        s += -0.166;
+        s += -0.161;
     }
     if deep_unsup {
-        s += if moved_minor { 0.559 } else { -0.297 };
+        s += if moved_minor { 0.320 } else { 0.026 };
+    }
+    if hang {
+        s += if moved_minor { 0.433 } else { -0.839 };
     }
     s.exp()
 }

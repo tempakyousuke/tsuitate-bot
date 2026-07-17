@@ -23,7 +23,7 @@ use tsuitate_bot::board::Coord;
 use tsuitate_bot::protocol::{Color, GameEndPayload};
 use tsuitate_bot::shogi::{Position, ShogiMove, parse_usi};
 
-const FEATURE_NAMES: [&str; 10] = [
+const FEATURE_NAMES: [&str; 12] = [
     "advance",       // 前進量（段）
     "promote_minor", // 成り（歩・香・桂）
     "promote_major", // 成り（銀・角・飛）
@@ -37,9 +37,13 @@ const FEATURE_NAMES: [&str; 10] = [
     "deep_unsup_pawn", // 敵陣（3段）への紐なし着地（歩・香・桂）。
     "deep_unsup_piece", // 敵陣（3段）への紐なし着地（銀以上の駒）。見えない敵陣は
                         // 守備駒が濃く、紐のない深入りは事実上の駒捨て
+    "hang_minor", // 相手の利きがあるマスへの紐なし着地（歩・香・桂、取りは除く）。
+                  // 垂れ歩などの軽い差し出しは指される
+    "hang_major", // 同（銀以上）。実質タダの駒捨てで、相手の利きは見えなくとも
+                  // 人間は推論で避ける（幻の角の飛び込み王手の過大評価を抑える）
 ];
 
-const D: usize = 10;
+const D: usize = 12;
 
 struct Sample {
     /// 観測クラス内の各候補手の特徴量
@@ -123,6 +127,25 @@ fn deep_unsupported(next: &Position, mv: &ShogiMove, mover: Color) -> bool {
         .any(|(sq, p)| p.color == mover && sq != to && next.attacks(sq, to))
 }
 
+/// 相手の利きがあるマスへの紐なし着地か（取りは除く = 交換ではなく差し出し）。
+/// 利き・紐とも着地後の盤面（next）で判定する（開き駒の利きを含む）。
+/// 相手の玉の利きも数える（紐がなければ玉に取られる）。
+/// **定義は estimator.rs の hangs_on_landing と一致させること**
+fn hangs_on_landing(pos: &Position, next: &Position, mv: &ShogiMove, mover: Color) -> bool {
+    let to = to_square(mv);
+    if pos.piece_at(to).is_some() {
+        return false; // 取り（交換の文脈）は対象外
+    }
+    let opp = mover.other();
+    let attacked = next
+        .pieces()
+        .any(|(sq, p)| p.color == opp && next.attacks(sq, to));
+    attacked
+        && !next
+            .pieces()
+            .any(|(sq, p)| p.color == mover && sq != to && next.attacks(sq, to))
+}
+
 /// 初期位置から一度も動いていない bot 駒のマス（相手はここを推論で狙ってくる）
 fn home_squares(pos: &Position, bot: Color, bot_touched: &HashSet<Coord>) -> HashSet<Coord> {
     let initial = Position::initial();
@@ -190,6 +213,7 @@ fn extract_samples(bot: Color, end: &GameEndPayload, samples: &mut Vec<Sample>) 
                 let minor = moved_is_minor(&pos, &lm);
                 let promotes = matches!(lm, ShogiMove::Board { promote: true, .. });
                 let deep_unsup = deep_unsupported(&next, &lm, human);
+                let hang = hangs_on_landing(&pos, &next, &lm, human);
                 features.push([
                     advance_of(&lm, human),
                     (promotes && minor) as u8 as f64,
@@ -201,6 +225,8 @@ fn extract_samples(bot: Color, end: &GameEndPayload, samples: &mut Vec<Sample>) 
                     flee as u8 as f64,
                     (deep_unsup && minor) as u8 as f64,
                     (deep_unsup && !minor) as u8 as f64,
+                    (hang && minor) as u8 as f64,
+                    (hang && !minor) as u8 as f64,
                 ]);
             }
             if let Some(chosen) = chosen {

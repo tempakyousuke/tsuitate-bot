@@ -962,24 +962,36 @@ fn stratified_sample<'a>(
     // （旧方式 = penalty昇順の先頭 min(eval, unique) 件の soft 重み和）で計る。
     // 尤度適用後の重みで計ると p(合法) ブレンドに使う実効質量 n が尤度分布に
     // 引きずられて prior_weight の較正が崩れる（2026-07-16 レビュー指摘）
-    let mut seen = HashSet::new();
+    // 重複局面（同一指紋）は「最良の総合重み」の個体で代表させる。
+    // SIR 導入後は同一局面でも経路によって logw が異なるため、先着1個だと
+    // 高尤度の個体が並び順次第で捨てられる（2026-07-17 codex レビュー指摘）
+    let mut seen: HashMap<u64, usize> = HashMap::new();
     let mut uniques: Vec<(&Position, f64, f64)> = vec![];
-    let mut legacy_mass = 0.0;
     for (i, (pos, pen)) in particles.iter().zip(penalties).enumerate() {
-        if !seen.insert(pos.fingerprint()) {
-            continue;
-        }
         let w = soft_decay.powi(i32::from(*pen));
-        if uniques.len() < eval_particles {
-            legacy_mass += w;
-        }
         let logl = particle_log_weight(&particle_features(pos, my_color, ctx), &FITTED_THETA)
             + log_weights.get(i).copied().unwrap_or(0.0);
-        uniques.push((pos, w, logl));
+        match seen.entry(pos.fingerprint()) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(uniques.len());
+                uniques.push((pos, w, logl));
+            }
+            std::collections::hash_map::Entry::Occupied(e) => {
+                let u = &mut uniques[*e.get()];
+                if w.ln() + logl > u.1.ln() + u.2 {
+                    *u = (pos, w, logl);
+                }
+            }
+        }
     }
     if uniques.is_empty() {
         return vec![];
     }
+    let legacy_mass: f64 = uniques
+        .iter()
+        .take(eval_particles)
+        .map(|(_, w, _)| w)
+        .sum();
     // 尤度を重みに乗じる（オーバーフロー対策で max を引く。全体スケールは
     // 最後に legacy_mass へ正規化されるので相対値だけが意味を持つ）
     let max_logl = uniques
