@@ -206,6 +206,10 @@ fn parse_move_body(body: &[char], prev_to: Option<Coord>) -> Result<Option<KifMo
                 drop = true;
                 i += 1;
             }
+            // 相対位置の修飾語（移動元が付くので判別には不要。読み飛ばす）
+            Some('右' | '左' | '直' | '引' | '寄' | '上' | '行') => {
+                i += 1;
+            }
             _ => break,
         }
     }
@@ -223,7 +227,7 @@ fn parse_move_body(body: &[char], prev_to: Option<Coord>) -> Result<Option<KifMo
         .ok_or_else(|| format!("移動元の筋が読めません: {s}"))?;
     let r = body
         .get(i + 2)
-        .and_then(|&c| c.to_digit(10).map(|d| d as i8))
+        .and_then(|&c| parse_file_digit(c))
         .ok_or_else(|| format!("移動元の段が読めません: {s}"))?;
     let from = coord(f, r).ok_or_else(|| format!("移動元が不正: {s}"))?;
     Ok(Some(KifMove::Board { from, to, promote }))
@@ -283,7 +287,9 @@ pub fn parse_kif(text: &str) -> Result<Kifu, String> {
         if digits.is_empty() {
             continue; // ヘッダ行
         }
-        let move_no: usize = digits.parse().unwrap();
+        let move_no: usize = digits
+            .parse()
+            .map_err(|_| err(format!("手数が読めません: {line}")))?;
         if ended {
             return Err(err(format!("終局後に指し手行があります: {line}")));
         }
@@ -293,14 +299,9 @@ pub fn parse_kif(text: &str) -> Result<Kifu, String> {
                 kifu.plies.len() + 1
             )));
         }
-        // 手数の後ろから消費時間 `( 0:` の手前までが指し手本体。
-        // 移動元の `(77)` と区別するため「( の直後が空白か数字+コロン」を時間とみなす
-        let rest = &line[digits.len()..];
-        let body_str = match rest.find("  (") {
-            Some(idx) => &rest[..idx],
-            None => rest,
-        };
-        let body: Vec<char> = body_str
+        // 手数の後ろ全体を渡す。パーサーは1手ぶん読んだところで止まるので、
+        // 後続の消費時間欄（空白の幅や形式に依存しない）は無視される
+        let body: Vec<char> = line[digits.len()..]
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
@@ -394,5 +395,35 @@ mod tests {
     fn 手数の欠落を検出する() {
         let err = parse_kif("1 ７六歩(77)\n3 ７五歩(76)\n").unwrap_err();
         assert!(err.contains("不連続"), "{err}");
+    }
+
+    #[test]
+    fn 消費時間欄の空白幅に依存しない() {
+        // 1スペース・タブ・時間欄なし、いずれも同じ結果になる
+        for line in [
+            "1 ７六歩(77) ( 0:00/00:00:00)",
+            "1 ７六歩(77)\t( 0:00/00:00:00)",
+            "1 ７六歩(77)",
+        ] {
+            let kifu = parse_kif(line).unwrap();
+            assert_eq!(usi_seq(&kifu), ["7g7f"], "{line}");
+        }
+    }
+
+    #[test]
+    fn 相対位置の修飾語と全角の移動元を受け付ける() {
+        let kifu = parse_kif(
+            "1 ７六歩(77)\n\
+             2 ３二金右(41)\n\
+             3 ２二角成(８８)\n",
+        )
+        .unwrap();
+        assert_eq!(usi_seq(&kifu), ["7g7f", "4a3b", "8h2b+"]);
+    }
+
+    #[test]
+    fn 異常な手数はエラーになる() {
+        let err = parse_kif("99999999999999999999999 ７六歩(77)\n").unwrap_err();
+        assert!(err.contains("手数"), "{err}");
     }
 }

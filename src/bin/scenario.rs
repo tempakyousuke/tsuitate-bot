@@ -132,7 +132,15 @@ fn resolve_foul(pos: &Position, side: Color, f: &RawFoul) -> String {
                 unpromote_role(*role),
                 "反則試行の駒コードと盤上の駒種が不一致"
             );
-            make_usi_move(*from, *to, piece.role != *role)
+            // 駒コードは移動後の駒種: 盤上が生駒でコードが成駒なら成る手。
+            // 盤上が成駒でコードが生駒に戻る組み合わせは存在しない（KIF不整合）
+            let piece_promoted = piece.role != unpromote_role(piece.role);
+            let code_promoted = *role != unpromote_role(*role);
+            assert!(
+                piece_promoted <= code_promoted,
+                "反則試行のコードが生駒なのに盤上は成駒（KIF不整合）: {from:?}"
+            );
+            make_usi_move(*from, *to, code_promoted && !piece_promoted)
         }
     }
 }
@@ -708,6 +716,13 @@ fn main() {
         }
     };
     let rep = replay(&sc.kifu, sc.ply);
+    if let Some(outcome) = rep.pos.outcome() {
+        eprintln!(
+            "ply={} の局面は終局しています（{outcome:?}）。--ply を見直してください",
+            sc.ply
+        );
+        std::process::exit(1);
+    }
 
     match args.get(1).map(String::as_str) {
         Some("diag") => {
