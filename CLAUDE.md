@@ -25,7 +25,12 @@
   baselines の既定値は凍結版を追加したら手動で更新すること。
   **アリーナの時計は 1000秒+3秒**（本番サイトの300秒+3秒より厚い。思考予算を上げて
   強さの上限を探るため）。本番へのデプロイ時は `TSUITATE_THINK_BUDGET_MS` を絞って
-  300秒+3秒に収める（強さと時間の調整ノブ）
+  300秒+3秒に収める（強さと時間の調整ノブ）。
+  `-f oracle=nofoul|check_nofoul` は診断用オラクル（候補側の反則を審判が握りつぶして
+  指し直させる = 合法性知識の上限測定。記録は自動無効化）。
+  実測 2026-07-16: vs v6 で nofoul 86.2%±4.8 / check_nofoul 59.5%±7.1 —
+  反則経済に36ptの伸びしろが実在する（現状の評価構造のスカラー係数調整では
+  届かないことが tune-round3/4 の不発で確定。tuning/README.md 参照）
 - `cargo run --release --bin tune -- [反復数] [評価あたり対局数] [基準...]` — 評価パラメータ
   （`strategy::EvalParams`）のSPSA自動チューニング。目的関数はアリーナのスコア率
   （引き分け=0.5勝）。**f+/f− は共通乱数法でペアリングされる**: 同じ対局シード列
@@ -37,10 +42,19 @@
   反則数・思考時間）が残るので、引き分け化や時間浪費でスコアが上がる変質を監視できる。
   ログの見方は `tuning/README.md`。
   `TUNE_CANDIDATE_LINE=<定跡名>` で候補側の定跡を固定できる（定跡特化チューニング。
-  基準側の固定は `estimator_rush` を基準に指定）。完走時に最終中心点を追加評価して
+  基準側の固定は `estimator_rush` を基準に指定）。
+  `TUNE_PARAMS=<名前,...>` で調整対象をマスク（他は中心点固定）、
+  `TUNE_SPAN=<0..1>` で有効範囲を既定値近傍へ局所化できる（中心が範囲端に近い
+  項目の片側クリップ対策）。完走時に最終中心点を追加評価して
   `done.final_score` に記録する。採用するときは `EvalParams::default` を書き換えて
   フルガントレットで確認する。
   対局ループは `selfplay.rs`（arena と共用）。**長時間ランはローカルでなくGCEで回す**（下記）
+- **粒子尤度のフィット**（`.github/workflows/fit.yml`、CIのみで実行する）:
+  `gh workflow run fit.yml -f run_ids="<arena実行のrun ID...>" -f max_games=600`。
+  過去アリーナの `arena-records`（観測列＋真実）を教師に、粒子群の中で真の局面を
+  判別する条件付きMLE（`bin/fit_particles`）を回し、係数を `src/likelihood.rs` の
+  `FITTED_THETA` へ手で反映する。評価側は `stratified_sample` が exp(θ·φ) を
+  粒子重みに乗じる（fit_opp の局面版。2026-07-16 のフィットで実効候補数 59→33）
 - `cargo run --release --bin scenario -- <名前|suite>` — 実戦棋譜の局面再現実験。
   `scenarios/*.kif`（Shogi Quest エクスポート + `*scenario ply=N` 行）を再生して
   特定局面での選択・粒子の信念（diag）・終局までの遂行（continue）を測る。
@@ -81,6 +95,9 @@
   アリーナの審判と推定器の局面シミュレーションの共通部品
 - `observation.rs` — 観測履歴。ついたて将棋で得られる情報はこれが全量:
   自分の手の受理/反則（理由は不明）・取った駒種・自駒が取られたマス・王手/反則宣言
+- `likelihood.rs` — 粒子の尤度モデル（アリーナ真実で教師あり学習した8特徴量の
+  線形モデル）。評価側の粒子重みに exp(θ·φ) を乗じる。フィットは fit.yml/
+  bin/fit_particles。C-7（尤度・ESSベースのフィルタ改修）の観測尤度の部品にもなる
 - `model.rs` — 観測履歴だけから自分側（自駒配置・持ち駒・相手手数・取られた駒）を
   再構成する GameModel。client.rs が sync の PlayerView と照合してズレを警告する
 - `estimator.rs` — 相手局面のパーティクルフィルタ（determinization）。粒子=具体的なフル局面。

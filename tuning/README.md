@@ -79,3 +79,17 @@ jq 'select(.type=="done") | .final' tuning/tune-rush.jsonl
   基準 estimator_v5、best 0.80）
 - 第1ラウンド（汎用、60反復 vs v5）のログはVM再構築時に喪失。
   収束点は commit 89a3612 の `EvalParams::default` に反映済み
+- `tune-round2.jsonl` — 第2ラウンド（2026-07-14、共通乱数法・全35次元・
+  60反復×2×40局 vs v5）。**成功**: final_score 0.675、収束点は estimator_v6 の
+  Default に反映。最大の発見は check_bonus↓/check_foul_scale↑
+  （王手価値は相手の反則蓄積に比例）
+- `tune-round3.jsonl` — 第3ラウンド（2026-07-15、機構系18次元マスク・span0.5・
+  vs v6）。**不発**: final_score 0.438。平均スコア 0.513 で終始フラット
+- `tune-round4.jsonl` — 第4ラウンド（2026-07-17、反則経済系9次元
+  （foul_cost_base/pow・check_bonus/check_foul_scale・foul_diff_pow・
+  check_limit_accel 等）・span1.0・vs v6）。**不発**: final_score 0.325、
+  平均 0.512。オラクル上限（下記）に対しスカラー係数の調整では届かない、
+  が確定した実験。
+  **オラクル測定（2026-07-16、ARENA_ORACLE_A）**: 全反則回避で vs v6 86.2%±4.8 /
+  王手中のみ回避で 59.5%±7.1 — 反則経済に36ptの伸びしろは実在する。
+  次の本命は構造改修（C-7: 連続重み・観測尤度・ESSの粒子フィルタ）
