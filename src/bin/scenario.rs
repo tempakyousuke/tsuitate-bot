@@ -386,10 +386,15 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
                 est.update(&running);
                 turn_no += 1;
                 if seed == 0 {
+                    let strict = est.info_miss().iter().filter(|&&m| m == 0).count();
+                    let (repaired, revived) = est.rejuv_stats();
                     eprintln!(
-                        "  [seed0] 手番{turn_no}: 粒子 {} (healthy={})",
+                        "  [seed0] 手番{turn_no}: 粒子 {} (厳密{} healthy={} 修復{} 復活{})",
                         est.particles().len(),
-                        est.healthy()
+                        strict,
+                        est.healthy(),
+                        repaired,
+                        revived,
                     );
                 }
             }
@@ -397,11 +402,23 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
         }
         est.update(&running);
         if seed == 0 {
+            let (repaired, revived) = est.rejuv_stats();
             eprintln!(
-                "  [seed0] 最終: 粒子 {} (healthy={})",
+                "  [seed0] 最終: 粒子 {} (healthy={} 修復{} 復活{})",
                 est.particles().len(),
-                est.healthy()
+                est.healthy(),
+                repaired,
+                revived,
             );
+            let fails = est.fail_report();
+            if !fails.is_empty() {
+                let top: Vec<String> = fails
+                    .iter()
+                    .take(12)
+                    .map(|(i, c)| format!("c{i}×{c}"))
+                    .collect();
+                eprintln!("  [seed0] 失敗制約: {}", top.join(" "));
+            }
         }
         // 推定器内の logw を max で正規化（評価側 stratified_sample と同じ規約）
         let max_logw = est
