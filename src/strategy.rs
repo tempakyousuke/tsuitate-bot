@@ -77,6 +77,9 @@ pub fn make_seeded(name: &str, seed: u64) -> Option<Box<dyn Strategy>> {
         "estimator_v6" => Some(Box::new(
             crate::frozen::estimator_v6::EstimatorV6::with_seed(seed),
         )),
+        "estimator_v7" => Some(Box::new(
+            crate::frozen::estimator_v7::EstimatorV7::with_seed(seed),
+        )),
         _ => make(name),
     }
 }
@@ -100,6 +103,7 @@ pub fn make(name: &str) -> Option<Box<dyn Strategy>> {
         "estimator_v4" => Some(Box::new(crate::frozen::estimator_v4::EstimatorV4::new())),
         "estimator_v5" => Some(Box::new(crate::frozen::estimator_v5::EstimatorV5::new())),
         "estimator_v6" => Some(Box::new(crate::frozen::estimator_v6::EstimatorV6::new())),
+        "estimator_v7" => Some(Box::new(crate::frozen::estimator_v7::EstimatorV7::new())),
         _ => None,
     }
 }
