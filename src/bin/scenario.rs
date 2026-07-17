@@ -409,26 +409,25 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
             .iter()
             .copied()
             .fold(f64::MIN, f64::max);
-        // 重複局面は最良の評価重みの個体で代表させる（stratified_sample と同じ規約）
-        let mut best: HashMap<u64, (f64, u8)> = HashMap::new();
-        for ((pp, &penalty), &lw) in est
+        // 重複局面は質量 Σexp(logw) を畳み込む（C-7 P1: multiplicity 保持。
+        // ソフト減衰はフィルタが logw へ課金済み。info_miss は厳密判定にだけ使う）
+        let mut mass: HashMap<u64, (f64, u8)> = HashMap::new();
+        for ((pp, &miss), &lw) in est
             .particles()
             .iter()
-            .zip(est.penalties())
+            .zip(est.info_miss())
             .zip(est.log_weights())
         {
-            let w = 0.5f64.powi(i32::from(penalty)) * (lw - max_logw).exp();
-            let e = best.entry(pp.fingerprint()).or_insert((w, penalty));
-            if w > e.0 {
-                *e = (w, penalty);
-            }
+            let e = mass.entry(pp.fingerprint()).or_insert((0.0, miss));
+            e.0 += (lw - max_logw).exp();
+            e.1 = e.1.min(miss);
         }
         let mut seen: HashSet<u64> = HashSet::new();
         for pp in est.particles() {
             if !seen.insert(pp.fingerprint()) {
                 continue;
             }
-            let (w, penalty) = best[&pp.fingerprint()];
+            let (w, penalty) = mass[&pp.fingerprint()];
             total_unique += 1;
             if rep.pos.in_check(side) {
                 let checkers: Vec<String> = pp
@@ -468,7 +467,7 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
 
     println!(
         "粒子診断: 推定器 {n_estimators} 個ぶんのユニーク粒子 {total_unique} 個（うち厳密整合 {strict_unique}。\
-         集計は評価重み = 0.5^penalty × 正規化exp(logw)。玉位置・利きは厳密のみ）"
+         集計は評価重み = 指紋ごとの正規化 Σexp(logw)（ソフト減衰は logw 課金済み）。玉位置・利きは厳密のみ）"
     );
     if strict_unique == 0 {
         println!("厳密整合の粒子がありません（フィルタ死。seed0 の手番別トレースは stderr 参照）");

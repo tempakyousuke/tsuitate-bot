@@ -22,11 +22,22 @@
 //! 粒子間で正規化して乗じる。リプレイ生成粒子も全制約ぶん累積するので比較可能。
 //!
 //! ソフト粒子（POMCP の particle reinvigoration の変種）:
-//! 厳密整合の生存粒子が SOFT_MIN を下回ったときは、棄却された粒子を
-//! 「情報系の制約だけを緩和した」判定で救済し、penalty を加算して残す。
+//! 厳密整合の生存粒子が target/4 を下回ったときは、棄却された粒子を
+//! 「情報系の制約だけを緩和した」判定で救済し、info_miss を加算して残す。
 //! 緩和するのは王手宣言の一致と自分の反則の説明のみで、物理的な制約
-//! （自手の合法性・取った駒種・取られたマス）は緩和しない。評価側は
-//! penalty に応じた重み（0.5^penalty）で加重する。
+//! （自手の合法性・取った駒種・取られたマス）は緩和しない。救済時は
+//! 観測尤度 EPS_INFO を logw へ課金する（C-7 P1: 従来の評価側 0.5^penalty
+//! 減衰を連続重みへ統合）。info_miss は課金回数の別勘定カウンタで、
+//! 上限管理（INFO_MISS_CAP）と評価側の較正（証拠数の勘定）にだけ使う。
+//!
+//! ESS リサンプリング（C-7 P1 / D2）:
+//! logw の退化を ESS = (Σw)²/Σw² で監視し、閾値を割ったら systematic
+//! resampling で質量を複製数へ実現して logw をリセットする。退化していないが
+//! 頭数が目標に足りないときは、質量保存の分割複製（コピーと元で exp(logw) を
+//! 等分）で埋める — 分布を変えずに、次の相手手サンプルで分岐する多様性の種を
+//! 蒔く（従来の複製埋めの後継。評価側が multiplicity を畳み込むようになったため
+//! 質量保存でない複製は事後分布を偏らせる）。info_miss はリサンプリングでも
+//! リセットしない（嘘の昇格防止・較正はカウンタが担う）。
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -49,7 +60,14 @@ const BACKTRACK_ATTEMPTS: u32 = 4;
 /// ソフト救済の累積回数の上限。超えた粒子は棄却する
 /// （観測と何度も矛盾した粒子は近似としても信用できない）。
 /// ソフト救済の発動閾値は target/4（apply_constraint 参照）
-const PENALTY_CAP: u8 = 3;
+const INFO_MISS_CAP: u8 = 3;
+/// 情報系ソフト救済1回あたりの観測尤度（logw へ ln(EPS_INFO) を課金）。
+/// 評価側の較正（証拠数の勘定）にも同じ値を使うため pub。
+/// C-7 P1 で評価側の soft_decay^penalty（旧0.6753）を置き換えた。
+/// フィルタ超パラメータなので調整は SPSA でなくグリッド＋シナリオ目的で行う
+pub const EPS_INFO: f64 = 0.1;
+/// ESS がこの割合（対 現粒子数）を下回ったら systematic resampling
+const ESS_THRESHOLD: f64 = 0.5;
 
 /// 観測列を推定に使える形に正規化した制約
 #[derive(Debug, Clone)]
@@ -72,8 +90,10 @@ enum Constraint {
 pub struct Estimator {
     my_color: Color,
     particles: Vec<Position>,
-    /// particles と同じ並びのソフト救済回数（0 = 全制約と厳密整合）
-    penalties: Vec<u8>,
+    /// particles と同じ並びのソフト救済回数（0 = 全制約と厳密整合）。
+    /// 尤度の課金（EPS_INFO）は logw 側で行い、これは回数の別勘定
+    /// （上限管理と評価側の証拠数較正用）。リサンプリングでもリセットしない
+    info_miss: Vec<u8>,
     /// particles と同じ並びの観測尤度の対数重み（SIR の重み更新）。
     /// 相手手の制約適用ごとに log(整合クラスの事前質量 / 全合法手の事前質量) を
     /// 累積する。「観測と整合する手はあるが、それが相手として指しにくい手しか
@@ -102,6 +122,10 @@ pub struct Estimator {
     cursor: usize,
     /// 観測との矛盾（リプレイでも整合局面を作れない等）で信頼できなくなったら false
     healthy: bool,
+    /// 直近の replenish で測った ESS（診断用）
+    last_ess: f64,
+    /// systematic resampling の累計回数（診断用）
+    resamples: u64,
     rng: StdRng,
 }
 
@@ -127,7 +151,7 @@ impl Estimator {
         Estimator {
             my_color,
             particles: vec![Position::initial(); target],
-            penalties: vec![0; target],
+            info_miss: vec![0; target],
             logw: vec![0.0; target],
             target,
             regen_attempts: (REGEN_ATTEMPTS as f64 * scale) as usize,
@@ -140,6 +164,8 @@ impl Estimator {
             my_touched_sq: vec![],
             cursor: 0,
             healthy: true,
+            last_ess: target as f64,
+            resamples: 0,
             rng: StdRng::seed_from_u64(seed),
         }
     }
@@ -153,15 +179,25 @@ impl Estimator {
         self.my_color
     }
 
-    /// 現在の粒子集合。空なら推定は信頼できない（呼び出し側でフォールバック）。
-    /// replenish 後は penalty 昇順（厳密整合が先頭側）に並んでいる
+    /// 現在の粒子集合。空なら推定は信頼できない（呼び出し側でフォールバック）
     pub fn particles(&self) -> &[Position] {
         &self.particles
     }
 
-    /// particles() と同じ並びのソフト救済回数。評価側の重み付けに使う
-    pub fn penalties(&self) -> &[u8] {
-        &self.penalties
+    /// particles() と同じ並びのソフト救済回数。評価側の証拠数較正に使う
+    /// （尤度の減衰は logw 側に課金済みなので、重みには二重に掛けない）
+    pub fn info_miss(&self) -> &[u8] {
+        &self.info_miss
+    }
+
+    /// 直近の replenish で測った ESS（診断用）
+    pub fn last_ess(&self) -> f64 {
+        self.last_ess
+    }
+
+    /// systematic resampling の累計回数（診断用）
+    pub fn resamples(&self) -> u64 {
+        self.resamples
     }
 
     /// particles() と同じ並びの観測尤度の対数重み。粒子間の相対値だけに意味が
@@ -258,7 +294,7 @@ impl Estimator {
     fn apply_constraint(&mut self, constraint: &Constraint) {
         let my_color = self.my_color;
         let particles = std::mem::take(&mut self.particles);
-        let penalties = std::mem::take(&mut self.penalties);
+        let penalties = std::mem::take(&mut self.info_miss);
         let logws = std::mem::take(&mut self.logw);
         let mut surv_pos = Vec::with_capacity(particles.len());
         let mut surv_pen = Vec::with_capacity(particles.len());
@@ -320,18 +356,21 @@ impl Estimator {
                 strict_dls[strict_dls.len() / 2]
             });
             for (mut pos, pen, lw) in failed {
-                if pen >= PENALTY_CAP {
+                if pen >= INFO_MISS_CAP {
                     continue;
                 }
                 if let Some(dlw) = self.apply_soft(&mut pos, constraint) {
                     surv_pos.push(pos);
                     surv_pen.push(pen + 1);
-                    surv_logw.push(lw + strict_dlw_median.unwrap_or(dlw));
+                    // 観測を説明できなかった近似粒子の課金: 典型的な厳密生存者と
+                    // 同じ増分（中央値）に加えて、情報系ソフトの尤度 EPS_INFO を払う
+                    // （旧: 評価側の soft_decay^penalty。C-7 P1 で logw へ統合）
+                    surv_logw.push(lw + strict_dlw_median.unwrap_or(dlw) + EPS_INFO.ln());
                 }
             }
         }
         self.particles = surv_pos;
-        self.penalties = surv_pen;
+        self.info_miss = surv_pen;
         self.logw = surv_logw;
     }
 
@@ -367,7 +406,7 @@ impl Estimator {
         let regen_deadline = start + std::time::Duration::from_millis(self.regen_deadline_ms);
         // リプレイの目標は「厳密整合の粒子数」。ソフト粒子で頭数が足りていても
         // 厳密粒子が薄ければリプレイで置き換えにいく（ソフトはあくまで近似）
-        let mut strict = self.penalties.iter().filter(|&&p| p == 0).count();
+        let mut strict = self.info_miss.iter().filter(|&&p| p == 0).count();
         if strict < self.target {
             for _ in 0..self.regen_attempts {
                 if strict >= self.target || std::time::Instant::now() > regen_deadline {
@@ -375,7 +414,7 @@ impl Estimator {
                 }
                 if let Some((pos, lw)) = self.replay_once() {
                     self.particles.push(pos);
-                    self.penalties.push(0);
+                    self.info_miss.push(0);
                     self.logw.push(lw);
                     strict += 1;
                 }
@@ -385,7 +424,7 @@ impl Estimator {
         while self.particles.is_empty() && std::time::Instant::now() < deadline {
             if let Some((pos, lw)) = self.replay_once() {
                 self.particles.push(pos);
-                self.penalties.push(0);
+                self.info_miss.push(0);
                 self.logw.push(lw);
             }
         }
@@ -394,37 +433,96 @@ impl Estimator {
         if self.particles.is_empty() {
             return;
         }
-        // penalty 昇順に並べ、厳密整合の粒子を優先して target まで絞る
-        let mut triples: Vec<(u8, f64, Position)> = std::mem::take(&mut self.penalties)
-            .into_iter()
-            .zip(std::mem::take(&mut self.logw))
-            .zip(std::mem::take(&mut self.particles))
-            .map(|((pen, lw), pos)| (pen, lw, pos))
-            .collect();
-        triples.sort_by_key(|(p, _, _)| *p);
-        triples.truncate(self.target);
-        for (pen, lw, pos) in triples {
-            self.penalties.push(pen);
-            self.logw.push(lw);
-            self.particles.push(pos);
-        }
-        // 不足分は複製で埋める（低ペナルティ粒子を重み 0.5^penalty で優先。
-        // 観測尤度 logw では選ばない: 複製は logw を引き継ぐので、尤度で選ぶと
-        // 評価側の正規化と二重に効いてしまう）
-        let m = self.particles.len();
-        if m < self.target {
-            let mut cum = Vec::with_capacity(m);
-            let mut total = 0.0f64;
-            for &p in &self.penalties {
-                total += 0.5f64.powi(i32::from(p));
-                cum.push(total);
+        // 溢れの整理: info_miss 昇順（厳密優先）→ logw 降順で target まで絞る
+        if self.particles.len() > self.target {
+            let mut triples: Vec<(u8, f64, Position)> = std::mem::take(&mut self.info_miss)
+                .into_iter()
+                .zip(std::mem::take(&mut self.logw))
+                .zip(std::mem::take(&mut self.particles))
+                .map(|((pen, lw), pos)| (pen, lw, pos))
+                .collect();
+            triples.sort_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+            });
+            triples.truncate(self.target);
+            for (pen, lw, pos) in triples {
+                self.info_miss.push(pen);
+                self.logw.push(lw);
+                self.particles.push(pos);
             }
-            while self.particles.len() < self.target {
-                let t = self.rng.random_range(0.0..total);
-                let i = cum.partition_point(|&c| c < t).min(m - 1);
+        }
+        // ESS 監視（C-7 P1 / D2）: 重みが退化していたら systematic resampling で
+        // 質量を複製数へ実現し logw をリセットする。退化していないが頭数が
+        // 足りないときは質量保存の分割複製で埋める（logw の相対値 = 評価側の
+        // 重み付けを崩さずに、次の相手手サンプルで分岐する多様性の種を蒔く）
+        let m = self.particles.len();
+        let max_lw = self.logw.iter().copied().fold(f64::MIN, f64::max);
+        let ws: Vec<f64> = self.logw.iter().map(|&lw| (lw - max_lw).exp()).collect();
+        let total: f64 = ws.iter().sum();
+        let sum2: f64 = ws.iter().map(|w| w * w).sum();
+        self.last_ess = if sum2 > 0.0 { total * total / sum2 } else { 0.0 };
+        if self.last_ess < m as f64 * ESS_THRESHOLD {
+            self.systematic_resample(&ws, total);
+            self.resamples += 1;
+        } else if m < self.target {
+            self.split_fill(&ws, total);
+        }
+    }
+
+    /// systematic resampling: 正規化重み比例で target 個へ複製し logw を
+    /// リセットする（質量が複製数へ実現される）。低分散・O(n)。
+    /// info_miss は各コピーへ引き継ぐ（較正・上限管理はカウンタが担う）
+    fn systematic_resample(&mut self, ws: &[f64], total: f64) {
+        let m = self.particles.len();
+        let want = self.target;
+        let step = total / want as f64;
+        let mut u = self.rng.random_range(0.0..step);
+        let mut new_pos = Vec::with_capacity(want);
+        let mut new_miss = Vec::with_capacity(want);
+        let mut i = 0usize;
+        let mut cum = ws[0];
+        for _ in 0..want {
+            while cum < u && i + 1 < m {
+                i += 1;
+                cum += ws[i];
+            }
+            new_pos.push(self.particles[i].clone());
+            new_miss.push(self.info_miss[i]);
+            u += step;
+        }
+        self.particles = new_pos;
+        self.info_miss = new_miss;
+        self.logw = vec![0.0; want];
+    }
+
+    /// 質量保存の分割複製: 重み比例で複製先を選び、同一個体群（元+コピー）で
+    /// exp(logw) を等分する。指紋ごとの合計質量が変わらないため、評価側の
+    /// multiplicity 畳み込みと二重に効かない（旧複製埋めの後継）
+    fn split_fill(&mut self, ws: &[f64], total: f64) {
+        let m = self.particles.len();
+        let mut cum = Vec::with_capacity(m);
+        let mut acc = 0.0f64;
+        for &w in ws {
+            acc += w;
+            cum.push(acc);
+        }
+        let mut copies = vec![0usize; m];
+        for _ in m..self.target {
+            let t = self.rng.random_range(0.0..total);
+            let i = cum.partition_point(|&c| c < t).min(m - 1);
+            copies[i] += 1;
+        }
+        for (i, &c) in copies.iter().enumerate() {
+            if c == 0 {
+                continue;
+            }
+            let share = self.logw[i] - ((c + 1) as f64).ln();
+            self.logw[i] = share;
+            for _ in 0..c {
                 self.particles.push(self.particles[i].clone());
-                self.penalties.push(self.penalties[i]);
-                self.logw.push(self.logw[i]);
+                self.info_miss.push(self.info_miss[i]);
+                self.logw.push(share);
             }
         }
     }
@@ -982,7 +1080,8 @@ mod tests {
         });
         est.update(&log);
         est.particles.clear();
-        est.penalties.clear();
+        est.info_miss.clear();
+        est.logw.clear();
         est.replenish();
         assert!(est.healthy(), "バックトラック付きリプレイで再生成できるはず");
         for pos in est.particles() {
@@ -1004,7 +1103,8 @@ mod tests {
         est.update(&log);
         // 人工的に枯渇させる
         est.particles.clear();
-        est.penalties.clear();
+        est.info_miss.clear();
+        est.logw.clear();
         est.replenish();
         assert!(est.healthy(), "リプレイで再生成できるはず");
         assert_eq!(est.particles().len(), TARGET_PARTICLES);
@@ -1086,8 +1186,9 @@ mod tests {
         record_my_move(&mut log, "7g7f", None);
         record_opp_move(&mut log, None);
         est.update(&log);
-        assert!(est.penalties().iter().all(|&p| p == 0));
-        assert_eq!(est.particles().len(), est.penalties().len());
+        assert!(est.info_miss().iter().all(|&p| p == 0));
+        assert_eq!(est.particles().len(), est.info_miss().len());
+        assert_eq!(est.particles().len(), est.log_weights().len());
     }
 
     #[test]
@@ -1102,7 +1203,13 @@ mod tests {
         };
         est.apply_constraint(&c);
         assert_eq!(est.particles.len(), TARGET_PARTICLES);
-        assert!(est.penalties.iter().all(|&p| p == 1));
+        assert!(est.info_miss.iter().all(|&p| p == 1));
+        // 情報系ソフトの尤度 EPS_INFO が logw へ課金されている
+        // （厳密生存者ゼロなので中央値課金はなく ln(EPS_INFO) のみ）
+        assert!(
+            est.logw.iter().all(|&lw| (lw - EPS_INFO.ln()).abs() < 1e-9),
+            "ソフト救済の課金が logw に乗っていない"
+        );
         // 物理的な適用（着手そのもの）は行われている
         for pos in est.particles() {
             assert_eq!(
@@ -1129,8 +1236,8 @@ mod tests {
     #[test]
     fn penalty_cap_culls_repeated_violators() {
         let mut est = Estimator::with_seed(Color::Sente, 5);
-        for p in est.penalties.iter_mut() {
-            *p = PENALTY_CAP;
+        for p in est.info_miss.iter_mut() {
+            *p = INFO_MISS_CAP;
         }
         let c = Constraint::MyMove {
             mv: parse_usi("7g7f").unwrap(),
@@ -1139,5 +1246,112 @@ mod tests {
         };
         est.apply_constraint(&c);
         assert!(est.particles.is_empty(), "上限到達の粒子は救済されない");
+    }
+
+    /// 2種の局面を粒子に仕込むヘルパ（初期局面と 3c3d 後の局面は別指紋）
+    fn two_kind_particles(est: &mut Estimator, n_a: usize, n_b: usize) -> (Position, Position) {
+        let a = Position::initial();
+        let mut b = Position::initial();
+        b.play_unchecked(&parse_usi("7g7f").unwrap());
+        b.play_unchecked(&parse_usi("3c3d").unwrap());
+        est.particles.clear();
+        est.info_miss.clear();
+        est.logw.clear();
+        for _ in 0..n_a {
+            est.particles.push(a.clone());
+            est.info_miss.push(0);
+            est.logw.push(0.0);
+        }
+        for _ in 0..n_b {
+            est.particles.push(b.clone());
+            est.info_miss.push(0);
+            est.logw.push(0.0);
+        }
+        (a, b)
+    }
+
+    #[test]
+    fn ess_degeneracy_triggers_systematic_resample() {
+        // 重みが1粒子へ退化した集合: ESS ≈ 1 → リサンプリングが発動し、
+        // logw リセット・target への複製・質量は複製数へ実現される
+        let mut est = Estimator::with_seed(Color::Sente, 31);
+        let n = est.target;
+        let (a, b) = two_kind_particles(&mut est, 1, n - 1);
+        est.logw[0] = 0.0; // a 粒子が支配的
+        for lw in est.logw.iter_mut().skip(1) {
+            *lw = -20.0;
+        }
+        est.replenish();
+        assert_eq!(est.resamples(), 1, "ESS退化でリサンプリングされるはず");
+        assert_eq!(est.particles().len(), est.target());
+        assert!(est.logw.iter().all(|&lw| lw == 0.0), "リサンプリング後は logw=0");
+        let n_a = est
+            .particles()
+            .iter()
+            .filter(|p| p.fingerprint() == a.fingerprint())
+            .count();
+        let n_b = est
+            .particles()
+            .iter()
+            .filter(|p| p.fingerprint() == b.fingerprint())
+            .count();
+        assert!(
+            n_a > est.target() * 9 / 10,
+            "支配的粒子の質量が複製数に実現されていない: a={n_a} b={n_b}"
+        );
+    }
+
+    #[test]
+    fn split_fill_preserves_mass_per_fingerprint() {
+        // 退化していない不足（2個体、重み比 1 : e^-1）は分割複製で埋まり、
+        // 指紋ごとの合計質量 exp(logw) が保存される（multiplicity 畳み込みと
+        // 二重に効かないための不変条件）。replenish のリプレイ充填と切り離すため
+        // split_fill を直接呼ぶ
+        let mut est = Estimator::with_seed(Color::Sente, 37);
+        let (a, b) = two_kind_particles(&mut est, 1, 1);
+        est.logw[1] = -1.0;
+        let ws: Vec<f64> = est.logw.iter().map(|&lw| lw.exp()).collect();
+        let total: f64 = ws.iter().sum();
+        est.split_fill(&ws, total);
+        assert_eq!(est.particles.len(), est.target());
+        let mass_of = |est: &Estimator, fp: u64| -> f64 {
+            est.particles
+                .iter()
+                .zip(&est.logw)
+                .filter(|(p, _)| p.fingerprint() == fp)
+                .map(|(_, &lw)| lw.exp())
+                .sum()
+        };
+        let mass_a = mass_of(&est, a.fingerprint());
+        let mass_b = mass_of(&est, b.fingerprint());
+        assert!((mass_a - 1.0).abs() < 1e-9, "a の質量が保存されていない: {mass_a}");
+        assert!(
+            (mass_b - (-1.0f64).exp()).abs() < 1e-9,
+            "b の質量が保存されていない: {mass_b}"
+        );
+    }
+
+    #[test]
+    fn resample_keeps_info_miss_counter() {
+        // リサンプリングは logw をリセットするが info_miss は引き継ぐ
+        // （嘘の昇格防止。較正・上限管理はカウンタが担う）
+        let mut est = Estimator::with_seed(Color::Sente, 41);
+        let n = est.target;
+        two_kind_particles(&mut est, 1, n - 1);
+        est.info_miss[0] = 2;
+        est.logw[0] = 0.0;
+        for lw in est.logw.iter_mut().skip(1) {
+            *lw = -20.0;
+        }
+        let max_lw = est.logw.iter().copied().fold(f64::MIN, f64::max);
+        let ws: Vec<f64> = est.logw.iter().map(|&lw| (lw - max_lw).exp()).collect();
+        let total: f64 = ws.iter().sum();
+        est.systematic_resample(&ws, total);
+        assert_eq!(est.particles.len(), est.target());
+        assert!(est.logw.iter().all(|&lw| lw == 0.0));
+        assert!(
+            est.info_miss.iter().filter(|&&m| m == 2).count() > est.target() * 9 / 10,
+            "リサンプリングのコピーが info_miss を引き継いでいない"
+        );
     }
 }

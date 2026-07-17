@@ -14,7 +14,7 @@ use crate::board::{
     parse_usi_square, promotion_choice,
 };
 use crate::check::CheckSolver;
-use crate::estimator::{Estimator, opp_reply_weights};
+use crate::estimator::{EPS_INFO, Estimator, opp_reply_weights};
 use crate::likelihood::{FITTED_THETA, ParticleCtx, particle_features, particle_log_weight};
 use crate::opening::OpeningBook;
 use crate::observation::{Observation, ObservationLog};
@@ -432,7 +432,9 @@ pub struct EvalParams {
     /// 直前に動かした駒をまた動かす手の減点（雑なシャッフルの抑制。
     /// 駒得や王手が絡む手は期待値側が勝つので実質影響しない）
     pub shuffle_penalty: f64,
-    /// ソフト救済粒子の評価重み減衰（重み = soft_decay^penalty。厳密整合=1.0）
+    /// 【C-7 P1 で未使用化】ソフト救済粒子の評価重み減衰。フィルタ側の
+    /// EPS_INFO（estimator.rs）へ統合された。SPSAベクタのレイアウト互換のため
+    /// フィールドは残す（調整しても無効）
     pub soft_decay: f64,
     /// 王探しの情報利得: 粒子間で王手判定が割れる手への p(1-p) 加点
     pub king_probe_bonus: f64,
@@ -762,9 +764,10 @@ impl Strategy for EstimatorStrategy {
             return None;
         }
 
-        // 複製粒子を指紋で除いたユニーク粒子だけを評価に使う
-        // （複製は独立な証拠ではないので p(合法) を過信させる）。
-        // ソフト救済された粒子（penalty>0）は重み soft_decay^penalty で薄く数え、
+        // 同一指紋の粒子は質量を畳み込んでユニーク化して評価に使う
+        // （ESSリサンプリング後は複製数が事後質量。ただし p(合法) ブレンドの
+        // 実効 n はユニーク数で数える = 複製は独立な証拠ではない）。
+        // ソフト救済の減衰はフィルタが logw へ課金済み（EPS_INFO）。
         // 粒子尤度モデル（likelihood.rs）で真の局面に近い粒子を厚くする。
         // 相手玉の位置で層化して抽出する（stratified_sample 参照）。
         // 粒子が完全に枯渇していても、事前確率だけで安全側の評価が成り立つ
@@ -780,11 +783,10 @@ impl Strategy for EstimatorStrategy {
         };
         let sample = stratified_sample(
             est.particles(),
-            est.penalties(),
+            est.info_miss(),
             est.log_weights(),
             view.your_color,
             &particle_ctx,
-            self.params.soft_decay,
             budget.eval_particles,
             &mut self.rng,
         );
@@ -938,69 +940,87 @@ impl Strategy for EstimatorStrategy {
 /// - 出力は層をまたぐ**ラウンドロビン順**: 先頭 k 件しか見ない評価
 ///   （王周辺圧力・2手読み）でも玉位置の分布が近似される
 /// - 採らなかった質量は同層の採用粒子へ再配分（層合計の重みを保存）
-/// - 重み和は「旧方式＝penalty昇順の先頭 min(eval, unique) 件の重み和」へ正規化し、
-///   ソフト減衰による退化度・prior_weight の較正を変えない
+/// - **multiplicity 畳み込み**（C-7 P1）: ESS リサンプリング後は複製数そのものが
+///   事後質量なので、同一指紋の個体は捨てずに質量 Σexp(logw) を畳み込む
+///   （旧「最良個体で代表」だとリサンプリングの結果が評価時に消える —
+///   2026-07-17 codex レビュー最重要指摘）
+/// - 重み和は較正アンカー legacy_mass へ正規化する: info_miss 昇順の先頭
+///   min(eval, unique) 件の EPS_INFO^info_miss 和（= 旧方式の soft 重み和の後継。
+///   複製は独立な証拠ではないので、p(合法) ブレンドの実効 n はユニーク数で数える）
 /// - 粒子尤度モデル（likelihood.rs、アリーナ真実で教師あり学習）の exp(θ·φ) を
-///   **平均1へ正規化して**乗じる: 真の局面に近い粒子ほど評価に効く。
-///   相対的な再重み付けなので合計質量（較正）は変えない
-/// - 推定器の観測尤度の対数重み（Estimator::log_weights、SIR の重み更新）も
-///   同じ枠で乗じる: 観測を「相手が指しにくい手」でしか説明できない粒子
-///   （幻の角の飛び込み王手等）を粒子間で相対的に軽くする
+///   乗じる: 真の局面に近い粒子ほど評価に効く。相対的な再重み付けなので
+///   合計質量（較正）は変えない
+/// - 推定器の観測尤度の対数重み（Estimator::log_weights、SIR の重み更新）は
+///   個体質量の側で効く: 観測を「相手が指しにくい手」でしか説明できない粒子
+///   （幻の角の飛び込み王手等）を粒子間で相対的に軽くする。
+///   ソフト減衰はフィルタが logw へ課金済み（EPS_INFO）なのでここでは掛けない
 fn stratified_sample<'a>(
     particles: &'a [Position],
-    penalties: &[u8],
+    info_miss: &[u8],
     log_weights: &[f64],
     my_color: Color,
     ctx: &ParticleCtx,
-    soft_decay: f64,
     eval_particles: usize,
     rng: &mut StdRng,
 ) -> Vec<(&'a Position, f64)> {
     let opp = my_color.other();
-    // ユニーク化（penalty 昇順の並びを保つ）と尤度の対数重み。
-    // 較正の正規化先（legacy_mass）は**尤度適用前**のベース重み
-    // （旧方式 = penalty昇順の先頭 min(eval, unique) 件の soft 重み和）で計る。
-    // 尤度適用後の重みで計ると p(合法) ブレンドに使う実効質量 n が尤度分布に
-    // 引きずられて prior_weight の較正が崩れる（2026-07-16 レビュー指摘）
-    // 重複局面（同一指紋）は「最良の総合重み」の個体で代表させる。
-    // SIR 導入後は同一局面でも経路によって logw が異なるため、先着1個だと
-    // 高尤度の個体が並び順次第で捨てられる（2026-07-17 codex レビュー指摘）
+    // ユニーク化: 同一指紋の質量 logΣexp(logw) と最小 info_miss を畳み込む
+    struct Unique<'a> {
+        pos: &'a Position,
+        mass_log: f64,
+        min_miss: u8,
+        logl: f64,
+    }
     let mut seen: HashMap<u64, usize> = HashMap::new();
-    let mut uniques: Vec<(&Position, f64, f64)> = vec![];
-    for (i, (pos, pen)) in particles.iter().zip(penalties).enumerate() {
-        let w = soft_decay.powi(i32::from(*pen));
-        let logl = particle_log_weight(&particle_features(pos, my_color, ctx), &FITTED_THETA)
-            + log_weights.get(i).copied().unwrap_or(0.0);
+    let mut uniques: Vec<Unique> = vec![];
+    for (i, pos) in particles.iter().enumerate() {
+        let lw = log_weights.get(i).copied().unwrap_or(0.0);
+        let miss = info_miss.get(i).copied().unwrap_or(0);
         match seen.entry(pos.fingerprint()) {
             std::collections::hash_map::Entry::Vacant(e) => {
+                let logl =
+                    particle_log_weight(&particle_features(pos, my_color, ctx), &FITTED_THETA);
                 e.insert(uniques.len());
-                uniques.push((pos, w, logl));
+                uniques.push(Unique {
+                    pos,
+                    mass_log: lw,
+                    min_miss: miss,
+                    logl,
+                });
             }
             std::collections::hash_map::Entry::Occupied(e) => {
                 let u = &mut uniques[*e.get()];
-                if w.ln() + logl > u.1.ln() + u.2 {
-                    *u = (pos, w, logl);
-                }
+                u.mass_log = logaddexp(u.mass_log, lw);
+                u.min_miss = u.min_miss.min(miss);
             }
         }
     }
     if uniques.is_empty() {
         return vec![];
     }
-    let legacy_mass: f64 = uniques
+    // 較正アンカー: 旧方式（penalty昇順の先頭 min(eval, unique) 件の soft 重み和）の
+    // 後継。ソフト減衰の較正はフィルタと同じ EPS_INFO^info_miss で数える。
+    // **尤度・logw 適用前**のベース重みで計るのは従来どおり（p(合法) ブレンドの
+    // 実効質量 n が尤度分布に引きずられて prior_weight の較正が崩れるため —
+    // 2026-07-16 レビュー指摘）。ESS リサンプリングで複製が増えても n は
+    // ユニーク数でしか増えない = リサンプリングは確信を偽装しない
+    let mut miss_sorted: Vec<u8> = uniques.iter().map(|u| u.min_miss).collect();
+    miss_sorted.sort_unstable();
+    let legacy_mass: f64 = miss_sorted
         .iter()
         .take(eval_particles)
-        .map(|(_, w, _)| w)
+        .map(|&m| EPS_INFO.powi(i32::from(m)))
         .sum();
-    // 尤度を重みに乗じる（オーバーフロー対策で max を引く。全体スケールは
-    // 最後に legacy_mass へ正規化されるので相対値だけが意味を持つ）
+    // 分布重み: 個体質量 × 粒子尤度 = exp(mass_log + logl)（オーバーフロー対策で
+    // max を引く。全体スケールは最後に legacy_mass へ正規化されるので相対値だけが
+    // 意味を持つ）
     let max_logl = uniques
         .iter()
-        .map(|(_, _, l)| *l)
+        .map(|u| u.mass_log + u.logl)
         .fold(f64::MIN, f64::max);
     let uniques: Vec<(&Position, f64)> = uniques
         .into_iter()
-        .map(|(p, w, l)| (p, w * (l - max_logl).exp()))
+        .map(|u| (u.pos, (u.mass_log + u.logl - max_logl).exp()))
         .collect();
 
     // 玉位置で層化（質量降順）
@@ -1110,6 +1130,15 @@ fn stratified_sample<'a>(
     sample
 }
 
+/// log(exp(a) + exp(b))（オーバーフロー安全）
+fn logaddexp(a: f64, b: f64) -> f64 {
+    let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
+    if hi == f64::NEG_INFINITY {
+        return f64::NEG_INFINITY;
+    }
+    hi + (lo - hi).exp().ln_1p()
+}
+
 /// 記録用の推定サマリ: 粒子の健全性・ユニーク数・相手玉の位置分布（上位）。
 /// 事後分析で「推定が外れていたのか、評価が悪かったのか」を切り分けるために残す
 fn debug_summary(est: &Estimator, sample: &[(&Position, f64)], push: f64) -> serde_json::Value {
@@ -1144,7 +1173,9 @@ fn debug_summary(est: &Estimator, sample: &[(&Position, f64)], push: f64) -> ser
         "healthy": est.healthy(),
         "unique_particles": fingerprints.len(),
         "sample_slots": sample.len(),
-        "soft_particles": est.penalties().iter().filter(|&&p| p > 0).count(),
+        "soft_particles": est.info_miss().iter().filter(|&&p| p > 0).count(),
+        "ess": (est.last_ess() * 10.0).round() / 10.0,
+        "resamples": est.resamples(),
         "endgame_push": (push * 100.0).round() / 100.0,
         "opp_king_top": opp_king_top,
     })
@@ -2055,9 +2086,9 @@ pub(crate) mod tests {
                 particles.push(synth_position(kf, pr));
             }
         }
-        let penalties = vec![0u8; particles.len()];
+        let miss = vec![0u8; particles.len()];
         // 上限16 < 層数9×最低枠4=36: 件数は必ず16以下
-        let sample = stratified_sample(&particles, &penalties, &vec![0.0f64; particles.len()], Color::Sente, &ParticleCtx::default(), 0.5, 16, &mut rng);
+        let sample = stratified_sample(&particles, &miss, &vec![0.0f64; particles.len()], Color::Sente, &ParticleCtx::default(), 16, &mut rng);
         assert!(sample.len() <= 16, "len={}", sample.len());
         // ラウンドロビン順: 先頭9件で9層すべての玉位置が現れる
         let prefix_kings: HashSet<_> = sample
@@ -2067,27 +2098,61 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(prefix_kings.len(), 9, "prefixが層化されていない");
         // 上限が大きい場合も件数はユニーク数以下・重みは旧方式と一致
-        let sample = stratified_sample(&particles, &penalties, &vec![0.0f64; particles.len()], Color::Sente, &ParticleCtx::default(), 0.5, 512, &mut rng);
+        // （不変条件①: 全ユニーク・logw=0・ソフトなしなら重み和 = ユニーク数）
+        let sample = stratified_sample(&particles, &miss, &vec![0.0f64; particles.len()], Color::Sente, &ParticleCtx::default(), 512, &mut rng);
         assert_eq!(sample.len(), 54);
         let mass: f64 = sample.iter().map(|(_, w)| w).sum();
         assert!((mass - 54.0).abs() < 1e-6, "mass={mass}");
     }
 
     #[test]
+    fn multiplicity_survives_unique_folding() {
+        // 不変条件②（C-7 P1）: ESSリサンプリング後の複製数は事後質量。
+        // 同一指紋3個+別指紋1個（全て logw=0）→ 質量比はちょうど 3:1 になり、
+        // 合計は較正アンカー（ユニーク2件×1.0）へ正規化される
+        let a = synth_position(1, 2);
+        let b = synth_position(1, 4); // 同じ玉位置 = 同じ層、別指紋
+        let particles = vec![a.clone(), a.clone(), a.clone(), b.clone()];
+        let miss = vec![0u8; 4];
+        let logw = vec![0.0f64; 4];
+        let a_fp = a.fingerprint();
+        let trials = 200;
+        let mut a_share_sum = 0.0;
+        for seed in 0..trials {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let sample = stratified_sample(&particles, &miss, &logw, Color::Sente, &ParticleCtx::default(), 16, &mut rng);
+            let total: f64 = sample.iter().map(|(_, w)| w).sum();
+            assert!((total - 2.0).abs() < 1e-6, "較正: ユニーク2件で mass=2.0");
+            let a_mass: f64 = sample
+                .iter()
+                .filter(|(p, _)| p.fingerprint() == a_fp)
+                .map(|(_, w)| w)
+                .sum();
+            a_share_sum += a_mass / total;
+        }
+        let avg = a_share_sum / trials as f64;
+        assert!(
+            (avg - 0.75).abs() < 0.05,
+            "multiplicity が評価重みに反映されていない: a_share={avg}（期待 0.75）"
+        );
+    }
+
+    #[test]
     fn stratum_representative_is_weight_proportional() {
-        // 同一層に strict（w=1.0）と penalty=3（w=0.125, decay 0.5）の2粒子。
-        // quota=1 のとき層代表は重み比例（strict ≈ 89%）で選ばれるべき。
+        // 同一層に重み 1.0 と 0.125（logw = ln 0.125。フィルタが課金済みの想定）の
+        // 2粒子。quota=1 のとき層代表は重み比例（重い側 ≈ 89%）で選ばれるべき。
         // 一様シャッフルだと 50% になる（回帰: 2026-07-15 追加レビュー）
         let strict = synth_position(1, 2);
         let soft = synth_position(1, 3); // 同じ玉位置 = 同じ層、別指紋
         let particles = vec![strict.clone(), soft];
-        let penalties = vec![0u8, 3u8];
+        let miss = vec![0u8, 0u8];
+        let logw = vec![0.0f64, 0.125f64.ln()];
         let strict_fp = strict.fingerprint();
         let mut strict_hits = 0;
         let trials = 400;
         for seed in 0..trials {
             let mut rng = StdRng::seed_from_u64(seed);
-            let sample = stratified_sample(&particles, &penalties, &vec![0.0f64; particles.len()], Color::Sente, &ParticleCtx::default(), 0.5, 1, &mut rng);
+            let sample = stratified_sample(&particles, &miss, &logw, Color::Sente, &ParticleCtx::default(), 1, &mut rng);
             assert_eq!(sample.len(), 1);
             if sample[0].0.fingerprint() == strict_fp {
                 strict_hits += 1;
@@ -2104,8 +2169,8 @@ pub(crate) mod tests {
 
     #[test]
     fn resampling_does_not_double_apply_weights() {
-        // 同一層に [strict 1.0, strict 1.0, penalty3 0.125] の3粒子、quota=2。
-        // soft粒子の期待質量シェアは 0.125/2.125 ≒ 5.9%。
+        // 同一層に [1.0, 1.0, 0.125（logw課金済み）] の3粒子、quota=2。
+        // 軽い粒子の期待質量シェアは 0.125/2.125 ≒ 5.9%。
         // 「重み比例で選び、さらに元の重みも配る」二重適用だと ~1.8% に沈む
         // （2026-07-15 追加レビューの回帰テスト）
         let s1 = synth_position(1, 2);
@@ -2113,12 +2178,13 @@ pub(crate) mod tests {
         let soft = synth_position(1, 6); // 同じ玉位置 = 同じ層
         let soft_fp = soft.fingerprint();
         let particles = vec![s1, s2, soft];
-        let penalties = vec![0u8, 0u8, 3u8];
+        let miss = vec![0u8, 0u8, 0u8];
+        let logw = vec![0.0f64, 0.0, 0.125f64.ln()];
         let trials = 400;
         let mut share_sum = 0.0;
         for seed in 0..trials {
             let mut rng = StdRng::seed_from_u64(1000 + seed);
-            let sample = stratified_sample(&particles, &penalties, &vec![0.0f64; particles.len()], Color::Sente, &ParticleCtx::default(), 0.5, 2, &mut rng);
+            let sample = stratified_sample(&particles, &miss, &logw, Color::Sente, &ParticleCtx::default(), 2, &mut rng);
             let total: f64 = sample.iter().map(|(_, w)| w).sum();
             let soft_mass: f64 = sample
                 .iter()
@@ -2130,25 +2196,28 @@ pub(crate) mod tests {
         let avg = share_sum / trials as f64;
         assert!(
             avg > 0.03 && avg < 0.09,
-            "soft粒子の期待寄与が歪んでいる: avg={avg}（期待 ≒ 0.059）"
+            "軽い粒子の期待寄与が歪んでいる: avg={avg}（期待 ≒ 0.059）"
         );
     }
 
     #[test]
-    fn stratified_sample_keeps_soft_decay_calibration() {
+    fn stratified_sample_keeps_soft_evidence_calibration() {
         let mut rng = StdRng::seed_from_u64(2);
-        // 20ユニーク全てが penalty=1（soft）。旧方式の重み和 = min(16,20)×0.5 = 8
+        // 20ユニーク全てが info_miss=1（フィルタが logw へ ln(EPS_INFO) 課金済み）。
+        // 較正アンカー = min(16,20) × EPS_INFO（ソフトは証拠として EPS_INFO 人分）
         let particles: Vec<Position> =
             (2..=7).flat_map(|pr| (1..=4).map(move |kf| synth_position(kf, pr)))
                 .take(20)
                 .collect();
-        let penalties = vec![1u8; particles.len()];
-        let sample = stratified_sample(&particles, &penalties, &vec![0.0f64; particles.len()], Color::Sente, &ParticleCtx::default(), 0.5, 16, &mut rng);
+        let miss = vec![1u8; particles.len()];
+        let logw = vec![EPS_INFO.ln(); particles.len()];
+        let sample = stratified_sample(&particles, &miss, &logw, Color::Sente, &ParticleCtx::default(), 16, &mut rng);
         assert!(sample.len() <= 16);
         let mass: f64 = sample.iter().map(|(_, w)| w).sum();
+        let expected = 16.0 * EPS_INFO;
         assert!(
-            (mass - 8.0).abs() < 1e-6,
-            "ソフト減衰の較正が崩れている: mass={mass}（期待8.0）"
+            (mass - expected).abs() < 1e-6,
+            "ソフト証拠の較正が崩れている: mass={mass}（期待{expected}）"
         );
     }
 

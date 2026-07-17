@@ -11,7 +11,7 @@
 //! 使い方: cargo run --release --bin fit_particles -- <records/*.jsonl>
 //! 環境変数: FIT_MAX_POINTS_PER_GAME（既定20）: 1局から取る決定点の上限
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use tsuitate_bot::board::parse_usi_square;
@@ -26,7 +26,8 @@ use tsuitate_bot::shogi::{Position, parse_usi};
 struct Sample {
     /// 候補（粒子＋真の局面）の特徴量
     features: Vec<[f64; D]>,
-    /// 候補の固定対数オフセット（推論側のベース重み ln(soft_decay^penalty)。
+    /// 候補の固定対数オフセット（推論側のベース重み = 指紋ごとの
+    /// logΣexp(logw)（max正規化）。ソフト減衰 EPS_INFO も logw に課金済み。
     /// 推論の重みは base×exp(θ·φ) なので、学習側の softmax にも同じオフセットを
     /// 入れないと分布がずれる）
     offsets: Vec<f64>,
@@ -65,7 +66,6 @@ fn extract_samples(
 
     // 推論側と同じスケールの推定器で負例分布を合わせる
     let mut est = Estimator::with_seed_and_scale(bot, game_seed, inference_scale());
-    let soft_decay = tsuitate_bot::strategy::EvalParams::default().soft_decay;
     let mut log = ObservationLog::default();
     let mut samples = vec![];
     // 決定点の間引き: 固定周期（% stride）は初回を必ず落とし本数も過小になるので、
@@ -131,17 +131,28 @@ fn extract_samples(
         // ユニーク粒子（真実と同一指紋の粒子は truth 側に統合）。
         // 各候補には推論側のベース重み ln(soft_decay^penalty) をオフセットとして持たせる
         let truth_fp = truth.fingerprint();
+        // 推論側のベース重み: 指紋ごとの logΣexp(logw - max)（multiplicity 畳み込み。
+        // stratified_sample と同じ規約）
+        let max_lw = est
+            .log_weights()
+            .iter()
+            .copied()
+            .fold(f64::MIN, f64::max);
+        let mut mass: HashMap<u64, f64> = HashMap::new();
+        for (pos, &lw) in est.particles().iter().zip(est.log_weights()) {
+            *mass.entry(pos.fingerprint()).or_insert(0.0) += (lw - max_lw).exp();
+        }
         let mut seen = HashSet::new();
         seen.insert(truth_fp);
         let mut features = vec![particle_features(truth, bot, &ctx)];
-        let mut offsets = vec![0.0]; // 真実は完全整合 = penalty 0
-        for (pos, pen) in est.particles().iter().zip(est.penalties()) {
+        let mut offsets = vec![0.0]; // 真実は完全整合のベース重み1（= log 0.0）とみなす
+        for pos in est.particles() {
             if features.len() > 64 {
                 break;
             }
             if seen.insert(pos.fingerprint()) {
                 features.push(particle_features(pos, bot, &ctx));
-                offsets.push(f64::from(*pen) * soft_decay.ln());
+                offsets.push(mass[&pos.fingerprint()].ln());
             }
         }
         if features.len() >= 8 {
