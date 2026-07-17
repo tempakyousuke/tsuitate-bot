@@ -71,9 +71,6 @@ pub fn make_seeded(name: &str, seed: u64) -> Option<Box<dyn Strategy>> {
                 Some(seed),
             )))
         }
-        "estimator_v5" => Some(Box::new(
-            crate::frozen::estimator_v5::EstimatorV5::with_seed(seed),
-        )),
         "estimator_v6" => Some(Box::new(
             crate::frozen::estimator_v6::EstimatorV6::with_seed(seed),
         )),
@@ -98,10 +95,6 @@ pub fn make(name: &str) -> Option<Box<dyn Strategy>> {
                 Some(idx),
             )))
         }
-        "estimator_v2" => Some(Box::new(crate::frozen::estimator_v2::EstimatorV2::new())),
-        "estimator_v3" => Some(Box::new(crate::frozen::estimator_v3::EstimatorV3::new())),
-        "estimator_v4" => Some(Box::new(crate::frozen::estimator_v4::EstimatorV4::new())),
-        "estimator_v5" => Some(Box::new(crate::frozen::estimator_v5::EstimatorV5::new())),
         "estimator_v6" => Some(Box::new(crate::frozen::estimator_v6::EstimatorV6::new())),
         "estimator_v7" => Some(Box::new(crate::frozen::estimator_v7::EstimatorV7::new())),
         _ => None,
@@ -2329,9 +2322,9 @@ pub(crate) mod tests {
     #[test]
     fn make_knows_frozen_versions() {
         assert!(make("estimator").is_some());
-        assert!(make("estimator_v2").is_some());
-        assert!(make("estimator_v3").is_some());
-        assert!(make("estimator_v4").is_some());
-        assert!(make("estimator_v5").is_some());
+        assert!(make("estimator_v6").is_some());
+        assert!(make("estimator_v7").is_some());
+        // 破棄済みの凍結版は登録されていない
+        assert!(make("estimator_v5").is_none());
     }
 }

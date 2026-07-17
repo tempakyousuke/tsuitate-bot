@@ -15,7 +15,7 @@
   100局を既定とし、結果が信頼区間内で判定できない僅差のときだけ局数を増やす。
   **実行はローカルでなく GitHub Actions で行う**（`.github/workflows/arena.yml`、手動起動のみ）:
   対象ブランチを push して
-  `gh workflow run arena.yml --ref <ブランチ> -f games=100 -f candidate=estimator -f baselines="estimator_v2 estimator_v3 estimator_v4 estimator_v5"`。
+  `gh workflow run arena.yml --ref <ブランチ> -f games=100 -f candidate=estimator -f baselines="estimator_v6 estimator_v7"`。
   「基準 × シャード」の matrix に分割され（`-f shards=4` 既定。単一基準の
   200局も4ランナーに並列化される）、総合結果は **aggregate ジョブのサマリー**
   （および artifact `arena-combined`）に合算表で出る。シャード個別は
@@ -119,13 +119,7 @@
   駒交換の価値は `exchange_value` =（盤上価値+持ち駒価値）÷2（と金の反動は歩1枚ぶんに近い）。
   終盤は `endgame_push`（手数×素材リード）で攻め項を増幅して膠着を破る（劣勢時は掛けない）。
   粒子数・読み幅は `SearchBudget`（`TSUITATE_THINK_BUDGET_MS` 由来）に比例
-- `frozen/` — アリーナ比較の基準となる凍結版戦略（`estimator_v2` = 王手回避修正、
-  `estimator_v3` = リプレイ再生成の限定バックトラック（いずれも 2026-07-06 凍結）、
-  `estimator_v4` = 評価関数の改善: 取られリスクの情報非対称・攻撃圧力・王手の
-  反則数スケール・手戻り減点・評価粒子数192（2026-07-08 凍結）、
-  `estimator_v5` = 王手ソルバー・評価式のmin修正・相手手事前分布の対人最尤推定・
-  思考予算増額・駒探し項・定跡ブック（2026-07-10 凍結。200局×3で確定、
-  vs v4 70.5%±7.9%）、
+- `frozen/` — アリーナ比較の基準となる凍結版戦略（
   `estimator_v6` = ソフト粒子（reinvigoration）・2手読み（応手サンプル・gain再構築）・
   交換価値是正・利き被覆/と金/王探し項・アンチドロー・思考予算スケール・
   SPSA第2ラウンド収束点（2026-07-14 凍結。200局×4基準で確定、
@@ -135,7 +129,8 @@
   （2026-07-18 凍結。設計と経緯は docs/c7-continuous-filter.md。200局×5基準で確定、
   vs v6 64.2%±6.8% / v5 83.8% / v4 82.7% / v3 88.0% / v2 89.3%））。
   凍結後は編集しない。改善が確定したらその時点のコピーを `estimator_vN` として追加登録する。
-  明らかに弱くなった古い凍結版は破棄してよい（v1 は王手放置癖が強すぎたため破棄済み）
+  明らかに弱くなった古い凍結版は破棄してよい（v1 は王手放置癖、v2〜v5 は v7 凍結時に
+  全て80%超で上回ったため 2026-07-18 破棄。成績は git 履歴と tuning/README.md に残る）
 - `client.rs` — 接続と対局ループ。反則リトライ（同じ手を繰り返さない）、
   `pending_move_number` による二重着手ガード、再接続時の `game:sync` 復帰、終局後の自動再キュー。
   常駐運用対応: 受付時間外の `queue:join` 拒否と `queue:closed` は `TSUITATE_QUEUE_RETRY_MS`
@@ -180,7 +175,7 @@
   （observation.rs にない情報を使わない、という公平性の担保はこの構造で守る）
 - 同一戦略同士は約50%になる（1000局で確認済み）。参考値: estimator vs heuristic は
   200局で勝率86.5%±4.7%、平均反則 2.2 vs 9.0（2026-07 時点）
-- **比較の基準は heuristic ではなく凍結版**（`estimator_v2` 等）。heuristic への勝率は
+- **比較の基準は heuristic ではなく凍結版**（`estimator_v6` 等）。heuristic への勝率は
   飽和していて改善の検出力がない。また非推移性（v2 に勝つが v1 に負ける）を検出するため、
   ガントレットで**全凍結版**に勝ち越すことを合格条件とする
 - フィッシャー時計 1000秒+3秒 をシミュレートし時間切れは負け（本番サイトは300秒+3秒。

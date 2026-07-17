@@ -11,9 +11,5 @@
 //! - ルールエンジン（shogi.rs / board.rs）と観測（observation.rs）は共有する
 //!   （ルールのバグ修正は全バージョンに反映されるべきなので）
 
-pub mod estimator_v2;
-pub mod estimator_v3;
-pub mod estimator_v4;
-pub mod estimator_v5;
 pub mod estimator_v6;
 pub mod estimator_v7;

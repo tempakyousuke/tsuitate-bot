@@ -13,7 +13,7 @@
 //! 注意: 推定器の時間打ち切り（壁時計）は決定論化できないため完全一致はしない。
 //!
 //! 使い方:
-//!   cargo run --release --bin tune -- [反復数=40] [評価あたり対局数=60] [基準...=estimator_v5]
+//!   cargo run --release --bin tune -- [反復数=40] [評価あたり対局数=60] [基準...=estimator_v7]
 //!
 //! - 進捗と各反復のパラメータは TUNE_LOG（既定 tune-log.jsonl）に追記する
 //! - **再開**: ログが存在すれば最後の反復のθから自動で続きを実行する。
@@ -376,7 +376,7 @@ fn main() {
     let baselines: Vec<String> = if args.len() > 3 {
         args[3..].to_vec()
     } else {
-        vec!["estimator_v5".into()]
+        vec!["estimator_v7".into()]
     };
     for name in &baselines {
         if strategy::make(name).is_none() {
