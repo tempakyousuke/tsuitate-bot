@@ -13,6 +13,14 @@
 //!
 //! 粒子が枯渇したら、制約列を最初からリプレイして再生成する（回数上限つき）。
 //!
+//! 観測尤度の重み（SIR の重み更新）:
+//! 相手手のサンプルは観測と整合するクラスへ絞ってから事前分布で正規化するため、
+//! そのままでは「観測を相手が指しにくい手でしか説明できない粒子」も確率1で
+//! 生き残ってしまう（例: 桂がいない粒子では角の飛び込み王手が強制される）。
+//! そこで制約適用のたびに r = 整合クラスの事前質量 / 全合法手の事前質量 を
+//! 対数重み logw へ累積し、評価側（strategy.rs の stratified_sample）が
+//! 粒子間で正規化して乗じる。リプレイ生成粒子も全制約ぶん累積するので比較可能。
+//!
 //! ソフト粒子（POMCP の particle reinvigoration の変種）:
 //! 厳密整合の生存粒子が SOFT_MIN を下回ったときは、棄却された粒子を
 //! 「情報系の制約だけを緩和した」判定で救済し、penalty を加算して残す。
@@ -66,6 +74,13 @@ pub struct Estimator {
     particles: Vec<Position>,
     /// particles と同じ並びのソフト救済回数（0 = 全制約と厳密整合）
     penalties: Vec<u8>,
+    /// particles と同じ並びの観測尤度の対数重み（SIR の重み更新）。
+    /// 相手手の制約適用ごとに log(整合クラスの事前質量 / 全合法手の事前質量) を
+    /// 累積する。「観測と整合する手はあるが、それが相手として指しにくい手しか
+    /// ない粒子」（例: 幻の角の飛び込み王手でしか王手を説明できない粒子）を
+    /// 粒子間で相対的に軽くする。リプレイ生成粒子も全制約ぶん累積するので
+    /// 生存粒子と比較可能。絶対値に意味はなく、評価側が max を引いて正規化する
+    logw: Vec<f64>,
     /// 思考予算に応じた粒子の目標数（スケール1.0で TARGET_PARTICLES）
     target: usize,
     /// リプレイ試行回数の上限（スケール比例）
@@ -113,6 +128,7 @@ impl Estimator {
             my_color,
             particles: vec![Position::initial(); target],
             penalties: vec![0; target],
+            logw: vec![0.0; target],
             target,
             regen_attempts: (REGEN_ATTEMPTS as f64 * scale) as usize,
             regen_deadline_ms: (500.0 * scale) as u64,
@@ -146,6 +162,12 @@ impl Estimator {
     /// particles() と同じ並びのソフト救済回数。評価側の重み付けに使う
     pub fn penalties(&self) -> &[u8] {
         &self.penalties
+    }
+
+    /// particles() と同じ並びの観測尤度の対数重み。粒子間の相対値だけに意味が
+    /// ある（評価側で max を引いて exp し正規化する）。複製粒子は同じ値を持つ
+    pub fn log_weights(&self) -> &[f64] {
+        &self.logw
     }
 
     pub fn healthy(&self) -> bool {
@@ -237,20 +259,29 @@ impl Estimator {
         let my_color = self.my_color;
         let particles = std::mem::take(&mut self.particles);
         let penalties = std::mem::take(&mut self.penalties);
+        let logws = std::mem::take(&mut self.logw);
         let mut surv_pos = Vec::with_capacity(particles.len());
         let mut surv_pen = Vec::with_capacity(particles.len());
+        let mut surv_logw = Vec::with_capacity(particles.len());
         // 棄却された粒子は適用前の局面を保持しておく（ソフト救済のやり直し用。
         // apply_my_move / sample_opp_move は失敗時も局面を汚しうる）
-        let mut failed: Vec<(Position, u8)> = vec![];
-        for (mut pos, pen) in particles.into_iter().zip(penalties) {
+        let mut failed: Vec<(Position, u8, f64)> = vec![];
+        // 厳密生存者が今回の制約で得た対数重み増分（ソフト救済の課金基準に使う）
+        let mut strict_dls: Vec<f64> = vec![];
+        for ((mut pos, pen), lw) in particles.into_iter().zip(penalties).zip(logws) {
             let backup = pos.clone();
+            // 自分の手・反則は決定的（尤度 0/1）なので重みは変えない。
+            // 相手手は観測クラスの尤度 r を対数重みへ累積する
             let ok = match constraint {
                 Constraint::MyMove {
                     mv,
                     captured,
                     gives_check,
-                } => apply_my_move(&mut pos, my_color, mv, *captured, Some(*gives_check)),
-                Constraint::MyFoul { mv } => foul_consistent(&pos, my_color, mv),
+                } => apply_my_move(&mut pos, my_color, mv, *captured, Some(*gives_check))
+                    .then_some(0.0),
+                Constraint::MyFoul { mv } => {
+                    foul_consistent(&pos, my_color, mv).then_some(0.0)
+                }
                 Constraint::OppMove {
                     captured_at,
                     gives_check,
@@ -262,43 +293,59 @@ impl Estimator {
                     &self.my_capture_sq,
                     &self.my_touched_sq,
                     &mut self.rng,
-                ),
+                )
+                .map(f64::ln),
             };
-            if ok {
+            if let Some(dlw) = ok {
                 surv_pos.push(pos);
                 surv_pen.push(pen);
+                surv_logw.push(lw + dlw);
+                strict_dls.push(dlw);
             } else {
-                failed.push((backup, pen));
+                failed.push((backup, pen, lw));
             }
         }
         // ソフト救済: 厳密整合の生存が少ないときだけ、情報系の制約を緩和して
         // 棄却粒子を penalty+1 で生かす（枯渇からの回復を初期局面リプレイに
         // 頼らない = POMCP の particle reinvigoration に相当）
         if surv_pos.len() < self.target / 4 {
-            for (mut pos, pen) in failed {
+            // ソフト粒子の観測尤度: 本当は P(観測|粒子)=0 だが近似として生かす
+            // ので、「典型的な厳密生存者と同じ増分」（中央値）を課す。緩和クラスの
+            // r（≈1）をそのまま使うと、観測を説明できない粒子のほうが正直に
+            // 小さい r を払った厳密粒子より重くなってしまう。厳密生存者がいない
+            // ときだけ緩和クラスの r で代用する（全員ソフトなら相対値として無害で、
+            // 後からリプレイされる厳密粒子は正直な累積 r を持つので比較もできる）
+            let strict_dlw_median = (!strict_dls.is_empty()).then(|| {
+                strict_dls.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                strict_dls[strict_dls.len() / 2]
+            });
+            for (mut pos, pen, lw) in failed {
                 if pen >= PENALTY_CAP {
                     continue;
                 }
-                if self.apply_soft(&mut pos, constraint) {
+                if let Some(dlw) = self.apply_soft(&mut pos, constraint) {
                     surv_pos.push(pos);
                     surv_pen.push(pen + 1);
+                    surv_logw.push(lw + strict_dlw_median.unwrap_or(dlw));
                 }
             }
         }
         self.particles = surv_pos;
         self.penalties = surv_pen;
+        self.logw = surv_logw;
     }
 
     /// 情報系の制約（王手宣言の一致・自分の反則の説明）だけを緩和した適用。
-    /// 物理的な制約（自手の合法性・取った駒種・取られたマス）は緩和しない
-    fn apply_soft(&mut self, pos: &mut Position, constraint: &Constraint) -> bool {
+    /// 物理的な制約（自手の合法性・取った駒種・取られたマス）は緩和しない。
+    /// 成功時は対数重みの増分（緩和クラスでの観測尤度）を返す
+    fn apply_soft(&mut self, pos: &mut Position, constraint: &Constraint) -> Option<f64> {
         match constraint {
             Constraint::MyMove { mv, captured, .. } => {
-                apply_my_move(pos, self.my_color, mv, *captured, None)
+                apply_my_move(pos, self.my_color, mv, *captured, None).then_some(0.0)
             }
             // 粒子上では合法だった手が実際は反則だった: この粒子は反則を
             // 説明できないが、盤面自体は生かす（反則手は実行されていない）
-            Constraint::MyFoul { .. } => true,
+            Constraint::MyFoul { .. } => Some(0.0),
             Constraint::OppMove { captured_at, .. } => sample_opp_move(
                 pos,
                 self.my_color,
@@ -307,7 +354,8 @@ impl Estimator {
                 &self.my_capture_sq,
                 &self.my_touched_sq,
                 &mut self.rng,
-            ),
+            )
+            .map(f64::ln),
         }
     }
 
@@ -325,18 +373,20 @@ impl Estimator {
                 if strict >= self.target || std::time::Instant::now() > regen_deadline {
                     break;
                 }
-                if let Some(pos) = self.replay_once() {
+                if let Some((pos, lw)) = self.replay_once() {
                     self.particles.push(pos);
                     self.penalties.push(0);
+                    self.logw.push(lw);
                     strict += 1;
                 }
             }
         }
         let deadline = start + std::time::Duration::from_millis(self.empty_deadline_ms);
         while self.particles.is_empty() && std::time::Instant::now() < deadline {
-            if let Some(pos) = self.replay_once() {
+            if let Some((pos, lw)) = self.replay_once() {
                 self.particles.push(pos);
                 self.penalties.push(0);
+                self.logw.push(lw);
             }
         }
         // ラッチしない: 粒子が戻れば健全に戻る（呼び出し側は毎手 update する）
@@ -345,17 +395,22 @@ impl Estimator {
             return;
         }
         // penalty 昇順に並べ、厳密整合の粒子を優先して target まで絞る
-        let mut pairs: Vec<(u8, Position)> = std::mem::take(&mut self.penalties)
+        let mut triples: Vec<(u8, f64, Position)> = std::mem::take(&mut self.penalties)
             .into_iter()
+            .zip(std::mem::take(&mut self.logw))
             .zip(std::mem::take(&mut self.particles))
+            .map(|((pen, lw), pos)| (pen, lw, pos))
             .collect();
-        pairs.sort_by_key(|(p, _)| *p);
-        pairs.truncate(self.target);
-        for (pen, pos) in pairs {
+        triples.sort_by_key(|(p, _, _)| *p);
+        triples.truncate(self.target);
+        for (pen, lw, pos) in triples {
             self.penalties.push(pen);
+            self.logw.push(lw);
             self.particles.push(pos);
         }
-        // 不足分は複製で埋める（低ペナルティ粒子を重み 0.5^penalty で優先）
+        // 不足分は複製で埋める（低ペナルティ粒子を重み 0.5^penalty で優先。
+        // 観測尤度 logw では選ばない: 複製は logw を引き継ぐので、尤度で選ぶと
+        // 評価側の正規化と二重に効いてしまう）
         let m = self.particles.len();
         if m < self.target {
             let mut cum = Vec::with_capacity(m);
@@ -369,6 +424,7 @@ impl Estimator {
                 let i = cum.partition_point(|&c| c < t).min(m - 1);
                 self.particles.push(self.particles[i].clone());
                 self.penalties.push(self.penalties[i]);
+                self.logw.push(self.logw[i]);
             }
         }
     }
@@ -379,13 +435,14 @@ impl Estimator {
     /// 取られたマス・王手宣言）と矛盾して失敗しうる。全部やり直すと手数に対して
     /// 成功率が指数的に落ちるため、失敗したら直近の決定点（相手手）まで戻って
     /// 引き直す限定バックトラックにする。ステップ予算で最悪時間を抑える
-    fn replay_once(&mut self) -> Option<Position> {
+    fn replay_once(&mut self) -> Option<(Position, f64)> {
         let n = self.constraints.len();
         let step_budget = n * 4 + 32;
         let mut steps = 0usize;
         let mut pos = Position::initial();
-        // 決定点スタック: (制約index, 適用前の局面, これまでの再試行回数)
-        let mut stack: Vec<(usize, Position, u32)> = vec![];
+        let mut lw = 0.0f64;
+        // 決定点スタック: (制約index, 適用前の局面, 適用前の対数重み, 再試行回数)
+        let mut stack: Vec<(usize, Position, f64, u32)> = vec![];
         let mut i = 0;
         while i < n {
             steps += 1;
@@ -404,14 +461,14 @@ impl Estimator {
                     gives_check,
                 } => {
                     // バックトラックで戻ってきた再訪なら積み直さない
-                    let is_retry = stack.last().is_some_and(|(j, _, _)| *j == i);
+                    let is_retry = stack.last().is_some_and(|(j, _, _, _)| *j == i);
                     if !is_retry {
-                        stack.push((i, pos.clone(), 0));
+                        stack.push((i, pos.clone(), lw, 0));
                     }
                     // この時点までに自分が駒を取ったマス／触れたマス
                     let k = self.my_capture_idx.partition_point(|&j| j < i);
                     let t = self.my_touched_idx.partition_point(|&j| j < i);
-                    sample_opp_move(
+                    match sample_opp_move(
                         &mut pos,
                         self.my_color,
                         *captured_at,
@@ -419,7 +476,13 @@ impl Estimator {
                         &self.my_capture_sq[..k],
                         &self.my_touched_sq[..t],
                         &mut self.rng,
-                    )
+                    ) {
+                        Some(r) => {
+                            lw += r.ln();
+                            true
+                        }
+                        None => false,
+                    }
                 }
             };
             if ok {
@@ -428,7 +491,7 @@ impl Estimator {
             }
             // 失敗: 直近の決定点に戻って引き直す。試行を使い切った点はさらに前へ
             loop {
-                let Some((j, snapshot, attempts)) = stack.pop() else {
+                let Some((j, snapshot, snapshot_lw, attempts)) = stack.pop() else {
                     return None;
                 };
                 // 失敗した制約自身が決定点なら、同じ局面からの再試行は無意味
@@ -438,13 +501,14 @@ impl Estimator {
                 }
                 if attempts + 1 < BACKTRACK_ATTEMPTS {
                     pos = snapshot.clone();
-                    stack.push((j, snapshot, attempts + 1));
+                    lw = snapshot_lw;
+                    stack.push((j, snapshot, snapshot_lw, attempts + 1));
                     i = j;
                     break;
                 }
             }
         }
-        Some(pos)
+        Some((pos, lw))
     }
 }
 
@@ -490,7 +554,9 @@ fn newly_threatens(pos: &Position, next: &Position, mv: &ShogiMove, targets: &[C
     })
 }
 
-/// 観測と整合する相手の合法手をサンプルして適用する。整合手がなければ false。
+/// 観測と整合する相手の合法手をサンプルして適用する。整合手がなければ None。
+/// 成功時は観測尤度 r = 整合クラスの事前質量 / 全合法手の事前質量（0<r≤1）を
+/// 返す（SIR の重み更新。呼び出し側が対数で累積する）。
 /// - gives_check: None なら王手宣言との一致を検査しない（ソフト救済用）
 /// - known_squares: 自分が駒を取ったマス（相手は自駒がそこで死んだことを知っている）
 /// - my_touched: 自分の手が触れたマス（初期配置のまま動いていない自駒の判定用。
@@ -503,10 +569,10 @@ fn sample_opp_move(
     known_squares: &[Coord],
     my_touched: &[Coord],
     rng: &mut StdRng,
-) -> bool {
+) -> Option<f64> {
     let opp = my_color.other();
     if pos.turn() != opp {
-        return false;
+        return None;
     }
     // 初期配置から動いていない自駒のマス（粒子内の実配置と突き合わせる）
     let initial = Position::initial();
@@ -523,6 +589,7 @@ fn sample_opp_move(
         .collect();
 
     let mut candidates: Vec<(ShogiMove, f64)> = vec![];
+    let mut total_mass = 0.0f64;
     for mv in pos.legal_moves() {
         // 取られたマスとの整合（取りがなかったなら自駒のあるマスへは来ていない）
         let to_capture = match mv {
@@ -532,16 +599,14 @@ fn sample_opp_move(
                 .map(|p| (to, p.role)),
             ShogiMove::Drop { .. } => None,
         };
-        match (captured_at, to_capture) {
-            (Some(at), Some((to, _))) if at == to => {}
-            (None, None) => {}
-            _ => continue,
-        }
+        let capture_ok = match (captured_at, to_capture) {
+            (Some(at), Some((to, _))) => at == to,
+            (None, None) => true,
+            _ => false,
+        };
         let mut next = pos.clone();
         next.play_unchecked(&mv);
-        if gives_check.is_some_and(|gc| next.in_check(my_color) != gc) {
-            continue;
-        }
+        let check_ok = gives_check.is_none_or(|gc| next.in_check(my_color) == gc);
         let threat_known = newly_threatens(pos, &next, &mv, known_squares);
         let threat_home = newly_threatens(pos, &next, &mv, &homes);
         let (is_king, flee) = match mv {
@@ -551,16 +616,26 @@ fn sample_opp_move(
             }
             ShogiMove::Drop { .. } => (false, false),
         };
-        candidates.push((
-            mv,
-            opp_move_weight(opp, &mv, threat_known, threat_home, is_king, flee),
-        ));
+        let w = opp_move_weight(
+            opp,
+            &mv,
+            threat_known,
+            threat_home,
+            is_king,
+            flee,
+            moved_is_minor(pos, &mv),
+            deep_unsupported(&next, &mv, opp),
+        );
+        total_mass += w;
+        if capture_ok && check_ok {
+            candidates.push((mv, w));
+        }
     }
-    let Some(chosen) = weighted_choice(&candidates, rng) else {
-        return false;
-    };
+    let chosen = weighted_choice(&candidates, rng)?;
+    let class_mass: f64 = candidates.iter().map(|(_, w)| w).sum();
     pos.play_unchecked(&chosen);
-    true
+    // weighted_choice が成功した時点で class_mass > 0、total_mass ≥ class_mass
+    Some((class_mass / total_mass).min(1.0))
 }
 
 /// 露見マス（自分が駒を取った=相手に通知されたマス）での取り返しブースト。
@@ -622,7 +697,16 @@ pub fn opp_reply_weights(
             }
             ShogiMove::Drop { .. } => (false, false),
         };
-        let mut w = opp_move_weight(opp, &mv, threat_known, threat_home, is_king, flee);
+        let mut w = opp_move_weight(
+            opp,
+            &mv,
+            threat_known,
+            threat_home,
+            is_king,
+            flee,
+            moved_is_minor(pos, &mv),
+            deep_unsupported(&next, &mv, opp),
+        );
         if let ShogiMove::Board { to, .. } = mv {
             let captures_mine = pos.piece_at(to).is_some_and(|p| p.color == my_color);
             if captures_mine && known_squares.contains(&to) {
@@ -632,6 +716,33 @@ pub fn opp_reply_weights(
         candidates.push((mv, w));
     }
     candidates
+}
+
+/// 動かす駒種（移動前の役）が歩・香・桂の小駒か。
+/// **定義は bin/fit_opp の moved_is_minor と一致させること**
+fn moved_is_minor(pos: &Position, mv: &ShogiMove) -> bool {
+    let role = match *mv {
+        ShogiMove::Board { from, .. } => pos.piece_at(from).map(|p| p.role),
+        ShogiMove::Drop { role, .. } => Some(role),
+    };
+    matches!(role, Some(Role::Pawn | Role::Lance | Role::Knight))
+}
+
+/// 敵陣（成れる3段）への紐なし着地か。着地点に自分の別の駒の利きが無い。
+/// 見えない敵陣は守備駒が濃く、大駒の紐なし深入りは事実上の駒捨てなので
+/// 人間はほとんど指さない（馬@62 のような幻の深部王手の過大評価を抑える）。
+/// **定義は bin/fit_opp の deep_unsupported と一致させること**
+fn deep_unsupported(next: &Position, mv: &ShogiMove, mover: Color) -> bool {
+    let to = match *mv {
+        ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+    };
+    let deep = match mover {
+        Color::Sente => to.rank <= 3,
+        Color::Gote => to.rank >= 7,
+    };
+    deep && !next
+        .pieces()
+        .any(|(sq, p)| p.color == mover && sq != to && next.attacks(sq, to))
 }
 
 /// チェビシェフ距離（玉の歩数）
@@ -649,11 +760,13 @@ fn flees_danger(from: Coord, to: Coord, danger: &[Coord]) -> bool {
     }
 }
 
-/// 相手の手の尤度づけ。対人57局の条件付き最尤推定（bin/fit_opp, 2026-07-10、
-/// 駒単位threat定義）: パープレキシティ 28.2（旧手調整）→ 25.3。
+/// 相手の手の尤度づけ。対人59局の条件付き最尤推定（bin/fit_opp, 2026-07-17、
+/// 成り・敵陣深入りの駒種分割）: パープレキシティ 28.2（旧手調整）→ 24.8。
 /// 駒取り・王手の有無は観測との整合ですでに絞り込まれているため、
 /// 事前分布には「観測クラス内で判別できる特徴量」だけが現れる。
-/// king_flee がわずかに負なのは実測（守りを剥がされても玉は特に逃げない）
+/// king_flee がわずかに負なのは実測（守りを剥がされても玉は特に逃げない）。
+/// 成りと敵陣への紐なし着地は小駒（歩香桂）と銀以上で分割: 垂れ歩・と金作りは
+/// 好んで指されるが、大駒のブラインド成り込みは実質駒捨てで滅多に指されない
 fn opp_move_weight(
     opp: Color,
     mv: &ShogiMove,
@@ -661,6 +774,8 @@ fn opp_move_weight(
     threat_home: bool,
     is_king_move: bool,
     king_flee: bool,
+    moved_minor: bool,
+    deep_unsup: bool,
 ) -> f64 {
     let mut s = 0.0;
     match *mv {
@@ -669,24 +784,27 @@ fn opp_move_weight(
                 Color::Sente => (from.rank - to.rank) as f64,
                 Color::Gote => (to.rank - from.rank) as f64,
             };
-            s += 0.139 * advance;
+            s += 0.156 * advance;
             if promote {
-                s += 1.422;
+                s += if moved_minor { 1.697 } else { 0.666 };
             }
         }
-        ShogiMove::Drop { .. } => s += -1.437,
+        ShogiMove::Drop { .. } => s += -1.472,
     }
     if threat_known {
-        s += 0.507;
+        s += 0.539;
     }
     if threat_home {
-        s += 0.574;
+        s += 0.609;
     }
     if is_king_move {
-        s += 0.136;
+        s += 0.130;
     }
     if king_flee {
-        s += -0.159;
+        s += -0.166;
+    }
+    if deep_unsup {
+        s += if moved_minor { 0.559 } else { -0.297 };
     }
     s.exp()
 }

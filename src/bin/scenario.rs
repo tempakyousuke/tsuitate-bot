@@ -367,10 +367,13 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
         })
         .collect();
 
-    let mut checker_tally: HashMap<String, u32> = HashMap::new();
-    let mut opp_king_tally: HashMap<String, u32> = HashMap::new();
-    // マスごとの相手利き枚数（0,1,2,3+）の度数
-    let mut cover_tally: Vec<[u32; 4]> = vec![[0; 4]; diag_sqs.len()];
+    // 集計は評価側と同じ重み（0.5^penalty × 推定器ごとに正規化した exp(logw)）で行う
+    let mut checker_tally: HashMap<String, f64> = HashMap::new();
+    let mut checker_mass = 0.0f64;
+    let mut opp_king_tally: HashMap<String, f64> = HashMap::new();
+    // マスごとの相手利き枚数（0,1,2,3+）の重み質量
+    let mut cover_tally: Vec<[f64; 4]> = vec![[0.0; 4]; diag_sqs.len()];
+    let mut strict_mass = 0.0f64;
     let mut total_unique = 0u32;
     let mut strict_unique = 0u32;
     for seed in 0..n_estimators {
@@ -400,12 +403,24 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
                 est.healthy()
             );
         }
+        // 推定器内の logw を max で正規化（評価側 stratified_sample と同じ規約）
+        let max_logw = est
+            .log_weights()
+            .iter()
+            .copied()
+            .fold(f64::MIN, f64::max);
         let mut seen: HashSet<u64> = HashSet::new();
-        for (pp, &penalty) in est.particles().iter().zip(est.penalties()) {
+        for ((pp, &penalty), &lw) in est
+            .particles()
+            .iter()
+            .zip(est.penalties())
+            .zip(est.log_weights())
+        {
             if !seen.insert(pp.fingerprint()) {
                 continue;
             }
             total_unique += 1;
+            let w = 0.5f64.powi(i32::from(penalty)) * (lw - max_logw).exp();
             if rep.pos.in_check(side) {
                 let checkers: Vec<String> = pp
                     .pieces()
@@ -417,14 +432,16 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
                 } else {
                     checkers.join("+")
                 };
-                *checker_tally.entry(key).or_insert(0) += 1;
+                *checker_tally.entry(key).or_insert(0.0) += w;
+                checker_mass += w;
             }
             if penalty > 0 {
                 continue;
             }
             strict_unique += 1;
+            strict_mass += w;
             if let Some(sq) = pp.king_square(side.other()) {
-                *opp_king_tally.entry(make_usi_square(sq)).or_insert(0) += 1;
+                *opp_king_tally.entry(make_usi_square(sq)).or_insert(0.0) += w;
             }
             for (i, (_, sq)) in diag_sqs.iter().enumerate() {
                 let n = pp
@@ -435,13 +452,14 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
                             && pp.attacks(*from, *sq)
                     })
                     .count();
-                cover_tally[i][n.min(3)] += 1;
+                cover_tally[i][n.min(3)] += w;
             }
         }
     }
 
     println!(
-        "粒子診断: 推定器 {n_estimators} 個ぶんのユニーク粒子 {total_unique} 個（うち厳密整合 {strict_unique}。玉位置・利きは厳密のみで集計）"
+        "粒子診断: 推定器 {n_estimators} 個ぶんのユニーク粒子 {total_unique} 個（うち厳密整合 {strict_unique}。\
+         集計は評価重み = 0.5^penalty × 正規化exp(logw)。玉位置・利きは厳密のみ）"
     );
     if strict_unique == 0 {
         println!("厳密整合の粒子がありません（フィルタ死。seed0 の手番別トレースは stderr 参照）");
@@ -449,35 +467,33 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
     }
     if rep.pos.in_check(side) {
         println!();
-        println!("王手駒の分布（粒子内で手番側の玉に利いている相手駒）:");
+        println!("王手駒の分布（粒子内で手番側の玉に利いている相手駒。重み付き）:");
         let mut sorted: Vec<_> = checker_tally.into_iter().collect();
-        sorted.sort_by(|a, b| b.1.cmp(&a.1));
-        for (key, n) in sorted {
-            println!(
-                "  {key}: {n} ({:.1}%)",
-                100.0 * n as f64 / total_unique as f64
-            );
+        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (key, m) in sorted {
+            let pct = 100.0 * m / checker_mass.max(1e-12);
+            if pct < 0.05 {
+                continue;
+            }
+            println!("  {key}: {pct:.1}%");
         }
     }
     println!();
-    println!("相手玉の位置分布（上位）:");
+    println!("相手玉の位置分布（上位、重み付き）:");
     let mut sorted: Vec<_> = opp_king_tally.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
-    for (sq, n) in sorted.iter().take(8) {
-        println!(
-            "  {sq}: {n} ({:.1}%)",
-            100.0 * *n as f64 / strict_unique as f64
-        );
+    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    for (sq, m) in sorted.iter().take(8) {
+        println!("  {sq}: {:.1}%", 100.0 * m / strict_mass.max(1e-12));
     }
     for (i, (name, _)) in diag_sqs.iter().enumerate() {
         let t = &cover_tally[i];
         println!();
         println!(
-            "{name} への相手利き枚数（玉を除く）: 0枚 {:.1}% / 1枚 {:.1}% / 2枚 {:.1}% / 3枚以上 {:.1}%",
-            100.0 * t[0] as f64 / strict_unique as f64,
-            100.0 * t[1] as f64 / strict_unique as f64,
-            100.0 * t[2] as f64 / strict_unique as f64,
-            100.0 * t[3] as f64 / strict_unique as f64,
+            "{name} への相手利き枚数（玉を除く、重み付き）: 0枚 {:.1}% / 1枚 {:.1}% / 2枚 {:.1}% / 3枚以上 {:.1}%",
+            100.0 * t[0] / strict_mass.max(1e-12),
+            100.0 * t[1] / strict_mass.max(1e-12),
+            100.0 * t[2] / strict_mass.max(1e-12),
+            100.0 * t[3] / strict_mass.max(1e-12),
         );
     }
 }

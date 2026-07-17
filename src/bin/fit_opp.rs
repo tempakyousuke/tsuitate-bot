@@ -23,9 +23,10 @@ use tsuitate_bot::board::Coord;
 use tsuitate_bot::protocol::{Color, GameEndPayload};
 use tsuitate_bot::shogi::{Position, ShogiMove, parse_usi};
 
-const FEATURE_NAMES: [&str; 7] = [
-    "advance",      // 前進量（段）
-    "promote",      // 成り
+const FEATURE_NAMES: [&str; 10] = [
+    "advance",       // 前進量（段）
+    "promote_minor", // 成り（歩・香・桂）
+    "promote_major", // 成り（銀・角・飛）
     "is_drop",      // 持ち駒を打つ
     "threat_known", // 位置が既知の相手駒（自分の駒が死んだマス）へ新たに当たりを付ける
     "threat_home",  // 初期位置から動いていない相手駒へ新たに当たりを付ける
@@ -33,9 +34,12 @@ const FEATURE_NAMES: [&str; 7] = [
     "is_king_move", // 玉を動かす（基礎傾向）
     "king_flee",    // 玉が危険地点（自駒が死んだマス = 相手駒の露見地点）から遠ざかる
                     // （守りを剥がされた玉は座り続けない、という行動予測）
+    "deep_unsup_pawn", // 敵陣（3段）への紐なし着地（歩・香・桂）。
+    "deep_unsup_piece", // 敵陣（3段）への紐なし着地（銀以上の駒）。見えない敵陣は
+                        // 守備駒が濃く、紐のない深入りは事実上の駒捨て
 ];
 
-const D: usize = 7;
+const D: usize = 10;
 
 struct Sample {
     /// 観測クラス内の各候補手の特徴量
@@ -58,6 +62,16 @@ fn to_square(mv: &ShogiMove) -> Coord {
     match *mv {
         ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
     }
+}
+
+/// 動かす駒種（移動前の役）。歩・香・桂を「小駒」とみなす
+fn moved_is_minor(pos: &Position, mv: &ShogiMove) -> bool {
+    use tsuitate_bot::protocol::Role;
+    let role = match *mv {
+        ShogiMove::Board { from, .. } => pos.piece_at(from).map(|p| p.role),
+        ShogiMove::Drop { role, .. } => Some(role),
+    };
+    matches!(role, Some(Role::Pawn | Role::Lance | Role::Knight))
 }
 
 /// 動かした駒（着地点 to）が対象マスのどれかへ新たに利きを付けたか。
@@ -94,6 +108,19 @@ fn flees_danger(from: Coord, to: Coord, danger: &HashSet<Coord>) -> bool {
         (Some(a), Some(b)) => b > a,
         _ => false,
     }
+}
+
+/// 敵陣（成れる3段）への紐なし着地か。着地点に自分の別の駒の利きが無い。
+/// **定義は estimator.rs 側と一致させること**（学習と推論の整合）
+fn deep_unsupported(next: &Position, mv: &ShogiMove, mover: Color) -> bool {
+    let to = to_square(mv);
+    let deep = match mover {
+        Color::Sente => to.rank <= 3,
+        Color::Gote => to.rank >= 7,
+    };
+    deep && !next
+        .pieces()
+        .any(|(sq, p)| p.color == mover && sq != to && next.attacks(sq, to))
 }
 
 /// 初期位置から一度も動いていない bot 駒のマス（相手はここを推論で狙ってくる）
@@ -160,14 +187,20 @@ fn extract_samples(bot: Color, end: &GameEndPayload, samples: &mut Vec<Sample>) 
                     }
                     ShogiMove::Drop { .. } => (false, false),
                 };
+                let minor = moved_is_minor(&pos, &lm);
+                let promotes = matches!(lm, ShogiMove::Board { promote: true, .. });
+                let deep_unsup = deep_unsupported(&next, &lm, human);
                 features.push([
                     advance_of(&lm, human),
-                    matches!(lm, ShogiMove::Board { promote: true, .. }) as u8 as f64,
+                    (promotes && minor) as u8 as f64,
+                    (promotes && !minor) as u8 as f64,
                     matches!(lm, ShogiMove::Drop { .. }) as u8 as f64,
                     newly_threatens(&pos, &next, &lm, &human_lost_at) as u8 as f64,
                     newly_threatens(&pos, &next, &lm, &homes) as u8 as f64,
                     is_king as u8 as f64,
                     flee as u8 as f64,
+                    (deep_unsup && minor) as u8 as f64,
+                    (deep_unsup && !minor) as u8 as f64,
                 ]);
             }
             if let Some(chosen) = chosen {
@@ -284,6 +317,24 @@ fn main() {
         }
     }
     println!("{games}局から {} サンプル（人間の着手）を抽出", samples.len());
+    // 特徴量ごとの基礎統計: 候補内の出現率 vs 選択された手での出現率
+    for i in 0..D {
+        let cand: usize = samples
+            .iter()
+            .map(|s| s.features.iter().filter(|f| f[i] > 0.0).count())
+            .sum();
+        let total: usize = samples.iter().map(|s| s.features.len()).sum();
+        let chosen = samples
+            .iter()
+            .filter(|s| s.features[s.chosen][i] > 0.0)
+            .count();
+        println!(
+            "  {:>16}: 候補 {:.2}% / 選択 {:.2}%",
+            FEATURE_NAMES[i],
+            100.0 * cand as f64 / total as f64,
+            100.0 * chosen as f64 / samples.len() as f64
+        );
+    }
 
     // 勾配上昇（凸なので単純でよい。学習率は発散したら半分に）
     let mut theta = [0.0f64; D];

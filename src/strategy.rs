@@ -781,6 +781,7 @@ impl Strategy for EstimatorStrategy {
         let sample = stratified_sample(
             est.particles(),
             est.penalties(),
+            est.log_weights(),
             view.your_color,
             &particle_ctx,
             self.params.soft_decay,
@@ -942,9 +943,13 @@ impl Strategy for EstimatorStrategy {
 /// - 粒子尤度モデル（likelihood.rs、アリーナ真実で教師あり学習）の exp(θ·φ) を
 ///   **平均1へ正規化して**乗じる: 真の局面に近い粒子ほど評価に効く。
 ///   相対的な再重み付けなので合計質量（較正）は変えない
+/// - 推定器の観測尤度の対数重み（Estimator::log_weights、SIR の重み更新）も
+///   同じ枠で乗じる: 観測を「相手が指しにくい手」でしか説明できない粒子
+///   （幻の角の飛び込み王手等）を粒子間で相対的に軽くする
 fn stratified_sample<'a>(
     particles: &'a [Position],
     penalties: &[u8],
+    log_weights: &[f64],
     my_color: Color,
     ctx: &ParticleCtx,
     soft_decay: f64,
@@ -960,7 +965,7 @@ fn stratified_sample<'a>(
     let mut seen = HashSet::new();
     let mut uniques: Vec<(&Position, f64, f64)> = vec![];
     let mut legacy_mass = 0.0;
-    for (pos, pen) in particles.iter().zip(penalties) {
+    for (i, (pos, pen)) in particles.iter().zip(penalties).enumerate() {
         if !seen.insert(pos.fingerprint()) {
             continue;
         }
@@ -968,7 +973,8 @@ fn stratified_sample<'a>(
         if uniques.len() < eval_particles {
             legacy_mass += w;
         }
-        let logl = particle_log_weight(&particle_features(pos, my_color, ctx), &FITTED_THETA);
+        let logl = particle_log_weight(&particle_features(pos, my_color, ctx), &FITTED_THETA)
+            + log_weights.get(i).copied().unwrap_or(0.0);
         uniques.push((pos, w, logl));
     }
     if uniques.is_empty() {
@@ -2039,7 +2045,7 @@ pub(crate) mod tests {
         }
         let penalties = vec![0u8; particles.len()];
         // 上限16 < 層数9×最低枠4=36: 件数は必ず16以下
-        let sample = stratified_sample(&particles, &penalties, Color::Sente, &ParticleCtx::default(), 0.5, 16, &mut rng);
+        let sample = stratified_sample(&particles, &penalties, &vec![0.0f64; particles.len()], Color::Sente, &ParticleCtx::default(), 0.5, 16, &mut rng);
         assert!(sample.len() <= 16, "len={}", sample.len());
         // ラウンドロビン順: 先頭9件で9層すべての玉位置が現れる
         let prefix_kings: HashSet<_> = sample
@@ -2049,7 +2055,7 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(prefix_kings.len(), 9, "prefixが層化されていない");
         // 上限が大きい場合も件数はユニーク数以下・重みは旧方式と一致
-        let sample = stratified_sample(&particles, &penalties, Color::Sente, &ParticleCtx::default(), 0.5, 512, &mut rng);
+        let sample = stratified_sample(&particles, &penalties, &vec![0.0f64; particles.len()], Color::Sente, &ParticleCtx::default(), 0.5, 512, &mut rng);
         assert_eq!(sample.len(), 54);
         let mass: f64 = sample.iter().map(|(_, w)| w).sum();
         assert!((mass - 54.0).abs() < 1e-6, "mass={mass}");
@@ -2069,7 +2075,7 @@ pub(crate) mod tests {
         let trials = 400;
         for seed in 0..trials {
             let mut rng = StdRng::seed_from_u64(seed);
-            let sample = stratified_sample(&particles, &penalties, Color::Sente, &ParticleCtx::default(), 0.5, 1, &mut rng);
+            let sample = stratified_sample(&particles, &penalties, &vec![0.0f64; particles.len()], Color::Sente, &ParticleCtx::default(), 0.5, 1, &mut rng);
             assert_eq!(sample.len(), 1);
             if sample[0].0.fingerprint() == strict_fp {
                 strict_hits += 1;
@@ -2100,7 +2106,7 @@ pub(crate) mod tests {
         let mut share_sum = 0.0;
         for seed in 0..trials {
             let mut rng = StdRng::seed_from_u64(1000 + seed);
-            let sample = stratified_sample(&particles, &penalties, Color::Sente, &ParticleCtx::default(), 0.5, 2, &mut rng);
+            let sample = stratified_sample(&particles, &penalties, &vec![0.0f64; particles.len()], Color::Sente, &ParticleCtx::default(), 0.5, 2, &mut rng);
             let total: f64 = sample.iter().map(|(_, w)| w).sum();
             let soft_mass: f64 = sample
                 .iter()
@@ -2125,7 +2131,7 @@ pub(crate) mod tests {
                 .take(20)
                 .collect();
         let penalties = vec![1u8; particles.len()];
-        let sample = stratified_sample(&particles, &penalties, Color::Sente, &ParticleCtx::default(), 0.5, 16, &mut rng);
+        let sample = stratified_sample(&particles, &penalties, &vec![0.0f64; particles.len()], Color::Sente, &ParticleCtx::default(), 0.5, 16, &mut rng);
         assert!(sample.len() <= 16);
         let mass: f64 = sample.iter().map(|(_, w)| w).sum();
         assert!(
