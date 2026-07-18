@@ -113,6 +113,9 @@ struct PlayerState {
     foul_tried: HashSet<String>,
     clock_ms: i64,
     think_us: Vec<u64>,
+    /// 選択の履歴 (move_number, usi, debug)。記録の chose イベント用
+    /// （p_legal 較正の測定に使う。MyMove/MyFoul 観測と1:1で対応する）
+    chosen: Vec<(u32, String, Option<serde_json::Value>)>,
 }
 
 fn make_view(
@@ -219,6 +222,8 @@ fn play_game_with_oracle(
                 mover.fouls_in_check += 1;
             }
             mover.foul_tried.insert(usi.clone());
+            let debug = mover.strategy.debug_state();
+            mover.chosen.push((pos.move_number(), usi.clone(), debug));
             let foul_count = mover.fouls;
             truth.foul_attempts.push(FoulRecord {
                 move_number: pos.move_number(),
@@ -239,6 +244,11 @@ fn play_game_with_oracle(
         }
 
         let mv = parse_usi(&usi).unwrap();
+        {
+            let mover = &mut players[idx(side)];
+            let debug = mover.strategy.debug_state();
+            mover.chosen.push((pos.move_number(), usi.clone(), debug));
+        }
         truth.moves.push(MoveRecord {
             usi: usi.clone(),
             by_color: side,
@@ -311,7 +321,18 @@ fn write_record(
             return;
         }
     };
+    // chose イベントを対応する MyMove/MyFoul 観測の直前に挟む
+    // （実対局の記録と同じ順序 = analyze の p_legal 突き合わせが機能する）
+    let mut chosen_iter = pa.chosen.iter();
     for obs in pa.log.events() {
+        if matches!(
+            obs,
+            Observation::MyMove { .. } | Observation::MyFoul { .. }
+        ) {
+            if let Some((mn, usi, debug)) = chosen_iter.next() {
+                rec.chosen(*mn, usi, 0, debug.as_ref());
+            }
+        }
         rec.observation(obs);
     }
     let result_str = match result {
@@ -500,6 +521,7 @@ where
                             foul_tried: HashSet::new(),
                             clock_ms: FISCHER_INITIAL_MS,
                             think_us: Vec::new(),
+                            chosen: Vec::new(),
                         };
                         let seeds_a = GameSeeds {
                             game_no,
