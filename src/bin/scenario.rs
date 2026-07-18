@@ -43,6 +43,9 @@ struct Scenario {
     ply: usize,
     /// diag で相手駒の利き枚数分布を測るマス
     diag_squares: Vec<String>,
+    /// continue の足切り手数（**通算**の手数。必勝局面の遂行実験で、これを
+    /// 超えたら不合格 = 引き分け扱いで打ち切る）。既定 200
+    limit: u32,
     kifu: Kifu,
 }
 
@@ -82,6 +85,11 @@ fn load_scenario(
         .or_else(|| kifu.directives.get("diag").cloned())
         .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
         .unwrap_or_default();
+    let limit: u32 = kifu
+        .directives
+        .get("limit")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(200);
     let name = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -99,6 +107,7 @@ fn load_scenario(
         target,
         ply,
         diag_squares,
+        limit,
         kifu,
     })
 }
@@ -371,6 +380,8 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
     let mut checker_tally: HashMap<String, f64> = HashMap::new();
     let mut checker_mass = 0.0f64;
     let mut opp_king_tally: HashMap<String, f64> = HashMap::new();
+    let mut all_king_tally: HashMap<String, f64> = HashMap::new();
+    let mut all_king_mass = 0.0f64;
     // マスごとの相手利き枚数（0,1,2,3+）の重み質量
     let mut cover_tally: Vec<[f64; 4]> = vec![[0.0; 4]; diag_sqs.len()];
     let mut strict_mass = 0.0f64;
@@ -457,6 +468,12 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
             }
             let (w, penalty) = mass[&pp.fingerprint()];
             total_unique += 1;
+            // taint 込みの全粒子での玉位置分布（ε_phys の信念の質の診断用。
+            // 厳密のみの分布とは別枠で集計する）
+            if let Some(sq) = pp.king_square(side.other()) {
+                *all_king_tally.entry(make_usi_square(sq)).or_insert(0.0) += w;
+                all_king_mass += w;
+            }
             if rep.pos.in_check(side) {
                 let checkers: Vec<String> = pp
                     .pieces()
@@ -497,7 +514,23 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
         "粒子診断: 推定器 {n_estimators} 個ぶんのユニーク粒子 {total_unique} 個（うち厳密整合 {strict_unique}。\
          集計は評価重み = 指紋ごとの正規化 Σexp(logw)（ソフト減衰は logw 課金済み）。玉位置・利きは厳密のみ）"
     );
+    // taint 込みの全粒子での相手玉位置（真実との突き合わせ。ε_phys の
+    // 「玉位置の信念は保てているか」の直接測定）
+    let truth_king = rep
+        .pos
+        .king_square(side.other())
+        .map(make_usi_square)
+        .unwrap_or_else(|| "-".into());
+    println!();
+    println!("相手玉の位置分布（taint 込み全粒子、重み付き。真実 = {truth_king}）:");
+    let mut sorted_all: Vec<_> = all_king_tally.into_iter().collect();
+    sorted_all.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    for (sq, m) in sorted_all.iter().take(8) {
+        let mark = if *sq == truth_king { " ←真実" } else { "" };
+        println!("  {sq}: {:.1}%{mark}", 100.0 * m / all_king_mass.max(1e-12));
+    }
     if strict_unique == 0 {
+        println!();
         println!("厳密整合の粒子がありません（フィルタ死。seed0 の手番別トレースは stderr 参照）");
         return;
     }
@@ -574,8 +607,10 @@ fn continue_games(sc: &Scenario, rep: &Replayed, games: u64, name_me: &str, name
         let mut first_move: Option<String> = None;
 
         let (winner, reason): (Option<Color>, String) = loop {
-            if plies >= 200 {
-                break (None, "max_plies".into());
+            // 足切り（*scenario limit=N）: 必勝局面の遂行実験では、決めるべき
+            // 手数で決められなかった時点で不合格（引き分け=負け扱いで集計）
+            if plies >= sc.limit {
+                break (None, "limit".into());
             }
             let side = pos.turn();
             let i = side_idx(side);

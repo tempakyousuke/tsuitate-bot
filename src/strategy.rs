@@ -864,6 +864,15 @@ impl Strategy for EstimatorStrategy {
             p
         };
 
+        // ブラインド時の玉攻め勾配（C-7 P3 追補）: クリーン粒子が全滅していても
+        // taint 粒子の玉位置信念は保たれている（kakunari 実測 91.8% 真実一致）。
+        // 玉位置分布**だけ**を抽出し、信念玉マスへ利きを作る手へボーナスを足す
+        let blind_king_dist: Vec<(Coord, f64)> = if sample.is_empty() {
+            taint_king_distribution(est)
+        } else {
+            vec![]
+        };
+
         let rng = &mut self.rng;
         // 1段目: 全候補を1手読み（静的リスク項つき）で評価する。
         // (usi, mv, 内訳, gain外の補正, 1段目スコア)
@@ -882,6 +891,9 @@ impl Strategy for EstimatorStrategy {
             // gain の外側の補正（タイブレーク乱数・手戻り/シャッフル減点）は
             // 2手読み後の再計算でも同じ値を使うので分離して持つ
             let mut adjust = rng.random_range(0.0..0.01);
+            if !blind_king_dist.is_empty() {
+                adjust += BLIND_KING_ATTACK_W * blind_king_attack(view, &mv, &blind_king_dist);
+            }
             // 手戻り（直前の手をそのまま逆に戻す）は膠着の典型なので減点。
             // 直前に動かした駒をまた動かすだけの手も雑なシャッフルとして軽く減点
             if let (
@@ -1159,6 +1171,85 @@ fn stratified_sample<'a>(
 
 /// taint 粒子を王手ソルバー投票に使う深さの上限（それ以上は嘘が深すぎる）
 const TAINT_VOTE_MAX: u8 = 6;
+/// ブラインド時の玉攻めボーナスの重み（クリーン粒子全滅時のみ。
+/// taint 粒子から抽出した**玉位置分布だけ**を使い、盤面の嘘は評価に入れない。
+/// kakunari 実測: 玉位置信念は 91.8% で真実に集中するのに、評価が使えず
+/// 無目的手を選んでいた）
+const BLIND_KING_ATTACK_W: f64 = 2.0;
+
+/// taint 粒子から相手玉の位置分布（正規化済み）だけを抽出する。
+/// 深い taint は玉位置も信用が下がるので投票と同じ減衰・上限を適用
+fn taint_king_distribution(est: &Estimator) -> Vec<(Coord, f64)> {
+    let max_lw = est
+        .log_weights()
+        .iter()
+        .zip(est.phys_taint())
+        .filter(|&(_, &t)| t > 0 && t <= TAINT_VOTE_MAX)
+        .map(|(&lw, _)| lw)
+        .fold(f64::MIN, f64::max);
+    if max_lw == f64::MIN {
+        return vec![];
+    }
+    let opp = est.my_color().other();
+    let mut tally: HashMap<Coord, f64> = HashMap::new();
+    let mut total = 0.0f64;
+    for ((pos, &t), &lw) in est
+        .particles()
+        .iter()
+        .zip(est.phys_taint())
+        .zip(est.log_weights())
+    {
+        if t == 0 || t > TAINT_VOTE_MAX {
+            continue;
+        }
+        let Some(sq) = pos.king_square(opp) else {
+            continue;
+        };
+        let w = (lw - max_lw).exp() * 0.5f64.powi(i32::from(t) - 1);
+        *tally.entry(sq).or_insert(0.0) += w;
+        total += w;
+    }
+    if total <= 0.0 {
+        return vec![];
+    }
+    tally.into_iter().map(|(sq, w)| (sq, w / total)).collect()
+}
+
+/// ブラインド時の玉攻めボーナス: 候補手の着地駒が「信念上の玉マス」へ利きを
+/// 作る度合い。自駒だけの盤（相手駒は不可視なので候補手生成と同じ仮定）で
+/// 着地点からの利きを判定する — taint 粒子の盤面（嘘を含む）は使わない
+fn blind_king_attack(view: &PlayerView, mv: &ShogiMove, dist: &[(Coord, f64)]) -> f64 {
+    if dist.is_empty() {
+        return 0.0;
+    }
+    // 自駒だけの盤面を作って候補手を適用する
+    let mut pos = Position::empty(view.your_color);
+    for p in &view.your_pieces {
+        let (Some(sq), role) = (parse_usi_square(&p.square), p.role) else {
+            continue;
+        };
+        pos.set(
+            sq,
+            Some(crate::shogi::Piece {
+                color: view.your_color,
+                role,
+            }),
+        );
+    }
+    for (role, n) in &view.your_hand {
+        pos.set_hand(view.your_color, *role, *n as u8);
+    }
+    if !pos.is_pseudo_legal(mv) {
+        return 0.0;
+    }
+    pos.play_unchecked(mv);
+    let to = match *mv {
+        ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+    };
+    dist.iter()
+        .map(|&(k, p)| if pos.attacks(to, k) { p } else { 0.0 })
+        .sum()
+}
 
 /// ε_phys の taint 粒子から王手ソルバー投票用のサンプルを作る（C-7 P3）。
 /// クリーン粒子が全滅しているときのフォールバック専用。重みは指紋ごとの
