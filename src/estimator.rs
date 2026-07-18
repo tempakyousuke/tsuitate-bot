@@ -61,12 +61,14 @@
 //! リサンプリング・分割複製で logw を動かすときはスナップショットの logw も
 //! 同じ量シフトする（相対会計の保存）。
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use rand::{Rng, SeedableRng};
 
-use crate::board::Coord;
+use crate::board::{Coord, dead_end_rank, parse_usi_square};
+use crate::model::GameModel;
 use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{Color, Role};
 use crate::shogi::{Piece, Position, ShogiMove, parse_usi, promote_role, unpromote_role};
@@ -106,7 +108,15 @@ const REJUV_MS: f64 = 150.0;
 /// 分布は歪まない。needle 突破には複数決定点での連続命中が要るため強めに取る）
 const GUIDE_BOOST: f64 = 24.0;
 /// ガイドの後読み幅（決定点から先読みする制約数の上限）
-const GUIDE_HORIZON: usize = 8;
+const GUIDE_HORIZON: usize = 24;
+
+/// 診断用: TSUITATE_DISABLE_DEFEND_GUIDE=1 で defend ブースト(MyFoulの
+/// 王手検出によるguide.attacksへの追加)を無効化できる(速度差の切り分け専用。
+/// 一時的なフラグ)
+fn defend_guide_disabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("TSUITATE_DISABLE_DEFEND_GUIDE").is_ok_and(|v| v == "1"))
+}
 
 /// 全滅時に保持する棄却粒子（墓場）の上限
 const GRAVEYARD_CAP: usize = 128;
@@ -145,11 +155,16 @@ struct Guide {
     /// 後続 OppMove(captured_at=X) 由来: 「X へ利きを作る手」をブースト
     /// （取り返しには X に利く駒が事前に必要）
     attacks: Vec<Coord>,
+    /// 多段ガイド（C-7 追補）: `lands` と同じ future MyMove(to=X, captured=R) 由来
+    /// だが、「今すぐ X に着地する」手ではなく「駒種 R を持つ駒が X へ**近づく**手」
+    /// を弱くブーストする。needle が複数手先にある場合（kakunari c42 型の
+    /// サイレント再配置）、1手先しか見ない lands/attacks では見つからない
+    approach: Vec<(Role, Coord)>,
 }
 
 impl Guide {
     fn is_empty(&self) -> bool {
-        self.lands.is_empty() && self.attacks.is_empty()
+        self.lands.is_empty() && self.attacks.is_empty() && self.approach.is_empty()
     }
 }
 
@@ -242,6 +257,12 @@ pub struct Estimator {
     /// TSUITATE_FILTER_DEBUG=1 のとき、リプレイ/若返りが失敗した制約 index の
     /// ヒストグラムを集める（needle の特定用）
     debug_fail: Option<std::collections::HashMap<usize, u32>>,
+    /// 現在の自玉位置（自分の手でしか動かないので常に厳密に分かる）
+    my_king: Coord,
+    /// king_at[i] = 制約 index i を処理する直前の自玉位置。build_guide が
+    /// 王手宣言との整合を確かめるたびに全体を舐め直さずに済むよう、
+    /// 制約追加時にインクリメンタルに更新する（O(1) 参照用のキャッシュ）
+    king_at: Vec<Coord>,
     rng: StdRng,
 }
 
@@ -296,6 +317,10 @@ impl Estimator {
             debug_fail: std::env::var("TSUITATE_FILTER_DEBUG")
                 .is_ok_and(|v| v == "1")
                 .then(std::collections::HashMap::new),
+            my_king: Position::initial()
+                .king_square(my_color)
+                .expect("初期局面に玉がない"),
+            king_at: vec![],
             rng: StdRng::seed_from_u64(seed),
         }
     }
@@ -378,6 +403,19 @@ impl Estimator {
                 continue;
             };
             self.apply_constraint(&constraint);
+            // king_at[idx] = この制約を処理する直前の自玉位置（build_guide の
+            // O(1) 参照用。king_square_before の全体再走査を避けるため
+            // インクリメンタルに維持する）
+            self.king_at.push(self.my_king);
+            if let Constraint::MyMove {
+                mv: ShogiMove::Board { from, to, .. },
+                ..
+            } = &constraint
+            {
+                if *from == self.my_king {
+                    self.my_king = *to;
+                }
+            }
             if let Constraint::MyMove { mv, captured, .. } = &constraint {
                 let idx = self.constraints.len();
                 let to = match *mv {
@@ -874,9 +912,18 @@ impl Estimator {
     /// - MyMove(to=X, captured=R) → 「X に相手の R が立つ」（lands）
     /// - OppMove(captured_at=X) → 「X へ利きを作る」（attacks。取り返しには
     ///   X に利く駒が事前に必要 — kakunari の同桂成の型）
+    /// - MyFoul(自玉が X への移動を試みて反則) → 「X は他の相手駒に守られて
+    ///   いる」ことが確定する（自玉の移動は経路遮蔽が起きないので、反則の
+    ///   理由は必ず「移動先が相手の利きにある」）。「X へ利きを作る」という
+    ///   意味では attacks と同じブースト対象なので同じ場に積む（新しい
+    ///   フィールドは作らない。窓探索実験で確認した mover/defender 構成の
+    ///   考え方を、既存の重み付きサンプリングへ再利用する形）
     /// upto 位置には current（未登録の制約）が入る。None なら constraints のみ
     fn build_guide(&self, i: usize, upto: usize, current: Option<&Constraint>) -> Guide {
         let mut guide = Guide::default();
+        // king_at は O(1) 参照（king_square_before の全体再走査版は廃止）。
+        // i が未記録の最新位置なら self.my_king が正しい値
+        let mut king = self.king_at.get(i).copied().unwrap_or(self.my_king);
         for j in (i + 1)..=(i + GUIDE_HORIZON) {
             let c = match j.cmp(&upto) {
                 std::cmp::Ordering::Less => &self.constraints[j],
@@ -896,12 +943,28 @@ impl Estimator {
                         ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
                     };
                     guide.lands.push((to, *role));
+                    guide.approach.push((*role, to));
                 }
                 Constraint::OppMove {
                     captured_at: Some(at),
                     ..
                 } => guide.attacks.push(*at),
+                Constraint::MyFoul {
+                    mv: ShogiMove::Board { from, to, .. },
+                } if *from == king && !defend_guide_disabled() => {
+                    guide.attacks.push(*to);
+                }
                 _ => {}
+            }
+            // ガイド窓の中でも自玉が動く可能性があるので追跡を続ける
+            if let Constraint::MyMove {
+                mv: ShogiMove::Board { from, to, .. },
+                ..
+            } = c
+            {
+                if *from == king {
+                    king = *to;
+                }
             }
         }
         guide
@@ -1407,11 +1470,7 @@ fn sample_opp_move(
         );
         total_mass += w;
         if consistent {
-            let g = if guide_matches(pos, &next, &mv, guide) {
-                w * GUIDE_BOOST
-            } else {
-                w
-            };
+            let g = w * guide_boost_factor(pos, &next, &mv, guide, opp);
             candidates.push((mv, w, g));
         }
     }
@@ -1426,28 +1485,49 @@ fn sample_opp_move(
     Some(r.ln() + (w_c / class_mass).ln() - (g_c / guide_mass).ln())
 }
 
-/// ガイド条件に合う手か:
-/// - lands: マス sq に（成りを剥がした）駒種 role を立てる手。
+/// 多段ガイドの接近ブースト倍率（GUIDE_BOOST より弱め。「向かっている」だけで
+/// 確定ではないため、exact landing/attacks ほど強くは信じない）
+const GUIDE_APPROACH_BOOST: f64 = 3.0;
+
+/// ガイド条件に合う手のブースト倍率（1.0 = ブーストなし）:
+/// - lands: マス sq に（成りを剥がした）駒種 role を立てる手 → GUIDE_BOOST。
 ///   取得駒の観測（captured）は unpromote 済みの駒種なので、成り駒も剥がして照合
-/// - attacks: 着地点から対象マスへ利きを作る手（取り返しの事前準備）
-fn guide_matches(pos: &Position, next: &Position, mv: &ShogiMove, guide: &Guide) -> bool {
+/// - attacks: 着地点から対象マスへ利きを作る手（取り返しの事前準備）→ GUIDE_BOOST
+/// - approach（多段ガイド）: 駒種が一致し、空盤上の最短手数（deduce の BFS）が
+///   目的地へ真に縮む手 → GUIDE_APPROACH_BOOST。1手先しか見ない lands/attacks
+///   では拾えない「複数手先の目的地への接近」を弱くブーストする
+fn guide_boost_factor(pos: &Position, next: &Position, mv: &ShogiMove, guide: &Guide, mover: Color) -> f64 {
     if guide.is_empty() {
-        return false;
+        return 1.0;
     }
-    let (to, role) = match *mv {
+    let (to, role, from) = match *mv {
         ShogiMove::Board { from, to, .. } => match pos.piece_at(from) {
-            Some(p) => (to, unpromote_role(p.role)),
-            None => return false,
+            Some(p) => (to, unpromote_role(p.role), Some(from)),
+            None => return 1.0,
         },
-        ShogiMove::Drop { to, role } => (to, role),
+        ShogiMove::Drop { to, role } => (to, role, None),
     };
     if guide.lands.iter().any(|&(sq, r)| sq == to && r == role) {
-        return true;
+        return GUIDE_BOOST;
     }
-    guide
-        .attacks
-        .iter()
-        .any(|&sq| sq != to && next.attacks(to, sq))
+    if guide.attacks.iter().any(|&sq| sq != to && next.attacks(to, sq)) {
+        return GUIDE_BOOST;
+    }
+    if let Some(from) = from {
+        for &(r, target) in &guide.approach {
+            if r != role || target == to {
+                continue; // target==to は既に lands で処理済み（二重ブースト回避）
+            }
+            let before = crate::deduce::min_moves_empty_board(role, mover, from, target, false);
+            let after = crate::deduce::min_moves_empty_board(role, mover, to, target, false);
+            if let (Some(b), Some(a)) = (before, after) {
+                if a < b {
+                    return GUIDE_APPROACH_BOOST;
+                }
+            }
+        }
+    }
+    1.0
 }
 
 /// 露見マス（自分が駒を取った=相手に通知されたマス）での取り返しブースト。
@@ -1681,6 +1761,169 @@ fn weighted_choice_idx<R: Rng>(
         }
     }
     last
+}
+
+/// synth_particle が棄却サンプリングで試す回数の上限
+const SYNTH_ATTEMPTS: u32 = 64;
+
+/// C-8 MVP（直接盤面合成）: 履歴の指し手列を再現せず、既知の制約
+/// （自分側は真実そのまま・相手の持ち駒は既知・相手の盤上駒の役割別内訳は
+/// 初期20枚から取られた駒を引いて既知）だけを満たす盤面を直接サンプルする。
+///
+/// **意図的に最小版**: テンポ収支・負の証拠・配置事前分布はまだ実装しない。
+/// 相手の残り駒は「取られる前の役割（成りを剥がした生駒）」で配置し、
+/// 空きマスは二歩・行き所のない駒の配置合法性だけを守って一様ランダムに選ぶ。
+/// 成り（どの駒が成っているか・どこに成ったか）は一切推定しない —
+/// これは意図的で、「単純な配置サンプルだけでどこまで再現できるか」を
+/// 検証するための基準線（bin/synth_check で確認する）。
+///
+/// **手番側の静的合法性**（cursor の C-8 設計レビュー指摘。deduce.rs の
+/// 部品で実装）: `you_in_check`（今まさに自玉が王手されているか。観測から
+/// 厳密に分かる）と矛盾する配置は棄却して引き直す。手番はこちらなので、
+/// 王手されているならその通り、されていないなら相手の駒が誰も自玉に
+/// 利いていない、という静的な整合性だけを見る（経路・履歴は見ない）。
+/// 玉位置バイアス等の事前分布は後続フェーズで追加する
+pub fn synth_particle(
+    my_color: Color,
+    model: &GameModel,
+    you_in_check: bool,
+    rng: &mut StdRng,
+) -> Option<Position> {
+    let opp = my_color.other();
+    for _ in 0..SYNTH_ATTEMPTS {
+        if let Some(pos) = synth_particle_once(my_color, model, rng) {
+            let actually_in_check = pos
+                .king_square(my_color)
+                .is_some_and(|k| pos.pieces().any(|(sq, p)| p.color == opp && pos.attacks(sq, k)));
+            if actually_in_check == you_in_check {
+                return Some(pos);
+            }
+        }
+    }
+    None
+}
+
+/// 玉の配置事前分布の減衰率（本国からのチェビシェフ距離 1 につき exp(-λ)）。
+/// **注意**: 当初 likelihood.rs の FITTED_THETA（king_advance に上限なし）を
+/// そのまま生成分布として流用したところ、盤の隅（本国から最遠）に確率が
+/// 集中する誤った挙動になった（実測: 1a・8a等の隅に上位が集中）。
+/// FITTED_THETA は「候補粒子群の中で真実を判別する」識別モデルであり、
+/// 候補群自体が指し手の連鎖で自然に生成される（＝隅は元々出現しにくい）
+/// という前提の上に成り立つ相対的な重みなので、一様な全マスに対する
+/// 生成分布としては使えない。代わりに「本国から離れるほど単調に減衰する」
+/// 素直な事前分布に置き換えた。
+/// λ は kakunari 1点（診断的中率）への簡易スイープで選定
+/// （0.15→5.2% / 0.35→6.0% / 0.5→7.2% / 0.8→8.8% / 1.2→8.7%、0.8-1.2で頭打ち）。
+/// **1シナリオだけへの過学習リスクに注意**——他のシナリオでの再検証が必要
+const KING_DISTANCE_DECAY: f64 = 0.8;
+
+/// 玉の配置事前分布スコア: 本国からのチェビシェフ距離だけで単調減衰する
+fn king_placement_score(king_home: Coord, candidate: Coord) -> f64 {
+    let dist = (candidate.file - king_home.file)
+        .abs()
+        .max((candidate.rank - king_home.rank).abs());
+    -KING_DISTANCE_DECAY * f64::from(dist)
+}
+
+fn synth_particle_once(my_color: Color, model: &GameModel, rng: &mut StdRng) -> Option<Position> {
+    let opp = my_color.other();
+    let mut pos = Position::empty(my_color);
+    for p in model.my_pieces() {
+        let sq = parse_usi_square(&p.square)?;
+        pos.set(
+            sq,
+            Some(Piece {
+                color: my_color,
+                role: p.role,
+            }),
+        );
+    }
+    for (role, n) in model.my_hand() {
+        pos.set_hand(my_color, role, n as u8);
+    }
+    for (role, n) in model.opponent_hand() {
+        pos.set_hand(opp, role, n as u8);
+    }
+
+    // 相手の盤上駒（生駒ベースの役割）の残り枚数 = 初期配置 − 取られた駒
+    let mut counts: HashMap<Role, i32> = HashMap::new();
+    for (_, p) in Position::initial().pieces() {
+        if p.color == opp {
+            *counts.entry(p.role).or_insert(0) += 1;
+        }
+    }
+    for (_, role) in model.lost_pieces() {
+        *counts.entry(unpromote_role(*role)).or_insert(0) -= 1;
+    }
+    let mut remaining: Vec<Role> = vec![];
+    for (&role, &c) in &counts {
+        for _ in 0..c.max(0) {
+            remaining.push(role);
+        }
+    }
+
+    // 空きマスの初期プール
+    let mut empties: Vec<Coord> = (1..=9)
+        .flat_map(|file| (1..=9).map(move |rank| Coord { file, rank }))
+        .filter(|&sq| pos.piece_at(sq).is_none())
+        .collect();
+
+    // 玉だけ先に配置事前分布で重み付きサンプリングする（taint に頼らない
+    // 玉位置ビリーフ。他の駒は依然として一様ランダム — 意図的な最小拡張）
+    if let Some(king_idx) = remaining.iter().position(|&r| r == Role::King) {
+        remaining.remove(king_idx);
+        let king_home = Position::initial().king_square(opp);
+        let placed = king_home.and_then(|home| {
+            let weights: Vec<f64> = empties
+                .iter()
+                .map(|&sq| king_placement_score(home, sq).exp())
+                .collect();
+            weighted_choice_idx(weights.into_iter(), rng)
+        });
+        match placed {
+            Some(i) => {
+                let sq = empties.remove(i);
+                pos.set(
+                    sq,
+                    Some(Piece {
+                        color: opp,
+                        role: Role::King,
+                    }),
+                );
+            }
+            // 万一重み付きサンプリングが失敗したら通常の一様配置へ戻す
+            None => remaining.push(Role::King),
+        }
+    }
+
+    // 残りの駒をシャッフルして順に置く（二歩・行き所のない駒だけ回避）
+    empties.shuffle(rng);
+    remaining.shuffle(rng);
+    let mut ei = 0usize;
+    for role in remaining {
+        let mut placed = false;
+        while ei < empties.len() {
+            let sq = empties[ei];
+            ei += 1;
+            if role == Role::Pawn
+                && pos
+                    .pieces()
+                    .any(|(s, p)| p.color == opp && p.role == Role::Pawn && s.file == sq.file)
+            {
+                continue; // 二歩
+            }
+            if dead_end_rank(role, sq.rank, opp) {
+                continue;
+            }
+            pos.set(sq, Some(Piece { color: opp, role }));
+            placed = true;
+            break;
+        }
+        if !placed {
+            return None;
+        }
+    }
+    Some(pos)
 }
 
 #[cfg(test)]
@@ -2210,6 +2453,7 @@ mod tests {
         let wanted = Guide {
             lands: vec![(Coord { file: 3, rank: 4 }, Role::Pawn)],
             attacks: vec![],
+            approach: vec![],
         };
         let n = 4000;
         // ガイドなしの素の選択頻度（大数近似で真の p_class）
