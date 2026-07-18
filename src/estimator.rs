@@ -69,7 +69,7 @@ use rand::{Rng, SeedableRng};
 use crate::board::Coord;
 use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{Color, Role};
-use crate::shogi::{Position, ShogiMove, parse_usi, unpromote_role};
+use crate::shogi::{Piece, Position, ShogiMove, parse_usi, promote_role, unpromote_role};
 
 /// 粒子の目標数。1手あたりの計算量はこれ*候補手数に比例する
 const TARGET_PARTICLES: usize = 512;
@@ -112,6 +112,13 @@ const GUIDE_HORIZON: usize = 8;
 const GRAVEYARD_CAP: usize = 128;
 /// 墓場スナップショットの有効期限（決定点からの制約数。これを超えたら stale）
 const GRAVEYARD_MAX_SEGMENT: usize = 24;
+/// 物理不整合の最後の砦（C-7 P3 / D4）: 完全全滅時だけ、棄却粒子を
+/// logw += ln(EPS_PHYS) と phys_taint+1 で残す（TSUITATE_EPS_PHYS で上書き可、
+/// 0 で無効）。嘘の盤面なので評価側は玉位置系の用途（王手ソルバーの投票）に限定。
+/// 救済に回数上限は設けない（kakunari 型の多段 needle は4連続以上の全滅を起こし、
+/// 上限があると結局ブラインドに落ちる）。深く汚れた粒子は ε の累積課金と
+/// truncate の taint 優先淘汰で、修復・復活・リプレイが成功し次第自然に消える
+const EPS_PHYS_DEFAULT: f64 = 0.01;
 
 /// 若返り用のスナップショット: 相手決定点 cidx の適用**前**の状態
 #[derive(Clone)]
@@ -121,10 +128,14 @@ struct Snap {
     pos: Position,
     logw: f64,
     miss: u8,
+    taint: u8,
 }
 
-/// スナップショット付きの棄却粒子（若返り→ソフト救済→墓場の受け渡し用）
-type Rejected = (Position, u8, f64, VecDeque<Snap>);
+/// スナップショット付きの棄却粒子（若返り→ソフト救済→墓場の受け渡し用）。
+/// (局面, info_miss, logw, 窓, phys_taint)
+type Rejected = (Position, u8, f64, VecDeque<Snap>, u8);
+/// 若返りの成功結果。(局面, info_miss, logw, 窓, phys_taint)
+type Repaired = (Position, u8, f64, VecDeque<Snap>, u8);
 
 /// 制約後読みガイド: 巻き戻し区間の再サンプルで満たしたい将来の状態条件
 #[derive(Default)]
@@ -182,6 +193,12 @@ pub struct Estimator {
     logw: Vec<f64>,
     /// particles と同じ並びの若返り窓（直近の相手決定点スナップショット）
     hist: Vec<VecDeque<Snap>>,
+    /// particles と同じ並びの物理不整合カウンタ（ε_phys の最後の砦で残した回数。
+    /// 0 = 物理的に厳密。リサンプリングでもリセットしない。評価側は taint>0 を
+    /// 通常サンプルから除外し、玉位置系の用途にだけ使う）
+    phys_taint: Vec<u8>,
+    /// ε_phys（TSUITATE_EPS_PHYS で上書き。0 = 最後の砦無効）
+    eps_phys: f64,
     /// 思考予算に応じた粒子の目標数（スケール1.0で TARGET_PARTICLES）
     target: usize,
     /// リプレイ試行回数の上限（スケール比例）
@@ -253,6 +270,11 @@ impl Estimator {
             info_miss: vec![0; target],
             logw: vec![0.0; target],
             hist: vec![VecDeque::new(); target],
+            phys_taint: vec![0; target],
+            eps_phys: std::env::var("TSUITATE_EPS_PHYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(EPS_PHYS_DEFAULT),
             target,
             regen_attempts: (REGEN_ATTEMPTS as f64 * scale) as usize,
             regen_deadline_ms: (500.0 * scale) as u64,
@@ -334,6 +356,12 @@ impl Estimator {
     /// ある（評価側で max を引いて exp し正規化する）。複製粒子は同じ値を持つ
     pub fn log_weights(&self) -> &[f64] {
         &self.logw
+    }
+
+    /// particles() と同じ並びの物理不整合カウンタ（0 = 物理的に厳密）。
+    /// 評価側は taint>0 を通常サンプルから除外し、玉位置系の用途にだけ使う
+    pub fn phys_taint(&self) -> &[u8] {
+        &self.phys_taint
     }
 
     pub fn healthy(&self) -> bool {
@@ -429,17 +457,23 @@ impl Estimator {
         let penalties = std::mem::take(&mut self.info_miss);
         let logws = std::mem::take(&mut self.logw);
         let hists = std::mem::take(&mut self.hist);
+        let taints = std::mem::take(&mut self.phys_taint);
         let mut surv_pos = Vec::with_capacity(particles.len());
         let mut surv_pen = Vec::with_capacity(particles.len());
         let mut surv_logw = Vec::with_capacity(particles.len());
         let mut surv_hist = Vec::with_capacity(particles.len());
+        let mut surv_taint = Vec::with_capacity(particles.len());
         // 棄却された粒子は適用前の局面を保持しておく（若返り・ソフト救済用。
         // apply_my_move / sample_opp_move は失敗時も局面を汚しうる）
         let mut failed: Vec<Rejected> = vec![];
         // 厳密生存者が今回の制約で得た対数重み増分（ソフト救済の課金基準に使う）
         let mut strict_dls: Vec<f64> = vec![];
-        for (((mut pos, pen), lw), mut hist) in
-            particles.into_iter().zip(penalties).zip(logws).zip(hists)
+        for ((((mut pos, pen), lw), mut hist), taint) in particles
+            .into_iter()
+            .zip(penalties)
+            .zip(logws)
+            .zip(hists)
+            .zip(taints)
         {
             let backup = pos.clone();
             // 相手決定点なら適用前の状態をスナップショット（若返りの巻き戻し先）
@@ -452,6 +486,7 @@ impl Estimator {
                     pos: backup.clone(),
                     logw: lw,
                     miss: pen,
+                    taint,
                 });
             }
             // 自分の手・反則は決定的（尤度 0/1）なので重みは変えない。
@@ -485,22 +520,26 @@ impl Estimator {
                 surv_pen.push(pen);
                 surv_logw.push(lw + dlw);
                 surv_hist.push(hist);
+                surv_taint.push(taint);
                 strict_dls.push(dlw);
             } else {
-                failed.push((backup, pen, lw, hist));
+                failed.push((backup, pen, lw, hist, taint));
             }
         }
         // 若返り（C-7 P2 / D3）: 厳密生存が薄いときは、棄却粒子を直近の
         // 相手決定点へ巻き戻して制約後読みガイド付きで引き直す。修復粒子は
-        // 厳密整合（info_miss はスナップショット時点の値へ戻る）。
-        // ゲートは**厳密生存数**（info_miss=0）で判定する（codex レビュー指摘:
-        // ソフトは独立証拠ではないので、ソフトが頭数を満たしていても厳密が
-        // 薄ければ修復に行く）。完全全滅（生存ゼロ）のときは予算を
-        // regen_deadline 級へ引き上げる（どうせブラインドになるなら
-        // リプレイ予算を前借りして修復に使う）
-        let strict_count =
-            |pens: &[u8]| -> usize { pens.iter().filter(|&&m| m == 0).count() };
-        if strict_count(&surv_pen) < self.target / 4 && !failed.is_empty() {
+        // 厳密整合（info_miss/phys_taint はスナップショット時点の値へ戻る）。
+        // ゲートは**厳密生存数**（info_miss=0 かつ phys_taint=0）で判定する
+        // （codex レビュー指摘: ソフト/taint は独立証拠ではない）。
+        // 完全全滅（生存ゼロ）のときは予算を regen_deadline 級へ引き上げる
+        // （どうせブラインドになるならリプレイ予算を前借りして修復に使う）
+        let strict_count = |pens: &[u8], taints: &[u8]| -> usize {
+            pens.iter()
+                .zip(taints)
+                .filter(|&(&m, &t)| m == 0 && t == 0)
+                .count()
+        };
+        if strict_count(&surv_pen, &surv_taint) < self.target / 4 && !failed.is_empty() {
             let budget_ms = if surv_pos.is_empty() {
                 self.regen_deadline_ms
             } else {
@@ -516,19 +555,20 @@ impl Estimator {
                 self.target,
                 deadline,
             );
-            for (pos, pen, lw, hist) in repaired {
+            for (pos, pen, lw, hist, taint) in repaired {
                 self.rejuv_repaired += 1;
                 surv_pos.push(pos);
                 surv_pen.push(pen);
                 surv_logw.push(lw);
                 surv_hist.push(hist);
+                surv_taint.push(taint);
             }
             failed = still;
         }
         // ソフト救済: 若返り後も厳密整合の生存が少ないときだけ、情報系の制約を
         // 緩和して棄却粒子を info_miss+1 で生かす（物理制約は緩和しない）
         let mut graveyard_candidates: Vec<Rejected> = vec![];
-        if strict_count(&surv_pen) < self.target / 4 {
+        if strict_count(&surv_pen, &surv_taint) < self.target / 4 {
             // ソフト粒子の観測尤度: 本当は P(観測|粒子)=0 だが近似として生かす
             // ので、「典型的な厳密生存者と同じ増分」（中央値）を課す。緩和クラスの
             // r（≈1）をそのまま使うと、観測を説明できない粒子のほうが正直に
@@ -539,7 +579,7 @@ impl Estimator {
                 strict_dls.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 strict_dls[strict_dls.len() / 2]
             });
-            for (mut pos, pen, lw, hist) in failed {
+            for (mut pos, pen, lw, hist, taint) in failed {
                 if pen >= INFO_MISS_CAP {
                     continue;
                 }
@@ -551,28 +591,51 @@ impl Estimator {
                     // （旧: 評価側の soft_decay^penalty。C-7 P1 で logw へ統合）
                     surv_logw.push(lw + strict_dlw_median.unwrap_or(dlw) + EPS_INFO.ln());
                     surv_hist.push(hist);
+                    surv_taint.push(taint);
                 } else {
-                    graveyard_candidates.push((pos, pen, lw, hist));
+                    graveyard_candidates.push((pos, pen, lw, hist, taint));
                 }
+            }
+        }
+        // ε_phys の最後の砦（C-7 P3 / D4）: 完全全滅（ソフトも含め生存ゼロ）の
+        // ときだけ、物理不整合の棄却粒子を強制適用して phys_taint+1 で残す。
+        // 狙いは信念の連続性（玉位置などの大域情報）で、盤面は観測と厳密整合
+        // しない「嘘」— 評価側は taint>0 を通常サンプルから除外し、
+        // 玉位置系の用途（王手ソルバーの投票）にだけ使う
+        let complete_wipe = surv_pos.is_empty();
+        if complete_wipe && self.eps_phys > 0.0 && !graveyard_candidates.is_empty() {
+            for (pos, pen, lw, hist, taint) in &graveyard_candidates {
+                if surv_pos.len() >= self.target {
+                    break;
+                }
+                let mut forced = pos.clone();
+                force_apply(&mut forced, my_color, constraint);
+                surv_pos.push(forced);
+                surv_pen.push(*pen);
+                surv_logw.push(lw + self.eps_phys.ln());
+                surv_hist.push(hist.clone());
+                surv_taint.push(taint.saturating_add(1));
             }
         }
         // 厳密全滅なら棄却粒子を墓場へ保管する（以後のターンで復活を試みる。
         // 物理的にはスナップショット時点まで整合していた歴史なので嘘ではないが、
         // snap.miss > 0 のものは情報観測に info_miss 分だけ汚染されている —
         // miss は復活後も維持されるので較正は保たれる）。
-        // 完全全滅（ソフトもゼロ）のときだけ logw の基準点を今へ再ベースする
-        // （復活粒子と新規リプレイ粒子のスケールを揃える近似）
-        if strict_count(&surv_pen) == 0 && !graveyard_candidates.is_empty() {
-            graveyard_candidates.sort_by_key(|(_, pen, _, _)| *pen);
+        // 完全全滅（ソフトもゼロ。taint 救済は数えない）のときだけ logw の
+        // 基準点を今へ再ベースする（復活粒子と新規リプレイ粒子のスケールを
+        // 揃える近似）
+        if strict_count(&surv_pen, &surv_taint) == 0 && !graveyard_candidates.is_empty() {
+            graveyard_candidates.sort_by_key(|(_, pen, _, _, taint)| (*taint, *pen));
             graveyard_candidates.truncate(GRAVEYARD_CAP);
             self.graveyard = graveyard_candidates;
-            if surv_pos.is_empty() {
+            if complete_wipe {
                 self.rebase_cidx = cidx;
             }
         }
         if self.debug_fail.is_some() {
-            let strict = surv_pen.iter().filter(|&&m| m == 0).count();
-            let soft = surv_pen.len() - strict;
+            let strict = strict_count(&surv_pen, &surv_taint);
+            let taint_n = surv_taint.iter().filter(|&&t| t > 0).count();
+            let soft = surv_pen.len() - strict - taint_n;
             let kind = match constraint {
                 Constraint::MyMove { captured, gives_check, .. } => {
                     format!("MyMove(cap={captured:?},chk={gives_check})")
@@ -583,7 +646,7 @@ impl Estimator {
                 }
             };
             eprintln!(
-                "    [c{cidx}] {kind}: 厳密{strict} soft{soft} 墓場{} 修復累計{}",
+                "    [c{cidx}] {kind}: 厳密{strict} soft{soft} taint{taint_n} 墓場{} 修復累計{}",
                 self.graveyard.len(),
                 self.rejuv_repaired,
             );
@@ -592,6 +655,7 @@ impl Estimator {
         self.info_miss = surv_pen;
         self.logw = surv_logw;
         self.hist = surv_hist;
+        self.phys_taint = surv_taint;
     }
 
     /// 情報系の制約（王手宣言の一致・自分の反則の説明）だけを緩和した適用。
@@ -631,7 +695,7 @@ impl Estimator {
         current: Option<&Constraint>,
         rebase: Option<usize>,
         deadline: std::time::Instant,
-    ) -> Option<(Position, u8, f64, VecDeque<Snap>)> {
+    ) -> Option<Repaired> {
         for &depth in &REJUV_DEPTHS {
             if depth > hist.len() {
                 break;
@@ -668,7 +732,7 @@ impl Estimator {
         rebase: Option<usize>,
         max: usize,
         deadline: std::time::Instant,
-    ) -> (Vec<(Position, u8, f64, VecDeque<Snap>)>, Vec<Rejected>) {
+    ) -> (Vec<Repaired>, Vec<Rejected>) {
         let mut repaired = vec![];
         let mut pool: Vec<Option<Rejected>> = failed.into_iter().map(Some).collect();
         // deadline まで depth スイープを周回する（1周の固定試行で打ち切ると
@@ -682,6 +746,7 @@ impl Estimator {
                     }
                     let Some(f) = slot else { continue };
                     let hist = &f.3;
+                    let _ = f.4;
                     if depth > hist.len() {
                         continue;
                     }
@@ -722,11 +787,12 @@ impl Estimator {
         upto: usize,
         current: Option<&Constraint>,
         rebase: Option<usize>,
-    ) -> Option<(Position, u8, f64, VecDeque<Snap>)> {
+    ) -> Option<Repaired> {
         let mut pos = snap.pos.clone();
         let mut lw = if rebase.is_some() { 0.0 } else { snap.logw };
         let count_from = rebase.unwrap_or(0);
         let miss = snap.miss;
+        let taint = snap.taint;
         // 巻き戻し先より前のスナップショットは有効（snap.cidx のエントリは
         // 「この決定の適用前」の状態なので、引き直し後もそのまま正しい）。
         // ただし墓場復活（rebase あり）では旧集団の logw スケールを引き継げない
@@ -740,6 +806,7 @@ impl Estimator {
                 pos: snap.pos.clone(),
                 logw: 0.0,
                 miss,
+                taint,
             });
             h
         } else {
@@ -772,6 +839,7 @@ impl Estimator {
                             pos: pos.clone(),
                             logw: lw,
                             miss,
+                            taint,
                         });
                     }
                     let k = self.my_capture_idx.partition_point(|&j| j < i);
@@ -802,7 +870,7 @@ impl Estimator {
                 return None;
             }
         }
-        Some((pos, miss, lw, new_hist))
+        Some((pos, miss, lw, new_hist, taint))
     }
 
     /// 制約後読みガイド: 決定点 i の後（最大 GUIDE_HORIZON 制約先まで）から
@@ -856,10 +924,15 @@ impl Estimator {
         // logw のスケール: ソフトが生きている（集団のスケールが継続している）
         // ときは snap.logw から再出発（rebase なし）、完全全滅後の再建なら
         // rebase 規約（0 起点、rebase_cidx 以降のみ課金）で揃える
-        let strict0 = self.info_miss.iter().filter(|&&m| m == 0).count();
+        let strict0 = self
+            .info_miss
+            .iter()
+            .zip(&self.phys_taint)
+            .filter(|&(&m, &t)| m == 0 && t == 0)
+            .count();
         if strict0 < self.target / 4 && !self.graveyard.is_empty() {
             let n = self.constraints.len();
-            self.graveyard.retain(|(_, _, _, hist)| {
+            self.graveyard.retain(|(_, _, _, hist, _)| {
                 hist.back().is_some_and(|s| n - s.cidx <= GRAVEYARD_MAX_SEGMENT)
             });
             let graveyard = std::mem::take(&mut self.graveyard);
@@ -878,19 +951,25 @@ impl Estimator {
                 .then_some(self.rebase_cidx);
             let (repaired, still) =
                 self.rejuvenate_batch(graveyard, n, None, rebase, self.target / 4, deadline);
-            for (pos, pen, lw, hist) in repaired {
+            for (pos, pen, lw, hist, taint) in repaired {
                 self.revived += 1;
                 self.particles.push(pos);
                 self.info_miss.push(pen);
                 self.logw.push(lw);
                 self.hist.push(hist);
+                self.phys_taint.push(taint);
             }
             // 修復できなかった分は墓場に残す（stale で自然消滅）
             self.graveyard = still;
         }
         // リプレイの目標は「厳密整合の粒子数」。ソフト粒子で頭数が足りていても
         // 厳密粒子が薄ければリプレイで置き換えにいく（ソフトはあくまで近似）
-        let mut strict = self.info_miss.iter().filter(|&&p| p == 0).count();
+        let mut strict = self
+            .info_miss
+            .iter()
+            .zip(&self.phys_taint)
+            .filter(|&(&m, &t)| m == 0 && t == 0)
+            .count();
         if strict < self.target {
             for _ in 0..self.regen_attempts {
                 if strict >= self.target || std::time::Instant::now() > regen_deadline {
@@ -901,6 +980,7 @@ impl Estimator {
                     self.info_miss.push(0);
                     self.logw.push(lw);
                     self.hist.push(hist);
+                    self.phys_taint.push(0);
                     strict += 1;
                 }
             }
@@ -912,6 +992,7 @@ impl Estimator {
                 self.info_miss.push(0);
                 self.logw.push(lw);
                 self.hist.push(hist);
+                self.phys_taint.push(0);
             }
         }
         // ラッチしない: 粒子が戻れば健全に戻る（呼び出し側は毎手 update する）
@@ -921,21 +1002,24 @@ impl Estimator {
         }
         // 溢れの整理: info_miss 昇順（厳密優先）→ logw 降順で target まで絞る
         if self.particles.len() > self.target {
-            let mut quads: Vec<(u8, f64, Position, VecDeque<Snap>)> =
+            let mut quints: Vec<(u8, u8, f64, Position, VecDeque<Snap>)> =
                 std::mem::take(&mut self.info_miss)
                     .into_iter()
+                    .zip(std::mem::take(&mut self.phys_taint))
                     .zip(std::mem::take(&mut self.logw))
                     .zip(std::mem::take(&mut self.particles))
                     .zip(std::mem::take(&mut self.hist))
-                    .map(|(((pen, lw), pos), hist)| (pen, lw, pos, hist))
+                    .map(|((((pen, taint), lw), pos), hist)| (taint, pen, lw, pos, hist))
                     .collect();
-            quads.sort_by(|a, b| {
-                a.0.cmp(&b.0)
-                    .then(b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal))
+            quints.sort_by(|a, b| {
+                (a.0, a.1)
+                    .cmp(&(b.0, b.1))
+                    .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
             });
-            quads.truncate(self.target);
-            for (pen, lw, pos, hist) in quads {
+            quints.truncate(self.target);
+            for (taint, pen, lw, pos, hist) in quints {
                 self.info_miss.push(pen);
+                self.phys_taint.push(taint);
                 self.logw.push(lw);
                 self.particles.push(pos);
                 self.hist.push(hist);
@@ -972,6 +1056,7 @@ impl Estimator {
         let mut new_pos = Vec::with_capacity(want);
         let mut new_miss = Vec::with_capacity(want);
         let mut new_hist = Vec::with_capacity(want);
+        let mut new_taint = Vec::with_capacity(want);
         let mut i = 0usize;
         let mut cum = ws[0];
         for _ in 0..want {
@@ -981,6 +1066,7 @@ impl Estimator {
             }
             new_pos.push(self.particles[i].clone());
             new_miss.push(self.info_miss[i]);
+            new_taint.push(self.phys_taint[i]);
             let mut h = self.hist[i].clone();
             shift_hist(&mut h, -self.logw[i]);
             new_hist.push(h);
@@ -990,6 +1076,7 @@ impl Estimator {
         self.info_miss = new_miss;
         self.logw = vec![0.0; want];
         self.hist = new_hist;
+        self.phys_taint = new_taint;
         // 以後の新規リプレイ粒子はここ以降の累積だけを課金する（スケール整合）
         self.rebase_cidx = self.constraints.len();
     }
@@ -1025,6 +1112,7 @@ impl Estimator {
                 self.info_miss.push(self.info_miss[i]);
                 self.logw.push(share);
                 self.hist.push(self.hist[i].clone());
+                self.phys_taint.push(self.phys_taint[i]);
             }
         }
     }
@@ -1131,6 +1219,7 @@ impl Estimator {
                 pos: p.clone(),
                 logw: *l,
                 miss: 0,
+                taint: 0,
             })
             .collect();
         Some((pos, lw, hist))
@@ -1159,6 +1248,71 @@ fn apply_my_move(
 /// 反則になった手との整合: 粒子上でも非合法であること
 fn foul_consistent(pos: &Position, my_color: Color, mv: &ShogiMove) -> bool {
     pos.turn() == my_color && !pos.is_legal(mv)
+}
+
+/// 物理不整合の粒子への制約の強制適用（ε_phys の最後の砦専用）。
+/// 自分側の状態（自駒配置・持ち駒・手番）は真実と同期させ、相手側は
+/// 分かる範囲（取られた自駒 → 相手の持ち駒）だけ反映する。結果の盤面は
+/// 観測と厳密整合しない近似なので、評価側は玉位置系の用途に限定すること
+fn force_apply(pos: &mut Position, my_color: Color, constraint: &Constraint) {
+    match constraint {
+        Constraint::MyMove { mv, .. } => {
+            if pos.turn() == my_color && pos.is_legal(mv) {
+                // 合法なら通常適用（取得駒種・王手宣言の不一致は無視）
+                pos.play_unchecked(mv);
+                return;
+            }
+            match *mv {
+                ShogiMove::Board { from, to, promote } => {
+                    if let Some(mut p) =
+                        pos.piece_at(from).filter(|p| p.color == my_color)
+                    {
+                        if let Some(victim) =
+                            pos.piece_at(to).filter(|v| v.color != my_color)
+                        {
+                            let r = unpromote_role(victim.role);
+                            pos.set_hand(my_color, r, pos.hand_count(my_color, r) + 1);
+                        }
+                        if promote {
+                            if let Some(pr) = promote_role(p.role) {
+                                p.role = pr;
+                            }
+                        }
+                        pos.set(from, None);
+                        pos.set(to, Some(p));
+                    }
+                }
+                ShogiMove::Drop { role, to } => {
+                    if pos.hand_count(my_color, role) > 0 {
+                        pos.set_hand(my_color, role, pos.hand_count(my_color, role) - 1);
+                        pos.set(
+                            to,
+                            Some(Piece {
+                                color: my_color,
+                                role,
+                            }),
+                        );
+                    }
+                }
+            }
+            pos.set_turn(my_color.other());
+        }
+        // 反則は指されていないので盤面維持（説明できない、は情報系の嘘として飲む）
+        Constraint::MyFoul { .. } => {}
+        Constraint::OppMove { captured_at, .. } => {
+            // 幽霊取り: 取られた自駒だけ盤から除き、相手の持ち駒へ移す
+            // （どの相手駒が来たかは分からないので相手駒は置かない）
+            if let Some(sq) = captured_at {
+                if let Some(p) = pos.piece_at(*sq).filter(|p| p.color == my_color) {
+                    let r = unpromote_role(p.role);
+                    let opp = my_color.other();
+                    pos.set_hand(opp, r, pos.hand_count(opp, r) + 1);
+                    pos.set(*sq, None);
+                }
+            }
+            pos.set_turn(my_color);
+        }
+    }
 }
 
 /// 動かした駒（着地点）が対象マスのどれかへ新たに利きを付けたか。
@@ -1671,6 +1825,7 @@ mod tests {
         est.info_miss.clear();
         est.logw.clear();
         est.hist.clear();
+        est.phys_taint.clear();
         est.replenish();
         assert!(est.healthy(), "バックトラック付きリプレイで再生成できるはず");
         for pos in est.particles() {
@@ -1695,6 +1850,7 @@ mod tests {
         est.info_miss.clear();
         est.logw.clear();
         est.hist.clear();
+        est.phys_taint.clear();
         est.replenish();
         assert!(est.healthy(), "リプレイで再生成できるはず");
         assert_eq!(est.particles().len(), TARGET_PARTICLES);
@@ -1812,8 +1968,9 @@ mod tests {
     #[test]
     fn soft_pass_does_not_relax_physical_constraints() {
         // 初手で 5e の駒を取ることはどの粒子でも物理的に不可能
-        // （5e への合法手自体がない）→ ソフト救済でも救えず全滅する
+        // （5e への合法手自体がない）→ ソフト救済でも救えず、ε_phys 無効なら全滅
         let mut est = Estimator::with_seed(Color::Sente, 5);
+        est.eps_phys = 0.0;
         let c = Constraint::MyMove {
             mv: parse_usi("5g5e").unwrap(),
             captured: Some(Role::Pawn),
@@ -1821,6 +1978,52 @@ mod tests {
         };
         est.apply_constraint(&c);
         assert!(est.particles.is_empty());
+    }
+
+    #[test]
+    fn eps_phys_keeps_tainted_particles_on_complete_wipe() {
+        // 同じ完全全滅でも ε_phys 有効なら taint=1 の粒子として残り、
+        // 自駒側の状態（5g5e の強制適用）は真実と同期する。厳密カウントは 0
+        let mut est = Estimator::with_seed(Color::Sente, 5);
+        est.eps_phys = 0.01;
+        let c = Constraint::MyMove {
+            mv: parse_usi("5g5e").unwrap(),
+            captured: Some(Role::Pawn),
+            gives_check: false,
+        };
+        est.apply_constraint(&c);
+        assert!(!est.particles.is_empty(), "ε_phys の最後の砦で生存するはず");
+        assert!(est.phys_taint.iter().all(|&t| t == 1));
+        assert!(
+            est.logw.iter().all(|&lw| (lw - 0.01f64.ln()).abs() < 1e-9),
+            "ε_phys の課金が logw に乗る"
+        );
+        for pos in est.particles() {
+            // 強制適用: 自分の歩が 5e に立ち、手番は相手へ
+            assert_eq!(
+                pos.piece_at(Coord { file: 5, rank: 5 }).map(|p| (p.color, p.role)),
+                Some((Color::Sente, Role::Pawn))
+            );
+            assert_eq!(pos.turn(), Color::Gote);
+        }
+    }
+
+    #[test]
+    fn tainted_particles_are_excluded_from_strict_and_repairable() {
+        // taint>0 は厳密カウントから除外される（リプレイ目標・ゲート判定）
+        let mut est = Estimator::with_seed(Color::Sente, 9);
+        let n = est.target;
+        two_kind_particles(&mut est, n / 2, n - n / 2);
+        for t in est.phys_taint.iter_mut().take(n / 2) {
+            *t = 1;
+        }
+        let strict = est
+            .info_miss
+            .iter()
+            .zip(&est.phys_taint)
+            .filter(|&(&m, &t)| m == 0 && t == 0)
+            .count();
+        assert_eq!(strict, n - n / 2);
     }
 
     #[test]
@@ -1848,17 +2051,20 @@ mod tests {
         est.info_miss.clear();
         est.logw.clear();
         est.hist.clear();
+        est.phys_taint.clear();
         for _ in 0..n_a {
             est.particles.push(a.clone());
             est.info_miss.push(0);
             est.logw.push(0.0);
             est.hist.push(VecDeque::new());
+            est.phys_taint.push(0);
         }
         for _ in 0..n_b {
             est.particles.push(b.clone());
             est.info_miss.push(0);
             est.logw.push(0.0);
             est.hist.push(VecDeque::new());
+            est.phys_taint.push(0);
         }
         (a, b)
     }
@@ -1969,12 +2175,14 @@ mod tests {
             pos: pre1.clone(),
             logw: 0.0,
             miss: 0,
+            taint: 0,
         });
         hist.push_back(Snap {
             cidx: 3,
             pos: pre2.clone(),
             logw: snap_lw,
             miss: 0,
+            taint: 0,
         });
         // 確率的な修復なので、失敗したら rng を進めて繰り返す（20回以内に成功）
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5000);
@@ -1985,8 +2193,9 @@ mod tests {
                 break;
             }
         }
-        let (pos, miss, lw, new_hist) = out.expect("巻き戻し＋ガイドで修復できるはず");
+        let (pos, miss, lw, new_hist, taint) = out.expect("巻き戻し＋ガイドで修復できるはず");
         assert_eq!(miss, 0);
+        assert_eq!(taint, 0);
         // 修復後は ▲2e2d まで適用済み: 2d に自分の歩、相手の歩を1枚取った
         assert_eq!(
             pos.piece_at(Coord { file: 2, rank: 4 })

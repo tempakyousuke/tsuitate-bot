@@ -138,17 +138,30 @@ fn extract_samples(
             .iter()
             .copied()
             .fold(f64::MIN, f64::max);
+        // 物理不整合（phys_taint>0）の粒子は学習候補に入れない
+        // （評価側の通常サンプルから除外されるものは学習分布にも入れない）
         let mut mass: HashMap<u64, f64> = HashMap::new();
-        for (pos, &lw) in est.particles().iter().zip(est.log_weights()) {
+        for ((pos, &lw), &taint) in est
+            .particles()
+            .iter()
+            .zip(est.log_weights())
+            .zip(est.phys_taint())
+        {
+            if taint > 0 {
+                continue;
+            }
             *mass.entry(pos.fingerprint()).or_insert(0.0) += (lw - max_lw).exp();
         }
         let mut seen = HashSet::new();
         seen.insert(truth_fp);
         let mut features = vec![particle_features(truth, bot, &ctx)];
         let mut offsets = vec![0.0]; // 真実は完全整合のベース重み1（= log 0.0）とみなす
-        for pos in est.particles() {
+        for (pos, &taint) in est.particles().iter().zip(est.phys_taint()) {
             if features.len() > 64 {
                 break;
+            }
+            if taint > 0 {
+                continue;
             }
             if seen.insert(pos.fingerprint()) {
                 features.push(particle_features(pos, bot, &ctx));

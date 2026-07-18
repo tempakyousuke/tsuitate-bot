@@ -781,6 +781,7 @@ impl Strategy for EstimatorStrategy {
         let sample = stratified_sample(
             est.particles(),
             est.info_miss(),
+            est.phys_taint(),
             est.log_weights(),
             view.your_color,
             &particle_ctx,
@@ -803,11 +804,23 @@ impl Strategy for EstimatorStrategy {
         });
 
         // 王手中は粒子に依存しない制約推論で「王手を解消する確率」を出す
-        // （粒子が枯渇する終盤の反則バースト対策。check.rs 参照）
+        // （粒子が枯渇する終盤の反則バースト対策。check.rs 参照）。
+        // クリーン粒子が全滅しているときだけ、ε_phys の taint 粒子を仮説投票に
+        // 使う（C-7 P3 / D4: 嘘の盤面だが玉・王手駒の幾何は直近まで整合していた
+        // 歴史なので、ブラインドで手探りするよりは仮説の重み付けに役立つ。
+        // 用途はこの投票に限定し、駒得・リスク・p(合法) には混ぜない）
+        let taint_fallback: Vec<(&Position, f64)> = if view.you_in_check
+            && sample.is_empty()
+        {
+            taint_check_sample(est)
+        } else {
+            vec![]
+        };
         let mut check_solver = if view.you_in_check {
             let fouls: Vec<ShogiMove> =
                 foul_tried.iter().filter_map(|u| parse_usi(u)).collect();
-            CheckSolver::new(view, &sample, &fouls, log)
+            let votes = if sample.is_empty() { &taint_fallback } else { &sample };
+            CheckSolver::new(view, votes, &fouls, log)
         } else {
             None
         };
@@ -890,7 +903,8 @@ impl Strategy for EstimatorStrategy {
         // gain 内の静的リスク項の depth2_replace 分を実測の期待損失で
         // 置き換えて（一致するなら無変化）、最終式を適用し直す
         scored.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
-        let mut best: Option<(String, f64)> = None;
+        // (usi, 選択手の p_legal, スコア)
+        let mut best: Option<(String, f64, f64)> = None;
         for (i, (usi, mv, out, adjust, score)) in scored.into_iter().enumerate() {
             let final_score = if i < budget.depth2_top_k {
                 let delta = depth2_delta(
@@ -909,13 +923,22 @@ impl Strategy for EstimatorStrategy {
             } else {
                 score
             };
-            if best.as_ref().is_none_or(|(_, s)| final_score > *s) {
-                best = Some((usi, final_score));
+            if best.as_ref().is_none_or(|(_, _, s)| final_score > *s) {
+                best = Some((usi, out.p_legal, final_score));
             }
         }
 
-        self.last_debug = Some(debug_summary(est, &sample, push));
-        best.map(|(usi, _)| usi)
+        let mut debug = debug_summary(est, &sample, push);
+        // 選択手の p(合法) 予測を記録へ残す（C-7 P3 の前提整備: アリーナ真実の
+        // 受理/反則と突き合わせて Brier/logloss を測る。bin/analyze 参照）
+        if let (Some((_, p_legal, _)), Some(obj)) = (&best, debug.as_object_mut()) {
+            obj.insert(
+                "p_legal".into(),
+                serde_json::json!(((p_legal * 1000.0).round()) / 1000.0),
+            );
+        }
+        self.last_debug = Some(debug);
+        best.map(|(usi, _, _)| usi)
     }
 
     fn name(&self) -> &'static str {
@@ -954,6 +977,7 @@ impl Strategy for EstimatorStrategy {
 fn stratified_sample<'a>(
     particles: &'a [Position],
     info_miss: &[u8],
+    phys_taint: &[u8],
     log_weights: &[f64],
     my_color: Color,
     ctx: &ParticleCtx,
@@ -961,7 +985,10 @@ fn stratified_sample<'a>(
     rng: &mut StdRng,
 ) -> Vec<(&'a Position, f64)> {
     let opp = my_color.other();
-    // ユニーク化: 同一指紋の質量 logΣexp(logw) と最小 info_miss を畳み込む
+    // ユニーク化: 同一指紋の質量 logΣexp(logw) と最小 info_miss を畳み込む。
+    // 物理不整合（phys_taint>0）の粒子は**通常サンプルから除外**する
+    // （C-7 P3 / D4: 嘘の盤面を駒得・リスク・p(合法) に混ぜない。
+    // 用途は王手ソルバーの投票フォールバック（taint_check_sample）に限定）
     struct Unique<'a> {
         pos: &'a Position,
         mass_log: f64,
@@ -971,6 +998,9 @@ fn stratified_sample<'a>(
     let mut seen: HashMap<u64, usize> = HashMap::new();
     let mut uniques: Vec<Unique> = vec![];
     for (i, pos) in particles.iter().enumerate() {
+        if phys_taint.get(i).copied().unwrap_or(0) > 0 {
+            continue;
+        }
         let lw = log_weights.get(i).copied().unwrap_or(0.0);
         let miss = info_miss.get(i).copied().unwrap_or(0);
         match seen.entry(pos.fingerprint()) {
@@ -1127,6 +1157,43 @@ fn stratified_sample<'a>(
     sample
 }
 
+/// ε_phys の taint 粒子から王手ソルバー投票用のサンプルを作る（C-7 P3）。
+/// クリーン粒子が全滅しているときのフォールバック専用。重みは指紋ごとの
+/// 正規化 Σexp(logw)（taint の EPS_PHYS 課金は logw に済み、相対値だけ使う）
+fn taint_check_sample(est: &Estimator) -> Vec<(&Position, f64)> {
+    let max_lw = est
+        .log_weights()
+        .iter()
+        .zip(est.phys_taint())
+        .filter(|&(_, &t)| t > 0)
+        .map(|(&lw, _)| lw)
+        .fold(f64::MIN, f64::max);
+    if max_lw == f64::MIN {
+        return vec![];
+    }
+    let mut seen: HashMap<u64, usize> = HashMap::new();
+    let mut out: Vec<(&Position, f64)> = vec![];
+    for ((pos, &t), &lw) in est
+        .particles()
+        .iter()
+        .zip(est.phys_taint())
+        .zip(est.log_weights())
+    {
+        if t == 0 {
+            continue;
+        }
+        let w = (lw - max_lw).exp();
+        match seen.entry(pos.fingerprint()) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(out.len());
+                out.push((pos, w));
+            }
+            std::collections::hash_map::Entry::Occupied(e) => out[*e.get()].1 += w,
+        }
+    }
+    out
+}
+
 /// log(exp(a) + exp(b))（オーバーフロー安全）
 fn logaddexp(a: f64, b: f64) -> f64 {
     let (hi, lo) = if a >= b { (a, b) } else { (b, a) };
@@ -1171,6 +1238,7 @@ fn debug_summary(est: &Estimator, sample: &[(&Position, f64)], push: f64) -> ser
         "unique_particles": fingerprints.len(),
         "sample_slots": sample.len(),
         "soft_particles": est.info_miss().iter().filter(|&&p| p > 0).count(),
+        "taint_particles": est.phys_taint().iter().filter(|&&t| t > 0).count(),
         "ess": (est.last_ess() * 10.0).round() / 10.0,
         "resamples": est.resamples(),
         "endgame_push": (push * 100.0).round() / 100.0,
@@ -2085,7 +2153,7 @@ pub(crate) mod tests {
         }
         let miss = vec![0u8; particles.len()];
         // 上限16 < 層数9×最低枠4=36: 件数は必ず16以下
-        let sample = stratified_sample(&particles, &miss, &vec![0.0f64; particles.len()], Color::Sente, &ParticleCtx::default(), 16, &mut rng);
+        let sample = stratified_sample(&particles, &miss, &vec![0u8; particles.len()], &vec![0.0f64; particles.len()], Color::Sente, &ParticleCtx::default(), 16, &mut rng);
         assert!(sample.len() <= 16, "len={}", sample.len());
         // ラウンドロビン順: 先頭9件で9層すべての玉位置が現れる
         let prefix_kings: HashSet<_> = sample
@@ -2096,10 +2164,31 @@ pub(crate) mod tests {
         assert_eq!(prefix_kings.len(), 9, "prefixが層化されていない");
         // 上限が大きい場合も件数はユニーク数以下・重みは旧方式と一致
         // （不変条件①: 全ユニーク・logw=0・ソフトなしなら重み和 = ユニーク数）
-        let sample = stratified_sample(&particles, &miss, &vec![0.0f64; particles.len()], Color::Sente, &ParticleCtx::default(), 512, &mut rng);
+        let sample = stratified_sample(&particles, &miss, &vec![0u8; particles.len()], &vec![0.0f64; particles.len()], Color::Sente, &ParticleCtx::default(), 512, &mut rng);
         assert_eq!(sample.len(), 54);
         let mass: f64 = sample.iter().map(|(_, w)| w).sum();
         assert!((mass - 54.0).abs() < 1e-6, "mass={mass}");
+    }
+
+    #[test]
+    fn stratified_sample_excludes_tainted_particles() {
+        // 物理不整合（phys_taint>0）の粒子は通常サンプルに混ざらない（C-7 P3）
+        let mut rng = StdRng::seed_from_u64(11);
+        let clean = synth_position(1, 2);
+        let tainted = synth_position(2, 3);
+        let particles = vec![clean.clone(), tainted.clone()];
+        let miss = vec![0u8, 0u8];
+        let taints = vec![0u8, 1u8];
+        let logw = vec![0.0f64, 0.0];
+        let sample = stratified_sample(&particles, &miss, &taints, &logw, Color::Sente, &ParticleCtx::default(), 16, &mut rng);
+        assert!(!sample.is_empty());
+        assert!(
+            sample.iter().all(|(p, _)| p.fingerprint() == clean.fingerprint()),
+            "taint 粒子がサンプルに混ざっている"
+        );
+        // 較正: ユニーク1件（クリーンのみ）
+        let mass: f64 = sample.iter().map(|(_, w)| w).sum();
+        assert!((mass - 1.0).abs() < 1e-6, "mass={mass}");
     }
 
     #[test]
@@ -2117,7 +2206,7 @@ pub(crate) mod tests {
         let mut a_share_sum = 0.0;
         for seed in 0..trials {
             let mut rng = StdRng::seed_from_u64(seed);
-            let sample = stratified_sample(&particles, &miss, &logw, Color::Sente, &ParticleCtx::default(), 16, &mut rng);
+            let sample = stratified_sample(&particles, &miss, &vec![0u8; particles.len()], &logw, Color::Sente, &ParticleCtx::default(), 16, &mut rng);
             let total: f64 = sample.iter().map(|(_, w)| w).sum();
             assert!((total - 2.0).abs() < 1e-6, "較正: ユニーク2件で mass=2.0");
             let a_mass: f64 = sample
@@ -2149,7 +2238,7 @@ pub(crate) mod tests {
         let trials = 400;
         for seed in 0..trials {
             let mut rng = StdRng::seed_from_u64(seed);
-            let sample = stratified_sample(&particles, &miss, &logw, Color::Sente, &ParticleCtx::default(), 1, &mut rng);
+            let sample = stratified_sample(&particles, &miss, &vec![0u8; particles.len()], &logw, Color::Sente, &ParticleCtx::default(), 1, &mut rng);
             assert_eq!(sample.len(), 1);
             if sample[0].0.fingerprint() == strict_fp {
                 strict_hits += 1;
@@ -2181,7 +2270,7 @@ pub(crate) mod tests {
         let mut share_sum = 0.0;
         for seed in 0..trials {
             let mut rng = StdRng::seed_from_u64(1000 + seed);
-            let sample = stratified_sample(&particles, &miss, &logw, Color::Sente, &ParticleCtx::default(), 2, &mut rng);
+            let sample = stratified_sample(&particles, &miss, &vec![0u8; particles.len()], &logw, Color::Sente, &ParticleCtx::default(), 2, &mut rng);
             let total: f64 = sample.iter().map(|(_, w)| w).sum();
             let soft_mass: f64 = sample
                 .iter()
@@ -2208,7 +2297,7 @@ pub(crate) mod tests {
                 .collect();
         let miss = vec![1u8; particles.len()];
         let logw = vec![EPS_INFO.ln(); particles.len()];
-        let sample = stratified_sample(&particles, &miss, &logw, Color::Sente, &ParticleCtx::default(), 16, &mut rng);
+        let sample = stratified_sample(&particles, &miss, &vec![0u8; particles.len()], &logw, Color::Sente, &ParticleCtx::default(), 16, &mut rng);
         assert!(sample.len() <= 16);
         let mass: f64 = sample.iter().map(|(_, w)| w).sum();
         let expected = 16.0 * EPS_INFO;

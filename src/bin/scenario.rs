@@ -386,12 +386,19 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
                 est.update(&running);
                 turn_no += 1;
                 if seed == 0 {
-                    let strict = est.info_miss().iter().filter(|&&m| m == 0).count();
+                    let strict = est
+                        .info_miss()
+                        .iter()
+                        .zip(est.phys_taint())
+                        .filter(|&(&m, &t)| m == 0 && t == 0)
+                        .count();
+                    let taint = est.phys_taint().iter().filter(|&&t| t > 0).count();
                     let (repaired, revived) = est.rejuv_stats();
                     eprintln!(
-                        "  [seed0] 手番{turn_no}: 粒子 {} (厳密{} healthy={} 修復{} 復活{})",
+                        "  [seed0] 手番{turn_no}: 粒子 {} (厳密{} taint{} healthy={} 修復{} 復活{})",
                         est.particles().len(),
                         strict,
+                        taint,
                         est.healthy(),
                         repaired,
                         revived,
@@ -427,17 +434,21 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
             .copied()
             .fold(f64::MIN, f64::max);
         // 重複局面は質量 Σexp(logw) を畳み込む（C-7 P1: multiplicity 保持。
-        // ソフト減衰はフィルタが logw へ課金済み。info_miss は厳密判定にだけ使う）
+        // ソフト減衰はフィルタが logw へ課金済み。info_miss は厳密判定にだけ使う。
+        // phys_taint>0 は非厳密扱い: 王手駒の分布には出るが玉位置・利きの
+        // 「厳密のみ」集計からは外れる）
         let mut mass: HashMap<u64, (f64, u8)> = HashMap::new();
-        for ((pp, &miss), &lw) in est
+        for (((pp, &miss), &taint), &lw) in est
             .particles()
             .iter()
             .zip(est.info_miss())
+            .zip(est.phys_taint())
             .zip(est.log_weights())
         {
-            let e = mass.entry(pp.fingerprint()).or_insert((0.0, miss));
+            let miss_eff = if taint > 0 { miss.max(1) } else { miss };
+            let e = mass.entry(pp.fingerprint()).or_insert((0.0, miss_eff));
             e.0 += (lw - max_logw).exp();
-            e.1 = e.1.min(miss);
+            e.1 = e.1.min(miss_eff);
         }
         let mut seen: HashSet<u64> = HashSet::new();
         for pp in est.particles() {

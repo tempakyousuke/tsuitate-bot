@@ -28,6 +28,9 @@ struct GameRecord {
     strategy: String,
     observations: Vec<Observation>,
     end: GameEndPayload,
+    /// (選択時の p_legal 予測, 実際に合法だったか)。chose イベントの
+    /// debug.p_legal と、その手の受理/反則の突き合わせ（C-7 P3 の較正測定）
+    p_legal_outcomes: Vec<(f64, bool)>,
 }
 
 fn load(path: &str) -> Option<GameRecord> {
@@ -36,6 +39,9 @@ fn load(path: &str) -> Option<GameRecord> {
     let mut strategy = String::new();
     let mut observations = vec![];
     let mut end = None;
+    let mut p_legal_outcomes = vec![];
+    // 直近の chose イベントの (usi, p_legal)。次の MyMove/MyFoul 観測と照合する
+    let mut pending_chose: Option<(String, f64)> = None;
     for line in content.lines() {
         let v: serde_json::Value = serde_json::from_str(line).ok()?;
         match v["type"].as_str() {
@@ -43,8 +49,26 @@ fn load(path: &str) -> Option<GameRecord> {
                 bot_color = serde_json::from_value(v["your_color"].clone()).ok();
                 strategy = v["strategy"].as_str().unwrap_or("?").to_string();
             }
+            Some("chose") => {
+                if let (Some(usi), Some(p)) =
+                    (v["usi"].as_str(), v["debug"]["p_legal"].as_f64())
+                {
+                    pending_chose = Some((usi.to_string(), p));
+                }
+            }
             Some("obs") => {
-                if let Ok(obs) = serde_json::from_value(v["event"].clone()) {
+                if let Ok(obs) = serde_json::from_value::<Observation>(v["event"].clone()) {
+                    match (&obs, &pending_chose) {
+                        (Observation::MyMove { usi, .. }, Some((cu, p))) if usi == cu => {
+                            p_legal_outcomes.push((*p, true));
+                            pending_chose = None;
+                        }
+                        (Observation::MyFoul { usi, .. }, Some((cu, p))) if usi == cu => {
+                            p_legal_outcomes.push((*p, false));
+                            pending_chose = None;
+                        }
+                        _ => {}
+                    }
                     observations.push(obs);
                 }
             }
@@ -60,6 +84,7 @@ fn load(path: &str) -> Option<GameRecord> {
         strategy,
         observations,
         end: end?,
+        p_legal_outcomes,
     })
 }
 
@@ -250,6 +275,7 @@ fn main() {
     let mut total_recap_missed_good = 0;
     let mut games = 0;
     let mut bot_wins = 0;
+    let mut p_legal_all: Vec<(f64, bool)> = vec![];
 
     for path in &paths {
         let Some(rec) = load(path) else {
@@ -257,6 +283,7 @@ fn main() {
             continue;
         };
         games += 1;
+        p_legal_all.extend(rec.p_legal_outcomes.iter().copied());
         let bot = rec.bot_color;
         let bot_won = matches!(
             (rec.end.result.as_str(), bot),
@@ -490,6 +517,37 @@ fn main() {
     if total_check_tested > 0 {
         println!(
             "王手中の反則: 実際 {total_check_tested}回 → ソルバー方策なら {total_check_solved}回"
+        );
+    }
+    // p_legal の較正（C-7 P3）: 選択手の合法確率予測 vs 実際の受理/反則。
+    // Brier = mean((p-y)^2)（小さいほど良い）。参考: 常に基底率を答える予測の Brier
+    if !p_legal_all.is_empty() {
+        let n = p_legal_all.len() as f64;
+        let base_rate = p_legal_all.iter().filter(|(_, y)| *y).count() as f64 / n;
+        let brier: f64 = p_legal_all
+            .iter()
+            .map(|(p, y)| {
+                let y = if *y { 1.0 } else { 0.0 };
+                (p - y) * (p - y)
+            })
+            .sum::<f64>()
+            / n;
+        let base_brier = base_rate * (1.0 - base_rate);
+        let logloss: f64 = p_legal_all
+            .iter()
+            .map(|(p, y)| {
+                let p = p.clamp(1e-6, 1.0 - 1e-6);
+                if *y { -p.ln() } else { -(1.0 - p).ln() }
+            })
+            .sum::<f64>()
+            / n;
+        println!(
+            "p_legal 較正（{}手 合法率{:.1}%）: Brier {:.4}（基底率予測 {:.4}）/ logloss {:.4}",
+            p_legal_all.len(),
+            base_rate * 100.0,
+            brier,
+            base_brier,
+            logloss,
         );
     }
 }
