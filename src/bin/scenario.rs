@@ -384,6 +384,11 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
     let mut all_king_mass = 0.0f64;
     // マスごとの相手利き枚数（0,1,2,3+）の重み質量
     let mut cover_tally: Vec<[f64; 4]> = vec![[0.0; 4]; diag_sqs.len()];
+    // taint 粒子だけでの同集計（strategy.rs の taint_particles/taint_square_coverage
+    // と同じ重み規約 = 0.5^(taint-1) 減衰・taint<=6・taint内max_lwで正規化）。
+    // 「局所被覆度ビリーフ」が真実とどれだけ一致するかの直接測定
+    let mut taint_cover_tally: Vec<[f64; 4]> = vec![[0.0; 4]; diag_sqs.len()];
+    let mut taint_cover_mass = 0.0f64;
     let mut strict_mass = 0.0f64;
     let mut total_unique = 0u32;
     let mut strict_unique = 0u32;
@@ -508,6 +513,62 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
                 cover_tally[i][n.min(3)] += w;
             }
         }
+        // taint 粒子だけの被覆度集計（strategy.rs の taint_particles/
+        // taint_square_coverage と**同じ規約**で計算する。診断が本番と
+        // 食い違うと較正の数字が無意味になる — codex レビュー指摘:
+        // ①玉も利き枚数に含める（本番の taint_square_coverage は role
+        // フィルタなし）②TAINT_POOL_CAP と同じ上限を適用 ③clean/soft 粒子の
+        // fingerprint を taint 専用マップへ誤って引いてパニックしない
+        // （タプルで直接持ち運び、HashMap の再引きをしない）
+        const TAINT_VOTE_MAX: u8 = 6;
+        const TAINT_POOL_CAP: usize = 256;
+        let max_taint_lw = est
+            .log_weights()
+            .iter()
+            .zip(est.phys_taint())
+            .filter(|&(_, &t)| t > 0 && t <= TAINT_VOTE_MAX)
+            .map(|(&lw, _)| lw)
+            .fold(f64::MIN, f64::max);
+        if max_taint_lw != f64::MIN {
+            let mut seen_t: HashMap<u64, usize> = HashMap::new();
+            let mut taint_uniques: Vec<(&Position, f64)> = vec![];
+            for ((pp, &t), &lw) in est
+                .particles()
+                .iter()
+                .zip(est.phys_taint())
+                .zip(est.log_weights())
+            {
+                if t == 0 || t > TAINT_VOTE_MAX {
+                    continue;
+                }
+                let w = (lw - max_taint_lw).exp() * 0.5f64.powi(i32::from(t) - 1);
+                match seen_t.entry(pp.fingerprint()) {
+                    std::collections::hash_map::Entry::Vacant(e) => {
+                        e.insert(taint_uniques.len());
+                        taint_uniques.push((pp, w));
+                    }
+                    std::collections::hash_map::Entry::Occupied(e) => {
+                        taint_uniques[*e.get()].1 += w;
+                    }
+                }
+            }
+            if taint_uniques.len() > TAINT_POOL_CAP {
+                taint_uniques.select_nth_unstable_by(TAINT_POOL_CAP, |a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                taint_uniques.truncate(TAINT_POOL_CAP);
+            }
+            for (pp, w) in taint_uniques {
+                taint_cover_mass += w;
+                for (i, (_, sq)) in diag_sqs.iter().enumerate() {
+                    let n = pp
+                        .pieces()
+                        .filter(|(from, pc)| pc.color == side.other() && pp.attacks(*from, *sq))
+                        .count();
+                    taint_cover_tally[i][n.min(3)] += w;
+                }
+            }
+        }
     }
 
     println!(
@@ -529,12 +590,7 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
         let mark = if *sq == truth_king { " ←真実" } else { "" };
         println!("  {sq}: {:.1}%{mark}", 100.0 * m / all_king_mass.max(1e-12));
     }
-    if strict_unique == 0 {
-        println!();
-        println!("厳密整合の粒子がありません（フィルタ死。seed0 の手番別トレースは stderr 参照）");
-        return;
-    }
-    if rep.pos.in_check(side) {
+    if rep.pos.in_check(side) && strict_unique > 0 {
         println!();
         println!("王手駒の分布（粒子内で手番側の玉に利いている相手駒。重み付き）:");
         let mut sorted: Vec<_> = checker_tally.into_iter().collect();
@@ -547,23 +603,60 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
             println!("  {key}: {pct:.1}%");
         }
     }
-    println!();
-    println!("相手玉の位置分布（上位、重み付き）:");
-    let mut sorted: Vec<_> = opp_king_tally.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    for (sq, m) in sorted.iter().take(8) {
-        println!("  {sq}: {:.1}%", 100.0 * m / strict_mass.max(1e-12));
-    }
-    for (i, (name, _)) in diag_sqs.iter().enumerate() {
-        let t = &cover_tally[i];
+    if strict_unique > 0 {
         println!();
-        println!(
-            "{name} への相手利き枚数（玉を除く、重み付き）: 0枚 {:.1}% / 1枚 {:.1}% / 2枚 {:.1}% / 3枚以上 {:.1}%",
-            100.0 * t[0] / strict_mass.max(1e-12),
-            100.0 * t[1] / strict_mass.max(1e-12),
-            100.0 * t[2] / strict_mass.max(1e-12),
-            100.0 * t[3] / strict_mass.max(1e-12),
-        );
+        println!("相手玉の位置分布（上位、重み付き）:");
+        let mut sorted: Vec<_> = opp_king_tally.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        for (sq, m) in sorted.iter().take(8) {
+            println!("  {sq}: {:.1}%", 100.0 * m / strict_mass.max(1e-12));
+        }
+    }
+    // マスへの相手利き枚数: 真実 vs 厳密粒子 vs taint粒子（局所被覆度ビリーフの
+    // 較正）。全滅ケース（strict_unique==0）でこそ taint 側の較正が主役になる
+    for (i, (name, sq)) in diag_sqs.iter().enumerate() {
+        // 真実の被覆度（審判が持つ全手順から直接計算。ground truth）。
+        // 厳密粒子の集計は玉を除く、taint（本番の taint_square_coverage と
+        // 同じ規約）は玉を含む — 列ごとに対応する真実を分けて表示する
+        // （codex レビュー指摘: 診断と本番の規約不一致は較正の数字を無意味にする）
+        let truth_no_king = rep
+            .pos
+            .pieces()
+            .filter(|(from, pc)| {
+                pc.color == side.other() && pc.role != Role::King && rep.pos.attacks(*from, *sq)
+            })
+            .count();
+        let truth_with_king = rep
+            .pos
+            .pieces()
+            .filter(|(from, pc)| pc.color == side.other() && rep.pos.attacks(*from, *sq))
+            .count();
+        println!();
+        println!("{name} への相手利き枚数:");
+        if strict_unique > 0 {
+            let t = &cover_tally[i];
+            println!(
+                "  厳密粒子（玉を除く、真実={truth_no_king}枚）: 0枚 {:.1}% / 1枚 {:.1}% / 2枚 {:.1}% / 3枚以上 {:.1}%",
+                100.0 * t[0] / strict_mass.max(1e-12),
+                100.0 * t[1] / strict_mass.max(1e-12),
+                100.0 * t[2] / strict_mass.max(1e-12),
+                100.0 * t[3] / strict_mass.max(1e-12),
+            );
+        } else {
+            println!("  厳密粒子: なし（フィルタ死）");
+        }
+        if taint_cover_mass > 0.0 {
+            let tt = &taint_cover_tally[i];
+            let expected: f64 = (0..4).map(|k| k as f64 * tt[k]).sum::<f64>() / taint_cover_mass;
+            println!(
+                "  taint粒子（玉を含む、本番と同じ規約。真実={truth_with_king}枚）: 0枚 {:.1}% / 1枚 {:.1}% / 2枚 {:.1}% / 3枚以上 {:.1}%（期待値 {:.2}枚）",
+                100.0 * tt[0] / taint_cover_mass,
+                100.0 * tt[1] / taint_cover_mass,
+                100.0 * tt[2] / taint_cover_mass,
+                100.0 * tt[3] / taint_cover_mass,
+                expected,
+            );
+        }
     }
 }
 

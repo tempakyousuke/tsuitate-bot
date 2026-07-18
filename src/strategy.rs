@@ -803,23 +803,36 @@ impl Strategy for EstimatorStrategy {
             _ => None,
         });
 
-        // 王手中は粒子に依存しない制約推論で「王手を解消する確率」を出す
-        // （粒子が枯渇する終盤の反則バースト対策。check.rs 参照）。
-        // クリーン粒子が全滅しているときだけ、ε_phys の taint 粒子を仮説投票に
-        // 使う（C-7 P3 / D4: 嘘の盤面だが玉・王手駒の幾何は直近まで整合していた
-        // 歴史なので、ブラインドで手探りするよりは仮説の重み付けに役立つ。
-        // 用途はこの投票に限定し、駒得・リスク・p(合法) には混ぜない）
-        let taint_fallback: Vec<(&Position, f64)> = if view.you_in_check
-            && sample.is_empty()
-        {
-            taint_check_sample(est)
+        // クリーン粒子が全滅しているときだけ taint 粒子を取り出す（C-7 P3 / D4:
+        // 嘘の盤面だが直近まで観測と整合していた歴史なので、用途を限定すれば
+        // ブラインドの手探りより役立つ）。王手ソルバーの仮説投票・玉攻め・
+        // ハング回避リスクで共有する（重複計算を避ける）。
+        // **上限つき**（長手数の対局で持続したブラインドはユニーク taint 粒子が
+        // 数百〜数千に膨らみうる。候補手ごとに O(particles×pieces) の被覆度
+        // 走査があるため無制限だと思考予算を溶かす — 125te/132te シナリオの
+        // 実測で検出。重み上位だけに絞る（自己正規化する関数群なので偏りは
+        // 軽微、末尾は寄与が薄い）
+        let taint_pool: Vec<(&Position, f64)> = if sample.is_empty() {
+            let mut pool = taint_particles(est);
+            if pool.len() > TAINT_POOL_CAP {
+                pool.select_nth_unstable_by(TAINT_POOL_CAP, |a, b| {
+                    b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+                });
+                pool.truncate(TAINT_POOL_CAP);
+            }
+            pool
         } else {
             vec![]
         };
+        let opp_color = view.your_color.other();
+
+        // 王手中は粒子に依存しない制約推論で「王手を解消する確率」を出す
+        // （粒子が枯渇する終盤の反則バースト対策。check.rs 参照）。
+        // taint 投票は駒得・リスク・p(合法) には混ぜない
         let mut check_solver = if view.you_in_check {
             let fouls: Vec<ShogiMove> =
                 foul_tried.iter().filter_map(|u| parse_usi(u)).collect();
-            let votes = if sample.is_empty() { &taint_fallback } else { &sample };
+            let votes = if sample.is_empty() { &taint_pool } else { &sample };
             CheckSolver::new(view, votes, &fouls, log)
         } else {
             None
@@ -864,14 +877,29 @@ impl Strategy for EstimatorStrategy {
             p
         };
 
-        // ブラインド時の玉攻め勾配（C-7 P3 追補）: クリーン粒子が全滅していても
-        // taint 粒子の玉位置信念は保たれている（kakunari 実測 91.8% 真実一致）。
-        // 玉位置分布**だけ**を抽出し、信念玉マスへ利きを作る手へボーナスを足す
-        let blind_king_dist: Vec<(Coord, f64)> = if sample.is_empty() {
-            taint_king_distribution(est)
-        } else {
+        // ブラインド時の玉攻め勾配（C-7 P3 追補）+ 局所被覆度ビリーフ（追補2）:
+        // taint_pool の玉位置分布だけを抽出して攻めへ使う。個々の駒種・位置は
+        // 特定しない「マスへの利き枚数密度」（ユーザーの実際の推論=
+        // 「５七への相手利き≥2枚の確率が低い」に対応）は blind_hang_risk が
+        // 受け（ハング回避）に使う
+        let blind_king_dist: Vec<(Coord, f64)> = if taint_pool.is_empty() {
             vec![]
+        } else {
+            taint_king_distribution(&taint_pool, opp_color)
         };
+        // 着地マスごとの被覆度をキャッシュ（成り/不成の同一着地マス等での
+        // 重複走査を避ける）
+        let mut coverage_cache: HashMap<Coord, f64> = HashMap::new();
+        // ブラインドハング回避リスクは**既定で無効**（実験用オプトイン）。
+        // codex レビュー: 5g（真実利き1枚）で期待値0.03（ほぼ0と誤信）、
+        // 4h（真実1枚）で期待値1.48（過大評価）という較正不良は「ノイズの多い
+        // 弱い特徴」ではなく「明確な誤誘導」水準で、blind_king_attack の
+        // ボーナスを重み1.0の piece_value×coverage が簡単に相殺してしまう
+        // （kakunari continue の指し継ぎが 2a1c 主体の無目的手へ逆戻りした
+        // 実測とも整合）。局所被覆度は玉位置と違い複数駒の相対位置が同時に
+        // 正しくないと当たらない複合情報で、taint の単純な force_apply では
+        // 再現できない（ユーザーの実践知見どおり）。再設計するまでは無効
+        let hang_risk_enabled = std::env::var("TSUITATE_ENABLE_HANG_RISK").is_ok();
 
         let rng = &mut self.rng;
         // 1段目: 全候補を1手読み（静的リスク項つき）で評価する。
@@ -893,6 +921,10 @@ impl Strategy for EstimatorStrategy {
             let mut adjust = rng.random_range(0.0..0.01);
             if !blind_king_dist.is_empty() {
                 adjust += BLIND_KING_ATTACK_W * blind_king_attack(view, &mv, &blind_king_dist);
+            }
+            if hang_risk_enabled && !taint_pool.is_empty() {
+                adjust -= BLIND_HANG_RISK_W
+                    * blind_hang_risk(view, &mv, &taint_pool, opp_color, &mut coverage_cache);
             }
             // 手戻り（直前の手をそのまま逆に戻す）は膠着の典型なので減点。
             // 直前に動かした駒をまた動かすだけの手も雑なシャッフルとして軽く減点
@@ -1176,10 +1208,20 @@ const TAINT_VOTE_MAX: u8 = 6;
 /// kakunari 実測: 玉位置信念は 91.8% で真実に集中するのに、評価が使えず
 /// 無目的手を選んでいた）
 const BLIND_KING_ATTACK_W: f64 = 2.0;
+/// ブラインド時のハング回避リスクの重み（クリーン粒子全滅時のみ。追補2）。
+/// 個々の駒種・位置を特定しない「マスへの相手利き枚数の期待値」を使い、
+/// 着地マスの被覆度が高いほど期待損失（駒の価値×密度）を引く。今までは
+/// 全滅すると exposed_capture_risk 等が完全に働かず、ただ取られるリスクへの
+/// 認識がゼロになっていた
+const BLIND_HANG_RISK_W: f64 = 1.0;
+/// taint_pool の上限（重み上位のみ使用。長手数対局での計算量爆発対策）
+const TAINT_POOL_CAP: usize = 256;
 
-/// taint 粒子から相手玉の位置分布（正規化済み）だけを抽出する。
-/// 深い taint は玉位置も信用が下がるので投票と同じ減衰・上限を適用
-fn taint_king_distribution(est: &Estimator) -> Vec<(Coord, f64)> {
+/// taint 粒子を指紋でユニーク化し、深度減衰つきの重みで合算して返す
+/// （taint_check_sample・taint_king_distribution・taint_square_coverage の
+/// 共通部品。深い taint は信用が下がるので 0.5^(taint-1) で減衰し、
+/// taint > TAINT_VOTE_MAX は除外する）
+fn taint_particles(est: &Estimator) -> Vec<(&Position, f64)> {
     let max_lw = est
         .log_weights()
         .iter()
@@ -1190,9 +1232,8 @@ fn taint_king_distribution(est: &Estimator) -> Vec<(Coord, f64)> {
     if max_lw == f64::MIN {
         return vec![];
     }
-    let opp = est.my_color().other();
-    let mut tally: HashMap<Coord, f64> = HashMap::new();
-    let mut total = 0.0f64;
+    let mut seen: HashMap<u64, usize> = HashMap::new();
+    let mut out: Vec<(&Position, f64)> = vec![];
     for ((pos, &t), &lw) in est
         .particles()
         .iter()
@@ -1202,10 +1243,27 @@ fn taint_king_distribution(est: &Estimator) -> Vec<(Coord, f64)> {
         if t == 0 || t > TAINT_VOTE_MAX {
             continue;
         }
+        let w = (lw - max_lw).exp() * 0.5f64.powi(i32::from(t) - 1);
+        match seen.entry(pos.fingerprint()) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(out.len());
+                out.push((pos, w));
+            }
+            std::collections::hash_map::Entry::Occupied(e) => out[*e.get()].1 += w,
+        }
+    }
+    out
+}
+
+/// taint 粒子から相手玉の位置分布（正規化済み）だけを抽出する。
+/// 深い taint は玉位置も信用が下がるので投票と同じ減衰・上限を適用
+fn taint_king_distribution(particles: &[(&Position, f64)], opp: Color) -> Vec<(Coord, f64)> {
+    let mut tally: HashMap<Coord, f64> = HashMap::new();
+    let mut total = 0.0f64;
+    for (pos, w) in particles {
         let Some(sq) = pos.king_square(opp) else {
             continue;
         };
-        let w = (lw - max_lw).exp() * 0.5f64.powi(i32::from(t) - 1);
         *tally.entry(sq).or_insert(0.0) += w;
         total += w;
     }
@@ -1213,6 +1271,28 @@ fn taint_king_distribution(est: &Estimator) -> Vec<(Coord, f64)> {
         return vec![];
     }
     tally.into_iter().map(|(sq, w)| (sq, w / total)).collect()
+}
+
+/// 指定マスへの相手利き枚数の期待値（taint 粒子由来）。個々の駒種・位置は
+/// 特定せず**密度だけ**を見る — kakunari 分析でのユーザーの実際の推論
+/// （「５七への相手利き≥2枚の確率が低い」）に対応する部品。
+/// 攻め（信念マスへ利きを作る）だけでなく受け（信念被覆度が高いマスへの
+/// 着地を避ける）にも使える
+fn taint_square_coverage(particles: &[(&Position, f64)], sq: Coord, opp: Color) -> f64 {
+    if particles.is_empty() {
+        return 0.0;
+    }
+    let mut total_w = 0.0f64;
+    let mut weighted_count = 0.0f64;
+    for (pos, w) in particles {
+        let n = pos
+            .pieces()
+            .filter(|(from, p)| p.color == opp && pos.attacks(*from, sq))
+            .count();
+        weighted_count += w * n as f64;
+        total_w += w;
+    }
+    if total_w <= 0.0 { 0.0 } else { weighted_count / total_w }
 }
 
 /// ブラインド時の玉攻めボーナス: 候補手の着地駒が「信念上の玉マス」へ利きを
@@ -1251,6 +1331,39 @@ fn blind_king_attack(view: &PlayerView, mv: &ShogiMove, dist: &[(Coord, f64)]) -
         .sum()
 }
 
+/// ブラインド時のハング回避リスク: 着地マスの taint 由来の被覆度（期待利き
+/// 枚数）× 着地する自駒の価値。相手駒は不可視なので着地駒の役割（成りを
+/// 反映）だけで価値を決める。取り（着地に既に自駒がある＝取られる駒がない）
+/// は対象外。cache は着地マスごとの被覆度の使い回し（成り/不成の同一着地マス
+/// 等で同じスキャンを繰り返さない。長手数対局での計算量対策）
+fn blind_hang_risk(
+    view: &PlayerView,
+    mv: &ShogiMove,
+    taint_pool: &[(&Position, f64)],
+    opp: Color,
+    cache: &mut HashMap<Coord, f64>,
+) -> f64 {
+    let (to, role) = match *mv {
+        ShogiMove::Board { from, to, promote } => {
+            let Some(p) = view.your_pieces.iter().find(|p| p.square == make_usi_square(from))
+            else {
+                return 0.0;
+            };
+            let role = if promote {
+                promote_role(p.role).unwrap_or(p.role)
+            } else {
+                p.role
+            };
+            (to, role)
+        }
+        ShogiMove::Drop { role, to } => (to, role),
+    };
+    let coverage = *cache
+        .entry(to)
+        .or_insert_with(|| taint_square_coverage(taint_pool, to, opp));
+    piece_value(role) * coverage
+}
+
 /// ε_phys の taint 粒子から王手ソルバー投票用のサンプルを作る（C-7 P3）。
 /// クリーン粒子が全滅しているときのフォールバック専用。重みは指紋ごとの
 /// 正規化 Σexp(logw)（taint の EPS_PHYS 課金は logw に済み、相対値だけ使う）に
@@ -1258,37 +1371,7 @@ fn blind_king_attack(view: &PlayerView, mv: &ShogiMove, dist: &[(Coord, f64)]) -
 /// ε 累積が複製数に実現されて消えるため、深い嘘の投票を別途薄める）。
 /// taint > TAINT_VOTE_MAX は投票から除外
 fn taint_check_sample(est: &Estimator) -> Vec<(&Position, f64)> {
-    let max_lw = est
-        .log_weights()
-        .iter()
-        .zip(est.phys_taint())
-        .filter(|&(_, &t)| t > 0)
-        .map(|(&lw, _)| lw)
-        .fold(f64::MIN, f64::max);
-    if max_lw == f64::MIN {
-        return vec![];
-    }
-    let mut seen: HashMap<u64, usize> = HashMap::new();
-    let mut out: Vec<(&Position, f64)> = vec![];
-    for ((pos, &t), &lw) in est
-        .particles()
-        .iter()
-        .zip(est.phys_taint())
-        .zip(est.log_weights())
-    {
-        if t == 0 || t > TAINT_VOTE_MAX {
-            continue;
-        }
-        let w = (lw - max_lw).exp() * 0.5f64.powi(i32::from(t) - 1);
-        match seen.entry(pos.fingerprint()) {
-            std::collections::hash_map::Entry::Vacant(e) => {
-                e.insert(out.len());
-                out.push((pos, w));
-            }
-            std::collections::hash_map::Entry::Occupied(e) => out[*e.get()].1 += w,
-        }
-    }
-    out
+    taint_particles(est)
 }
 
 /// log(exp(a) + exp(b))（オーバーフロー安全）
