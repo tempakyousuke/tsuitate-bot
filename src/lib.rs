@@ -6,6 +6,7 @@ pub mod board;
 pub mod bridge;
 pub mod check;
 pub mod client;
+pub mod deduce;
 pub mod estimator;
 pub mod frozen;
 pub mod kifu;
