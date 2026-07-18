@@ -50,6 +50,9 @@ fn load(path: &str) -> Option<GameRecord> {
                 strategy = v["strategy"].as_str().unwrap_or("?").to_string();
             }
             Some("chose") => {
+                // p_legal の無い chose（定跡手・旧記録）で古い pending を残さない
+                // （後続の同一 USI に誤対応するのを防ぐ — codex レビュー指摘）
+                pending_chose = None;
                 if let (Some(usi), Some(p)) =
                     (v["usi"].as_str(), v["debug"]["p_legal"].as_f64())
                 {

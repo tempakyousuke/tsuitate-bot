@@ -547,14 +547,8 @@ impl Estimator {
             };
             let deadline =
                 std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
-            let (repaired, still) = self.rejuvenate_batch(
-                failed,
-                cidx,
-                Some(constraint),
-                None,
-                self.target,
-                deadline,
-            );
+            let (repaired, still) =
+                self.rejuvenate_batch(failed, cidx, Some(constraint), self.target, deadline);
             for (pos, pen, lw, hist, taint) in repaired {
                 self.rejuv_repaired += 1;
                 surv_pos.push(pos);
@@ -601,8 +595,26 @@ impl Estimator {
         // ときだけ、物理不整合の棄却粒子を強制適用して phys_taint+1 で残す。
         // 狙いは信念の連続性（玉位置などの大域情報）で、盤面は観測と厳密整合
         // しない「嘘」— 評価側は taint>0 を通常サンプルから除外し、
-        // 玉位置系の用途（王手ソルバーの投票）にだけ使う
+        // 玉位置系の用途（王手ソルバーの投票）にだけ使う。
+        //
+        // エポック正規化（codex P3 レビュー指摘への対応）: wipe をまたぐと
+        // 旧スケールの logw（全制約の累積）と、rebase 後の新規リプレイ粒子
+        // （rebase_cidx 以降のみ課金 ≈ 0 基準）が混在してしまう。wipe 時点で
+        // 生き残る taint 粒子・墓場エントリの logw とスナップショットを
+        // **共通定数（候補内の max logw）だけシフト**して新エポックの 0 基準へ
+        // 揃える。共通シフトなので相対重みは保存され、以後の若返り修復・
+        // 墓場復活はどちらも「スナップショット値から再出発」の一本の規約で
+        // 新規リプレイ粒子と比較可能になる
         let complete_wipe = surv_pos.is_empty();
+        let epoch_shift = if complete_wipe {
+            graveyard_candidates
+                .iter()
+                .map(|(_, _, lw, _, _)| *lw)
+                .fold(f64::MIN, f64::max)
+        } else {
+            0.0
+        };
+        let epoch_shift = if epoch_shift == f64::MIN { 0.0 } else { epoch_shift };
         if complete_wipe && self.eps_phys > 0.0 && !graveyard_candidates.is_empty() {
             for (pos, pen, lw, hist, taint) in &graveyard_candidates {
                 if surv_pos.len() >= self.target {
@@ -610,10 +622,12 @@ impl Estimator {
                 }
                 let mut forced = pos.clone();
                 force_apply(&mut forced, my_color, constraint);
+                let mut h = hist.clone();
+                shift_hist(&mut h, -epoch_shift);
                 surv_pos.push(forced);
                 surv_pen.push(*pen);
-                surv_logw.push(lw + self.eps_phys.ln());
-                surv_hist.push(hist.clone());
+                surv_logw.push(lw - epoch_shift + self.eps_phys.ln());
+                surv_hist.push(h);
                 surv_taint.push(taint.saturating_add(1));
             }
         }
@@ -622,9 +636,14 @@ impl Estimator {
         // snap.miss > 0 のものは情報観測に info_miss 分だけ汚染されている —
         // miss は復活後も維持されるので較正は保たれる）。
         // 完全全滅（ソフトもゼロ。taint 救済は数えない）のときだけ logw の
-        // 基準点を今へ再ベースする（復活粒子と新規リプレイ粒子のスケールを
-        // 揃える近似）
+        // 基準点を今へ再ベースし、墓場エントリも同じエポックへシフトする
         if strict_count(&surv_pen, &surv_taint) == 0 && !graveyard_candidates.is_empty() {
+            if complete_wipe {
+                for (_, _, lw, hist, _) in graveyard_candidates.iter_mut() {
+                    *lw -= epoch_shift;
+                    shift_hist(hist, -epoch_shift);
+                }
+            }
             graveyard_candidates.sort_by_key(|(_, pen, _, _, taint)| (*taint, *pen));
             graveyard_candidates.truncate(GRAVEYARD_CAP);
             self.graveyard = graveyard_candidates;
@@ -685,15 +704,13 @@ impl Estimator {
     /// 若返り: 棄却粒子を直近の相手決定点へ巻き戻し、区間を引き直して修復する。
     /// 深さは REJUV_DEPTHS の順で adaptive に広げる（近い分岐から試す）。
     /// 巻き戻し先が今回の制約自身（= 同じ決定の再試行）は、整合クラス空が
-    /// 決定的なので飛ばす。rebase = Some(c) のとき（墓場からの復活）は
-    /// logw を 0 から始め、c 以降の決定だけ課金する（全滅時の再ベース。
-    /// 死んだ集団のスナップショット値は現集団と比較できないため）
+    /// 決定的なので飛ばす。logw の規約は常に「スナップショット値から再出発」
+    /// （wipe をまたぐスナップショットはエポック正規化済み — apply_constraint 参照）
     fn rejuvenate_one(
         &mut self,
         hist: &VecDeque<Snap>,
         upto: usize,
         current: Option<&Constraint>,
-        rebase: Option<usize>,
         deadline: std::time::Instant,
     ) -> Option<Repaired> {
         for &depth in &REJUV_DEPTHS {
@@ -711,7 +728,7 @@ impl Estimator {
                 if std::time::Instant::now() > deadline {
                     return None;
                 }
-                if let Some(out) = self.replay_segment(snap, hist, upto, current, rebase) {
+                if let Some(out) = self.replay_segment(snap, hist, upto, current) {
                     return Some(out);
                 }
             }
@@ -729,7 +746,6 @@ impl Estimator {
         failed: Vec<Rejected>,
         upto: usize,
         current: Option<&Constraint>,
-        rebase: Option<usize>,
         max: usize,
         deadline: std::time::Instant,
     ) -> (Vec<Repaired>, Vec<Rejected>) {
@@ -756,9 +772,7 @@ impl Estimator {
                     }
                     attempts += 1;
                     for _ in 0..REJUV_TRIES {
-                        if let Some(out) =
-                            self.replay_segment(snap, hist, upto, current, rebase)
-                        {
+                        if let Some(out) = self.replay_segment(snap, hist, upto, current) {
                             repaired.push(out);
                             *slot = None;
                             break;
@@ -786,32 +800,16 @@ impl Estimator {
         hist: &VecDeque<Snap>,
         upto: usize,
         current: Option<&Constraint>,
-        rebase: Option<usize>,
     ) -> Option<Repaired> {
         let mut pos = snap.pos.clone();
-        let mut lw = if rebase.is_some() { 0.0 } else { snap.logw };
-        let count_from = rebase.unwrap_or(0);
+        let mut lw = snap.logw;
         let miss = snap.miss;
         let taint = snap.taint;
         // 巻き戻し先より前のスナップショットは有効（snap.cidx のエントリは
         // 「この決定の適用前」の状態なので、引き直し後もそのまま正しい）。
-        // ただし墓場復活（rebase あり）では旧集団の logw スケールを引き継げない
-        // ため、巻き戻し先の決定点だけを復活粒子の規約（lw=0 起点）で残し、
-        // それ以前は捨てる（codex レビュー指摘: 残すと復活粒子の再若返りで
-        // スケールが壊れる）
-        let mut new_hist: VecDeque<Snap> = if rebase.is_some() {
-            let mut h = VecDeque::new();
-            h.push_back(Snap {
-                cidx: snap.cidx,
-                pos: snap.pos.clone(),
-                logw: 0.0,
-                miss,
-                taint,
-            });
-            h
-        } else {
-            hist.iter().filter(|s| s.cidx <= snap.cidx).cloned().collect()
-        };
+        // wipe をまたぐエントリはエポック正規化済みなのでそのまま使える
+        let mut new_hist: VecDeque<Snap> =
+            hist.iter().filter(|s| s.cidx <= snap.cidx).cloned().collect();
         let end = upto + usize::from(current.is_some());
         for i in snap.cidx..end {
             let c: &Constraint = if i < upto {
@@ -856,9 +854,7 @@ impl Estimator {
                         &mut self.rng,
                     ) {
                         Some(dlw) => {
-                            if i >= count_from {
-                                lw += dlw;
-                            }
+                            lw += dlw;
                             true
                         }
                         None => false,
@@ -945,12 +941,8 @@ impl Estimator {
                 self.regen_deadline_ms
             };
             let deadline = start + std::time::Duration::from_millis(budget_ms);
-            let rebase = self
-                .particles
-                .is_empty()
-                .then_some(self.rebase_cidx);
             let (repaired, still) =
-                self.rejuvenate_batch(graveyard, n, None, rebase, self.target / 4, deadline);
+                self.rejuvenate_batch(graveyard, n, None, self.target / 4, deadline);
             for (pos, pen, lw, hist, taint) in repaired {
                 self.revived += 1;
                 self.particles.push(pos);
@@ -1256,23 +1248,17 @@ fn foul_consistent(pos: &Position, my_color: Color, mv: &ShogiMove) -> bool {
 /// 観測と厳密整合しない近似なので、評価側は玉位置系の用途に限定すること
 fn force_apply(pos: &mut Position, my_color: Color, constraint: &Constraint) {
     match constraint {
-        Constraint::MyMove { mv, .. } => {
-            if pos.turn() == my_color && pos.is_legal(mv) {
-                // 合法なら通常適用（取得駒種・王手宣言の不一致は無視）
-                pos.play_unchecked(mv);
-                return;
-            }
+        Constraint::MyMove { mv, captured, .. } => {
+            // 盤面: 自駒を強制移動（to の相手駒は盤から消えるだけ）。
+            // 持ち駒: **観測された captured（真実）**だけを加える — 粒子上の
+            // 嘘の駒種で自分の持ち駒を汚さない（codex P3 レビュー指摘）。
+            // 合法時の play_unchecked も同じ理由で使わない（粒子上の to の駒種が
+            // 真実と違うと持ち駒がズレる）
             match *mv {
                 ShogiMove::Board { from, to, promote } => {
                     if let Some(mut p) =
                         pos.piece_at(from).filter(|p| p.color == my_color)
                     {
-                        if let Some(victim) =
-                            pos.piece_at(to).filter(|v| v.color != my_color)
-                        {
-                            let r = unpromote_role(victim.role);
-                            pos.set_hand(my_color, r, pos.hand_count(my_color, r) + 1);
-                        }
                         if promote {
                             if let Some(pr) = promote_role(p.role) {
                                 p.role = pr;
@@ -1283,17 +1269,20 @@ fn force_apply(pos: &mut Position, my_color: Color, constraint: &Constraint) {
                     }
                 }
                 ShogiMove::Drop { role, to } => {
-                    if pos.hand_count(my_color, role) > 0 {
-                        pos.set_hand(my_color, role, pos.hand_count(my_color, role) - 1);
-                        pos.set(
-                            to,
-                            Some(Piece {
-                                color: my_color,
-                                role,
-                            }),
-                        );
-                    }
+                    // 真実では打てた手なので必ず置く（粒子の持ち駒は saturating）
+                    let h = pos.hand_count(my_color, role);
+                    pos.set_hand(my_color, role, h.saturating_sub(1));
+                    pos.set(
+                        to,
+                        Some(Piece {
+                            color: my_color,
+                            role,
+                        }),
+                    );
                 }
+            }
+            if let Some(r) = captured {
+                pos.set_hand(my_color, *r, pos.hand_count(my_color, *r) + 1);
             }
             pos.set_turn(my_color.other());
         }
@@ -2188,7 +2177,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5000);
         let mut out = None;
         for _ in 0..20 {
-            out = est.rejuvenate_one(&hist, 4, Some(&current), None, deadline);
+            out = est.rejuvenate_one(&hist, 4, Some(&current), deadline);
             if out.is_some() {
                 break;
             }

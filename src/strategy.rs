@@ -1157,9 +1157,15 @@ fn stratified_sample<'a>(
     sample
 }
 
+/// taint 粒子を王手ソルバー投票に使う深さの上限（それ以上は嘘が深すぎる）
+const TAINT_VOTE_MAX: u8 = 6;
+
 /// ε_phys の taint 粒子から王手ソルバー投票用のサンプルを作る（C-7 P3）。
 /// クリーン粒子が全滅しているときのフォールバック専用。重みは指紋ごとの
-/// 正規化 Σexp(logw)（taint の EPS_PHYS 課金は logw に済み、相対値だけ使う）
+/// 正規化 Σexp(logw)（taint の EPS_PHYS 課金は logw に済み、相対値だけ使う）に
+/// 深度減衰 0.5^(taint-1) を掛ける（codex 指摘: ESS リセット後は logw の
+/// ε 累積が複製数に実現されて消えるため、深い嘘の投票を別途薄める）。
+/// taint > TAINT_VOTE_MAX は投票から除外
 fn taint_check_sample(est: &Estimator) -> Vec<(&Position, f64)> {
     let max_lw = est
         .log_weights()
@@ -1179,10 +1185,10 @@ fn taint_check_sample(est: &Estimator) -> Vec<(&Position, f64)> {
         .zip(est.phys_taint())
         .zip(est.log_weights())
     {
-        if t == 0 {
+        if t == 0 || t > TAINT_VOTE_MAX {
             continue;
         }
-        let w = (lw - max_lw).exp();
+        let w = (lw - max_lw).exp() * 0.5f64.powi(i32::from(t) - 1);
         match seen.entry(pos.fingerprint()) {
             std::collections::hash_map::Entry::Vacant(e) => {
                 e.insert(out.len());
