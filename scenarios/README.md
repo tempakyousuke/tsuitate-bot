@@ -5,6 +5,8 @@ Shogi Quest からエクスポートした棋譜をそのまま置くと、`bin/
 
 ## 追加手順
 
+### Shogi Quest の実戦棋譜から
+
 1. Shogi Quest の棋譜（`*illegal:` 行込み）を `scenarios/<名前>.kif` に保存
 2. ファイル内のどこかに1行足す:
    ```
@@ -22,6 +24,21 @@ Shogi Quest からエクスポートした棋譜をそのまま置くと、`bin/
    ```
    `--ply N` で同じ棋譜の別の局面をアドホックに試せる。
 
+### tsuitate の対局DB（自分でbotと対局した記録）から
+
+E2E検証手順（CLAUDE.md）でスクラッチDBを使ってbotと対局した後、
+`games.moves`/`games.foul_attempts`（JSON列）を `{moves, foulAttempts}` 形式で
+書き出し、`bin/make_scenario`（診断専用の一時ツール）でKIFへ変換する:
+
+```
+cargo run --release --bin make_scenario -- <moves.json> <sente|gote> <ply> [diag=マス,マス] > scenarios/<名前>.kif
+```
+
+`<moves.json>` は `{"moves": games.moves, "foulAttempts": games.foul_attempts}` の
+JSON（DBの列をそのままJSON.parseして詰め直すだけでよい）。`sente|gote` は bot 側の手番。
+局面確認には `bin/dump_position <moves.json> [手数]` で盤面・持ち駒を表示できる
+（`*scenario` の直前の局面を目で確認したいときに使う）。
+
 リプレイ時に全手・全反則試行を裁定検証（合法手は合法・`*illegal` は非合法）するので、
 棋譜の欠落・コピペミス・パース誤りは実行時に即 panic で検出される。
 
@@ -35,6 +52,12 @@ Shogi Quest からエクスポートした棋譜をそのまま置くと、`bin/
   実は先手に１手詰め G*2e があり bot は 16/20 で発見（continue 20/20 勝ち。
   2026-07-17 keima-recapture ブランチ時点）。観測を発生させない忍び込みが
   粒子に映らない盲点（48/49 の利き0枚を93〜99%で誤信）の記録も兼ねる
+- `kakudo.kif` — 22手目 R*2d（自玉と同じ2筋への飛車打ち。ユーザーによる
+  実戦対局のレビューで指摘）。20/20 で R*2d を選択。`diag` で確認すると、
+  未動の先手角（7九、対角線が完全に開通）が2四に利いているのに、粒子は
+  1枚利き=2.5%・0枚=97.5%と正反対に誤信していた（真実は1枚）。
+  「動いていない大駒の長い利き」を軽視する事前分布の課題の回帰テスト
+  （2026-07-19、tsuitateスクラッチDB対局より `bin/make_scenario` で変換）
 
 ## 注意
 
