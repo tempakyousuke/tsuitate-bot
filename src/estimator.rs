@@ -166,11 +166,20 @@ struct Guide {
     /// を弱くブーストする。needle が複数手先にある場合（kakunari c42 型の
     /// サイレント再配置）、1手先しか見ない lands/attacks では見つからない
     approach: Vec<(Role, Coord)>,
+    /// 打ちマス反則ガイド: 後続 MyFoul(打ち, 王手中でない) 由来:
+    /// 「X に（駒種不明の）相手駒を置く手」をブースト。王手中でない打ちが
+    /// 反則になる理由は二歩・行き所のない駒（自分の情報だけで既に候補から
+    /// 除外済み）を除けば「着地マスに見えない相手駒がいる」でほぼ一意
+    /// （lands と違い駒種は分からないので role を問わず着地だけを見る）
+    occupies: Vec<Coord>,
 }
 
 impl Guide {
     fn is_empty(&self) -> bool {
-        self.lands.is_empty() && self.attacks.is_empty() && self.approach.is_empty()
+        self.lands.is_empty()
+            && self.attacks.is_empty()
+            && self.approach.is_empty()
+            && self.occupies.is_empty()
     }
 }
 
@@ -269,6 +278,12 @@ pub struct Estimator {
     /// 王手宣言との整合を確かめるたびに全体を舐め直さずに済むよう、
     /// 制約追加時にインクリメンタルに更新する（O(1) 参照用のキャッシュ）
     king_at: Vec<Coord>,
+    /// 現在の自玉の被王手状態（直近の OppMove.gives_check で更新。MyMove が
+    /// 受理された時点で必ず解消されているので false に戻す）
+    in_check: bool,
+    /// in_check_at[i] = 制約 index i を処理する直前の被王手状態。
+    /// king_at と同じ O(1) 参照用のキャッシュ（打ちマス反則の理由の一意性判定に使う）
+    in_check_at: Vec<bool>,
     rng: StdRng,
 }
 
@@ -327,6 +342,8 @@ impl Estimator {
                 .king_square(my_color)
                 .expect("初期局面に玉がない"),
             king_at: vec![],
+            in_check: false,
+            in_check_at: vec![],
             rng: StdRng::seed_from_u64(seed),
         }
     }
@@ -421,6 +438,13 @@ impl Estimator {
                 if *from == self.my_king {
                     self.my_king = *to;
                 }
+            }
+            // in_check_at[idx] = この制約を処理する直前の被王手状態
+            self.in_check_at.push(self.in_check);
+            match &constraint {
+                Constraint::OppMove { gives_check, .. } => self.in_check = *gives_check,
+                Constraint::MyMove { .. } => self.in_check = false,
+                Constraint::MyFoul { .. } => {}
             }
             if let Constraint::MyMove { mv, captured, .. } = &constraint {
                 let idx = self.constraints.len();
@@ -924,6 +948,10 @@ impl Estimator {
     ///   意味では attacks と同じブースト対象なので同じ場に積む（新しい
     ///   フィールドは作らない。窓探索実験で確認した mover/defender 構成の
     ///   考え方を、既存の重み付きサンプリングへ再利用する形）
+    /// - MyFoul(打ち to=X, 王手中でない) → 「X に相手駒がいる」ことがほぼ確定
+    ///   する（二歩・行き所のない駒は自分の情報だけで候補から除外済みなので、
+    ///   残る理由は着地マスの占有がほぼ全て。王手中は「合駒のはずが実は違う
+    ///   ラインだった」という別説明があるので除外する）→ occupies
     /// upto 位置には current（未登録の制約）が入る。None なら constraints のみ
     fn build_guide(&self, i: usize, upto: usize, current: Option<&Constraint>) -> Guide {
         let mut guide = Guide::default();
@@ -959,6 +987,13 @@ impl Estimator {
                     mv: ShogiMove::Board { from, to, .. },
                 } if *from == king && !defend_guide_disabled() => {
                     guide.attacks.push(*to);
+                }
+                Constraint::MyFoul {
+                    mv: ShogiMove::Drop { to, .. },
+                } if !self.in_check_at.get(j).copied().unwrap_or(self.in_check)
+                    && !defend_guide_disabled() =>
+                {
+                    guide.occupies.push(*to);
                 }
                 _ => {}
             }
@@ -1498,6 +1533,7 @@ const GUIDE_APPROACH_BOOST: f64 = 3.0;
 /// ガイド条件に合う手のブースト倍率（1.0 = ブーストなし）:
 /// - lands: マス sq に（成りを剥がした）駒種 role を立てる手 → GUIDE_BOOST。
 ///   取得駒の観測（captured）は unpromote 済みの駒種なので、成り駒も剥がして照合
+/// - occupies: マス sq に駒種を問わず着地する手（打ちマス反則由来）→ GUIDE_BOOST
 /// - attacks: 着地点から対象マスへ利きを作る手（取り返しの事前準備）→ GUIDE_BOOST
 /// - approach（多段ガイド）: 駒種が一致し、空盤上の最短手数（deduce の BFS）が
 ///   目的地へ真に縮む手 → GUIDE_APPROACH_BOOST。1手先しか見ない lands/attacks
@@ -1514,6 +1550,9 @@ fn guide_boost_factor(pos: &Position, next: &Position, mv: &ShogiMove, guide: &G
         ShogiMove::Drop { to, role } => (to, role, None),
     };
     if guide.lands.iter().any(|&(sq, r)| sq == to && r == role) {
+        return GUIDE_BOOST;
+    }
+    if guide.occupies.iter().any(|&sq| sq == to) {
         return GUIDE_BOOST;
     }
     if guide.attacks.iter().any(|&sq| sq != to && next.attacks(to, sq)) {
@@ -2460,6 +2499,7 @@ mod tests {
             lands: vec![(Coord { file: 3, rank: 4 }, Role::Pawn)],
             attacks: vec![],
             approach: vec![],
+            occupies: vec![],
         };
         let n = 4000;
         // ガイドなしの素の選択頻度（大数近似で真の p_class）
