@@ -116,9 +116,9 @@ const GUIDE_BOOST: f64 = 24.0;
 /// 効果未確認・コストありのため、検証済みの8へ戻す
 const GUIDE_HORIZON: usize = 8;
 
-/// 診断用: TSUITATE_DISABLE_DEFEND_GUIDE=1 で defend ブースト(MyFoulの
-/// 王手検出によるguide.attacksへの追加)を無効化できる(速度差の切り分け専用。
-/// 一時的なフラグ)
+/// 診断用: TSUITATE_DISABLE_DEFEND_GUIDE=1 で「MyFoul由来のガイド」
+/// （自玉移動反則→guide.attacks、打ちマス反則→guide.occupies）を
+/// まとめて無効化できる（速度差の切り分け専用。一時的なフラグ）
 fn defend_guide_disabled() -> bool {
     static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FLAG.get_or_init(|| std::env::var("TSUITATE_DISABLE_DEFEND_GUIDE").is_ok_and(|v| v == "1"))
@@ -166,11 +166,13 @@ struct Guide {
     /// を弱くブーストする。needle が複数手先にある場合（kakunari c42 型の
     /// サイレント再配置）、1手先しか見ない lands/attacks では見つからない
     approach: Vec<(Role, Coord)>,
-    /// 打ちマス反則ガイド: 後続 MyFoul(打ち, 王手中でない) 由来:
+    /// 打ちマス反則ガイド: 後続 MyFoul(歩以外の打ち, 王手中でない) 由来:
     /// 「X に（駒種不明の）相手駒を置く手」をブースト。王手中でない打ちが
     /// 反則になる理由は二歩・行き所のない駒（自分の情報だけで既に候補から
     /// 除外済み）を除けば「着地マスに見えない相手駒がいる」でほぼ一意
-    /// （lands と違い駒種は分からないので role を問わず着地だけを見る）
+    /// （lands と違い駒種は分からないので role を問わず着地だけを見る）。
+    /// 歩打ちだけは打ち歩詰め（相手玉が見えないので自分からは判定不能）と
+    /// いう別の反則理由がありうるため対象外にする
     occupies: Vec<Coord>,
 }
 
@@ -989,10 +991,14 @@ impl Estimator {
                     guide.attacks.push(*to);
                 }
                 Constraint::MyFoul {
-                    mv: ShogiMove::Drop { to, .. },
-                } if !self.in_check_at.get(j).copied().unwrap_or(self.in_check)
+                    mv: ShogiMove::Drop { to, role },
+                } if *role != Role::Pawn
+                    && !self.in_check_at.get(j).copied().unwrap_or(self.in_check)
                     && !defend_guide_disabled() =>
                 {
+                    // 歩打ちだけは打ち歩詰め（自分からは判定不能: 相手玉の位置が
+                    // 見えないので王手/詰みの成否を検証できない）という別の反則
+                    // 理由がありうるため除外する（codex 指摘、2026-07-19）
                     guide.occupies.push(*to);
                 }
                 _ => {}
