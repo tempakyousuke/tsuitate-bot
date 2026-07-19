@@ -901,12 +901,17 @@ impl Strategy for EstimatorStrategy {
         // 再現できない（ユーザーの実践知見どおり）。再設計するまでは無効
         let hang_risk_enabled = std::env::var("TSUITATE_ENABLE_HANG_RISK").is_ok();
 
+        // 同一局内の自分の過去の反則から直接わかる占有マス情報。
+        // 次回の粒子リプレイを待たず、この場で prior_legal へ反映する
+        let foul_risk = foul_risk_from_log(log, view.your_color);
+
         let rng = &mut self.rng;
         // 1段目: 全候補を1手読み（静的リスク項つき）で評価する。
         // (usi, mv, 内訳, gain外の補正, 1段目スコア)
         let mut scored: Vec<(String, ShogiMove, EvalOut, f64, f64)> = vec![];
         for (usi, mv) in candidates {
             let mut prior = prior_legal(view, &mv, opp_board_n);
+            prior *= 1.0 - direct_suspicion(&mv, &foul_risk).min(0.95);
             if view.you_in_check {
                 prior *= match check_solver.as_mut() {
                     Some(solver) => solver.resolve_probability(&mv).clamp(0.02, 1.0),
@@ -1537,6 +1542,115 @@ fn prior_legal(view: &PlayerView, mv: &ShogiMove, opp_board_n: f64) -> f64 {
         }
         ShogiMove::Drop { .. } => q,
     }
+}
+
+/// 反則から直接わかる占有マス情報（同一局内の自分の過去の反則履歴だけから
+/// 作れる「直接制約」）。粒子リプレイ経由の Guide::occupies/path_blocks
+/// （estimator.rs）は重要度補正つき proposal なので粒子が十分あると
+/// 効きにくいことが codex レビュー（2026-07-19）で指摘され、
+/// `bin/analyze` の再訪率診断でも占有マス反則の28%（122/434）が
+/// 同一局内の再訪だったと確認された。この関数は次回の粒子リプレイを
+/// 待たず、prior_legal へ直接ペナルティとして反映するために使う
+struct FoulRisk {
+    /// (マス, 反則時点からの相手手数)。打ちマス反則（歩以外・王手中でない）
+    occupied: Vec<(Coord, u32)>,
+    /// (経路マス集合, 反則時点からの相手手数)。経路封鎖反則（王手中でない）の
+    /// OR制約（bot視点ではどのマスが真に占有されていたか一意化できない）
+    blocked: Vec<(Vec<Coord>, u32)>,
+}
+
+/// 反則マスの疑いが薄れる半減期（相手の手数）。駒が移動して離れる機会は
+/// 相手の手番でしか生まれないので、相手手数を経過の単位にする
+const FOUL_RISK_HALFLIFE: f64 = 8.0;
+
+fn foul_risk_from_log(log: &ObservationLog, my_color: Color) -> FoulRisk {
+    let mut occupied = vec![];
+    let mut blocked = vec![];
+    let mut in_check = false;
+    let mut opp_moves = 0u32;
+    for e in log.events() {
+        match e {
+            Observation::MyMove { .. } => in_check = false,
+            Observation::MyFoul { usi, .. } => {
+                if !in_check {
+                    if let Some(mv) = parse_usi(usi) {
+                        match mv {
+                            ShogiMove::Drop { to, role } if role != Role::Pawn => {
+                                occupied.push((to, opp_moves));
+                            }
+                            ShogiMove::Board { from, to, .. } => {
+                                let squares = path_squares_between(from, to);
+                                if !squares.is_empty() {
+                                    blocked.push((squares, opp_moves));
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            Observation::OpponentMoved { .. } => opp_moves += 1,
+            Observation::Check { in_check: c } => in_check = *c == my_color,
+            Observation::OpponentFoul { .. } => {}
+        }
+    }
+    FoulRisk { occupied, blocked }
+}
+
+/// 2マス以上のスライド移動の経路上（自駒には塞がれない前提の）中間マス列。
+/// 非スライド・隣接1マスなら空
+fn path_squares_between(from: Coord, to: Coord) -> Vec<Coord> {
+    let df = to.file - from.file;
+    let dr = to.rank - from.rank;
+    let aligned = df == 0 || dr == 0 || df.abs() == dr.abs();
+    let steps = df.abs().max(dr.abs());
+    if !aligned || steps <= 1 {
+        return vec![];
+    }
+    let sf = df.signum();
+    let sr = dr.signum();
+    (1..steps)
+        .map(|k| Coord {
+            file: from.file + sf * k,
+            rank: from.rank + sr * k,
+        })
+        .collect()
+}
+
+/// mv が FoulRisk の示すマスへ着地/通過するときの疑い度
+/// （0以上・実質1未満、大きいほど疑わしい）。半減期 FOUL_RISK_HALFLIFE
+/// （経過した相手手数）で減衰する
+fn direct_suspicion(mv: &ShogiMove, risk: &FoulRisk) -> f64 {
+    if risk.occupied.is_empty() && risk.blocked.is_empty() {
+        return 0.0;
+    }
+    let (to, from) = match *mv {
+        ShogiMove::Board { from, to, .. } => (to, Some(from)),
+        ShogiMove::Drop { to, .. } => (to, None),
+    };
+    let decay = |age: u32| 0.5f64.powf(f64::from(age) / FOUL_RISK_HALFLIFE);
+    let mut suspicion = risk
+        .occupied
+        .iter()
+        .filter(|&&(sq, _)| sq == to)
+        .map(|&(_, age)| decay(age))
+        .fold(0.0, f64::max);
+    for (squares, age) in &risk.blocked {
+        if squares.contains(&to) {
+            suspicion = suspicion.max(decay(*age) / squares.len() as f64);
+        }
+    }
+    if let Some(from) = from {
+        let path = path_squares_between(from, to);
+        if !path.is_empty() {
+            for (squares, age) in &risk.blocked {
+                if path.iter().any(|sq| squares.contains(sq)) {
+                    suspicion = suspicion.max(decay(*age) / squares.len() as f64);
+                }
+            }
+        }
+    }
+    suspicion
 }
 
 /// 相手が位置を知っている自駒の地図（マス → 既知度 0.0〜1.0）。
