@@ -1514,6 +1514,7 @@ fn sample_opp_move(
             moved_is_minor(pos, &mv),
             deep_unsupported(&next, &mv, opp),
             hangs_on_landing(pos, &next, &mv, opp),
+            home_lance_move(pos, &mv, opp),
         );
         total_mass += w;
         if consistent {
@@ -1650,6 +1651,7 @@ pub fn opp_reply_weights(
             moved_is_minor(pos, &mv),
             deep_unsupported(&next, &mv, opp),
             hangs_on_landing(pos, &next, &mv, opp),
+            home_lance_move(pos, &mv, opp),
         );
         if let ShogiMove::Board { to, .. } = mv {
             let captures_mine = pos.piece_at(to).is_some_and(|p| p.color == my_color);
@@ -1670,6 +1672,25 @@ fn moved_is_minor(pos: &Position, mv: &ShogiMove) -> bool {
         ShogiMove::Drop { role, .. } => Some(role),
     };
     matches!(role, Some(Role::Pawn | Role::Lance | Role::Knight))
+}
+
+/// 初期配置の香車マス（自分から動かしたことがない）からの移動か。
+/// 香車は序盤ほぼ動かない駒で、これが立たない限り「初期配置のまま」を
+/// 強く信じてよい（人間レビューでの指摘: 未観測の駒は初期配置のまま
+/// とみなすべきで、隅への探り打ちを繰り返すのは反則を浪費するだけ）。
+/// **定義は bin/fit_opp の home_lance_move と一致させること**
+fn home_lance_move(pos: &Position, mv: &ShogiMove, opp: Color) -> bool {
+    let ShogiMove::Board { from, .. } = *mv else {
+        return false;
+    };
+    if !pos.piece_at(from).is_some_and(|p| p.color == opp && p.role == Role::Lance) {
+        return false;
+    }
+    let home_rank = match opp {
+        Color::Sente => 9,
+        Color::Gote => 1,
+    };
+    from.rank == home_rank && (from.file == 1 || from.file == 9)
 }
 
 /// 相手の利きがあるマスへの紐なし着地か（取りは除く = 交換ではなく差し出し）。
@@ -1742,6 +1763,7 @@ fn opp_move_weight(
     moved_minor: bool,
     deep_unsup: bool,
     hang: bool,
+    home_lance: bool,
 ) -> f64 {
     let mut s = 0.0;
     match *mv {
@@ -1774,6 +1796,11 @@ fn opp_move_weight(
     }
     if hang {
         s += if moved_minor { 0.433 } else { -0.839 };
+    }
+    // 香車は序盤ほぼ動かない。threat_known/threat_home/promote 等の
+    // 具体的な理由があれば上の加点で相殺されるので、無目的な初手だけを狙って割り引く
+    if home_lance {
+        s += -1.3;
     }
     s.exp()
 }
@@ -1995,6 +2022,50 @@ mod tests {
             move_number: 0,
             captured_my_piece_at: captured_at.map(String::from),
         });
+    }
+
+    #[test]
+    fn home_lance_move_flags_only_untouched_corner_lances() {
+        let pos = Position::initial();
+        // 後手の香車（初期配置1一・9一）が動く手は該当
+        let mv = ShogiMove::Board {
+            from: Coord { file: 1, rank: 1 },
+            to: Coord { file: 1, rank: 2 },
+            promote: false,
+        };
+        assert!(home_lance_move(&pos, &mv, Color::Gote));
+        let mv9 = ShogiMove::Board {
+            from: Coord { file: 9, rank: 1 },
+            to: Coord { file: 9, rank: 2 },
+            promote: false,
+        };
+        assert!(home_lance_move(&pos, &mv9, Color::Gote));
+        // 先手の香車は5九ではなく1九・9九
+        assert!(!home_lance_move(
+            &pos,
+            &ShogiMove::Board {
+                from: Coord { file: 1, rank: 1 },
+                to: Coord { file: 1, rank: 2 },
+                promote: false,
+            },
+            Color::Sente
+        ));
+        let mv_sente = ShogiMove::Board {
+            from: Coord { file: 9, rank: 9 },
+            to: Coord { file: 9, rank: 8 },
+            promote: false,
+        };
+        assert!(home_lance_move(&pos, &mv_sente, Color::Sente));
+        // 隣の桂馬マス（初期配置2一）は香車ではないので該当しない
+        let knight_mv = ShogiMove::Board {
+            from: Coord { file: 2, rank: 1 },
+            to: Coord { file: 1, rank: 3 },
+            promote: false,
+        };
+        assert!(!home_lance_move(&pos, &knight_mv, Color::Gote));
+        // 打ちは該当しない
+        let drop = ShogiMove::Drop { role: Role::Lance, to: Coord { file: 5, rank: 5 } };
+        assert!(!home_lance_move(&pos, &drop, Color::Gote));
     }
 
     #[test]
