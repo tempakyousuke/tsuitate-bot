@@ -911,7 +911,6 @@ impl Strategy for EstimatorStrategy {
         let mut scored: Vec<(String, ShogiMove, EvalOut, f64, f64)> = vec![];
         for (usi, mv) in candidates {
             let mut prior = prior_legal(view, &mv, opp_board_n);
-            prior *= 1.0 - direct_suspicion(&mv, &foul_risk).min(0.95);
             if view.you_in_check {
                 prior *= match check_solver.as_mut() {
                     Some(solver) => solver.resolve_probability(&mv).clamp(0.02, 1.0),
@@ -920,7 +919,12 @@ impl Strategy for EstimatorStrategy {
                     None => in_check_prior(view, &mv),
                 };
             }
-            let out = evaluate(view, &mv, &sample, prior, &known, &params, budget);
+            let mut out = evaluate(view, &mv, &sample, prior, &known, &params, budget);
+            // 直接制約: prior_legal のブレンド重み（prior_weight）は粒子が
+            // 健全なときは小さく、prior だけを割り引いても最終 p_legal は
+            // ほぼ動かない。ここで粒子ブレンド後の p_legal 自体を直接割り引く
+            // ことで、粒子が「知らないはず」の情報にも即座に効かせる
+            out.p_legal *= 1.0 - direct_suspicion(&mv, &foul_risk).min(0.95);
             // gain の外側の補正（タイブレーク乱数・手戻り/シャッフル減点）は
             // 2手読み後の再計算でも同じ値を使うので分離して持つ
             let mut adjust = rng.random_range(0.0..0.01);
