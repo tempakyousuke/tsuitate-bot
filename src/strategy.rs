@@ -412,6 +412,13 @@ pub struct EvalParams {
     /// 着手後に自分が当たりを付けている敵駒の価値への重み（露出リスクの鏡像）。
     /// 1手読みでは見えない「次の駒得」（飛車頭への歩打ち等）を作る手に価値を与える
     pub threat_w: f64,
+    /// 桂馬の高跳び歩の餌食: 敵桂馬への攻撃マス（桂馬の直前1マス）への歩の
+    /// 接近を評価する重み。桂馬は後退できないので安い歩で追い詰めれば
+    /// 駒得が確定しやすい（人間レビューでの指摘: 序盤に安全に桂馬を狙う
+    /// 手段として大駒より歩が優先されるべき）。threat_w は着手直後に当たりが
+    /// 「付いている」手しか拾えない（1手読み）ため、複数手かけて歩を寄せる
+    /// 「狙いに行く」計画性は別項として持つ
+    pub knight_bait_w: f64,
     /// 探索ボーナス: 着地マスの敵駒有無について粒子が割れているほど加点。
     /// 取れても空振りでも観測が推定を絞る（情報の価値）
     pub info_bonus: f64,
@@ -486,6 +493,9 @@ impl Default for EvalParams {
             prior_weight: 4.9065,
             prior_weight_degen: 7.9515,
             threat_w: 0.4586,
+            // 新項（2026-07-19、人間レビュー指摘を受けて追加）。0 = 従来と同一挙動。
+            // 未調整のため控えめな初期値。次のSPSAラウンドの調整対象
+            knight_bait_w: 0.15,
             info_bonus: 0.64,
             big_home_penalty: 0.3156,
             hand_drop_w: 0.0757,
@@ -514,7 +524,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 37] = [
+    pub const SPECS: [ParamSpec; 38] = [
         ParamSpec { name: "check_bonus", lo: 0.0, hi: 3.0 },
         ParamSpec { name: "check_foul_scale", lo: 0.0, hi: 0.5 },
         ParamSpec { name: "mover_w_captured", lo: 0.0, hi: 1.5 },
@@ -538,6 +548,7 @@ impl EvalParams {
         ParamSpec { name: "prior_weight", lo: 0.5, hi: 16.0 },
         ParamSpec { name: "prior_weight_degen", lo: 0.0, hi: 32.0 },
         ParamSpec { name: "threat_w", lo: 0.0, hi: 1.0 },
+        ParamSpec { name: "knight_bait_w", lo: 0.0, hi: 1.0 },
         ParamSpec { name: "info_bonus", lo: 0.0, hi: 2.0 },
         ParamSpec { name: "big_home_penalty", lo: 0.0, hi: 1.5 },
         ParamSpec { name: "hand_drop_w", lo: 0.0, hi: 0.5 },
@@ -579,6 +590,7 @@ impl EvalParams {
             self.prior_weight,
             self.prior_weight_degen,
             self.threat_w,
+            self.knight_bait_w,
             self.info_bonus,
             self.big_home_penalty,
             self.hand_drop_w,
@@ -622,20 +634,21 @@ impl EvalParams {
             prior_weight: v[20],
             prior_weight_degen: v[21],
             threat_w: v[22],
-            info_bonus: v[23],
-            big_home_penalty: v[24],
-            hand_drop_w: v[25],
-            backtrack_penalty: v[26],
-            shuffle_penalty: v[27],
-            soft_decay: v[28],
-            king_probe_bonus: v[29],
-            coverage_w: v[30],
-            tokin_probe_w: v[31],
-            depth2_replace: v[32],
-            depth2_check_pen: v[33],
-            depth2_recap_discount: v[34],
-            foul_diff_pow: v[35],
-            check_limit_accel: v[36],
+            knight_bait_w: v[23],
+            info_bonus: v[24],
+            big_home_penalty: v[25],
+            hand_drop_w: v[26],
+            backtrack_penalty: v[27],
+            shuffle_penalty: v[28],
+            soft_decay: v[29],
+            king_probe_bonus: v[30],
+            coverage_w: v[31],
+            tokin_probe_w: v[32],
+            depth2_replace: v[33],
+            depth2_check_pen: v[34],
+            depth2_recap_discount: v[35],
+            foul_diff_pow: v[36],
+            check_limit_accel: v[37],
         }
     }
 }
@@ -1745,6 +1758,8 @@ fn evaluate(
         // 自分が敵駒に当たりを付けている価値（露出リスクの鏡像）。
         // 1手読みでは見えない「次の駒得」を作る手（大駒の頭への歩打ち等）に価値を与える
         v += params.threat_w * threat_value(&next, me);
+        // 桂馬の高跳び歩の餌食: 歩が敵桂馬の攻撃マスへ近づくほど加点
+        v += params.knight_bait_w * knight_bait_value(&next, me, mv);
 
         // 王の安全度と攻撃圧力（利き走査が重いので少数の粒子でだけ測って平均する）
         if pressure_n < pressure_samples {
@@ -2015,6 +2030,48 @@ fn threat_value(pos: &Position, me: Color) -> f64 {
     best
 }
 
+/// 桂馬の高跳び歩の餌食: 敵桂馬への攻撃マス（桂馬の直前1マス。歩がそこに
+/// いれば次に桂馬を取れる）へ、着手した歩がどれだけ近づいたかを評価する。
+/// 桂馬は後退できないので、安い歩で追い詰められれば駒得がほぼ確定する
+/// （人間レビューでの指摘: 序盤の桂馬狙いは大駒より歩を優先すべき）。
+/// BFS距離（deduce、多段ガイドと同じ空盤近似の下限）が縮むほど指数的に
+/// 加点し、攻撃マスに直接着地した手（距離0）が最大。
+/// `min_moves_empty_board(..., want_promoted=false)` は「成っても不成でも
+/// 良いなら最短」であり成り駒（金型移動）経由で筋を跨げてしまうため、
+/// ここでは `all_distances_empty_board` から不成状態の距離だけを直接引く
+/// （歩が本当に同じ筋を歩数だけ進む距離。筋違いの桂馬には自然に届かない）
+fn knight_bait_value(next: &Position, me: Color, mv: &ShogiMove) -> f64 {
+    let to = match *mv {
+        ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+    };
+    // 着手後にそのマスにいる駒が歩でなければ関係ない（成った歩=と金も除外）
+    if !next.piece_at(to).is_some_and(|p| p.role == Role::Pawn) {
+        return 0.0;
+    }
+    let opp = me.other();
+    let mut best = 0.0f64;
+    for (sq, piece) in next.pieces() {
+        if piece.color != opp || piece.role != Role::Knight {
+            continue;
+        }
+        let attack_rank = match me {
+            Color::Sente => sq.rank + 1,
+            Color::Gote => sq.rank - 1,
+        };
+        if !(1..=9).contains(&attack_rank) {
+            continue;
+        }
+        let attack_sq = Coord { file: sq.file, rank: attack_rank };
+        let dist_map = crate::deduce::all_distances_empty_board(Role::Pawn, me, to);
+        let Some(&dist) = dist_map.get(&(attack_sq, false)) else {
+            continue;
+        };
+        let decay = 0.6f64.powi(dist as i32);
+        best = best.max(exchange_value(Role::Knight) * decay);
+    }
+    best
+}
+
 /// 着手駒（マス to にいる自駒）が次の相手番で取られるリスク。
 /// 紐つきなら取り返せるぶん割り引く（相手のどの駒で取るかは不明なので近似）
 fn recapture_risk(pos: &Position, me: Color, to: Coord, defended_discount: f64) -> f64 {
@@ -2219,6 +2276,52 @@ pub(crate) mod tests {
         let view = minimal_view(without_rook, HashMap::new());
         let expected = -2.0 * piece_value(Role::Rook);
         assert!((material_lead(&view) - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn knight_bait_rewards_pawn_on_attack_square_only() {
+        // 後手番。先手桂馬が3七（file3,rank7）にいる → 攻撃マスは3六（file3,rank6）
+        let knight_sq = Coord { file: 3, rank: 7 };
+        let attack_sq = Coord { file: 3, rank: 6 };
+        let mut next = Position::empty(Color::Sente);
+        next.set(
+            knight_sq,
+            Some(crate::shogi::Piece { color: Color::Sente, role: Role::Knight }),
+        );
+        next.set(
+            attack_sq,
+            Some(crate::shogi::Piece { color: Color::Gote, role: Role::Pawn }),
+        );
+        let mv = ShogiMove::Drop { role: Role::Pawn, to: attack_sq };
+        let v = knight_bait_value(&next, Color::Gote, &mv);
+        assert!((v - exchange_value(Role::Knight)).abs() < 1e-9, "v={v}");
+
+        // 違う筋への歩打ちは桂馬に届かないのでゼロ
+        let off_file = Coord { file: 7, rank: 6 };
+        let mut next2 = Position::empty(Color::Sente);
+        next2.set(
+            knight_sq,
+            Some(crate::shogi::Piece { color: Color::Sente, role: Role::Knight }),
+        );
+        next2.set(
+            off_file,
+            Some(crate::shogi::Piece { color: Color::Gote, role: Role::Pawn }),
+        );
+        let mv2 = ShogiMove::Drop { role: Role::Pawn, to: off_file };
+        assert_eq!(knight_bait_value(&next2, Color::Gote, &mv2), 0.0);
+
+        // 歩以外の駒（例: 香）を敵桂馬の攻撃マスへ打ってもゼロ（歩限定）
+        let mut next3 = Position::empty(Color::Sente);
+        next3.set(
+            knight_sq,
+            Some(crate::shogi::Piece { color: Color::Sente, role: Role::Knight }),
+        );
+        next3.set(
+            attack_sq,
+            Some(crate::shogi::Piece { color: Color::Gote, role: Role::Lance }),
+        );
+        let mv3 = ShogiMove::Drop { role: Role::Lance, to: attack_sq };
+        assert_eq!(knight_bait_value(&next3, Color::Gote, &mv3), 0.0);
     }
 
     #[test]
