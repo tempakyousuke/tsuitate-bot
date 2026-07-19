@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use tsuitate_bot::board::Coord;
 use tsuitate_bot::check::CheckSolver;
 use tsuitate_bot::model::GameModel;
 use tsuitate_bot::observation::{Observation, ObservationLog};
@@ -233,6 +234,33 @@ fn classify_foul(pos: &Position, foul: &FoulRecord) -> FoulCause {
     FoulCause::Other
 }
 
+/// Blocked/DropOccupied 反則について、真の局面から「実際に駒があった」
+/// マスを一意に特定する（analyze は真の棋譜を持つので、bot視点では
+/// 一意化できない経路封鎖も truth で厳密に分かる）。占有マス反則の
+/// 再訪率測定に使う
+fn true_occupied_square(pos: &Position, mv: &ShogiMove) -> Option<Coord> {
+    match *mv {
+        ShogiMove::Drop { to, .. } => pos.piece_at(to).map(|_| to),
+        ShogiMove::Board { from, to, .. } => {
+            let df = to.file - from.file;
+            let dr = to.rank - from.rank;
+            let aligned = df == 0 || dr == 0 || df.abs() == dr.abs();
+            let steps = df.abs().max(dr.abs());
+            if !aligned || steps <= 1 {
+                return None;
+            }
+            let sf = df.signum();
+            let sr = dr.signum();
+            (1..steps)
+                .map(|k| Coord {
+                    file: from.file + sf * k,
+                    rank: from.rank + sr * k,
+                })
+                .find(|&sq| pos.piece_at(sq).is_some())
+        }
+    }
+}
+
 fn cause_label(c: FoulCause) -> &'static str {
     match c {
         FoulCause::Blocked => "経路が見えない駒に塞がれた",
@@ -279,6 +307,12 @@ fn main() {
     let mut games = 0;
     let mut bot_wins = 0;
     let mut p_legal_all: Vec<(f64, bool)> = vec![];
+    // 占有マス反則（Blocked/DropOccupied）が、同じ対局内で過去の占有マス
+    // 反則が実際に示していたマスと重なっていたか。「反則が起きたマスを
+    // 覚えて避ける」系の対策（Guide::occupies/path_blocks）が原理的に
+    // 防げる範囲の上限を測る診断
+    let mut total_occupancy_fouls = 0u32;
+    let mut total_repeat_avoidable = 0u32;
 
     for path in &paths {
         let Some(rec) = load(path) else {
@@ -319,7 +353,15 @@ fn main() {
         }
 
         let mut fouls_here: HashMap<FoulCause, u32> = HashMap::new();
-        for foul in rec.end.foul_attempts.iter().filter(|f| f.by_color == bot) {
+        let mut known_risky_squares: HashSet<Coord> = HashSet::new();
+        let mut bot_fouls: Vec<_> = rec
+            .end
+            .foul_attempts
+            .iter()
+            .filter(|f| f.by_color == bot)
+            .collect();
+        bot_fouls.sort_by_key(|f| f.move_number);
+        for foul in bot_fouls {
             let idx = (foul.move_number as usize).saturating_sub(1);
             if idx >= positions.len() {
                 continue;
@@ -333,6 +375,17 @@ fn main() {
                 foul.usi,
                 cause_label(cause)
             );
+            if matches!(cause, FoulCause::Blocked | FoulCause::DropOccupied) {
+                if let Some(mv) = parse_usi(&foul.usi) {
+                    if let Some(sq) = true_occupied_square(&positions[idx], &mv) {
+                        total_occupancy_fouls += 1;
+                        if known_risky_squares.contains(&sq) {
+                            total_repeat_avoidable += 1;
+                        }
+                        known_risky_squares.insert(sq);
+                    }
+                }
+            }
         }
         let _ = fouls_here;
 
@@ -517,6 +570,11 @@ fn main() {
         "取り返し: 機会{total_recap_ops}回中 実行{total_recap_taken}回 / 得だったのに逃した{total_recap_missed_good}回"
     );
     println!("1手詰みの存在（参考値・玉位置は不可視）: {total_missed_mates}回");
+    if total_occupancy_fouls > 0 {
+        println!(
+            "占有マス反則（打ちマス/経路封鎖）の再訪率: {total_repeat_avoidable}/{total_occupancy_fouls}（同一局内で過去の占有反則マスと一致。反則マスを覚える対策の理論上限）"
+        );
+    }
     if total_check_tested > 0 {
         println!(
             "王手中の反則: 実際 {total_check_tested}回 → ソルバー方策なら {total_check_solved}回"
