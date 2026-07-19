@@ -155,8 +155,30 @@ fn in_promotion_zone(color: Color, rank: i8) -> bool {
 /// （この関数は「これより少ない手数はあり得ない」という下限の計算専用）
 /// from を起点にした空盤上の最短手数を、到達しうる全マス(かつ成/不成の両状態)に
 /// ついて1回のBFSでまとめて求める。target を1つずつ聞く min_moves_empty_board を
-/// 何度も呼ぶより、候補が多い場面(守り駒の列挙など)で大幅に速い
+/// 何度も呼ぶより、候補が多い場面(守り駒の列挙など)で大幅に速い。
+/// 結果は (role, color, from) だけで決まる純粋な値（盤面非依存）なので
+/// スレッドローカルにメモ化する。guide_boost_factor 等、同じ from から
+/// 何度も呼ばれるホットパスでの再BFSを避けるための最適化（挙動は変えない）
 pub fn all_distances_empty_board(
+    base_role: Role,
+    color: Color,
+    from: Coord,
+) -> std::collections::HashMap<(Coord, bool), u32> {
+    thread_local! {
+        static CACHE: std::cell::RefCell<
+            std::collections::HashMap<(Role, Color, Coord), std::collections::HashMap<(Coord, bool), u32>>,
+        > = std::cell::RefCell::new(std::collections::HashMap::new());
+    }
+    let key = (base_role, color, from);
+    if let Some(cached) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        return cached;
+    }
+    let dist_map = compute_distances_empty_board(base_role, color, from);
+    CACHE.with(|c| c.borrow_mut().insert(key, dist_map.clone()));
+    dist_map
+}
+
+fn compute_distances_empty_board(
     base_role: Role,
     color: Color,
     from: Coord,
