@@ -2130,7 +2130,7 @@ fn exposed_capture_risk(
 /// - 金/銀: 玉の隣接空きマス（打てば即王手）
 /// - 歩: 玉頭の1マス
 /// 持ち駒が空ならゼロ = 居玉そのものは咎めない
-fn drop_check_danger(pos: &Position, me: Color) -> f64 {
+pub(crate) fn drop_check_danger(pos: &Position, me: Color) -> f64 {
     let Some(king) = pos.king_square(me) else {
         return 0.0;
     };
@@ -2186,7 +2186,7 @@ fn drop_check_danger(pos: &Position, me: Color) -> f64 {
 }
 
 /// owner 玉の周囲8マス（と玉のマス）に当たっている by 側の利きの数
-fn king_zone_pressure(pos: &Position, owner: Color, by: Color) -> f64 {
+pub(crate) fn king_zone_pressure(pos: &Position, owner: Color, by: Color) -> f64 {
     let Some(king) = pos.king_square(owner) else {
         return 0.0;
     };
