@@ -172,6 +172,14 @@ struct Guide {
     /// 除外済み）を除けば「着地マスに見えない相手駒がいる」でほぼ一意
     /// （lands と違い駒種は分からないので role を問わず着地だけを見る）
     occupies: Vec<Coord>,
+    /// 経路封鎖反則ガイド: 後続 MyFoul(駒移動, 2マス以上のスライド, 王手中でない)
+    /// 由来: 「経路上のどこか1マスに相手駒がいる」（OR制約）を弱くブースト。
+    /// 1件ごとに経路マスの集合を積み、ブーストは GUIDE_BOOST を集合サイズで
+    /// 割った値（マス数が多いほど1マスあたりの疑いは薄まる）。
+    /// 注意: この反則は「自玉の遮蔽駒を動かして飛び込んだ」（別カテゴリ）とも
+    /// 見分けがつかない場合があるが、経路封鎖の方が支配的という前提で採用する
+    /// （実測は反則原因分類: 経路封鎖164 vs 飛び込み65）
+    path_blocks: Vec<Vec<Coord>>,
 }
 
 impl Guide {
@@ -180,7 +188,28 @@ impl Guide {
             && self.attacks.is_empty()
             && self.approach.is_empty()
             && self.occupies.is_empty()
+            && self.path_blocks.is_empty()
     }
+}
+
+/// 2マス以上のスライド移動（飛車・角・香、成っていても直進方向は同じ）の
+/// 経路上（自駒には塞がれない前提の）中間マス列。非スライド・隣接1マスなら空
+fn path_between(from: Coord, to: Coord) -> Vec<Coord> {
+    let df = to.file - from.file;
+    let dr = to.rank - from.rank;
+    let aligned = df == 0 || dr == 0 || df.abs() == dr.abs();
+    let steps = df.abs().max(dr.abs());
+    if !aligned || steps <= 1 {
+        return vec![];
+    }
+    let sf = df.signum();
+    let sr = dr.signum();
+    (1..steps)
+        .map(|k| Coord {
+            file: from.file + sf * k,
+            rank: from.rank + sr * k,
+        })
+        .collect()
 }
 
 fn shift_hist(hist: &mut VecDeque<Snap>, d: f64) {
@@ -995,6 +1024,17 @@ impl Estimator {
                 {
                     guide.occupies.push(*to);
                 }
+                Constraint::MyFoul {
+                    mv: ShogiMove::Board { from, to, .. },
+                } if *from != king
+                    && !self.in_check_at.get(j).copied().unwrap_or(self.in_check)
+                    && !defend_guide_disabled() =>
+                {
+                    let squares = path_between(*from, *to);
+                    if !squares.is_empty() {
+                        guide.path_blocks.push(squares);
+                    }
+                }
                 _ => {}
             }
             // ガイド窓の中でも自玉が動く可能性があるので追跡を続ける
@@ -1535,6 +1575,8 @@ const GUIDE_APPROACH_BOOST: f64 = 3.0;
 ///   取得駒の観測（captured）は unpromote 済みの駒種なので、成り駒も剥がして照合
 /// - occupies: マス sq に駒種を問わず着地する手（打ちマス反則由来）→ GUIDE_BOOST
 /// - attacks: 着地点から対象マスへ利きを作る手（取り返しの事前準備）→ GUIDE_BOOST
+/// - path_blocks: 経路封鎖反則由来の経路マス集合のどれかに着地する手 →
+///   GUIDE_BOOST / 集合サイズ（OR制約なので集合が大きいほど1マスあたりは弱める）
 /// - approach（多段ガイド）: 駒種が一致し、空盤上の最短手数（deduce の BFS）が
 ///   目的地へ真に縮む手 → GUIDE_APPROACH_BOOST。1手先しか見ない lands/attacks
 ///   では拾えない「複数手先の目的地への接近」を弱くブーストする
@@ -1557,6 +1599,15 @@ fn guide_boost_factor(pos: &Position, next: &Position, mv: &ShogiMove, guide: &G
     }
     if guide.attacks.iter().any(|&sq| sq != to && next.attacks(to, sq)) {
         return GUIDE_BOOST;
+    }
+    let path_boost = guide
+        .path_blocks
+        .iter()
+        .filter(|squares| squares.contains(&to))
+        .map(|squares| GUIDE_BOOST / squares.len() as f64)
+        .fold(1.0, f64::max);
+    if path_boost > 1.0 {
+        return path_boost;
     }
     if let Some(from) = from {
         for &(r, target) in &guide.approach {
@@ -2500,6 +2551,7 @@ mod tests {
             attacks: vec![],
             approach: vec![],
             occupies: vec![],
+            path_blocks: vec![],
         };
         let n = 4000;
         // ガイドなしの素の選択頻度（大数近似で真の p_class）
