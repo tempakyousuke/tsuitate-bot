@@ -238,6 +238,30 @@ impl CheckSolver {
         resolved / total
     }
 
+    /// mv が「王手駒仮説のマスへ、自玉以外の駒で移動して、その仮説の下で
+    /// 王手が解消する」手か = 王手駒を捕獲しに行く手か。
+    ///
+    /// `resolve_probability`は仮説ごとの重みで平均するため、生存仮説が
+    /// 多いと正しい捕獲でも確率が薄まってしまう（王手駒の粒子ビリーフが
+    /// 誤っている局面では特に顕著。kakutori.kif参照）。捕獲そのものは
+    /// 「当たれば王手駒を排除できる、外れても反則1回ぶんの探索コストで
+    /// 済む」性質を持つ数少ない手なので、combine_score側でp_legalの
+    /// フロアとして特別扱いする（strategy.rsのchoose参照）
+    pub fn captures_checker(&mut self, mv: &ShogiMove) -> bool {
+        let ShogiMove::Board { from, to, .. } = *mv else {
+            return false;
+        };
+        if self.base.king_square(self.my_color) == Some(from) {
+            return false;
+        }
+        for i in 0..self.hypotheses.len() {
+            if self.hypotheses[i].square == to && self.legal_under(i, mv) {
+                return true;
+            }
+        }
+        false
+    }
+
     #[cfg(test)]
     fn hypothesis_count(&self) -> usize {
         self.hypotheses.len()
