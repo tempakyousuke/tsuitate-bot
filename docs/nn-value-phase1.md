@@ -370,18 +370,27 @@ gold-check 5/5・kakudo 4/5（5seed中）。厳密な成功条件（両方5/5）
 歩打ち vs 無警戒な飛車打ち」という、当初の動機（33手目5八四金）と
 同種の判断は概ね学習できている。
 
-**変更ファイル（tsuitate-bot、未コミット）**:
+**変更ファイル（tsuitate-bot、コミット済み dafb2d0）**:
 `src/value_features.rs`（transition_features新設）・
 `src/bin/export_value_data.rs`・`src/bin/eval_candidates.rs`・
 `src/bin/export_pairwise_data.rs`（新規）・`src/strategy.rs`
 （exchange_value を pub(crate) 化）・本ドキュメント・`.gitignore`
 
-**変更ファイル（tsuitate-nn、未コミット）**:
+**変更ファイル（tsuitate-nn、コミット済み 691129a）**:
 `train.py`（pairwise補助loss）・`model.py`（dropout・INPUT_DIM）・
 `eval_scenario.py`。`out/`は`weight=20.0, margin=0.1, seed=0`で
-再学習済みの現時点のベストモデル。`data/value_data_3000.csv`・
+再学習済みの現時点のベストモデル（gitignore対象、リポジトリには無い。
+再学習手順は本ドキュメント参照）。`data/value_data_3000.csv`・
 `data/pairwise_3000.csv`は3000局（estimator/v6/v7混合）から生成
 （`.gitignore`でcsvは除外済み、再生成手順は本ドキュメント参照）
+
+**追記（2026-07-21）**: 下記候補3（新規シナリオの追加）に着手し、
+`scenarios/kakutori.kif`を追加したところ、NN検証とは別に**estimator戦略
+本体（手作り評価、NN未統合）のバグ**を発見した（王手をかけてきた駒を
+タダで取れるのに取らない）。原因は`check.rs::CheckSolver`の仮説平均化
+（詳細はCLAUDE.mdの`check.rs`節）で、修正して`estimator_v8`として凍結
+（vs v6 71.3%±8.8% / vs v7 62.5%±9.3%、100局）。フェーズ1（NN統合）
+自体の進捗ではないが、シナリオ拡充が想定外の価値を生んだ例として記録。
 
 **未着手（フェーズ1のスコープ外のまま）**: bot本体（strategy.rs）への
 推論統合、ONNX推論クレートの選定。統合を検討するなら、まず今回の
