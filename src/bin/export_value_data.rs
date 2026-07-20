@@ -8,7 +8,10 @@
 
 use tsuitate_bot::protocol::{Color, GameEndPayload};
 use tsuitate_bot::shogi::{Position, parse_usi};
-use tsuitate_bot::value_features::{VALUE_FEATURES, VALUE_FEATURE_NAMES, value_features};
+use tsuitate_bot::value_features::{
+    TRANSITION_FEATURE_NAMES, TRANSITION_FEATURES, VALUE_FEATURE_NAMES, VALUE_FEATURES,
+    transition_features, value_features,
+};
 
 fn load_end_payload(path: &str) -> Option<GameEndPayload> {
     let content = std::fs::read_to_string(path).ok()?;
@@ -40,7 +43,11 @@ fn main() {
     // game_id列でゲーム単位のグループ分割ができるようにする（codexレビュー指摘:
     // 行単位のランダム分割だと同じ対局の別手番が学習/検証の両方に混じり
     // データリークになる）。ply列は手数（1始まり）
-    println!("game_id,ply,{},label", VALUE_FEATURE_NAMES.join(","));
+    println!(
+        "game_id,ply,{},{},label",
+        VALUE_FEATURE_NAMES.join(","),
+        TRANSITION_FEATURE_NAMES.join(",")
+    );
 
     let mut games = 0u64;
     let mut rows = 0u64;
@@ -68,15 +75,18 @@ fn main() {
                 1.0 - win_value_sente
             };
             let f = value_features(&pos, side);
-            let row: Vec<String> = f.iter().map(|x| x.to_string()).collect();
-            buf.push(format!("{games},{},{},{label}", i + 1, row.join(",")));
 
             let Some(mv) = parse_usi(&m.usi) else {
                 eprintln!("  棋譜の手をパースできません: {} ({path})。この局はスキップ", m.usi);
                 ok = false;
                 break;
             };
+            let before = pos.clone();
             pos.play_unchecked(&mv);
+            let t = transition_features(&before, &mv, &pos, side);
+
+            let row: Vec<String> = f.iter().chain(t.iter()).map(|x| x.to_string()).collect();
+            buf.push(format!("{games},{},{},{label}", i + 1, row.join(",")));
         }
         if ok {
             for line in &buf {
@@ -86,5 +96,8 @@ fn main() {
             games += 1;
         }
     }
-    eprintln!("書き出し完了: {games}局 / {rows}行 / 特徴量{VALUE_FEATURES}次元");
+    eprintln!(
+        "書き出し完了: {games}局 / {rows}行 / 特徴量{}次元",
+        VALUE_FEATURES + TRANSITION_FEATURES
+    );
 }

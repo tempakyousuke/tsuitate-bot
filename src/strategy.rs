@@ -236,7 +236,7 @@ const DEPTH2_MATE_PEN: f64 = 30.0;
 /// 素の駒は piece_value と一致し、成駒は取られても相手の持ち駒に入るのは
 /// 基本駒種ぶんなので割り引かれる（と金を取り返された反動 = (6+1)/2 = 3.5）。
 /// 逆に成駒を取る側の得も同じ理由で割り引く
-fn exchange_value(role: Role) -> f64 {
+pub(crate) fn exchange_value(role: Role) -> f64 {
     (piece_value(role) + piece_value(unpromote_role(role))) / 2.0
 }
 

@@ -8,10 +8,10 @@
 //! ここに一本化し、学習側（tsuitate-nn）とズレないようにする。
 
 use crate::protocol::{Color, Role};
-use crate::shogi::{Position, piece_value};
-use crate::strategy::{drop_check_danger, king_zone_pressure};
+use crate::shogi::{Position, ShogiMove, piece_value};
+use crate::strategy::{drop_check_danger, exchange_value, king_zone_pressure};
 
-pub const VALUE_FEATURES: usize = 14;
+pub const VALUE_FEATURES: usize = 16;
 
 pub const VALUE_FEATURE_NAMES: [&str; VALUE_FEATURES] = [
     "material_diff",     // 自分の駒価値合計（盤上+持ち駒） − 相手の同値
@@ -27,6 +27,8 @@ pub const VALUE_FEATURE_NAMES: [&str; VALUE_FEATURES] = [
     "opp_pieces_in_my_camp", // 自陣3段にいる相手の駒数（歩・玉除く）
     "my_max_hanging",      // 相手の利きが当たり自分の紐が無い自分の駒の最大価値
     "opp_max_hanging",      // 同、相手側（=自分が取れる駒の最大価値）
+    "my_max_exchange_loss", // 相手に取られた場合の最悪交換損失（取り返しの補償を差し引いた後）
+    "opp_max_exchange_loss", // 同、相手側（=自分が仕掛けられる最悪の交換損失）
     "ply_progress",        // 手数を100で割った進行度（局面フェーズの粗い指標）
 ];
 
@@ -87,6 +89,47 @@ fn max_hanging_value(pos: &Position, color: Color) -> f64 {
         .fold(0.0, f64::max)
 }
 
+/// マス sq を攻撃している `by` 側の駒のうち、最も安い exchange_value（取り返す/
+/// 取られる際に実際に使われるはずの駒。攻撃側は損を最小化するため最安の駒で
+/// 取る）。1枚も無ければ None
+///
+/// 近似: `attacks()`（利きの有無）だけを見ており、ピンで動けない駒や
+/// 取ると自玉が王手になる駒も攻撃駒に数える（既存の`max_hanging_value`と
+/// 同じ近似方針）。厳密な合法性チェックは局面ごとに指し手を構築する必要があり
+/// コストが高いため、学習データの特徴量としては許容範囲としている
+/// （codexレビュー指摘、2026-07-20。pairwiseの教師信号としてのノイズ源になる
+/// 可能性は残る）
+fn min_attacker_exchange_value(pos: &Position, sq: crate::board::Coord, by: Color) -> Option<f64> {
+    pos.pieces()
+        .filter(|(from, p)| p.color == by && pos.attacks(*from, sq))
+        .map(|(_, p)| exchange_value(p.role))
+        .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.min(v))))
+}
+
+/// `color` の駒（歩・玉除く。歩は打ち歩詰め等の特殊性が強く exchange_value の
+/// 前提が崩れやすいため除外）のうち、相手に取られた場合の最悪の交換損失
+/// （取り返せるなら相手の攻め駒の exchange_value を補償として差し引く）。
+/// kakudo局面（scenarios/kakudo.kif、R*2d vs P*2h）のような「取られる駒の
+/// 価値の高さ」を、single hangingでは表現できない紐つき交換でも捉えるための特徴量
+/// （2026-07-20、codexレビュー指摘: max_hanging_valueは紐なしの即取りしか
+/// 表せず、飛車を切って角を得る/歩を切って角を得るの損得差を区別できない）
+fn max_exchange_loss(pos: &Position, color: Color) -> f64 {
+    let opp = color.other();
+    pos.pieces()
+        .filter(|(_, p)| p.color == color && !matches!(p.role, Role::King | Role::Pawn))
+        .filter_map(|(sq, p)| {
+            // 相手は損を最小化するため最安の攻め駒で取ってくる想定
+            let attacker = min_attacker_exchange_value(pos, sq, opp)?;
+            let loss = exchange_value(p.role);
+            // 取り返せる（sq を自分の他の駒も攻撃している）なら、取り返して
+            // 得る相手の攻め駒の価値ぶんを補償として差し引く
+            let can_recapture = min_attacker_exchange_value(pos, sq, color).is_some();
+            let comp = if can_recapture { attacker } else { 0.0 };
+            Some((loss - comp).max(0.0))
+        })
+        .fold(0.0, f64::max)
+}
+
 /// 局面特徴量。`me` は評価する側（手番側とは限らない。学習データ書き出し側で
 /// 手番ごとに `me` を指定して両方の視点を作れる）
 pub fn value_features(pos: &Position, me: Color) -> [f64; VALUE_FEATURES] {
@@ -105,7 +148,74 @@ pub fn value_features(pos: &Position, me: Color) -> [f64; VALUE_FEATURES] {
         pieces_in_enemy_camp(pos, opp),
         max_hanging_value(pos, me),
         max_hanging_value(pos, opp),
+        max_exchange_loss(pos, me),
+        max_exchange_loss(pos, opp),
         f64::from(pos.move_number()) / 100.0,
+    ]
+}
+
+pub const TRANSITION_FEATURES: usize = 6;
+
+pub const TRANSITION_FEATURE_NAMES: [&str; TRANSITION_FEATURES] = [
+    "moved_piece_value",           // 直前に着手された駒（動いた/打たれた駒）の価値
+    "moved_piece_hanging_value",   // 同、紐なしで即取られる状態なら価値、そうでなければ0
+    "moved_piece_exchange_loss",   // 同、紐つきでも駒種の交換で損する額（取り返しの補償を差し引いた後）
+    "captured_value",              // その着手で取った相手駒の価値（打つ手・非取りなら0）
+    "net_capture_then_recapture",  // captured_value − moved_piece_exchange_loss（この一手の実質損得）
+    "gives_check",                 // その着手で相手に王手をかけたか
+];
+
+/// 直前の着手（`mv`）固有の特徴量。`max_hanging_value`/`max_exchange_loss`は
+/// 盤面全体でのworst-caseを返すため、無関係などこか別の駒のリスクが大きいと
+/// その着手自体が生むリスクの差がmaxに埋もれて消える（kakudo局面 R*2d vs P*2h
+/// で実際に発生・codexレビューで指摘、2026-07-20）。この関数は着手で動いた/
+/// 打たれた駒**だけ**に絞ることでその埋没を避ける。`mover` は着手した側
+pub fn transition_features(
+    before: &Position,
+    mv: &ShogiMove,
+    after: &Position,
+    mover: Color,
+) -> [f64; TRANSITION_FEATURES] {
+    let opp = mover.other();
+    let to = match *mv {
+        ShogiMove::Board { to, .. } => to,
+        ShogiMove::Drop { to, .. } => to,
+    };
+    let moved_role = after
+        .piece_at(to)
+        .expect("着手直後は to に自駒があるはず")
+        .role;
+    let moved_value = piece_value(moved_role);
+
+    let hanging = if after.is_attacked(to, opp) && !after.is_attacked(to, mover) {
+        moved_value
+    } else {
+        0.0
+    };
+
+    let exchange_loss = min_attacker_exchange_value(after, to, opp).map_or(0.0, |attacker| {
+        let loss = exchange_value(moved_role);
+        let can_recapture = min_attacker_exchange_value(after, to, mover).is_some();
+        let comp = if can_recapture { attacker } else { 0.0 };
+        (loss - comp).max(0.0)
+    });
+
+    // exchange_value に揃える（captured_value - exchange_loss = net の両辺が
+    // 同じ「持ち駒化後の実質価値」基準でないと差し引きの意味がズレる。
+    // codexレビュー指摘、2026-07-20: ここだけpiece_valueのままだと、と金等
+    // 成駒を取った際の得を過大評価し、net_capture_then_recaptureが歪む）
+    let captured_value = match *mv {
+        ShogiMove::Board { to, .. } => before.piece_at(to).map_or(0.0, |p| exchange_value(p.role)),
+        ShogiMove::Drop { .. } => 0.0,
+    };
+
+    [
+        moved_value,
+        hanging,
+        exchange_loss,
+        captured_value,
+        captured_value - exchange_loss,
+        f64::from(after.in_check(opp)),
     ]
 }
 
@@ -149,9 +259,9 @@ mod tests {
     #[test]
     fn ply_progress_increases_with_moves() {
         let mut pos = Position::initial();
-        let before = value_features(&pos, Color::Sente)[13];
+        let before = value_features(&pos, Color::Sente)[15];
         pos.play_unchecked(&parse_usi("7g7f").unwrap());
-        let after = value_features(&pos, Color::Sente)[13];
+        let after = value_features(&pos, Color::Sente)[15];
         assert!(after > before);
     }
 
@@ -186,5 +296,42 @@ mod tests {
         let f = value_features(&pos, Color::Sente);
         assert_eq!(f[11], piece_value(Role::Gold), "my_max_hanging: 先手の金が浮いている");
         assert_eq!(f[12], 0.0, "opp_max_hanging: 後手の金は歩に守られていて紐つき");
+    }
+
+    #[test]
+    fn defended_piece_still_shows_exchange_loss() {
+        // kakudo局面相当の最小再現: 飛車が「紐つき」（取り返せる）なので
+        // my_max_hangingは0だが、取り返しても金と飛車の交換では駒種で損する
+        // （my_max_exchange_lossはその損失=9.5-5.5=4.0を検出するはず）
+        let mut pos = Position::empty(Color::Sente);
+        pos.set(
+            Coord { file: 9, rank: 9 },
+            Some(crate::shogi::Piece { color: Color::Sente, role: Role::King }),
+        );
+        pos.set(
+            Coord { file: 1, rank: 1 },
+            Some(crate::shogi::Piece { color: Color::Gote, role: Role::King }),
+        );
+        // 先手の飛車が4五、後手の金が4四から攻撃
+        pos.set(
+            Coord { file: 4, rank: 5 },
+            Some(crate::shogi::Piece { color: Color::Sente, role: Role::Rook }),
+        );
+        pos.set(
+            Coord { file: 4, rank: 4 },
+            Some(crate::shogi::Piece { color: Color::Gote, role: Role::Gold }),
+        );
+        // 先手の歩が4六から飛車を守る（紐つき。金を取り返せる）
+        pos.set(
+            Coord { file: 4, rank: 6 },
+            Some(crate::shogi::Piece { color: Color::Sente, role: Role::Pawn }),
+        );
+        let f = value_features(&pos, Color::Sente);
+        assert_eq!(f[11], 0.0, "my_max_hanging: 飛車は紐つきなのでハングではない");
+        assert!(
+            (f[13] - 4.0).abs() < 1e-9,
+            "my_max_exchange_loss: 飛車(9.5)を切られ金(5.5)を取り返しても4.0損: {}",
+            f[13]
+        );
     }
 }
