@@ -37,10 +37,10 @@ fn main() {
         std::process::exit(1);
     }
 
-    println!(
-        "{},label",
-        VALUE_FEATURE_NAMES.join(",")
-    );
+    // game_id列でゲーム単位のグループ分割ができるようにする（codexレビュー指摘:
+    // 行単位のランダム分割だと同じ対局の別手番が学習/検証の両方に混じり
+    // データリークになる）。ply列は手数（1始まり）
+    println!("game_id,ply,{},label", VALUE_FEATURE_NAMES.join(","));
 
     let mut games = 0u64;
     let mut rows = 0u64;
@@ -53,10 +53,14 @@ fn main() {
             eprintln!("resultが不明: {path} ({})", end.result);
             continue;
         };
-        games += 1;
 
+        // 1局ぶんをバッファし、全手のreplayが成功した場合だけ出力する
+        // （codexレビュー指摘: パース失敗で打ち切ると、真実が壊れている
+        // 可能性がある局の一部だけが結果ラベルつきで紛れ込む）
+        let mut buf: Vec<String> = vec![];
         let mut pos = Position::initial();
-        for m in &end.moves {
+        let mut ok = true;
+        for (i, m) in end.moves.iter().enumerate() {
             let side = pos.turn();
             let label = if side == Color::Sente {
                 win_value_sente
@@ -65,14 +69,21 @@ fn main() {
             };
             let f = value_features(&pos, side);
             let row: Vec<String> = f.iter().map(|x| x.to_string()).collect();
-            println!("{},{label}", row.join(","));
-            rows += 1;
+            buf.push(format!("{games},{},{},{label}", i + 1, row.join(",")));
 
             let Some(mv) = parse_usi(&m.usi) else {
-                eprintln!("  棋譜の手をパースできません: {} ({path})", m.usi);
+                eprintln!("  棋譜の手をパースできません: {} ({path})。この局はスキップ", m.usi);
+                ok = false;
                 break;
             };
             pos.play_unchecked(&mv);
+        }
+        if ok {
+            for line in &buf {
+                println!("{line}");
+            }
+            rows += buf.len() as u64;
+            games += 1;
         }
     }
     eprintln!("書き出し完了: {games}局 / {rows}行 / 特徴量{VALUE_FEATURES}次元");

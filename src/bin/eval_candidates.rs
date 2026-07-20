@@ -27,6 +27,17 @@ fn main() {
         base.play_unchecked(&mv);
     }
 
+    // codexレビュー指摘: me は「候補手を指す側」でなければ評価の符号が反転する。
+    // CLI引数の指定ミスをここで検出する（着手後にpos.turn()が反転してからでは
+    // 気づけない）
+    if base.turn() != me {
+        eprintln!(
+            "エラー: 指定した me（{me:?}）はこの局面の手番（{:?}）と一致しません",
+            base.turn()
+        );
+        std::process::exit(1);
+    }
+
     println!("usi,{}", VALUE_FEATURE_NAMES.join(","));
     for usi in candidates {
         let mv = parse_usi(usi).unwrap_or_else(|| panic!("bad candidate usi {usi}"));
