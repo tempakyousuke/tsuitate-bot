@@ -181,17 +181,30 @@
 `strategy.rs` の手作りヒューリスティックが「堅実な手 vs 派手だが危険な手」を
 正しく評価できない事例（33手目5八四金、上記参照）を受け、以前見送っていた
 NN化（4段階案の③「粒子上のvalueネット」）に2026-07-20着手した。
-`src/value_features.rs`（真の局面の14特徴量）・`bin/export_value_data`
-（対局記録→学習データCSV）・`bin/eval_candidates`（候補手のオフライン評価）
-をtsuitate-bot側に実装し、学習パイプライン本体は別リポジトリ
-`~/Develop/tsuitate-nn`（Python/PyTorch、まだリモート無し）に置く。
+`src/value_features.rs`（真の局面のstate特徴量16 + 着手固有のtransition
+特徴量6 = 22次元）・`bin/export_value_data`（対局記録→学習データCSV）・
+`bin/export_pairwise_data`（同一局面内の手作り特徴量による優劣ペアを抽出、
+補助hinge loss用）・`bin/eval_candidates`（候補手のオフライン評価、
+`.kif`を直接読める）をtsuitate-bot側に実装し、学習パイプライン本体は
+別リポジトリ `~/Develop/tsuitate-nn`（Python/PyTorch、まだリモート無し）に置く。
 
-**現状: フェーズ1（データ基盤＋オフライン学習）はまだ成功条件未達**。
-初回学習でオフライン検証「合格」と一度報告したが、正規化統計を分割前の
-全データで計算・対局単位でなく行単位でtrain/val分割という手法上の欠陥が
-codexレビューで発覚し、修正後は不合格に逆転した（教訓: 良い結果が出た
-ときこそ疑ってレビューすべき）。詳細・訂正の経緯・次のステップは
-`docs/nn-value-phase1.md` を参照。**bot本体への推論統合はまだ行っていない**。
+**現状（2026-07-21時点）: フェーズ1（データ基盤＋オフライン学習）は
+一区切り、厳密な成功条件には一歩届かず**。既知シナリオ2件
+（`scenarios/gold-check.kif`, `kakudo.kif`）のオフライン検証がgold-check
+5/5・kakudo 4/5（5seed中）まで到達。経緯: 初回学習でオフライン検証「合格」
+と一度報告したが、正規化統計の分割前計算・行単位train/val分割という
+手法上の欠陥がcodexレビューで発覚し不合格に逆転（教訓: 良い結果が出た
+ときこそ疑ってレビューすべき）。データ拡大（3000局）・過学習対策の後も
+state特徴量だけでは候補手比較の信号がmax型特徴量に埋もれ、transition
+特徴量を追加しても最終勝敗ラベルのみでは符号を学習できない
+credit assignment問題に直面。pairwise補助loss（weight=20.0, margin=0.1）
+導入で現在地まで改善した。詳細・全経緯は`docs/nn-value-phase1.md`参照。
+**bot本体への推論統合はまだ行っていない**。
+
+副産物として、オフライン検証シナリオを増やす過程で`scenarios/kakutori.kif`
+を追加したところ、NNとは無関係にestimator戦略本体のバグ（王手駒の
+無条件捕獲を見逃す）を発見・修正し`estimator_v8`として凍結した
+（`check.rs`節参照）。
 
 ## SPSAチューニング（GCE）
 
