@@ -30,7 +30,12 @@
   指し直させる = 合法性知識の上限測定。記録は自動無効化）。
   実測 2026-07-16: vs v6 で nofoul 86.2%±4.8 / check_nofoul 59.5%±7.1 —
   反則経済に36ptの伸びしろが実在する（現状の評価構造のスカラー係数調整では
-  届かないことが tune-round3/4 の不発で確定。tuning/README.md 参照）
+  届かないことが tune-round3/4 の不発で確定。tuning/README.md 参照）。
+  C-7凍結後（2026-07-19）に再測定しても vs v7 で通常51.9%→nofoul 83.2%と
+  約31ptのギャップが温存されており、反則マスを記憶して割り引く4種の対策
+  （粒子ガイド2種・prior_legal/最終p_legal直接制約2種）はいずれも
+  有意な改善に届かなかった（docs/c8-direct-synthesis.md 参照）。この
+  ギャップは今のところ埋まっていない
 - `cargo run --release --bin tune -- [反復数] [評価あたり対局数] [基準...]` — 評価パラメータ
   （`strategy::EvalParams`）のSPSA自動チューニング。目的関数はアリーナのスコア率
   （引き分け=0.5勝）。**f+/f− は共通乱数法でペアリングされる**: 同じ対局シード列
@@ -107,7 +112,12 @@
   reinvigoration 相当）: 情報系の制約（王手宣言・反則の説明）だけ緩和して penalty+1 で
   生かし、評価側は重み 0.5^penalty で薄く数える。物理制約（合法性・駒種・取られたマス）は
   緩和しない。`predict_opp_reply` は観測フィルタなしの応手予測（2手読み用）。
-  粒子数・リプレイ予算は思考予算スケール（`with_scale`）に比例
+  粒子数・リプレイ予算は思考予算スケール（`with_scale`）に比例。
+  相手手のサンプリング事前分布 `opp_move_weight` は駒種ごとの動きやすさの
+  違いをほぼ持たない中で、`home_lance_move`（未動の隅香車が動く手を強く
+  割り引く。2026-07-19、人間レビュー指摘）だけ例外的に駒種特化の項がある
+  （「未観測の駒は初期配置のまま」という将棋の原則。他の駒種への一般化は
+  未着手）
 - `strategy.rs` — `Strategy` trait。`heuristic`（前進＋乱数の旧実装）と
   `estimator`（粒子加重平均で候補手を評価: 駒得期待値・反則確率×急峻な反則コスト・
   取られリスク・王周辺の利き圧力・王手/詰みボーナス・駒探し/王探しの情報利得・
@@ -118,6 +128,12 @@
   被王手/被詰みペナルティ）に置き換える。
   駒交換の価値は `exchange_value` =（盤上価値+持ち駒価値）÷2（と金の反動は歩1枚ぶんに近い）。
   終盤は `endgame_push`（手数×素材リード）で攻め項を増幅して膠着を破る（劣勢時は掛けない）。
+  `knight_bait_w`（桂馬の高跳び歩の餌食。敵桂馬の攻撃マスへ歩がBFS距離的に
+  近づくほど加点。2026-07-19、人間レビュー指摘）は「安い駒で駒得を狙う」の
+  唯一の駒種特化項。人間との対局レビューで「良い手を探す力が根本的に
+  足りていない」という指摘も出ており（33手目5八四金: 位置が確定している
+  敵駒の利きへ無防備に踏み込む手を20/20で選択）、個別の駒種特化項の
+  積み増しでは埋まらない可能性がある。詳細は下記「NN方向」参照。
   粒子数・読み幅は `SearchBudget`（`TSUITATE_THINK_BUDGET_MS` 由来）に比例
 - `frozen/` — アリーナ比較の基準となる凍結版戦略（
   `estimator_v6` = ソフト粒子（reinvigoration）・2手読み（応手サンプル・gain再構築）・
@@ -138,6 +154,23 @@
   キューへ戻る。本番（VPS）では systemd サービス `tsuitate-bot` として常駐
   （設置は tsuitate リポジトリの `scripts/server/setup/07-bot.sh`、更新は
   `npm run deploy -- --bot`）
+
+## NN方向（進行中、strategy.rs本体へは未統合）
+
+`strategy.rs` の手作りヒューリスティックが「堅実な手 vs 派手だが危険な手」を
+正しく評価できない事例（33手目5八四金、上記参照）を受け、以前見送っていた
+NN化（4段階案の③「粒子上のvalueネット」）に2026-07-20着手した。
+`src/value_features.rs`（真の局面の14特徴量）・`bin/export_value_data`
+（対局記録→学習データCSV）・`bin/eval_candidates`（候補手のオフライン評価）
+をtsuitate-bot側に実装し、学習パイプライン本体は別リポジトリ
+`~/Develop/tsuitate-nn`（Python/PyTorch、まだリモート無し）に置く。
+
+**現状: フェーズ1（データ基盤＋オフライン学習）はまだ成功条件未達**。
+初回学習でオフライン検証「合格」と一度報告したが、正規化統計を分割前の
+全データで計算・対局単位でなく行単位でtrain/val分割という手法上の欠陥が
+codexレビューで発覚し、修正後は不合格に逆転した（教訓: 良い結果が出た
+ときこそ疑ってレビューすべき）。詳細・訂正の経緯・次のステップは
+`docs/nn-value-phase1.md` を参照。**bot本体への推論統合はまだ行っていない**。
 
 ## SPSAチューニング（GCE）
 
@@ -196,10 +229,27 @@
 tsuitate リポジトリ側でスクラッチDBのdevサーバーを立てて1局打たせる:
 
 1. シード（人間ユーザーのセッション + botトークンを発行）: tsuitate リポジトリで
-   `createBotAccount` / `createSession` を呼ぶ小スクリプトを `DATABASE_URL=<scratch>.db npx tsx` で実行
-2. `DATABASE_URL=<scratch>.db npm run dev -- --port 5175` でサーバー起動
+   `createBotAccount` / `createSession` を呼ぶ小スクリプトを `DATABASE_URL=<scratch>.db npx tsx` で実行。
+   `$lib` エイリアス解決を避けたいだけなら `better-sqlite3` で users/sessions/bot_accounts に
+   直接INSERTする生SQLスクリプトでもよい（`scripts/server/official-bot.mjs` と同じ手法。
+   トークンは `tsb_` + 32byte base64url、ハッシュはSHA-256）
+2. `DATABASE_URL=<scratch>.db npm run dev -- --port 5175` でサーバー起動。
+   受付時間（平日21-22時/土日21-24時JST）外だと `queue:join` が拒否されるので、
+   ローカル検証では `MATCH_OPEN_ALWAYS=1` を付けて常時開放にする
+   （`src/lib/server/socket/handlers.ts` の `matchOpenNow` が参照。botには元々適用されない）
 3. このbotを `TSUITATE_URL=http://localhost:5175` で起動（バックグラウンド）
-4. 人間役スクリプト（socket.io-client + クッキー認証。数手指して投了）を実行し、
-   マッチ成立 → 交互着手 → 終局まで両者のログで確認
+4. 人間役はスクリプト（socket.io-client + クッキー認証。数手指して投了）でも、
+   **実際にブラウザで対局してレビューする**のでもよい。後者は
+   `document.cookie = "session=<生トークン>; path=/"` でログインできる
+   （sessionクッキーはhttpOnlyだが、`document.cookie` での新規作成には効く。
+   既存のhttpOnly cookieと衝突する場合は一度削除してから設定するか
+   シークレットウィンドウを使う）
 
 過疎判定（人間接続数 < 4）によりレート無視で即マッチするので、人間役1人で成立する。
+
+**実戦対局レビューは有効な診断手段**（2026-07-19〜20の実績: 3件の評価関数バグ
+knight_bait_w・home_lance_move・kakudo角道誤信を発見・修正）。真の局面を
+`bin/dump_position <moves.json> [手数]` で確認し、`bin/make_scenario`で
+`scenarios/*.kif` へ変換すれば `bin/scenario` の再現テスト・回帰テストとして
+残せる（手順は `scenarios/README.md`）。学習データ化するなら
+`bin/export_value_data`（NN方向、上記参照）。
