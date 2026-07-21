@@ -1,3 +1,4 @@
+<meta charset="UTF-8">
 <title>ついたて定跡エディタ</title>
 <style>
   :root {
@@ -15,6 +16,7 @@
     --accent-ink: #FFF6EF;
     --ok: #3E6B3A;
     --hint: rgba(174, 59, 36, 0.28);
+    --feature: #3B6E8C;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -31,19 +33,20 @@
       --accent: #D45A3E;
       --accent-ink: #2A130D;
       --hint: rgba(212, 90, 62, 0.35);
+      --feature: #7FB3D5;
     }
   }
   :root[data-theme="light"] {
     --bg: #F3EEE4; --panel: #FBF8F1; --ink: #2B2620; --muted: #7A7062;
     --line: #DDD4C2; --board: #D9A55E; --board-edge: #8A5A28; --grid: #5A3E1F;
     --piece: #F6E7C3; --piece-edge: #B08D4F; --accent: #AE3B24; --accent-ink: #FFF6EF;
-    --ok: #3E6B3A; --hint: rgba(174, 59, 36, 0.28);
+    --ok: #3E6B3A; --hint: rgba(174, 59, 36, 0.28); --feature: #3B6E8C;
   }
   :root[data-theme="dark"] {
     --bg: #201D18; --panel: #2A2620; --ink: #EDE5D4; --muted: #A2988A;
     --line: #453E33; --board: #B88743; --board-edge: #6E4517; --grid: #3E2A10;
     --piece: #EFDDB4; --piece-edge: #93743C; --accent: #D45A3E; --accent-ink: #2A130D;
-    --ok: #5F9457; --hint: rgba(212, 90, 62, 0.35);
+    --ok: #5F9457; --hint: rgba(212, 90, 62, 0.35); --feature: #7FB3D5;
   }
 
   body {
@@ -116,7 +119,9 @@
   .piece.selected { box-shadow: 0 0 0 3px var(--accent) inset; }
 
   /* 手順・ボタン */
-  .movelist { display: flex; flex-wrap: wrap; gap: 6px; min-height: 34px; }
+  /* contain: inline-size で手順チップの内容量をレイアウト幅の計算から遮断する。
+     これが無いと手数が伸びるたびに盤面パネルごと横に広がり、戻す/進むボタンの位置がズレる */
+  .movelist { display: flex; flex-wrap: wrap; gap: 6px; min-height: 34px; contain: inline-size; width: 100%; }
   .move-chip {
     background: var(--bg);
     border: 1px solid var(--line);
@@ -139,6 +144,7 @@
   button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
   button:disabled { opacity: 0.45; cursor: default; }
   .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .row[hidden] { display: none; }
   input[type="text"] {
     font: inherit;
     background: var(--bg);
@@ -150,21 +156,63 @@
     min-width: 140px;
   }
   input[type="text"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-  .warn { color: var(--accent); font-size: 0.85rem; }
+  select {
+    font: inherit;
+    background: var(--bg);
+    color: var(--ink);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 6px 10px;
+  }
+  select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  /* movelist と同じ理由: 特徴チェックボックスの内容量をパネル幅の計算から遮断する */
+  .feature-checks { display: flex; flex-wrap: wrap; gap: 6px 4px; margin: 2px 0; contain: inline-size; width: 100%; }
+  .feature-chip { display: inline-flex; align-items: center; gap: 4px; font-size: 0.85rem; }
+  .feature-chip label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+  .feature-chip-del {
+    border: none;
+    background: transparent;
+    color: var(--muted);
+    padding: 0 4px;
+    font-size: 0.8rem;
+    line-height: 1;
+    cursor: pointer;
+  }
+  .feature-chip-del:hover { color: var(--accent); }
+  /* movelist と同じ理由: 警告文の中身がパネル幅の計算に影響しないようにする */
+  .warn { color: var(--accent); font-size: 0.85rem; contain: inline-size; width: 100%; }
   .note { color: var(--muted); font-size: 0.8rem; }
 
   /* 保存済みライン */
   .saved { display: flex; flex-direction: column; gap: 8px; }
   .saved-line {
-    display: flex; gap: 10px; align-items: baseline;
+    display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline;
     border: 1px solid var(--line);
     border-radius: 4px;
     padding: 8px 10px;
     background: var(--bg);
   }
   .saved-line .name { font-weight: 600; }
-  .saved-line .moves { color: var(--muted); font-size: 0.82rem; flex: 1; overflow-x: auto; white-space: nowrap; }
+  .saved-line .moves {
+    color: var(--muted);
+    font-size: 0.82rem;
+    flex: 1 1 100%;
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: break-word;
+  }
   .saved-line button { padding: 2px 8px; font-size: 0.8rem; }
+  .saved-line .feature-tag { color: var(--feature); font-size: 0.8rem; font-weight: 600; }
+  .group-heading {
+    font-family: "Hiragino Mincho ProN", "Yu Mincho", serif;
+    font-size: 0.9rem;
+    color: var(--muted);
+    letter-spacing: 0.04em;
+    margin: 8px 0 -2px;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 2px;
+  }
+  .group-heading:first-child { margin-top: 0; }
   textarea {
     font-family: ui-monospace, monospace;
     font-size: 0.78rem;
@@ -212,6 +260,24 @@
         </div>
         <div class="movelist" id="movelist"></div>
         <p class="warn" id="capture-warn" hidden>⚠ 駒取りが起きる手です。実戦ではここでブックを抜けるため、以降の手は使われない可能性があります。</p>
+      </div>
+      <div class="row">
+        <label for="line-category" class="note">カテゴリ</label>
+        <select id="line-category"></select>
+        <button id="delete-category" title="選択中のカテゴリを選択肢から削除">削除</button>
+      </div>
+      <div class="row" id="new-category-row" hidden>
+        <input type="text" id="new-category-input" placeholder="新しいカテゴリ名（例: 居飛車速攻）">
+        <button id="add-category">追加</button>
+        <button id="cancel-category">キャンセル</button>
+      </div>
+      <div>
+        <span class="note">特徴（複数選択可）</span>
+        <div class="feature-checks" id="feature-checks"></div>
+        <div class="row">
+          <input type="text" id="new-feature-input" placeholder="新しい特徴（例: 7八銀）">
+          <button id="add-feature">追加</button>
+        </div>
       </div>
       <div class="row">
         <input type="text" id="line-name" placeholder="ラインの名前（例: 居飛車速攻）">
@@ -456,12 +522,16 @@
       }
     }
     document.getElementById("line-name").value = line.name;
+    currentCategory = line.category || "";
+    currentFeatures = new Set(line.features || []);
+    renderCategorySelect();
+    renderFeatureChecks();
     render();
     setStatus(`「${line.name}」を盤に読み込みました。◀▶で確認、そのまま編集して保存も可能`);
   }
 
-  /// 表示用: USI列を日本語棋譜に変換（再生に失敗したらUSIのまま返す）
-  function lineToJp(usis) {
+  /// 表示用: USI列を日本語棋譜に変換する（再生に失敗したら null）
+  function simulateLine(usis) {
     const savedBoard = board, savedGhosts = ghosts, savedMoves = moves,
           savedHistory = history, savedRedo = redoStack;
     initState();
@@ -478,75 +548,228 @@
   // ---- ライン管理 ----
   const STORAGE = "tsuitate-joseki-lines";
   const DEFAULTS = [
-    { name: "居飛車速攻", moves: ["2g2f", "2f2e", "2e2d", "2d2c+"] },
-    { name: "玉の右逃げ", moves: ["5i4h", "4h3h", "7i6h", "5g5f"] },
-    { name: "中住まい風", moves: ["5i5h", "3i4h", "7i6h", "5g5f"] },
-    { name: "左囲い", moves: ["5i6h", "7i7h", "6h7i", "5g5f"] },
+    { name: "居飛車速攻", moves: ["2g2f", "2f2e", "2e2d", "2d2c+"], category: "居飛車速攻", features: [] },
+    { name: "玉の右逃げ", moves: ["5i4h", "4h3h", "7i6h", "5g5f"], category: "囲い", features: [] },
+    { name: "中住まい風", moves: ["5i5h", "3i4h", "7i6h", "5g5f"], category: "囲い", features: [] },
+    { name: "左囲い", moves: ["5i6h", "7i7h", "6h7i", "5g5f"], category: "囲い", features: [] },
   ];
   let lines;
   try {
     lines = JSON.parse(localStorage.getItem(STORAGE)) || DEFAULTS;
   } catch { lines = DEFAULTS; }
 
+  // ---- カテゴリ・特徴（自由入力で追加できる選択式マスタ） ----
+  const CAT_STORAGE = "tsuitate-joseki-categories";
+  const FEAT_STORAGE = "tsuitate-joseki-features";
+  const DEFAULT_CATEGORIES = ["居飛車速攻", "囲い"];
+  const DEFAULT_FEATURES = ["7八銀"];
+  function loadList(key, fallback) {
+    try {
+      const v = JSON.parse(localStorage.getItem(key));
+      return Array.isArray(v) && v.length ? v : fallback.slice();
+    } catch { return fallback.slice(); }
+  }
+  let categories = loadList(CAT_STORAGE, DEFAULT_CATEGORIES);
+  let features = loadList(FEAT_STORAGE, DEFAULT_FEATURES);
+  let currentCategory = "";
+  let currentFeatures = new Set();
+
+  /// 既存ラインが使っているカテゴリ・特徴をマスタへ合流させる（インポート後・初回読み込み時）
+  function syncMasterLists() {
+    for (const line of lines) {
+      if (line.category && !categories.includes(line.category)) categories.push(line.category);
+      for (const f of line.features || []) {
+        if (!features.includes(f)) features.push(f);
+      }
+    }
+    categories.sort((a, b) => a.localeCompare(b, "ja"));
+    features.sort((a, b) => a.localeCompare(b, "ja"));
+  }
+  syncMasterLists();
+  function persistMasterLists() {
+    localStorage.setItem(CAT_STORAGE, JSON.stringify(categories));
+    localStorage.setItem(FEAT_STORAGE, JSON.stringify(features));
+    renderJson();
+  }
+  function renderCategorySelect() {
+    const sel = document.getElementById("line-category");
+    sel.innerHTML = "";
+    const optNone = document.createElement("option");
+    optNone.value = ""; optNone.textContent = "（未分類）";
+    sel.appendChild(optNone);
+    for (const c of categories) {
+      const opt = document.createElement("option");
+      opt.value = c; opt.textContent = c;
+      sel.appendChild(opt);
+    }
+    const optNew = document.createElement("option");
+    optNew.value = "__new__"; optNew.textContent = "＋ 新規カテゴリ…";
+    sel.appendChild(optNew);
+    sel.value = currentCategory;
+    document.getElementById("delete-category").disabled = !currentCategory;
+  }
+  function renderFeatureChecks() {
+    const box = document.getElementById("feature-checks");
+    box.innerHTML = "";
+    for (const f of features) {
+      const wrap = document.createElement("span");
+      wrap.className = "feature-chip";
+      const label = document.createElement("label");
+      const cb = document.createElement("input");
+      cb.type = "checkbox";
+      cb.checked = currentFeatures.has(f);
+      cb.addEventListener("change", () => {
+        if (cb.checked) currentFeatures.add(f); else currentFeatures.delete(f);
+      });
+      label.appendChild(cb);
+      label.append(f);
+      const del = document.createElement("button");
+      del.type = "button";
+      del.className = "feature-chip-del";
+      del.textContent = "×";
+      del.title = `「${f}」を選択肢から削除`;
+      del.addEventListener("click", () => {
+        features = features.filter(x => x !== f);
+        currentFeatures.delete(f);
+        persistMasterLists();
+        renderFeatureChecks();
+      });
+      wrap.append(label, del);
+      box.appendChild(wrap);
+    }
+  }
+  document.getElementById("line-category").addEventListener("change", e => {
+    if (e.target.value === "__new__") {
+      document.getElementById("new-category-row").hidden = false;
+      document.getElementById("new-category-input").focus();
+      e.target.value = currentCategory;
+    } else {
+      currentCategory = e.target.value;
+      document.getElementById("delete-category").disabled = !currentCategory;
+    }
+  });
+  document.getElementById("delete-category").addEventListener("click", () => {
+    if (!currentCategory) return;
+    categories = categories.filter(c => c !== currentCategory);
+    persistMasterLists();
+    currentCategory = "";
+    renderCategorySelect();
+  });
+  document.getElementById("add-category").addEventListener("click", () => {
+    const input = document.getElementById("new-category-input");
+    const name = input.value.trim();
+    if (!name) return;
+    if (!categories.includes(name)) {
+      categories.push(name);
+      categories.sort((a, b) => a.localeCompare(b, "ja"));
+      persistMasterLists();
+    }
+    currentCategory = name;
+    input.value = "";
+    document.getElementById("new-category-row").hidden = true;
+    renderCategorySelect();
+  });
+  document.getElementById("cancel-category").addEventListener("click", () => {
+    document.getElementById("new-category-input").value = "";
+    document.getElementById("new-category-row").hidden = true;
+    renderCategorySelect();
+  });
+  document.getElementById("add-feature").addEventListener("click", () => {
+    const input = document.getElementById("new-feature-input");
+    const name = input.value.trim();
+    if (!name) return;
+    if (!features.includes(name)) {
+      features.push(name);
+      features.sort((a, b) => a.localeCompare(b, "ja"));
+      persistMasterLists();
+    }
+    currentFeatures.add(name);
+    input.value = "";
+    renderFeatureChecks();
+  });
+
+  /// lines を「カテゴリ→手数→名前」の順に並べ替える（未分類は末尾）
+  function sortLines() {
+    lines.sort((a, b) => {
+      const catA = a.category || "", catB = b.category || "";
+      if (!catA && catB) return 1;
+      if (catA && !catB) return -1;
+      return catA.localeCompare(catB, "ja") ||
+        a.moves.length - b.moves.length ||
+        a.name.localeCompare(b.name, "ja");
+    });
+  }
+  sortLines();
+
   function persist() {
+    sortLines();
     localStorage.setItem(STORAGE, JSON.stringify(lines));
     renderSaved();
     renderJson();
   }
+  /// 保存済みライン（sortLines 済みの順）をカテゴリごとに見出しで区切って表示する
   function renderSaved() {
     const box = document.getElementById("saved");
     box.innerHTML = "";
     if (lines.length === 0) {
       box.innerHTML = '<p class="note">まだラインがありません。盤で手順を作って保存してください。</p>';
+      return;
     }
-    lines.forEach((line, i) => {
+    const counts = new Map();
+    for (const line of lines) {
+      const key = line.category || "未分類";
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+    let lastKey;
+    lines.forEach((line, index) => {
+      const jp = simulateLine(line.moves);
+      const key = line.category || "未分類";
+      if (key !== lastKey) {
+        const heading = document.createElement("h3");
+        heading.className = "group-heading";
+        heading.textContent = `${key}（${counts.get(key)}）`;
+        box.appendChild(heading);
+        lastKey = key;
+      }
       const row = document.createElement("div");
       row.className = "saved-line";
-      const up = document.createElement("button");
-      up.textContent = "▲";
-      up.title = "上へ";
-      up.disabled = i === 0;
-      up.addEventListener("click", () => {
-        [lines[i - 1], lines[i]] = [lines[i], lines[i - 1]];
-        persist();
-      });
-      const down = document.createElement("button");
-      down.textContent = "▼";
-      down.title = "下へ";
-      down.disabled = i === lines.length - 1;
-      down.addEventListener("click", () => {
-        [lines[i], lines[i + 1]] = [lines[i + 1], lines[i]];
-        persist();
-      });
       const show = document.createElement("button");
       show.textContent = "確認";
-      show.addEventListener("click", () => loadLine(i));
+      show.addEventListener("click", () => loadLine(index));
       const del = document.createElement("button");
       del.textContent = "削除";
-      del.addEventListener("click", () => { lines.splice(i, 1); persist(); });
+      del.addEventListener("click", () => { lines.splice(index, 1); persist(); });
       const name = document.createElement("span");
       name.className = "name";
       name.textContent = line.name;
       const mv = document.createElement("span");
       mv.className = "moves";
-      const jp = lineToJp(line.moves);
       mv.textContent = jp ? jp.join("　") : `⚠ ${line.moves.join(" ")}`;
       mv.title = line.moves.join(" ");
-      row.append(up, down, name, mv, show, del);
+      row.append(name, mv);
+      if (line.features && line.features.length) {
+        const feat = document.createElement("span");
+        feat.className = "feature-tag";
+        feat.textContent = line.features.join(" / ");
+        row.appendChild(feat);
+      }
+      row.append(show, del);
       box.appendChild(row);
     });
   }
   function renderJson() {
-    document.getElementById("json").value = JSON.stringify({ lines }, null, 2);
+    document.getElementById("json").value = JSON.stringify({ lines, categories, features }, null, 2);
   }
 
   document.getElementById("save-line").addEventListener("click", () => {
     if (moves.length === 0) return setStatus("手順が空です");
     const name = document.getElementById("line-name").value.trim() || `ライン${lines.length + 1}`;
-    lines.push({ name, moves: moves.map(m => m.usi) });
+    lines.push({ name, moves: moves.map(m => m.usi), category: currentCategory, features: [...currentFeatures] });
     persist();
     setStatus(`「${name}」を保存しました`);
     document.getElementById("line-name").value = "";
+    currentCategory = ""; currentFeatures = new Set();
+    renderCategorySelect(); renderFeatureChecks();
     initState(); selected = null; render();
   });
   document.getElementById("undo").addEventListener("click", () => {
@@ -585,7 +808,18 @@
     try {
       const v = JSON.parse(document.getElementById("json").value);
       if (!Array.isArray(v.lines)) throw new Error("lines がありません");
-      lines = v.lines.filter(l => l.name && Array.isArray(l.moves));
+      lines = v.lines.filter(l => l.name && Array.isArray(l.moves)).map(l => ({
+        name: l.name,
+        moves: l.moves,
+        category: typeof l.category === "string" ? l.category : "",
+        features: Array.isArray(l.features) ? l.features.filter(f => typeof f === "string") : [],
+      }));
+      if (Array.isArray(v.categories)) categories = v.categories.filter(c => typeof c === "string");
+      if (Array.isArray(v.features)) features = v.features.filter(f => typeof f === "string");
+      syncMasterLists();
+      persistMasterLists();
+      renderCategorySelect();
+      renderFeatureChecks();
       persist();
       setStatus(`${lines.length}本のラインを取り込みました`);
     } catch (e) {
@@ -598,6 +832,8 @@
 
   initState();
   render();
+  renderCategorySelect();
+  renderFeatureChecks();
   renderSaved();
   renderJson();
 })();
