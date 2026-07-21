@@ -1538,6 +1538,7 @@ fn sample_opp_move(
             ShogiMove::Drop { .. } => (false, false),
         };
         let w = opp_move_weight(
+            pos,
             opp,
             &mv,
             threat_known,
@@ -1547,7 +1548,6 @@ fn sample_opp_move(
             moved_is_minor(pos, &mv),
             deep_unsupported(&next, &mv, opp),
             hangs_on_landing(pos, &next, &mv, opp),
-            home_lance_move(pos, &mv, opp),
             foul_count_this_turn,
         );
         total_mass += w;
@@ -1678,6 +1678,7 @@ pub fn opp_reply_weights(
         // 2手読み予測はまだ起きていない相手の応手を当てるので、この手番の
         // 反則回数は未知（観測なし）。既定値0（実データの最頻値）を使う
         let mut w = opp_move_weight(
+            pos,
             opp,
             &mv,
             threat_known,
@@ -1687,7 +1688,6 @@ pub fn opp_reply_weights(
             moved_is_minor(pos, &mv),
             deep_unsupported(&next, &mv, opp),
             hangs_on_landing(pos, &next, &mv, opp),
-            home_lance_move(pos, &mv, opp),
             0,
         );
         if let ShogiMove::Board { to, .. } = mv {
@@ -1709,25 +1709,6 @@ fn moved_is_minor(pos: &Position, mv: &ShogiMove) -> bool {
         ShogiMove::Drop { role, .. } => Some(role),
     };
     matches!(role, Some(Role::Pawn | Role::Lance | Role::Knight))
-}
-
-/// 初期配置の香車マス（自分から動かしたことがない）からの移動か。
-/// 香車は序盤ほぼ動かない駒で、これが立たない限り「初期配置のまま」を
-/// 強く信じてよい（人間レビューでの指摘: 未観測の駒は初期配置のまま
-/// とみなすべきで、隅への探り打ちを繰り返すのは反則を浪費するだけ）。
-/// **定義は bin/fit_opp の home_lance_move と一致させること**
-fn home_lance_move(pos: &Position, mv: &ShogiMove, opp: Color) -> bool {
-    let ShogiMove::Board { from, .. } = *mv else {
-        return false;
-    };
-    if !pos.piece_at(from).is_some_and(|p| p.color == opp && p.role == Role::Lance) {
-        return false;
-    }
-    let home_rank = match opp {
-        Color::Sente => 9,
-        Color::Gote => 1,
-    };
-    from.rank == home_rank && (from.file == 1 || from.file == 9)
 }
 
 /// 相手の利きがあるマスへの紐なし着地か（取りは除く = 交換ではなく差し出し）。
@@ -1784,16 +1765,19 @@ fn flees_danger(from: Coord, to: Coord, danger: &[Coord]) -> bool {
 
 /// 相手の手の尤度づけ。2026-07-21、NN段階①-a: bin/fit_opp の12特徴量
 /// 線形フィット（旧実装、パープレキシティ24.2）を1隠れ層MLP
-/// （`opp_move_nn::opp_move_nn_forward`）へ置き換えた。tsuitate-nn側の
-/// オフライン比較（4シード）でNLL・top-1・top-3とも線形に対して頑健に改善
-/// （例: seed0 perplexity 22.0→19.4、top-1 21.0%→26.9%）。
+/// （`opp_move_nn::opp_move_nn_forward`）へ置き換えた。
+/// 2026-07-22、①-b: 駒種特化ブロック（駒種one-hot・成駒・移動距離・
+/// 初期配置マスからの移動）を追加して13→23特徴量。kakutoriで露呈した
+/// 「角・飛の長距離移動を表現できない」欠陥と、home_lance_move の
+/// 駒種横断への一般化（未観測の駒は初期配置のまま）が狙い。
+/// 旧実装で別立てだった home_lance の-1.3加点は、NNが from_home×lance を
+/// 直接表現できるようになったため二重計上を避けて廃止した。
 /// 呼び出し頻度が1手の意思決定あたり最大10万回超のオーダーのため、
 /// ONNX等の推論クレートは使わず手書きforward pass（外部依存ゼロ、
-/// 数百FLOP）にしている（詳細は`opp_move_nn.rs`のモジュールコメント）。
-/// `home_lance`はNNの12特徴量に含まれない駒種特化項（2026-07-19、
-/// 人間対局レビューで追加）なので、退行させないよう対数スコアへの
-/// 加算として引き続き別立てで維持する
+/// 数百FLOP）にしている（詳細は`opp_move_nn.rs`のモジュールコメント）
+#[allow(clippy::too_many_arguments)]
 fn opp_move_weight(
+    pos: &Position,
     opp: Color,
     mv: &ShogiMove,
     threat_known: bool,
@@ -1803,7 +1787,6 @@ fn opp_move_weight(
     moved_minor: bool,
     deep_unsup: bool,
     hang: bool,
-    home_lance: bool,
     foul_count_this_turn: u32,
 ) -> f64 {
     let (advance, is_drop, promotes) = match *mv {
@@ -1816,6 +1799,7 @@ fn opp_move_weight(
         }
         ShogiMove::Drop { .. } => (0.0, true, false),
     };
+    let pt = crate::opp_move_features::piece_type_features(pos, mv, opp);
     let features = [
         advance,
         (promotes && moved_minor) as u8 as f64,
@@ -1830,18 +1814,23 @@ fn opp_move_weight(
         (hang && moved_minor) as u8 as f64,
         (hang && !moved_minor) as u8 as f64,
         f64::from(foul_count_this_turn),
+        pt[0],
+        pt[1],
+        pt[2],
+        pt[3],
+        pt[4],
+        pt[5],
+        pt[6],
+        pt[7],
+        pt[8],
+        pt[9],
     ];
     // クランプ: NNは訓練データの分布から外れた入力（リプレイの仮説探索中に
     // 現れる、実戦ではまれな特徴量の組み合わせ）に対して極端なlogitを出しうる
     // （旧線形モデルは係数が小さく手作りなので自然に有界だった）。診断で
     // 反則中の王手駒探索（kakutori.kif）の粒子再生成コストが2〜3倍以上に
     // 悪化する事例を確認したため、外挿時の暴走を防ぐ安全弁として導入
-    let mut s = crate::opp_move_nn::opp_move_nn_forward(&features).clamp(-15.0, 15.0);
-    // 香車は序盤ほぼ動かない。threat_known/threat_home/promote 等の
-    // 具体的な理由があれば上の加点で相殺されるので、無目的な初手だけを狙って割り引く
-    if home_lance {
-        s += -1.3;
-    }
+    let s = crate::opp_move_nn::opp_move_nn_forward(&features).clamp(-15.0, 15.0);
     s.exp()
 }
 
@@ -2062,50 +2051,6 @@ mod tests {
             move_number: 0,
             captured_my_piece_at: captured_at.map(String::from),
         });
-    }
-
-    #[test]
-    fn home_lance_move_flags_only_untouched_corner_lances() {
-        let pos = Position::initial();
-        // 後手の香車（初期配置1一・9一）が動く手は該当
-        let mv = ShogiMove::Board {
-            from: Coord { file: 1, rank: 1 },
-            to: Coord { file: 1, rank: 2 },
-            promote: false,
-        };
-        assert!(home_lance_move(&pos, &mv, Color::Gote));
-        let mv9 = ShogiMove::Board {
-            from: Coord { file: 9, rank: 1 },
-            to: Coord { file: 9, rank: 2 },
-            promote: false,
-        };
-        assert!(home_lance_move(&pos, &mv9, Color::Gote));
-        // 先手の香車は5九ではなく1九・9九
-        assert!(!home_lance_move(
-            &pos,
-            &ShogiMove::Board {
-                from: Coord { file: 1, rank: 1 },
-                to: Coord { file: 1, rank: 2 },
-                promote: false,
-            },
-            Color::Sente
-        ));
-        let mv_sente = ShogiMove::Board {
-            from: Coord { file: 9, rank: 9 },
-            to: Coord { file: 9, rank: 8 },
-            promote: false,
-        };
-        assert!(home_lance_move(&pos, &mv_sente, Color::Sente));
-        // 隣の桂馬マス（初期配置2一）は香車ではないので該当しない
-        let knight_mv = ShogiMove::Board {
-            from: Coord { file: 2, rank: 1 },
-            to: Coord { file: 1, rank: 3 },
-            promote: false,
-        };
-        assert!(!home_lance_move(&pos, &knight_mv, Color::Gote));
-        // 打ちは該当しない
-        let drop = ShogiMove::Drop { role: Role::Lance, to: Coord { file: 5, rank: 5 } };
-        assert!(!home_lance_move(&pos, &drop, Color::Gote));
     }
 
     #[test]
@@ -2711,7 +2656,7 @@ mod tests {
         );
     }
 
-    /// opp_move_weight が組み立てる12特徴量と opp_move_features::opp_move_features
+    /// opp_move_weight が組み立てる23特徴量と opp_move_features::opp_move_features
     /// が同じ局面・同じ手に対して一致することを固定する（codexレビュー指摘、
     /// 2026-07-21: estimator.rs 側は hot path 用に private helper を複製したまま
     /// なので、将来どちらか一方だけ変更されてズレるのを検出する）
@@ -2760,6 +2705,7 @@ mod tests {
             // opp_foul_count_this_turn（13番目）はConstraint::OppMoveから素通しされる
             // だけの値なので、非ゼロ値（3）で両辺の一致も確認する
             let foul_count_this_turn = 3u32;
+            let pt = opp_move_features::piece_type_features(&pos, &mv, mover);
             let est_features = [
                 advance,
                 (promotes && minor) as u8 as f64,
@@ -2774,6 +2720,16 @@ mod tests {
                 (hang && minor) as u8 as f64,
                 (hang && !minor) as u8 as f64,
                 f64::from(foul_count_this_turn),
+                pt[0],
+                pt[1],
+                pt[2],
+                pt[3],
+                pt[4],
+                pt[5],
+                pt[6],
+                pt[7],
+                pt[8],
+                pt[9],
             ];
 
             let shared_features = opp_move_features::opp_move_features(
