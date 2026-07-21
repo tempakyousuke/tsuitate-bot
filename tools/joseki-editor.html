@@ -117,7 +117,9 @@
   .piece.selected { box-shadow: 0 0 0 3px var(--accent) inset; }
 
   /* 手順・ボタン */
-  .movelist { display: flex; flex-wrap: wrap; gap: 6px; min-height: 34px; }
+  /* contain: inline-size で手順チップの内容量をレイアウト幅の計算から遮断する。
+     これが無いと手数が伸びるたびに盤面パネルごと横に広がり、戻す/進むボタンの位置がズレる */
+  .movelist { display: flex; flex-wrap: wrap; gap: 6px; min-height: 34px; contain: inline-size; width: 100%; }
   .move-chip {
     background: var(--bg);
     border: 1px solid var(--line);
@@ -151,20 +153,28 @@
     min-width: 140px;
   }
   input[type="text"]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-  .warn { color: var(--accent); font-size: 0.85rem; }
+  /* movelist と同じ理由: 警告文の中身がパネル幅の計算に影響しないようにする */
+  .warn { color: var(--accent); font-size: 0.85rem; contain: inline-size; width: 100%; }
   .note { color: var(--muted); font-size: 0.8rem; }
 
   /* 保存済みライン */
   .saved { display: flex; flex-direction: column; gap: 8px; }
   .saved-line {
-    display: flex; gap: 10px; align-items: baseline;
+    display: flex; flex-wrap: wrap; gap: 4px 10px; align-items: baseline;
     border: 1px solid var(--line);
     border-radius: 4px;
     padding: 8px 10px;
     background: var(--bg);
   }
   .saved-line .name { font-weight: 600; }
-  .saved-line .moves { color: var(--muted); font-size: 0.82rem; flex: 1; overflow-x: auto; white-space: nowrap; }
+  .saved-line .moves {
+    color: var(--muted);
+    font-size: 0.82rem;
+    flex: 1 1 100%;
+    min-width: 0;
+    white-space: normal;
+    overflow-wrap: break-word;
+  }
   .saved-line button { padding: 2px 8px; font-size: 0.8rem; }
   .group-heading {
     font-family: "Hiragino Mincho ProN", "Yu Mincho", serif;
