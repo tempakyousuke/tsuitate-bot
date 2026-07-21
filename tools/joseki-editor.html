@@ -711,6 +711,11 @@
       box.innerHTML = '<p class="note">まだラインがありません。盤で手順を作って保存してください。</p>';
       return;
     }
+    const counts = new Map();
+    for (const line of lines) {
+      const key = line.category || "未分類";
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
     let lastKey;
     lines.forEach((line, index) => {
       const jp = simulateLine(line.moves);
@@ -718,7 +723,7 @@
       if (key !== lastKey) {
         const heading = document.createElement("h3");
         heading.className = "group-heading";
-        heading.textContent = key;
+        heading.textContent = `${key}（${counts.get(key)}）`;
         box.appendChild(heading);
         lastKey = key;
       }
