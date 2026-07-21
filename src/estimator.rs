@@ -1697,7 +1697,7 @@ fn home_lance_move(pos: &Position, mv: &ShogiMove, opp: Color) -> bool {
 /// 利き・紐とも着地後の盤面（next）で判定する（開き駒の利きを含む）。
 /// 相手の玉の利きも数える（紐がなければ玉に取られる）。銀以上の駒での該当は
 /// 実質タダの駒捨てで人間はほぼ指さない（馬@62 のような幻の飛び込み王手の
-/// 過大評価を抑える）。**定義は bin/fit_opp の hangs_on_landing と一致させること**
+/// 過大評価を抑える）。**定義は opp_move_features::hangs_on_landing と一致させること**
 fn hangs_on_landing(pos: &Position, next: &Position, mv: &ShogiMove, mover: Color) -> bool {
     let to = match *mv {
         ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
@@ -1716,7 +1716,7 @@ fn hangs_on_landing(pos: &Position, next: &Position, mv: &ShogiMove, mover: Colo
 }
 
 /// 敵陣（成れる3段）への紐なし着地か。着地点に自分の別の駒の利きが無い。
-/// **定義は bin/fit_opp の deep_unsupported と一致させること**
+/// **定義は opp_move_features::deep_unsupported と一致させること**
 fn deep_unsupported(next: &Position, mv: &ShogiMove, mover: Color) -> bool {
     let to = match *mv {
         ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
@@ -1736,7 +1736,7 @@ fn dist(a: Coord, b: Coord) -> i8 {
 }
 
 /// 玉の移動が危険地点集合（自分が駒を取ったマス = 相手にとっての露見地点）から
-/// 遠ざかる手か。**定義は bin/fit_opp の flees_danger と一致させること**
+/// 遠ざかる手か。**定義は opp_move_features::flees_danger と一致させること**
 fn flees_danger(from: Coord, to: Coord, danger: &[Coord]) -> bool {
     let near = |sq: Coord| danger.iter().map(|&d| dist(sq, d)).min();
     match (near(from), near(to)) {
@@ -1745,14 +1745,17 @@ fn flees_danger(from: Coord, to: Coord, danger: &[Coord]) -> bool {
     }
 }
 
-/// 相手の手の尤度づけ。対人59局の条件付き最尤推定（bin/fit_opp, 2026-07-17、
-/// 成り・敵陣深入り・ハングの駒種分割）: パープレキシティ 28.2（旧手調整）→ 24.2。
-/// 駒取り・王手の有無は観測との整合ですでに絞り込まれているため、
-/// 事前分布には「観測クラス内で判別できる特徴量」だけが現れる。
-/// king_flee がわずかに負なのは実測（守りを剥がされても玉は特に逃げない）。
-/// 成り・深入り・ハングは小駒（歩香桂）と銀以上で分割: 垂れ歩・と金作りは
-/// 好んで指されるが、大駒を相手の利きに紐なしで差し出す手（hang_major）は
-/// 実質駒捨てで明確に避けられる（候補10.3%に対し選択3.6%）
+/// 相手の手の尤度づけ。2026-07-21、NN段階①-a: bin/fit_opp の12特徴量
+/// 線形フィット（旧実装、パープレキシティ24.2）を1隠れ層MLP
+/// （`opp_move_nn::opp_move_nn_forward`）へ置き換えた。tsuitate-nn側の
+/// オフライン比較（4シード）でNLL・top-1・top-3とも線形に対して頑健に改善
+/// （例: seed0 perplexity 22.0→19.4、top-1 21.0%→26.9%）。
+/// 呼び出し頻度が1手の意思決定あたり最大10万回超のオーダーのため、
+/// ONNX等の推論クレートは使わず手書きforward pass（外部依存ゼロ、
+/// 数百FLOP）にしている（詳細は`opp_move_nn.rs`のモジュールコメント）。
+/// `home_lance`はNNの12特徴量に含まれない駒種特化項（2026-07-19、
+/// 人間対局レビューで追加）なので、退行させないよう対数スコアへの
+/// 加算として引き続き別立てで維持する
 fn opp_move_weight(
     opp: Color,
     mv: &ShogiMove,
@@ -1765,38 +1768,36 @@ fn opp_move_weight(
     hang: bool,
     home_lance: bool,
 ) -> f64 {
-    let mut s = 0.0;
-    match *mv {
+    let (advance, is_drop, promotes) = match *mv {
         ShogiMove::Board { from, to, promote } => {
             let advance = match opp {
                 Color::Sente => (from.rank - to.rank) as f64,
                 Color::Gote => (to.rank - from.rank) as f64,
             };
-            s += 0.162 * advance;
-            if promote {
-                s += if moved_minor { 1.647 } else { 0.659 };
-            }
+            (advance, false, promote)
         }
-        ShogiMove::Drop { .. } => s += -1.451,
-    }
-    if threat_known {
-        s += 0.561;
-    }
-    if threat_home {
-        s += 0.670;
-    }
-    if is_king_move {
-        s += 0.131;
-    }
-    if king_flee {
-        s += -0.161;
-    }
-    if deep_unsup {
-        s += if moved_minor { 0.320 } else { 0.026 };
-    }
-    if hang {
-        s += if moved_minor { 0.433 } else { -0.839 };
-    }
+        ShogiMove::Drop { .. } => (0.0, true, false),
+    };
+    let features = [
+        advance,
+        (promotes && moved_minor) as u8 as f64,
+        (promotes && !moved_minor) as u8 as f64,
+        is_drop as u8 as f64,
+        threat_known as u8 as f64,
+        threat_home as u8 as f64,
+        is_king_move as u8 as f64,
+        king_flee as u8 as f64,
+        (deep_unsup && moved_minor) as u8 as f64,
+        (deep_unsup && !moved_minor) as u8 as f64,
+        (hang && moved_minor) as u8 as f64,
+        (hang && !moved_minor) as u8 as f64,
+    ];
+    // クランプ: NNは訓練データの分布から外れた入力（リプレイの仮説探索中に
+    // 現れる、実戦ではまれな特徴量の組み合わせ）に対して極端なlogitを出しうる
+    // （旧線形モデルは係数が小さく手作りなので自然に有界だった）。診断で
+    // 反則中の王手駒探索（kakutori.kif）の粒子再生成コストが2〜3倍以上に
+    // 悪化する事例を確認したため、外挿時の暴走を防ぐ安全弁として導入
+    let mut s = crate::opp_move_nn::opp_move_nn_forward(&features).clamp(-15.0, 15.0);
     // 香車は序盤ほぼ動かない。threat_known/threat_home/promote 等の
     // 具体的な理由があれば上の加点で相殺されるので、無目的な初手だけを狙って割り引く
     if home_lance {
@@ -2665,5 +2666,77 @@ mod tests {
             est.info_miss.iter().filter(|&&m| m == 2).count() > est.target() * 9 / 10,
             "リサンプリングのコピーが info_miss を引き継いでいない"
         );
+    }
+
+    /// opp_move_weight が組み立てる12特徴量と opp_move_features::opp_move_features
+    /// が同じ局面・同じ手に対して一致することを固定する（codexレビュー指摘、
+    /// 2026-07-21: estimator.rs 側は hot path 用に private helper を複製したまま
+    /// なので、将来どちらか一方だけ変更されてズレるのを検出する）
+    #[test]
+    fn opp_move_weight_features_match_shared_module() {
+        use crate::opp_move_features;
+        use std::collections::HashSet;
+
+        let mut pos = Position::initial();
+        for usi in ["7g7f", "3c3d", "2g2f", "8c8d", "2f2e", "8d8e", "3g3f", "3d3e"] {
+            pos.play_unchecked(&parse_usi(usi).unwrap());
+        }
+        let mover = pos.turn();
+        let known_squares = vec![Coord { file: 5, rank: 3 }];
+        let known_set: HashSet<Coord> = known_squares.iter().copied().collect();
+        let touched: HashSet<Coord> = HashSet::new();
+        let homes_set = opp_move_features::home_squares(&pos, mover.other(), &touched);
+        let homes_vec: Vec<Coord> = homes_set.iter().copied().collect();
+
+        let mut checked = 0;
+        for mv in pos.legal_moves() {
+            let mut next = pos.clone();
+            next.play_unchecked(&mv);
+
+            let threat_known = newly_threatens(&pos, &next, &mv, &known_squares);
+            let threat_home = newly_threatens(&pos, &next, &mv, &homes_vec);
+            let (is_king, flee) = match mv {
+                ShogiMove::Board { from, to, .. } => {
+                    let is_king = pos.piece_at(from).is_some_and(|p| p.role == Role::King);
+                    (is_king, is_king && flees_danger(from, to, &known_squares))
+                }
+                ShogiMove::Drop { .. } => (false, false),
+            };
+            let minor = moved_is_minor(&pos, &mv);
+            let promotes = matches!(mv, ShogiMove::Board { promote: true, .. });
+            let is_drop = matches!(mv, ShogiMove::Drop { .. });
+            let advance = match mv {
+                ShogiMove::Board { from, to, .. } => match mover {
+                    Color::Sente => (from.rank - to.rank) as f64,
+                    Color::Gote => (to.rank - from.rank) as f64,
+                },
+                ShogiMove::Drop { .. } => 0.0,
+            };
+            let deep_unsup = deep_unsupported(&next, &mv, mover);
+            let hang = hangs_on_landing(&pos, &next, &mv, mover);
+            let est_features = [
+                advance,
+                (promotes && minor) as u8 as f64,
+                (promotes && !minor) as u8 as f64,
+                is_drop as u8 as f64,
+                threat_known as u8 as f64,
+                threat_home as u8 as f64,
+                is_king as u8 as f64,
+                flee as u8 as f64,
+                (deep_unsup && minor) as u8 as f64,
+                (deep_unsup && !minor) as u8 as f64,
+                (hang && minor) as u8 as f64,
+                (hang && !minor) as u8 as f64,
+            ];
+
+            let shared_features =
+                opp_move_features::opp_move_features(&pos, &next, &mv, mover, &known_set, &homes_set);
+            assert_eq!(
+                est_features, shared_features,
+                "特徴量が一致しない: mv={mv:?}"
+            );
+            checked += 1;
+        }
+        assert!(checked > 10, "候補手が少なすぎてテストとして機能していない");
     }
 }

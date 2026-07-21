@@ -20,144 +20,17 @@
 use std::collections::HashSet;
 
 use tsuitate_bot::board::Coord;
+use tsuitate_bot::opp_move_features::{
+    FEATURE_NAMES, OPP_MOVE_FEATURES as D, home_squares, opp_move_features, to_square,
+};
 use tsuitate_bot::protocol::{Color, GameEndPayload};
 use tsuitate_bot::shogi::{Position, ShogiMove, parse_usi};
-
-const FEATURE_NAMES: [&str; 12] = [
-    "advance",       // 前進量（段）
-    "promote_minor", // 成り（歩・香・桂）
-    "promote_major", // 成り（銀・角・飛）
-    "is_drop",      // 持ち駒を打つ
-    "threat_known", // 位置が既知の相手駒（自分の駒が死んだマス）へ新たに当たりを付ける
-    "threat_home",  // 初期位置から動いていない相手駒へ新たに当たりを付ける
-                    // （筋が開いた背後の飛車を狙う歩打ち等。相手は推論で位置を当ててくる）
-    "is_king_move", // 玉を動かす（基礎傾向）
-    "king_flee",    // 玉が危険地点（自駒が死んだマス = 相手駒の露見地点）から遠ざかる
-                    // （守りを剥がされた玉は座り続けない、という行動予測）
-    "deep_unsup_pawn", // 敵陣（3段）への紐なし着地（歩・香・桂）。
-    "deep_unsup_piece", // 敵陣（3段）への紐なし着地（銀以上の駒）。見えない敵陣は
-                        // 守備駒が濃く、紐のない深入りは事実上の駒捨て
-    "hang_minor", // 相手の利きがあるマスへの紐なし着地（歩・香・桂、取りは除く）。
-                  // 垂れ歩などの軽い差し出しは指される
-    "hang_major", // 同（銀以上）。実質タダの駒捨てで、相手の利きは見えなくとも
-                  // 人間は推論で避ける（幻の角の飛び込み王手の過大評価を抑える）
-];
-
-const D: usize = 12;
 
 struct Sample {
     /// 観測クラス内の各候補手の特徴量
     features: Vec<[f64; D]>,
     /// 選ばれた手のインデックス
     chosen: usize,
-}
-
-fn advance_of(mv: &ShogiMove, mover: Color) -> f64 {
-    match *mv {
-        ShogiMove::Board { from, to, .. } => match mover {
-            Color::Sente => (from.rank - to.rank) as f64,
-            Color::Gote => (to.rank - from.rank) as f64,
-        },
-        ShogiMove::Drop { .. } => 0.0,
-    }
-}
-
-fn to_square(mv: &ShogiMove) -> Coord {
-    match *mv {
-        ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
-    }
-}
-
-/// 動かす駒種（移動前の役）。歩・香・桂を「小駒」とみなす
-fn moved_is_minor(pos: &Position, mv: &ShogiMove) -> bool {
-    use tsuitate_bot::protocol::Role;
-    let role = match *mv {
-        ShogiMove::Board { from, .. } => pos.piece_at(from).map(|p| p.role),
-        ShogiMove::Drop { role, .. } => Some(role),
-    };
-    matches!(role, Some(Role::Pawn | Role::Lance | Role::Knight))
-}
-
-/// 動かした駒（着地点 to）が対象マスのどれかへ新たに利きを付けたか。
-/// 「新たに」= 移動元からは利いていなかった（打ちは常に新規）。
-/// 全盤面の利き走査ではなく駒単位の判定にする（estimator 側の実行コスト都合。
-/// 定義は estimator.rs の threat 特徴量と一致させること）
-fn newly_threatens(
-    pos: &Position,
-    next: &Position,
-    mv: &ShogiMove,
-    targets: &HashSet<Coord>,
-) -> bool {
-    let to = to_square(mv);
-    targets.iter().any(|&s| {
-        if s == to || !next.attacks(to, s) {
-            return false;
-        }
-        match *mv {
-            ShogiMove::Board { from, .. } => !pos.attacks(from, s),
-            ShogiMove::Drop { .. } => true,
-        }
-    })
-}
-
-/// チェビシェフ距離（玉の歩数）
-fn dist(a: Coord, b: Coord) -> i8 {
-    (a.file - b.file).abs().max((a.rank - b.rank).abs())
-}
-
-/// 玉の移動が危険地点集合から遠ざかる手か（最近接距離が増える）
-fn flees_danger(from: Coord, to: Coord, danger: &HashSet<Coord>) -> bool {
-    let near = |sq: Coord| danger.iter().map(|&d| dist(sq, d)).min();
-    match (near(from), near(to)) {
-        (Some(a), Some(b)) => b > a,
-        _ => false,
-    }
-}
-
-/// 敵陣（成れる3段）への紐なし着地か。着地点に自分の別の駒の利きが無い。
-/// **定義は estimator.rs 側と一致させること**（学習と推論の整合）
-fn deep_unsupported(next: &Position, mv: &ShogiMove, mover: Color) -> bool {
-    let to = to_square(mv);
-    let deep = match mover {
-        Color::Sente => to.rank <= 3,
-        Color::Gote => to.rank >= 7,
-    };
-    deep && !next
-        .pieces()
-        .any(|(sq, p)| p.color == mover && sq != to && next.attacks(sq, to))
-}
-
-/// 相手の利きがあるマスへの紐なし着地か（取りは除く = 交換ではなく差し出し）。
-/// 利き・紐とも着地後の盤面（next）で判定する（開き駒の利きを含む）。
-/// 相手の玉の利きも数える（紐がなければ玉に取られる）。
-/// **定義は estimator.rs の hangs_on_landing と一致させること**
-fn hangs_on_landing(pos: &Position, next: &Position, mv: &ShogiMove, mover: Color) -> bool {
-    let to = to_square(mv);
-    if pos.piece_at(to).is_some() {
-        return false; // 取り（交換の文脈）は対象外
-    }
-    let opp = mover.other();
-    let attacked = next
-        .pieces()
-        .any(|(sq, p)| p.color == opp && next.attacks(sq, to));
-    attacked
-        && !next
-            .pieces()
-            .any(|(sq, p)| p.color == mover && sq != to && next.attacks(sq, to))
-}
-
-/// 初期位置から一度も動いていない bot 駒のマス（相手はここを推論で狙ってくる）
-fn home_squares(pos: &Position, bot: Color, bot_touched: &HashSet<Coord>) -> HashSet<Coord> {
-    let initial = Position::initial();
-    initial
-        .pieces()
-        .filter(|(sq, p)| {
-            p.color == bot
-                && !bot_touched.contains(sq)
-                && pos.piece_at(*sq).is_some_and(|cur| cur.color == bot && cur.role == p.role)
-        })
-        .map(|(sq, _)| sq)
-        .collect()
 }
 
 /// 1局から（人間手番の局面, 選択手）のサンプル列を作る。
@@ -201,33 +74,14 @@ fn extract_samples(bot: Color, end: &GameEndPayload, samples: &mut Vec<Sample>) 
                     chosen = Some(features.len());
                 }
                 let _ = to;
-                let (is_king, flee) = match lm {
-                    ShogiMove::Board { from, to, .. } => {
-                        let is_king = pos
-                            .piece_at(from)
-                            .is_some_and(|p| p.role == tsuitate_bot::protocol::Role::King);
-                        (is_king, is_king && flees_danger(from, to, &human_lost_at))
-                    }
-                    ShogiMove::Drop { .. } => (false, false),
-                };
-                let minor = moved_is_minor(&pos, &lm);
-                let promotes = matches!(lm, ShogiMove::Board { promote: true, .. });
-                let deep_unsup = deep_unsupported(&next, &lm, human);
-                let hang = hangs_on_landing(&pos, &next, &lm, human);
-                features.push([
-                    advance_of(&lm, human),
-                    (promotes && minor) as u8 as f64,
-                    (promotes && !minor) as u8 as f64,
-                    matches!(lm, ShogiMove::Drop { .. }) as u8 as f64,
-                    newly_threatens(&pos, &next, &lm, &human_lost_at) as u8 as f64,
-                    newly_threatens(&pos, &next, &lm, &homes) as u8 as f64,
-                    is_king as u8 as f64,
-                    flee as u8 as f64,
-                    (deep_unsup && minor) as u8 as f64,
-                    (deep_unsup && !minor) as u8 as f64,
-                    (hang && minor) as u8 as f64,
-                    (hang && !minor) as u8 as f64,
-                ]);
+                features.push(opp_move_features(
+                    &pos,
+                    &next,
+                    &lm,
+                    human,
+                    &human_lost_at,
+                    &homes,
+                ));
             }
             if let Some(chosen) = chosen {
                 if features.len() >= 2 {
