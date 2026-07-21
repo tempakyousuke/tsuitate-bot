@@ -1,3 +1,4 @@
+<meta charset="UTF-8">
 <title>ついたて定跡エディタ</title>
 <style>
   :root {
@@ -165,6 +166,16 @@
   .saved-line .name { font-weight: 600; }
   .saved-line .moves { color: var(--muted); font-size: 0.82rem; flex: 1; overflow-x: auto; white-space: nowrap; }
   .saved-line button { padding: 2px 8px; font-size: 0.8rem; }
+  .group-heading {
+    font-family: "Hiragino Mincho ProN", "Yu Mincho", serif;
+    font-size: 0.9rem;
+    color: var(--muted);
+    letter-spacing: 0.04em;
+    margin: 8px 0 -2px;
+    border-bottom: 1px solid var(--line);
+    padding-bottom: 2px;
+  }
+  .group-heading:first-child { margin-top: 0; }
   textarea {
     font-family: ui-monospace, monospace;
     font-size: 0.78rem;
@@ -460,8 +471,9 @@
     setStatus(`「${line.name}」を盤に読み込みました。◀▶で確認、そのまま編集して保存も可能`);
   }
 
-  /// 表示用: USI列を日本語棋譜に変換（再生に失敗したらUSIのまま返す）
-  function lineToJp(usis) {
+  /// 表示用: USI列を日本語棋譜に変換し、最終局面の飛車の筋も返す
+  /// （再生に失敗したら jp/rookFile とも null）
+  function simulateLine(usis) {
     const savedBoard = board, savedGhosts = ghosts, savedMoves = moves,
           savedHistory = history, savedRedo = redoStack;
     initState();
@@ -469,10 +481,22 @@
     for (const usi of usis) {
       if (!applyUsi(usi)) { ok = false; break; }
     }
-    const jp = ok ? moves.map(m => m.jp) : null;
+    let jp = null, rookFile = null;
+    if (ok) {
+      jp = moves.map(m => m.jp);
+      search: for (let r = 0; r < 9; r++) {
+        for (let c = 0; c < 9; c++) {
+          const piece = board[r][c];
+          if (piece && piece.mine && (piece.role === "R" || piece.role === "+R")) {
+            rookFile = fileOf(c);
+            break search;
+          }
+        }
+      }
+    }
     board = savedBoard; ghosts = savedGhosts; moves = savedMoves;
     history = savedHistory; redoStack = savedRedo;
-    return jp;
+    return { jp, rookFile };
   }
 
   // ---- ライン管理 ----
@@ -488,51 +512,61 @@
     lines = JSON.parse(localStorage.getItem(STORAGE)) || DEFAULTS;
   } catch { lines = DEFAULTS; }
 
+  /// lines を「飛車の筋→手数→名前」の順に並べ替える（再生不能な行は末尾）
+  function sortLines() {
+    const withKeys = lines.map(line => {
+      const { rookFile } = simulateLine(line.moves);
+      return { line, rookFile: rookFile ?? Infinity };
+    });
+    withKeys.sort((a, b) =>
+      a.rookFile - b.rookFile ||
+      a.line.moves.length - b.line.moves.length ||
+      a.line.name.localeCompare(b.line.name, "ja"));
+    lines = withKeys.map(w => w.line);
+  }
+  sortLines();
+
   function persist() {
+    sortLines();
     localStorage.setItem(STORAGE, JSON.stringify(lines));
     renderSaved();
     renderJson();
   }
+  /// 保存済みライン（sortLines 済みの順）を飛車の最終位置（筋）ごとに見出しで区切って表示する
   function renderSaved() {
     const box = document.getElementById("saved");
     box.innerHTML = "";
     if (lines.length === 0) {
       box.innerHTML = '<p class="note">まだラインがありません。盤で手順を作って保存してください。</p>';
+      return;
     }
-    lines.forEach((line, i) => {
+    let lastKey;
+    lines.forEach((line, index) => {
+      const { jp, rookFile } = simulateLine(line.moves);
+      const key = rookFile ?? "unknown";
+      if (key !== lastKey) {
+        const heading = document.createElement("h3");
+        heading.className = "group-heading";
+        heading.textContent = key === "unknown" ? "飛車位置不明（再生不可）" : `${ZKD[key]}筋`;
+        box.appendChild(heading);
+        lastKey = key;
+      }
       const row = document.createElement("div");
       row.className = "saved-line";
-      const up = document.createElement("button");
-      up.textContent = "▲";
-      up.title = "上へ";
-      up.disabled = i === 0;
-      up.addEventListener("click", () => {
-        [lines[i - 1], lines[i]] = [lines[i], lines[i - 1]];
-        persist();
-      });
-      const down = document.createElement("button");
-      down.textContent = "▼";
-      down.title = "下へ";
-      down.disabled = i === lines.length - 1;
-      down.addEventListener("click", () => {
-        [lines[i], lines[i + 1]] = [lines[i + 1], lines[i]];
-        persist();
-      });
       const show = document.createElement("button");
       show.textContent = "確認";
-      show.addEventListener("click", () => loadLine(i));
+      show.addEventListener("click", () => loadLine(index));
       const del = document.createElement("button");
       del.textContent = "削除";
-      del.addEventListener("click", () => { lines.splice(i, 1); persist(); });
+      del.addEventListener("click", () => { lines.splice(index, 1); persist(); });
       const name = document.createElement("span");
       name.className = "name";
       name.textContent = line.name;
       const mv = document.createElement("span");
       mv.className = "moves";
-      const jp = lineToJp(line.moves);
       mv.textContent = jp ? jp.join("　") : `⚠ ${line.moves.join(" ")}`;
       mv.title = line.moves.join(" ");
-      row.append(up, down, name, mv, show, del);
+      row.append(name, mv, show, del);
       box.appendChild(row);
     });
   }
