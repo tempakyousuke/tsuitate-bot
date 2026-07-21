@@ -16,6 +16,7 @@
     --accent-ink: #FFF6EF;
     --ok: #3E6B3A;
     --hint: rgba(174, 59, 36, 0.28);
+    --feature: #3B6E8C;
   }
   @media (prefers-color-scheme: dark) {
     :root {
@@ -32,19 +33,20 @@
       --accent: #D45A3E;
       --accent-ink: #2A130D;
       --hint: rgba(212, 90, 62, 0.35);
+      --feature: #7FB3D5;
     }
   }
   :root[data-theme="light"] {
     --bg: #F3EEE4; --panel: #FBF8F1; --ink: #2B2620; --muted: #7A7062;
     --line: #DDD4C2; --board: #D9A55E; --board-edge: #8A5A28; --grid: #5A3E1F;
     --piece: #F6E7C3; --piece-edge: #B08D4F; --accent: #AE3B24; --accent-ink: #FFF6EF;
-    --ok: #3E6B3A; --hint: rgba(174, 59, 36, 0.28);
+    --ok: #3E6B3A; --hint: rgba(174, 59, 36, 0.28); --feature: #3B6E8C;
   }
   :root[data-theme="dark"] {
     --bg: #201D18; --panel: #2A2620; --ink: #EDE5D4; --muted: #A2988A;
     --line: #453E33; --board: #B88743; --board-edge: #6E4517; --grid: #3E2A10;
     --piece: #EFDDB4; --piece-edge: #93743C; --accent: #D45A3E; --accent-ink: #2A130D;
-    --ok: #5F9457; --hint: rgba(212, 90, 62, 0.35);
+    --ok: #5F9457; --hint: rgba(212, 90, 62, 0.35); --feature: #7FB3D5;
   }
 
   body {
@@ -200,6 +202,7 @@
     overflow-wrap: break-word;
   }
   .saved-line button { padding: 2px 8px; font-size: 0.8rem; }
+  .saved-line .feature-tag { color: var(--feature); font-size: 0.8rem; font-weight: 600; }
   .group-heading {
     font-family: "Hiragino Mincho ProN", "Yu Mincho", serif;
     font-size: 0.9rem;
@@ -746,7 +749,7 @@
       row.append(name, mv);
       if (line.features && line.features.length) {
         const feat = document.createElement("span");
-        feat.className = "note";
+        feat.className = "feature-tag";
         feat.textContent = line.features.join(" / ");
         row.appendChild(feat);
       }
