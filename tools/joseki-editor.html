@@ -163,7 +163,8 @@
     padding: 6px 10px;
   }
   select:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
-  .feature-checks { display: flex; flex-wrap: wrap; gap: 6px 4px; margin: 2px 0; }
+  /* movelist と同じ理由: 特徴チェックボックスの内容量をパネル幅の計算から遮断する */
+  .feature-checks { display: flex; flex-wrap: wrap; gap: 6px 4px; margin: 2px 0; contain: inline-size; width: 100%; }
   .feature-chip { display: inline-flex; align-items: center; gap: 4px; font-size: 0.85rem; }
   .feature-chip label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
   .feature-chip-del {
