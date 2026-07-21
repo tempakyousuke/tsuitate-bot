@@ -202,10 +202,14 @@ enum Constraint {
     },
     /// 反則になった自分の手（真の局面では非合法）
     MyFoul { mv: ShogiMove },
-    /// 相手の着手（captured_at: 自駒が取られたマス、gives_check: 自玉への王手宣言）
+    /// 相手の着手（captured_at: 自駒が取られたマス、gives_check: 自玉への王手宣言、
+    /// foul_count: この手番で相手がこの着手に至るまでに試みた反則の回数。
+    /// 反則の中身は不明だが回数は Observation::OpponentFoul でリアルタイムに
+    /// 観測できる。opp_move_weight の特徴量として使う）
     OppMove {
         captured_at: Option<Coord>,
         gives_check: bool,
+        foul_count: u32,
     },
 }
 
@@ -252,6 +256,10 @@ pub struct Estimator {
     my_touched_sq: Vec<Coord>,
     /// ObservationLog の消化済みイベント数
     cursor: usize,
+    /// この手番でここまでに観測した相手の反則回数（Observation::OpponentFoul
+    /// の累積）。次の Constraint::OppMove が確定した時点でその制約へ焼き込み、
+    /// 0へリセットする
+    pending_opp_foul_count: u32,
     /// 観測との矛盾（リプレイでも整合局面を作れない等）で信頼できなくなったら false
     healthy: bool,
     /// 直近の replenish で測った ESS（診断用）
@@ -330,6 +338,7 @@ impl Estimator {
             my_touched_idx: vec![],
             my_touched_sq: vec![],
             cursor: 0,
+            pending_opp_foul_count: 0,
             healthy: true,
             last_ess: target as f64,
             resamples: 0,
@@ -422,6 +431,13 @@ impl Estimator {
     pub fn update(&mut self, log: &ObservationLog) {
         let events = log.events();
         while self.cursor < events.len() {
+            // 相手の反則は中身不明だが回数は実戦でもリアルタイムに観測できる。
+            // 次の相手着手（OppMove）が確定するまで累積し、そちらへ焼き込む
+            if matches!(events[self.cursor], Observation::OpponentFoul { .. }) {
+                self.pending_opp_foul_count += 1;
+                self.cursor += 1;
+                continue;
+            }
             let (constraint, consumed) = self.normalize(&events[self.cursor..]);
             self.cursor += consumed;
             let Some(constraint) = constraint else {
@@ -444,7 +460,10 @@ impl Estimator {
             // in_check_at[idx] = この制約を処理する直前の被王手状態
             self.in_check_at.push(self.in_check);
             match &constraint {
-                Constraint::OppMove { gives_check, .. } => self.in_check = *gives_check,
+                Constraint::OppMove { gives_check, .. } => {
+                    self.in_check = *gives_check;
+                    self.pending_opp_foul_count = 0;
+                }
                 Constraint::MyMove { .. } => self.in_check = false,
                 Constraint::MyFoul { .. } => {}
             }
@@ -509,12 +528,14 @@ impl Estimator {
                     Some(Constraint::OppMove {
                         captured_at,
                         gives_check,
+                        foul_count: self.pending_opp_foul_count,
                     }),
                     consumed,
                 )
             }
-            // 相手の反則は「相手が何か非合法手を試みた」ことしか分からないので使わない。
-            // 単独で現れた Check（手と紐づかない）は情報としては手側で消化済みのはず
+            // 相手の反則は中身（どの手を試みたか）は分からないが、回数は
+            // update() が pending_opp_foul_count へ累積し次の OppMove へ渡す
+            // （opp_move_weight の特徴量。単独で現れた Check は手側で消化済みのはず）
             Observation::OpponentFoul { .. } | Observation::Check { .. } => (None, 1),
         }
     }
@@ -574,11 +595,13 @@ impl Estimator {
                 Constraint::OppMove {
                     captured_at,
                     gives_check,
+                    foul_count,
                 } => sample_opp_move(
                     &mut pos,
                     my_color,
                     *captured_at,
                     Some(*gives_check),
+                    *foul_count,
                     &self.my_capture_sq,
                     &self.my_touched_sq,
                     &Guide::default(),
@@ -730,7 +753,7 @@ impl Estimator {
                     format!("MyMove(cap={captured:?},chk={gives_check})")
                 }
                 Constraint::MyFoul { .. } => "MyFoul".into(),
-                Constraint::OppMove { captured_at, gives_check } => {
+                Constraint::OppMove { captured_at, gives_check, .. } => {
                     format!("OppMove(cap_at={captured_at:?},chk={gives_check})")
                 }
             };
@@ -758,11 +781,16 @@ impl Estimator {
             // 粒子上では合法だった手が実際は反則だった: この粒子は反則を
             // 説明できないが、盤面自体は生かす（反則手は実行されていない）
             Constraint::MyFoul { .. } => Some(0.0),
-            Constraint::OppMove { captured_at, .. } => sample_opp_move(
+            Constraint::OppMove {
+                captured_at,
+                foul_count,
+                ..
+            } => sample_opp_move(
                 pos,
                 self.my_color,
                 *captured_at,
                 None,
+                *foul_count,
                 &self.my_capture_sq,
                 &self.my_touched_sq,
                 &Guide::default(),
@@ -897,6 +925,7 @@ impl Estimator {
                 Constraint::OppMove {
                     captured_at,
                     gives_check,
+                    foul_count,
                 } => {
                     if i > snap.cidx {
                         if new_hist.len() == REJUV_SNAPSHOTS {
@@ -918,6 +947,7 @@ impl Estimator {
                         self.my_color,
                         *captured_at,
                         Some(*gives_check),
+                        *foul_count,
                         &self.my_capture_sq[..k],
                         &self.my_touched_sq[..t],
                         &guide,
@@ -1252,6 +1282,7 @@ impl Estimator {
                 Constraint::OppMove {
                     captured_at,
                     gives_check,
+                    foul_count,
                 } => {
                     // バックトラックで戻ってきた再訪なら積み直さない
                     let is_retry = stack.last().is_some_and(|(j, _, _, _)| *j == i);
@@ -1267,6 +1298,7 @@ impl Estimator {
                         self.my_color,
                         *captured_at,
                         Some(*gives_check),
+                        *foul_count,
                         &self.my_capture_sq[..k],
                         &self.my_touched_sq[..t],
                         &guide,
@@ -1449,6 +1481,7 @@ fn sample_opp_move(
     my_color: Color,
     captured_at: Option<Coord>,
     gives_check: Option<bool>,
+    foul_count_this_turn: u32,
     known_squares: &[Coord],
     my_touched: &[Coord],
     guide: &Guide,
@@ -1515,6 +1548,7 @@ fn sample_opp_move(
             deep_unsupported(&next, &mv, opp),
             hangs_on_landing(pos, &next, &mv, opp),
             home_lance_move(pos, &mv, opp),
+            foul_count_this_turn,
         );
         total_mass += w;
         if consistent {
@@ -1641,6 +1675,8 @@ pub fn opp_reply_weights(
             }
             ShogiMove::Drop { .. } => (false, false),
         };
+        // 2手読み予測はまだ起きていない相手の応手を当てるので、この手番の
+        // 反則回数は未知（観測なし）。既定値0（実データの最頻値）を使う
         let mut w = opp_move_weight(
             opp,
             &mv,
@@ -1652,6 +1688,7 @@ pub fn opp_reply_weights(
             deep_unsupported(&next, &mv, opp),
             hangs_on_landing(pos, &next, &mv, opp),
             home_lance_move(pos, &mv, opp),
+            0,
         );
         if let ShogiMove::Board { to, .. } = mv {
             let captures_mine = pos.piece_at(to).is_some_and(|p| p.color == my_color);
@@ -1767,6 +1804,7 @@ fn opp_move_weight(
     deep_unsup: bool,
     hang: bool,
     home_lance: bool,
+    foul_count_this_turn: u32,
 ) -> f64 {
     let (advance, is_drop, promotes) = match *mv {
         ShogiMove::Board { from, to, promote } => {
@@ -1791,6 +1829,7 @@ fn opp_move_weight(
         (deep_unsup && !moved_minor) as u8 as f64,
         (hang && moved_minor) as u8 as f64,
         (hang && !moved_minor) as u8 as f64,
+        f64::from(foul_count_this_turn),
     ];
     // クランプ: NNは訓練データの分布から外れた入力（リプレイの仮説探索中に
     // 現れる、実戦ではまれな特徴量の組み合わせ）に対して極端なlogitを出しうる
@@ -2502,6 +2541,7 @@ mod tests {
         est.constraints.push(Constraint::OppMove {
             captured_at: None,
             gives_check: false,
+            foul_count: 0,
         });
         est.constraints.push(Constraint::MyMove {
             mv: parse_usi("2f2e").unwrap(),
@@ -2511,6 +2551,7 @@ mod tests {
         est.constraints.push(Constraint::OppMove {
             captured_at: None,
             gives_check: false,
+            foul_count: 0,
         });
         let current = Constraint::MyMove {
             mv: parse_usi("2e2d").unwrap(),
@@ -2590,6 +2631,7 @@ mod tests {
                 Color::Sente,
                 None,
                 Some(false),
+                0,
                 &[],
                 &[],
                 &Guide::default(),
@@ -2617,6 +2659,7 @@ mod tests {
                 Color::Sente,
                 None,
                 Some(false),
+                0,
                 &[],
                 &[],
                 &wanted,
@@ -2714,6 +2757,9 @@ mod tests {
             };
             let deep_unsup = deep_unsupported(&next, &mv, mover);
             let hang = hangs_on_landing(&pos, &next, &mv, mover);
+            // opp_foul_count_this_turn（13番目）はConstraint::OppMoveから素通しされる
+            // だけの値なので、非ゼロ値（3）で両辺の一致も確認する
+            let foul_count_this_turn = 3u32;
             let est_features = [
                 advance,
                 (promotes && minor) as u8 as f64,
@@ -2727,10 +2773,18 @@ mod tests {
                 (deep_unsup && !minor) as u8 as f64,
                 (hang && minor) as u8 as f64,
                 (hang && !minor) as u8 as f64,
+                f64::from(foul_count_this_turn),
             ];
 
-            let shared_features =
-                opp_move_features::opp_move_features(&pos, &next, &mv, mover, &known_set, &homes_set);
+            let shared_features = opp_move_features::opp_move_features(
+                &pos,
+                &next,
+                &mv,
+                mover,
+                &known_set,
+                &homes_set,
+                foul_count_this_turn,
+            );
             assert_eq!(
                 est_features, shared_features,
                 "特徴量が一致しない: mv={mv:?}"

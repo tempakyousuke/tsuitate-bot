@@ -47,6 +47,11 @@ fn extract_samples(bot: Color, end: &GameEndPayload, samples: &mut Vec<Sample>) 
         let Some(mv) = parse_usi(&m.usi) else { return };
         if m.by_color == human && pos.turn() == human {
             let homes = home_squares(&pos, bot, &bot_touched);
+            let foul_count_this_turn = end
+                .foul_attempts
+                .iter()
+                .filter(|f| f.by_color == human && f.move_number == pos.move_number())
+                .count() as u32;
             // 選ばれた手の観測クラス
             let chosen_to = to_square(&mv);
             let chosen_capture = pos
@@ -81,6 +86,7 @@ fn extract_samples(bot: Color, end: &GameEndPayload, samples: &mut Vec<Sample>) 
                     human,
                     &human_lost_at,
                     &homes,
+                    foul_count_this_turn,
                 ));
             }
             if let Some(chosen) = chosen {

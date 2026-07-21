@@ -47,6 +47,15 @@ fn export_game(game_id: u64, bot: Color, end: &GameEndPayload, buf: &mut Vec<Str
         };
         if m.by_color == human && pos.turn() == human {
             let homes = home_squares(&pos, bot, &bot_touched);
+            // この手番で人間が最終的な着手に至るまでに試みた反則の回数。
+            // 反則の中身は「ついたて」の公平性上どちらのプレイヤーにも
+            // 相手には明かされないが、回数（Observation::OpponentFoulの
+            // count）は実戦でもリアルタイムに観測できる
+            let foul_count_this_turn = end
+                .foul_attempts
+                .iter()
+                .filter(|f| f.by_color == human && f.move_number == pos.move_number())
+                .count() as u32;
             let chosen_to = to_square(&mv);
             let chosen_capture = pos
                 .piece_at(chosen_to)
@@ -71,7 +80,15 @@ fn export_game(game_id: u64, bot: Color, end: &GameEndPayload, buf: &mut Vec<Str
                 }
                 let is_chosen = lm == mv;
                 saw_chosen |= is_chosen;
-                let f = opp_move_features(&pos, &next, &lm, human, &human_lost_at, &homes);
+                let f = opp_move_features(
+                    &pos,
+                    &next,
+                    &lm,
+                    human,
+                    &human_lost_at,
+                    &homes,
+                    foul_count_this_turn,
+                );
                 let feats: Vec<String> = f.iter().map(|x| x.to_string()).collect();
                 rows.push(format!(
                     "{game_id},{decision_id},{},{}",

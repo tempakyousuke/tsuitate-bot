@@ -12,7 +12,7 @@ use crate::board::Coord;
 use crate::protocol::{Color, Role};
 use crate::shogi::{Position, ShogiMove};
 
-pub const OPP_MOVE_FEATURES: usize = 12;
+pub const OPP_MOVE_FEATURES: usize = 13;
 
 pub const FEATURE_NAMES: [&str; OPP_MOVE_FEATURES] = [
     "advance",          // 前進量（段）
@@ -27,6 +27,12 @@ pub const FEATURE_NAMES: [&str; OPP_MOVE_FEATURES] = [
     "deep_unsup_piece", // 敵陣（3段）への紐なし着地（銀以上の駒）
     "hang_minor", // 相手の利きがあるマスへの紐なし着地（歩・香・桂、取りは除く）
     "hang_major", // 同（銀以上）
+    "opp_foul_count_this_turn", // この手番で相手が最終的な着手に至るまでに
+    // 試みた反則の回数。反則の具体的な中身は「ついたて」の公平性上どちらの
+    // プレイヤーにも相手には明かされないが、回数（Observation::OpponentFoul
+    // のcount）は実戦でもリアルタイムに観測できる。反則を重ねた末の着手は
+    // 探り直し・方針転換の産物であることが多いはずで、学習データ（真実の
+    // foul_attempts）と実戦観測（累計countの差分）の両方から同じ値が求まる
 ];
 
 pub fn advance_of(mv: &ShogiMove, mover: Color) -> f64 {
@@ -132,7 +138,9 @@ pub fn home_squares(pos: &Position, bot: Color, bot_touched: &HashSet<Coord>) ->
 
 /// 候補手1つぶんの特徴量ベクトル。`pos`は着手前、`next`は着手後、
 /// `known_squares`は位置が既知の相手駒（自分の駒が死んだマス）、
-/// `homes`は初期位置から動いていない自分側の駒のマス
+/// `homes`は初期位置から動いていない自分側の駒のマス、
+/// `foul_count_this_turn`はこの手番で相手がここまでに試みた反則の回数
+/// （候補手によらずこの手番内で共通の値。全候補行に同じ値が入る）
 pub fn opp_move_features(
     pos: &Position,
     next: &Position,
@@ -140,6 +148,7 @@ pub fn opp_move_features(
     mover: Color,
     known_squares: &HashSet<Coord>,
     homes: &HashSet<Coord>,
+    foul_count_this_turn: u32,
 ) -> [f64; OPP_MOVE_FEATURES] {
     let (is_king, flee) = match *mv {
         ShogiMove::Board { from, to, .. } => {
@@ -165,5 +174,6 @@ pub fn opp_move_features(
         (deep_unsup && !minor) as u8 as f64,
         (hang && minor) as u8 as f64,
         (hang && !minor) as u8 as f64,
+        f64::from(foul_count_this_turn),
     ]
 }
