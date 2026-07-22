@@ -52,6 +52,12 @@ fn extract_samples(bot: Color, end: &GameEndPayload, samples: &mut Vec<Sample>) 
                 .iter()
                 .filter(|f| f.by_color == human && f.move_number == pos.move_number())
                 .count() as u32;
+            // 直前のbot手番の反則回数（my_foul_count_last_turn。export_opp_move_data と同じ定義）
+            let my_foul_count_last_turn = end
+                .foul_attempts
+                .iter()
+                .filter(|f| f.by_color == bot && f.move_number + 1 == pos.move_number())
+                .count() as u32;
             // 選ばれた手の観測クラス
             let chosen_to = to_square(&mv);
             let chosen_capture = pos
@@ -86,6 +92,7 @@ fn extract_samples(bot: Color, end: &GameEndPayload, samples: &mut Vec<Sample>) 
                     &human_lost_at,
                     &homes,
                     foul_count_this_turn,
+                    my_foul_count_last_turn,
                 ));
             }
             if let Some(chosen) = chosen {
