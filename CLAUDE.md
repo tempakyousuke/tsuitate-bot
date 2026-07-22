@@ -63,7 +63,14 @@
 - `cargo run --release --bin scenario -- <名前|suite>` — 実戦棋譜の局面再現実験。
   `scenarios/*.kif`（Shogi Quest エクスポート + `*scenario ply=N` 行）を再生して
   特定局面での選択・粒子の信念（diag）・終局までの遂行（continue）を測る。
-  追加手順は `scenarios/README.md`
+  追加手順は `scenarios/README.md`。
+  **suite はローカル直列だと30分超かかるので CI で並列実行できる**
+  （`.github/workflows/scenario.yml`、手動起動のみ）:
+  `gh workflow run scenario.yml --ref <ブランチ> -f trials=20`。
+  1シナリオ=1ランナーの matrix で壁時計は最遅1件分。
+  `-f scenarios="kakutori keima"` で対象を絞れる。総合表は aggregate ジョブの
+  サマリー（suite と同形式）。注意: 試行はシード同一でも壁時計ベースの
+  予算スケールで揺れるため、10試行の±2〜3件差はノイズ。版比較は20試行×両版で
 - `cargo run --release --bin analyze -- records/*.jsonl` — 対局記録の事後分析。
   アリーナも `ARENA_RECORD_DIR` を設定すると候補(A)視点の記録を同形式で出力する
   （CIでは常時有効で artifact `arena-records` に上がる。真実の全手順つきなので

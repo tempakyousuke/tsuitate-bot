@@ -1,0 +1,123 @@
+name: Scenario Suite
+
+# scenario suite をシナリオごとに並列実行する（ローカルの直列実行だと30分超）。
+# 手動起動のみ。1シナリオ=1ランナーで、壁時計は最遅シナリオ1件分になる。
+# 各ジョブが suite と同形式の1行サマリーを出し、aggregate ジョブが表に合算する。
+on:
+  workflow_dispatch:
+    inputs:
+      trials:
+        description: "シナリオごとの試行数"
+        required: false
+        default: "20"
+      strategy:
+        description: "戦略"
+        required: false
+        default: "estimator"
+      scenarios:
+        description: "対象シナリオ（スペース区切り。空なら scenarios/*.kif 全部）"
+        required: false
+        default: ""
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      scenarios: ${{ steps.list.outputs.scenarios }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        run: |
+          filter='${{ inputs.scenarios }}'
+          if [ -n "$filter" ]; then
+            echo "scenarios=$(echo "$filter" | jq -R -c 'split(" ") | map(select(length > 0))')" >> "$GITHUB_OUTPUT"
+          else
+            echo "scenarios=$(ls scenarios/*.kif | xargs -n1 basename | sed 's/\.kif$//' | jq -R . | jq -s -c .)" >> "$GITHUB_OUTPUT"
+          fi
+
+  scenario:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario: ${{ fromJSON(needs.plan.outputs.scenarios) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run scenario
+        run: |
+          cargo run --release --bin scenario -- \
+            "${{ matrix.scenario }}" \
+            "${{ inputs.trials }}" \
+            "${{ inputs.strategy }}" \
+            | tee result.txt
+
+      - name: Extract summary line
+        if: always()
+        run: |
+          # suite の1行サマリー相当を standalone 出力から復元する。
+          # 「  1d1e: 15/20 ← 注目手」→ 注目手と選択率。0回選択だと行が無いので
+          # kif の target= ディレクティブへフォールバックする
+          hit_line=$(grep '← 注目手' result.txt || true)
+          if [ -n "$hit_line" ]; then
+            target=$(echo "$hit_line" | awk -F: '{gsub(/^ +/,"",$1); print $1}')
+            hits=$(echo "$hit_line" | grep -oE '[0-9]+/[0-9]+' | head -1)
+          else
+            target=$(grep -oE 'target=[^ ]+' "scenarios/${{ matrix.scenario }}.kif" | head -1 | cut -d= -f2)
+            hits="0/${{ inputs.trials }}"
+          fi
+          fouls=$(grep -oE '追加の反則の総数: [0-9]+' result.txt | grep -oE '[0-9]+$' || echo 0)
+          others=$(awk '/受理された手の内訳/{f=1;next} /追加の反則の総数/{f=0} f && !/← 注目手/ {gsub(/^ +/,""); print}' result.txt | head -3 | paste -sd' ' -)
+          printf '%s\t%s\t%s\t%s\t%s\n' \
+            "${{ matrix.scenario }}" "${target:--}" "$hits" "$fouls" "${others:--}" > line.tsv
+          cat line.tsv
+
+      - name: Write job summary
+        if: always()
+        run: |
+          {
+            echo '```'
+            cat result.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-result-${{ matrix.scenario }}
+          path: |
+            result.txt
+            line.tsv
+
+  aggregate:
+    needs: scenario
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: scenario-result-*
+          path: results
+
+      - name: Aggregate
+        run: |
+          {
+            echo "## Scenario Suite（各 ${{ inputs.trials }} 試行 / 戦略 ${{ inputs.strategy }}）"
+            echo ""
+            echo '| シナリオ | 注目手 | 選択 | 反則 | 他の選択 |'
+            echo '|---|---|---|---|---|'
+            cat results/*/line.tsv | sort | awk -F'\t' '{printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5}'
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload combined result
+        uses: actions/upload-artifact@v4
+        with:
+          name: scenario-combined
+          path: results/*/line.tsv
