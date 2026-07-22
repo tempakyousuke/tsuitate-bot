@@ -965,7 +965,16 @@ impl Strategy for EstimatorStrategy {
             // 2手読み後の再計算でも同じ値を使うので分離して持つ
             let mut adjust = rng.random_range(0.0..0.01);
             if !blind_king_dist.is_empty() {
-                adjust += BLIND_KING_ATTACK_W * blind_king_attack(view, &mv, &blind_king_dist);
+                // 攻め加点は p(合法) で割り引く（加点が実現するのは手が受理された
+                // ときだけ）。adjust は combine_score の外側に加算されるため、
+                // 割引がないと反則確実な手の攻めボーナスが反則コストを素通りで
+                // 上書きする。王手中が顕著（dragon-check-drop.kif: 解消確率ゼロの
+                // G*5h が信念上の敵玉 5i/4h への利きで +1.7 を得て正解の玉逃げ
+                // 5c4d を逆転）だが、平時のブラインドでも taint 粒子は反則の説明
+                // （打ちマス占有など）を緩和しているため同じ穴が開く
+                adjust += out.p_legal
+                    * BLIND_KING_ATTACK_W
+                    * blind_king_attack(view, &mv, &blind_king_dist);
             }
             if hang_risk_enabled && !taint_pool.is_empty() {
                 adjust -= BLIND_HANG_RISK_W
