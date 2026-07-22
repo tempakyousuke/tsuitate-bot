@@ -546,9 +546,11 @@ impl Default for EvalParams {
             foul_diff_pow: 0.0,
             check_limit_accel: 0.0,
             // valueネット統合（2026-07-22、NN段階③フェーズ2）。NNの候補間スコア差は
-            // 0.1〜0.2程度（pairwise margin=0.1で学習）なので、3.0で0.3〜0.6歩相当
-            // = advance_bias等の微小項は支配するが駒得・王手の太い信号は上書きしない
-            value_nn_w: 3.0,
+            // 0.1〜0.2程度（pairwise margin=0.1で学習）なので、6.0で0.6〜1.2歩相当。
+            // w選定スイープ（w=3/6/10 × 5シナリオ）: w=3はgold-checkの悪手を
+            // 変えられず（17/20）、w=6で2/20に反転。王手中の反則増（dragon-check-
+            // drop）は you_in_check ゲートで遮断したうえでの採用値
+            value_nn_w: 6.0,
         }
     }
 }
@@ -1860,8 +1862,12 @@ fn evaluate(
 
         // valueネット: 学習時の規約（state=指す前の局面・指す側視点、transition=
         // その一手。docs/nn-value-phase1.md）どおり、粒子=真の局面仮説として推論する。
-        // state特徴量は候補間で共通なので粒子単位にキャッシュする
-        if params.value_nn_w != 0.0 && nn_n < budget.nn_samples {
+        // state特徴量は候補間で共通なので粒子単位にキャッシュする。
+        // **自分が王手されている間は無効**: 王手回避は CheckSolver（制約推論）の
+        // 領分で、NNの加点が回避プローブの反則試行を増やす実測があった
+        // （dragon-check-drop で w=6 時に反則負け2/20が発生。w選定スイープ
+        // 2026-07-22）。王手中の候補序列は p_legal（解消確率）が支配すべき
+        if params.value_nn_w != 0.0 && !view.you_in_check && nn_n < budget.nn_samples {
             let state = nn_state_cache[pi]
                 .get_or_insert_with(|| crate::value_features::value_features(pos, me));
             let trans = crate::value_features::transition_features(pos, mv, &next, me);
