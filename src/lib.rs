@@ -22,3 +22,4 @@ pub mod selfplay;
 pub mod shogi;
 pub mod strategy;
 pub mod value_features;
+pub mod value_nn;
