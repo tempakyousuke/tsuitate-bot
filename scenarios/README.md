@@ -91,6 +91,16 @@ JSON（DBの列をそのままJSON.parseして詰め直すだけでよい）。`
   「反則確実な手の攻めボーナス素通り」の回帰テストとして常設する
   （2026-07-22、スクラッチDB対局より `bin/make_scenario` で変換）
 
+## archive/
+
+suite から外したシナリオ置き場（suite は `scenarios/` 直下の `.kif` だけを読む）。
+パス指定で個別実行はできる: `cargo run --release --bin scenario -- scenarios/archive/125te.kif`
+
+- `125te.kif` / `132te.kif` — 長手数（100手超）の局面。リプレイが重い割に
+  注目手の判定が意味を持たなくなっていたため suite から除外（2026-07-22、
+  ユーザー判断）。TAINT_POOL_CAP（taint粒子の計算量爆発対策、strategy.rs）を
+  検出した経緯があるため記録として残す
+
 ## 注意
 
 - `*illegal:` 行は「**直前の指し手行の手番側が、その手を指す前に試みた反則**」
