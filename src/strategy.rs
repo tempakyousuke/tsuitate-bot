@@ -207,6 +207,8 @@ struct SearchBudget {
     eval_particles: usize,
     /// 王周辺圧力を測る粒子数
     pressure_samples: usize,
+    /// valueネット（value_nn.rs）を評価する粒子数
+    nn_samples: usize,
     /// 2手読みする上位候補数
     depth2_top_k: usize,
     /// 2手読みに使う粒子数
@@ -223,6 +225,7 @@ impl SearchBudget {
             scale,
             eval_particles: f(EVAL_PARTICLES, 48, 2048),
             pressure_samples: f(PRESSURE_SAMPLES, 8, 64),
+            nn_samples: f(NN_SAMPLES, 16, 256),
             depth2_top_k: f(DEPTH2_TOP_K, 4, 32),
             depth2_particles: f(DEPTH2_PARTICLES, 16, 384),
         }
@@ -231,6 +234,11 @@ impl SearchBudget {
 
 /// 王周辺圧力を測る粒子数の基準値（スケール1.0時）
 const PRESSURE_SAMPLES: usize = 16;
+
+/// valueネットを評価する粒子数の基準値（スケール1.0時）。forward pass自体は
+/// 約0.6µs/回だが、transition特徴量の利き走査が粒子×候補ごとに掛かるため
+/// 圧力項（PRESSURE_SAMPLES）と同様に粒子数を絞る
+const NN_SAMPLES: usize = 48;
 
 /// 2手読み（相手応手のサンプル再評価）を行う上位候補数の基準値（スケール1.0時）。
 /// 1手読みの静的リスク項は近似なので、有望手だけ実際の応手分布で検算する
@@ -476,6 +484,13 @@ pub struct EvalParams {
     /// 王手の反則誘発価値の上限加速: check_foul_scale 項に ×(10/相手残数)^accel。
     /// 相手が反則負けに近づくほど1回の誘発の限界価値が跳ねる（0=従来）
     pub check_limit_accel: f64,
+    /// 粒子上のvalueネット（value_nn.rs、NN段階③）の重み。粒子ごとに
+    /// (state特徴量16 + transition特徴量6) → 勝率相当[0,1] を推論し、
+    /// 重み付き平均の (avg − 0.5) をこの係数で歩価値スケールへ換算して
+    /// gain に加算する。手作り項が横並びになる静かな局面の序列付けが狙い
+    /// （54手目9二香: 意味を問わない advance_bias だけで手が決まる問題）。
+    /// 0 = NN無効（従来と同一挙動）
+    pub value_nn_w: f64,
 }
 
 impl Default for EvalParams {
@@ -530,6 +545,10 @@ impl Default for EvalParams {
             // 0 = 従来と同一挙動。SPSA第4ラウンド（反則経済マスク）の調整対象
             foul_diff_pow: 0.0,
             check_limit_accel: 0.0,
+            // valueネット統合（2026-07-22、NN段階③フェーズ2）。NNの候補間スコア差は
+            // 0.1〜0.2程度（pairwise margin=0.1で学習）なので、3.0で0.3〜0.6歩相当
+            // = advance_bias等の微小項は支配するが駒得・王手の太い信号は上書きしない
+            value_nn_w: 3.0,
         }
     }
 }
@@ -542,7 +561,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 38] = [
+    pub const SPECS: [ParamSpec; 39] = [
         ParamSpec { name: "check_bonus", lo: 0.0, hi: 3.0 },
         ParamSpec { name: "check_foul_scale", lo: 0.0, hi: 0.5 },
         ParamSpec { name: "mover_w_captured", lo: 0.0, hi: 1.5 },
@@ -581,6 +600,7 @@ impl EvalParams {
         ParamSpec { name: "depth2_recap_discount", lo: 0.0, hi: 1.0 },
         ParamSpec { name: "foul_diff_pow", lo: 0.0, hi: 3.0 },
         ParamSpec { name: "check_limit_accel", lo: 0.0, hi: 3.0 },
+        ParamSpec { name: "value_nn_w", lo: 0.0, hi: 10.0 },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -623,6 +643,7 @@ impl EvalParams {
             self.depth2_recap_discount,
             self.foul_diff_pow,
             self.check_limit_accel,
+            self.value_nn_w,
         ]
     }
 
@@ -667,6 +688,7 @@ impl EvalParams {
             depth2_recap_discount: v[35],
             foul_diff_pow: v[36],
             check_limit_accel: v[37],
+            value_nn_w: v[38],
         }
     }
 }
@@ -716,6 +738,15 @@ impl EstimatorStrategy {
         book_line: Option<usize>,
         seed: Option<u64>,
     ) -> Self {
+        // valueネット重みの運用ノブ（デプロイ時の切り戻し・アブレーション用）。
+        // SPSA（with_params 経由）でも env が設定されていればそちらを優先する
+        let params = match std::env::var("TSUITATE_VALUE_NN_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+        {
+            Some(w) => EvalParams { value_nn_w: w, ..params },
+            None => params,
+        };
         EstimatorStrategy {
             est: None,
             book: None,
@@ -934,6 +965,10 @@ impl Strategy for EstimatorStrategy {
         let debug_check_enabled = std::env::var("TSUITATE_DEBUG_CHECK").is_ok();
 
         let rng = &mut self.rng;
+        // valueネットのstate特徴量キャッシュ（sample と同じ並び。候補間で共通なので
+        // 手番ごとに1回だけ計算する）
+        let mut nn_state_cache: Vec<Option<[f64; crate::value_features::VALUE_FEATURES]>> =
+            vec![None; sample.len()];
         // 1段目: 全候補を1手読み（静的リスク項つき）で評価する。
         // (usi, mv, 内訳, gain外の補正, 1段目スコア)
         let mut scored: Vec<(String, ShogiMove, EvalOut, f64, f64)> = vec![];
@@ -947,7 +982,16 @@ impl Strategy for EstimatorStrategy {
                     None => in_check_prior(view, &mv),
                 };
             }
-            let mut out = evaluate(view, &mv, &sample, prior, &known, &params, budget);
+            let mut out = evaluate(
+                view,
+                &mv,
+                &sample,
+                prior,
+                &known,
+                &params,
+                budget,
+                &mut nn_state_cache,
+            );
             if view.you_in_check
                 && out.gain > 0.0
                 && check_solver
@@ -1681,6 +1725,9 @@ fn evaluate(
     known: &HashMap<Coord, f64>,
     params: &EvalParams,
     budget: SearchBudget,
+    // valueネットのstate特徴量キャッシュ（particles と同じ並び。候補間で共通なので
+    // choose() が1手番ぶん保持し、最初に使う候補の評価時に遅延計算する）
+    nn_state_cache: &mut [Option<[f64; crate::value_features::VALUE_FEATURES]>],
 ) -> EvalOut {
     let me = view.your_color;
     let opp = me.other();
@@ -1700,9 +1747,13 @@ fn evaluate(
     let mut pressure_n = 0usize;
     // 圧力項もソフト粒子の重みで加重する（他の項と同じ扱い）
     let mut pressure_w_sum = 0.0f64;
+    // valueネット（粒子=真の局面仮説ごとの勝率相当を重み付き平均）。
+    // 圧力項と同じく少数の粒子でだけ測る（transition特徴量の利き走査が重い）
+    let mut nn_sum = 0.0f64;
+    let mut nn_w_sum = 0.0f64;
+    let mut nn_n = 0usize;
 
-    for (pos, w) in particles {
-        let w = *w;
+    for (pi, &(pos, w)) in particles.iter().enumerate() {
         if !pos.is_legal(mv) {
             continue;
         }
@@ -1723,7 +1774,7 @@ fn evaluate(
             capture_hits += w;
         }
 
-        let mut next = (*pos).clone();
+        let mut next = pos.clone();
         next.play_unchecked(mv);
 
         // 王手・詰み。ついたて将棋では王手された側は王手駒の位置が見えず
@@ -1807,6 +1858,22 @@ fn evaluate(
             pressure_n += 1;
         }
 
+        // valueネット: 学習時の規約（state=指す前の局面・指す側視点、transition=
+        // その一手。docs/nn-value-phase1.md）どおり、粒子=真の局面仮説として推論する。
+        // state特徴量は候補間で共通なので粒子単位にキャッシュする
+        if params.value_nn_w != 0.0 && nn_n < budget.nn_samples {
+            let state = nn_state_cache[pi]
+                .get_or_insert_with(|| crate::value_features::value_features(pos, me));
+            let trans = crate::value_features::transition_features(pos, mv, &next, me);
+            let mut f =
+                [0.0f64; crate::value_features::VALUE_FEATURES + crate::value_features::TRANSITION_FEATURES];
+            f[..crate::value_features::VALUE_FEATURES].copy_from_slice(state);
+            f[crate::value_features::VALUE_FEATURES..].copy_from_slice(&trans);
+            nn_sum += w * crate::value_nn::value_nn_forward(&f);
+            nn_w_sum += w;
+            nn_n += 1;
+        }
+
         value_sum += w * v;
     }
 
@@ -1829,9 +1896,18 @@ fn evaluate(
         // 固まりやすく、「誰もいない場所への攻め」が加点され続ける
         // （対人実戦: 終盤の成桂の徘徊）。健全度が低いときは確実な項だけ残す
         let confidence = (n / budget.eval_particles as f64).min(1.0);
+        // valueネット項: 勝率相当[0,1]の重み付き平均を中心化して歩価値スケールへ。
+        // gain の内側（= combine_score の p_legal 割引を受ける側）に置くことで、
+        // 反則確実な手への加点素通り（dragon-check-drop の教訓）を構造的に防ぐ
+        let nn_term = if nn_w_sum > 0.0 {
+            params.value_nn_w * (nn_sum / nn_w_sum - 0.5)
+        } else {
+            0.0
+        };
         value_sum / legal
             + params.info_bonus * p_hit * (1.0 - p_hit)
             + params.king_probe_bonus * p_chk * (1.0 - p_chk)
+            + nn_term
             + (params.attack_w * confidence * attack_sum
                 - params.pressure_w * pressure_sum
                 - params.hand_drop_w * danger_sum)
