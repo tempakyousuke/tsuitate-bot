@@ -17,8 +17,9 @@
 //!
 //! - 進捗と各反復のパラメータは TUNE_LOG（既定 tune-log.jsonl）に追記する
 //! - **再開**: ログが存在すれば最後の反復のθから自動で続きを実行する。
-//!   再開時は start イベントの設定（基準・局数・定跡固定・思考予算・パラメータ空間・
-//!   ランシード）と一致するか検証し、不一致なら停止する（TUNE_FORCE_RESUME=1 で強行）
+//!   再開時は start イベントの設定（基準・局数・定跡固定・思考予算・
+//!   パラメータ空間など）と一致するか検証し、ランシードはログ側の値を引き継ぐ
+//!   （TUNE_FORCE_RESUME=1 で設定不一致でも強行）
 //! - 最後に最終中心点を追加評価して done に記録する。採用は人間が判断し、
 //!   strategy.rs の Default を書き換えてガントレット（CI・200局）で確認する
 //!
@@ -34,20 +35,12 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 
 use tsuitate_bot::opening::OpeningBook;
-use tsuitate_bot::selfplay::{MatchStats, run_match_with_seeds};
+use tsuitate_bot::selfplay::{MatchStats, mix, run_match_with_seeds};
 use tsuitate_bot::strategy::{self, EstimatorStrategy, EvalParams};
 
 /// ログファイルのパス（実験ごとに分けられる）
 fn log_path() -> String {
     std::env::var("TUNE_LOG").unwrap_or_else(|_| "tune-log.jsonl".into())
-}
-
-/// SplitMix64（selfplay::player_seed と同系の撹拌。シード導出に使う）
-fn mix(mut z: u64) -> u64 {
-    z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
 }
 
 /// 調整空間: 各パラメータの調整対象マスクと有効範囲。

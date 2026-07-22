@@ -931,6 +931,7 @@ impl Strategy for EstimatorStrategy {
         // 正しくないと当たらない複合情報で、taint の単純な force_apply では
         // 再現できない（ユーザーの実践知見どおり）。再設計するまでは無効
         let hang_risk_enabled = std::env::var("TSUITATE_ENABLE_HANG_RISK").is_ok();
+        let debug_check_enabled = std::env::var("TSUITATE_DEBUG_CHECK").is_ok();
 
         let rng = &mut self.rng;
         // 1段目: 全候補を1手読み（静的リスク項つき）で評価する。
@@ -955,7 +956,7 @@ impl Strategy for EstimatorStrategy {
             {
                 out.p_legal = out.p_legal.max(CHECK_CAPTURE_P_LEGAL_FLOOR);
             }
-            if std::env::var("TSUITATE_DEBUG_CHECK").is_ok() && view.you_in_check {
+            if debug_check_enabled && view.you_in_check {
                 eprintln!(
                     "DEBUG {usi}: prior={prior:.4} gain={:.3} p_legal={:.4} foul_cost={:.3} score={:.4}",
                     out.gain, out.p_legal, out.foul_cost, out.score()
@@ -1086,7 +1087,7 @@ fn stratified_sample<'a>(
     // ユニーク化: 同一指紋の質量 logΣexp(logw) と最小 info_miss を畳み込む。
     // 物理不整合（phys_taint>0）の粒子は**通常サンプルから除外**する
     // （C-7 P3 / D4: 嘘の盤面を駒得・リスク・p(合法) に混ぜない。
-    // 用途は王手ソルバーの投票フォールバック（taint_check_sample）に限定）
+    // 必要な補助評価は別途作る taint_pool を直接使う）
     struct Unique<'a> {
         pos: &'a Position,
         mass_log: f64,
@@ -1272,8 +1273,8 @@ const BLIND_HANG_RISK_W: f64 = 1.0;
 const TAINT_POOL_CAP: usize = 256;
 
 /// taint 粒子を指紋でユニーク化し、深度減衰つきの重みで合算して返す
-/// （taint_check_sample・taint_king_distribution・taint_square_coverage の
-/// 共通部品。深い taint は信用が下がるので 0.5^(taint-1) で減衰し、
+/// （taint_king_distribution・taint_square_coverage の共通部品。
+/// 深い taint は信用が下がるので 0.5^(taint-1) で減衰し、
 /// taint > TAINT_VOTE_MAX は除外する）
 fn taint_particles(est: &Estimator) -> Vec<(&Position, f64)> {
     let max_lw = est
@@ -1416,16 +1417,6 @@ fn blind_hang_risk(
         .entry(to)
         .or_insert_with(|| taint_square_coverage(taint_pool, to, opp));
     piece_value(role) * coverage
-}
-
-/// ε_phys の taint 粒子から王手ソルバー投票用のサンプルを作る（C-7 P3）。
-/// クリーン粒子が全滅しているときのフォールバック専用。重みは指紋ごとの
-/// 正規化 Σexp(logw)（taint の EPS_PHYS 課金は logw に済み、相対値だけ使う）に
-/// 深度減衰 0.5^(taint-1) を掛ける（codex 指摘: ESS リセット後は logw の
-/// ε 累積が複製数に実現されて消えるため、深い嘘の投票を別途薄める）。
-/// taint > TAINT_VOTE_MAX は投票から除外
-fn taint_check_sample(est: &Estimator) -> Vec<(&Position, f64)> {
-    taint_particles(est)
 }
 
 /// log(exp(a) + exp(b))（オーバーフロー安全）
@@ -2079,7 +2070,7 @@ fn threat_value(pos: &Position, me: Color) -> f64 {
 /// 加点し、攻撃マスに直接着地した手（距離0）が最大。
 /// `min_moves_empty_board(..., want_promoted=false)` は「成っても不成でも
 /// 良いなら最短」であり成り駒（金型移動）経由で筋を跨げてしまうため、
-/// ここでは `all_distances_empty_board` から不成状態の距離だけを直接引く
+/// ここでは `distance_empty_board` から不成状態の距離だけを直接引く
 /// （歩が本当に同じ筋を歩数だけ進む距離。筋違いの桂馬には自然に届かない）
 fn knight_bait_value(next: &Position, me: Color, mv: &ShogiMove) -> f64 {
     let to = match *mv {
@@ -2103,8 +2094,8 @@ fn knight_bait_value(next: &Position, me: Color, mv: &ShogiMove) -> f64 {
             continue;
         }
         let attack_sq = Coord { file: sq.file, rank: attack_rank };
-        let dist_map = crate::deduce::all_distances_empty_board(Role::Pawn, me, to);
-        let Some(&dist) = dist_map.get(&(attack_sq, false)) else {
+        let Some(dist) = crate::deduce::distance_empty_board(Role::Pawn, me, to, attack_sq, false)
+        else {
             continue;
         };
         let decay = 0.6f64.powi(dist as i32);
@@ -2395,6 +2386,53 @@ pub(crate) mod tests {
         // 本番向けに絞れば従来より軽くなる
         let small = SearchBudget::from_ms(450);
         assert!(small.eval_particles < base.eval_particles);
+    }
+
+    #[test]
+    fn eval_params_specs_to_vec_from_vec_stay_aligned() {
+        fn changed_indices(a: &[f64], b: &[f64]) -> Vec<usize> {
+            a.iter()
+                .zip(b)
+                .enumerate()
+                .filter_map(|(i, (&x, &y))| ((x - y).abs() > 1e-12).then_some(i))
+                .collect()
+        }
+
+        fn spec_index(name: &str) -> usize {
+            EvalParams::SPECS
+                .iter()
+                .position(|s| s.name == name)
+                .unwrap_or_else(|| panic!("SPECSに {name} がない"))
+        }
+
+        let base = EvalParams::default();
+        let base_vec = base.to_vec();
+        assert_eq!(base_vec.len(), EvalParams::SPECS.len());
+        assert_eq!(EvalParams::from_vec(&base_vec).to_vec(), base_vec);
+
+        for i in 0..base_vec.len() {
+            let mut v = base_vec.clone();
+            v[i] += 1.0;
+            let round = EvalParams::from_vec(&v).to_vec();
+            assert_eq!(changed_indices(&base_vec, &round), vec![i]);
+        }
+
+        macro_rules! assert_field_index {
+            ($field:ident) => {{
+                let mut p = base.clone();
+                p.$field += 1.0;
+                assert_eq!(
+                    changed_indices(&base_vec, &p.to_vec()),
+                    vec![spec_index(stringify!($field))]
+                );
+            }};
+        }
+
+        assert_field_index!(check_bonus);
+        assert_field_index!(foul_cost_base);
+        assert_field_index!(knight_bait_w);
+        assert_field_index!(depth2_replace);
+        assert_field_index!(check_limit_accel);
     }
 
     #[test]

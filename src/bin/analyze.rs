@@ -297,9 +297,11 @@ fn main() {
     let mut total_bot_captured = 0.0;
     let mut total_bot_lost = 0.0;
     let mut total_free_losses = 0.0;
+    let mut total_exchange_settlements = 0u32;
     let mut total_bad_trades = 0.0;
     let mut total_missed_mates = 0;
-    let mut total_check_tested = 0;
+    let mut total_check_turns = 0;
+    let mut total_check_actual_fouls = 0;
     let mut total_check_solved = 0;
     let mut total_recap_ops = 0;
     let mut total_recap_taken = 0;
@@ -352,7 +354,6 @@ fn main() {
             positions.push(next);
         }
 
-        let mut fouls_here: HashMap<FoulCause, u32> = HashMap::new();
         let mut known_risky_squares: HashSet<Coord> = HashSet::new();
         let mut bot_fouls: Vec<_> = rec
             .end
@@ -367,7 +368,6 @@ fn main() {
                 continue;
             }
             let cause = classify_foul(&positions[idx], foul);
-            *fouls_here.entry(cause).or_default() += 1;
             *total_fouls.entry(cause).or_default() += 1;
             println!(
                 "  反則 {}手目 {}: {}",
@@ -387,8 +387,6 @@ fn main() {
                 }
             }
         }
-        let _ = fouls_here;
-
         // 駒の損得: 各手の捕獲を追い、直後の取り返しをペアにする
         let mut bot_captured = 0.0;
         let mut bot_lost = 0.0;
@@ -407,6 +405,14 @@ fn main() {
                 bot_captured += v;
             } else {
                 bot_lost += v;
+                let exchange_settlement = i > 0
+                    && rec.end.moves[i - 1].by_color == bot
+                    && parse_usi(&rec.end.moves[i - 1].usi).is_some_and(|pm| {
+                        let prev_to = match pm {
+                            ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+                        };
+                        prev_to == to && positions[i - 1].piece_at(prev_to).is_some()
+                    });
                 // 取り返したか（次の bot の正規手が同じマスを取ったか）
                 let recaptured = rec.end.moves.get(i + 1).is_some_and(|n| {
                     n.by_color == bot
@@ -416,7 +422,10 @@ fn main() {
                             }
                         })
                 });
-                if !recaptured {
+                if exchange_settlement {
+                    total_exchange_settlements += 1;
+                }
+                if !recaptured && !exchange_settlement {
                     // 守られていたのに取り返さなかったのか、そもそも守っていなかったのか
                     free_losses.push(format!(
                         "{}手目 {} で {:?}(価値{v:.0}) を只取られ",
@@ -469,8 +478,8 @@ fn main() {
 
         // 王手ソルバーの再現検証（王手中に反則した手番それぞれを指し直す）
         let (tested, actual, sim) = simulate_check_solver(&rec, &positions, bot);
-        let _ = tested;
-        total_check_tested += actual;
+        total_check_turns += tested;
+        total_check_actual_fouls += actual;
         total_check_solved += sim;
 
         // 取り返し機会: 相手に駒を取られた直後の bot 手番で、そのマスを合法に
@@ -503,18 +512,24 @@ fn main() {
             });
             if took {
                 total_recap_taken += 1;
-            } else if let Some(best) = recaps.first() {
-                // 取り返し後にさらに取り返されるか（真の局面で）
-                let mut probe = after.clone();
-                let own = match best {
-                    ShogiMove::Board { from, .. } => {
-                        after.piece_at(*from).map(|p| piece_value(p.role)).unwrap_or(0.0)
-                    }
-                    ShogiMove::Drop { .. } => 0.0,
-                };
-                probe.play_unchecked(best);
-                let exposed = probe.is_attacked(to, bot.other());
-                let net = attacker_value - if exposed { own } else { 0.0 };
+            } else if let Some((best, net)) = recaps
+                .iter()
+                .map(|mv| {
+                    // 取り返し後にさらに取り返されるか（真の局面で）
+                    let mut probe = after.clone();
+                    let own = match mv {
+                        ShogiMove::Board { from, .. } => {
+                            after.piece_at(*from).map(|p| piece_value(p.role)).unwrap_or(0.0)
+                        }
+                        ShogiMove::Drop { .. } => 0.0,
+                    };
+                    probe.play_unchecked(mv);
+                    let exposed = probe.is_attacked(to, bot.other());
+                    let net = attacker_value - if exposed { own } else { 0.0 };
+                    (mv, net)
+                })
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+            {
                 if net > 0.5 {
                     total_recap_missed_good += 1;
                     println!(
@@ -565,7 +580,9 @@ fn main() {
         println!("  {:>3}回  {}", n, cause_label(*cause));
     }
     println!("駒得収支合計: 取った {total_bot_captured:.0} / 取られた {total_bot_lost:.0}");
-    println!("只取られ回数: {total_free_losses:.0} / 損な交換の累計損失: {total_bad_trades:.0}");
+    println!(
+        "只取られ回数（交換決済除外）: {total_free_losses:.0} / 交換決済: {total_exchange_settlements}件 / 損な交換の累計損失: {total_bad_trades:.0}"
+    );
     println!(
         "取り返し: 機会{total_recap_ops}回中 実行{total_recap_taken}回 / 得だったのに逃した{total_recap_missed_good}回"
     );
@@ -575,9 +592,9 @@ fn main() {
             "占有マス反則（打ちマス/経路封鎖）の再訪率: {total_repeat_avoidable}/{total_occupancy_fouls}（同一局内で過去の占有反則マスと一致。反則マスを覚える対策の理論上限）"
         );
     }
-    if total_check_tested > 0 {
+    if total_check_actual_fouls > 0 {
         println!(
-            "王手中の反則: 実際 {total_check_tested}回 → ソルバー方策なら {total_check_solved}回"
+            "王手中の反則: {total_check_turns}手番で実際 {total_check_actual_fouls}回 → ソルバー方策なら {total_check_solved}回"
         );
     }
     // p_legal の較正（C-7 P3）: 選択手の合法確率予測 vs 実際の受理/反則。

@@ -156,14 +156,6 @@ pub struct GameTruth {
     pub foul_attempts: Vec<FoulRecord>,
 }
 
-/// 1局対戦する。players[0] が先手。
-fn play_game(
-    players: &mut [PlayerState; 2],
-    game_no: u32,
-) -> (GameResult, &'static str, u32, GameTruth) {
-    play_game_with_oracle(players, game_no, [None, None])
-}
-
 /// oracle[先手, 後手]: 診断用。Some の側は該当する反則手が「候補から外して
 /// 指し直し」になり、反則カウント・観測は発生しない（OracleMode 参照）
 fn play_game_with_oracle(
@@ -438,7 +430,7 @@ pub struct GameSeeds {
 }
 
 /// SplitMix64。単純なXORや加算だとシード間に相関が残るため撹拌する
-fn mix(mut z: u64) -> u64 {
+pub fn mix(mut z: u64) -> u64 {
     z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);

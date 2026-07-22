@@ -23,8 +23,8 @@ pub const VALUE_FEATURE_NAMES: [&str; VALUE_FEATURES] = [
     "drop_check_danger_opp", // 相手玉への同（自分の持ち駒基準）
     "my_in_check",        // 自分が王手されている
     "opp_in_check",        // 相手が王手されている
-    "my_pieces_in_opp_camp", // 敵陣3段にいる自分の駒数（歩・玉除く）
-    "opp_pieces_in_my_camp", // 自陣3段にいる相手の駒数（歩・玉除く）
+    "my_pieces_in_opp_camp", // 敵陣3段にいる自分の駒数（歩・と金・玉除く）
+    "opp_pieces_in_my_camp", // 自陣3段にいる相手の駒数（歩・と金・玉除く）
     "my_max_hanging",      // 相手の利きが当たり自分の紐が無い自分の駒の最大価値
     "opp_max_hanging",      // 同、相手側（=自分が取れる駒の最大価値）
     "my_max_exchange_loss", // 相手に取られた場合の最悪交換損失（取り返しの補償を差し引いた後）
@@ -58,7 +58,7 @@ fn material_sum(pos: &Position, color: Color) -> f64 {
     board_value(pos, color) + hand_value(pos, color)
 }
 
-/// `color` の駒（歩・玉除く）のうち、`color` から見た敵陣（盤の奥3段）に
+/// `color` の駒（歩・と金・玉除く）のうち、`color` から見た敵陣（盤の奥3段）に
 /// いる枚数。攻め込みの深さ（自分が攻めているなら my_pieces、相手が攻めて
 /// いるなら opp_pieces として呼ぶ）
 fn pieces_in_enemy_camp(pos: &Position, color: Color) -> f64 {
@@ -106,7 +106,7 @@ fn min_attacker_exchange_value(pos: &Position, sq: crate::board::Coord, by: Colo
         .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.min(v))))
 }
 
-/// `color` の駒（歩・玉除く。歩は打ち歩詰め等の特殊性が強く exchange_value の
+/// `color` の駒（歩・と金・玉除く。歩は打ち歩詰め等の特殊性が強く exchange_value の
 /// 前提が崩れやすいため除外）のうち、相手に取られた場合の最悪の交換損失
 /// （取り返せるなら相手の攻め駒の exchange_value を補償として差し引く）。
 /// kakudo局面（scenarios/kakudo.kif、R*2d vs P*2h）のような「取られる駒の

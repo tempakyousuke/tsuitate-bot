@@ -33,7 +33,8 @@ pub const OPP_MOVE_NN_B2: f64 = -1.19723612e-03;
 // AUTO-GENERATED END
 
 /// 学習時と同じ正規化 + Linear(23→16) → ReLU → Linear(16→1) のforward pass。
-/// 出力はlogit（Sigmoidではない）。呼び出し側は `exp(logit)` として使う
+/// 出力はlogit（Sigmoidではない）。呼び出し側は `clamp(-15, 15)` してから
+/// `exp(logit)` として使う
 pub fn opp_move_nn_forward(features: &[f64; 23]) -> f64 {
     let mut x = [0.0f64; 23];
     for i in 0..23 {
@@ -120,10 +121,11 @@ mod tests {
         let elapsed = start.elapsed();
         std::hint::black_box(acc);
         eprintln!("{n}回のforward pass: {elapsed:?}（1回あたり{:?}）", elapsed / n);
-        // 実測は数十ns/回のオーダー（13次元時代で約48ns、23次元でも100ns未満）。
-        // CI環境のノイズでflakyにならないよう10us/回まで大きく余裕を見た閾値
+        // release実測は100ns未満、debug実測は十数us/回のオーダー。
+        // CI環境のノイズでflakyにならないようdebugだけ閾値を緩める
+        let threshold = if cfg!(debug_assertions) { 1e-4 } else { 1e-5 };
         assert!(
-            elapsed.as_secs_f64() / f64::from(n) < 1e-5,
+            elapsed.as_secs_f64() / f64::from(n) < threshold,
             "forward passが遅すぎる: {elapsed:?} / {n}回"
         );
     }

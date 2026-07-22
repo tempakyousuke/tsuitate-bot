@@ -5,7 +5,7 @@
 
 use std::collections::HashSet;
 use std::sync::mpsc::{Receiver, Sender, channel};
-use std::thread::sleep;
+use std::thread::{self, sleep};
 use std::time::{Duration, Instant};
 
 use rust_socketio::client::Client;
@@ -45,6 +45,7 @@ enum Msg {
     Closed,
     SocketError(String),
     QueueAck(Ack),
+    RetryQueue,
     /// 受付時間の終了で待機列から外された（サーバーの queue:closed）
     QueueClosed(String),
     MatchFound(MatchFoundPayload),
@@ -64,6 +65,13 @@ enum Msg {
 }
 
 const ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn schedule_retry(tx: Sender<Msg>, delay_ms: u64) {
+    thread::spawn(move || {
+        sleep(Duration::from_millis(delay_ms));
+        let _ = tx.send(Msg::RetryQueue);
+    });
+}
 
 /// Payload の第1引数を型付きで取り出す。
 /// 通常イベントは `Text([arg0, ...])`、ack コールバックは引数列がさらに
@@ -103,6 +111,7 @@ fn connect(config: &Config, tx: &Sender<Msg>) -> Result<Client, rust_socketio::E
     let tx_close = tx.clone();
     let tx_err = tx.clone();
     let tx_state = tx.clone();
+    let tx_check = tx.clone();
 
     ClientBuilder::new(config.url.clone())
         .transport_type(TransportType::Websocket)
@@ -145,10 +154,16 @@ fn connect(config: &Config, tx: &Sender<Msg>) -> Result<Client, rust_socketio::E
         )
         .on(
             "game:check",
-            forward(tx, |v: serde_json::Value| {
-                let color = serde_json::from_value(v["inCheck"].clone()).unwrap_or(Color::Sente);
-                Msg::Check(color)
-            }),
+            move |payload: Payload, _| {
+                if let Some(v) = parse_first::<serde_json::Value>(&payload) {
+                    match serde_json::from_value(v["inCheck"].clone()) {
+                        Ok(color) => {
+                            let _ = tx_check.send(Msg::Check(color));
+                        }
+                        Err(e) => eprintln!("game:check の inCheck を解釈できませんでした: {e}"),
+                    }
+                }
+            },
         )
         .on("game:end", forward(tx, Msg::GameEnd))
         .connect()
@@ -162,6 +177,10 @@ struct BotState {
     /// 着手を送信済みの手番番号。思考トリガが重複しても二重に指さないためのガード。
     /// 反則 ack で解除して同じ手番を指し直す
     pending_move_number: Option<u32>,
+    /// queue:join の成功 ack を受けて待機列にいるか
+    in_queue: bool,
+    /// queue:join の保険タイマーと失敗時タイマーを重複して増やさないための予定時刻
+    queue_retry_due: Option<Instant>,
     /// 直近に送った手（moveAccepted の記録用）
     last_sent: Option<String>,
     log: ObservationLog,
@@ -181,6 +200,18 @@ impl BotState {
     }
 }
 
+fn schedule_retry_once(state: &mut BotState, tx: &Sender<Msg>, delay_ms: u64) {
+    let delay = Duration::from_millis(delay_ms);
+    let due = Instant::now() + delay;
+    if let Some(current) = state.queue_retry_due {
+        if current <= due {
+            return;
+        }
+    }
+    state.queue_retry_due = Some(due);
+    schedule_retry(tx.clone(), delay_ms);
+}
+
 /// 接続して対局し続ける。復帰不能なエラーでのみ返る。
 pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
     let (tx, rx): (Sender<Msg>, Receiver<Msg>) = channel();
@@ -195,6 +226,8 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
         foul_tried: HashSet::new(),
         last_move_number: 0,
         pending_move_number: None,
+        in_queue: false,
+        queue_retry_due: None,
         last_sent: None,
         log: ObservationLog::default(),
         strategy: make_strategy(),
@@ -202,8 +235,8 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
     };
     println!("戦略: {}", state.strategy.name());
 
-    let join_queue = |socket: &Client, tx: &Sender<Msg>| {
-        let tx = tx.clone();
+    let join_queue = |socket: &Client, tx: &Sender<Msg>, state: &mut BotState| {
+        let tx_ack = tx.clone();
         // queue:join はデータ引数なし（ack のみ）
         let result = socket.emit_with_ack(
             "queue:join",
@@ -211,13 +244,14 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
             ACK_TIMEOUT,
             move |payload: Payload, _| {
                 if let Some(ack) = parse_first::<Ack>(&payload) {
-                    let _ = tx.send(Msg::QueueAck(ack));
+                    let _ = tx_ack.send(Msg::QueueAck(ack));
                 }
             },
         );
         if let Err(e) = result {
             eprintln!("queue:join の送信に失敗: {e}");
         }
+        schedule_retry_once(state, tx, config.queue_retry_ms);
     };
 
     let request_sync = |socket: &Client, tx: &Sender<Msg>, game_id: &str| {
@@ -240,41 +274,64 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
         match msg {
             Msg::Connected => {
                 println!("接続しました: {}", config.url);
+                state.pending_move_number = None;
                 if let Some(game_id) = state.game_id.clone() {
                     // 再接続: 対局中なら状態を取り直す
                     request_sync(&socket, &tx, &game_id);
                 } else {
-                    join_queue(&socket, &tx);
+                    state.in_queue = false;
+                    join_queue(&socket, &tx, &mut state);
                 }
             }
             Msg::Closed => println!("切断されました（自動再接続します）"),
             Msg::SocketError(e) => eprintln!("socketエラー: {e}"),
             Msg::QueueAck(ack) => {
                 if ack.ok {
+                    state.in_queue = true;
+                    state.queue_retry_due = None;
                     println!("キューに参加しました");
                 } else if state.game_id.is_some() {
                     // 進行中の対局へ復帰済み（game:active）。再キューしない
                 } else {
+                    state.in_queue = false;
+                    state.queue_retry_due = None;
                     // 受付時間外など。開場を待って再試行し続ける（常駐運用）
                     eprintln!(
                         "キュー参加失敗: {:?}（{}秒後に再試行）",
                         ack.error,
                         config.queue_retry_ms / 1000
                     );
-                    sleep(Duration::from_millis(config.queue_retry_ms));
-                    join_queue(&socket, &tx);
+                    schedule_retry_once(&mut state, &tx, config.queue_retry_ms);
+                }
+            }
+            Msg::RetryQueue => {
+                let Some(due) = state.queue_retry_due else {
+                    continue;
+                };
+                let now = Instant::now();
+                if now < due {
+                    let remaining_ms = due.duration_since(now).as_millis().max(1) as u64;
+                    schedule_retry(tx.clone(), remaining_ms);
+                    continue;
+                }
+                state.queue_retry_due = None;
+                if state.game_id.is_none() && !state.in_queue {
+                    join_queue(&socket, &tx, &mut state);
                 }
             }
             Msg::QueueClosed(reason) => {
+                state.in_queue = false;
+                state.queue_retry_due = None;
                 println!(
                     "受付終了で待機列から外されました: {reason}（{}秒間隔で再試行）",
                     config.queue_retry_ms / 1000
                 );
-                sleep(Duration::from_millis(config.queue_retry_ms));
-                join_queue(&socket, &tx);
+                schedule_retry_once(&mut state, &tx, config.queue_retry_ms);
             }
             Msg::MatchFound(m) => {
                 println!("マッチ成立: {:?} 番（相手は終局まで匿名）", m.your_color);
+                state.in_queue = false;
+                state.queue_retry_due = None;
                 state.foul_tried.clear();
                 state.last_move_number = 0;
                 state.pending_move_number = None;
@@ -289,6 +346,8 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
                     // プロセス再起動などで対局IDを失った状態からの復帰。
                     // それまでの観測は失われている（sync とのズレ警告が出る）
                     println!("進行中の対局に復帰します: {game_id}");
+                    state.in_queue = false;
+                    state.queue_retry_due = None;
                     state.game_id = Some(game_id.clone());
                     request_sync(&socket, &tx, &game_id);
                 }
@@ -313,9 +372,10 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
                     }
                     state.foul_tried.clear();
                     state.pending_move_number = None;
+                    state.in_queue = false;
+                    state.queue_retry_due = None;
                     state.last_sent = None;
-                    sleep(Duration::from_millis(config.requeue_delay_ms));
-                    join_queue(&socket, &tx);
+                    schedule_retry_once(&mut state, &tx, config.requeue_delay_ms);
                 }
             }
             Msg::MoveAccepted(p) => {
@@ -323,10 +383,11 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
                     if let Some(role) = p.captured {
                         println!("着手 {usi} で {role:?} を取りました");
                     }
+                    let captured = p.captured.map(crate::shogi::unpromote_role);
                     state.observe(Observation::MyMove {
                         move_number: p.move_number,
                         usi,
-                        captured: p.captured,
+                        captured,
                     });
                 }
             }
@@ -358,8 +419,9 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
                 }
                 state.game_id = None;
                 state.foul_tried.clear();
-                sleep(Duration::from_millis(config.requeue_delay_ms));
-                join_queue(&socket, &tx);
+                state.in_queue = false;
+                state.queue_retry_due = None;
+                schedule_retry_once(&mut state, &tx, config.requeue_delay_ms);
             }
             Msg::MoveResult { usi, ack } => {
                 if !ack.ok && ack.reason.as_deref() == Some("foul") {
@@ -376,6 +438,10 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
                     let _ = tx.send(Msg::ThinkTrigger);
                 } else if !ack.ok {
                     eprintln!("着手エラー: {:?}", ack.error);
+                    state.pending_move_number = None;
+                    if let Some(game_id) = state.game_id.clone() {
+                        request_sync(&socket, &tx, &game_id);
+                    }
                 }
             }
         }
@@ -396,7 +462,7 @@ fn handle_sync(
 
     // 対局ごとの記録ファイルは最初の sync で作る（match:found 起点の新規対局と
     // game:active 起点の復帰対局の共通経路）
-    if state.recorder.is_none() {
+    if view.status == GameStatus::Playing && state.recorder.is_none() {
         if let Some(dir) = record_dir {
             match GameRecorder::create(dir, &view.game_id, view.your_color, state.strategy.name())
             {

@@ -8,7 +8,7 @@
 //! 「負の証拠は時間減衰する」問題を回避できる — 自玉の位置と王手履歴は
 //! 履歴ぜんぶを通じて exactly 分かるため、鮮度が腐らない。
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::board::{Coord, on_board, orient, steps};
 use crate::observation::{Observation, ObservationLog};
@@ -145,14 +145,14 @@ fn in_promotion_zone(color: Color, rank: i8) -> bool {
     }
 }
 
-/// 空盤上での駒の最短到達手数（admissible な下限）。成りの状態遷移を含む
-/// 拡張状態 (マス, 成っているか) の BFS — 生駒の移動グラフで進み、
-/// 出発マスか到達マスのどちらかが成れるゾーンなら、その手で成る選択肢も生まれる
-/// （将棋の成りルールどおり。成り自体は手数を消費しない）。
-/// `want_promoted` が true なら「成った状態で to に到達する」最短手数を返す
-/// （金・王など成れない駒に true を渡すと base=promoted 扱いで通常の到達を返す）。
-/// 打ち歩詰め・二歩などの合法性、他の駒による遮蔽は考慮しない
-/// （この関数は「これより少ない手数はあり得ない」という下限の計算専用）
+type DistanceMap = HashMap<(Coord, bool), u32>;
+
+thread_local! {
+    static EMPTY_BOARD_DISTANCE_CACHE: std::cell::RefCell<
+        HashMap<(Role, Color, Coord), DistanceMap>,
+    > = std::cell::RefCell::new(HashMap::new());
+}
+
 /// from を起点にした空盤上の最短手数を、到達しうる全マス(かつ成/不成の両状態)に
 /// ついて1回のBFSでまとめて求める。target を1つずつ聞く min_moves_empty_board を
 /// 何度も呼ぶより、候補が多い場面(守り駒の列挙など)で大幅に速い。
@@ -163,30 +163,42 @@ pub fn all_distances_empty_board(
     base_role: Role,
     color: Color,
     from: Coord,
-) -> std::collections::HashMap<(Coord, bool), u32> {
-    thread_local! {
-        static CACHE: std::cell::RefCell<
-            std::collections::HashMap<(Role, Color, Coord), std::collections::HashMap<(Coord, bool), u32>>,
-        > = std::cell::RefCell::new(std::collections::HashMap::new());
-    }
+) -> HashMap<(Coord, bool), u32> {
     let key = (base_role, color, from);
-    if let Some(cached) = CACHE.with(|c| c.borrow().get(&key).cloned()) {
+    if let Some(cached) = EMPTY_BOARD_DISTANCE_CACHE.with(|c| c.borrow().get(&key).cloned()) {
         return cached;
     }
     let dist_map = compute_distances_empty_board(base_role, color, from);
-    CACHE.with(|c| c.borrow_mut().insert(key, dist_map.clone()));
+    EMPTY_BOARD_DISTANCE_CACHE.with(|c| c.borrow_mut().insert(key, dist_map.clone()));
     dist_map
+}
+
+pub fn distance_empty_board(
+    base_role: Role,
+    color: Color,
+    from: Coord,
+    target: Coord,
+    promoted: bool,
+) -> Option<u32> {
+    let key = (base_role, color, from);
+    EMPTY_BOARD_DISTANCE_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        let dist_map = cache
+            .entry(key)
+            .or_insert_with(|| compute_distances_empty_board(base_role, color, from));
+        dist_map.get(&(target, promoted)).copied()
+    })
 }
 
 fn compute_distances_empty_board(
     base_role: Role,
     color: Color,
     from: Coord,
-) -> std::collections::HashMap<(Coord, bool), u32> {
+) -> DistanceMap {
     let promoted_role = promote_role(base_role);
     let mut visited: HashSet<(Coord, bool)> = HashSet::new();
     let mut queue: VecDeque<((Coord, bool), u32)> = VecDeque::new();
-    let mut dist_map = std::collections::HashMap::new();
+    let mut dist_map = HashMap::new();
     queue.push_back(((from, false), 0));
     visited.insert((from, false));
     dist_map.insert((from, false), 0);
@@ -217,6 +229,14 @@ fn compute_distances_empty_board(
     dist_map
 }
 
+/// 空盤上での駒の最短到達手数（admissible な下限）。成りの状態遷移を含む
+/// 拡張状態 (マス, 成っているか) の BFS — 生駒の移動グラフで進み、
+/// 出発マスか到達マスのどちらかが成れるゾーンなら、その手で成る選択肢も生まれる
+/// （将棋の成りルールどおり。成り自体は手数を消費しない）。
+/// `want_promoted` が true なら「成った状態で to に到達する」最短手数を返す。
+/// 金・王など成れない駒に true を渡した場合は None を返す。
+/// 打ち歩詰め・二歩などの合法性、他の駒による遮蔽は考慮しない
+/// （この関数は「これより少ない手数はあり得ない」という下限の計算専用）
 pub fn min_moves_empty_board(
     base_role: Role,
     color: Color,
@@ -229,13 +249,12 @@ pub fn min_moves_empty_board(
         // 成れない駒に「成った状態」を要求するのは無意味な問い
         return None;
     }
-    let dist_map = all_distances_empty_board(base_role, color, from);
     if want_promoted {
-        dist_map.get(&(to, true)).copied()
+        distance_empty_board(base_role, color, from, to, true)
     } else {
         // 成っていても不成でも構わない場合は両方のうち短い方
-        let a = dist_map.get(&(to, false)).copied();
-        let b = dist_map.get(&(to, true)).copied();
+        let a = distance_empty_board(base_role, color, from, to, false);
+        let b = distance_empty_board(base_role, color, from, to, true);
         a.into_iter().chain(b).min()
     }
 }
@@ -243,7 +262,6 @@ pub fn min_moves_empty_board(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::shogi::parse_usi;
 
     #[test]
     fn knight_landing_square_attacks_adjacent_diagonal_ranks() {

@@ -294,10 +294,13 @@ fn known_enemy_squares(log: &ObservationLog, since_move: u32) -> Vec<Coord> {
             _ => {}
         }
     }
-    map.into_iter()
+    let mut out: Vec<Coord> = map
+        .into_iter()
         .filter(|(_, mn)| *mn >= since_move)
         .map(|(c, _)| c)
-        .collect()
+        .collect();
+    out.sort_by_key(|c| (c.file, c.rank));
+    out
 }
 
 /// 粒子の加重多数決でそのマスの敵駒の駒種を推定する（過半に満たなければ None）。
@@ -317,11 +320,34 @@ fn particle_majority_role(particles: &[(&Position, f64)], opp: Color, sq: Coord)
     }
     let (role, n) = counts
         .into_iter()
-        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))?;
+        .max_by(|(ra, a), (rb, b)| {
+            a.partial_cmp(b)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| role_order(*rb).cmp(&role_order(*ra)))
+        })?;
     if n * 2.0 > total {
         Some(role)
     } else {
         None
+    }
+}
+
+fn role_order(role: Role) -> u8 {
+    match role {
+        Role::Pawn => 0,
+        Role::Lance => 1,
+        Role::Knight => 2,
+        Role::Silver => 3,
+        Role::Gold => 4,
+        Role::Bishop => 5,
+        Role::Rook => 6,
+        Role::King => 7,
+        Role::Tokin => 8,
+        Role::Promotedlance => 9,
+        Role::Promotedknight => 10,
+        Role::Promotedsilver => 11,
+        Role::Horse => 12,
+        Role::Dragon => 13,
     }
 }
 
@@ -413,6 +439,22 @@ mod tests {
             side > 0.7,
             "縦筋仮説の下で横逃げは解消するはず（p={side:.2}）"
         );
+    }
+
+    #[test]
+    fn captures_checker_detects_only_non_king_capture_on_hypothesis_square() {
+        // 5d の後手歩は 5e 玉への王手駒仮説。4e 金で取る手だけを
+        // 「王手駒捕獲」として扱い、玉捕獲・別マス移動・打ちは除外する
+        let view = view_with(vec![
+            ("5e", Role::King),
+            ("4e", Role::Gold),
+            ("1e", Role::Rook),
+        ]);
+        let mut solver = CheckSolver::new(&view, &[], &[], &ObservationLog::default()).unwrap();
+        assert!(solver.captures_checker(&mv("4e5d")));
+        assert!(!solver.captures_checker(&mv("5e5d")));
+        assert!(!solver.captures_checker(&mv("1e1b")));
+        assert!(!solver.captures_checker(&mv("P*5d")));
     }
 
     #[test]

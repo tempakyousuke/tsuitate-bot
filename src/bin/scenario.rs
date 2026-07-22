@@ -53,6 +53,33 @@ fn scenarios_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("scenarios")
 }
 
+fn usage() -> &'static str {
+    "usage:
+  cargo run --release --bin scenario -- <名前|path.kif> [試行数=20] [戦略=estimator]
+  cargo run --release --bin scenario -- <名前> diag [推定器数=10]
+  cargo run --release --bin scenario -- <名前> continue [対局数=10] [手番側戦略] [相手戦略]
+  cargo run --release --bin scenario -- suite [試行数=10] [戦略=estimator]
+  共通フラグ: --ply N / --target USI / --diag 5g,4h"
+}
+
+fn exit_usage(msg: &str) -> ! {
+    eprintln!("{msg}");
+    eprintln!("{}", usage());
+    std::process::exit(1);
+}
+
+fn parse_u64_arg(label: &str, value: &str) -> u64 {
+    value
+        .parse()
+        .unwrap_or_else(|_| exit_usage(&format!("{label} を数値として読めません: {value}")))
+}
+
+fn validate_strategy_name(name: &str) {
+    if strategy::make_seeded(name, 0).is_none() {
+        exit_usage(&format!("未知の戦略名です: {name}"));
+    }
+}
+
 fn load_scenario(
     spec: &str,
     ply_flag: Option<usize>,
@@ -83,8 +110,17 @@ fn load_scenario(
         .unwrap_or_default();
     let diag_squares: Vec<String> = diag_flag
         .or_else(|| kifu.directives.get("diag").cloned())
-        .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim())
+                .filter(|x| !x.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
+    for sq in &diag_squares {
+        parse_usi_square(sq).ok_or_else(|| format!("diag のマスを読めません: {sq}"))?;
+    }
     let limit: u32 = kifu
         .directives
         .get("limit")
@@ -590,7 +626,7 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
         let mark = if *sq == truth_king { " ←真実" } else { "" };
         println!("  {sq}: {:.1}%{mark}", 100.0 * m / all_king_mass.max(1e-12));
     }
-    if rep.pos.in_check(side) && strict_unique > 0 {
+    if rep.pos.in_check(side) && checker_mass > 0.0 {
         println!();
         println!("王手駒の分布（粒子内で手番側の玉に利いている相手駒。重み付き）:");
         let mut sorted: Vec<_> = checker_tally.into_iter().collect();
@@ -858,15 +894,30 @@ fn main() {
     while i < raw.len() {
         match raw[i].as_str() {
             "--ply" => {
-                ply_flag = raw.get(i + 1).and_then(|s| s.parse().ok());
+                let Some(value) = raw.get(i + 1) else {
+                    exit_usage("--ply には値が必要です");
+                };
+                let ply = value
+                    .parse()
+                    .unwrap_or_else(|_| exit_usage(&format!("--ply を数値として読めません: {value}")));
+                ply_flag = Some(ply);
                 i += 2;
             }
             "--target" => {
-                target_flag = raw.get(i + 1).cloned();
+                let Some(value) = raw.get(i + 1) else {
+                    exit_usage("--target には値が必要です");
+                };
+                if parse_usi(value).is_none() {
+                    exit_usage(&format!("--target をUSIとして読めません: {value}"));
+                }
+                target_flag = Some(value.clone());
                 i += 2;
             }
             "--diag" => {
-                diag_flag = raw.get(i + 1).cloned();
+                let Some(value) = raw.get(i + 1) else {
+                    exit_usage("--diag には値が必要です");
+                };
+                diag_flag = Some(value.clone());
                 i += 2;
             }
             _ => {
@@ -878,8 +929,9 @@ fn main() {
 
     let spec = args.first().map(String::as_str).unwrap_or("keima");
     if spec == "suite" {
-        let trials = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(10);
+        let trials = args.get(1).map(|s| parse_u64_arg("試行数", s)).unwrap_or(10);
         let name = args.get(2).map(String::as_str).unwrap_or("estimator");
+        validate_strategy_name(name);
         run_suite(trials, name);
         return;
     }
@@ -906,19 +958,34 @@ fn main() {
 
     match args.get(1).map(String::as_str) {
         Some("diag") => {
-            let n = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
+            let n = args
+                .get(2)
+                .map(|s| parse_u64_arg("推定器数", s))
+                .unwrap_or(10);
             diagnose_particles(&sc, &rep, n);
         }
         Some("continue") => {
-            let games = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(10);
+            let games = args
+                .get(2)
+                .map(|s| parse_u64_arg("対局数", s))
+                .unwrap_or(10);
             let name_me = args.get(3).map(String::as_str).unwrap_or("estimator");
             let name_opp = args.get(4).map(String::as_str).unwrap_or("estimator");
+            validate_strategy_name(name_me);
+            validate_strategy_name(name_opp);
             continue_games(&sc, &rep, games, name_me, name_opp);
         }
-        mode => {
-            let trials = mode.and_then(|s| s.parse().ok()).unwrap_or(20);
+        Some(mode) => {
+            let trials = mode.parse().unwrap_or_else(|_| {
+                exit_usage(&format!("第2引数は試行数、diag、continue のいずれかです: {mode}"))
+            });
             let name = args.get(2).map(String::as_str).unwrap_or("estimator");
+            validate_strategy_name(name);
             choice_trials(&sc, &rep, trials, name, true);
+        }
+        None => {
+            validate_strategy_name("estimator");
+            choice_trials(&sc, &rep, 20, "estimator", true);
         }
     }
 }

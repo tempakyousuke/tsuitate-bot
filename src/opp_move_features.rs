@@ -109,93 +109,6 @@ pub fn is_home_square(role: Role, mover: Color, sq: Coord) -> bool {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::shogi::parse_usi;
-
-    fn board(from: (i8, i8), to: (i8, i8)) -> ShogiMove {
-        ShogiMove::Board {
-            from: Coord { file: from.0, rank: from.1 },
-            to: Coord { file: to.0, rank: to.1 },
-            promote: false,
-        }
-    }
-
-    /// 初期配置マス判定が Position::initial の実配置と全マス・全駒種で一致する
-    /// （ハードコードした座標のずれをエンジン側の初期局面で照合する）
-    #[test]
-    fn is_home_square_matches_initial_position() {
-        let initial = Position::initial();
-        for color in [Color::Sente, Color::Gote] {
-            for file in 1..=9i8 {
-                for rank in 1..=9i8 {
-                    let sq = Coord { file, rank };
-                    for role in [
-                        Role::Pawn,
-                        Role::Lance,
-                        Role::Knight,
-                        Role::Silver,
-                        Role::Gold,
-                        Role::Bishop,
-                        Role::Rook,
-                        Role::King,
-                    ] {
-                        let expect = initial
-                            .piece_at(sq)
-                            .is_some_and(|p| p.color == color && p.role == role);
-                        assert_eq!(
-                            is_home_square(role, color, sq),
-                            expect,
-                            "role={role:?} color={color:?} sq={sq:?}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// 旧home_lance_move相当のケース: 隅の香車の初手は lance one-hot + from_home が
-    /// 同時に立つ（NNがこの組で旧-1.3割り引きを表現できることの前提）
-    #[test]
-    fn piece_type_features_flags_home_lance() {
-        let pos = Position::initial();
-        let f = piece_type_features(&pos, &board((1, 1), (1, 2)), Color::Gote);
-        assert_eq!(f[1], 1.0, "lance one-hot");
-        assert_eq!(f[9], 1.0, "from_home");
-        assert_eq!(f[8], 1.0, "dist=1");
-        // 桂馬マスからの手は香車扱いしない（後手2一は桂馬）
-        let g = piece_type_features(&pos, &board((2, 1), (1, 3)), Color::Gote);
-        assert_eq!(g[1], 0.0);
-        assert_eq!(g[2], 1.0, "knight one-hot");
-        assert_eq!(g[9], 1.0, "桂馬も初期配置マスからなら from_home");
-    }
-
-    /// 長距離移動の距離と、打ち・玉・成駒の扱い
-    #[test]
-    fn piece_type_features_dist_drop_and_king() {
-        let mut pos = Position::initial();
-        // 角道を開けて後手角が2二→8八の長距離移動（dist=6）
-        for usi in ["7g7f", "3c3d", "2g2f"] {
-            pos.play_unchecked(&parse_usi(usi).unwrap());
-        }
-        let f = piece_type_features(&pos, &board((2, 2), (8, 8)), Color::Gote);
-        assert_eq!(f[5], 1.0, "bishop one-hot");
-        assert_eq!(f[8], 6.0, "dist");
-        assert_eq!(f[9], 1.0, "2二は後手角の初期配置マス");
-        // 打ちは one-hot のみ（dist=0, from_home=0）
-        let drop = ShogiMove::Drop { role: Role::Pawn, to: Coord { file: 5, rank: 5 } };
-        let d = piece_type_features(&pos, &drop, Color::Gote);
-        assert_eq!(d[0], 1.0);
-        assert_eq!(d[8], 0.0);
-        assert_eq!(d[9], 0.0);
-        // 玉は one-hot 全ゼロ（is_king_move が既存特徴量にある）だが from_home は立つ
-        let k = piece_type_features(&pos, &board((5, 1), (4, 2)), Color::Gote);
-        assert_eq!(&k[..8], &[0.0; 8], "玉はone-hotなし・成駒フラグOFF");
-        assert_eq!(k[9], 1.0, "5一は後手玉の初期配置マス");
-    }
-}
-
 pub fn advance_of(mv: &ShogiMove, mover: Color) -> f64 {
     match *mv {
         ShogiMove::Board { from, to, .. } => match mover {
@@ -348,4 +261,91 @@ pub fn opp_move_features(
         pt[8],
         pt[9],
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shogi::parse_usi;
+
+    fn board(from: (i8, i8), to: (i8, i8)) -> ShogiMove {
+        ShogiMove::Board {
+            from: Coord { file: from.0, rank: from.1 },
+            to: Coord { file: to.0, rank: to.1 },
+            promote: false,
+        }
+    }
+
+    /// 初期配置マス判定が Position::initial の実配置と全マス・全駒種で一致する
+    /// （ハードコードした座標のずれをエンジン側の初期局面で照合する）
+    #[test]
+    fn is_home_square_matches_initial_position() {
+        let initial = Position::initial();
+        for color in [Color::Sente, Color::Gote] {
+            for file in 1..=9i8 {
+                for rank in 1..=9i8 {
+                    let sq = Coord { file, rank };
+                    for role in [
+                        Role::Pawn,
+                        Role::Lance,
+                        Role::Knight,
+                        Role::Silver,
+                        Role::Gold,
+                        Role::Bishop,
+                        Role::Rook,
+                        Role::King,
+                    ] {
+                        let expect = initial
+                            .piece_at(sq)
+                            .is_some_and(|p| p.color == color && p.role == role);
+                        assert_eq!(
+                            is_home_square(role, color, sq),
+                            expect,
+                            "role={role:?} color={color:?} sq={sq:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 旧home_lance_move相当のケース: 隅の香車の初手は lance one-hot + from_home が
+    /// 同時に立つ（NNがこの組で旧-1.3割り引きを表現できることの前提）
+    #[test]
+    fn piece_type_features_flags_home_lance() {
+        let pos = Position::initial();
+        let f = piece_type_features(&pos, &board((1, 1), (1, 2)), Color::Gote);
+        assert_eq!(f[1], 1.0, "lance one-hot");
+        assert_eq!(f[9], 1.0, "from_home");
+        assert_eq!(f[8], 1.0, "dist=1");
+        // 桂馬マスからの手は香車扱いしない（後手2一は桂馬）
+        let g = piece_type_features(&pos, &board((2, 1), (1, 3)), Color::Gote);
+        assert_eq!(g[1], 0.0);
+        assert_eq!(g[2], 1.0, "knight one-hot");
+        assert_eq!(g[9], 1.0, "桂馬も初期配置マスからなら from_home");
+    }
+
+    /// 長距離移動の距離と、打ち・玉・成駒の扱い
+    #[test]
+    fn piece_type_features_dist_drop_and_king() {
+        let mut pos = Position::initial();
+        // 角道を開けて後手角が2二→8八の長距離移動（dist=6）
+        for usi in ["7g7f", "3c3d", "2g2f"] {
+            pos.play_unchecked(&parse_usi(usi).unwrap());
+        }
+        let f = piece_type_features(&pos, &board((2, 2), (8, 8)), Color::Gote);
+        assert_eq!(f[5], 1.0, "bishop one-hot");
+        assert_eq!(f[8], 6.0, "dist");
+        assert_eq!(f[9], 1.0, "2二は後手角の初期配置マス");
+        // 打ちは one-hot のみ（dist=0, from_home=0）
+        let drop = ShogiMove::Drop { role: Role::Pawn, to: Coord { file: 5, rank: 5 } };
+        let d = piece_type_features(&pos, &drop, Color::Gote);
+        assert_eq!(d[0], 1.0);
+        assert_eq!(d[8], 0.0);
+        assert_eq!(d[9], 0.0);
+        // 玉は one-hot 全ゼロ（is_king_move が既存特徴量にある）だが from_home は立つ
+        let k = piece_type_features(&pos, &board((5, 1), (4, 2)), Color::Gote);
+        assert_eq!(&k[..8], &[0.0; 8], "玉はone-hotなし・成駒フラグOFF");
+        assert_eq!(k[9], 1.0, "5一は後手玉の初期配置マス");
+    }
 }

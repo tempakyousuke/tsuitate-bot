@@ -78,7 +78,6 @@ fn extract_samples(bot: Color, end: &GameEndPayload, samples: &mut Vec<Sample>) 
                 if lm == mv {
                     chosen = Some(features.len());
                 }
-                let _ = to;
                 features.push(opp_move_features(
                     &pos,
                     &next,
@@ -144,9 +143,19 @@ fn log_likelihood(samples: &[Sample], theta: &[f64; D], l2: f64) -> (f64, [f64; 
     (ll / n - 0.5 * l2 * theta.iter().map(|t| t * t).sum::<f64>(), grad)
 }
 
-/// 現行の手調整事前分布（estimator.rs の opp_move_weight 相当）での平均対数尤度。
-/// 駒取り項は観測クラス内で定数なので 0 として比較する（近似）
+/// NN化（v9）以前の線形版 opp_move_weight 相当での平均対数尤度。
+/// 駒取り項は観測クラス内で定数なので 0 として比較する近似ベースライン
 fn current_prior_ll(samples: &[Sample]) -> f64 {
+    let idx = |name: &str| {
+        FEATURE_NAMES
+            .iter()
+            .position(|&n| n == name)
+            .unwrap_or_else(|| panic!("FEATURE_NAMES に {name} がない"))
+    };
+    let advance = idx("advance");
+    let promote_minor = idx("promote_minor");
+    let promote_major = idx("promote_major");
+    let is_drop = idx("is_drop");
     let mut ll = 0.0;
     for s in samples {
         let weights: Vec<f64> = s
@@ -154,11 +163,11 @@ fn current_prior_ll(samples: &[Sample]) -> f64 {
             .iter()
             .map(|f| {
                 let mut w = 1.0;
-                w += 0.25 * f[0].max(0.0); // advance
-                if f[1] > 0.0 {
+                w += 0.25 * f[advance].max(0.0);
+                if f[promote_minor] > 0.0 || f[promote_major] > 0.0 {
                     w += 1.0; // promote
                 }
-                if f[2] > 0.0 {
+                if f[is_drop] > 0.0 {
                     w *= 0.5; // drop
                 }
                 w.max(0.05)

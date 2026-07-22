@@ -146,13 +146,19 @@ fn parse_foul_entry(entry: &str) -> Result<RawFoul, String> {
     if e.len() != 6 {
         return Err(format!("illegal エントリの長さが不正: {e}"));
     }
-    let digits: Vec<i8> = e[..4]
+    let coord_part = e
+        .get(..4)
+        .ok_or_else(|| format!("illegal エントリの座標が不正: {e}"))?;
+    let role_part = e
+        .get(4..)
+        .ok_or_else(|| format!("illegal エントリの駒コードが不正: {e}"))?;
+    let digits: Vec<i8> = coord_part
         .chars()
         .map(|c| c.to_digit(10).map(|d| d as i8))
         .collect::<Option<_>>()
         .ok_or_else(|| format!("illegal エントリの座標が不正: {e}"))?;
     let role =
-        parse_foul_code(&e[4..]).ok_or_else(|| format!("illegal エントリの駒コードが不正: {e}"))?;
+        parse_foul_code(role_part).ok_or_else(|| format!("illegal エントリの駒コードが不正: {e}"))?;
     let to = coord(digits[2], digits[3]).ok_or_else(|| format!("illegal の移動先が不正: {e}"))?;
     if digits[0] == 0 && digits[1] == 0 {
         Ok(RawFoul::Drop { role, to })
@@ -377,6 +383,12 @@ mod tests {
             ]
         );
         assert_eq!(kifu.trailing_fouls.len(), 1);
+    }
+
+    #[test]
+    fn illegalエントリの非asciiはpanicせずエラーになる() {
+        let err = parse_foul_entry("ああ").unwrap_err();
+        assert!(err.contains("座標"), "{err}");
     }
 
     #[test]

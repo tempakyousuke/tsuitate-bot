@@ -97,7 +97,9 @@ const ESS_THRESHOLD: f64 = 0.5;
 /// 各粒子が保持する直近の相手決定点スナップショット数（若返りの巻き戻し窓）
 const REJUV_SNAPSHOTS: usize = 8;
 /// 若返りの巻き戻し深さの試行順（近い決定点から adaptive に広げる。
-/// 固定深さだと「原因が窓の少し前」を拾えず、常に深いとコスト過剰）
+/// 固定深さだと「原因が窓の少し前」を拾えず、常に深いとコスト過剰）。
+/// 主経路ではスナップショットを制約適用前に積むため、depth=1 は同じ決定点として
+/// 常にスキップされる
 const REJUV_DEPTHS: [usize; 4] = [1, 2, 4, 8];
 /// 1つの巻き戻し深さあたりの再サンプル試行回数
 const REJUV_TRIES: u32 = 3;
@@ -799,41 +801,6 @@ impl Estimator {
         }
     }
 
-    /// 若返り: 棄却粒子を直近の相手決定点へ巻き戻し、区間を引き直して修復する。
-    /// 深さは REJUV_DEPTHS の順で adaptive に広げる（近い分岐から試す）。
-    /// 巻き戻し先が今回の制約自身（= 同じ決定の再試行）は、整合クラス空が
-    /// 決定的なので飛ばす。logw の規約は常に「スナップショット値から再出発」
-    /// （wipe をまたぐスナップショットはエポック正規化済み — apply_constraint 参照）
-    fn rejuvenate_one(
-        &mut self,
-        hist: &VecDeque<Snap>,
-        upto: usize,
-        current: Option<&Constraint>,
-        deadline: std::time::Instant,
-    ) -> Option<Repaired> {
-        for &depth in &REJUV_DEPTHS {
-            if depth > hist.len() {
-                break;
-            }
-            let snap = &hist[hist.len() - depth];
-            if snap.cidx == upto {
-                continue;
-            }
-            if upto - snap.cidx > GRAVEYARD_MAX_SEGMENT {
-                break;
-            }
-            for _ in 0..REJUV_TRIES {
-                if std::time::Instant::now() > deadline {
-                    return None;
-                }
-                if let Some(out) = self.replay_segment(snap, hist, upto, current) {
-                    return Some(out);
-                }
-            }
-        }
-        None
-    }
-
     /// depth-major の若返りバッチ: **浅い巻き戻しを全粒子に先に試し、だめなら
     /// 深くする**。1粒子に深い試行を使い切るより、多様な粒子の浅い修復を
     /// 先に広く拾うほうが予算効率がよい（kakunari c42 の教訓: 深い巻き戻しが
@@ -860,7 +827,6 @@ impl Estimator {
                     }
                     let Some(f) = slot else { continue };
                     let hist = &f.3;
-                    let _ = f.4;
                     if depth > hist.len() {
                         continue;
                     }
@@ -1604,8 +1570,16 @@ fn guide_boost_factor(pos: &Position, next: &Position, mv: &ShogiMove, guide: &G
             if r != role || target == to {
                 continue; // target==to は既に lands で処理済み（二重ブースト回避）
             }
-            let before = crate::deduce::min_moves_empty_board(role, mover, from, target, false);
-            let after = crate::deduce::min_moves_empty_board(role, mover, to, target, false);
+            let before = crate::deduce::distance_empty_board(role, mover, from, target, false)
+                .into_iter()
+                .chain(crate::deduce::distance_empty_board(
+                    role, mover, from, target, true,
+                ))
+                .min();
+            let after = crate::deduce::distance_empty_board(role, mover, to, target, false)
+                .into_iter()
+                .chain(crate::deduce::distance_empty_board(role, mover, to, target, true))
+                .min();
             if let (Some(b), Some(a)) = (before, after) {
                 if a < b {
                     return GUIDE_APPROACH_BOOST;
@@ -2532,7 +2506,10 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5000);
         let mut out = None;
         for _ in 0..20 {
-            out = est.rejuvenate_one(&hist, 4, Some(&current), deadline);
+            let failed = vec![(pre2.clone(), 0, snap_lw, hist.clone(), 0)];
+            let (mut repaired, _) =
+                est.rejuvenate_batch(failed, 4, Some(&current), 1, deadline);
+            out = repaired.pop();
             if out.is_some() {
                 break;
             }

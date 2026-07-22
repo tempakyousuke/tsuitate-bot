@@ -68,10 +68,26 @@ fn print_board(pos: &Position) {
     }
 }
 
+fn usage() -> &'static str {
+    "usage: cargo run --bin dump_position -- <moves.json> [upto]"
+}
+
+fn exit_usage(msg: &str) -> ! {
+    eprintln!("{msg}");
+    eprintln!("{}", usage());
+    std::process::exit(1);
+}
+
 fn main() {
-    let args: Vec<String> = env::args().collect();
-    let path = &args[1];
-    let upto: usize = args.get(2).map(|s| s.parse().unwrap()).unwrap_or(usize::MAX);
+    let args: Vec<String> = env::args().skip(1).collect();
+    if args.is_empty() {
+        exit_usage("引数が不足しています");
+    }
+    let path = &args[0];
+    let upto: usize = args
+        .get(1)
+        .map(|s| s.parse().unwrap_or_else(|_| exit_usage(&format!("upto を数値として読めません: {s}"))))
+        .unwrap_or(usize::MAX);
     let content = fs::read_to_string(path).unwrap();
     let v: serde_json::Value = serde_json::from_str(&content).unwrap();
     let moves = v["moves"].as_array().unwrap();

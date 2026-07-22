@@ -17,7 +17,7 @@ use tsuitate_bot::observation::{Observation, ObservationLog};
 use tsuitate_bot::protocol::{Color, Role};
 use tsuitate_bot::shogi::{Position, ShogiMove, parse_usi, unpromote_role};
 
-fn resolve_foul(pos: &Position, side: Color, f: &RawFoul) -> String {
+fn resolve_foul(pos: &Position, f: &RawFoul) -> String {
     match f {
         RawFoul::Drop { role, to } => {
             tsuitate_bot::board::make_usi_drop(*role, *to).expect("打てない駒種の反則試行")
@@ -41,7 +41,7 @@ fn replay_to(path: &str, ply: usize) -> (Position, ObservationLog, Color) {
     for ply_data in &kifu.plies[..ply] {
         let side = pos.turn();
         for f in &ply_data.fouls {
-            let usi = resolve_foul(&pos, side, f);
+            let usi = resolve_foul(&pos, f);
             let mv = parse_usi(&usi).expect("反則USI解析失敗");
             let log = if side == Color::Sente { &mut log_sente } else { &mut log_gote };
             log.record(Observation::MyFoul {

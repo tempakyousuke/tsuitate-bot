@@ -57,7 +57,7 @@ pub fn parse_usi(usi: &str) -> Option<ShogiMove> {
             b'R' => Role::Rook,
             _ => return None,
         };
-        let to = parse_usi_square(&usi[2..4])?;
+        let to = parse_usi_square(usi.get(2..4)?)?;
         return Some(ShogiMove::Drop { role, to });
     }
     if bytes.len() != 4 && bytes.len() != 5 {
@@ -68,8 +68,8 @@ pub fn parse_usi(usi: &str) -> Option<ShogiMove> {
         return None;
     }
     Some(ShogiMove::Board {
-        from: parse_usi_square(&usi[0..2])?,
-        to: parse_usi_square(&usi[2..4])?,
+        from: parse_usi_square(usi.get(0..2)?)?,
+        to: parse_usi_square(usi.get(2..4)?)?,
         promote,
     })
 }
@@ -649,6 +649,7 @@ mod tests {
         }
         assert_eq!(parse_usi("K*5e"), None); // 玉は打てない
         assert_eq!(parse_usi("7g7f#"), None);
+        assert_eq!(parse_usi("あa"), None); // UTF-8境界でないスライスを作らない
     }
 
     #[test]
