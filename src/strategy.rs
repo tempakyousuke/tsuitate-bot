@@ -80,6 +80,9 @@ pub fn make_seeded(name: &str, seed: u64) -> Option<Box<dyn Strategy>> {
         "estimator_v8" => Some(Box::new(
             crate::frozen::estimator_v8::EstimatorV8::with_seed(seed),
         )),
+        "estimator_v9" => Some(Box::new(
+            crate::frozen::estimator_v9::EstimatorV9::with_seed(seed),
+        )),
         _ => make(name),
     }
 }
@@ -101,6 +104,7 @@ pub fn make(name: &str) -> Option<Box<dyn Strategy>> {
         "estimator_v6" => Some(Box::new(crate::frozen::estimator_v6::EstimatorV6::new())),
         "estimator_v7" => Some(Box::new(crate::frozen::estimator_v7::EstimatorV7::new())),
         "estimator_v8" => Some(Box::new(crate::frozen::estimator_v8::EstimatorV8::new())),
+        "estimator_v9" => Some(Box::new(crate::frozen::estimator_v9::EstimatorV9::new())),
         _ => None,
     }
 }
@@ -2725,6 +2729,7 @@ pub(crate) mod tests {
         assert!(make("estimator_v6").is_some());
         assert!(make("estimator_v7").is_some());
         assert!(make("estimator_v8").is_some());
+        assert!(make("estimator_v9").is_some());
         // 破棄済みの凍結版は登録されていない
         assert!(make("estimator_v5").is_none());
     }

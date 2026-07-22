@@ -163,8 +163,17 @@
   occupiesガイド・home_lance_move/knight_bait_w（相手手事前分布の駒種特化）・
   王手中の駒捕獲候補へのp_legal下限（`CheckSolver::captures_checker`、
   kakutori.kifの捕獲見逃しへの対応。今回の主変更）
-  （2026-07-21 凍結。100局実測で vs v6 71.3%±8.8% / vs v7 62.5%±9.3%。
-  v6/v7 との相対的な立ち位置の全面検証はまだ）。
+  （2026-07-21 凍結。100局実測で vs v6 71.3%±8.8% / vs v7 62.5%±9.3%）、
+  `estimator_v9` = NN段階①-a/①-b: opp_move_weight を23特徴量の1隠れ層MLP
+  （手書きforward pass、`src/opp_move_nn.rs`）へ置き換え。①-a =
+  bot自己対局データでのNN化＋反則回数特徴量 opp_foul_count_this_turn の
+  ライブ配線、①-b = 駒種one-hot・成駒・移動距離・from_home（初期配置マス
+  からの移動 = home_lance の全駒種一般化。別立て-1.3加点は廃止）。
+  学習データは新定石1536局（定石更新は凍結版側の序盤分布も変えるため
+  データ再生成が必要、が教訓）。kakutori 注目手2/10→10/10・
+  真の王手駒信念1.0%→2.7%
+  （2026-07-22 凍結。200局×3基準で確定、vs v6 78.0%±5.7 /
+  vs v7 62.3%±6.7 / vs v8 57.0%±6.9 — 全凍結版に有意勝ち越し）。
   凍結後は編集しない。改善が確定したらその時点のコピーを `estimator_vN` として追加登録する。
   明らかに弱くなった古い凍結版は破棄してよい（v1 は王手放置癖、v2〜v5 は v7 凍結時に
   全て80%超で上回ったため 2026-07-18 破棄。成績は git 履歴と tuning/README.md に残る）
@@ -176,7 +185,26 @@
   （設置は tsuitate リポジトリの `scripts/server/setup/07-bot.sh`、更新は
   `npm run deploy -- --bot`）
 
-## NN方向（進行中、strategy.rs本体へは未統合）
+## NN方向
+
+**段階①（opp_move_weightのNN化）は本番統合済み**（estimator_v9、2026-07-22
+凍結）。`src/opp_move_features.rs`（23特徴量の共有定義。学習エクスポートと
+estimator推論の両方がここを参照）・`src/opp_move_nn.rs`（重み定数+手書き
+forward pass。1手あたり最大10万回超のホットパスなのでONNX等は使わない）・
+`bin/export_opp_move_data`（アリーナ記録→候補集合CSV）。学習は tsuitate-nn の
+`train_opp_move.py`（候補集合内softmax条件付きNLL、`--feature-set base|piece`で
+アブレーション）、重み書き出しは `export_opp_move_weights.py`。
+再学習の手順: 記録用アリーナ（例 500局×3基準）→ artifact回収 →
+`export_opp_move_data` → 学習（**4シードで頑健性確認**）→ export → cargo test
+（numpyクロスチェックの期待値も再生成）→ `scenario suite`＋`kakutori diag` →
+200局ガントレット。**定石（joseki.json）を更新したら学習データも再生成する
+こと**（定石は実行時読み込みで凍結版＝教師側の序盤分布も変わる。①-bの
+from_home等は序盤感度が高い）。NN出力のclamp(-15,15)は分布外入力への
+安全弁なので外さない。次の候補: 逆方向反則特徴量 my_foul_count_last_turn
+（v9を含む自己対局データが必要=ブートストラップ依存が解消済み）、段階②
+（信念ネット）。
+
+## NN方向フェーズ1: valueネット（一区切り、strategy.rs本体へは未統合）
 
 `strategy.rs` の手作りヒューリスティックが「堅実な手 vs 派手だが危険な手」を
 正しく評価できない事例（33手目5八四金、上記参照）を受け、以前見送っていた
