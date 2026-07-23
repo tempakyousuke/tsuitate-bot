@@ -173,18 +173,26 @@ pub fn choose_move(store: &SessionStore, req: &BotTurnRequest) -> Result<String,
     let arc = store.session_for(&req.game_id, my_color)?;
     let mut session = arc.lock().expect("session mutex poisoned");
 
+    let mut cold_start = false;
     if advance(&mut session, &req.positions, req.ply).is_err() {
         // 想定外の食い違い（プロセス再起動直後でキャッシュが空、ply欠落等）は
         // セッションを作り直して0手目からやり直す
         *session = GameSession::new(&store.strategy_name, my_color)
             .ok_or_else(|| SessionError::UnknownStrategy(store.strategy_name.clone()))?;
         advance(&mut session, &req.positions, req.ply)?;
+        cold_start = true;
     }
 
     let view = build_player_view(&session, req)?;
     let foul_tried = collect_foul_tried(&session.log, session.next_move_number);
 
     let GameSession { strategy, log, .. } = &mut *session;
+    if cold_start {
+        // 一括 update だと長い履歴で粒子が完全枯渇するため、自分の手番ごとに
+        // 逐次 prewarm してから choose する（bin/scenario.rs::prewarm_strategy
+        // と同じ手当て。通常の増分パスは choose 自体の内部 update で十分）
+        strategy::prewarm_strategy(&mut **strategy, &view, log);
+    }
     let chosen = strategy.choose(&view, log, &foul_tried);
     let usi = chosen.ok_or(SessionError::NoLegalMove)?;
 

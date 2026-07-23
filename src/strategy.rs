@@ -49,6 +49,21 @@ pub trait Strategy {
     fn prewarm(&mut self, _view: &PlayerView, _log: &ObservationLog) {}
 }
 
+/// 蓄積済みの観測ログを「自分の手番ごとの逐次 update」で戦略に温めさせる。
+/// 一括 update だとリプレイ予算が1回分しか与えられず、長い履歴では粒子が
+/// 完全枯渇する（kakunari の69手を一括で食わせるとユニーク粒子0になる）。
+/// bin/scenario.rs（棋譜の途中局面再現）と webhook_session.rs
+/// （プロセス再起動後などのコールドスタート復元）の両方が使う共通部品
+pub fn prewarm_strategy(strat: &mut dyn Strategy, view: &PlayerView, full: &ObservationLog) {
+    let mut running = ObservationLog::default();
+    for e in full.events() {
+        if matches!(e, Observation::MyMove { .. } | Observation::MyFoul { .. }) {
+            strat.prewarm(view, &running);
+        }
+        running.record(e.clone());
+    }
+}
+
 pub const DEFAULT_STRATEGY: &str = "estimator";
 
 /// 戦略名からインスタンスを作る。未知の名前は None。

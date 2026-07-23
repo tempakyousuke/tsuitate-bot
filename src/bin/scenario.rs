@@ -244,23 +244,6 @@ fn replay(kifu: &Kifu, upto: usize) -> Replayed {
     }
 }
 
-/// 実対局と同じ「自分の手番ごとの逐次 update」を再現して戦略の推定器を温める。
-/// 一括 update だとリプレイ予算が1回分しか与えられず、長い棋譜では粒子が
-/// 完全枯渇する（kakunari の69手を一括で食わせるとユニーク粒子0になる）
-fn prewarm_strategy(
-    strat: &mut Box<dyn tsuitate_bot::strategy::Strategy + Send>,
-    view: &PlayerView,
-    full: &ObservationLog,
-) {
-    let mut running = ObservationLog::default();
-    for e in full.events() {
-        if matches!(e, Observation::MyMove { .. } | Observation::MyFoul { .. }) {
-            strat.prewarm(view, &running);
-        }
-        running.record(e.clone());
-    }
-}
-
 fn clone_log(log: &ObservationLog) -> ObservationLog {
     let mut out = ObservationLog::default();
     for e in log.events() {
@@ -335,7 +318,7 @@ fn choice_trials(
     for seed in 0..trials {
         let mut strat = strategy::make_seeded(name, seed).expect("未知の戦略名");
         let mut log = clone_log(&rep.logs[side_idx(side)]);
-        prewarm_strategy(&mut strat, &make_view(&rep.pos, side, &rep.fouls), &log);
+        strategy::prewarm_strategy(&mut *strat, &make_view(&rep.pos, side, &rep.fouls), &log);
         let mut foul_tried: HashSet<String> = HashSet::new();
         let mut fouls = rep.fouls;
         let mut foul_seq: Vec<String> = vec![];
@@ -728,7 +711,7 @@ fn continue_games(sc: &Scenario, rep: &Replayed, games: u64, name_me: &str, name
         let mut logs = [clone_log(&rep.logs[0]), clone_log(&rep.logs[1])];
         for (i, strat) in strats.iter_mut().enumerate() {
             let color = if i == 0 { Color::Sente } else { Color::Gote };
-            prewarm_strategy(strat, &make_view(&rep.pos, color, &rep.fouls), &logs[i]);
+            strategy::prewarm_strategy(&mut **strat, &make_view(&rep.pos, color, &rep.fouls), &logs[i]);
         }
         let mut fouls = rep.fouls;
         let mut foul_tried: [HashSet<String>; 2] = [HashSet::new(), HashSet::new()];
