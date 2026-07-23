@@ -56,6 +56,14 @@ fn export_game(game_id: u64, bot: Color, end: &GameEndPayload, buf: &mut Vec<Str
                 .iter()
                 .filter(|f| f.by_color == human && f.move_number == pos.move_number())
                 .count() as u32;
+            // 直前のbot手番でbotが試みた反則の回数（my_foul_count_last_turn）。
+            // 反則宣言（回数のみ）は人間側もリアルタイムに観測できる。
+            // 反則は手番を消費しないので、botの直前の決定点は move_number-1
+            let my_foul_count_last_turn = end
+                .foul_attempts
+                .iter()
+                .filter(|f| f.by_color == bot && f.move_number + 1 == pos.move_number())
+                .count() as u32;
             let chosen_to = to_square(&mv);
             let chosen_capture = pos
                 .piece_at(chosen_to)
@@ -88,6 +96,7 @@ fn export_game(game_id: u64, bot: Color, end: &GameEndPayload, buf: &mut Vec<Str
                     &human_lost_at,
                     &homes,
                     foul_count_this_turn,
+                    my_foul_count_last_turn,
                 );
                 let feats: Vec<String> = f.iter().map(|x| x.to_string()).collect();
                 rows.push(format!(

@@ -12,7 +12,7 @@ use crate::board::Coord;
 use crate::protocol::{Color, Role};
 use crate::shogi::{Position, ShogiMove};
 
-pub const OPP_MOVE_FEATURES: usize = 23;
+pub const OPP_MOVE_FEATURES: usize = 24;
 
 pub const FEATURE_NAMES: [&str; OPP_MOVE_FEATURES] = [
     "advance",          // 前進量（段）
@@ -50,6 +50,13 @@ pub const FEATURE_NAMES: [&str; OPP_MOVE_FEATURES] = [
     "moved_promoted", // 動かす駒が成駒（one-hotは成る前の駒種側に立つ）
     "move_dist",      // 移動距離（チェビシェフ。打ちは0）
     "from_home",      // その駒種の初期配置マスからの移動（未動駒の近似）
+    "my_foul_count_last_turn", // 直前の相手（=このモデルから見た敵側）手番で
+    // 相手が試みた反則の回数。opp_foul_count_this_turn の逆方向版
+    // （2026-07-23）: 敵の反則宣言は指し手側も観測できる（回数のみ・中身は
+    // 不明）。敵が反則を重ねた直後は「敵はこちらの駒配置を読み違えている」
+    // シグナルであり、突撃・様子見などの方針変化が学習できるはず。
+    // v9凍結（反則に反応する教師の自己対局データが取れるようになった）で
+    // ブートストラップ依存が解消されたため追加
 ];
 
 /// 駒種特化ブロック（末尾10特徴量）。one-hotは成る前の駒種（unpromote）で
@@ -214,7 +221,9 @@ pub fn home_squares(pos: &Position, bot: Color, bot_touched: &HashSet<Coord>) ->
 /// `known_squares`は位置が既知の相手駒（自分の駒が死んだマス）、
 /// `homes`は初期位置から動いていない自分側の駒のマス、
 /// `foul_count_this_turn`はこの手番で相手がここまでに試みた反則の回数
-/// （候補手によらずこの手番内で共通の値。全候補行に同じ値が入る）
+/// （候補手によらずこの手番内で共通の値。全候補行に同じ値が入る）、
+/// `my_foul_count_last_turn`は直前の敵側（moverの相手）手番での反則回数
+/// （同じく全候補行で共通）
 pub fn opp_move_features(
     pos: &Position,
     next: &Position,
@@ -223,6 +232,7 @@ pub fn opp_move_features(
     known_squares: &HashSet<Coord>,
     homes: &HashSet<Coord>,
     foul_count_this_turn: u32,
+    my_foul_count_last_turn: u32,
 ) -> [f64; OPP_MOVE_FEATURES] {
     let (is_king, flee) = match *mv {
         ShogiMove::Board { from, to, .. } => {
@@ -260,6 +270,7 @@ pub fn opp_move_features(
         pt[7],
         pt[8],
         pt[9],
+        f64::from(my_foul_count_last_turn),
     ]
 }
 

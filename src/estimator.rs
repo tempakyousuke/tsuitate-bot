@@ -207,11 +207,15 @@ enum Constraint {
     /// 相手の着手（captured_at: 自駒が取られたマス、gives_check: 自玉への王手宣言、
     /// foul_count: この手番で相手がこの着手に至るまでに試みた反則の回数。
     /// 反則の中身は不明だが回数は Observation::OpponentFoul でリアルタイムに
-    /// 観測できる。opp_move_weight の特徴量として使う）
+    /// 観測できる。opp_move_weight の特徴量として使う。
+    /// my_foul_count: 直前の自分手番で自分が試みた反則の回数。相手側も
+    /// 反則宣言（回数のみ）を観測しているので、相手の指し手はこれに
+    /// 反応しうる = my_foul_count_last_turn 特徴量の逆方向配線）
     OppMove {
         captured_at: Option<Coord>,
         gives_check: bool,
         foul_count: u32,
+        my_foul_count: u32,
     },
 }
 
@@ -262,6 +266,12 @@ pub struct Estimator {
     /// の累積）。次の Constraint::OppMove が確定した時点でその制約へ焼き込み、
     /// 0へリセットする
     pending_opp_foul_count: u32,
+    /// この手番でここまでに自分が試みた反則の回数（Constraint::MyFoul の累積）。
+    /// 自分の着手（MyMove）確定時に last_my_foul_count へ移して0へ戻す
+    pending_my_foul_count: u32,
+    /// 直前の自分手番で自分が試みた反則の回数。次の Constraint::OppMove へ
+    /// 焼き込む（相手は反則宣言の回数を観測している = my_foul_count_last_turn）
+    last_my_foul_count: u32,
     /// 観測との矛盾（リプレイでも整合局面を作れない等）で信頼できなくなったら false
     healthy: bool,
     /// 直近の replenish で測った ESS（診断用）
@@ -341,6 +351,8 @@ impl Estimator {
             my_touched_sq: vec![],
             cursor: 0,
             pending_opp_foul_count: 0,
+            pending_my_foul_count: 0,
+            last_my_foul_count: 0,
             healthy: true,
             last_ess: target as f64,
             resamples: 0,
@@ -466,8 +478,14 @@ impl Estimator {
                     self.in_check = *gives_check;
                     self.pending_opp_foul_count = 0;
                 }
-                Constraint::MyMove { .. } => self.in_check = false,
-                Constraint::MyFoul { .. } => {}
+                Constraint::MyMove { .. } => {
+                    self.in_check = false;
+                    // 自分手番の反則回数を確定（次の OppMove が
+                    // my_foul_count_last_turn として焼き込む）
+                    self.last_my_foul_count = self.pending_my_foul_count;
+                    self.pending_my_foul_count = 0;
+                }
+                Constraint::MyFoul { .. } => self.pending_my_foul_count += 1,
             }
             if let Constraint::MyMove { mv, captured, .. } = &constraint {
                 let idx = self.constraints.len();
@@ -531,6 +549,7 @@ impl Estimator {
                         captured_at,
                         gives_check,
                         foul_count: self.pending_opp_foul_count,
+                        my_foul_count: self.last_my_foul_count,
                     }),
                     consumed,
                 )
@@ -598,12 +617,14 @@ impl Estimator {
                     captured_at,
                     gives_check,
                     foul_count,
+                    my_foul_count,
                 } => sample_opp_move(
                     &mut pos,
                     my_color,
                     *captured_at,
                     Some(*gives_check),
                     *foul_count,
+                    *my_foul_count,
                     &self.my_capture_sq,
                     &self.my_touched_sq,
                     &Guide::default(),
@@ -786,6 +807,7 @@ impl Estimator {
             Constraint::OppMove {
                 captured_at,
                 foul_count,
+                my_foul_count,
                 ..
             } => sample_opp_move(
                 pos,
@@ -793,6 +815,7 @@ impl Estimator {
                 *captured_at,
                 None,
                 *foul_count,
+                *my_foul_count,
                 &self.my_capture_sq,
                 &self.my_touched_sq,
                 &Guide::default(),
@@ -892,6 +915,7 @@ impl Estimator {
                     captured_at,
                     gives_check,
                     foul_count,
+                    my_foul_count,
                 } => {
                     if i > snap.cidx {
                         if new_hist.len() == REJUV_SNAPSHOTS {
@@ -914,6 +938,7 @@ impl Estimator {
                         *captured_at,
                         Some(*gives_check),
                         *foul_count,
+                        *my_foul_count,
                         &self.my_capture_sq[..k],
                         &self.my_touched_sq[..t],
                         &guide,
@@ -1249,6 +1274,7 @@ impl Estimator {
                     captured_at,
                     gives_check,
                     foul_count,
+                    my_foul_count,
                 } => {
                     // バックトラックで戻ってきた再訪なら積み直さない
                     let is_retry = stack.last().is_some_and(|(j, _, _, _)| *j == i);
@@ -1265,6 +1291,7 @@ impl Estimator {
                         *captured_at,
                         Some(*gives_check),
                         *foul_count,
+                        *my_foul_count,
                         &self.my_capture_sq[..k],
                         &self.my_touched_sq[..t],
                         &guide,
@@ -1442,12 +1469,14 @@ fn newly_threatens(pos: &Position, next: &Position, mv: &ShogiMove, targets: &[C
 /// - guide: 制約後読みガイド（若返り・リプレイ用）。該当手を GUIDE_BOOST 倍した
 ///   提案分布から選ぶ。マスクはしない（成功しうる素の経路を提案の台から消すと
 ///   補正が定義できない）
+#[allow(clippy::too_many_arguments)]
 fn sample_opp_move(
     pos: &mut Position,
     my_color: Color,
     captured_at: Option<Coord>,
     gives_check: Option<bool>,
     foul_count_this_turn: u32,
+    my_foul_count_last_turn: u32,
     known_squares: &[Coord],
     my_touched: &[Coord],
     guide: &Guide,
@@ -1515,6 +1544,7 @@ fn sample_opp_move(
             deep_unsupported(&next, &mv, opp),
             hangs_on_landing(pos, &next, &mv, opp),
             foul_count_this_turn,
+            my_foul_count_last_turn,
         );
         total_mass += w;
         if consistent {
@@ -1604,21 +1634,26 @@ pub fn predict_opp_reply<R: Rng>(
     my_color: Color,
     known_squares: &[Coord],
     my_touched: &[Coord],
+    my_foul_count_this_turn: u32,
     rng: &mut R,
 ) -> Option<ShogiMove> {
     weighted_choice(
-        &opp_reply_weights(pos, my_color, known_squares, my_touched),
+        &opp_reply_weights(pos, my_color, known_squares, my_touched, my_foul_count_this_turn),
         rng,
     )
 }
 
 /// 相手の全合法応手と方策重み（事前分布モデル＋露見マスの取り返しブースト）。
-/// 2手読みの期待値評価用: サンプルせず重み付き平均を取れる
+/// 2手読みの期待値評価用: サンプルせず重み付き平均を取れる。
+/// my_foul_count_this_turn: この手番でここまでに自分が試みた反則の回数
+/// （相手は応手時にこれを反則宣言として観測している = 応手予測の
+/// my_foul_count_last_turn 特徴量）
 pub fn opp_reply_weights(
     pos: &Position,
     my_color: Color,
     known_squares: &[Coord],
     my_touched: &[Coord],
+    my_foul_count_this_turn: u32,
 ) -> Vec<(ShogiMove, f64)> {
     let opp = my_color.other();
     if pos.turn() != opp {
@@ -1649,8 +1684,10 @@ pub fn opp_reply_weights(
             }
             ShogiMove::Drop { .. } => (false, false),
         };
-        // 2手読み予測はまだ起きていない相手の応手を当てるので、この手番の
-        // 反則回数は未知（観測なし）。既定値0（実データの最頻値）を使う
+        // 2手読み予測はまだ起きていない相手の応手を当てるので、相手手番の
+        // 反則回数は未知（観測なし）。既定値0（実データの最頻値）を使う。
+        // 一方こちらの反則回数（my_foul_count_this_turn）は既知: 相手は
+        // 応手時にこの手番の反則宣言を観測済みのはず
         let mut w = opp_move_weight(
             pos,
             opp,
@@ -1663,6 +1700,7 @@ pub fn opp_reply_weights(
             deep_unsupported(&next, &mv, opp),
             hangs_on_landing(pos, &next, &mv, opp),
             0,
+            my_foul_count_this_turn,
         );
         if let ShogiMove::Board { to, .. } = mv {
             let captures_mine = pos.piece_at(to).is_some_and(|p| p.color == my_color);
@@ -1762,6 +1800,7 @@ fn opp_move_weight(
     deep_unsup: bool,
     hang: bool,
     foul_count_this_turn: u32,
+    my_foul_count_last_turn: u32,
 ) -> f64 {
     let (advance, is_drop, promotes) = match *mv {
         ShogiMove::Board { from, to, promote } => {
@@ -1798,6 +1837,7 @@ fn opp_move_weight(
         pt[7],
         pt[8],
         pt[9],
+        f64::from(my_foul_count_last_turn),
     ];
     // クランプ: NNは訓練データの分布から外れた入力（リプレイの仮説探索中に
     // 現れる、実戦ではまれな特徴量の組み合わせ）に対して極端なlogitを出しうる
@@ -2174,12 +2214,12 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(3);
         let mut pos = Position::initial();
         pos.play_unchecked(&parse_usi("7g7f").unwrap());
-        let reply = predict_opp_reply(&pos, Color::Sente, &[], &[], &mut rng)
+        let reply = predict_opp_reply(&pos, Color::Sente, &[], &[], 0, &mut rng)
             .expect("初期局面の相手に応手がないはずはない");
         assert!(pos.is_legal(&reply));
         // 手番が自分側の局面では予測しない
         let initial = Position::initial();
-        assert!(predict_opp_reply(&initial, Color::Sente, &[], &[], &mut rng).is_none());
+        assert!(predict_opp_reply(&initial, Color::Sente, &[], &[], 0, &mut rng).is_none());
     }
 
     #[test]
@@ -2192,7 +2232,7 @@ mod tests {
         }
         let recapture = parse_usi("3a2b").unwrap();
         let weight_of = |known: &[Coord]| -> f64 {
-            opp_reply_weights(&pos, Color::Sente, known, &[])
+            opp_reply_weights(&pos, Color::Sente, known, &[], 0)
                 .iter()
                 .find(|(mv, _)| *mv == recapture)
                 .map(|(_, w)| *w)
@@ -2221,7 +2261,7 @@ mod tests {
             let n = 400;
             let mut hits = 0;
             for _ in 0..n {
-                if predict_opp_reply(&pos, Color::Sente, known, &[], &mut rng)
+                if predict_opp_reply(&pos, Color::Sente, known, &[], 0, &mut rng)
                     == Some(recapture)
                 {
                     hits += 1;
@@ -2464,6 +2504,7 @@ mod tests {
             captured_at: None,
             gives_check: false,
             foul_count: 0,
+            my_foul_count: 0,
         });
         est.constraints.push(Constraint::MyMove {
             mv: parse_usi("2f2e").unwrap(),
@@ -2474,6 +2515,7 @@ mod tests {
             captured_at: None,
             gives_check: false,
             foul_count: 0,
+            my_foul_count: 0,
         });
         let current = Constraint::MyMove {
             mv: parse_usi("2e2d").unwrap(),
@@ -2557,6 +2599,7 @@ mod tests {
                 None,
                 Some(false),
                 0,
+                0,
                 &[],
                 &[],
                 &Guide::default(),
@@ -2584,6 +2627,7 @@ mod tests {
                 Color::Sente,
                 None,
                 Some(false),
+                0,
                 0,
                 &[],
                 &[],
@@ -2636,7 +2680,7 @@ mod tests {
         );
     }
 
-    /// opp_move_weight が組み立てる23特徴量と opp_move_features::opp_move_features
+    /// opp_move_weight が組み立てる24特徴量と opp_move_features::opp_move_features
     /// が同じ局面・同じ手に対して一致することを固定する（codexレビュー指摘、
     /// 2026-07-21: estimator.rs 側は hot path 用に private helper を複製したまま
     /// なので、将来どちらか一方だけ変更されてズレるのを検出する）
@@ -2682,9 +2726,11 @@ mod tests {
             };
             let deep_unsup = deep_unsupported(&next, &mv, mover);
             let hang = hangs_on_landing(&pos, &next, &mv, mover);
-            // opp_foul_count_this_turn（13番目）はConstraint::OppMoveから素通しされる
-            // だけの値なので、非ゼロ値（3）で両辺の一致も確認する
+            // opp_foul_count_this_turn（13番目）と my_foul_count_last_turn
+            // （24番目）はConstraint::OppMoveから素通しされるだけの値なので、
+            // 非ゼロ値（3, 2）で両辺の一致も確認する
             let foul_count_this_turn = 3u32;
+            let my_foul_count_last_turn = 2u32;
             let pt = opp_move_features::piece_type_features(&pos, &mv, mover);
             let est_features = [
                 advance,
@@ -2710,6 +2756,7 @@ mod tests {
                 pt[7],
                 pt[8],
                 pt[9],
+                f64::from(my_foul_count_last_turn),
             ];
 
             let shared_features = opp_move_features::opp_move_features(
@@ -2720,6 +2767,7 @@ mod tests {
                 &known_set,
                 &homes_set,
                 foul_count_this_turn,
+                my_foul_count_last_turn,
             );
             assert_eq!(
                 est_features, shared_features,

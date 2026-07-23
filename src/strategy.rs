@@ -910,23 +910,32 @@ impl Strategy for EstimatorStrategy {
         let known = knownness_map(view, log, self.params.home_knownness);
 
         // 2手読み用: 自分が駒を取ったマス（露見）と自分の手が触れたマス
-        // （estimator の my_capture_sq / my_touched_sq と同じ定義）
+        // （estimator の my_capture_sq / my_touched_sq と同じ定義）。
+        // my_fouls_this_turn はこの手番でここまでに自分が試みた反則の回数
+        // （反則リトライ中は >0）。相手は反則宣言の回数を観測しているので、
+        // 応手予測の my_foul_count_last_turn 特徴量として渡す
         let mut my_capture_squares: Vec<Coord> = vec![];
         let mut my_touched_squares: Vec<Coord> = vec![];
+        let mut my_fouls_this_turn: u32 = 0;
         for e in log.events() {
-            if let Observation::MyMove { usi, captured, .. } = e {
-                if let Some(mv) = parse_usi(usi) {
-                    let to = match mv {
-                        ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
-                    };
-                    if captured.is_some() {
-                        my_capture_squares.push(to);
+            match e {
+                Observation::MyMove { usi, captured, .. } => {
+                    my_fouls_this_turn = 0;
+                    if let Some(mv) = parse_usi(usi) {
+                        let to = match mv {
+                            ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+                        };
+                        if captured.is_some() {
+                            my_capture_squares.push(to);
+                        }
+                        if let ShogiMove::Board { from, .. } = mv {
+                            my_touched_squares.push(from);
+                        }
+                        my_touched_squares.push(to);
                     }
-                    if let ShogiMove::Board { from, .. } = mv {
-                        my_touched_squares.push(from);
-                    }
-                    my_touched_squares.push(to);
                 }
+                Observation::MyFoul { .. } => my_fouls_this_turn += 1,
+                _ => {}
             }
         }
 
@@ -1063,6 +1072,7 @@ impl Strategy for EstimatorStrategy {
                     &known,
                     &my_capture_squares,
                     &my_touched_squares,
+                    my_fouls_this_turn,
                     &params,
                     budget,
                     &mut *rng,
@@ -1983,6 +1993,7 @@ fn depth2_delta(
     known: &HashMap<Coord, f64>,
     my_captures: &[Coord],
     my_touched: &[Coord],
+    my_fouls_this_turn: u32,
     params: &EvalParams,
     budget: SearchBudget,
     rng: &mut impl rand::Rng,
@@ -2023,7 +2034,8 @@ fn depth2_delta(
         } else {
             my_captures
         };
-        let replies = opp_reply_weights(&next, me, known_for_reply, my_touched);
+        let replies =
+            opp_reply_weights(&next, me, known_for_reply, my_touched, my_fouls_this_turn);
         let total_rw: f64 = replies.iter().map(|(_, rw)| rw).sum();
         if replies.is_empty() || total_rw <= 0.0 {
             continue; // 応手なし（詰み/ステイルメイト）は stage1 のボーナス側で評価済み
