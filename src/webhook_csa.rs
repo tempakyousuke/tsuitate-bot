@@ -104,6 +104,10 @@ pub enum CsaMoveKind {
     Board {
         from: Coord,
         to: Coord,
+        /// 着手末尾の駒種2文字が表す着手後の駒種（成っていれば成駒コード）。
+        /// `wasPromotion` が欠落した反則エントリでも、着手前の駒種と比較すれば
+        /// 成りだったかを復元できる（webhook_session::advance 参照）
+        role_after: Role,
     },
 }
 
@@ -149,9 +153,14 @@ pub fn parse_csa_move(csa: &str) -> Option<CsaMove> {
         });
     }
     let from = parse_csa_square(from_str)?;
+    let role_after = csa2_to_role(code_str)?;
     Some(CsaMove {
         mover,
-        kind: CsaMoveKind::Board { from, to },
+        kind: CsaMoveKind::Board {
+            from,
+            to,
+            role_after,
+        },
     })
 }
 
@@ -208,6 +217,21 @@ mod tests {
             CsaMoveKind::Board {
                 from: Coord { file: 7, rank: 7 },
                 to: Coord { file: 7, rank: 6 },
+                role_after: Role::Pawn,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_own_board_promotion() {
+        let mv = parse_csa_move("+8822UM").unwrap();
+        assert_eq!(mv.mover, Color::Sente);
+        assert_eq!(
+            mv.kind,
+            CsaMoveKind::Board {
+                from: Coord { file: 8, rank: 8 },
+                to: Coord { file: 2, rank: 2 },
+                role_after: Role::Horse,
             }
         );
     }

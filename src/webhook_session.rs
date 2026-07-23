@@ -21,7 +21,7 @@ use crate::board::{make_usi_drop, make_usi_move, make_usi_square};
 use crate::model::GameModel;
 use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{ClockState, Color, FoulCounts, GameStatus, PlayerView};
-use crate::shogi::ShogiMove;
+use crate::shogi::{ShogiMove, promote_role};
 use crate::strategy::{self, Strategy};
 use crate::webhook_csa::{CsaMoveKind, parse_capture_letter, parse_csa_move, usi_move_to_csa};
 use crate::webhook_protocol::{
@@ -220,7 +220,8 @@ pub fn choose_move(store: &SessionStore, req: &BotTurnRequest) -> Result<String,
     }
     let view = build_player_view(&session, req)?;
     let mut foul_tried = collect_foul_tried(&session.log, session.next_move_number);
-    exclude_moves_on_known_opponent(&session.log, &view, &mut foul_tried);
+    let mut deduced_illegal = HashSet::new();
+    exclude_moves_on_known_opponent(&session.log, &view, &mut deduced_illegal);
 
     let GameSession { strategy, log, .. } = &mut *session;
     if cold_start {
@@ -238,7 +239,13 @@ pub fn choose_move(store: &SessionStore, req: &BotTurnRequest) -> Result<String,
             Some(Duration::from_millis(budget_ms)),
         );
     }
-    let chosen = strategy.choose(&view, log, &foul_tried);
+    let chosen = choose_avoiding_deduced_illegal(
+        &mut **strategy,
+        &view,
+        log,
+        &mut foul_tried,
+        &deduced_illegal,
+    );
     let usi = chosen.ok_or(SessionError::NoLegalMove)?;
 
     let model = &session.model;
@@ -268,6 +275,40 @@ pub fn choose_move(store: &SessionStore, req: &BotTurnRequest) -> Result<String,
     Ok(csa)
 }
 
+/// `Strategy::choose` に渡す `foul_tried` は、王手中は `CheckSolver` へも
+/// 「実際に試みて反則になった手」という証拠としてそのまま流れ込む（凍結版
+/// 含め全戦略共通の規約で、trait signature を変えない限り経路を分けられない）。
+/// `exclude_moves_on_known_opponent` の演繹的除外（占有マスへの打ち・
+/// そこを飛び越える長距離移動）を無条件に `foul_tried` へ混ぜると、実際には
+/// 一度も試していない手が「反則だった」という誤った証拠として扱われ、
+/// 無関係な王手駒仮説を誤って減衰させかねない
+/// （占有マスの駒が王手駒仮説と紛らわしく `check.rs` の `base` から一時的に
+/// 取り除かれるケースで顕在化する）。
+///
+/// そのため演繹的除外は事前に `foul_tried` へ混ぜず、戦略が実際にそれを
+/// 選んだ場合だけ事後的に足して選び直させる。選ばれなかった除外候補は
+/// 一切証拠として扱わないため、汚染は「戦略が現に選ぼうとした手」だけに
+/// 限定される（サーバーへ反則を1回無駄撃ちする代わりに、ローカルで
+/// 選び直す点は元の意図のまま）
+fn choose_avoiding_deduced_illegal(
+    strategy: &mut dyn Strategy,
+    view: &PlayerView,
+    log: &ObservationLog,
+    foul_tried: &mut HashSet<String>,
+    deduced_illegal: &HashSet<String>,
+) -> Option<String> {
+    // deduced_illegal に含まれる手は candidate_moves から1つずつ確実に
+    // 除外されていくため、高々 deduced_illegal.len() 回で終端する
+    for _ in 0..=deduced_illegal.len() {
+        let chosen = strategy.choose(view, log, foul_tried)?;
+        if !deduced_illegal.contains(&chosen) {
+            return Some(chosen);
+        }
+        foul_tried.insert(chosen);
+    }
+    None
+}
+
 /// 直近まで消化済みのログの末尾から、今回の手番で自分が試みた反則（まだ
 /// move_number が進んでいないもの）を集める。client.rs の
 /// `state.foul_tried`（move_number が変わったらクリア）と同じ規約
@@ -285,7 +326,9 @@ fn collect_foul_tried(log: &ObservationLog, current_move_number: u32) -> HashSet
 
 /// 相手が直前の正規手で自駒を取った升には、相手の着手駒が確実に存在する。
 /// 打ちは駒を取れないため、その升への駒打ちは粒子推定によらず必ず反則になる。
-/// `foul_tried` と同じ除外集合へ加えることで、凍結版を含む全Strategyへ適用する。
+/// 呼び出し側（`choose_avoiding_deduced_illegal`）が `foul_tried` とは別に
+/// 保持し、戦略が実際にそれを選んだ場合だけ事後的に反則として扱う
+/// （`foul_tried` へ直接混ぜない理由は同関数のコメント参照）。
 ///
 /// それより古い捕獲升は相手駒が既に動いた可能性があるので使わない。自分が
 /// 王手回避を反則にされた場合も盤面は変わらず、直前の捕獲升は引き続き有効。
@@ -511,8 +554,27 @@ fn advance(
 
         let event = if mover == session.my_color {
             let usi = match parsed.kind {
-                CsaMoveKind::Board { from, to } => {
-                    make_usi_move(from, to, entry.was_promotion.unwrap_or(false))
+                CsaMoveKind::Board {
+                    from,
+                    to,
+                    role_after,
+                } => {
+                    // wasPromotion が欠落した場合（反則エントリで観測済み）は、
+                    // 着手前に from にあった自駒の成り先と着手後の駒種2文字を
+                    // 比較して成りを復元する。役に立つ比較ができない場合
+                    // （from に自駒が見つからない、成れない駒種等。存在しない駒を
+                    // 動かす反則など role_after が pre-role と無関係な場合を含む）
+                    // は不成扱い（従来どおり）
+                    let promoted = entry.was_promotion.unwrap_or_else(|| {
+                        session
+                            .model
+                            .my_pieces()
+                            .into_iter()
+                            .find(|p| p.square == make_usi_square(from))
+                            .and_then(|p| promote_role(p.role))
+                            == Some(role_after)
+                    });
+                    make_usi_move(from, to, promoted)
                 }
                 CsaMoveKind::Drop { role, to } => {
                     make_usi_drop(role, to).ok_or_else(|| SessionError::InvalidLastMove {
@@ -809,6 +871,183 @@ mod tests {
         let foul_tried = collect_foul_tried(&session.log, session.next_move_number);
         // "+9998FU" = 99(9i)から98(9h)への移動。USIは筋+段(段はa〜iの文字)表記
         assert!(foul_tried.contains("9i9h"));
+    }
+
+    #[test]
+    fn missing_was_promotion_is_recovered_from_pre_move_role() {
+        let mut session = GameSession::new("heuristic", Color::Sente).unwrap();
+        let mut positions = HashMap::new();
+        positions.insert("0".to_string(), initial_entry());
+        positions.insert(
+            "1".to_string(),
+            PositionEntry {
+                sfen: "ignored".into(),
+                fouls: Some(FoulsField { b: 9, w: 9 }),
+                // 初期配置の角(8h)が2bへ成り、実戦の反則エントリ等で
+                // wasPromotion が欠落したケースを模する
+                last_move: Some("+8822UM".into()),
+                last_info: Some(INFO_NONE),
+                last_capture: None,
+                was_promotion: None,
+            },
+        );
+        advance(&mut session, &positions, 1).unwrap();
+
+        let my_move = session.log.events().iter().find_map(|e| match e {
+            Observation::MyMove { usi, .. } => Some(usi.clone()),
+            _ => None,
+        });
+        assert_eq!(my_move.as_deref(), Some("8h2b+"));
+    }
+
+    #[test]
+    fn missing_was_promotion_defaults_to_unpromoted_when_pre_role_unknown() {
+        // "+9998FU" は存在しない歩を動かす反則で、from(9i)には実際には香車がいる。
+        // role_after(歩)がpromote_role(香車)と一致しないため、成りとは誤認しない
+        // （foul_retry_is_tracked_and_does_not_advance_move_number と同じ入力で、
+        // 成り判定の観点から明示的に確認する回帰テスト）
+        let mut session = GameSession::new("heuristic", Color::Sente).unwrap();
+        let mut positions = HashMap::new();
+        positions.insert("0".to_string(), initial_entry());
+        positions.insert(
+            "1".to_string(),
+            PositionEntry {
+                sfen: "ignored".into(),
+                fouls: Some(FoulsField { b: 8, w: 9 }),
+                last_move: Some("+9998FU".into()),
+                last_info: Some(INFO_FOUL),
+                last_capture: None,
+                was_promotion: None,
+            },
+        );
+        advance(&mut session, &positions, 1).unwrap();
+
+        let foul_usi = session.log.events().iter().find_map(|e| match e {
+            Observation::MyFoul { usi, .. } => Some(usi.clone()),
+            _ => None,
+        });
+        assert_eq!(foul_usi.as_deref(), Some("9i9h"));
+    }
+
+    /// choose_avoiding_deduced_illegal のテスト用スタブ: 呼ばれるたびに
+    /// 事前に用意した候補列から、foul_tried に含まれない最初の1手を返す
+    /// （実戦略の候補生成と同じ「除外されたら次点を返す」挙動だけを模す）。
+    /// 実際に choose() へ渡された foul_tried の内容も記録し、除外された
+    /// 手ぶんだけ余計な情報が渡っていないかを検証できるようにする
+    struct StubStrategy {
+        candidates: Vec<&'static str>,
+        seen_foul_tried: Vec<HashSet<String>>,
+    }
+
+    impl Strategy for StubStrategy {
+        fn choose(
+            &mut self,
+            _view: &PlayerView,
+            _log: &ObservationLog,
+            foul_tried: &HashSet<String>,
+        ) -> Option<String> {
+            self.seen_foul_tried.push(foul_tried.clone());
+            self.candidates
+                .iter()
+                .find(|c| !foul_tried.contains(**c))
+                .map(|c| c.to_string())
+        }
+
+        fn name(&self) -> &'static str {
+            "stub"
+        }
+    }
+
+    fn stub_view() -> PlayerView {
+        PlayerView {
+            game_id: "stub".into(),
+            your_color: Color::Sente,
+            your_pieces: vec![],
+            your_hand: HashMap::new(),
+            turn: Color::Sente,
+            move_number: 1,
+            clocks: ClockState {
+                sente_ms: 0,
+                gote_ms: 0,
+                running: None,
+                server_time: 0,
+            },
+            fouls: FoulCounts {
+                you: 0,
+                opponent: 0,
+            },
+            you_in_check: false,
+            opponent_in_check: false,
+            status: GameStatus::Playing,
+        }
+    }
+
+    #[test]
+    fn choose_avoiding_deduced_illegal_returns_first_pick_when_not_excluded() {
+        let mut strategy = StubStrategy {
+            candidates: vec!["7g7f", "2g2f"],
+            seen_foul_tried: vec![],
+        };
+        let view = stub_view();
+        let log = ObservationLog::default();
+        let mut foul_tried = HashSet::new();
+        let deduced_illegal = HashSet::new();
+
+        let chosen = choose_avoiding_deduced_illegal(
+            &mut strategy,
+            &view,
+            &log,
+            &mut foul_tried,
+            &deduced_illegal,
+        );
+
+        assert_eq!(chosen.as_deref(), Some("7g7f"));
+        assert_eq!(
+            strategy.seen_foul_tried.len(),
+            1,
+            "除外がなければ1回で決まる"
+        );
+        assert!(
+            foul_tried.is_empty(),
+            "選ばれなかった除外候補まで foul_tried を汚してはいけない"
+        );
+    }
+
+    #[test]
+    fn choose_avoiding_deduced_illegal_retries_locally_without_polluting_foul_tried() {
+        // 戦略の一番手("L*5g")が演繹的除外候補と衝突するケース。
+        // ローカルで選び直し、最終的に採用したのは次点("2g2f")だけであるべきで、
+        // 除外候補のうち実際に選ばれなかったもの（"B*5g"）は foul_tried に
+        // 残らない（=王手ソルバーへの偽の反則証拠として混入しない）ことを確認する
+        let mut strategy = StubStrategy {
+            candidates: vec!["L*5g", "2g2f"],
+            seen_foul_tried: vec![],
+        };
+        let view = stub_view();
+        let log = ObservationLog::default();
+        let mut foul_tried = HashSet::new();
+        let mut deduced_illegal = HashSet::new();
+        deduced_illegal.insert("L*5g".to_string());
+        deduced_illegal.insert("B*5g".to_string());
+
+        let chosen = choose_avoiding_deduced_illegal(
+            &mut strategy,
+            &view,
+            &log,
+            &mut foul_tried,
+            &deduced_illegal,
+        );
+
+        assert_eq!(chosen.as_deref(), Some("2g2f"));
+        assert_eq!(strategy.seen_foul_tried.len(), 2, "1回除外されて選び直す");
+        assert!(
+            foul_tried.contains("L*5g"),
+            "実際に選ばれた除外候補は反則として扱う"
+        );
+        assert!(
+            !foul_tried.contains("B*5g"),
+            "選ばれなかった除外候補まで反則扱いしてはいけない"
+        );
     }
 
     #[test]
