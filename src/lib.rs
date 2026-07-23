@@ -23,3 +23,7 @@ pub mod shogi;
 pub mod strategy;
 pub mod value_features;
 pub mod value_nn;
+pub mod webhook_csa;
+pub mod webhook_hmac;
+pub mod webhook_protocol;
+pub mod webhook_session;

@@ -56,7 +56,7 @@ pub const DEFAULT_STRATEGY: &str = "estimator";
 /// シード付きで戦略を作る（SPSA の f+/f− 評価で対局条件を揃える共通乱数法用）。
 /// シード注入に対応していない戦略は通常の make にフォールバックする
 /// （その場合、その戦略側の乱数はペアリングされない）
-pub fn make_seeded(name: &str, seed: u64) -> Option<Box<dyn Strategy>> {
+pub fn make_seeded(name: &str, seed: u64) -> Option<Box<dyn Strategy + Send>> {
     match name {
         "estimator" => Some(Box::new(EstimatorStrategy::with_params_line_seed(
             EvalParams::default(),
@@ -90,7 +90,7 @@ pub fn make_seeded(name: &str, seed: u64) -> Option<Box<dyn Strategy>> {
     }
 }
 
-pub fn make(name: &str) -> Option<Box<dyn Strategy>> {
+pub fn make(name: &str) -> Option<Box<dyn Strategy + Send>> {
     match name {
         "heuristic" => Some(Box::new(Heuristic)),
         "estimator" => Some(Box::new(EstimatorStrategy::new())),

@@ -248,7 +248,7 @@ fn replay(kifu: &Kifu, upto: usize) -> Replayed {
 /// 一括 update だとリプレイ予算が1回分しか与えられず、長い棋譜では粒子が
 /// 完全枯渇する（kakunari の69手を一括で食わせるとユニーク粒子0になる）
 fn prewarm_strategy(
-    strat: &mut Box<dyn tsuitate_bot::strategy::Strategy>,
+    strat: &mut Box<dyn tsuitate_bot::strategy::Strategy + Send>,
     view: &PlayerView,
     full: &ObservationLog,
 ) {
