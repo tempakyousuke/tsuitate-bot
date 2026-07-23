@@ -11,8 +11,13 @@
 //! - WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS（既定 300）: HMAC timestampの許容秒数
 //! - TSUITATE_THINK_BUDGET_MS: strategy.rs 側の思考予算（既定2000ms）。
 //!   登録する「レスポンス時間」より十分小さい値に絞ること
+//! - TSUITATE_WEBHOOK_LOG_DIR（既定 未設定＝無効）: 設定すると、検証済みリクエストの
+//!   生payload・応答・所要時間を `<dir>/<gameId>.jsonl` に1行1リクエストで追記する
+//!   （本体の TSUITATE_RECORD_DIR と同じ「対局ごとに1ファイル」の思想。
+//!   実戦での「弱く感じる」挙動を後から再現・分析するための診断用）
 
-use std::io::Read;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
 use std::process::exit;
 use std::sync::Arc;
 
@@ -45,6 +50,16 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(300);
+    let log_dir = match std::env::var("TSUITATE_WEBHOOK_LOG_DIR") {
+        Ok(v) if !v.is_empty() => match fs::create_dir_all(&v) {
+            Ok(()) => Some(v),
+            Err(e) => {
+                eprintln!("TSUITATE_WEBHOOK_LOG_DIR ({v}) の作成に失敗しました: {e}");
+                exit(1);
+            }
+        },
+        _ => None,
+    };
 
     let server = match Server::http(&bind) {
         Ok(s) => s,
@@ -58,12 +73,23 @@ fn main() {
     let store = Arc::new(SessionStore::new(strategy_name));
     let secret = Arc::new(secret);
     let path = Arc::new(path);
+    let log_dir = Arc::new(log_dir);
 
     for request in server.incoming_requests() {
         let store = store.clone();
         let secret = secret.clone();
         let path = path.clone();
-        std::thread::spawn(move || handle(request, &store, &secret, &path, tolerance_secs));
+        let log_dir = log_dir.clone();
+        std::thread::spawn(move || {
+            handle(
+                request,
+                &store,
+                &secret,
+                &path,
+                tolerance_secs,
+                log_dir.as_deref(),
+            )
+        });
     }
 }
 
@@ -73,6 +99,7 @@ fn handle(
     secret: &str,
     expected_path: &str,
     tolerance_secs: i64,
+    log_dir: Option<&str>,
 ) {
     let mut request = request;
     if *request.method() != Method::Post {
@@ -146,20 +173,56 @@ fn handle(
         }
     };
 
-    match choose_move(store, &payload) {
+    let start = std::time::Instant::now();
+    let result = choose_move(store, &payload);
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+
+    let response_json = match &result {
         Ok(mv) => {
             println!("[{}] ply={} -> {}", payload.game_id, payload.ply, mv);
-            respond(request, 200, &serde_json::json!({ "move": mv }));
+            serde_json::json!({ "move": mv })
         }
         Err(e) => {
             eprintln!("[{}] ply={} エラー: {e}", payload.game_id, payload.ply);
-            let status = e.status_code();
-            respond(
-                request,
-                status,
-                &serde_json::json!({ "error": e.to_string() }),
-            );
+            serde_json::json!({ "error": e.to_string() })
         }
+    };
+    if let Some(dir) = log_dir {
+        log_raw_request(dir, &payload, &body, &response_json, elapsed_ms);
+    }
+
+    match result {
+        Ok(mv) => respond(request, 200, &serde_json::json!({ "move": mv })),
+        Err(e) => respond(request, e.status_code(), &response_json),
+    }
+}
+
+/// 検証済みリクエストの生payload・応答・所要時間を `<dir>/<gameId>.jsonl` に1行追記する
+fn log_raw_request(
+    dir: &str,
+    payload: &BotTurnRequest,
+    raw_body: &[u8],
+    response: &serde_json::Value,
+    elapsed_ms: u64,
+) {
+    let raw: serde_json::Value =
+        serde_json::from_slice(raw_body).unwrap_or(serde_json::Value::Null);
+    let line = serde_json::json!({
+        "ts": webhook_hmac::unix_now(),
+        "ply": payload.ply,
+        "elapsed_ms": elapsed_ms,
+        "request": raw,
+        "response": response,
+    });
+    let path = format!("{dir}/{}.jsonl", payload.game_id);
+    let file = OpenOptions::new().create(true).append(true).open(&path);
+    match file {
+        Ok(mut f) => {
+            if let Err(e) = writeln!(f, "{line}") {
+                eprintln!("ログ書き込みに失敗しました ({path}): {e}");
+            }
+        }
+        Err(e) => eprintln!("ログファイルを開けませんでした ({path}): {e}"),
     }
 }
 
