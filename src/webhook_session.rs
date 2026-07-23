@@ -12,7 +12,7 @@
 //! 既存の `GameModel::from_log` 相当の増分適用（`GameModel::apply`）だけで
 //! 自分の可視局面が再構成できる（詳細はプロジェクトのplan参照）。
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -32,6 +32,9 @@ pub const SUPPORTED_GAME_TYPE: &str = "ついたて";
 /// 古いゲームのセッションを掃除するまでの猶予（本番の対局時計 300秒+3秒 は
 /// もちろん、アリーナ検証用の 1000秒+3秒 よりも十分長く取っておく）
 const SESSION_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+/// コールドスタート時の逐次prewarmに使う時間上限。残りの履歴は choose 内の
+/// 通常updateへ渡し、HTTP deadlineを無制限の復元処理で消費しない。
+const DEFAULT_COLD_START_PREWARM_MS: u64 = 2_500;
 
 #[derive(Debug)]
 pub enum SessionError {
@@ -95,6 +98,10 @@ struct GameSession {
     check_holder: Option<Color>,
     /// このセッションが処理済みの ply（次に処理すべきは +1 から）
     processed_ply: u32,
+    /// dispatcherの再送に対して同じ応答を返すためのrequestIdキャッシュ。
+    /// 古い再送でセッションを過去へ巻き戻さないことも目的とする。
+    request_cache: HashMap<String, String>,
+    request_cache_order: VecDeque<String>,
 }
 
 impl GameSession {
@@ -107,6 +114,8 @@ impl GameSession {
             next_move_number: 1,
             check_holder: None,
             processed_ply: 0,
+            request_cache: HashMap::new(),
+            request_cache_order: VecDeque::new(),
         })
     }
 }
@@ -130,7 +139,7 @@ impl SessionStore {
         &self,
         game_id: &str,
         my_color: Color,
-    ) -> Result<Arc<Mutex<GameSession>>, SessionError> {
+    ) -> Result<(Arc<Mutex<GameSession>>, bool), SessionError> {
         let mut games = self.games.lock().expect("games mutex poisoned");
         let now = Instant::now();
         games.retain(|_, (last_seen, _)| now.duration_since(*last_seen) < SESSION_TTL);
@@ -139,14 +148,14 @@ impl SessionStore {
             let same_color = session.lock().expect("session mutex poisoned").my_color == my_color;
             if same_color {
                 *last_seen = now;
-                return Ok(session.clone());
+                return Ok((session.clone(), false));
             }
         }
         let fresh = GameSession::new(&self.strategy_name, my_color)
             .ok_or_else(|| SessionError::UnknownStrategy(self.strategy_name.clone()))?;
         let arc = Arc::new(Mutex::new(fresh));
         games.insert(game_id.to_string(), (now, arc.clone()));
-        Ok(arc)
+        Ok((arc, true))
     }
 
     #[cfg(test)]
@@ -170,10 +179,16 @@ pub fn choose_move(store: &SessionStore, req: &BotTurnRequest) -> Result<String,
     let my_color =
         parse_bw_color(&req.color).ok_or_else(|| SessionError::InvalidColor(req.color.clone()))?;
 
-    let arc = store.session_for(&req.game_id, my_color)?;
+    let (arc, new_session) = store.session_for(&req.game_id, my_color)?;
     let mut session = arc.lock().expect("session mutex poisoned");
 
-    let mut cold_start = false;
+    if !req.request_id.is_empty() {
+        if let Some(cached) = session.request_cache.get(&req.request_id) {
+            return Ok(cached.clone());
+        }
+    }
+
+    let mut cold_start = new_session;
     if advance(&mut session, &req.positions, req.ply).is_err() {
         // 想定外の食い違い（プロセス再起動直後でキャッシュが空、ply欠落等）は
         // セッションを作り直して0手目からやり直す
@@ -191,20 +206,45 @@ pub fn choose_move(store: &SessionStore, req: &BotTurnRequest) -> Result<String,
         // 一括 update だと長い履歴で粒子が完全枯渇するため、自分の手番ごとに
         // 逐次 prewarm してから choose する（bin/scenario.rs::prewarm_strategy
         // と同じ手当て。通常の増分パスは choose 自体の内部 update で十分）
-        strategy::prewarm_strategy(&mut **strategy, &view, log);
+        let budget_ms = std::env::var("TSUITATE_COLD_START_PREWARM_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_COLD_START_PREWARM_MS);
+        strategy::prewarm_strategy_with_budget(
+            &mut **strategy,
+            &view,
+            log,
+            Some(Duration::from_millis(budget_ms)),
+        );
     }
     let chosen = strategy.choose(&view, log, &foul_tried);
     let usi = chosen.ok_or(SessionError::NoLegalMove)?;
 
     let model = &session.model;
-    usi_move_to_csa(my_color, &usi, |c| {
+    let csa = usi_move_to_csa(my_color, &usi, |c| {
         model
             .my_pieces()
             .into_iter()
             .find(|p| p.square == make_usi_square(c))
             .map(|p| p.role)
     })
-    .ok_or(SessionError::ResponseEncodingFailed)
+    .ok_or(SessionError::ResponseEncodingFailed)?;
+
+    if !req.request_id.is_empty() {
+        const REQUEST_CACHE_LIMIT: usize = 128;
+        session
+            .request_cache
+            .insert(req.request_id.clone(), csa.clone());
+        session
+            .request_cache_order
+            .push_back(req.request_id.clone());
+        while session.request_cache_order.len() > REQUEST_CACHE_LIMIT {
+            if let Some(old) = session.request_cache_order.pop_front() {
+                session.request_cache.remove(&old);
+            }
+        }
+    }
+    Ok(csa)
 }
 
 /// 直近まで消化済みのログの末尾から、今回の手番で自分が試みた反則（まだ
@@ -263,8 +303,9 @@ fn fouls_at(
     let entry = positions
         .get(&ply.to_string())
         .ok_or(SessionError::MissingPosition(ply))?;
-    let fouls = entry.fouls.ok_or(SessionError::MissingPosition(ply))?;
-    Ok((fouls.b, fouls.w))
+    // 標準ついたての既定値。dispatcher契約上 fouls は任意フィールドなので、
+    // 欠落していても標準ルールでは初期残数9として扱う。
+    Ok(entry.fouls.map(|f| (f.b, f.w)).unwrap_or((9, 9)))
 }
 
 fn split_by_color(color: Color, (b, w): (u32, u32)) -> (u32, u32) {
@@ -469,6 +510,20 @@ mod tests {
         assert_eq!(mv.len(), 7);
         assert!(mv.starts_with('+'));
         assert_eq!(store.session_count(), 1);
+
+        // 同じrequestIdの再送は戦略を再実行せず、同じ応答を返す
+        assert_eq!(choose_move(&store, &req).unwrap(), mv);
+    }
+
+    #[test]
+    fn missing_fouls_use_standard_default() {
+        let store = SessionStore::new("heuristic".into());
+        let mut entry = initial_entry();
+        entry.fouls = None;
+        let mut positions = HashMap::new();
+        positions.insert("0".to_string(), entry);
+        let req = request("g-default-fouls", "b", 0, positions);
+        assert!(choose_move(&store, &req).is_ok());
     }
 
     #[test]
@@ -703,5 +758,9 @@ mod tests {
         let elapsed = start.elapsed();
         println!("estimator_v10 cold-start replay ({last_ply} plies) took {elapsed:?} -> {mv}");
         assert_eq!(mv.len(), 7);
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "cold start exceeded webhook budget"
+        );
     }
 }

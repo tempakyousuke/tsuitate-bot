@@ -11,6 +11,7 @@
 //! - WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS（既定 300）: HMAC timestampの許容秒数
 //! - TSUITATE_THINK_BUDGET_MS: strategy.rs 側の思考予算（既定2000ms）。
 //!   登録する「レスポンス時間」より十分小さい値に絞ること
+//! - TSUITATE_COLD_START_PREWARM_MS（既定2500）: 再起動後の履歴prewarm上限ms。
 //! - TSUITATE_WEBHOOK_LOG_DIR（既定 未設定＝無効）: 設定すると、検証済みリクエストの
 //!   生payload・応答・所要時間を `<dir>/<gameId>.jsonl` に1行1リクエストで追記する
 //!   （本体の TSUITATE_RECORD_DIR と同じ「対局ごとに1ファイル」の思想。

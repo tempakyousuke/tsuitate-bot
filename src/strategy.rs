@@ -6,6 +6,7 @@
 //!   候補手を粒子平均で評価する
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use rand::Rng;
 
@@ -16,8 +17,8 @@ use crate::board::{
 use crate::check::CheckSolver;
 use crate::estimator::{EPS_INFO, Estimator, opp_reply_weights};
 use crate::likelihood::{FITTED_THETA, ParticleCtx, particle_features, particle_log_weight};
-use crate::opening::OpeningBook;
 use crate::observation::{Observation, ObservationLog};
+use crate::opening::OpeningBook;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 
@@ -55,9 +56,24 @@ pub trait Strategy {
 /// bin/scenario.rs（棋譜の途中局面再現）と webhook_session.rs
 /// （プロセス再起動後などのコールドスタート復元）の両方が使う共通部品
 pub fn prewarm_strategy(strat: &mut dyn Strategy, view: &PlayerView, full: &ObservationLog) {
+    prewarm_strategy_with_budget(strat, view, full, None);
+}
+
+/// 履歴を逐次prewarmするが、HTTP webhookのコールドスタートなどでは時間上限を
+/// 設ける。途中で打ち切っても、次の choose が残りのイベントを通常updateする。
+pub fn prewarm_strategy_with_budget(
+    strat: &mut dyn Strategy,
+    view: &PlayerView,
+    full: &ObservationLog,
+    max_duration: Option<Duration>,
+) {
+    let deadline = max_duration.map(|d| Instant::now() + d);
     let mut running = ObservationLog::default();
     for e in full.events() {
         if matches!(e, Observation::MyMove { .. } | Observation::MyFoul { .. }) {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                break;
+            }
             strat.prewarm(view, &running);
         }
         running.record(e.clone());
@@ -237,9 +253,7 @@ struct SearchBudget {
 impl SearchBudget {
     fn from_ms(ms: u64) -> Self {
         let scale = (ms as f64 / REFERENCE_BUDGET_MS).clamp(0.25, 8.0);
-        let f = |base: usize, lo: usize, hi: usize| {
-            ((base as f64 * scale) as usize).clamp(lo, hi)
-        };
+        let f = |base: usize, lo: usize, hi: usize| ((base as f64 * scale) as usize).clamp(lo, hi);
         SearchBudget {
             scale,
             eval_particles: f(EVAL_PARTICLES, 48, 2048),
@@ -583,45 +597,201 @@ pub struct ParamSpec {
 
 impl EvalParams {
     pub const SPECS: [ParamSpec; 39] = [
-        ParamSpec { name: "check_bonus", lo: 0.0, hi: 3.0 },
-        ParamSpec { name: "check_foul_scale", lo: 0.0, hi: 0.5 },
-        ParamSpec { name: "mover_w_captured", lo: 0.0, hi: 1.5 },
-        ParamSpec { name: "mover_w_quiet", lo: 0.0, hi: 1.5 },
-        ParamSpec { name: "mover_check_extra", lo: 0.0, hi: 1.0 },
-        ParamSpec { name: "capture_reveal_risk", lo: 0.0, hi: 0.6 },
-        ParamSpec { name: "camp_known_quiet", lo: 0.0, hi: 1.0 },
-        ParamSpec { name: "camp_scale", lo: 0.0, hi: 3.0 },
-        ParamSpec { name: "exposed_base", lo: 0.0, hi: 1.5 },
-        ParamSpec { name: "exposed_known", lo: 0.0, hi: 1.5 },
-        ParamSpec { name: "home_knownness", lo: 0.0, hi: 1.0 },
-        ParamSpec { name: "recapture_defended", lo: 0.0, hi: 1.0 },
-        ParamSpec { name: "exposed_defended", lo: 0.0, hi: 1.0 },
-        ParamSpec { name: "attack_w", lo: 0.0, hi: 0.5 },
-        ParamSpec { name: "pressure_w", lo: 0.0, hi: 0.6 },
-        ParamSpec { name: "foul_cost_base", lo: 0.2, hi: 6.0 },
-        ParamSpec { name: "foul_cost_pow", lo: 0.5, hi: 3.0 },
-        ParamSpec { name: "advance_w", lo: -0.1, hi: 0.3 },
-        ParamSpec { name: "promote_bias", lo: -0.2, hi: 0.6 },
-        ParamSpec { name: "drop_bias", lo: -0.5, hi: 0.3 },
-        ParamSpec { name: "prior_weight", lo: 0.5, hi: 16.0 },
-        ParamSpec { name: "prior_weight_degen", lo: 0.0, hi: 32.0 },
-        ParamSpec { name: "threat_w", lo: 0.0, hi: 1.0 },
-        ParamSpec { name: "knight_bait_w", lo: 0.0, hi: 1.0 },
-        ParamSpec { name: "info_bonus", lo: 0.0, hi: 2.0 },
-        ParamSpec { name: "big_home_penalty", lo: 0.0, hi: 1.5 },
-        ParamSpec { name: "hand_drop_w", lo: 0.0, hi: 0.5 },
-        ParamSpec { name: "backtrack_penalty", lo: 0.0, hi: 1.5 },
-        ParamSpec { name: "shuffle_penalty", lo: 0.0, hi: 1.0 },
-        ParamSpec { name: "soft_decay", lo: 0.05, hi: 1.0 },
-        ParamSpec { name: "king_probe_bonus", lo: 0.0, hi: 1.5 },
-        ParamSpec { name: "coverage_w", lo: 0.0, hi: 0.1 },
-        ParamSpec { name: "tokin_probe_w", lo: 0.0, hi: 1.0 },
-        ParamSpec { name: "depth2_replace", lo: 0.0, hi: 1.0 },
-        ParamSpec { name: "depth2_check_pen", lo: 0.0, hi: 1.5 },
-        ParamSpec { name: "depth2_recap_discount", lo: 0.0, hi: 1.0 },
-        ParamSpec { name: "foul_diff_pow", lo: 0.0, hi: 3.0 },
-        ParamSpec { name: "check_limit_accel", lo: 0.0, hi: 3.0 },
-        ParamSpec { name: "value_nn_w", lo: 0.0, hi: 10.0 },
+        ParamSpec {
+            name: "check_bonus",
+            lo: 0.0,
+            hi: 3.0,
+        },
+        ParamSpec {
+            name: "check_foul_scale",
+            lo: 0.0,
+            hi: 0.5,
+        },
+        ParamSpec {
+            name: "mover_w_captured",
+            lo: 0.0,
+            hi: 1.5,
+        },
+        ParamSpec {
+            name: "mover_w_quiet",
+            lo: 0.0,
+            hi: 1.5,
+        },
+        ParamSpec {
+            name: "mover_check_extra",
+            lo: 0.0,
+            hi: 1.0,
+        },
+        ParamSpec {
+            name: "capture_reveal_risk",
+            lo: 0.0,
+            hi: 0.6,
+        },
+        ParamSpec {
+            name: "camp_known_quiet",
+            lo: 0.0,
+            hi: 1.0,
+        },
+        ParamSpec {
+            name: "camp_scale",
+            lo: 0.0,
+            hi: 3.0,
+        },
+        ParamSpec {
+            name: "exposed_base",
+            lo: 0.0,
+            hi: 1.5,
+        },
+        ParamSpec {
+            name: "exposed_known",
+            lo: 0.0,
+            hi: 1.5,
+        },
+        ParamSpec {
+            name: "home_knownness",
+            lo: 0.0,
+            hi: 1.0,
+        },
+        ParamSpec {
+            name: "recapture_defended",
+            lo: 0.0,
+            hi: 1.0,
+        },
+        ParamSpec {
+            name: "exposed_defended",
+            lo: 0.0,
+            hi: 1.0,
+        },
+        ParamSpec {
+            name: "attack_w",
+            lo: 0.0,
+            hi: 0.5,
+        },
+        ParamSpec {
+            name: "pressure_w",
+            lo: 0.0,
+            hi: 0.6,
+        },
+        ParamSpec {
+            name: "foul_cost_base",
+            lo: 0.2,
+            hi: 6.0,
+        },
+        ParamSpec {
+            name: "foul_cost_pow",
+            lo: 0.5,
+            hi: 3.0,
+        },
+        ParamSpec {
+            name: "advance_w",
+            lo: -0.1,
+            hi: 0.3,
+        },
+        ParamSpec {
+            name: "promote_bias",
+            lo: -0.2,
+            hi: 0.6,
+        },
+        ParamSpec {
+            name: "drop_bias",
+            lo: -0.5,
+            hi: 0.3,
+        },
+        ParamSpec {
+            name: "prior_weight",
+            lo: 0.5,
+            hi: 16.0,
+        },
+        ParamSpec {
+            name: "prior_weight_degen",
+            lo: 0.0,
+            hi: 32.0,
+        },
+        ParamSpec {
+            name: "threat_w",
+            lo: 0.0,
+            hi: 1.0,
+        },
+        ParamSpec {
+            name: "knight_bait_w",
+            lo: 0.0,
+            hi: 1.0,
+        },
+        ParamSpec {
+            name: "info_bonus",
+            lo: 0.0,
+            hi: 2.0,
+        },
+        ParamSpec {
+            name: "big_home_penalty",
+            lo: 0.0,
+            hi: 1.5,
+        },
+        ParamSpec {
+            name: "hand_drop_w",
+            lo: 0.0,
+            hi: 0.5,
+        },
+        ParamSpec {
+            name: "backtrack_penalty",
+            lo: 0.0,
+            hi: 1.5,
+        },
+        ParamSpec {
+            name: "shuffle_penalty",
+            lo: 0.0,
+            hi: 1.0,
+        },
+        ParamSpec {
+            name: "soft_decay",
+            lo: 0.05,
+            hi: 1.0,
+        },
+        ParamSpec {
+            name: "king_probe_bonus",
+            lo: 0.0,
+            hi: 1.5,
+        },
+        ParamSpec {
+            name: "coverage_w",
+            lo: 0.0,
+            hi: 0.1,
+        },
+        ParamSpec {
+            name: "tokin_probe_w",
+            lo: 0.0,
+            hi: 1.0,
+        },
+        ParamSpec {
+            name: "depth2_replace",
+            lo: 0.0,
+            hi: 1.0,
+        },
+        ParamSpec {
+            name: "depth2_check_pen",
+            lo: 0.0,
+            hi: 1.5,
+        },
+        ParamSpec {
+            name: "depth2_recap_discount",
+            lo: 0.0,
+            hi: 1.0,
+        },
+        ParamSpec {
+            name: "foul_diff_pow",
+            lo: 0.0,
+            hi: 3.0,
+        },
+        ParamSpec {
+            name: "check_limit_accel",
+            lo: 0.0,
+            hi: 3.0,
+        },
+        ParamSpec {
+            name: "value_nn_w",
+            lo: 0.0,
+            hi: 10.0,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -765,7 +935,10 @@ impl EstimatorStrategy {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
         {
-            Some(w) => EvalParams { value_nn_w: w, ..params },
+            Some(w) => EvalParams {
+                value_nn_w: w,
+                ..params
+            },
             None => params,
         };
         EstimatorStrategy {
@@ -876,7 +1049,15 @@ impl Strategy for EstimatorStrategy {
         let my_captures = log
             .events()
             .iter()
-            .filter(|e| matches!(e, Observation::MyMove { captured: Some(_), .. }))
+            .filter(|e| {
+                matches!(
+                    e,
+                    Observation::MyMove {
+                        captured: Some(_),
+                        ..
+                    }
+                )
+            })
             .count();
         let opp_board_n = (20 - my_captures.min(19)) as f64;
 
@@ -913,9 +1094,12 @@ impl Strategy for EstimatorStrategy {
         // （粒子が枯渇する終盤の反則バースト対策。check.rs 参照）。
         // taint 投票は駒得・リスク・p(合法) には混ぜない
         let mut check_solver = if view.you_in_check {
-            let fouls: Vec<ShogiMove> =
-                foul_tried.iter().filter_map(|u| parse_usi(u)).collect();
-            let votes = if sample.is_empty() { &taint_pool } else { &sample };
+            let fouls: Vec<ShogiMove> = foul_tried.iter().filter_map(|u| parse_usi(u)).collect();
+            let votes = if sample.is_empty() {
+                &taint_pool
+            } else {
+                &sample
+            };
             CheckSolver::new(view, votes, &fouls, log)
         } else {
             None
@@ -1033,7 +1217,10 @@ impl Strategy for EstimatorStrategy {
             if debug_check_enabled && view.you_in_check {
                 eprintln!(
                     "DEBUG {usi}: prior={prior:.4} gain={:.3} p_legal={:.4} foul_cost={:.3} score={:.4}",
-                    out.gain, out.p_legal, out.foul_cost, out.score()
+                    out.gain,
+                    out.p_legal,
+                    out.foul_cost,
+                    out.score()
                 );
             }
             // gain の外側の補正（タイブレーク乱数・手戻り/シャッフル減点）は
@@ -1058,7 +1245,9 @@ impl Strategy for EstimatorStrategy {
             // 手戻り（直前の手をそのまま逆に戻す）は膠着の典型なので減点。
             // 直前に動かした駒をまた動かすだけの手も雑なシャッフルとして軽く減点
             if let (
-                Some(ShogiMove::Board { from: pf, to: pt, .. }),
+                Some(ShogiMove::Board {
+                    from: pf, to: pt, ..
+                }),
                 ShogiMove::Board { from, to, .. },
             ) = (last_my_move, mv)
             {
@@ -1422,7 +1611,11 @@ fn taint_square_coverage(particles: &[(&Position, f64)], sq: Coord, opp: Color) 
         weighted_count += w * n as f64;
         total_w += w;
     }
-    if total_w <= 0.0 { 0.0 } else { weighted_count / total_w }
+    if total_w <= 0.0 {
+        0.0
+    } else {
+        weighted_count / total_w
+    }
 }
 
 /// ブラインド時の玉攻めボーナス: 候補手の着地駒が「信念上の玉マス」へ利きを
@@ -1475,7 +1668,10 @@ fn blind_hang_risk(
 ) -> f64 {
     let (to, role) = match *mv {
         ShogiMove::Board { from, to, promote } => {
-            let Some(p) = view.your_pieces.iter().find(|p| p.square == make_usi_square(from))
+            let Some(p) = view
+                .your_pieces
+                .iter()
+                .find(|p| p.square == make_usi_square(from))
             else {
                 return 0.0;
             };
@@ -1547,7 +1743,10 @@ fn debug_summary(est: &Estimator, sample: &[(&Position, f64)], push: f64) -> ser
 }
 
 /// 自分に見える範囲の候補手（foul_tried を除く）。bin/analyze の検証でも使う
-pub fn candidate_moves(view: &PlayerView, foul_tried: &HashSet<String>) -> Vec<(String, ShogiMove)> {
+pub fn candidate_moves(
+    view: &PlayerView,
+    foul_tried: &HashSet<String>,
+) -> Vec<(String, ShogiMove)> {
     let color = view.your_color;
     let mut out = vec![];
     let push = |usi: String, out: &mut Vec<(String, ShogiMove)>| {
@@ -1900,8 +2099,8 @@ fn evaluate(
             let state = nn_state_cache[pi]
                 .get_or_insert_with(|| crate::value_features::value_features(pos, me));
             let trans = crate::value_features::transition_features(pos, mv, &next, me);
-            let mut f =
-                [0.0f64; crate::value_features::VALUE_FEATURES + crate::value_features::TRANSITION_FEATURES];
+            let mut f = [0.0f64;
+                crate::value_features::VALUE_FEATURES + crate::value_features::TRANSITION_FEATURES];
             f[..crate::value_features::VALUE_FEATURES].copy_from_slice(state);
             f[crate::value_features::VALUE_FEATURES..].copy_from_slice(&trans);
             nn_sum += w * crate::value_nn::value_nn_forward(&f);
@@ -2049,8 +2248,7 @@ fn depth2_delta(
         } else {
             my_captures
         };
-        let replies =
-            opp_reply_weights(&next, me, known_for_reply, my_touched, my_fouls_this_turn);
+        let replies = opp_reply_weights(&next, me, known_for_reply, my_touched, my_fouls_this_turn);
         let total_rw: f64 = replies.iter().map(|(_, rw)| rw).sum();
         if replies.is_empty() || total_rw <= 0.0 {
             continue; // 応手なし（詰み/ステイルメイト）は stage1 のボーナス側で評価済み
@@ -2206,7 +2404,10 @@ fn knight_bait_value(next: &Position, me: Color, mv: &ShogiMove) -> f64 {
         if !(1..=9).contains(&attack_rank) {
             continue;
         }
-        let attack_sq = Coord { file: sq.file, rank: attack_rank };
+        let attack_sq = Coord {
+            file: sq.file,
+            rank: attack_rank,
+        };
         let Some(dist) = crate::deduce::distance_empty_board(Role::Pawn, me, to, attack_sq, false)
         else {
             continue;
@@ -2260,7 +2461,11 @@ fn exposed_capture_risk(
         let knownness = known.get(&sq).copied().unwrap_or(0.0);
         let weight = params.exposed_base + params.exposed_known * knownness;
         let loss = exchange_value(piece.role)
-            * if defended { params.exposed_defended } else { 1.0 }
+            * if defended {
+                params.exposed_defended
+            } else {
+                1.0
+            }
             * weight;
         worst = worst.max(loss);
     }
@@ -2283,10 +2488,16 @@ pub(crate) fn drop_check_danger(pos: &Position, me: Color) -> f64 {
     let on_board = |c: &Coord| (1..=9).contains(&c.file) && (1..=9).contains(&c.rank);
     let ray_len = |df: i8, dr: i8| -> f64 {
         let mut n = 0;
-        let mut c = Coord { file: king.file + df, rank: king.rank + dr };
+        let mut c = Coord {
+            file: king.file + df,
+            rank: king.rank + dr,
+        };
         while on_board(&c) && pos.piece_at(c).is_none() {
             n += 1;
-            c = Coord { file: c.file + df, rank: c.rank + dr };
+            c = Coord {
+                file: c.file + df,
+                rank: c.rank + dr,
+            };
         }
         n as f64
     };
@@ -2305,13 +2516,15 @@ pub(crate) fn drop_check_danger(pos: &Position, me: Color) -> f64 {
         danger += ray_len(0, toward);
     }
     if pos.hand_count(opp, Role::Pawn) > 0 {
-        let head = Coord { file: king.file, rank: king.rank + toward };
+        let head = Coord {
+            file: king.file,
+            rank: king.rank + toward,
+        };
         if on_board(&head) && pos.piece_at(head).is_none() {
             danger += 1.0;
         }
     }
-    let generals =
-        pos.hand_count(opp, Role::Gold) > 0 || pos.hand_count(opp, Role::Silver) > 0;
+    let generals = pos.hand_count(opp, Role::Gold) > 0 || pos.hand_count(opp, Role::Silver) > 0;
     if generals {
         let mut air = 0.0;
         for df in -1..=1i8 {
@@ -2319,7 +2532,10 @@ pub(crate) fn drop_check_danger(pos: &Position, me: Color) -> f64 {
                 if df == 0 && dr == 0 {
                     continue;
                 }
-                let c = Coord { file: king.file + df, rank: king.rank + dr };
+                let c = Coord {
+                    file: king.file + df,
+                    rank: king.rank + dr,
+                };
                 if on_board(&c) && pos.piece_at(c).is_none() {
                     air += 0.5;
                 }
@@ -2342,10 +2558,7 @@ pub(crate) fn king_zone_pressure(pos: &Position, owner: Color, by: Color) -> f64
                 file: king.file + df,
                 rank: king.rank + dr,
             };
-            if (1..=9).contains(&c.file)
-                && (1..=9).contains(&c.rank)
-                && pos.is_attacked(c, by)
-            {
+            if (1..=9).contains(&c.file) && (1..=9).contains(&c.rank) && pos.is_attacked(c, by) {
                 pressure += 1;
             }
         }
@@ -2374,7 +2587,10 @@ pub(crate) mod tests {
                 running: Some(Color::Sente),
                 server_time: 0,
             },
-            fouls: FoulCounts { you: 0, opponent: 0 },
+            fouls: FoulCounts {
+                you: 0,
+                opponent: 0,
+            },
             you_in_check: false,
             opponent_in_check: false,
             status: GameStatus::Playing,
@@ -2431,13 +2647,22 @@ pub(crate) mod tests {
         let mut next = Position::empty(Color::Sente);
         next.set(
             knight_sq,
-            Some(crate::shogi::Piece { color: Color::Sente, role: Role::Knight }),
+            Some(crate::shogi::Piece {
+                color: Color::Sente,
+                role: Role::Knight,
+            }),
         );
         next.set(
             attack_sq,
-            Some(crate::shogi::Piece { color: Color::Gote, role: Role::Pawn }),
+            Some(crate::shogi::Piece {
+                color: Color::Gote,
+                role: Role::Pawn,
+            }),
         );
-        let mv = ShogiMove::Drop { role: Role::Pawn, to: attack_sq };
+        let mv = ShogiMove::Drop {
+            role: Role::Pawn,
+            to: attack_sq,
+        };
         let v = knight_bait_value(&next, Color::Gote, &mv);
         assert!((v - exchange_value(Role::Knight)).abs() < 1e-9, "v={v}");
 
@@ -2446,26 +2671,44 @@ pub(crate) mod tests {
         let mut next2 = Position::empty(Color::Sente);
         next2.set(
             knight_sq,
-            Some(crate::shogi::Piece { color: Color::Sente, role: Role::Knight }),
+            Some(crate::shogi::Piece {
+                color: Color::Sente,
+                role: Role::Knight,
+            }),
         );
         next2.set(
             off_file,
-            Some(crate::shogi::Piece { color: Color::Gote, role: Role::Pawn }),
+            Some(crate::shogi::Piece {
+                color: Color::Gote,
+                role: Role::Pawn,
+            }),
         );
-        let mv2 = ShogiMove::Drop { role: Role::Pawn, to: off_file };
+        let mv2 = ShogiMove::Drop {
+            role: Role::Pawn,
+            to: off_file,
+        };
         assert_eq!(knight_bait_value(&next2, Color::Gote, &mv2), 0.0);
 
         // 歩以外の駒（例: 香）を敵桂馬の攻撃マスへ打ってもゼロ（歩限定）
         let mut next3 = Position::empty(Color::Sente);
         next3.set(
             knight_sq,
-            Some(crate::shogi::Piece { color: Color::Sente, role: Role::Knight }),
+            Some(crate::shogi::Piece {
+                color: Color::Sente,
+                role: Role::Knight,
+            }),
         );
         next3.set(
             attack_sq,
-            Some(crate::shogi::Piece { color: Color::Gote, role: Role::Lance }),
+            Some(crate::shogi::Piece {
+                color: Color::Gote,
+                role: Role::Lance,
+            }),
         );
-        let mv3 = ShogiMove::Drop { role: Role::Lance, to: attack_sq };
+        let mv3 = ShogiMove::Drop {
+            role: Role::Lance,
+            to: attack_sq,
+        };
         assert_eq!(knight_bait_value(&next3, Color::Gote, &mv3), 0.0);
     }
 
@@ -2600,14 +2843,20 @@ pub(crate) mod tests {
             }),
         );
         pos.set(
-            Coord { file: king_file, rank: 1 },
+            Coord {
+                file: king_file,
+                rank: 1,
+            },
             Some(crate::shogi::Piece {
                 color: Color::Gote,
                 role: Role::King,
             }),
         );
         pos.set(
-            Coord { file: 5, rank: pawn_rank },
+            Coord {
+                file: 5,
+                rank: pawn_rank,
+            },
             Some(crate::shogi::Piece {
                 color: Color::Sente,
                 role: Role::Pawn,
@@ -2628,7 +2877,16 @@ pub(crate) mod tests {
         }
         let miss = vec![0u8; particles.len()];
         // 上限16 < 層数9×最低枠4=36: 件数は必ず16以下
-        let sample = stratified_sample(&particles, &miss, &vec![0u8; particles.len()], &vec![0.0f64; particles.len()], Color::Sente, &ParticleCtx::default(), 16, &mut rng);
+        let sample = stratified_sample(
+            &particles,
+            &miss,
+            &vec![0u8; particles.len()],
+            &vec![0.0f64; particles.len()],
+            Color::Sente,
+            &ParticleCtx::default(),
+            16,
+            &mut rng,
+        );
         assert!(sample.len() <= 16, "len={}", sample.len());
         // ラウンドロビン順: 先頭9件で9層すべての玉位置が現れる
         let prefix_kings: HashSet<_> = sample
@@ -2639,7 +2897,16 @@ pub(crate) mod tests {
         assert_eq!(prefix_kings.len(), 9, "prefixが層化されていない");
         // 上限が大きい場合も件数はユニーク数以下・重みは旧方式と一致
         // （不変条件①: 全ユニーク・logw=0・ソフトなしなら重み和 = ユニーク数）
-        let sample = stratified_sample(&particles, &miss, &vec![0u8; particles.len()], &vec![0.0f64; particles.len()], Color::Sente, &ParticleCtx::default(), 512, &mut rng);
+        let sample = stratified_sample(
+            &particles,
+            &miss,
+            &vec![0u8; particles.len()],
+            &vec![0.0f64; particles.len()],
+            Color::Sente,
+            &ParticleCtx::default(),
+            512,
+            &mut rng,
+        );
         assert_eq!(sample.len(), 54);
         let mass: f64 = sample.iter().map(|(_, w)| w).sum();
         assert!((mass - 54.0).abs() < 1e-6, "mass={mass}");
@@ -2655,10 +2922,21 @@ pub(crate) mod tests {
         let miss = vec![0u8, 0u8];
         let taints = vec![0u8, 1u8];
         let logw = vec![0.0f64, 0.0];
-        let sample = stratified_sample(&particles, &miss, &taints, &logw, Color::Sente, &ParticleCtx::default(), 16, &mut rng);
+        let sample = stratified_sample(
+            &particles,
+            &miss,
+            &taints,
+            &logw,
+            Color::Sente,
+            &ParticleCtx::default(),
+            16,
+            &mut rng,
+        );
         assert!(!sample.is_empty());
         assert!(
-            sample.iter().all(|(p, _)| p.fingerprint() == clean.fingerprint()),
+            sample
+                .iter()
+                .all(|(p, _)| p.fingerprint() == clean.fingerprint()),
             "taint 粒子がサンプルに混ざっている"
         );
         // 較正: ユニーク1件（クリーンのみ）
@@ -2681,7 +2959,16 @@ pub(crate) mod tests {
         let mut a_share_sum = 0.0;
         for seed in 0..trials {
             let mut rng = StdRng::seed_from_u64(seed);
-            let sample = stratified_sample(&particles, &miss, &vec![0u8; particles.len()], &logw, Color::Sente, &ParticleCtx::default(), 16, &mut rng);
+            let sample = stratified_sample(
+                &particles,
+                &miss,
+                &vec![0u8; particles.len()],
+                &logw,
+                Color::Sente,
+                &ParticleCtx::default(),
+                16,
+                &mut rng,
+            );
             let total: f64 = sample.iter().map(|(_, w)| w).sum();
             assert!((total - 2.0).abs() < 1e-6, "較正: ユニーク2件で mass=2.0");
             let a_mass: f64 = sample
@@ -2713,7 +3000,16 @@ pub(crate) mod tests {
         let trials = 400;
         for seed in 0..trials {
             let mut rng = StdRng::seed_from_u64(seed);
-            let sample = stratified_sample(&particles, &miss, &vec![0u8; particles.len()], &logw, Color::Sente, &ParticleCtx::default(), 1, &mut rng);
+            let sample = stratified_sample(
+                &particles,
+                &miss,
+                &vec![0u8; particles.len()],
+                &logw,
+                Color::Sente,
+                &ParticleCtx::default(),
+                1,
+                &mut rng,
+            );
             assert_eq!(sample.len(), 1);
             if sample[0].0.fingerprint() == strict_fp {
                 strict_hits += 1;
@@ -2745,7 +3041,16 @@ pub(crate) mod tests {
         let mut share_sum = 0.0;
         for seed in 0..trials {
             let mut rng = StdRng::seed_from_u64(1000 + seed);
-            let sample = stratified_sample(&particles, &miss, &vec![0u8; particles.len()], &logw, Color::Sente, &ParticleCtx::default(), 2, &mut rng);
+            let sample = stratified_sample(
+                &particles,
+                &miss,
+                &vec![0u8; particles.len()],
+                &logw,
+                Color::Sente,
+                &ParticleCtx::default(),
+                2,
+                &mut rng,
+            );
             let total: f64 = sample.iter().map(|(_, w)| w).sum();
             let soft_mass: f64 = sample
                 .iter()
@@ -2766,13 +3071,22 @@ pub(crate) mod tests {
         let mut rng = StdRng::seed_from_u64(2);
         // 20ユニーク全てが info_miss=1（フィルタが logw へ ln(EPS_INFO) 課金済み）。
         // 較正アンカー = min(16,20) × EPS_INFO（ソフトは証拠として EPS_INFO 人分）
-        let particles: Vec<Position> =
-            (2..=7).flat_map(|pr| (1..=4).map(move |kf| synth_position(kf, pr)))
-                .take(20)
-                .collect();
+        let particles: Vec<Position> = (2..=7)
+            .flat_map(|pr| (1..=4).map(move |kf| synth_position(kf, pr)))
+            .take(20)
+            .collect();
         let miss = vec![1u8; particles.len()];
         let logw = vec![EPS_INFO.ln(); particles.len()];
-        let sample = stratified_sample(&particles, &miss, &vec![0u8; particles.len()], &logw, Color::Sente, &ParticleCtx::default(), 16, &mut rng);
+        let sample = stratified_sample(
+            &particles,
+            &miss,
+            &vec![0u8; particles.len()],
+            &logw,
+            Color::Sente,
+            &ParticleCtx::default(),
+            16,
+            &mut rng,
+        );
         assert!(sample.len() <= 16);
         let mass: f64 = sample.iter().map(|(_, w)| w).sum();
         let expected = 16.0 * EPS_INFO;
@@ -2791,7 +3105,10 @@ pub(crate) mod tests {
             }],
             HashMap::new(),
         );
-        assert_eq!(choose_move(&view, &HashSet::new()), Some("7g7f".to_string()));
+        assert_eq!(
+            choose_move(&view, &HashSet::new()),
+            Some("7g7f".to_string())
+        );
     }
 
     #[test]
@@ -2826,7 +3143,10 @@ pub(crate) mod tests {
         );
         let ok = |usi: &str| may_resolve_check(&view, &parse_usi(usi).unwrap());
         assert!(ok("5i5h"), "玉移動は常に候補");
-        assert!(ok("7g5g"), "自玉と同段（ライン上）への移動は合駒/取りになりうる");
+        assert!(
+            ok("7g5g"),
+            "自玉と同段（ライン上）への移動は合駒/取りになりうる"
+        );
         assert!(ok("7g5e"), "架空の手でも判定対象はライン（5筋）上の着地点");
         assert!(!ok("7g7f"), "ライン外への移動は王手放置が確定");
     }

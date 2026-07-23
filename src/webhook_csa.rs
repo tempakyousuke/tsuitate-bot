@@ -6,8 +6,8 @@
 //! （tsuboshun/tsuitate-sample-bot）のREADMEに加え、実際のエンジン実装
 //! （tsuboshun/tsuitate-shogi-crates の tsuitate_bindings/src/game_api.rs
 //! `piece_kind_to_csa` / `last_move_csa`）をソースで確認して実装した。
-//! `lastCapture` はこれとは別に1文字のUSI駒コード（同リポジトリの
-//! `PieceKind::to_usi`）で表される点に注意（README中の2文字表記例は誤り）。
+//! `lastCapture` は実戦dispatcherではCSAの2文字コードで、エンジン直結の
+//! サンプルでは1文字のUSIコードの場合もあるため、下記パーサーは両方を受理する。
 
 use crate::board::Coord;
 use crate::protocol::{Color, Role};
@@ -71,9 +71,13 @@ fn csa2_to_role(code: &str) -> Option<Role> {
     })
 }
 
-/// `lastCapture` の1文字USI駒コード（常に不成の基本形。King が捕獲されることはない）
+/// `lastCapture` を内部の基本駒種へ変換する。
+///
+/// dispatcher の実payloadはCSAの2文字（`FU`など）だが、エンジン直結の
+/// payloadではUSIの1文字（`P`など）も使われるため、両方を受け付ける。
+/// 成駒表記が来ても、持ち駒へ入る時点では必ず不成へ戻す。
 pub fn parse_capture_letter(s: &str) -> Option<Role> {
-    Some(match s {
+    let role = match s {
         "P" => Role::Pawn,
         "L" => Role::Lance,
         "N" => Role::Knight,
@@ -82,8 +86,9 @@ pub fn parse_capture_letter(s: &str) -> Option<Role> {
         "B" => Role::Bishop,
         "R" => Role::Rook,
         "K" => Role::King,
-        _ => return None,
-    })
+        _ => csa2_to_role(s)?,
+    };
+    Some(crate::shogi::unpromote_role(role))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,9 +246,11 @@ mod tests {
 
     #[test]
     fn parses_capture_from_sample_test_fixture() {
-        // tsuitate-sample-bot test_strategy.py: lastCapture: "P" (2文字CSAではなく1文字USI)
+        // サンプルのエンジン直結形式（1文字USI）とdispatcher形式（2文字CSA）
         assert_eq!(parse_capture_letter("P"), Some(Role::Pawn));
-        assert_eq!(parse_capture_letter("FU"), None);
+        assert_eq!(parse_capture_letter("FU"), Some(Role::Pawn));
+        assert_eq!(parse_capture_letter("KA"), Some(Role::Bishop));
+        assert_eq!(parse_capture_letter("TO"), Some(Role::Pawn));
     }
 
     #[test]
