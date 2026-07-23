@@ -12,6 +12,10 @@
 //!
 //! 使い方: cargo run --release --bin export_particle_data -- records/*.jsonl > data.csv
 //! 環境変数: FIT_MAX_POINTS_PER_GAME（既定20）: 1局から取る決定点の上限
+//!
+//! 注意: game_id は1回の実行内でのみ一意。複数回のexport出力を後で連結すると
+//! game_id が衝突して別対局が同一グループ/同一対局扱いになるので、
+//! 全記録を1回の実行にまとめて渡すこと
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
