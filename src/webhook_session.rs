@@ -21,6 +21,7 @@ use crate::board::{make_usi_drop, make_usi_move, make_usi_square};
 use crate::model::GameModel;
 use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{ClockState, Color, FoulCounts, GameStatus, PlayerView};
+use crate::shogi::ShogiMove;
 use crate::strategy::{self, Strategy};
 use crate::webhook_csa::{CsaMoveKind, parse_capture_letter, parse_csa_move, usi_move_to_csa};
 use crate::webhook_protocol::{
@@ -46,6 +47,9 @@ pub enum SessionError {
     MissingPosition(u32),
     MissingLastMove(u32),
     InvalidLastMove { ply: u32, raw: String },
+    UnsupportedGameParameters,
+    InconsistentHistory,
+    StaleRequest,
     NoLegalMove,
     ResponseEncodingFailed,
 }
@@ -56,6 +60,9 @@ impl fmt::Display for SessionError {
             SessionError::UnsupportedRequestType(t) => write!(f, "unsupported_request_type: {t}"),
             SessionError::UnsupportedGameType(t) => write!(f, "unsupported_game_type: {t}"),
             SessionError::UnsupportedPlayers => write!(f, "unsupported_players"),
+            SessionError::UnsupportedGameParameters => write!(f, "unsupported_game_parameters"),
+            SessionError::InconsistentHistory => write!(f, "inconsistent_history"),
+            SessionError::StaleRequest => write!(f, "stale_request"),
             SessionError::UnknownStrategy(name) => write!(f, "unknown_strategy: {name}"),
             SessionError::InvalidColor(c) => write!(f, "invalid_color: {c}"),
             SessionError::MissingPosition(ply) => write!(f, "missing_position: {ply}"),
@@ -75,10 +82,13 @@ impl SessionError {
             SessionError::UnsupportedRequestType(_)
             | SessionError::UnsupportedGameType(_)
             | SessionError::UnsupportedPlayers
+            | SessionError::UnsupportedGameParameters
+            | SessionError::InconsistentHistory
             | SessionError::InvalidColor(_)
             | SessionError::MissingPosition(_)
             | SessionError::MissingLastMove(_)
             | SessionError::InvalidLastMove { .. } => 400,
+            SessionError::StaleRequest => 409,
             SessionError::UnknownStrategy(_) | SessionError::ResponseEncodingFailed => 500,
             SessionError::NoLegalMove => 422,
         }
@@ -176,6 +186,7 @@ pub fn choose_move(store: &SessionStore, req: &BotTurnRequest) -> Result<String,
     if req.game.required_players.b != 1 || req.game.required_players.w != 1 {
         return Err(SessionError::UnsupportedPlayers);
     }
+    validate_game_parameters(&req.game)?;
     let my_color =
         parse_bw_color(&req.color).ok_or_else(|| SessionError::InvalidColor(req.color.clone()))?;
 
@@ -188,6 +199,12 @@ pub fn choose_move(store: &SessionStore, req: &BotTurnRequest) -> Result<String,
         }
     }
 
+    // requestIdキャッシュから外れた遅延再送で、進行済みセッションを過去へ
+    // 巻き戻すと、その後の履歴を二重適用するため拒否する。
+    if session.processed_ply > req.ply {
+        return Err(SessionError::StaleRequest);
+    }
+
     let mut cold_start = new_session;
     if advance(&mut session, &req.positions, req.ply).is_err() {
         // 想定外の食い違い（プロセス再起動直後でキャッシュが空、ply欠落等）は
@@ -198,8 +215,12 @@ pub fn choose_move(store: &SessionStore, req: &BotTurnRequest) -> Result<String,
         cold_start = true;
     }
 
+    if !session.model.consistent() {
+        return Err(SessionError::InconsistentHistory);
+    }
     let view = build_player_view(&session, req)?;
-    let foul_tried = collect_foul_tried(&session.log, session.next_move_number);
+    let mut foul_tried = collect_foul_tried(&session.log, session.next_move_number);
+    exclude_moves_on_known_opponent(&session.log, &view, &mut foul_tried);
 
     let GameSession { strategy, log, .. } = &mut *session;
     if cold_start {
@@ -262,14 +283,160 @@ fn collect_foul_tried(log: &ObservationLog, current_move_number: u32) -> HashSet
         .collect()
 }
 
+/// 相手が直前の正規手で自駒を取った升には、相手の着手駒が確実に存在する。
+/// 打ちは駒を取れないため、その升への駒打ちは粒子推定によらず必ず反則になる。
+/// `foul_tried` と同じ除外集合へ加えることで、凍結版を含む全Strategyへ適用する。
+///
+/// それより古い捕獲升は相手駒が既に動いた可能性があるので使わない。自分が
+/// 王手回避を反則にされた場合も盤面は変わらず、直前の捕獲升は引き続き有効。
+fn exclude_moves_on_known_opponent(
+    log: &ObservationLog,
+    view: &PlayerView,
+    excluded: &mut HashSet<String>,
+) {
+    let mut occupied = HashSet::new();
+    if let Some(square) = log
+        .events()
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            Observation::OpponentMoved {
+                captured_my_piece_at,
+                ..
+            } => Some(
+                captured_my_piece_at
+                    .as_deref()
+                    .and_then(crate::board::parse_usi_square),
+            ),
+            _ => None,
+        })
+        .flatten()
+    {
+        occupied.insert(square);
+    }
+
+    // 王手中でない非歩の駒打ちが反則になった場合、候補生成が既知の
+    // 二歩・行き所のない駒を除外しているため、着地点は相手駒で占有されている。
+    // 同じ手番中は反則で盤面が変わらないので、これも確定情報として使う。
+    if !view.you_in_check {
+        for event in log.events() {
+            let Observation::MyFoul { move_number, usi } = event else {
+                continue;
+            };
+            if *move_number != view.move_number {
+                continue;
+            }
+            if let Some(ShogiMove::Drop { role, to }) = crate::shogi::parse_usi(usi) {
+                if role != crate::protocol::Role::Pawn {
+                    occupied.insert(to);
+                }
+            }
+        }
+    }
+
+    if occupied.is_empty() {
+        return;
+    }
+
+    // 駒打ちは着地点そのもの、盤上の長距離移動は確定占有升を
+    // 飛び越える場合が必ず反則になる。着地点への盤上移動（捕獲）は許可する。
+    let candidates = strategy::candidate_moves(view, &HashSet::new());
+    for square in occupied {
+        for (usi, mv) in &candidates {
+            let blocked = match mv {
+                ShogiMove::Drop { to, .. } => *to == square,
+                ShogiMove::Board { from, to, .. } => crosses_square(*from, *to, square),
+            };
+            if blocked {
+                excluded.insert(usi.clone());
+            }
+        }
+    }
+}
+
+fn crosses_square(
+    from: crate::board::Coord,
+    to: crate::board::Coord,
+    square: crate::board::Coord,
+) -> bool {
+    let df = to.file - from.file;
+    let dr = to.rank - from.rank;
+    let aligned = (df == 0 || dr == 0 || df.abs() == dr.abs()) && (df != 0 || dr != 0);
+    if !aligned {
+        return false;
+    }
+    let step_file = df.signum();
+    let step_rank = dr.signum();
+    let mut current = crate::board::Coord {
+        file: from.file + step_file,
+        rank: from.rank + step_rank,
+    };
+    while current != to {
+        if current == square {
+            return true;
+        }
+        current.file += step_file;
+        current.rank += step_rank;
+    }
+    false
+}
+
+/// エンジンが標準ついたて用に固定実装されているため、ゲーム設定も標準値だけを
+/// 受理する。`param` がない旧形式のテストpayloadは標準値として扱う。
+fn validate_game_parameters(game: &crate::webhook_protocol::GameInfo) -> Result<(), SessionError> {
+    let Some(param) = game.param.as_deref() else {
+        return Ok(());
+    };
+    let mut values = HashMap::new();
+    for pair in param.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        values.insert(key, value.replace("%2F", "/").replace("%2f", "/"));
+    }
+    let standard_board = "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL";
+    let standard = [
+        ("initial_board", standard_board),
+        ("promotion_rank", "3"),
+        ("foul_limits", "9.9"),
+        ("draw_move_count", "150"),
+        ("enable_try_rule", "false"),
+    ];
+    if standard
+        .iter()
+        .any(|(key, expected)| values.get(key).is_some_and(|actual| actual != expected))
+    {
+        return Err(SessionError::UnsupportedGameParameters);
+    }
+    Ok(())
+}
+
 fn build_player_view(
     session: &GameSession,
     req: &BotTurnRequest,
 ) -> Result<PlayerView, SessionError> {
-    let current_fouls = fouls_at(&req.positions, req.ply)?;
-    let start_fouls = fouls_at(&req.positions, 0)?;
-    let (you_start, opp_start) = split_by_color(session.my_color, start_fouls);
-    let (you_remaining, opp_remaining) = split_by_color(session.my_color, current_fouls);
+    let fouls_present = req
+        .positions
+        .get("0")
+        .and_then(|entry| entry.fouls)
+        .is_some()
+        && req
+            .positions
+            .get(&req.ply.to_string())
+            .and_then(|entry| entry.fouls)
+            .is_some();
+    let (you_fouls, opponent_fouls) = if fouls_present {
+        let current_fouls = fouls_at(&req.positions, req.ply)?;
+        let start_fouls = fouls_at(&req.positions, 0)?;
+        let (you_start, opp_start) = split_by_color(session.my_color, start_fouls);
+        let (you_remaining, opp_remaining) = split_by_color(session.my_color, current_fouls);
+        (
+            you_start.saturating_sub(you_remaining),
+            opp_start.saturating_sub(opp_remaining),
+        )
+    } else {
+        (session.model.my_fouls(), session.model.opponent_fouls())
+    };
 
     Ok(PlayerView {
         game_id: req.game_id.clone(),
@@ -287,8 +454,8 @@ fn build_player_view(
             server_time: 0,
         },
         fouls: FoulCounts {
-            you: you_start.saturating_sub(you_remaining),
-            opponent: opp_start.saturating_sub(opp_remaining),
+            you: you_fouls,
+            opponent: opponent_fouls,
         },
         you_in_check: session.check_holder == Some(session.my_color),
         opponent_in_check: false,
@@ -374,7 +541,7 @@ fn advance(
                 }
             }
         } else if is_foul {
-            let count = opponent_foul_count(positions, ply, mover)?;
+            let count = opponent_foul_count(session, positions, ply, mover)?;
             Observation::OpponentFoul { count }
         } else {
             let captured_my_piece_at = match parsed.kind {
@@ -416,12 +583,33 @@ fn advance(
 /// 相手の残り反則数（`fouls`）から累計反則回数を逆算する。開始値は0手目
 /// （初期局面）の残り数から読む
 fn opponent_foul_count(
+    session: &GameSession,
     positions: &HashMap<String, PositionEntry>,
     ply: u32,
     mover: Color,
 ) -> Result<u32, SessionError> {
-    let (start_b, start_w) = fouls_at(positions, 0)?;
-    let (cur_b, cur_w) = fouls_at(positions, ply)?;
+    let start = positions.get("0").and_then(|entry| entry.fouls);
+    let current = positions
+        .get(&ply.to_string())
+        .and_then(|entry| entry.fouls);
+    let Some((start_b, start_w)) = start.map(|f| (f.b, f.w)) else {
+        return Ok(session
+            .log
+            .events()
+            .iter()
+            .filter(|event| matches!(event, Observation::OpponentFoul { .. }))
+            .count() as u32
+            + 1);
+    };
+    let Some((cur_b, cur_w)) = current.map(|f| (f.b, f.w)) else {
+        return Ok(session
+            .log
+            .events()
+            .iter()
+            .filter(|event| matches!(event, Observation::OpponentFoul { .. }))
+            .count() as u32
+            + 1);
+    };
     let (start, cur) = match mover {
         Color::Sente => (start_b, cur_b),
         Color::Gote => (start_w, cur_w),
@@ -454,6 +642,7 @@ mod tests {
         GameInfo {
             kind: kind.into(),
             required_players: RequiredPlayers { b: 1, w: 1 },
+            param: None,
         }
     }
 
@@ -620,6 +809,143 @@ mod tests {
         let foul_tried = collect_foul_tried(&session.log, session.next_move_number);
         // "+9998FU" = 99(9i)から98(9h)への移動。USIは筋+段(段はa〜iの文字)表記
         assert!(foul_tried.contains("9i9h"));
+    }
+
+    #[test]
+    fn excludes_drops_on_square_where_opponent_just_captured() {
+        let mut log = ObservationLog::default();
+        log.record(Observation::OpponentMoved {
+            move_number: 25,
+            captured_my_piece_at: Some("5g".into()),
+        });
+        log.record(Observation::Check {
+            in_check: Color::Sente,
+        });
+        // 王手回避の失敗後も相手駒は5gに残っている。
+        log.record(Observation::MyFoul {
+            move_number: 26,
+            usi: "5h7g".into(),
+        });
+
+        let mut hand = HashMap::new();
+        hand.insert(Role::Lance, 2);
+        hand.insert(Role::Bishop, 1);
+        let view = PlayerView {
+            game_id: "known-occupied-drop".into(),
+            your_color: Color::Sente,
+            your_pieces: vec![crate::protocol::VisiblePiece {
+                square: "5i".into(),
+                role: Role::Rook,
+            }],
+            your_hand: hand,
+            turn: Color::Sente,
+            move_number: 26,
+            clocks: ClockState {
+                sente_ms: 0,
+                gote_ms: 0,
+                running: None,
+                server_time: 0,
+            },
+            fouls: FoulCounts {
+                you: 1,
+                opponent: 0,
+            },
+            you_in_check: true,
+            opponent_in_check: false,
+            status: GameStatus::Playing,
+        };
+        let mut excluded = HashSet::new();
+        exclude_moves_on_known_opponent(&log, &view, &mut excluded);
+
+        assert!(excluded.contains("L*5g"));
+        assert!(excluded.contains("B*5g"));
+        assert!(excluded.contains("5i5f"));
+        assert!(!excluded.contains("5i5g"));
+        assert!(!excluded.contains("L*5f"));
+    }
+
+    #[test]
+    fn missing_fouls_after_a_foul_are_recovered_from_history() {
+        let mut session = GameSession::new("heuristic", Color::Sente).unwrap();
+        let mut positions = HashMap::new();
+        positions.insert("0".to_string(), initial_entry());
+        positions.insert(
+            "1".to_string(),
+            PositionEntry {
+                sfen: "ignored".into(),
+                fouls: None,
+                last_move: Some("+9998FU".into()),
+                last_info: Some(INFO_FOUL),
+                last_capture: None,
+                was_promotion: None,
+            },
+        );
+        advance(&mut session, &positions, 1).unwrap();
+        let req = request("g-missing-foul-after", "b", 1, positions);
+        let view = build_player_view(&session, &req).unwrap();
+        assert_eq!(view.fouls.you, 1);
+    }
+
+    #[test]
+    fn rejects_nonstandard_game_parameters() {
+        let store = SessionStore::new("heuristic".into());
+        let mut positions = HashMap::new();
+        positions.insert("0".to_string(), initial_entry());
+        let mut req = request("g-custom-param", "b", 0, positions);
+        req.game.param = Some("promotion_rank=4".into());
+        let err = choose_move(&store, &req).unwrap_err();
+        assert!(matches!(err, SessionError::UnsupportedGameParameters));
+        assert_eq!(err.status_code(), 400);
+    }
+
+    #[test]
+    fn accepts_standard_game_parameters() {
+        let store = SessionStore::new("heuristic".into());
+        let mut positions = HashMap::new();
+        positions.insert("0".to_string(), initial_entry());
+        let mut req = request("g-standard-param", "b", 0, positions);
+        req.game.param = Some("initial_board=lnsgkgsnl%2F1r5b1%2Fppppppppp%2F9%2F9%2F9%2FPPPPPPPPP%2F1B5R1%2FLNSGKGSNL&promotion_rank=3&draw_move_count=150&enable_try_rule=false&foul_limits=9.9".into());
+        assert!(choose_move(&store, &req).is_ok());
+    }
+
+    #[test]
+    fn does_not_treat_an_older_capture_square_as_still_occupied() {
+        let mut log = ObservationLog::default();
+        log.record(Observation::OpponentMoved {
+            move_number: 10,
+            captured_my_piece_at: Some("5g".into()),
+        });
+        log.record(Observation::OpponentMoved {
+            move_number: 11,
+            captured_my_piece_at: None,
+        });
+        let mut hand = HashMap::new();
+        hand.insert(Role::Lance, 1);
+        let view = PlayerView {
+            game_id: "stale-capture-square".into(),
+            your_color: Color::Sente,
+            your_pieces: vec![],
+            your_hand: hand,
+            turn: Color::Sente,
+            move_number: 12,
+            clocks: ClockState {
+                sente_ms: 0,
+                gote_ms: 0,
+                running: None,
+                server_time: 0,
+            },
+            fouls: FoulCounts {
+                you: 0,
+                opponent: 0,
+            },
+            you_in_check: false,
+            opponent_in_check: false,
+            status: GameStatus::Playing,
+        };
+        let mut excluded = HashSet::new();
+        exclude_moves_on_known_opponent(&log, &view, &mut excluded);
+
+        assert!(!excluded.contains("L*5g"));
     }
 
     #[test]

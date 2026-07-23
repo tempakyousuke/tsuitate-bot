@@ -83,6 +83,8 @@ pub struct GameInfo {
     #[serde(rename = "type")]
     pub kind: String,
     pub required_players: RequiredPlayers,
+    #[serde(default)]
+    pub param: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
