@@ -16,6 +16,7 @@ pub mod observation;
 pub mod opening;
 pub mod opp_move_features;
 pub mod opp_move_nn;
+pub mod particle_nn;
 pub mod protocol;
 pub mod record;
 pub mod selfplay;

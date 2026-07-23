@@ -53,6 +53,13 @@ pub const FITTED_THETA: [f64; PARTICLE_FEATURES] = [
 pub struct ParticleCtx {
     /// 直近で自駒が取られたマス（相手の駒がそこに着地した）
     pub opp_landed_last: Option<Coord>,
+    /// 相手の着手数（NN版の文脈特徴量。グループ内で不変なので softmax では
+    /// 単独では効かず、粒子特徴量との相互作用としてだけ効く）
+    pub opp_moves: u32,
+    /// 取られた自駒の数（相手の持ち駒＋打ち戻しの上限）
+    pub my_dead: u32,
+    /// いま自玉が王手されているか
+    pub you_in_check: bool,
 }
 
 /// 相手側の前進量（段）: 初期配置側から自分側へ何段進んだか
@@ -152,6 +159,204 @@ pub fn particle_log_weight(features: &[f64; PARTICLE_FEATURES], theta: &[f64; PA
     features.iter().zip(theta).map(|(f, t)| f * t).sum()
 }
 
+/// NN版の特徴量次元（線形8特徴量の上位互換。likelihood.rs のNN化 =
+/// ロードマップ段階①の残り。学習は tsuitate-nn/train_particle.py、
+/// 推論は particle_nn.rs の手書き forward pass）
+pub const PARTICLE_NN_FEATURES: usize = 26;
+
+pub const NN_FEATURE_NAMES: [&str; PARTICLE_NN_FEATURES] = [
+    // 線形モデルと同じ定義の8特徴量
+    "king_moved",
+    "king_advance",
+    "king_shift",
+    "pawn_advance",
+    "pieces_home",
+    "at_my_death",
+    "in_my_camp",
+    "past_mid",
+    // 駒種別の初期配置残存（「未観測の駒は初期配置のまま」の駒種分解。
+    // home_lance_move / from_home と同じ原則の粒子判別版）
+    "pawns_home",   // 初期マスに残る歩 /9
+    "lances_home",  // /2
+    "knights_home", // /2
+    "silvers_home", // /2
+    "golds_home",   // /2
+    "bishop_home",  // 0/1
+    "rook_home",    // 0/1
+    // 進出・成り・持ち駒
+    "pawn_advance_max",    // 歩（と金含む）の最大前進量
+    "nonpawn_advance_max", // 歩・玉以外が敵陣（相手の3段）を出た最大段数
+    "promoted_count",      // 成駒の数 /5
+    "opp_hand_count",      // 相手の持ち駒数 /5（取った駒をまだ打っていない数。粒子ごとに違う）
+    // 自分の駒（既知）との相互作用
+    "attacked_by_me",     // 自分の利きが当たっている相手駒数 /5
+    "hanging_to_me",      // うち相手の紐が無い駒数 /5
+    "defended_frac",      // 相手の駒（玉以外）のうち紐つきの割合
+    "king_zone_attackers", // 自玉とその周囲8マスへ利かせている相手駒数 /5
+    // 文脈（グループ内で不変。NNの相互作用項としてだけ効く）
+    "ply",          // 相手の着手数 /50
+    "my_dead",      // 取られた自駒数 /10
+    "you_in_check", // 0/1
+];
+
+/// NN版の粒子特徴量。先頭8個は線形版 `particle_features` と同じ値
+pub fn particle_nn_features(
+    pos: &Position,
+    my_color: Color,
+    ctx: &ParticleCtx,
+) -> [f64; PARTICLE_NN_FEATURES] {
+    let opp = my_color.other();
+    let initial = Position::initial();
+    let base = particle_features(pos, my_color, ctx);
+
+    // 駒種別のhome残存カウント
+    let mut home_by_role = [0.0f64; 7]; // Pawn..Rook の順
+    for (sq, p) in initial.pieces() {
+        if p.color != opp || p.role == Role::King {
+            continue;
+        }
+        if pos
+            .piece_at(sq)
+            .is_some_and(|cur| cur.color == opp && cur.role == p.role)
+        {
+            let i = match p.role {
+                Role::Pawn => 0,
+                Role::Lance => 1,
+                Role::Knight => 2,
+                Role::Silver => 3,
+                Role::Gold => 4,
+                Role::Bishop => 5,
+                Role::Rook => 6,
+                _ => continue,
+            };
+            home_by_role[i] += 1.0;
+        }
+    }
+
+    let pawn_home_rank = match opp {
+        Color::Gote => 3,
+        Color::Sente => 7,
+    };
+    // 敵陣（相手側の3段）の境界: そこを出た段数で非歩駒の進出を測る
+    let camp_edge = match opp {
+        Color::Gote => 3,
+        Color::Sente => 7,
+    };
+    let mut pawn_adv_max = 0.0f64;
+    let mut nonpawn_adv_max = 0.0f64;
+    let mut promoted = 0.0f64;
+    let mut attacked_by_me = 0.0f64;
+    let mut hanging_to_me = 0.0f64;
+    let mut defended = 0.0f64;
+    let mut nonking = 0.0f64;
+    for (sq, p) in pos.pieces() {
+        if p.color != opp {
+            continue;
+        }
+        match p.role {
+            Role::Pawn | Role::Tokin => {
+                pawn_adv_max = pawn_adv_max.max(advance_of(sq.rank, pawn_home_rank, opp).max(0.0));
+            }
+            Role::King => {}
+            _ => {
+                nonpawn_adv_max =
+                    nonpawn_adv_max.max(advance_of(sq.rank, camp_edge, opp).max(0.0));
+            }
+        }
+        if matches!(
+            p.role,
+            Role::Tokin
+                | Role::Promotedlance
+                | Role::Promotedknight
+                | Role::Promotedsilver
+                | Role::Horse
+                | Role::Dragon
+        ) {
+            promoted += 1.0;
+        }
+        if p.role != Role::King {
+            nonking += 1.0;
+            let def = pos.is_attacked(sq, opp);
+            if def {
+                defended += 1.0;
+            }
+            if pos.is_attacked(sq, my_color) {
+                attacked_by_me += 1.0;
+                if !def {
+                    hanging_to_me += 1.0;
+                }
+            }
+        }
+    }
+
+    let opp_hand: f64 = pos
+        .hand_map(opp)
+        .values()
+        .map(|&c| f64::from(c))
+        .sum();
+
+    // 自玉とその周囲8マスへの利き（王手駒仮説の妥当性判別に効かせたい）
+    let mut king_zone_attackers = 0.0f64;
+    if let Some(k) = pos.king_square(my_color) {
+        for (sq, p) in pos.pieces() {
+            if p.color != opp {
+                continue;
+            }
+            let mut hits = false;
+            for df in -1i8..=1 {
+                for dr in -1i8..=1 {
+                    let t = Coord {
+                        file: k.file + df,
+                        rank: k.rank + dr,
+                    };
+                    if (1..=9).contains(&t.file)
+                        && (1..=9).contains(&t.rank)
+                        && pos.attacks(sq, t)
+                    {
+                        hits = true;
+                        break;
+                    }
+                }
+                if hits {
+                    break;
+                }
+            }
+            if hits {
+                king_zone_attackers += 1.0;
+            }
+        }
+    }
+
+    [
+        base[0],
+        base[1],
+        base[2],
+        base[3],
+        base[4],
+        base[5],
+        base[6],
+        base[7],
+        home_by_role[0] / 9.0,
+        home_by_role[1] / 2.0,
+        home_by_role[2] / 2.0,
+        home_by_role[3] / 2.0,
+        home_by_role[4] / 2.0,
+        home_by_role[5],
+        home_by_role[6],
+        pawn_adv_max,
+        nonpawn_adv_max,
+        promoted / 5.0,
+        opp_hand / 5.0,
+        attacked_by_me / 5.0,
+        hanging_to_me / 5.0,
+        if nonking > 0.0 { defended / nonking } else { 0.0 },
+        king_zone_attackers / 5.0,
+        f64::from(ctx.opp_moves) / 50.0,
+        f64::from(ctx.my_dead) / 10.0,
+        f64::from(ctx.you_in_check),
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,9 +381,79 @@ mod tests {
         // at_my_death: 2b の駒の有無
         let ctx = ParticleCtx {
             opp_landed_last: Some(Coord { file: 2, rank: 2 }),
+            ..ParticleCtx::default()
         };
         let f = particle_features(&pos, Color::Sente, &ctx);
         assert_eq!(f[5], 1.0, "2bには後手の角がいる");
+    }
+
+    #[test]
+    fn nn_features_track_piece_type_development() {
+        let mut pos = Position::initial();
+        let ctx = ParticleCtx::default();
+        let f0 = particle_nn_features(&pos, Color::Sente, &ctx);
+        // 先頭8個は線形版と同じ値
+        let lin = particle_features(&pos, Color::Sente, &ctx);
+        for i in 0..PARTICLE_FEATURES {
+            assert_eq!(f0[i], lin[i], "feature {i} が線形版とずれている");
+        }
+        assert_eq!(f0[8], 1.0, "初期局面: 歩は全部home");
+        assert_eq!(f0[9], 1.0, "香車は全部home");
+        assert_eq!(f0[13], 1.0, "角はhome");
+        assert_eq!(f0[14], 1.0, "飛車はhome");
+        assert_eq!(f0[17], 0.0, "成駒なし");
+        assert_eq!(f0[18], 0.0, "持ち駒なし");
+        assert_eq!(f0[15], 0.0, "歩の前進なし");
+
+        pos.play_unchecked(&parse_usi("7g7f").unwrap());
+        pos.play_unchecked(&parse_usi("3c3d").unwrap());
+        let f1 = particle_nn_features(&pos, Color::Sente, &ctx);
+        assert!((f1[8] - 8.0 / 9.0).abs() < 1e-9, "歩1枚がhomeを離れた: {}", f1[8]);
+        assert_eq!(f1[15], 1.0, "歩の最大前進=1: {}", f1[15]);
+
+        let ctx = ParticleCtx {
+            opp_moves: 25,
+            my_dead: 3,
+            you_in_check: true,
+            ..ParticleCtx::default()
+        };
+        let f2 = particle_nn_features(&pos, Color::Sente, &ctx);
+        assert_eq!(f2[23], 0.5);
+        assert_eq!(f2[24], 0.3);
+        assert_eq!(f2[25], 1.0);
+    }
+
+    /// NN特徴量抽出は stratified_sample でユニーク粒子ごとに1回呼ばれる
+    /// （1手あたり数百回オーダー）。利き判定（attacked_by_me / defended /
+    /// king_zone）を含むため forward pass より重いが、粒子512個ぶんでも
+    /// 思考予算（900ms〜）の数%に収まることをガードする
+    #[test]
+    fn nn_feature_extraction_is_fast_enough() {
+        let mut pos = Position::initial();
+        for usi in ["7g7f", "3c3d", "8h2b+", "3a2b", "B*4e", "8c8d"] {
+            pos.play_unchecked(&parse_usi(usi).unwrap());
+        }
+        let ctx = ParticleCtx {
+            opp_moves: 3,
+            my_dead: 1,
+            ..ParticleCtx::default()
+        };
+        let n = 2_000u32;
+        let start = std::time::Instant::now();
+        let mut acc = 0.0f64;
+        for _ in 0..n {
+            acc += particle_nn_features(std::hint::black_box(&pos), Color::Sente, &ctx)[19];
+        }
+        let elapsed = start.elapsed();
+        std::hint::black_box(acc);
+        eprintln!("{n}回の特徴量抽出: {elapsed:?}（1回あたり{:?}）", elapsed / n);
+        // release実測は数µs/回のオーダー。512粒子×数µs ≈ 数ms/手。
+        // debugは1桁以上遅いので閾値を緩める
+        let threshold = if cfg!(debug_assertions) { 400e-6 } else { 40e-6 };
+        assert!(
+            elapsed.as_secs_f64() / f64::from(n) < threshold,
+            "特徴量抽出が遅すぎる: {elapsed:?} / {n}回"
+        );
     }
 
     #[test]

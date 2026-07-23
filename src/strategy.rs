@@ -16,7 +16,8 @@ use crate::board::{
 };
 use crate::check::CheckSolver;
 use crate::estimator::{EPS_INFO, Estimator, opp_reply_weights};
-use crate::likelihood::{FITTED_THETA, ParticleCtx, particle_features, particle_log_weight};
+use crate::likelihood::{ParticleCtx, particle_nn_features};
+use crate::particle_nn::particle_nn_forward;
 use crate::observation::{Observation, ObservationLog};
 use crate::opening::OpeningBook;
 use rand::SeedableRng;
@@ -1033,6 +1034,25 @@ impl Strategy for EstimatorStrategy {
                 } => parse_usi_square(sq),
                 _ => None,
             }),
+            opp_moves: log
+                .events()
+                .iter()
+                .filter(|e| matches!(e, Observation::OpponentMoved { .. }))
+                .count() as u32,
+            my_dead: log
+                .events()
+                .iter()
+                .filter(|e| {
+                    matches!(
+                        e,
+                        Observation::OpponentMoved {
+                            captured_my_piece_at: Some(_),
+                            ..
+                        }
+                    )
+                })
+                .count() as u32,
+            you_in_check: view.you_in_check,
         };
         let sample = stratified_sample(
             est.particles(),
@@ -1368,8 +1388,9 @@ fn stratified_sample<'a>(
         let miss = info_miss.get(i).copied().unwrap_or(0);
         match seen.entry(pos.fingerprint()) {
             std::collections::hash_map::Entry::Vacant(e) => {
-                let logl =
-                    particle_log_weight(&particle_features(pos, my_color, ctx), &FITTED_THETA);
+                // 粒子尤度NN（likelihood.rs のNN化）。clamp は分布外入力への安全弁
+                let logl = particle_nn_forward(&particle_nn_features(pos, my_color, ctx))
+                    .clamp(-15.0, 15.0);
                 e.insert(uniques.len());
                 uniques.push(Unique {
                     pos,

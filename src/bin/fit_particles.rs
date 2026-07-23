@@ -127,7 +127,10 @@ fn extract_samples(
         let Some(truth) = truth_positions.get(mn as usize - 1) else {
             continue;
         };
-        let ctx = ParticleCtx { opp_landed_last };
+        let ctx = ParticleCtx {
+            opp_landed_last,
+            ..ParticleCtx::default()
+        };
         // ユニーク粒子（真実と同一指紋の粒子は truth 側に統合）。
         // 各候補には推論側のベース重み ln(soft_decay^penalty) をオフセットとして持たせる
         let truth_fp = truth.fingerprint();
