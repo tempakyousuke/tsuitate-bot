@@ -551,6 +551,11 @@ pub struct EvalParams {
     /// （kakutori.kif）ことへの対応。旧 CHECK_CAPTURE_P_LEGAL_FLOOR
     /// （一律0.35のp_legal下限）の置き換え。0 = 無効（従来と同一挙動）
     pub checker_removal_w: f64,
+    /// 捕獲の賭け分散ペナルティの重み。p_hit(1−p_hit) × E[捕獲価値|hit] を
+    /// gain から引く（王手中は無効）。占有が五分に近いマスへの高額な捕獲賭けは
+    /// 空振り分岐の認識悪化（信念の前提崩壊＋進出駒の孤立）を素の期待値が
+    /// 数えないことへの補正。0 = 無効（従来と同一挙動）
+    pub capture_bet_var_w: f64,
 }
 
 impl Default for EvalParams {
@@ -618,6 +623,10 @@ impl Default for EvalParams {
             // 反則観測→仮説減衰→真の捕獲」の系列で、プローブ反則が少し増える
             // 対価はアリーナの反則経済で判定した
             checker_removal_w: 1.0,
+            // 捕獲賭け分散（2026-07-24、play-estimator-20260724 16手目
+            // 「8八と > 8八歩打」レビューを受けて追加）。w スイープと
+            // アリーナで調整する。0 = 従来と同一挙動
+            capture_bet_var_w: 1.0,
         }
     }
 }
@@ -630,7 +639,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 40] = [
+    pub const SPECS: [ParamSpec; 41] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -831,6 +840,11 @@ impl EvalParams {
             lo: 0.0,
             hi: 2.0,
         },
+        ParamSpec {
+            name: "capture_bet_var_w",
+            lo: 0.0,
+            hi: 3.0,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -875,6 +889,7 @@ impl EvalParams {
             self.check_limit_accel,
             self.value_nn_w,
             self.checker_removal_w,
+            self.capture_bet_var_w,
         ]
     }
 
@@ -921,6 +936,7 @@ impl EvalParams {
             check_limit_accel: v[37],
             value_nn_w: v[38],
             checker_removal_w: v[39],
+            capture_bet_var_w: v[40],
         }
     }
 }
@@ -991,6 +1007,17 @@ impl EstimatorStrategy {
         {
             Some(w) => EvalParams {
                 checker_removal_w: w,
+                ..params
+            },
+            None => params,
+        };
+        // 捕獲賭け分散ペナルティの運用ノブ（w スイープ・切り戻し用）
+        let params = match std::env::var("TSUITATE_CAPTURE_BET_VAR_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+        {
+            Some(w) => EvalParams {
+                capture_bet_var_w: w,
                 ..params
             },
             None => params,
@@ -2049,6 +2076,8 @@ fn evaluate(
     let mut risk_sum = 0.0;
     // 着地マスに敵駒がいた（=駒を取れた）粒子の重み。探索ボーナスの不一致度に使う
     let mut capture_hits = 0.0f64;
+    // 捕獲価値の重み付き和（賭け分散ペナルティの stake = E[捕獲価値|hit] 用）
+    let mut capture_value_sum = 0.0f64;
     // 王手になった粒子の重み。王探しの情報利得（判定が割れるほど価値）に使う
     let mut check_hits = 0.0f64;
     // 王周辺の圧力は粒子間の分散が小さいわりに計算が重い（9マス×利き走査）ので
@@ -2085,6 +2114,7 @@ fn evaluate(
         v += captured_value;
         if captured_value > 0.0 {
             capture_hits += w;
+            capture_value_sum += w * captured_value;
         }
 
         let mut next = pos.clone();
@@ -2221,7 +2251,21 @@ fn evaluate(
         } else {
             0.0
         };
-        value_sum / legal
+        // 捕獲の賭け分散ペナルティ: 期待駒得が「占有が割れているマスへの
+        // 大きな捕獲」1本に集中している手を凹に割り引く。素の期待値
+        // p×stake は空振り分岐（賭けの前提が崩れ、進出駒だけが未知領域に
+        // 残る側）の質の悪さを見ないため、信念が五分に近いほど・賭け金
+        // （stake = E[捕獲価値|hit]）が大きいほど p(1−p)×stake で課金する。
+        // 同じ1ビット（マスの占有）を買うなら安い駒のプローブが相対的に
+        // 浮く設計（play-estimator-20260724 16手目: 8八と>8八歩打の逆転が発端）。
+        // 王手中は無効: 王手駒捕獲の序列は CheckSolver（removal_term・p_legal）の
+        // 領分で、五分の信念での捕獲プローブはむしろ推奨挙動（kakutori）
+        let bet_penalty = if capture_hits > 0.0 && !view.you_in_check {
+            params.capture_bet_var_w * p_hit * (1.0 - p_hit) * (capture_value_sum / capture_hits)
+        } else {
+            0.0
+        };
+        value_sum / legal - bet_penalty
             + params.info_bonus * p_hit * (1.0 - p_hit)
             + params.king_probe_bonus * p_chk * (1.0 - p_chk)
             + nn_term
