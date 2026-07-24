@@ -16,7 +16,9 @@ use crate::board::{
 };
 use crate::check::CheckSolver;
 use crate::estimator::{EPS_INFO, Estimator, opp_reply_weights};
-use crate::likelihood::{ParticleCtx, particle_nn_features};
+use crate::likelihood::{
+    FITTED_THETA, ParticleCtx, particle_features, particle_log_weight, particle_nn_features,
+};
 use crate::particle_nn::particle_nn_forward;
 use crate::observation::{Observation, ObservationLog};
 use crate::opening::OpeningBook;
@@ -1357,6 +1359,25 @@ impl Strategy for EstimatorStrategy {
 ///   個体質量の側で効く: 観測を「相手が指しにくい手」でしか説明できない粒子
 ///   （幻の角の飛び込み王手等）を粒子間で相対的に軽くする。
 ///   ソフト減衰はフィルタが logw へ課金済み（EPS_INFO）なのでここでは掛けない
+/// 粒子尤度NN（particle_nn.rs）の温度: logl に掛ける倍率（尤度のべき乗 =
+/// fractional update）。NNのグループ内 logit 振れ幅（max-min 中央値 8.3）は
+/// 旧線形モデル（2.9）の約3倍あり、当初は評価側の粒子混合の崩壊を疑って
+/// 導入したが、シナリオ悪化の真因は王手中の適用（下記ゲートで解決）で、
+/// ゲート後は 0.35 と 1.0 に有意差なし（kakutori 15/20 vs 16/20 等）。
+/// 既定は 1.0（温度なし）とし、アブレーション・切り戻しノブとして残す。
+/// TSUITATE_PARTICLE_NN_SCALE で上書き可（凍結版は反応しない）
+const PARTICLE_NN_SCALE: f64 = 1.0;
+
+fn particle_nn_scale() -> f64 {
+    static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *SCALE.get_or_init(|| {
+        std::env::var("TSUITATE_PARTICLE_NN_SCALE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(PARTICLE_NN_SCALE)
+    })
+}
+
 fn stratified_sample<'a>(
     particles: &'a [Position],
     info_miss: &[u8],
@@ -1388,9 +1409,21 @@ fn stratified_sample<'a>(
         let miss = info_miss.get(i).copied().unwrap_or(0);
         match seen.entry(pos.fingerprint()) {
             std::collections::hash_map::Entry::Vacant(e) => {
-                // 粒子尤度NN（likelihood.rs のNN化）。clamp は分布外入力への安全弁
-                let logl = particle_nn_forward(&particle_nn_features(pos, my_color, ctx))
-                    .clamp(-15.0, 15.0);
+                // 粒子尤度NN（likelihood.rs のNN化）。clamp は分布外入力への安全弁、
+                // PARTICLE_NN_SCALE は粒子混合の崩壊を防ぐ温度（上記参照）。
+                // **王手中は旧線形モデルへフォールバック**: 学習データ上、王手中
+                // グループはどの再重み付けも一様より悪く（NLL: 一様3.83 /
+                // offset-only 5.66 / 線形6.09 / NN 4.33）、王手中の意思決定は
+                // CheckSolver の領分。NN適用だと kakutori 14/20→2〜8/20・
+                // keima 20/20→8〜15/20 と実測悪化した（value_nn の
+                // you_in_check ゲートと同じ構図。2026-07-24）
+                let logl = if ctx.you_in_check {
+                    particle_log_weight(&particle_features(pos, my_color, ctx), &FITTED_THETA)
+                } else {
+                    particle_nn_forward(&particle_nn_features(pos, my_color, ctx))
+                        .clamp(-15.0, 15.0)
+                        * particle_nn_scale()
+                };
                 e.insert(uniques.len());
                 uniques.push(Unique {
                     pos,
