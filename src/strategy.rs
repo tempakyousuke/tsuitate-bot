@@ -1361,12 +1361,14 @@ impl Strategy for EstimatorStrategy {
 ///   ソフト減衰はフィルタが logw へ課金済み（EPS_INFO）なのでここでは掛けない
 /// 粒子尤度NN（particle_nn.rs）の温度: logl に掛ける倍率（尤度のべき乗 =
 /// fractional update）。NNのグループ内 logit 振れ幅（max-min 中央値 8.3）は
-/// 旧線形モデル（2.9）の約3倍あり、当初は評価側の粒子混合の崩壊を疑って
-/// 導入したが、シナリオ悪化の真因は王手中の適用（下記ゲートで解決）で、
-/// ゲート後は 0.35 と 1.0 に有意差なし（kakutori 15/20 vs 16/20 等）。
-/// 既定は 1.0（温度なし）とし、アブレーション・切り戻しノブとして残す。
+/// 旧線形モデル（2.9）の約3倍あり、scale=1.0 だと ansatsu（忍び込み玉への
+/// 1手詰め発見）が 20/20→0/20 に回帰した: NNの「玉は深く進出していない
+/// はず」方向の割り引きが、観測を発生させない忍び込みの真実粒子の質量を
+/// 潰すため。温度応答は単調（1.0→0/20, 0.5→4/20, 0.35→8/20, 0.25→16/20,
+/// 0.15→19/20）で、0.25 でほぼ回復し他シナリオも良好。
+/// scale=1.0 のアリーナは vs v10 51.5%±6.9（強さ中立）だった。
 /// TSUITATE_PARTICLE_NN_SCALE で上書き可（凍結版は反応しない）
-const PARTICLE_NN_SCALE: f64 = 1.0;
+const PARTICLE_NN_SCALE: f64 = 0.25;
 
 fn particle_nn_scale() -> f64 {
     static SCALE: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
