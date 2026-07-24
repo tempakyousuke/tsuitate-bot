@@ -168,6 +168,10 @@ pub struct CandidateScore {
     /// gain のうち王手駒の除去期待値（checker_removal_w × removal_term）分。
     /// 王手中の候補にだけ非ゼロが入る（gain には加算済みの内訳表示）
     pub checker_removal: f64,
+    /// gain から引かれた捕獲の賭け分散ペナルティ
+    /// （capture_bet_var_w × p_hit(1−p_hit) × E[捕獲価値|hit]、王手外のみ）。
+    /// 正の値 = そのぶん gain が減っている（内訳表示。gain には控除済み）
+    pub capture_bet_penalty: f64,
 }
 
 /// 前進を好むヒューリスティック＋乱数（従来実装）
@@ -415,6 +419,10 @@ struct EvalOut {
     /// gain のうち王手駒の除去期待値（checker_removal_w × removal_term）分。
     /// 王手中の候補にだけ入る（内訳表示用。gain には加算済み）
     checker_removal: f64,
+    /// gain から引かれた捕獲の賭け分散ペナルティ
+    /// （capture_bet_var_w × p_hit(1−p_hit) × E[捕獲価値|hit]）。
+    /// 正の値 = そのぶん gain が減っている（内訳表示用。gain には控除済み）
+    capture_bet_penalty: f64,
 }
 
 impl EvalOut {
@@ -1393,6 +1401,7 @@ impl Strategy for EstimatorStrategy {
                 adjust,
                 depth2,
                 checker_removal: out.checker_removal,
+                capture_bet_penalty: out.capture_bet_penalty,
             });
             if best.as_ref().is_none_or(|(_, _, s)| final_score > *s) {
                 best = Some((usi, out.p_legal, final_score));
@@ -2236,6 +2245,8 @@ fn evaluate(
     let degen = 1.0 - (n / budget.eval_particles as f64).min(1.0);
     let w = params.prior_weight + params.prior_weight_degen * degen;
     let p_legal = (legal + prior * w) / (n + w);
+    // 賭け分散ペナルティの内訳（ランキング表示用に expected の外へ持ち出す）
+    let mut capture_bet_penalty = 0.0;
     let expected = if legal > 0.0 {
         // 探索ボーナス: 着地マスの敵駒有無について粒子が割れているほど、
         // 指せば（取れても空でも）推定が絞れる。捕獲の期待値とは別の情報の価値
@@ -2264,12 +2275,11 @@ fn evaluate(
         // 浮く設計（play-estimator-20260724 16手目: 8八と>8八歩打の逆転が発端）。
         // 王手中は無効: 王手駒捕獲の序列は CheckSolver（removal_term・p_legal）の
         // 領分で、五分の信念での捕獲プローブはむしろ推奨挙動（kakutori）
-        let bet_penalty = if capture_hits > 0.0 && !view.you_in_check {
-            params.capture_bet_var_w * p_hit * (1.0 - p_hit) * (capture_value_sum / capture_hits)
-        } else {
-            0.0
-        };
-        value_sum / legal - bet_penalty
+        if capture_hits > 0.0 && !view.you_in_check {
+            capture_bet_penalty =
+                params.capture_bet_var_w * p_hit * (1.0 - p_hit) * (capture_value_sum / capture_hits);
+        }
+        value_sum / legal - capture_bet_penalty
             + params.info_bonus * p_hit * (1.0 - p_hit)
             + params.king_probe_bonus * p_chk * (1.0 - p_chk)
             + nn_term
@@ -2320,6 +2330,7 @@ fn evaluate(
         p_legal,
         foul_cost,
         checker_removal: 0.0,
+        capture_bet_penalty,
     }
 }
 

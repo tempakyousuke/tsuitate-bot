@@ -108,6 +108,8 @@ export interface CandidateScore {
   depth2: boolean;
   /** gain のうち王手駒の除去期待値ぶん（王手中の候補のみ非ゼロ） */
   checker_removal: number;
+  /** gain から引かれた捕獲の賭け分散ペナルティ（正の値、王手外のみ） */
+  capture_bet_penalty: number;
 }
 
 export interface RankingResult {

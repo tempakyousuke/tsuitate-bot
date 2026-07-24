@@ -28,8 +28,18 @@ fn main() {
         for (i, c) in ranking.iter().enumerate() {
             let is_focus = focus.iter().any(|f| f == &c.usi);
             if i < 8 || is_focus {
+                let extras = {
+                    let mut s = String::new();
+                    if c.checker_removal != 0.0 {
+                        s.push_str(&format!(" 除去EV={:+.3}", c.checker_removal));
+                    }
+                    if c.capture_bet_penalty != 0.0 {
+                        s.push_str(&format!(" 賭けpen=-{:.3}", c.capture_bet_penalty));
+                    }
+                    s
+                };
                 println!(
-                    "{:>3} {}{:<6} score={:8.3} gain={:8.3} p_legal={:.3} foul_cost={:7.3} adjust={:7.3} depth2={}",
+                    "{:>3} {}{:<6} score={:8.3} gain={:8.3} p_legal={:.3} foul_cost={:7.3} adjust={:7.3} depth2={}{extras}",
                     i + 1,
                     if is_focus { "*" } else { " " },
                     c.usi,
