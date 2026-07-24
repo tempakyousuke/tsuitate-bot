@@ -281,16 +281,6 @@ const DEPTH2_PARTICLES: usize = 48;
 /// 応手で詰まされる場合のペナルティ（壊滅的なのでSPSA対象にしない）
 const DEPTH2_MATE_PEN: f64 = 30.0;
 
-/// 王手駒捕獲候補（CheckSolver::captures_checker）に敷くp_legalの下限。
-/// CheckSolverの仮説平均化は生存仮説が多いと正しい捕獲でも確率を薄める
-/// （王手駒の粒子ビリーフが誤っている局面では特に顕著。kakutori.kif:
-/// 真の捕獲p_legal=0.061で王移動(p_legal=0.99)に完敗していた）。
-/// 捕獲は「当たれば王手駒を排除、外れても反則1回ぶんの探索コストで済む」
-/// 数少ない手なので、粒子由来のlegal/n項が外していても最低限試す価値を
-/// 保証する（2026-07-20、codexレビュー: 原因1単体では届かない数値だったため
-/// p_legalフロアで対応）
-const CHECK_CAPTURE_P_LEGAL_FLOOR: f64 = 0.35;
-
 /// 駒交換で動く価値: 盤上価値と持ち駒価値（基本駒種）の平均。
 /// 素の駒は piece_value と一致し、成駒は取られても相手の持ち駒に入るのは
 /// 基本駒種ぶんなので割り引かれる（と金を取り返された反動 = (6+1)/2 = 3.5）。
@@ -1196,7 +1186,7 @@ impl Strategy for EstimatorStrategy {
                     None => in_check_prior(view, &mv),
                 };
             }
-            let mut out = evaluate(
+            let out = evaluate(
                 view,
                 &mv,
                 &sample,
@@ -1206,14 +1196,6 @@ impl Strategy for EstimatorStrategy {
                 budget,
                 &mut nn_state_cache,
             );
-            if view.you_in_check
-                && out.gain > 0.0
-                && check_solver
-                    .as_mut()
-                    .is_some_and(|solver| solver.captures_checker(&mv))
-            {
-                out.p_legal = out.p_legal.max(CHECK_CAPTURE_P_LEGAL_FLOOR);
-            }
             if debug_check_enabled && view.you_in_check {
                 eprintln!(
                     "DEBUG {usi}: prior={prior:.4} gain={:.3} p_legal={:.4} foul_cost={:.3} score={:.4}",
