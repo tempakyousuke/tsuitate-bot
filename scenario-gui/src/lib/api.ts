@@ -116,6 +116,37 @@ export interface RankingResult {
   ranking: CandidateScore[];
 }
 
+// ---------- 対局モード（play.rs） ----------
+
+export interface PlayHint {
+  from: string | null; // 打ちのときは null
+  role: Role;
+  to: string;
+  promotion: "none" | "optional" | "forced";
+}
+
+export interface PlayOutcome {
+  winner: Color | null;
+  reason: string; // checkmate | stalemate | resign | foul_limit
+}
+
+export interface PlayView {
+  engine: string;
+  seed: number;
+  budgetMs: number;
+  humanColor: Color;
+  /** 真実の局面（隠す表示はフロント側で行う） */
+  snapshot: Snapshot;
+  /** 人間の手番のときだけ非空 */
+  hints: PlayHint[];
+  /** このコマンドで起きた人間向けイベント */
+  events: string[];
+  totalMoves: number;
+  outcome: PlayOutcome | null;
+  /** bot の直前の手で取られた自駒のマス */
+  capturedSquare: string | null;
+}
+
 export const listScenarios = () => invoke<ScenarioInfo[]>("list_scenarios");
 export const getEngines = () => invoke<string[]>("engines");
 export const loadKifu = (path: string) => invoke<KifuData>("load_kifu", { path });
@@ -135,3 +166,15 @@ export const evalRanking = (
   budgetMs: number,
 ) => invoke<RankingResult>("eval_ranking", { path, ply, engine, seed, budgetMs });
 export const cancelEval = (runId: number) => invoke<void>("cancel_eval", { runId });
+export const playStart = (
+  engine: string,
+  humanColor: Color,
+  seed: number,
+  budgetMs: number,
+) => invoke<PlayView>("play_start", { engine, humanColor, seed, budgetMs });
+export const playHumanMove = (usi: string) => invoke<PlayView>("play_human_move", { usi });
+export const playBotMove = () => invoke<PlayView>("play_bot_move");
+export const playResign = () => invoke<PlayView>("play_resign");
+export const playView = () => invoke<PlayView>("play_view");
+export const playExport = (fileName: string, ply: number | null, desc: string | null) =>
+  invoke<string>("play_export", { fileName, ply, desc });

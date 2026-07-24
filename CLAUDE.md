@@ -77,7 +77,15 @@
   スコア内訳）。思考予算も指定可（900ms=本番相当）。
   リプレイ・選択試行の本体は `src/scenario_core.rs`
   （bin/scenario.rs と共有）。ランキングは `Strategy::last_ranking`
-  （現行 estimator のみ実装。凍結版は編集しないため seed 集計のみ）
+  （現行 estimator のみ実装。凍結版は編集しないため seed 集計のみ）。
+  **対局モード**（ヘッダの「対局」タブ）で人間 vs bot をGUI内で直接対局できる:
+  審判は selfplay.rs と同じ裁定（反則は手番維持でカウント・10回で反則負け・
+  王手宣言）、人間側は自駒のみ表示＋自駒だけ考慮の候補ハイライト
+  （=実対局と同じ情報条件。「真実を表示」トグルあり、時計はなし）。
+  終局後（途中でも可）に `*illegal:` 行つき `.kif` を scenarios/ へ書き出して
+  そのままリプレイ・`bin/scenario`・候補手分析へ流せる（スクラッチDBサーバーを
+  立てる E2E 手順より手軽な実戦レビュー用。KIF 整形は `kifu::kif_body` =
+  bin/make_scenario と共用）。対局セッションの本体は `src-tauri/src/play.rs`
 - `cargo run --release --bin analyze -- records/*.jsonl` — 対局記録の事後分析。
   アリーナも `ARENA_RECORD_DIR` を設定すると候補(A)視点の記録を同形式で出力する
   （CIでは常時有効で artifact `arena-records` に上がる。真実の全手順つきなので

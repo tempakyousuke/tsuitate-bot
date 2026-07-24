@@ -24,6 +24,8 @@ use tsuitate_bot::scenario_core::{
 use tsuitate_bot::shogi::{Position, ShogiMove, parse_usi};
 use tsuitate_bot::strategy::{self, CandidateScore};
 
+mod play;
+
 /// GUI で選べるエンジン。凍結版は内部スコアを出せないので seed 集計のみ、
 /// ランキング（内訳表示）は last_ranking を実装した現行 estimator だけ
 const ENGINES: &[&str] = &[
@@ -610,6 +612,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(EvalState::default())
+        .manage(play::PlayState::default())
         .invoke_handler(tauri::generate_handler![
             list_scenarios,
             engines,
@@ -617,6 +620,12 @@ fn main() {
             eval_tally,
             eval_ranking,
             cancel_eval,
+            play::play_start,
+            play::play_human_move,
+            play::play_bot_move,
+            play::play_resign,
+            play::play_view,
+            play::play_export,
         ])
         .run(tauri::generate_context!())
         .expect("tauri アプリの起動に失敗");

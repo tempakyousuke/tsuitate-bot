@@ -19,6 +19,7 @@ use std::collections::HashMap;
 
 use crate::board::Coord;
 use crate::protocol::Role;
+use crate::shogi::{Position, ShogiMove, parse_usi, promote_role, unpromote_role};
 
 /// 受理された1手。同・成・打は解決済み（KIF には移動元が常に付くので曖昧性がない）
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,6 +325,161 @@ pub fn parse_kif(text: &str) -> Result<Kifu, String> {
     Ok(kifu)
 }
 
+// ---------- KIF 書き出し（Shogi Quest 風。parse_kif と往復できる） ----------
+
+/// KIF 表記の駒名（書き出しと GUI 表示の共用）
+pub fn role_kanji(role: Role) -> &'static str {
+    use Role::*;
+    match role {
+        Pawn => "歩",
+        Lance => "香",
+        Knight => "桂",
+        Silver => "銀",
+        Gold => "金",
+        Bishop => "角",
+        Rook => "飛",
+        King => "玉",
+        Tokin => "と",
+        Promotedlance => "成香",
+        Promotedknight => "成桂",
+        Promotedsilver => "成銀",
+        Horse => "馬",
+        Dragon => "龍",
+    }
+}
+
+fn role_foul_code(role: Role) -> &'static str {
+    use Role::*;
+    match role {
+        Pawn => "FU",
+        Lance => "KY",
+        Knight => "KE",
+        Silver => "GI",
+        Gold => "KI",
+        Bishop => "KA",
+        Rook => "HI",
+        King => "OU",
+        Tokin => "TO",
+        Promotedlance => "NY",
+        Promotedknight => "NK",
+        Promotedsilver => "NG",
+        Horse => "UM",
+        Dragon => "RY",
+    }
+}
+
+fn kif_move_line(no: usize, pos: &Position, usi: &str, prev_to: Option<Coord>) -> Result<String, String> {
+    let mv = parse_usi(usi).ok_or_else(|| format!("{no}手目のUSIを解釈できません: {usi}"))?;
+    match mv {
+        ShogiMove::Drop { to, role } => Ok(format!(
+            "{no} {}{}{}打",
+            to.file,
+            KANJI_RANKS[(to.rank - 1) as usize],
+            role_kanji(role)
+        )),
+        ShogiMove::Board { from, to, promote } => {
+            let piece = pos
+                .piece_at(from)
+                .ok_or_else(|| format!("{no}手目 {usi}: 移動元に駒がありません"))?;
+            // 成る手は成る前の駒名（例: 角成）、既に成っている駒はそのまま
+            let name = if promote {
+                role_kanji(unpromote_role(piece.role))
+            } else {
+                role_kanji(piece.role)
+            };
+            let dest = if Some(to) == prev_to {
+                "同　".to_string()
+            } else {
+                format!("{}{}", to.file, KANJI_RANKS[(to.rank - 1) as usize])
+            };
+            let suffix = if promote { "成" } else { "" };
+            Ok(format!(
+                "{no} {dest}{name}{suffix}({}{})",
+                from.file, from.rank
+            ))
+        }
+    }
+}
+
+/// *illegal 行の1エントリ。駒コードは「移動後の駒」（parse 側の規約と対）
+fn kif_foul_entry(pos: &Position, usi: &str) -> Result<String, String> {
+    let mv = parse_usi(usi).ok_or_else(|| format!("反則試行のUSIを解釈できません: {usi}"))?;
+    match mv {
+        ShogiMove::Drop { to, role } => {
+            Ok(format!("00{}{}{}", to.file, to.rank, role_foul_code(role)))
+        }
+        ShogiMove::Board { from, to, promote } => {
+            let piece = pos
+                .piece_at(from)
+                .ok_or_else(|| format!("反則試行 {usi}: 移動元に駒がありません"))?;
+            let role = if promote {
+                promote_role(piece.role).unwrap_or(piece.role)
+            } else {
+                piece.role
+            };
+            Ok(format!(
+                "{}{}{}{}{}",
+                from.file,
+                from.rank,
+                to.file,
+                to.rank,
+                role_foul_code(role)
+            ))
+        }
+    }
+}
+
+/// 真実の全手順と反則試行から KIF 本文（指し手行・*illegal 行・終局行）を組み立てる。
+/// `foul_attempts` は (試行時点の move_number, USI)。move_number が受理された手の
+/// 手数と同じものはその手の *illegal 行に、`moves.len()` を超えるものは終局行の
+/// 後の trailing になる。`ending` は「投了」「反則負け」等の終局宣言
+/// （None で trailing がある場合は「中断」を自動で入れる: trailing は終局行の
+/// 後でないとパーサーが直前の手の反則と誤読するため）。
+/// 合法性は検証しない（真実データを信頼する。検証は scenario_core::replay の領分）
+pub fn kif_body(
+    moves: &[String],
+    foul_attempts: &[(u32, String)],
+    ending: Option<&str>,
+) -> Result<String, String> {
+    let mut out = String::new();
+    let mut pos = Position::initial();
+    let mut prev_to: Option<Coord> = None;
+    for (i, usi) in moves.iter().enumerate() {
+        let no = i + 1;
+        out.push_str(&kif_move_line(no, &pos, usi, prev_to)?);
+        out.push('\n');
+        let codes: Vec<String> = foul_attempts
+            .iter()
+            .filter(|(mn, _)| *mn as usize == no)
+            .map(|(_, fusi)| kif_foul_entry(&pos, fusi))
+            .collect::<Result<_, _>>()?;
+        if !codes.is_empty() {
+            out.push_str(&format!("*illegal:{}\n", codes.join(",")));
+        }
+        let mv = parse_usi(usi).ok_or_else(|| format!("USIを解釈できません: {usi}"))?;
+        prev_to = Some(match mv {
+            ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+        });
+        pos.play_unchecked(&mv);
+    }
+    let trailing: Vec<&(u32, String)> = foul_attempts
+        .iter()
+        .filter(|(mn, _)| *mn as usize > moves.len())
+        .collect();
+    let ending = ending.or(if trailing.is_empty() { None } else { Some("中断") });
+    if let Some(term) = ending {
+        out.push_str(&format!("{} {term}\n", moves.len() + 1));
+        if !trailing.is_empty() {
+            let codes: Vec<String> = trailing
+                .iter()
+                .map(|(_, fusi)| kif_foul_entry(&pos, fusi))
+                .collect::<Result<_, _>>()?;
+            out.push_str(&format!("*illegal:{}\n", codes.join(",")));
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -437,5 +593,46 @@ mod tests {
     fn 異常な手数はエラーになる() {
         let err = parse_kif("99999999999999999999999 ７六歩(77)\n").unwrap_err();
         assert!(err.contains("手数"), "{err}");
+    }
+
+    #[test]
+    fn kif_bodyはparse_kifと往復できる() {
+        // 成・同・打を含む手順と、盤上駒/打ちの反則試行・trailing を往復させる
+        let moves: Vec<String> = ["7g7f", "3a3b", "8h2b+", "3b2b", "B*4e"]
+            .map(String::from)
+            .to_vec();
+        let fouls = vec![
+            (2, "2b3c".to_string()),  // 2手目の前の後手の反則試行（盤上駒）
+            (5, "P*5e".to_string()),  // 5手目の前の先手の反則試行（打ち）
+            (6, "4e5d".to_string()),  // 終局行の後の trailing
+        ];
+        let body = kif_body(&moves, &fouls, None).unwrap();
+        let kifu = parse_kif(&body).unwrap();
+        assert_eq!(usi_seq(&kifu), moves);
+        assert_eq!(kifu.plies[1].fouls, vec![RawFoul::Board {
+            from: Coord { file: 2, rank: 2 },
+            to: Coord { file: 3, rank: 3 },
+            role: Role::Bishop,
+        }]);
+        assert_eq!(kifu.plies[4].fouls, vec![RawFoul::Drop {
+            role: Role::Pawn,
+            to: Coord { file: 5, rank: 5 },
+        }]);
+        // trailing は自動で「中断」行の後に出る
+        assert!(body.contains("6 中断"), "{body}");
+        assert_eq!(kifu.trailing_fouls.len(), 1);
+    }
+
+    #[test]
+    fn kif_bodyの終局行と成り反則コードを書ける() {
+        let moves: Vec<String> = ["7g7f", "3a3b"].map(String::from).to_vec();
+        // 8八の角を2二へ成り込もうとした反則（コードは移動後の駒 = UM）
+        let fouls = vec![(3, "8h2b+".to_string())];
+        let body = kif_body(&moves, &fouls, Some("投了")).unwrap();
+        assert!(body.contains("3 投了"), "{body}");
+        assert!(body.contains("*illegal:8822UM"), "{body}");
+        let kifu = parse_kif(&body).unwrap();
+        assert_eq!(usi_seq(&kifu), moves);
+        assert_eq!(kifu.trailing_fouls.len(), 1);
     }
 }

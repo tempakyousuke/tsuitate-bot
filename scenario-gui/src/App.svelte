@@ -4,6 +4,7 @@
   import Board from "./lib/Board.svelte";
   import MoveList from "./lib/MoveList.svelte";
   import AnalysisPanel from "./lib/AnalysisPanel.svelte";
+  import PlayPanel from "./lib/PlayPanel.svelte";
   import {
     getEngines,
     listScenarios,
@@ -12,6 +13,7 @@
     type ScenarioInfo,
   } from "./lib/api";
 
+  let mode = $state<"replay" | "play">("replay");
   let scenarios = $state<ScenarioInfo[]>([]);
   let engines = $state<string[]>([]);
   let selectedPath = $state("");
@@ -54,8 +56,15 @@
     return Math.max(0, Math.min(p, kifu?.totalPlies ?? 0));
   }
 
+  // 対局モードで書き出した kif をそのままリプレイで開く
+  async function openExported(path: string) {
+    mode = "replay";
+    scenarios = await listScenarios();
+    await loadPath(path);
+  }
+
   function onKeydown(ev: KeyboardEvent) {
-    if (kifu == null) return;
+    if (mode !== "replay" || kifu == null) return;
     const tag = (ev.target as HTMLElement | null)?.tagName;
     if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
     if (ev.key === "ArrowLeft") {
@@ -72,36 +81,49 @@
 
 <main>
   <header>
-    <label>
-      シナリオ
-      <select
-        value={selectedPath}
-        onchange={(ev) => {
-          const path = ev.currentTarget.value;
-          if (path !== "") void loadPath(path);
-        }}
-      >
-        <option value="" disabled>選択…</option>
-        {#each scenarios.filter((s) => !s.archived) as s (s.path)}
-          <option value={s.path}>{s.name}（{s.totalPlies}手）</option>
-        {/each}
-        {#each scenarios.filter((s) => s.archived) as s (s.path)}
-          <option value={s.path}>archive/{s.name}（{s.totalPlies}手）</option>
-        {/each}
-      </select>
-    </label>
-    <button onclick={openFile}>.kif を開く…</button>
-    {#if kifu}
-      <span class="kifu-name">{kifu.name}</span>
-      {#if kifu.desc}<span class="desc">{kifu.desc}</span>{/if}
+    <nav class="mode-nav">
+      <button class:active={mode === "replay"} onclick={() => (mode = "replay")}>
+        リプレイ
+      </button>
+      <button class:active={mode === "play"} onclick={() => (mode = "play")}>対局</button>
+    </nav>
+    {#if mode === "replay"}
+      <label>
+        シナリオ
+        <select
+          value={selectedPath}
+          onchange={(ev) => {
+            const path = ev.currentTarget.value;
+            if (path !== "") void loadPath(path);
+          }}
+        >
+          <option value="" disabled>選択…</option>
+          {#each scenarios.filter((s) => !s.archived) as s (s.path)}
+            <option value={s.path}>{s.name}（{s.totalPlies}手）</option>
+          {/each}
+          {#each scenarios.filter((s) => s.archived) as s (s.path)}
+            <option value={s.path}>archive/{s.name}（{s.totalPlies}手）</option>
+          {/each}
+        </select>
+      </label>
+      <button onclick={openFile}>.kif を開く…</button>
+      {#if kifu}
+        <span class="kifu-name">{kifu.name}</span>
+        {#if kifu.desc}<span class="desc">{kifu.desc}</span>{/if}
+      {/if}
     {/if}
   </header>
 
-  {#if loadError !== ""}
+  <!-- 対局モードは非表示でもマウントしたままにする（進行中の対局状態を保つ） -->
+  <div class="tab" style:display={mode === "play" ? "contents" : "none"}>
+    <PlayPanel {engines} onOpenKifu={openExported} />
+  </div>
+
+  {#if mode === "replay" && loadError !== ""}
     <div class="error">{loadError}</div>
   {/if}
 
-  {#if kifu && snapshot}
+  {#if mode === "replay" && kifu && snapshot}
     <div class="content">
       <section class="left">
         <Board {snapshot} {flipped} />
@@ -156,7 +178,7 @@
         <AnalysisPanel path={kifu.path} {ply} target={kifu.target} {engines} />
       </section>
     </div>
-  {:else}
+  {:else if mode === "replay"}
     <div class="placeholder">
       シナリオを選ぶか .kif ファイルを開いてください（scenarios/*.kif 形式、
       *illegal: 行・*scenario ディレクティブ対応）
@@ -185,6 +207,25 @@
     align-items: center;
     gap: 6px;
     color: var(--text-dim);
+  }
+
+  .mode-nav {
+    display: flex;
+    gap: 0;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+
+  .mode-nav button {
+    border: none;
+    border-radius: 0;
+    padding: 4px 14px;
+  }
+
+  .mode-nav button.active {
+    background: var(--accent);
+    color: #fff;
   }
 
   .kifu-name {
