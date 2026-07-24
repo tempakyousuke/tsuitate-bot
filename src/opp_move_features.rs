@@ -12,7 +12,7 @@ use crate::board::Coord;
 use crate::protocol::{Color, Role};
 use crate::shogi::{Position, ShogiMove};
 
-pub const OPP_MOVE_FEATURES: usize = 24;
+pub const OPP_MOVE_FEATURES: usize = 25;
 
 pub const FEATURE_NAMES: [&str; OPP_MOVE_FEATURES] = [
     "advance",          // 前進量（段）
@@ -57,6 +57,12 @@ pub const FEATURE_NAMES: [&str; OPP_MOVE_FEATURES] = [
     // シグナルであり、突撃・様子見などの方針変化が学習できるはず。
     // v9凍結（反則に反応する教師の自己対局データが取れるようになった）で
     // ブートストラップ依存が解消されたため追加
+    "en_prise_flee", // 位置が既知の敵駒（known_squares 上の駒）から当たりを
+    // 付けられているマスの駒（玉以外）を動かす手。king_flee の全駒種一般化
+    // （2026-07-24）: tokin-bet.kif で「8七のと金（歩成で位置が露見済み）に
+    // 当てられた8八の角が逃げた」という当然の推論を粒子が持たず、占有信念が
+    // 五分のまま残った。逃げ・攻撃駒の捕獲・かわしを一括で「当たられた駒を
+    // 動かす」条件として立て、重みの学習はNNに委ねる
 ];
 
 /// 駒種特化ブロック（末尾10特徴量）。one-hotは成る前の駒種（unpromote）で
@@ -158,6 +164,28 @@ pub fn newly_threatens(
             ShogiMove::Board { from, .. } => !pos.attacks(from, s),
             ShogiMove::Drop { .. } => true,
         }
+    })
+}
+
+/// 位置が既知の敵駒（known_squares 上に立つ mover の敵駒）から当たりを
+/// 付けられているマスの駒（玉以外）を動かす手か（en-prise 回避）。
+/// 玉は king_flee が担うので除外。打ちは常に false
+pub fn moved_from_known_attacked(
+    pos: &Position,
+    mv: &ShogiMove,
+    mover: Color,
+    known_squares: &HashSet<Coord>,
+) -> bool {
+    let ShogiMove::Board { from, .. } = *mv else {
+        return false;
+    };
+    if pos.piece_at(from).is_some_and(|p| p.role == Role::King) {
+        return false;
+    }
+    known_squares.iter().any(|&s| {
+        s != from
+            && pos.piece_at(s).is_some_and(|p| p.color != mover)
+            && pos.attacks(s, from)
     })
 }
 
@@ -271,6 +299,7 @@ pub fn opp_move_features(
         pt[8],
         pt[9],
         f64::from(my_foul_count_last_turn),
+        moved_from_known_attacked(pos, mv, mover, known_squares) as u8 as f64,
     ]
 }
 

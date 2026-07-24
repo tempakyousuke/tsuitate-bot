@@ -1545,6 +1545,7 @@ fn sample_opp_move(
             hangs_on_landing(pos, &next, &mv, opp),
             foul_count_this_turn,
             my_foul_count_last_turn,
+            moved_from_known_attacked(pos, &mv, opp, known_squares),
         );
         total_mass += w;
         if consistent {
@@ -1701,6 +1702,7 @@ pub fn opp_reply_weights(
             hangs_on_landing(pos, &next, &mv, opp),
             0,
             my_foul_count_this_turn,
+            moved_from_known_attacked(pos, &mv, opp, known_squares),
         );
         if let ShogiMove::Board { to, .. } = mv {
             let captures_mine = pos.piece_at(to).is_some_and(|p| p.color == my_color);
@@ -1775,6 +1777,28 @@ fn flees_danger(from: Coord, to: Coord, danger: &[Coord]) -> bool {
     }
 }
 
+/// 位置が既知の敵駒（known 上に立つ mover の敵駒）から当たりを付けられている
+/// マスの駒（玉以外）を動かす手か（en-prise 回避）。
+/// **定義は opp_move_features::moved_from_known_attacked と一致させること**
+fn moved_from_known_attacked(
+    pos: &Position,
+    mv: &ShogiMove,
+    mover: Color,
+    known: &[Coord],
+) -> bool {
+    let ShogiMove::Board { from, .. } = *mv else {
+        return false;
+    };
+    if pos.piece_at(from).is_some_and(|p| p.role == Role::King) {
+        return false;
+    }
+    known.iter().any(|&s| {
+        s != from
+            && pos.piece_at(s).is_some_and(|p| p.color != mover)
+            && pos.attacks(s, from)
+    })
+}
+
 /// 相手の手の尤度づけ。2026-07-21、NN段階①-a: bin/fit_opp の12特徴量
 /// 線形フィット（旧実装、パープレキシティ24.2）を1隠れ層MLP
 /// （`opp_move_nn::opp_move_nn_forward`）へ置き換えた。
@@ -1801,6 +1825,7 @@ fn opp_move_weight(
     hang: bool,
     foul_count_this_turn: u32,
     my_foul_count_last_turn: u32,
+    en_prise_flee: bool,
 ) -> f64 {
     let (advance, is_drop, promotes) = match *mv {
         ShogiMove::Board { from, to, promote } => {
@@ -1838,6 +1863,7 @@ fn opp_move_weight(
         pt[8],
         pt[9],
         f64::from(my_foul_count_last_turn),
+        en_prise_flee as u8 as f64,
     ];
     // クランプ: NNは訓練データの分布から外れた入力（リプレイの仮説探索中に
     // 現れる、実戦ではまれな特徴量の組み合わせ）に対して極端なlogitを出しうる
@@ -2757,6 +2783,7 @@ mod tests {
                 pt[8],
                 pt[9],
                 f64::from(my_foul_count_last_turn),
+                moved_from_known_attacked(&pos, &mv, mover, &known_squares) as u8 as f64,
             ];
 
             let shared_features = opp_move_features::opp_move_features(
