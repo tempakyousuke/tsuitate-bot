@@ -626,7 +626,7 @@ impl Default for EvalParams {
             // 捕獲賭け分散（2026-07-24、play-estimator-20260724 16手目
             // 「8八と > 8八歩打」レビューを受けて追加）。w スイープと
             // アリーナで調整する。0 = 従来と同一挙動
-            capture_bet_var_w: 1.0,
+            capture_bet_var_w: 2.0,
         }
     }
 }
