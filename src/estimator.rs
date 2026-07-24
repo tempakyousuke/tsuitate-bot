@@ -1864,6 +1864,7 @@ fn opp_move_weight(
         pt[9],
         f64::from(my_foul_count_last_turn),
         en_prise_flee as u8 as f64,
+        (en_prise_flee && pt[9] == 1.0) as u8 as f64,
     ];
     // クランプ: NNは訓練データの分布から外れた入力（リプレイの仮説探索中に
     // 現れる、実戦ではまれな特徴量の組み合わせ）に対して極端なlogitを出しうる
@@ -2251,7 +2252,9 @@ mod tests {
     #[test]
     fn reply_weights_apply_recapture_boost_deterministically() {
         // 7g7f / 3c3d / 8h2b+ の後、3a2b（取り返し）の重みは
-        // 2b が既知地点のときだけ PREDICT_RECAPTURE_BOOST 倍される
+        // 2b が既知地点のときだけ PREDICT_RECAPTURE_BOOST 倍される。
+        // known={2b} は en_prise_flee（馬に当てられた3a銀の移動）も立てるので、
+        // NNの特徴量応答ぶんを除いた倍率がちょうどブースト値になることを確認する
         let mut pos = Position::initial();
         for usi in ["7g7f", "3c3d", "8h2b+"] {
             pos.play_unchecked(&parse_usi(usi).unwrap());
@@ -2266,9 +2269,29 @@ mod tests {
         };
         let with_boost = weight_of(&[Coord { file: 2, rank: 2 }]);
         let without = weight_of(&[]);
+        // known 差で変わる特徴量は en_prise_flee のみ（threat_known は着地マス
+        // 自身を対象にしない・銀なので king_flee も無関係）。そのNN応答比を
+        // 共有モジュール経由で独立に計算して除する
+        let mut next = pos.clone();
+        next.play_unchecked(&recapture);
+        let mover = pos.turn();
+        let known_set: std::collections::HashSet<Coord> =
+            [Coord { file: 2, rank: 2 }].into_iter().collect();
+        let empty_set: std::collections::HashSet<Coord> = std::collections::HashSet::new();
+        let f_with = crate::opp_move_features::opp_move_features(
+            &pos, &next, &recapture, mover, &known_set, &empty_set, 0, 0,
+        );
+        let f_without = crate::opp_move_features::opp_move_features(
+            &pos, &next, &recapture, mover, &empty_set, &empty_set, 0, 0,
+        );
+        assert_ne!(f_with, f_without, "en_prise_flee が立っていない（テスト前提が崩れた）");
+        let nn_ratio = (crate::opp_move_nn::opp_move_nn_forward(&f_with)
+            .clamp(-15.0, 15.0)
+            - crate::opp_move_nn::opp_move_nn_forward(&f_without).clamp(-15.0, 15.0))
+        .exp();
         assert!(
-            (with_boost / without - PREDICT_RECAPTURE_BOOST).abs() < 1e-6,
-            "with={with_boost} without={without}"
+            (with_boost / without / nn_ratio - PREDICT_RECAPTURE_BOOST).abs() < 1e-6,
+            "with={with_boost} without={without} nn_ratio={nn_ratio}"
         );
     }
 
@@ -2784,6 +2807,8 @@ mod tests {
                 pt[9],
                 f64::from(my_foul_count_last_turn),
                 moved_from_known_attacked(&pos, &mv, mover, &known_squares) as u8 as f64,
+                (moved_from_known_attacked(&pos, &mv, mover, &known_squares) && pt[9] == 1.0)
+                    as u8 as f64,
             ];
 
             let shared_features = opp_move_features::opp_move_features(

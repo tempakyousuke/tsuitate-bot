@@ -12,7 +12,7 @@ use crate::board::Coord;
 use crate::protocol::{Color, Role};
 use crate::shogi::{Position, ShogiMove};
 
-pub const OPP_MOVE_FEATURES: usize = 25;
+pub const OPP_MOVE_FEATURES: usize = 26;
 
 pub const FEATURE_NAMES: [&str; OPP_MOVE_FEATURES] = [
     "advance",          // 前進量（段）
@@ -63,6 +63,13 @@ pub const FEATURE_NAMES: [&str; OPP_MOVE_FEATURES] = [
     // 当てられた8八の角が逃げた」という当然の推論を粒子が持たず、占有信念が
     // 五分のまま残った。逃げ・攻撃駒の捕獲・かわしを一括で「当たられた駒を
     // 動かす」条件として立て、重みの学習はNNに委ねる
+    "en_prise_flee_home", // en_prise_flee × from_home の明示的交互作用。
+    // 「初期配置のまま動いていない駒に既知の当たりが付いた」ケースは
+    // 教師データで選択率が約2倍（24.1% vs 12.9%、角）に跳ねる最重要セル
+    // なのに、行数が希少（324/286万行）でMLPが単独では学習できなかった
+    // （反実仮想Δlogitが-0.14と逆符号）。信念は未動駒にこそ集中する
+    // （「未観測の駒は初期配置のまま」）ので、このセルの較正が占有信念の
+    // 精度を直接左右する。識別性を上げるため線形の直通路を与える
 ];
 
 /// 駒種特化ブロック（末尾10特徴量）。one-hotは成る前の駒種（unpromote）で
@@ -274,6 +281,7 @@ pub fn opp_move_features(
     let deep_unsup = deep_unsupported(next, mv, mover);
     let hang = hangs_on_landing(pos, next, mv, mover);
     let pt = piece_type_features(pos, mv, mover);
+    let en_prise = moved_from_known_attacked(pos, mv, mover, known_squares);
     [
         advance_of(mv, mover),
         (promotes && minor) as u8 as f64,
@@ -299,7 +307,8 @@ pub fn opp_move_features(
         pt[8],
         pt[9],
         f64::from(my_foul_count_last_turn),
-        moved_from_known_attacked(pos, mv, mover, known_squares) as u8 as f64,
+        en_prise as u8 as f64,
+        (en_prise && pt[9] == 1.0) as u8 as f64,
     ]
 }
 
