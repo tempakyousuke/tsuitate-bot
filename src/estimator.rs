@@ -1864,7 +1864,6 @@ fn opp_move_weight(
         pt[9],
         f64::from(my_foul_count_last_turn),
         en_prise_flee as u8 as f64,
-        (en_prise_flee && pt[9] == 1.0) as u8 as f64,
     ];
     // クランプ: NNは訓練データの分布から外れた入力（リプレイの仮説探索中に
     // 現れる、実戦ではまれな特徴量の組み合わせ）に対して極端なlogitを出しうる
@@ -2807,8 +2806,6 @@ mod tests {
                 pt[9],
                 f64::from(my_foul_count_last_turn),
                 moved_from_known_attacked(&pos, &mv, mover, &known_squares) as u8 as f64,
-                (moved_from_known_attacked(&pos, &mv, mover, &known_squares) && pt[9] == 1.0)
-                    as u8 as f64,
             ];
 
             let shared_features = opp_move_features::opp_move_features(
