@@ -1,0 +1,6 @@
+{
+  "identifier": "default",
+  "description": "scenario デバッガ既定の権限",
+  "windows": ["main"],
+  "permissions": ["core:default", "dialog:default"]
+}

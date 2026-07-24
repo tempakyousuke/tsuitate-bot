@@ -2,3 +2,8 @@
 /tune-log.jsonl
 /records/
 /human-review/
+/scenario-gui/node_modules/
+/scenario-gui/dist/
+/scenario-gui/src-tauri/target/
+/scenario-gui/src-tauri/gen/
+/scenario-gui/public/fixtures/

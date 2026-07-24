@@ -3,6 +3,28 @@
 Shogi Quest からエクスポートした棋譜をそのまま置くと、`bin/scenario` が
 任意の局面を再現して bot の選択・信念・終盤遂行を測定できる。
 
+## GUI デバッガ（scenario-gui）
+
+盤面を目視しながら任意 ply の候補手を調べたいときは Tauri 製 GUI が使える:
+
+```
+cd scenario-gui
+npm install          # 初回のみ
+npm run tauri dev
+```
+
+- `.kif` の取り込み（scenarios/ ドロップダウン or ファイルダイアログ）、
+  スライダー/←→キーでの再生、先手/後手の視点切り替え
+- 分析は2方式: **seed集計**（`bin/scenario` の選択実験と同じ意味論。全エンジン対応、
+  2エンジン並べて回帰チェック可）と **ランキング**（現行 estimator のみ、
+  1回の choose の全候補スコア内訳 gain / p_legal / foul_cost / adjust）
+- 評価はその局面の**手番側**として行う（手番側の観測ログだけを与える。CLI と同じ規約）
+- 思考予算（`TSUITATE_THINK_BUDGET_MS` 相当、既定2000ms）もGUIから指定できる
+  （900ms=本番相当。エンジン構築時に env へ反映、実行は直列化して競合を防ぐ）
+- リプレイ・裁定・選択試行の実装は `src/scenario_core.rs`（CLI と共有）
+- フロントだけを確認したいときは `npm run dev` → `http://localhost:1421/?mock=1`
+  （invoke をフィクスチャで置き換えるモック。生成手順は `src/mock.ts` 冒頭）
+
 ## 追加手順
 
 ### Shogi Quest の実戦棋譜から

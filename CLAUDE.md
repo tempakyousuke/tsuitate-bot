@@ -71,6 +71,13 @@
   `-f scenarios="kakutori keima"` で対象を絞れる。総合表は aggregate ジョブの
   サマリー（suite と同形式）。注意: 試行はシード同一でも壁時計ベースの
   予算スケールで揺れるため、10試行の±2〜3件差はノイズ。版比較は20試行×両版で
+- `cd scenario-gui` → `npm run tauri dev` — シナリオデバッグ GUI（Tauri）。
+  `.kif` の取り込み・任意 ply までの再生・先後視点切り替え・候補手分析
+  （seed集計=全エンジン対応で回帰比較可 / ランキング=現行 estimator の
+  スコア内訳）。思考予算も指定可（900ms=本番相当）。
+  リプレイ・選択試行の本体は `src/scenario_core.rs`
+  （bin/scenario.rs と共有）。ランキングは `Strategy::last_ranking`
+  （現行 estimator のみ実装。凍結版は編集しないため seed 集計のみ）
 - `cargo run --release --bin analyze -- records/*.jsonl` — 対局記録の事後分析。
   アリーナも `ARENA_RECORD_DIR` を設定すると候補(A)視点の記録を同形式で出力する
   （CIでは常時有効で artifact `arena-records` に上がる。真実の全手順つきなので

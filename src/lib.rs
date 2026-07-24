@@ -18,6 +18,7 @@ pub mod opp_move_features;
 pub mod opp_move_nn;
 pub mod protocol;
 pub mod record;
+pub mod scenario_core;
 pub mod selfplay;
 pub mod shogi;
 pub mod strategy;

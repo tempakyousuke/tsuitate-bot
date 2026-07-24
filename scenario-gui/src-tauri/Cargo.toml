@@ -1,0 +1,23 @@
+[package]
+name = "scenario-gui"
+version = "0.1.0"
+edition = "2021"
+description = "tsuitate-bot の scenario デバッグ GUI"
+
+# 親クレート（tsuitate-bot）とは独立してビルドする
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tsuitate-bot = { path = "../.." }
+
+# `tauri dev`（devプロファイル）でも estimator が実用速度で回るように
+# 依存クレート（tsuitate-bot 含む）だけ最適化する。GUI クレート自体は debug のまま
+[profile.dev.package."*"]
+opt-level = 3

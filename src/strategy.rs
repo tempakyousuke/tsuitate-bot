@@ -43,6 +43,13 @@ pub trait Strategy {
         None
     }
 
+    /// 直近の choose 時点の全候補評価（スコア降順）。scenario-gui のデバッグ表示用。
+    /// 現行 estimator のみ実装する（凍結版は編集しないので既定 None のまま）。
+    /// 定跡で指した手番・候補ゼロの手番は None
+    fn last_ranking(&self) -> Option<&[CandidateScore]> {
+        None
+    }
+
     /// 観測ログを内部推定器に先行反映する（候補評価はしない）。
     /// 実対局では choose が自分の手番ごとに呼ばれて推定器が逐次更新される
     /// （リプレイ予算も手番ごとに与えられる）。局面再現実験（bin/scenario）が
@@ -142,6 +149,22 @@ pub fn make(name: &str) -> Option<Box<dyn Strategy + Send>> {
         "estimator_v10" => Some(Box::new(crate::frozen::estimator_v10::EstimatorV10::new())),
         _ => None,
     }
+}
+
+/// 1候補の評価内訳（`Strategy::last_ranking` 用）。
+/// score = combine_score(gain, p_legal, foul_cost) + adjust で、
+/// depth2=true の候補は gain が2手読みで再構築された値
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CandidateScore {
+    pub usi: String,
+    pub score: f64,
+    pub gain: f64,
+    pub p_legal: f64,
+    pub foul_cost: f64,
+    /// gain の外側の補正（タイブレーク乱数・手戻り減点・ブラインド玉攻め等）
+    pub adjust: f64,
+    /// 2手読み（上位 depth2_top_k 候補の再評価）を通ったか
+    pub depth2: bool,
 }
 
 /// 前進を好むヒューリスティック＋乱数（従来実装）
@@ -906,6 +929,8 @@ pub struct EstimatorStrategy {
     rng: StdRng,
     /// 直近の choose 時点の内部状態（記録用）
     last_debug: Option<serde_json::Value>,
+    /// 直近の choose 時点の全候補評価（スコア降順、scenario-gui 用）
+    last_ranking: Option<Vec<CandidateScore>>,
 }
 
 impl EstimatorStrategy {
@@ -953,6 +978,7 @@ impl EstimatorStrategy {
                 None => StdRng::seed_from_u64(rand::rng().random()),
             },
             last_debug: None,
+            last_ranking: None,
         }
     }
 }
@@ -982,6 +1008,8 @@ impl Strategy for EstimatorStrategy {
     ) -> Option<String> {
         let budget = self.budget;
         let seed = self.seed;
+        // 定跡・候補ゼロで早期 return したとき前の手番のランキングが残らないように
+        self.last_ranking = None;
         let est = self.est.get_or_insert_with(|| match seed {
             Some(s) => Estimator::with_seed_and_scale(view.your_color, s, budget.scale),
             None => Estimator::with_scale(view.your_color, budget.scale),
@@ -1267,8 +1295,10 @@ impl Strategy for EstimatorStrategy {
         scored.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
         // (usi, 選択手の p_legal, スコア)
         let mut best: Option<(String, f64, f64)> = None;
+        let mut ranking: Vec<CandidateScore> = vec![];
         for (i, (usi, mv, out, adjust, score)) in scored.into_iter().enumerate() {
-            let final_score = if i < budget.depth2_top_k {
+            let depth2 = i < budget.depth2_top_k;
+            let (final_gain, final_score) = if depth2 {
                 let delta = depth2_delta(
                     view,
                     &mv,
@@ -1282,14 +1312,25 @@ impl Strategy for EstimatorStrategy {
                     &mut *rng,
                 );
                 let gain2 = out.gain + params.depth2_replace * (out.risk_mean + delta);
-                combine_score(gain2, out.p_legal, out.foul_cost) + adjust
+                (gain2, combine_score(gain2, out.p_legal, out.foul_cost) + adjust)
             } else {
-                score
+                (out.gain, score)
             };
+            ranking.push(CandidateScore {
+                usi: usi.clone(),
+                score: final_score,
+                gain: final_gain,
+                p_legal: out.p_legal,
+                foul_cost: out.foul_cost,
+                adjust,
+                depth2,
+            });
             if best.as_ref().is_none_or(|(_, _, s)| final_score > *s) {
                 best = Some((usi, out.p_legal, final_score));
             }
         }
+        ranking.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        self.last_ranking = Some(ranking);
 
         let mut debug = debug_summary(est, &sample, push);
         // 選択手の p(合法) 予測を記録へ残す（C-7 P3 の前提整備: アリーナ真実の
@@ -1310,6 +1351,10 @@ impl Strategy for EstimatorStrategy {
 
     fn debug_state(&self) -> Option<serde_json::Value> {
         self.last_debug.clone()
+    }
+
+    fn last_ranking(&self) -> Option<&[CandidateScore]> {
+        self.last_ranking.as_deref()
     }
 }
 
