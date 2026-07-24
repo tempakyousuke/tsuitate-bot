@@ -514,6 +514,14 @@ pub struct EvalParams {
     /// （54手目9二香: 意味を問わない advance_bias だけで手が決まる問題）。
     /// 0 = NN無効（従来と同一挙動）
     pub value_nn_w: f64,
+    /// 王手中の仮説条件付き「王手駒の除去期待値」（CheckSolver::removal_term、
+    /// 歩価値スケール）の重み。王手駒のマスを取る手には+交換価値、王手駒を
+    /// 盤に残す解消手には−残存脅威を、受理を条件付けた仮説の事後分布で
+    /// 平均して gain へ加算する。p_legal は合法性しか平均しないため、粒子が
+    /// 真の王手駒を外している局面では捕獲の価値が評価のどこにも現れない
+    /// （kakutori.kif）ことへの対応。旧 CHECK_CAPTURE_P_LEGAL_FLOOR
+    /// （一律0.35のp_legal下限）の置き換え。0 = 無効（従来と同一挙動）
+    pub checker_removal_w: f64,
 }
 
 impl Default for EvalParams {
@@ -574,6 +582,13 @@ impl Default for EvalParams {
             // 変えられず（17/20）、w=6で2/20に反転。王手中の反則増（dragon-check-
             // drop）は you_in_check ゲートで遮断したうえでの採用値
             value_nn_w: 6.0,
+            // 仮説条件付き除去期待値（2026-07-24、p_legalフロアの置き換え）。
+            // w スイープ（kakutori 捕獲率: w=0.5で10/20, w=1で19/20, w=2で18/20 /
+            // dragon-check-drop: w=1で玉逃げ20/20維持・反則18→28 /
+            // keima: w=1で捕獲20/20維持）から採用。挙動は「捕獲プローブ→
+            // 反則観測→仮説減衰→真の捕獲」の系列で、プローブ反則が少し増える
+            // 対価はアリーナの反則経済で判定した
+            checker_removal_w: 1.0,
         }
     }
 }
@@ -586,7 +601,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 39] = [
+    pub const SPECS: [ParamSpec; 40] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -782,6 +797,11 @@ impl EvalParams {
             lo: 0.0,
             hi: 10.0,
         },
+        ParamSpec {
+            name: "checker_removal_w",
+            lo: 0.0,
+            hi: 2.0,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -825,6 +845,7 @@ impl EvalParams {
             self.foul_diff_pow,
             self.check_limit_accel,
             self.value_nn_w,
+            self.checker_removal_w,
         ]
     }
 
@@ -870,6 +891,7 @@ impl EvalParams {
             foul_diff_pow: v[36],
             check_limit_accel: v[37],
             value_nn_w: v[38],
+            checker_removal_w: v[39],
         }
     }
 }
@@ -927,6 +949,17 @@ impl EstimatorStrategy {
         {
             Some(w) => EvalParams {
                 value_nn_w: w,
+                ..params
+            },
+            None => params,
+        };
+        // 除去期待値項の運用ノブ（w スイープ・切り戻し用）
+        let params = match std::env::var("TSUITATE_CHECKER_REMOVAL_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+        {
+            Some(w) => EvalParams {
+                checker_removal_w: w,
                 ..params
             },
             None => params,
@@ -1186,7 +1219,7 @@ impl Strategy for EstimatorStrategy {
                     None => in_check_prior(view, &mv),
                 };
             }
-            let out = evaluate(
+            let mut out = evaluate(
                 view,
                 &mv,
                 &sample,
@@ -1196,6 +1229,21 @@ impl Strategy for EstimatorStrategy {
                 budget,
                 &mut nn_state_cache,
             );
+            // 王手中: 仮説条件付きの「王手駒の除去期待値」（check.rs::removal_term）。
+            // 王手駒のマスを取る手は受理された未来で脅威ごと駒を排除し、玉逃げ等の
+            // 解消手は王手駒を盤に残す。この差は粒子が真の王手駒を外している局面
+            // （kakutori.kif）では gain に現れないため、CheckSolver の仮説分布で
+            // 補正する。gain の内側（= combine_score の p_legal 割引の内側）に
+            // 置くこと: 王手中の加点を外側に置くと反則確実な手が素通りする
+            // （dragon-check-drop の教訓）
+            if view.you_in_check && params.checker_removal_w != 0.0 {
+                if let Some(term) = check_solver
+                    .as_mut()
+                    .and_then(|solver| solver.removal_term(&mv))
+                {
+                    out.gain += params.checker_removal_w * term;
+                }
+            }
             if debug_check_enabled && view.you_in_check {
                 eprintln!(
                     "DEBUG {usi}: prior={prior:.4} gain={:.3} p_legal={:.4} foul_cost={:.3} score={:.4}",

@@ -46,6 +46,11 @@ const UNEXPLAINED_FOUL_DECAY: f64 = 0.15;
 /// 粒子投票の強さ（全粒子が一致した仮説は一様仮説の 1+PARTICLE_VOTE_W 倍）
 const PARTICLE_VOTE_W: f64 = 8.0;
 
+/// 残存脅威（threat_of）の重み: 王手駒に攻撃されている自駒の交換価値に掛ける係数
+const THREAT_MATERIAL_W: f64 = 0.5;
+/// 残存脅威の重み: 自玉の隣接マス1つへの利き（逃げ場を縛り続ける圧力）の価値
+const THREAT_KING_ZONE_W: f64 = 0.5;
+
 struct Hypothesis {
     square: Coord,
     role: Role,
@@ -57,6 +62,8 @@ pub struct CheckSolver {
     base: Position,
     my_color: Color,
     hypotheses: Vec<Hypothesis>,
+    /// 仮説ごとの残存脅威（threat_of）の遅延キャッシュ。hypotheses と同じ並び
+    threat_cache: Vec<Option<f64>>,
 }
 
 impl CheckSolver {
@@ -115,11 +122,13 @@ impl CheckSolver {
             base,
             my_color,
             hypotheses: vec![],
+            threat_cache: vec![],
         };
         solver.enumerate(&opponent_role_counts(view, log));
         if solver.hypotheses.is_empty() {
             return None;
         }
+        solver.threat_cache = vec![None; solver.hypotheses.len()];
         solver.vote_by_particles(particles);
         for foul in fouls_this_turn {
             solver.observe_foul(foul);
@@ -241,12 +250,9 @@ impl CheckSolver {
     /// mv が「王手駒仮説のマスへ、自玉以外の駒で移動して、その仮説の下で
     /// 王手が解消する」手か = 王手駒を捕獲しに行く手か。
     ///
-    /// `resolve_probability`は仮説ごとの重みで平均するため、生存仮説が
-    /// 多いと正しい捕獲でも確率が薄まってしまう（王手駒の粒子ビリーフが
-    /// 誤っている局面では特に顕著。kakutori.kif参照）。捕獲そのものは
-    /// 「当たれば王手駒を排除できる、外れても反則1回ぶんの探索コストで
-    /// 済む」性質を持つ数少ない手なので、combine_score側でp_legalの
-    /// フロアとして特別扱いする（strategy.rsのchoose参照）
+    /// かつては p_legal フロア（CHECK_CAPTURE_P_LEGAL_FLOOR）の発動条件
+    /// だったが、フロアは removal_term（仮説条件付き期待値）に置き換えられた。
+    /// 診断・テスト用に残している
     pub fn captures_checker(&mut self, mv: &ShogiMove) -> bool {
         let ShogiMove::Board { from, to, .. } = *mv else {
             return false;
@@ -260,6 +266,111 @@ impl CheckSolver {
             }
         }
         false
+    }
+
+    /// 仮説 i の王手駒が（王手解消後も）盤に残った場合に自陣へ残す圧力
+    /// （歩価値スケール）。攻撃されている自駒の交換価値と、自玉隣接マスへの
+    /// 利き（逃げ場を縛り続ける圧力）の和。候補手にほぼ依存しないので
+    /// 仮説ごとに1回だけ計算してキャッシュする（着手による自駒配置の変化は
+    /// 無視する近似）
+    fn threat_of(&mut self, i: usize) -> f64 {
+        if let Some(t) = self.threat_cache[i] {
+            return t;
+        }
+        let (sq, role) = {
+            let h = &self.hypotheses[i];
+            (h.square, h.role)
+        };
+        let opp = self.my_color.other();
+        self.base
+            .set(sq, Some(crate::shogi::Piece { color: opp, role }));
+        let targets: Vec<(Coord, Role)> = self
+            .base
+            .pieces()
+            .filter(|(_, p)| p.color == self.my_color && p.role != Role::King)
+            .map(|(c, p)| (c, p.role))
+            .collect();
+        let mut t = 0.0;
+        for (c, r) in targets {
+            if self.base.attacks(sq, c) {
+                t += THREAT_MATERIAL_W * crate::strategy::exchange_value(r);
+            }
+        }
+        if let Some(king) = self.base.king_square(self.my_color) {
+            for df in -1..=1i8 {
+                for dr in -1..=1i8 {
+                    if df == 0 && dr == 0 {
+                        continue;
+                    }
+                    let a = Coord {
+                        file: king.file + df,
+                        rank: king.rank + dr,
+                    };
+                    if (1..=9).contains(&a.file)
+                        && (1..=9).contains(&a.rank)
+                        && self.base.attacks(sq, a)
+                    {
+                        t += THREAT_KING_ZONE_W;
+                    }
+                }
+            }
+        }
+        self.base.set(sq, None);
+        self.threat_cache[i] = Some(t);
+        t
+    }
+
+    /// 仮説条件付きの「王手駒の除去期待値」（歩価値スケール、非負）。
+    /// mv が受理された（=王手を解消した）と条件付けた仮説の事後分布で、
+    /// 王手駒のマスを取る未来の +（交換価値 + 回避された残存脅威 threat_of）を
+    /// 平均する。捕獲は受理された未来では王手駒が消えており、玉逃げ等の解消手は
+    /// 王手駒（1五角だったなら角）が盤に残って自陣を睨み続ける、という非対称を
+    /// gain 側へ伝える。p_legal（resolve_probability）は合法性しか平均しない
+    /// ため、粒子が真の王手駒を外している局面ではこの差が評価のどこにも
+    /// 現れず、捕獲が玉逃げに完敗していた（kakutori.kif）。
+    ///
+    /// **正項のみ**にする理由: 王手駒が生き残る未来に −threat を課す対称形は
+    /// 候補間の相対順序こそ同じだが、合法な解消手ほぼ全員の絶対水準を沈める。
+    /// min 形式の combine_score では負の gain は p_legal で割り引かれず全額
+    /// 効くため、ペナルティが反則コストの水位を越えると非合法寄りのプローブが
+    /// 相対的に浮上する（実測: kakutori 20試行で追加反則 4→28 に爆発）。
+    /// 王手中の候補はその手番内でしか比較されないので、全体を正側へ平行移動
+    /// しても選択への副作用はない。
+    ///
+    /// **玉による捕獲は加点しない**（captures_checker と同じ除外）: 隣接マスへの
+    /// 玉移動はすべて「そのマスの王手駒仮説の捕獲」になるため、加点すると
+    /// 逃げ手全員が capture 並みに膨らんで相対差が消える（実測: kakutori で
+    /// 3g2g の gain 0.3→10.4）。玉捕獲は相手駒に紐があれば反則になるだけで、
+    /// 駒を失わずに王手駒を排除しに行く探索プローブの非対称な価値も持たない。
+    /// mv がどの仮説の下でも受理されない・仮説が全滅している場合は None
+    pub fn removal_term(&mut self, mv: &ShogiMove) -> Option<f64> {
+        let to = match *mv {
+            ShogiMove::Board { to, .. } => to,
+            ShogiMove::Drop { to, .. } => to,
+        };
+        let from_king = match *mv {
+            ShogiMove::Board { from, .. } => self.base.king_square(self.my_color) == Some(from),
+            ShogiMove::Drop { .. } => false,
+        };
+        let mut legal_w = 0.0;
+        let mut term = 0.0;
+        for i in 0..self.hypotheses.len() {
+            if !self.legal_under(i, mv) {
+                continue;
+            }
+            let (w, sq, role) = {
+                let h = &self.hypotheses[i];
+                (h.weight, h.square, h.role)
+            };
+            legal_w += w;
+            if sq == to && !from_king {
+                term += w * (crate::strategy::exchange_value(role) + self.threat_of(i));
+            }
+        }
+        if legal_w <= 1e-12 {
+            return None;
+        }
+        Some(term / legal_w)
     }
 
     #[cfg(test)]
@@ -455,6 +566,29 @@ mod tests {
         assert!(!solver.captures_checker(&mv("5e5d")));
         assert!(!solver.captures_checker(&mv("1e1b")));
         assert!(!solver.captures_checker(&mv("P*5d")));
+    }
+
+    #[test]
+    fn removal_term_prefers_capturing_the_checker_over_escaping() {
+        // 5e 玉・4e 金。4e5d の捕獲は受理された未来（5d 王手駒仮説）では
+        // 王手駒が消えているので大きな正、玉逃げ 5e5f は大半の受理仮説で
+        // 王手駒が盤に残るのでほぼゼロになるはず
+        let view = view_with(vec![("5e", Role::King), ("4e", Role::Gold)]);
+        let mut solver = CheckSolver::new(&view, &[], &[], &ObservationLog::default()).unwrap();
+        let capture = solver.removal_term(&mv("4e5d")).unwrap();
+        let escape = solver.removal_term(&mv("5e5f")).unwrap();
+        assert!(capture > 0.0, "捕獲は正の除去期待値のはず（{capture:.3}）");
+        assert!(escape >= 0.0, "正項のみなので負にはならない（{escape:.3}）");
+        assert!(capture > escape);
+    }
+
+    #[test]
+    fn removal_term_is_none_when_no_hypothesis_accepts_the_move() {
+        // どの王手駒仮説の下でも王手を解消しない手（その場に留まる別駒の横動き
+        // 相当が無いので、離れた金の無関係な移動で代用）は None
+        let view = view_with(vec![("5e", Role::King), ("1a", Role::Gold)]);
+        let mut solver = CheckSolver::new(&view, &[], &[], &ObservationLog::default()).unwrap();
+        assert!(solver.removal_term(&mv("1a1b")).is_none());
     }
 
     #[test]
