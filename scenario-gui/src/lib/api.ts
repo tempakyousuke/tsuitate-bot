@@ -106,6 +106,8 @@ export interface CandidateScore {
   foul_cost: number;
   adjust: number;
   depth2: boolean;
+  /** gain のうち王手駒の除去期待値ぶん（王手中の候補のみ非ゼロ） */
+  checker_removal: number;
 }
 
 export interface RankingResult {

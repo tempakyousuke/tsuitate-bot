@@ -165,6 +165,9 @@ pub struct CandidateScore {
     pub adjust: f64,
     /// 2手読み（上位 depth2_top_k 候補の再評価）を通ったか
     pub depth2: bool,
+    /// gain のうち王手駒の除去期待値（checker_removal_w × removal_term）分。
+    /// 王手中の候補にだけ非ゼロが入る（gain には加算済みの内訳表示）
+    pub checker_removal: f64,
 }
 
 /// 前進を好むヒューリスティック＋乱数（従来実装）
@@ -409,6 +412,9 @@ struct EvalOut {
     risk_mean: f64,
     p_legal: f64,
     foul_cost: f64,
+    /// gain のうち王手駒の除去期待値（checker_removal_w × removal_term）分。
+    /// 王手中の候補にだけ入る（内訳表示用。gain には加算済み）
+    checker_removal: f64,
 }
 
 impl EvalOut {
@@ -1269,7 +1275,8 @@ impl Strategy for EstimatorStrategy {
                     .as_mut()
                     .and_then(|solver| solver.removal_term(&mv))
                 {
-                    out.gain += params.checker_removal_w * term;
+                    out.checker_removal = params.checker_removal_w * term;
+                    out.gain += out.checker_removal;
                 }
             }
             if debug_check_enabled && view.you_in_check {
@@ -1354,6 +1361,7 @@ impl Strategy for EstimatorStrategy {
                 foul_cost: out.foul_cost,
                 adjust,
                 depth2,
+                checker_removal: out.checker_removal,
             });
             if best.as_ref().is_none_or(|(_, _, s)| final_score > *s) {
                 best = Some((usi, out.p_legal, final_score));
@@ -2263,6 +2271,7 @@ fn evaluate(
         risk_mean: if legal > 0.0 { risk_sum / legal } else { 0.0 },
         p_legal,
         foul_cost,
+        checker_removal: 0.0,
     }
 }
 

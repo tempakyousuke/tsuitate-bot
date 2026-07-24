@@ -242,6 +242,7 @@
             <th>手</th>
             <th>score</th>
             <th>gain</th>
+            <th title="gainのうち王手駒の除去期待値ぶん（王手中のみ）">除去EV</th>
             <th>p_legal</th>
             <th>foul_cost</th>
             <th>adjust</th>
@@ -255,6 +256,7 @@
               <td>{c.usi}{c.usi === target ? " ★" : ""}</td>
               <td>{fmt(c.score)}</td>
               <td>{fmt(c.gain)}</td>
+              <td>{c.checker_removal !== 0 ? fmt(c.checker_removal) : ""}</td>
               <td>{fmt(c.p_legal)}</td>
               <td>{fmt(c.foul_cost)}</td>
               <td>{fmt(c.adjust)}</td>
