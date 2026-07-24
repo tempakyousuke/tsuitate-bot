@@ -93,3 +93,14 @@ jq 'select(.type=="done") | .final' tuning/tune-rush.jsonl
   **オラクル測定（2026-07-16、ARENA_ORACLE_A）**: 全反則回避で vs v6 86.2%±4.8 /
   王手中のみ回避で 59.5%±7.1 — 反則経済に36ptの伸びしろは実在する。
   次の本命は構造改修（C-7: 連続重み・観測尤度・ESSの粒子フィルタ）
+- `tune-v10.jsonl` — 第5ラウンド（2026-07-23〜24、value_nn_w+攻め・圧力系
+  9次元マスク（attack_w/pressure_w/advance_w/threat_w/info_bonus/
+  king_probe_bonus/coverage_w/tokin_probe_w/value_nn_w）・span0.6・
+  60反復×2×60局 vs v10、GCE Spot）。**不発**: final_score 0.442、
+  評価スコアは前半0.474→終盤0.487でトレンドなし。value_nn_w は
+  6.0→5.77 とほぼ不動（凍結時の w スイープが既に最適近傍だった証拠）、
+  他の8次元も±25%以内の微動。「SPSAは未調整の新パラメータがあるときだけ
+  効く」の追認で、EvalParams::default への反映なし。
+  途中2回のSpot停止あり（TUNE_LOGから再開。1回は設定一致チェックが
+  浮動小数点1ULP差で誤検知→TUNE_FORCE_RESUME=1のdrop-inで解消、
+  メモリ tune-resume-float-ulp-trap 参照）
