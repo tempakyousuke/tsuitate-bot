@@ -11,7 +11,9 @@ use crate::protocol::{Color, Role};
 use crate::shogi::{Position, ShogiMove, piece_value};
 use crate::strategy::{drop_check_danger, exchange_value, king_zone_pressure};
 
-pub const VALUE_FEATURES: usize = 16;
+/// 局面側の特徴量数（既存16 + 接近4）。列順は
+/// [既存16, 接近4] で固定する（学習CSV・推論の組み立ての両方がこの順）
+pub const VALUE_FEATURES: usize = 20;
 
 pub const VALUE_FEATURE_NAMES: [&str; VALUE_FEATURES] = [
     "material_diff",     // 自分の駒価値合計（盤上+持ち駒） − 相手の同値
@@ -30,6 +32,11 @@ pub const VALUE_FEATURE_NAMES: [&str; VALUE_FEATURES] = [
     "my_max_exchange_loss", // 相手に取られた場合の最悪交換損失（取り返しの補償を差し引いた後）
     "opp_max_exchange_loss", // 同、相手側（=自分が仕掛けられる最悪の交換損失）
     "ply_progress",        // 手数を100で割った進行度（局面フェーズの粗い指標）
+    // 接近特徴量（2026-07-25追加。詳細は APPROACH_DIST_CAP 付近のdocコメント）
+    "my_prey_proximity",  // 自分の駒から見た「価値×近さ」が最大の敵駒
+    "opp_prey_proximity", // 同、相手側
+    "my_king_siege",      // 相手玉へ寄っている自分の駒の 価値×近さ の総和
+    "opp_king_siege",     // 同、相手側（自玉が寄せられている度合い）
 ];
 
 fn camp_rank_range(owner: Color) -> std::ops::RangeInclusive<i8> {
@@ -134,6 +141,7 @@ fn max_exchange_loss(pos: &Position, color: Color) -> f64 {
 /// 手番ごとに `me` を指定して両方の視点を作れる）
 pub fn value_features(pos: &Position, me: Color) -> [f64; VALUE_FEATURES] {
     let opp = me.other();
+    let approach = approach_state_features(pos, me);
     [
         material_sum(pos, me) - material_sum(pos, opp),
         hand_value(pos, me),
@@ -151,6 +159,10 @@ pub fn value_features(pos: &Position, me: Color) -> [f64; VALUE_FEATURES] {
         max_exchange_loss(pos, me),
         max_exchange_loss(pos, opp),
         f64::from(pos.move_number()) / 100.0,
+        approach[0],
+        approach[1],
+        approach[2],
+        approach[3],
     ]
 }
 
@@ -195,9 +207,15 @@ fn closeness(dist: Option<u32>) -> f64 {
     APPROACH_DECAY.powi(d.saturating_sub(1) as i32)
 }
 
+/// 紐つき（相手が守っている）獲物の割引率。取っても取り返されるので、
+/// 寄せる価値はそのぶん低い（threat_value の THREAT_DEFENDED_DISCOUNT と同じ発想）
+const PREY_DEFENDED_DISCOUNT: f64 = 0.45;
+
 /// `from` にいる `role` の駒から見た「獲物の近さ」= 敵駒（玉除く）のうち
 /// `価値 × 近さ` が最大のもの。**これが1手先だけを見る threat_value の一般化**で、
-/// 距離2・3の獲物にも減衰した価値がつくので、寄せていく途中の手に勾配が立つ
+/// 距離2・3の獲物にも減衰した価値がつくので、寄せていく途中の手に勾配が立つ。
+/// 紐つきの獲物は割り引く（2026-07-26 修正。当初は生の価値を使っていたが、
+/// 「取り返される獲物へ寄る価値」を過大評価していた）
 fn prey_proximity_from(
     pos: &Position,
     me: Color,
@@ -207,7 +225,10 @@ fn prey_proximity_from(
     let opp = me.other();
     pos.pieces()
         .filter(|(_, p)| p.color == opp && p.role != Role::King)
-        .map(|(sq, p)| exchange_value(p.role) * closeness(moves_to_reach(role, me, from, sq)))
+        .map(|(sq, p)| {
+            let defended = if pos.is_attacked(sq, opp) { PREY_DEFENDED_DISCOUNT } else { 1.0 };
+            exchange_value(p.role) * defended * closeness(moves_to_reach(role, me, from, sq))
+        })
         .fold(0.0, f64::max)
 }
 
@@ -252,12 +273,19 @@ pub fn approach_state_features(pos: &Position, me: Color) -> [f64; APPROACH_STAT
     ]
 }
 
-pub const APPROACH_TRANSITION_FEATURES: usize = 3;
+pub const APPROACH_TRANSITION_FEATURES: usize = 5;
 
 pub const APPROACH_TRANSITION_FEATURE_NAMES: [&str; APPROACH_TRANSITION_FEATURES] = [
     "king_approach",       // この手で着手駒が相手玉へ縮めた手数（打ちは0）
     "prey_approach",       // この手で着手駒の「獲物の近さ」が増えた量（打ちは0）
     "king_closeness_after", // 着手後の着手駒→相手玉の近さ（打ちも定義できる）
+    // 「紐をつけながら寄せる」の観点（2026-07-26、人間レビュー指摘）。
+    // 将棋では単に近づくのではなく、取られても取り返せる形で寄せることが要る。
+    // 実測（1536局・静かな手7.7万件）でも接近の実現利得は駒種で符号が逆転して
+    // いた（歩 -1.10 / 香桂銀 -0.64 / 金飛角と成駒 +1.18）ので、裸の距離だけでは
+    // 足りない
+    "moved_piece_supported", // 着手後、着地マスを自分の他の駒が守っているか
+    "supported_prey_approach", // 紐つきで寄せたぶんだけの prey_approach
 ];
 
 /// 着手側の接近特徴量。`transition_features` と同じ規約（`mover` が指した側）。
@@ -297,10 +325,19 @@ pub fn approach_transition_features(
         }
         ShogiMove::Drop { .. } => (0.0, 0.0),
     };
-    [king_approach, prey_approach, closeness(dist_after)]
+    // 紐 = 着地マスを自分の**他の**駒が守っているか（自分自身は自マスを攻撃しない）
+    let supported = f64::from(after.is_attacked(to, mover));
+    [
+        king_approach,
+        prey_approach,
+        closeness(dist_after),
+        supported,
+        if supported > 0.0 { prey_approach } else { 0.0 },
+    ]
 }
 
-pub const TRANSITION_FEATURES: usize = 6;
+/// 着手側の特徴量数（既存6 + 接近5）。列順は [既存6, 接近5]
+pub const TRANSITION_FEATURES: usize = 11;
 
 pub const TRANSITION_FEATURE_NAMES: [&str; TRANSITION_FEATURES] = [
     "moved_piece_value",           // 直前に着手された駒（動いた/打たれた駒）の価値
@@ -309,6 +346,11 @@ pub const TRANSITION_FEATURE_NAMES: [&str; TRANSITION_FEATURES] = [
     "captured_value",              // その着手で取った相手駒の価値（打つ手・非取りなら0）
     "net_capture_then_recapture",  // captured_value − moved_piece_exchange_loss（この一手の実質損得）
     "gives_check",                 // その着手で相手に王手をかけたか
+    "king_approach",               // この手で着手駒が相手玉へ縮めた手数（打ちは0）
+    "prey_approach",               // この手で着手駒の「獲物の近さ」が増えた量（打ちは0）
+    "king_closeness_after",        // 着手後の着手駒→相手玉の近さ（打ちも定義できる）
+    "moved_piece_supported",       // 着手後、着地マスを自分の他の駒が守っているか
+    "supported_prey_approach",     // 紐つきで寄せたぶんだけの prey_approach
 ];
 
 /// 直前の着手（`mv`）固有の特徴量。`max_hanging_value`/`max_exchange_loss`は
@@ -355,6 +397,7 @@ pub fn transition_features(
         ShogiMove::Drop { .. } => 0.0,
     };
 
+    let approach = approach_transition_features(before, mv, after, mover);
     [
         moved_value,
         hanging,
@@ -362,6 +405,11 @@ pub fn transition_features(
         captured_value,
         captured_value - exchange_loss,
         f64::from(after.in_check(opp)),
+        approach[0],
+        approach[1],
+        approach[2],
+        approach[3],
+        approach[4],
     ]
 }
 

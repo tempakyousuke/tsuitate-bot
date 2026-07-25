@@ -19,13 +19,9 @@
 use tsuitate_bot::protocol::GameEndPayload;
 use tsuitate_bot::shogi::{Position, parse_usi};
 use tsuitate_bot::value_features::{
-    APPROACH_STATE_FEATURE_NAMES, APPROACH_TRANSITION_FEATURE_NAMES, APPROACH_TRANSITION_FEATURES,
-    TRANSITION_FEATURE_NAMES, TRANSITION_FEATURES, VALUE_FEATURE_NAMES, approach_state_features,
-    approach_transition_features, transition_features, value_features,
+    TRANSITION_FEATURE_NAMES, TRANSITION_FEATURES, VALUE_FEATURE_NAMES, transition_features,
+    value_features,
 };
-
-/// 着手側の特徴量の総数（既存 + 接近）。列順は export_value_data と同じ
-const TRANS_ALL: usize = TRANSITION_FEATURES + APPROACH_TRANSITION_FEATURES;
 
 const MIN_QUALITY_GAP: f64 = 0.5;
 
@@ -47,18 +43,11 @@ fn main() {
         std::process::exit(1);
     }
 
-    let state_names: Vec<String> = VALUE_FEATURE_NAMES
-        .iter()
-        .chain(APPROACH_STATE_FEATURE_NAMES.iter())
-        .map(|s| s.to_string())
-        .collect();
-    let trans_names: Vec<&str> = TRANSITION_FEATURE_NAMES
-        .iter()
-        .chain(APPROACH_TRANSITION_FEATURE_NAMES.iter())
-        .copied()
-        .collect();
-    let good_names: Vec<String> = trans_names.iter().map(|s| format!("good_{s}")).collect();
-    let bad_names: Vec<String> = trans_names.iter().map(|s| format!("bad_{s}")).collect();
+    let state_names: Vec<String> = VALUE_FEATURE_NAMES.iter().map(|s| s.to_string()).collect();
+    let good_names: Vec<String> =
+        TRANSITION_FEATURE_NAMES.iter().map(|s| format!("good_{s}")).collect();
+    let bad_names: Vec<String> =
+        TRANSITION_FEATURE_NAMES.iter().map(|s| format!("bad_{s}")).collect();
     println!(
         "game_id,ply,{},{},{},quality_gap",
         state_names.join(","),
@@ -81,21 +70,17 @@ fn main() {
             let side = pos.turn();
             let legals = pos.legal_moves();
 
-            let mut best: Option<(f64, [f64; TRANS_ALL])> = None;
-            let mut worst: Option<(f64, [f64; TRANS_ALL])> = None;
+            let mut best: Option<(f64, [f64; TRANSITION_FEATURES])> = None;
+            let mut worst: Option<(f64, [f64; TRANSITION_FEATURES])> = None;
             for mv in &legals {
                 let mut after = pos.clone();
                 after.play_unchecked(mv);
-                let base = transition_features(&pos, mv, &after, side);
-                let approach = approach_transition_features(&pos, mv, &after, side);
-                let mut t = [0.0; TRANS_ALL];
-                t[..TRANSITION_FEATURES].copy_from_slice(&base);
-                t[TRANSITION_FEATURES..].copy_from_slice(&approach);
+                let t = transition_features(&pos, mv, &after, side);
                 // 優劣の基準は**従来どおり駒得のみ**にしておく。接近特徴量を
                 // 基準に混ぜると「接近は良い」を教師側で作り込むことになり、
                 // 学習後の検証が循環する（接近項が重みを得るかどうかは、
                 // 勝敗ラベルと駒得ペアからの学習結果として観測したい）
-                let quality = base[4]; // net_capture_then_recapture
+                let quality = t[4]; // net_capture_then_recapture
                 if best.is_none_or(|(q, _)| quality > q) {
                     best = Some((quality, t));
                 }
@@ -108,12 +93,7 @@ fn main() {
                 let gap = qg - qb;
                 if gap >= MIN_QUALITY_GAP {
                     let state = value_features(&pos, side);
-                    let state_approach = approach_state_features(&pos, side);
-                    let state_s: Vec<String> = state
-                        .iter()
-                        .chain(state_approach.iter())
-                        .map(|x| x.to_string())
-                        .collect();
+                    let state_s: Vec<String> = state.iter().map(|x| x.to_string()).collect();
                     let good_s: Vec<String> = good.iter().map(|x| x.to_string()).collect();
                     let bad_s: Vec<String> = bad.iter().map(|x| x.to_string()).collect();
                     buf.push(format!(
