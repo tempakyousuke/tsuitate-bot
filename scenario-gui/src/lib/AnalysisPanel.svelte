@@ -350,6 +350,8 @@
             <th>gain</th>
             <th title="gainのうち王手駒の除去期待値ぶん（王手中のみ）">除去EV</th>
             <th title="gainから引かれた捕獲の賭け分散ペナルティ p_hit(1−p_hit)×E[捕獲価値|hit]×w（王手外のみ）">賭けpen</th>
+            <th title="gainに加算された詰めろ生成ボーナス（この手の後に自分の打ち一手詰めが成立する確率×w）">詰めろ</th>
+            <th title="gainから引かれた被詰めろペナルティ（この手の後に相手の打ち一手詰めが残る確率×w）">被詰めろ</th>
             <th>p_legal</th>
             <th>foul_cost</th>
             <th>adjust</th>
@@ -365,6 +367,8 @@
               <td>{fmt(c.gain)}</td>
               <td>{c.checker_removal !== 0 ? fmt(c.checker_removal) : ""}</td>
               <td>{c.capture_bet_penalty !== 0 ? `−${fmt(c.capture_bet_penalty)}` : ""}</td>
+              <td>{c.mate_threat ? `+${fmt(c.mate_threat)}` : ""}</td>
+              <td>{c.mate_risk ? `−${fmt(c.mate_risk)}` : ""}</td>
               <td>{fmt(c.p_legal)}</td>
               <td>{fmt(c.foul_cost)}</td>
               <td>{fmt(c.adjust)}</td>

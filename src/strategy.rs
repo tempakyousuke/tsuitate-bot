@@ -180,6 +180,11 @@ pub struct CandidateScore {
     /// （capture_bet_var_w × p_hit(1−p_hit) × E[捕獲価値|hit]、王手外のみ）。
     /// 正の値 = そのぶん gain が減っている（内訳表示。gain には控除済み）
     pub capture_bet_penalty: f64,
+    /// gain に加算された詰めろ生成ボーナス（mate_threat_w × 成立確率 × 健全度）
+    pub mate_threat: f64,
+    /// gain から引かれた被詰めろペナルティ（mate_risk_w × 危険確率 × 健全度）。
+    /// 正の値 = そのぶん gain が減っている
+    pub mate_risk: f64,
 }
 
 /// 前進を好むヒューリスティック＋乱数（従来実装）
@@ -445,6 +450,10 @@ struct EvalOut {
     /// （capture_bet_var_w × p_hit(1−p_hit) × E[捕獲価値|hit]）。
     /// 正の値 = そのぶん gain が減っている（内訳表示用。gain には控除済み）
     capture_bet_penalty: f64,
+    /// gain に加算された詰めろ生成ボーナス（内訳表示用）
+    mate_threat: f64,
+    /// gain から引かれた被詰めろペナルティ（正の値。内訳表示用）
+    mate_risk: f64,
 }
 
 impl EvalOut {
@@ -1489,6 +1498,8 @@ impl Strategy for EstimatorStrategy {
                 depth2,
                 checker_removal: out.checker_removal,
                 capture_bet_penalty: out.capture_bet_penalty,
+                mate_threat: out.mate_threat,
+                mate_risk: out.mate_risk,
             });
             if best.as_ref().is_none_or(|(_, _, s)| final_score > *s) {
                 best = Some((usi, out.p_legal, final_score));
@@ -2491,6 +2502,8 @@ fn evaluate(
         foul_cost,
         checker_removal: 0.0,
         capture_bet_penalty,
+        mate_threat,
+        mate_risk,
     }
 }
 

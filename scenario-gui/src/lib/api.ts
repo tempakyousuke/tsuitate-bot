@@ -110,6 +110,10 @@ export interface CandidateScore {
   checker_removal: number;
   /** gain から引かれた捕獲の賭け分散ペナルティ（正の値、王手外のみ） */
   capture_bet_penalty: number;
+  /** gain に加算された詰めろ生成ボーナス */
+  mate_threat: number;
+  /** gain から引かれた被詰めろペナルティ（正の値） */
+  mate_risk: number;
 }
 
 export interface RankingResult {

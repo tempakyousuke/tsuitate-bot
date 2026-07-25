@@ -36,6 +36,12 @@ fn main() {
                     if c.capture_bet_penalty != 0.0 {
                         s.push_str(&format!(" 賭けpen=-{:.3}", c.capture_bet_penalty));
                     }
+                    if c.mate_threat != 0.0 {
+                        s.push_str(&format!(" 詰めろ={:+.3}", c.mate_threat));
+                    }
+                    if c.mate_risk != 0.0 {
+                        s.push_str(&format!(" 被詰めろ=-{:.3}", c.mate_risk));
+                    }
                     s
                 };
                 println!(
@@ -51,6 +57,19 @@ fn main() {
                     c.depth2
                 );
             }
+        }
+        // 詰めろ2項の発火率と gain の符号（w が強すぎて評価構造を壊していないかの診断）。
+        // combine_score は (p_legal×gain).min(gain) なので、gain が負に振り切ると
+        // p_legal による割引が効かなくなる = 序列付けの性質が変わる
+        let n = ranking.len();
+        let risk_n = ranking.iter().filter(|c| c.mate_risk > 0.0).count();
+        let threat_n = ranking.iter().filter(|c| c.mate_threat > 0.0).count();
+        let neg_n = ranking.iter().filter(|c| c.gain < 0.0).count();
+        if risk_n > 0 || threat_n > 0 {
+            let risk_max = ranking.iter().map(|c| c.mate_risk).fold(0.0, f64::max);
+            println!(
+                "   [発火] 被詰めろ {risk_n}/{n}（最大 -{risk_max:.3}）/ 詰めろ {threat_n}/{n} / gain<0 {neg_n}/{n}"
+            );
         }
     }
 }
