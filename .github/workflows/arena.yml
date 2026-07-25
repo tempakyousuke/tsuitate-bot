@@ -89,7 +89,7 @@ jobs:
           for kv in $ARENA_EXTRA_ENV; do
             case "$kv" in
               TSUITATE_*=*) export "$kv" ;;
-              *) echo "無視: $kv（TSUITATE_XXX=値 のみ許可）" ;;
+              *) echo "無視（TSUITATE_XXX=値 のみ許可）: ${kv}" ;;
             esac
           done
           cargo run --release --bin arena -- \
