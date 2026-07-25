@@ -16,7 +16,9 @@ use tsuitate_bot::kifu::parse_kif;
 use tsuitate_bot::protocol::Color;
 use tsuitate_bot::shogi::{Position, parse_usi};
 use tsuitate_bot::value_features::{
-    TRANSITION_FEATURE_NAMES, VALUE_FEATURE_NAMES, transition_features, value_features,
+    APPROACH_STATE_FEATURE_NAMES, APPROACH_TRANSITION_FEATURE_NAMES, TRANSITION_FEATURE_NAMES,
+    VALUE_FEATURE_NAMES, approach_state_features, approach_transition_features,
+    transition_features, value_features,
 };
 
 fn main() {
@@ -58,9 +60,11 @@ fn main() {
     }
 
     println!(
-        "usi,{},{}",
+        "usi,{},{},{},{}",
         VALUE_FEATURE_NAMES.join(","),
-        TRANSITION_FEATURE_NAMES.join(",")
+        APPROACH_STATE_FEATURE_NAMES.join(","),
+        TRANSITION_FEATURE_NAMES.join(","),
+        APPROACH_TRANSITION_FEATURE_NAMES.join(",")
     );
     for usi in candidates {
         let mv = parse_usi(usi).unwrap_or_else(|| panic!("bad candidate usi {usi}"));
@@ -72,8 +76,16 @@ fn main() {
         pos.play_unchecked(&mv);
         // stateは着手前（base, me視点）、transitionはbase→posの遷移をme視点で
         let f = value_features(&base, me);
+        let fa = approach_state_features(&base, me);
         let t = transition_features(&base, &mv, &pos, me);
-        let row: Vec<String> = f.iter().chain(t.iter()).map(|x| x.to_string()).collect();
+        let ta = approach_transition_features(&base, &mv, &pos, me);
+        let row: Vec<String> = f
+            .iter()
+            .chain(fa.iter())
+            .chain(t.iter())
+            .chain(ta.iter())
+            .map(|x| x.to_string())
+            .collect();
         println!("{usi},{}", row.join(","));
     }
 }

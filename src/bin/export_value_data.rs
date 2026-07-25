@@ -9,7 +9,9 @@
 use tsuitate_bot::protocol::{Color, GameEndPayload};
 use tsuitate_bot::shogi::{Position, parse_usi};
 use tsuitate_bot::value_features::{
-    TRANSITION_FEATURE_NAMES, TRANSITION_FEATURES, VALUE_FEATURE_NAMES, VALUE_FEATURES,
+    APPROACH_STATE_FEATURE_NAMES, APPROACH_STATE_FEATURES, APPROACH_TRANSITION_FEATURE_NAMES,
+    APPROACH_TRANSITION_FEATURES, TRANSITION_FEATURE_NAMES, TRANSITION_FEATURES,
+    VALUE_FEATURE_NAMES, VALUE_FEATURES, approach_state_features, approach_transition_features,
     transition_features, value_features,
 };
 
@@ -43,10 +45,15 @@ fn main() {
     // game_id列でゲーム単位のグループ分割ができるようにする（codexレビュー指摘:
     // 行単位のランダム分割だと同じ対局の別手番が学習/検証の両方に混じり
     // データリークになる）。ply列は手数（1始まり）
+    // 列順は [既存state, 接近state, 既存transition, 接近transition] で固定する
+    // （推論側 evaluate() が同じ順で組み立てる。ここがズレると学習と推論が
+    // 静かに食い違う）
     println!(
-        "game_id,ply,{},{},label",
+        "game_id,ply,{},{},{},{},label",
         VALUE_FEATURE_NAMES.join(","),
-        TRANSITION_FEATURE_NAMES.join(",")
+        APPROACH_STATE_FEATURE_NAMES.join(","),
+        TRANSITION_FEATURE_NAMES.join(","),
+        APPROACH_TRANSITION_FEATURE_NAMES.join(",")
     );
 
     let mut games = 0u64;
@@ -75,6 +82,7 @@ fn main() {
                 1.0 - win_value_sente
             };
             let f = value_features(&pos, side);
+            let fa = approach_state_features(&pos, side);
 
             let Some(mv) = parse_usi(&m.usi) else {
                 eprintln!("  棋譜の手をパースできません: {} ({path})。この局はスキップ", m.usi);
@@ -84,8 +92,15 @@ fn main() {
             let before = pos.clone();
             pos.play_unchecked(&mv);
             let t = transition_features(&before, &mv, &pos, side);
+            let ta = approach_transition_features(&before, &mv, &pos, side);
 
-            let row: Vec<String> = f.iter().chain(t.iter()).map(|x| x.to_string()).collect();
+            let row: Vec<String> = f
+                .iter()
+                .chain(fa.iter())
+                .chain(t.iter())
+                .chain(ta.iter())
+                .map(|x| x.to_string())
+                .collect();
             buf.push(format!("{games},{},{},{label}", i + 1, row.join(",")));
         }
         if ok {
@@ -98,6 +113,6 @@ fn main() {
     }
     eprintln!(
         "書き出し完了: {games}局 / {rows}行 / 特徴量{}次元",
-        VALUE_FEATURES + TRANSITION_FEATURES
+        VALUE_FEATURES + APPROACH_STATE_FEATURES + TRANSITION_FEATURES + APPROACH_TRANSITION_FEATURES
     );
 }
