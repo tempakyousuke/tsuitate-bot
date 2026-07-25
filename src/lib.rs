@@ -11,6 +11,7 @@ pub mod estimator;
 pub mod frozen;
 pub mod kifu;
 pub mod likelihood;
+pub mod mate;
 pub mod model;
 pub mod observation;
 pub mod opening;

@@ -286,6 +286,8 @@ struct SearchBudget {
     depth2_top_k: usize,
     /// 2手読みに使う粒子数
     depth2_particles: usize,
+    /// 詰めろ生成（mate.rs::drop_mate）を判定する粒子数
+    mate_samples: usize,
 }
 
 impl SearchBudget {
@@ -299,6 +301,7 @@ impl SearchBudget {
             nn_samples: f(NN_SAMPLES, 16, 256),
             depth2_top_k: f(DEPTH2_TOP_K, 4, 32),
             depth2_particles: f(DEPTH2_PARTICLES, 16, 384),
+            mate_samples: f(MATE_SAMPLES, 2, 32),
         }
     }
 }
@@ -318,6 +321,17 @@ const DEPTH2_TOP_K: usize = 8;
 const DEPTH2_PARTICLES: usize = 48;
 /// 応手で詰まされる場合のペナルティ（壊滅的なのでSPSA対象にしない）
 const DEPTH2_MATE_PEN: f64 = 30.0;
+
+/// 被詰めろのうち「玉で打った駒を取る以外に受けがない」形（MateThreat::
+/// IfSupported）を数える割合。相手の支え駒が実際にそのマスへ利いている確率の
+/// 代理で、真の詰み（Mate）より軽い。SPSA対象にはしない（mate_risk_w で
+/// まとめて調整できる。分けても勾配が立たない）
+const MATE_RISK_IF_SUPPORTED: f64 = 0.5;
+
+/// 詰めろ生成の判定に使う粒子数の基準値（スケール1.0時）。1粒子あたり
+/// 「玉の利き線上の空きマス × 持ち駒種」ぶんの詰み判定が走るので、
+/// 圧力項（PRESSURE_SAMPLES）よりさらに絞る
+const MATE_SAMPLES: usize = 6;
 
 /// 駒交換で動く価値: 盤上価値と持ち駒価値（基本駒種）の平均。
 /// 素の駒は piece_value と一致し、成駒は取られても相手の持ち駒に入るのは
@@ -572,6 +586,18 @@ pub struct EvalParams {
     /// 空振り分岐の認識悪化（信念の前提崩壊＋進出駒の孤立）を素の期待値が
     /// 数えないことへの補正。0 = 無効（従来と同一挙動）
     pub capture_bet_var_w: f64,
+    /// 詰めろ生成（この手の後、次の自分の手番で持ち駒打ちの一手詰めが
+    /// 成立する）ボーナス。粒子上での成立確率 × 粒子健全度で掛ける。
+    /// ついたて将棋では相手から脅威が見えないので詰めろは受けられにくく、
+    /// 通常将棋より実効価値が高い（2026-07-25 の対人局: 58手目 N*6六 で
+    /// 詰めろ、bot は受けを選ばず 60手目 G*7八 で詰み）。0 = 無効
+    pub mate_threat_w: f64,
+    /// 被詰めろペナルティ。この手の後、**相手**が持ち駒打ちで一手詰めにできる
+    /// 状態を残すことへの減点。詰みの成立条件は自玉の逃げ道と自駒（=完全既知）と
+    /// 相手の持ち駒（=取られた自駒なので既知）がほぼ決めるので、相手の盤上の
+    /// 支え駒が見えなくても評価できる（玉で取る以外に受けがない
+    /// `MateThreat::IfSupported` を MATE_RISK_IF_SUPPORTED 倍で数える）。0 = 無効
+    pub mate_risk_w: f64,
 }
 
 impl Default for EvalParams {
@@ -647,6 +673,10 @@ impl Default for EvalParams {
             // w=1 59.2%±9.5 / w=2 62.5%±9.3。keima 20/20・kakutori 19/20
             // （王手中ゲートで不変）を確認して 2.5 を採用
             capture_bet_var_w: 2.5,
+            // 詰めろ生成（2026-07-25、対人局 58手目 N*6六 のレビューを受けて追加）。
+            // 0 = 従来と同一挙動。未調整の新項なので w スイープで決める
+            mate_threat_w: 0.0,
+            mate_risk_w: 0.0,
         }
     }
 }
@@ -659,7 +689,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 41] = [
+    pub const SPECS: [ParamSpec; 43] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -865,6 +895,16 @@ impl EvalParams {
             lo: 0.0,
             hi: 3.0,
         },
+        ParamSpec {
+            name: "mate_threat_w",
+            lo: 0.0,
+            hi: 6.0,
+        },
+        ParamSpec {
+            name: "mate_risk_w",
+            lo: 0.0,
+            hi: 6.0,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -910,6 +950,8 @@ impl EvalParams {
             self.value_nn_w,
             self.checker_removal_w,
             self.capture_bet_var_w,
+            self.mate_threat_w,
+            self.mate_risk_w,
         ]
     }
 
@@ -957,6 +999,8 @@ impl EvalParams {
             value_nn_w: v[38],
             checker_removal_w: v[39],
             capture_bet_var_w: v[40],
+            mate_threat_w: v[41],
+            mate_risk_w: v[42],
         }
     }
 }
@@ -1038,6 +1082,28 @@ impl EstimatorStrategy {
         {
             Some(w) => EvalParams {
                 capture_bet_var_w: w,
+                ..params
+            },
+            None => params,
+        };
+        // 詰めろ生成ボーナスの運用ノブ（w スイープ・切り戻し用）
+        let params = match std::env::var("TSUITATE_MATE_THREAT_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+        {
+            Some(w) => EvalParams {
+                mate_threat_w: w,
+                ..params
+            },
+            None => params,
+        };
+        // 被詰めろペナルティの運用ノブ（w スイープ・切り戻し用）
+        let params = match std::env::var("TSUITATE_MATE_RISK_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+        {
+            Some(w) => EvalParams {
+                mate_risk_w: w,
                 ..params
             },
             None => params,
@@ -1282,6 +1348,16 @@ impl Strategy for EstimatorStrategy {
         let hang_risk_enabled = std::env::var("TSUITATE_ENABLE_HANG_RISK").is_ok();
         let debug_check_enabled = std::env::var("TSUITATE_DEBUG_CHECK").is_ok();
 
+        // 詰めろ判定のプール: 厳密粒子があればそれ、全滅していれば taint 粒子。
+        // 終盤のブラインド（＝詰めろが決まる局面）ほど厳密粒子は枯れているので、
+        // sample だけを見ると項が発火しない（実測: 発端の対人局 57手目は厳密0個・
+        // taint の玉位置信念は真実 7i に 71.6%）。
+        // taint 粒子でも**自駒配置・持ち駒・相手の持ち駒は真実と同期**している
+        // （estimator.rs::force_apply）ので、自玉の逃げ道と相手の打てる駒種で
+        // ほぼ決まる被詰めろ判定は taint でも信頼できる。嘘が乗るのは相手の
+        // 盤上駒＝支え駒の有無で、そこは IfSupported 側が吸収する
+        let mate_pool: &[(&Position, f64)] = if sample.is_empty() { &taint_pool } else { &sample };
+
         let rng = &mut self.rng;
         // valueネットのstate特徴量キャッシュ（sample と同じ並び。候補間で共通なので
         // 手番ごとに1回だけ計算する）
@@ -1304,6 +1380,7 @@ impl Strategy for EstimatorStrategy {
                 view,
                 &mv,
                 &sample,
+                mate_pool,
                 prior,
                 &known,
                 &params,
@@ -2080,10 +2157,15 @@ fn camp_defended_prior(to: Coord, me: Color, camp_scale: f64) -> f64 {
 }
 
 /// 候補手をユニーク粒子の加重平均で評価する（重み = ソフト救済の減衰）
+#[allow(clippy::too_many_arguments)]
 fn evaluate(
     view: &PlayerView,
     mv: &ShogiMove,
     particles: &[(&Position, f64)],
+    // 詰めろ生成の判定に使う粒子プール。厳密粒子があれば `particles` と同じ、
+    // 全滅していれば taint 粒子（choose() が渡す）。終盤のブラインドでは
+    // 厳密粒子が枯れるので、詰めろが効く局面ほど `particles` は空になる
+    mate_pool: &[(&Position, f64)],
     prior: f64,
     known: &HashMap<Coord, f64>,
     params: &EvalParams,
@@ -2257,6 +2339,10 @@ fn evaluate(
     let p_legal = (legal + prior * w) / (n + w);
     // 賭け分散ペナルティの内訳（ランキング表示用に expected の外へ持ち出す）
     let mut capture_bet_penalty = 0.0;
+    // 攻め圧力は粒子の健全度でゲートする。退化した粒子は間違った玉位置に
+    // 固まりやすく、「誰もいない場所への攻め」が加点され続ける
+    // （対人実戦: 終盤の成桂の徘徊）。健全度が低いときは確実な項だけ残す
+    let confidence = (n / budget.eval_particles as f64).min(1.0);
     let expected = if legal > 0.0 {
         // 探索ボーナス: 着地マスの敵駒有無について粒子が割れているほど、
         // 指せば（取れても空でも）推定が絞れる。捕獲の期待値とは別の情報の価値
@@ -2264,10 +2350,6 @@ fn evaluate(
         // 王探し: 王手判定が粒子間で割れる手は、指せば王手宣言の有無で
         // 玉位置仮説が絞れる（互角膠着で「玉が見つからない」を崩す勾配）
         let p_chk = check_hits / legal;
-        // 攻め圧力は粒子の健全度でゲートする。退化した粒子は間違った玉位置に
-        // 固まりやすく、「誰もいない場所への攻め」が加点され続ける
-        // （対人実戦: 終盤の成桂の徘徊）。健全度が低いときは確実な項だけ残す
-        let confidence = (n / budget.eval_particles as f64).min(1.0);
         // valueネット項: 勝率相当[0,1]の重み付き平均を中心化して歩価値スケールへ。
         // gain の内側（= combine_score の p_legal 割引を受ける側）に置くことで、
         // 反則確実な手への加点素通り（dragon-check-drop の教訓）を構造的に防ぐ
@@ -2333,7 +2415,75 @@ fn evaluate(
     let coverage = params.coverage_w * coverage_after(view, mv);
     let probe = params.tokin_probe_w * tokin_probe(view, mv);
 
-    let gain = expected + advance_bias + development + coverage + probe;
+    // 詰めろ生成: この手の後、次の自分の手番で持ち駒打ちの一手詰めが成立するか
+    // （mate.rs::drop_mate）。ついたて将棋では相手に脅威が見えないので、詰めろは
+    // 実質「次で詰む」に近い（発端の対人局 2026-07-25: 58手目 N*6六 の詰めろに
+    // bot は受けを選ばず 60手目 G*7八 で詰み）。既存の攻め項（check_bonus /
+    // attack_w / blind_king_attack）はどれも「王手でも駒得でもない、詰み網を
+    // 完成させる静かな手」を評価できない。
+    //
+    // **`expected` の外**に置くのは、詰めろが効く終盤ほど厳密粒子が枯れて
+    // `legal == 0`（= expected が丸ごとゼロ）になるため。ただし gain の内側なので
+    // combine_score の p_legal 割引は受ける（反則確実な手への攻め加点素通りを
+    // 防ぐ dragon-check-drop の教訓）。
+    // **王手中は両方とも無効**: 候補の序列は解消確率（CheckSolver）が支配すべき。
+    // 攻め側は加点が回避プローブの反則を増やす実測があり（value_nn_w と同じゲート）、
+    // 受け側は「合法な回避手だけを一律に減点する」形になるため、合法手全体が
+    // 反則水位を割って反則が爆発する（removal_term の対称形で踏んだ罠と同型。
+    // check.rs の doc コメント参照）
+    //
+    // 被詰めろ（`mate_risk_w`）は同じ判定の鏡像。ただし相手の**盤上の支え駒**は
+    // 見えないので、真の詰みだけを数えると発端の局面（支えが不可視の 6六桂）を
+    // 取りこぼす。「玉で取る以外に受けがない」= 支えが1枚あれば詰み
+    // （MateThreat::IfSupported）も MATE_RISK_IF_SUPPORTED 倍で数える。
+    // 詰みの成立条件は自玉の逃げ道・自駒・相手の持ち駒（いずれも既知）が
+    // ほぼ決めるので、この形なら不可視情報にほとんど依存しない
+    let (mate_threat, mate_risk) = if (params.mate_threat_w != 0.0 || params.mate_risk_w != 0.0)
+        && !view.you_in_check
+    {
+        // 厳密粒子は正確なぶん退化度（confidence）で割り引く。taint 粒子は
+        // 重み自体に 0.5^(taint-1) の減衰が入っているのでそのまま使う
+        let conf = if particles.is_empty() { 1.0 } else { confidence };
+        let mut threat = 0.0f64;
+        let mut risk = 0.0f64;
+        let mut tot = 0.0f64;
+        for (pos, w) in mate_pool.iter().take(budget.mate_samples) {
+            if !pos.is_legal(mv) {
+                continue;
+            }
+            let mut next = (*pos).clone();
+            next.play_unchecked(mv);
+            tot += w;
+            // 既に詰ましている手は粒子ループの +1000 側で評価済み（受けも不要）
+            if next.in_check(opp) && !next.has_any_legal_move() {
+                continue;
+            }
+            if params.mate_threat_w != 0.0 && crate::mate::drop_mate(&next, me).is_some() {
+                threat += w;
+            }
+            if params.mate_risk_w != 0.0 {
+                match crate::mate::drop_mate_threat(&next, opp) {
+                    Some((_, crate::mate::MateThreat::Mate)) => risk += w,
+                    Some((_, crate::mate::MateThreat::IfSupported)) => {
+                        risk += w * MATE_RISK_IF_SUPPORTED
+                    }
+                    None => {}
+                }
+            }
+        }
+        if tot > 0.0 {
+            (
+                params.mate_threat_w * conf * (threat / tot),
+                params.mate_risk_w * conf * (risk / tot),
+            )
+        } else {
+            (0.0, 0.0)
+        }
+    } else {
+        (0.0, 0.0)
+    };
+
+    let gain = expected + advance_bias + development + coverage + probe + mate_threat - mate_risk;
     EvalOut {
         gain,
         risk_mean: if legal > 0.0 { risk_sum / legal } else { 0.0 },

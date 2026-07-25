@@ -492,7 +492,9 @@ impl Position {
     }
 
     /// 手番側の疑似合法手（成り/不成の両変種を含む）
-    fn pseudo_legal_moves(&self) -> Vec<ShogiMove> {
+    /// 手番側の疑似合法手（自玉の安全・打ち歩詰めは見ない）。
+    /// mate.rs が「合法手を全部作らずに詰み・逃げ道の形を判定する」ために使う
+    pub fn pseudo_legal_moves(&self) -> Vec<ShogiMove> {
         let mut moves = vec![];
         for (i, p) in self.board.iter().enumerate() {
             let Some(piece) = *p else { continue };
@@ -583,8 +585,9 @@ impl Position {
     }
 
     /// 手番側に合法手が1つでもあるか（打ち歩詰め判定の内側では
-    /// 相手の歩打ちの打ち歩詰めまでは見ない = shogiops と同等の近似）
-    fn has_any_legal_move(&self) -> bool {
+    /// 相手の歩打ちの打ち歩詰めまでは見ない = shogiops と同等の近似）。
+    /// `legal_moves().is_empty()` より安い詰み判定として mate.rs が使う
+    pub fn has_any_legal_move(&self) -> bool {
         self.pseudo_legal_moves().iter().any(|mv| {
             let mut next = self.clone();
             next.play_unchecked(mv);

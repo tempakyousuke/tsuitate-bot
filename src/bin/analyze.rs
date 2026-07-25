@@ -6,6 +6,8 @@
 //! - タダ取られ（守られていない駒を只で取られた）
 //! - 1手詰みの存在（参考値: botからは玉位置が見えないため「逃し」を責める指標ではなく、
 //!   玉位置推定が当たっていれば勝てた機会の総量を測る）
+//! - 被詰めろ（相手番の局面で相手に1手詰めが存在した回数）。相手が実際に詰みを
+//!   見つけたかに依らないので、相手が弱い環境でも自玉の受けの失敗を直接測れる
 //! - 王手ソルバー（check.rs）の再現検証: 記録上の王手中の反則それぞれについて、
 //!   その時点の観測だけからソルバーが選んだ手が真の局面で合法だったかを判定する
 //!
@@ -15,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 
 use tsuitate_bot::board::Coord;
 use tsuitate_bot::check::CheckSolver;
+use tsuitate_bot::mate::{drop_mate, mate_in_1};
 use tsuitate_bot::model::GameModel;
 use tsuitate_bot::observation::{Observation, ObservationLog};
 use tsuitate_bot::protocol::{
@@ -300,6 +303,14 @@ fn main() {
     let mut total_exchange_settlements = 0u32;
     let mut total_bad_trades = 0.0;
     let mut total_missed_mates = 0;
+    // 被詰めろオラクル: bot が指した後（相手番）の局面で、相手に一手詰めが
+    // 存在したか。**相手が実際に見つけたかに依らない**ので、相手が詰みを
+    // 実行してこない環境（アリーナの凍結版同士は互いに玉位置が見えない）でも
+    // 受けの改善を直接測れる。nofoul オラクルと同じ趣旨の診断
+    let mut total_mate_allowed = 0u32;
+    let mut total_mate_allowed_drop = 0u32;
+    let mut total_mate_executed = 0u32;
+    let mut games_mate_allowed = 0u32;
     let mut total_check_turns = 0;
     let mut total_check_actual_fouls = 0;
     let mut total_check_solved = 0;
@@ -570,6 +581,39 @@ fn main() {
                 total_missed_mates += 1;
             }
         }
+
+        // 被詰めろ: 相手番の各局面で相手に一手詰めがあったか（= bot が受け損ねた）
+        let mut allowed_here = 0u32;
+        for (i, pos) in positions.iter().enumerate() {
+            if pos.turn() == bot || pos.outcome().is_some() {
+                continue;
+            }
+            let Some(mate) = mate_in_1(pos) else { continue };
+            allowed_here += 1;
+            total_mate_allowed += 1;
+            let by_drop = drop_mate(pos, pos.turn()).is_some();
+            if by_drop {
+                total_mate_allowed_drop += 1;
+            }
+            let played = rec.end.moves.get(i).map(|m| m.usi.as_str()).unwrap_or("-");
+            let executed = positions
+                .get(i + 1)
+                .and_then(|p| p.outcome())
+                .is_some_and(|o| matches!(o, Outcome::Checkmate { winner } if winner != bot));
+            if executed {
+                total_mate_executed += 1;
+            }
+            println!(
+                "  被詰めろ {}手目: 相手に {} があった（実際は {played}{}{}）",
+                i + 1,
+                mate.to_usi(),
+                if by_drop { "・打ち詰み" } else { "" },
+                if executed { "・実行された" } else { "" },
+            );
+        }
+        if allowed_here > 0 {
+            games_mate_allowed += 1;
+        }
     }
 
     println!("\n=== 集計（{games}局 bot {bot_wins}勝）===");
@@ -587,6 +631,9 @@ fn main() {
         "取り返し: 機会{total_recap_ops}回中 実行{total_recap_taken}回 / 得だったのに逃した{total_recap_missed_good}回"
     );
     println!("1手詰みの存在（参考値・玉位置は不可視）: {total_missed_mates}回");
+    println!(
+        "被詰めろ（相手に1手詰めを与えた局面）: {total_mate_allowed}回 / {games_mate_allowed}局（うち打ち詰み {total_mate_allowed_drop}回・実際に詰まされた {total_mate_executed}回）"
+    );
     if total_occupancy_fouls > 0 {
         println!(
             "占有マス反則（打ちマス/経路封鎖）の再訪率: {total_repeat_avoidable}/{total_occupancy_fouls}（同一局内で過去の占有反則マスと一致。反則マスを覚える対策の理論上限）"

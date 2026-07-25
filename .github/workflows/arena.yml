@@ -32,6 +32,10 @@ on:
         description: "診断用オラクル（nofoul / check_nofoul。候補側の反則を審判が握りつぶす上限測定）"
         required: false
         default: ""
+      env:
+        description: "候補側の評価ノブ（スペース区切りの TSUITATE_XXX=値。w スイープ用。例: TSUITATE_MATE_RISK_W=3 TSUITATE_MATE_THREAT_W=4）"
+        required: false
+        default: ""
 
 jobs:
   plan:
@@ -73,6 +77,7 @@ jobs:
           ARENA_RECORD_DIR: arena-records
           ARENA_JSON: arena-summary.json
           ARENA_ORACLE_A: ${{ inputs.oracle }}
+          ARENA_EXTRA_ENV: ${{ inputs.env }}
         run: |
           # 共通seed指定時はシャードごとにずらす（シャード間の対局重複を防ぎつつ、
           # 同じ入力なら版をまたいで同じ対局条件列になる）
@@ -80,11 +85,30 @@ jobs:
           if [ -n "$seed" ]; then
             export ARENA_MATCH_SEED=$(( seed + ${{ matrix.shard }} ))
           fi
+          # 評価ノブ（TSUITATE_* のみ許可。凍結版は env を見ないので候補側にだけ効く）
+          for kv in $ARENA_EXTRA_ENV; do
+            case "$kv" in
+              TSUITATE_*=*) export "$kv" ;;
+              *) echo "無視: $kv（TSUITATE_XXX=値 のみ許可）" ;;
+            esac
+          done
           cargo run --release --bin arena -- \
             "${{ needs.plan.outputs.games_per_shard }}" \
             "${{ inputs.candidate }}" \
             "${{ matrix.baseline }}" \
             | tee arena-result.txt
+
+      # 被詰めろオラクル: 相手が詰みを実行してこない環境でも自玉の受けを測れる
+      # 唯一の指標なので、記録を捨てる前にこのジョブで集計してサマリーへ出す
+      - name: Analyze records (被詰めろオラクル)
+        if: always()
+        run: |
+          if ls arena-records/*.jsonl > /dev/null 2>&1; then
+            cargo run --release --bin analyze -- arena-records/*.jsonl \
+              | grep -E "^(被詰めろ|1手詰みの存在|只取られ|反則の原因|  +[0-9]+回)" \
+              > analyze-summary.txt || true
+            cat analyze-summary.txt
+          fi
 
       - name: Write job summary
         if: always()
@@ -92,6 +116,10 @@ jobs:
           {
             echo '```'
             cat arena-result.txt
+            if [ -s analyze-summary.txt ]; then
+              echo ""
+              cat analyze-summary.txt
+            fi
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -103,6 +131,7 @@ jobs:
           path: |
             arena-result.txt
             arena-summary.json
+            analyze-summary.txt
 
       - name: Upload game records
         if: always()
