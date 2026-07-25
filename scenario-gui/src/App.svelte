@@ -6,6 +6,7 @@
   import AnalysisPanel from "./lib/AnalysisPanel.svelte";
   import PlayPanel from "./lib/PlayPanel.svelte";
   import {
+    clearKingBeliefCache,
     getEngines,
     listScenarios,
     loadKifu,
@@ -33,6 +34,9 @@
 
   async function loadPath(path: string) {
     loadError = "";
+    overlay = null;
+    // 棋譜が変わると観測ログが別物になるので、粒子キャッシュは捨てる
+    await clearKingBeliefCache().catch(() => {});
     try {
       const data = await loadKifu(path);
       kifu = data;

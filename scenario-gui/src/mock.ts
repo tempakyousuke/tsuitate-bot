@@ -27,6 +27,8 @@ export async function installMockIfRequested(): Promise<void> {
           return fixture("ranking");
         case "eval_king_belief":
           return fixture("king_belief");
+        case "clear_king_belief_cache":
+          return;
         case "cancel_eval":
           return;
         default:

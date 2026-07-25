@@ -201,6 +201,8 @@ export const evalKingBelief = (
   seeds: number,
   budgetMs: number,
 ) => invoke<KingBelief>("eval_king_belief", { path, ply, seeds, budgetMs });
+/** 玉位置ビリーフの推定器キャッシュを捨てる（棋譜を読み直したとき） */
+export const clearKingBeliefCache = () => invoke<void>("clear_king_belief_cache");
 export const cancelEval = (runId: number) => invoke<void>("cancel_eval", { runId });
 export const playStart = (
   engine: string,

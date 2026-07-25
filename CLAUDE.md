@@ -87,6 +87,11 @@
   玉位置ビリーフは `scenario_core::king_belief`（推定器の構築 `build_estimator` と
   評価重み `weighted_unique_particles` は `bin/scenario ... diag` と共通。
   診断とGUIで重み規約が食い違うと較正の数字が無意味になるため）。
+  粒子の構築は ply に比例して重い（実測: 83手の棋譜の50手目・seed10個・予算2000ms で
+  **175秒**）ので、GUI は**推定器を手番側ごとにキャッシュして続きだけ食わせる**
+  （`IncrementalEstimator`。`Estimator::update` が消化済みイベント数を持つので、
+  作り直しと同じ結果になることをテストで担保）。実測 175秒 → 26秒（さらに seed 並列で
+  1/4）。棋譜を読み直すと `clear_king_belief_cache` で捨てる
   **対局モード**（ヘッダの「対局」タブ）で人間 vs bot をGUI内で直接対局できる:
   審判は selfplay.rs と同じ裁定（反則は手番維持でカウント・10回で反則負け・
   王手宣言）、人間側は自駒のみ表示＋自駒だけ考慮の候補ハイライト

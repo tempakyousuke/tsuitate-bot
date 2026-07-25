@@ -488,25 +488,98 @@ async fn eval_ranking(
     .map_err(|e| format!("実行スレッドの異常終了: {e}"))?
 }
 
+/// 玉位置ビリーフの推定器キャッシュ。
+///
+/// 粒子の構築は「1手目から観測を順に食わせる」ので ply に比例して重い
+/// （seed 10個・予算2000ms で数分かかることがある）。`Estimator::update` は
+/// 消化済みイベント数を自分で覚えているので、**推定器を保持したまま続きだけ**を
+/// 食わせれば作り直さずに済む。`.kif` を再生した観測ログは ply が進んでも
+/// 前のログのプレフィックス拡張なので、これで結果は作り直しと同じになる。
+///
+/// 手番は 1手進むごとに入れ替わるので、キャッシュは**手番側ごと**に持つ
+/// （ply を1つずつ進めると各キャッシュが2手ぶんずつ進む）。
+#[derive(Default)]
+struct KingBeliefState {
+    cache: Mutex<HashMap<KingCacheKey, Vec<scenario_core::IncrementalEstimator>>>,
+}
+
+#[derive(PartialEq, Eq, Hash, Clone)]
+struct KingCacheKey {
+    path: String,
+    side: Color,
+    budget_ms: u32,
+    seeds: u64,
+}
+
 /// 手番側の粒子が「相手玉はどこにいると思っているか」の分布。
 /// 盤に % を重ねて出すための最小データ（計算本体は scenario_core::king_belief で、
 /// `bin/scenario diag` の「相手玉の位置分布」と同じ重み規約）
 #[tauri::command]
 async fn eval_king_belief(
+    state: State<'_, KingBeliefState>,
     path: String,
     ply: usize,
     seeds: u64,
     budget_ms: Option<u32>,
 ) -> Result<scenario_core::KingBelief, String> {
-    tauri::async_runtime::spawn_blocking(move || -> Result<scenario_core::KingBelief, String> {
-        let rep = replayed_at(&path, ply)?;
-        // 粒子数・リプレイ予算のスケールは他の分析と同じ規約（基準 900ms）
-        let ms = budget_ms.unwrap_or(2000).clamp(100, 60_000);
-        let scale = f64::from(ms) / 900.0;
-        with_budget(ms, || catch(|| scenario_core::king_belief(&rep, seeds.clamp(1, 32), scale)))
-    })
-    .await
-    .map_err(|e| format!("実行スレッドの異常終了: {e}"))?
+    let rep = {
+        let path = path.clone();
+        tauri::async_runtime::spawn_blocking(move || replayed_at(&path, ply))
+            .await
+            .map_err(|e| format!("実行スレッドの異常終了: {e}"))??
+    };
+    // 粒子数・リプレイ予算のスケールは他の分析と同じ規約（基準 900ms）
+    let ms = budget_ms.unwrap_or(2000).clamp(100, 60_000);
+    let scale = f64::from(ms) / 900.0;
+    let seeds = seeds.clamp(1, 32);
+    let side = rep.pos.turn();
+    let key = KingCacheKey {
+        path,
+        side,
+        budget_ms: ms,
+        seeds,
+    };
+
+    let mut cache = state.cache.lock().unwrap();
+    let ests = cache
+        .entry(key)
+        .or_insert_with(|| (0..seeds).map(|s| scenario_core::IncrementalEstimator::new(side, s, scale)).collect());
+    let log = &rep.logs[scenario_core::side_idx(side)];
+    // 巻き戻し（食わせ済みが要求より先）ならキャッシュを捨てて作り直す
+    if ests.iter().any(|e| e.consumed() > log.events().len()) {
+        *ests = (0..seeds)
+            .map(|s| scenario_core::IncrementalEstimator::new(side, s, scale))
+            .collect();
+    }
+    let belief = with_budget(ms, || {
+        catch(|| {
+            // seed ごとに独立なのでスレッドで分ける（既定 seed 10個は直列だと待たされる）
+            let n_threads = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .min(4)
+                .min(ests.len());
+            let chunk = ests.len().div_ceil(n_threads.max(1));
+            std::thread::scope(|scope| {
+                for part in ests.chunks_mut(chunk) {
+                    scope.spawn(move || {
+                        for e in part {
+                            e.feed(log);
+                        }
+                    });
+                }
+            });
+            let snapshot: Vec<_> = ests.iter().map(|e| e.est()).collect();
+            scenario_core::king_belief_from_refs(&rep, &snapshot, seeds)
+        })
+    })?;
+    Ok(belief)
+}
+
+/// 玉位置ビリーフのキャッシュを捨てる（棋譜を読み直したとき・作り直したいとき）
+#[tauri::command]
+fn clear_king_belief_cache(state: State<'_, KingBeliefState>) {
+    state.cache.lock().unwrap().clear();
 }
 
 #[tauri::command]
@@ -639,6 +712,7 @@ fn main() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(EvalState::default())
+        .manage(KingBeliefState::default())
         .manage(play::PlayState::default())
         .invoke_handler(tauri::generate_handler![
             list_scenarios,
@@ -648,6 +722,7 @@ fn main() {
             eval_ranking,
             eval_king_belief,
             cancel_eval,
+            clear_king_belief_cache,
             play::play_start,
             play::play_human_move,
             play::play_bot_move,

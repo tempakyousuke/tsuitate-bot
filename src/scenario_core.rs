@@ -324,6 +324,53 @@ pub fn build_estimator(
     est
 }
 
+/// 途中まで観測を食わせた推定器を保持し、**続きだけ**を食わせて進められる形。
+///
+/// `Estimator::update` は消化済みイベント数（cursor）を自分で覚えているので、
+/// 同じ手順で観測を足していけば「ゼロから構築し直した場合と同じ状態」になる。
+/// GUI で ply を進めながら信念を見るときに、毎回 1手目から粒子を作り直さずに済む
+/// （`.kif` を再生した観測ログは ply が進んでも**前のログのプレフィックス拡張**に
+/// なるので、続きから食わせるだけでよい）。
+pub struct IncrementalEstimator {
+    est: Estimator,
+    running: ObservationLog,
+    consumed: usize,
+}
+
+impl IncrementalEstimator {
+    pub fn new(side: Color, seed: u64, scale: f64) -> Self {
+        IncrementalEstimator {
+            est: Estimator::with_seed_and_scale(side, seed, scale),
+            running: ObservationLog::default(),
+            consumed: 0,
+        }
+    }
+
+    /// `log`（これまで食わせたログのプレフィックス拡張）の続きを食わせる。
+    /// build_estimator と同じ順序（自分の手番の直前で update、最後にもう一度）
+    pub fn feed(&mut self, log: &ObservationLog) {
+        let events = log.events();
+        while self.consumed < events.len() {
+            let e = &events[self.consumed];
+            if matches!(e, Observation::MyMove { .. } | Observation::MyFoul { .. }) {
+                self.est.update(&self.running);
+            }
+            self.running.record(e.clone());
+            self.consumed += 1;
+        }
+        self.est.update(&self.running);
+    }
+
+    pub fn est(&self) -> &Estimator {
+        &self.est
+    }
+
+    /// 食わせ済みのイベント数（キャッシュが使えるかの判定用）
+    pub fn consumed(&self) -> usize {
+        self.consumed
+    }
+}
+
 /// 推定器のユニーク粒子と**評価重み**。重みの規約は評価側 `stratified_sample`
 /// と同じ: 推定器内の logw を max で正規化し、同一指紋の質量 Σexp(logw) を
 /// 畳み込む（C-7 P1 の multiplicity 保持。ソフト減衰は logw に課金済み）。
@@ -397,15 +444,30 @@ pub struct KingBelief {
 /// 推定器を seeds 個ぶん構築して相手玉の位置ビリーフを集計する
 pub fn king_belief(rep: &Replayed, seeds: u64, scale: f64) -> KingBelief {
     let side = rep.pos.turn();
+    let ests: Vec<Estimator> = (0..seeds.max(1))
+        .map(|seed| build_estimator(rep, seed, scale, |_, _| {}))
+        .collect();
+    king_belief_from(rep, &ests, seeds.max(1))
+}
+
+/// 構築済みの推定器から相手玉の位置ビリーフを集計する
+/// （GUI は推定器をキャッシュして ply を進めるので、構築と集計を分けておく）
+pub fn king_belief_from(rep: &Replayed, ests: &[Estimator], seeds: u64) -> KingBelief {
+    let refs: Vec<&Estimator> = ests.iter().collect();
+    king_belief_from_refs(rep, &refs, seeds)
+}
+
+/// `king_belief_from` の参照版（キャッシュから借りたまま集計するため）
+pub fn king_belief_from_refs(rep: &Replayed, ests: &[&Estimator], seeds: u64) -> KingBelief {
+    let side = rep.pos.turn();
     let mut all_tally: HashMap<String, f64> = HashMap::new();
     let mut strict_tally: HashMap<String, f64> = HashMap::new();
     let mut all_mass = 0.0f64;
     let mut strict_mass = 0.0f64;
     let mut unique = 0u32;
     let mut strict_unique = 0u32;
-    for seed in 0..seeds.max(1) {
-        let est = build_estimator(rep, seed, scale, |_, _| {});
-        for (pp, w, strict) in weighted_unique_particles(&est) {
+    for est in ests {
+        for (pp, w, strict) in weighted_unique_particles(*est) {
             unique += 1;
             if strict {
                 strict_unique += 1;
@@ -449,7 +511,7 @@ pub fn king_belief(rep: &Replayed, seeds: u64, scale: f64) -> KingBelief {
         truth: rep.pos.king_square(side.other()).map(make_usi_square),
         unique,
         strict_unique,
-        seeds: seeds.max(1),
+        seeds,
         deduced,
     }
 }
@@ -578,6 +640,33 @@ mod tests {
         // 序盤は厳密粒子が生きていて、真実の 5a が最有力
         assert!(b.strict_unique > 0, "序盤なのに厳密粒子が全滅している");
         assert_eq!(b.squares[0].sq, "5a", "初期マスが最有力でない");
+    }
+
+    /// 粒子を引き継いで進めた推定器が、ゼロから作り直したものと同じになること
+    /// （GUI の玉位置ビリーフのキャッシュが結果を変えないことの担保）。
+    /// 粒子が潤沢な序盤で測る（終盤はリプレイの時間打ち切りが壁時計依存で揺れる）
+    #[test]
+    fn 推定器は途中から引き継いでも作り直しと一致する() {
+        let sc = load("keima");
+        let side = replay(&sc.kifu, 4).pos.turn();
+        let mut inc = IncrementalEstimator::new(side, 0, 1.0);
+        // 2手目まで食わせてから 4手目まで継ぎ足す
+        inc.feed(&replay(&sc.kifu, 2).logs[side_idx(side)]);
+        let mid = inc.consumed();
+        let rep4 = replay(&sc.kifu, 4);
+        inc.feed(&rep4.logs[side_idx(side)]);
+        assert!(inc.consumed() > mid, "継ぎ足しでイベントが進んでいない");
+
+        let fresh = build_estimator(&rep4, 0, 1.0, |_, _| {});
+        let key = |est: &Estimator| -> Vec<(u64, u64)> {
+            let mut v: Vec<(u64, u64)> = weighted_unique_particles(est)
+                .iter()
+                .map(|(p, w, _)| (p.fingerprint(), (w * 1e9) as u64))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+        assert_eq!(key(inc.est()), key(&fresh), "引き継ぎと作り直しで粒子集合が違う");
     }
 
     /// リプレイの裁定検証（合法手は合法・反則試行は非合法）が全編通ること
