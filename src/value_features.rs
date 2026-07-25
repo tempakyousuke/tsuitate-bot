@@ -154,6 +154,152 @@ pub fn value_features(pos: &Position, me: Color) -> [f64; VALUE_FEATURES] {
     ]
 }
 
+/// 接近特徴量（NN段階③の追補、2026-07-25）。
+///
+/// 動機: 手作り評価にもvalueネットにも「**多手かけて敵駒・敵玉へ近づく**」を
+/// 測る量が無い。前向きの項は `threat_value`（既に当たっている＝1手先）・
+/// `king_zone_pressure`（隣接8マスのみ）・`knight_bait_value`（歩→桂だけの
+/// BFS距離）で、距離勾配を持つのは最後の1つ、しかも駒種特化。その結果
+/// 「取られないが何の脅威にもならない手」と「駒を寄せて次に取りに行く手」が
+/// 同じ評価になる（scenarios/watch-estimator-vs-estimator-20260725-203544.kif
+/// の34手目 8八歩が発端）。
+///
+/// ここでは `deduce::distance_empty_board`（空盤BFS＝手数の admissible な下限。
+/// (駒種,色,出発マス) でメモ化済み）で距離を測り、`knight_bait_value` の
+/// 駒種一般化にあたる量を state / transition の両方に足す。
+/// **遮蔽を見ない下限**なので「近いのに実は届かない」を過大評価するが、
+/// 学習側が重みを決めるので手作り項ほど致命的ではない（同じ近似方針は
+/// max_hanging_value 等の既存特徴量でも採っている）。
+///
+/// 距離が定義できない（到達不能）ときの打ち切り手数
+const APPROACH_DIST_CAP: u32 = 8;
+/// 1手ぶんの減衰。距離1（空盤なら次の手でそのマスへ行ける）を 1.0 とする
+const APPROACH_DECAY: f64 = 0.6;
+
+/// `from` にいる `role`（成駒ならその成駒自身を base に渡す）が `target` へ
+/// 到達するのに要する空盤上の最短手数。成れる駒は成った経路も含めた最短
+fn moves_to_reach(
+    role: Role,
+    color: Color,
+    from: crate::board::Coord,
+    target: crate::board::Coord,
+) -> Option<u32> {
+    let plain = crate::deduce::distance_empty_board(role, color, from, target, false);
+    let promoted = crate::deduce::distance_empty_board(role, color, from, target, true);
+    plain.into_iter().chain(promoted).min()
+}
+
+/// 距離を [0,1] の「近さ」へ落とす。距離1 = 1.0（次の手で取れる位置）
+fn closeness(dist: Option<u32>) -> f64 {
+    let d = dist.unwrap_or(APPROACH_DIST_CAP).min(APPROACH_DIST_CAP);
+    APPROACH_DECAY.powi(d.saturating_sub(1) as i32)
+}
+
+/// `from` にいる `role` の駒から見た「獲物の近さ」= 敵駒（玉除く）のうち
+/// `価値 × 近さ` が最大のもの。**これが1手先だけを見る threat_value の一般化**で、
+/// 距離2・3の獲物にも減衰した価値がつくので、寄せていく途中の手に勾配が立つ
+fn prey_proximity_from(
+    pos: &Position,
+    me: Color,
+    role: Role,
+    from: crate::board::Coord,
+) -> f64 {
+    let opp = me.other();
+    pos.pieces()
+        .filter(|(_, p)| p.color == opp && p.role != Role::King)
+        .map(|(sq, p)| exchange_value(p.role) * closeness(moves_to_reach(role, me, from, sq)))
+        .fold(0.0, f64::max)
+}
+
+/// `me` の駒（玉除く）全体で見た獲物の近さの最大値
+fn prey_proximity(pos: &Position, me: Color) -> f64 {
+    pos.pieces()
+        .filter(|(_, p)| p.color == me && p.role != Role::King)
+        .map(|(sq, p)| prey_proximity_from(pos, me, p.role, sq))
+        .fold(0.0, f64::max)
+}
+
+/// `me` の駒（玉除く）が相手玉へどれだけ集まっているか（価値×近さの総和）。
+/// king_zone_pressure が隣接8マスしか見ないのに対し、こちらは寄せの途中の
+/// 「まだ届いていないが向かっている駒」も数える
+fn king_siege(pos: &Position, me: Color) -> f64 {
+    let Some(king) = pos.king_square(me.other()) else {
+        return 0.0;
+    };
+    pos.pieces()
+        .filter(|(_, p)| p.color == me && p.role != Role::King)
+        .map(|(sq, p)| exchange_value(p.role) * closeness(moves_to_reach(p.role, me, sq, king)))
+        .sum()
+}
+
+pub const APPROACH_STATE_FEATURES: usize = 4;
+
+pub const APPROACH_STATE_FEATURE_NAMES: [&str; APPROACH_STATE_FEATURES] = [
+    "my_prey_proximity",  // 自分の駒から見た「価値×近さ」が最大の敵駒
+    "opp_prey_proximity", // 同、相手側
+    "my_king_siege",      // 相手玉へ寄っている自分の駒の 価値×近さ の総和
+    "opp_king_siege",     // 同、相手側（自玉が寄せられている度合い）
+];
+
+/// 局面側の接近特徴量。`value_features` と同じ規約（`me` 視点）
+pub fn approach_state_features(pos: &Position, me: Color) -> [f64; APPROACH_STATE_FEATURES] {
+    let opp = me.other();
+    [
+        prey_proximity(pos, me),
+        prey_proximity(pos, opp),
+        king_siege(pos, me),
+        king_siege(pos, opp),
+    ]
+}
+
+pub const APPROACH_TRANSITION_FEATURES: usize = 3;
+
+pub const APPROACH_TRANSITION_FEATURE_NAMES: [&str; APPROACH_TRANSITION_FEATURES] = [
+    "king_approach",       // この手で着手駒が相手玉へ縮めた手数（打ちは0）
+    "prey_approach",       // この手で着手駒の「獲物の近さ」が増えた量（打ちは0）
+    "king_closeness_after", // 着手後の着手駒→相手玉の近さ（打ちも定義できる）
+];
+
+/// 着手側の接近特徴量。`transition_features` と同じ規約（`mover` が指した側）。
+/// 盤上手は from/to の差分、打つ手は差分を持たないので 0 とし、
+/// 着手後の近さ（`king_closeness_after`）だけで表現する
+pub fn approach_transition_features(
+    before: &Position,
+    mv: &ShogiMove,
+    after: &Position,
+    mover: Color,
+) -> [f64; APPROACH_TRANSITION_FEATURES] {
+    let to = match *mv {
+        ShogiMove::Board { to, .. } => to,
+        ShogiMove::Drop { to, .. } => to,
+    };
+    let role_after = after
+        .piece_at(to)
+        .expect("着手直後は to に自駒があるはず")
+        .role;
+    let opp_king = after.king_square(mover.other());
+
+    let dist_after = opp_king.and_then(|k| moves_to_reach(role_after, mover, to, k));
+    let (king_approach, prey_approach) = match *mv {
+        ShogiMove::Board { from, .. } => {
+            let role_before = before
+                .piece_at(from)
+                .expect("着手前は from に自駒があるはず")
+                .role;
+            let dist_before = opp_king.and_then(|k| moves_to_reach(role_before, mover, from, k));
+            let d_before = dist_before.unwrap_or(APPROACH_DIST_CAP).min(APPROACH_DIST_CAP);
+            let d_after = dist_after.unwrap_or(APPROACH_DIST_CAP).min(APPROACH_DIST_CAP);
+            (
+                f64::from(d_before) - f64::from(d_after),
+                prey_proximity_from(after, mover, role_after, to)
+                    - prey_proximity_from(before, mover, role_before, from),
+            )
+        }
+        ShogiMove::Drop { .. } => (0.0, 0.0),
+    };
+    [king_approach, prey_approach, closeness(dist_after)]
+}
+
 pub const TRANSITION_FEATURES: usize = 6;
 
 pub const TRANSITION_FEATURE_NAMES: [&str; TRANSITION_FEATURES] = [
@@ -296,6 +442,85 @@ mod tests {
         let f = value_features(&pos, Color::Sente);
         assert_eq!(f[11], piece_value(Role::Gold), "my_max_hanging: 先手の金が浮いている");
         assert_eq!(f[12], 0.0, "opp_max_hanging: 後手の金は歩に守られていて紐つき");
+    }
+
+    fn put(pos: &mut Position, file: i8, rank: i8, color: Color, role: Role) {
+        pos.set(
+            Coord { file, rank },
+            Some(crate::shogi::Piece { color, role }),
+        );
+    }
+
+    /// 玉だけの空盤（接近特徴量のテスト用。玉が無いと king_siege が0になる）
+    fn kings_only() -> Position {
+        let mut pos = Position::empty(Color::Sente);
+        put(&mut pos, 5, 9, Color::Sente, Role::King);
+        put(&mut pos, 5, 1, Color::Gote, Role::King);
+        pos
+    }
+
+    #[test]
+    fn king_approach_counts_moves_saved_toward_enemy_king() {
+        let mut pos = kings_only();
+        // 先手の金5五 → 5四は敵玉5一へ1手ぶん近づく
+        put(&mut pos, 5, 5, Color::Sente, Role::Gold);
+        let mv = parse_usi("5e5d").unwrap();
+        let mut after = pos.clone();
+        after.play_unchecked(&mv);
+        let f = approach_transition_features(&pos, &mv, &after, Color::Sente);
+        assert_eq!(f[0], 1.0, "king_approach: 1手ぶん縮む");
+        // 遠ざかる手は負
+        let back = parse_usi("5e5f").unwrap();
+        let mut after_back = pos.clone();
+        after_back.play_unchecked(&back);
+        let g = approach_transition_features(&pos, &back, &after_back, Color::Sente);
+        assert_eq!(g[0], -1.0, "king_approach: 遠ざかると負");
+        // 近いほうが king_closeness_after は大きい
+        assert!(f[2] > g[2]);
+    }
+
+    #[test]
+    fn prey_approach_rewards_closing_on_enemy_pieces() {
+        let mut pos = kings_only();
+        put(&mut pos, 5, 5, Color::Sente, Role::Gold);
+        // 敵の飛車を9三に置く（金からは遠い）
+        put(&mut pos, 9, 3, Color::Gote, Role::Rook);
+        let toward = parse_usi("5e6d").unwrap();
+        let mut after = pos.clone();
+        after.play_unchecked(&toward);
+        let f = approach_transition_features(&pos, &toward, &after, Color::Sente);
+        assert!(f[1] > 0.0, "獲物へ近づく手は prey_approach が正: {}", f[1]);
+    }
+
+    #[test]
+    fn drops_have_no_delta_but_keep_closeness() {
+        let pos = kings_only();
+        let mv = parse_usi("G*5b").unwrap();
+        let mut after = pos.clone();
+        after.play_unchecked(&mv);
+        let f = approach_transition_features(&pos, &mv, &after, Color::Sente);
+        assert_eq!(f[0], 0.0, "打つ手に差分は無い");
+        assert_eq!(f[1], 0.0);
+        assert!(f[2] > 0.5, "敵玉の隣に打てば近さは最大級: {}", f[2]);
+    }
+
+    #[test]
+    fn king_siege_grows_as_pieces_close_in() {
+        let mut far = kings_only();
+        put(&mut far, 5, 8, Color::Sente, Role::Gold);
+        let mut near = kings_only();
+        put(&mut near, 5, 2, Color::Sente, Role::Gold);
+        let f_far = approach_state_features(&far, Color::Sente);
+        let f_near = approach_state_features(&near, Color::Sente);
+        assert!(
+            f_near[2] > f_far[2],
+            "my_king_siege: 寄っているほうが大きい {} vs {}",
+            f_near[2],
+            f_far[2]
+        );
+        // 相手視点では鏡像（自玉が寄せられている度合い）に入る
+        let g = approach_state_features(&near, Color::Gote);
+        assert!((g[3] - f_near[2]).abs() < 1e-9, "opp_king_siege は鏡像");
     }
 
     #[test]
