@@ -389,6 +389,9 @@ pub struct KingBelief {
     pub strict_unique: u32,
     /// 集計に使った推定器（シード）の数
     pub seeds: u64,
+    /// 王手宣言の履歴から**健全に**絞れる玉位置候補（deduce::opp_king_candidates）。
+    /// ここに無いマスの信念は論理的にあり得ない = フィルタの綻び
+    pub deduced: Vec<String>,
 }
 
 /// 推定器を seeds 個ぶん構築して相手玉の位置ビリーフを集計する
@@ -436,6 +439,10 @@ pub fn king_belief(rep: &Replayed, seeds: u64, scale: f64) -> KingBelief {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.sq.cmp(&b.sq))
     });
+    let deduced = crate::deduce::opp_king_candidates(side, &rep.logs[side_idx(side)])
+        .into_iter()
+        .map(make_usi_square)
+        .collect();
     KingBelief {
         side,
         squares,
@@ -443,6 +450,7 @@ pub fn king_belief(rep: &Replayed, seeds: u64, scale: f64) -> KingBelief {
         unique,
         strict_unique,
         seeds: seeds.max(1),
+        deduced,
     }
 }
 

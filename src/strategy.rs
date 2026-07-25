@@ -1255,7 +1255,14 @@ impl Strategy for EstimatorStrategy {
         // 走査があるため無制限だと思考予算を溶かす — 125te/132te シナリオの
         // 実測で検出。重み上位だけに絞る（自己正規化する関数群なので偏りは
         // 軽微、末尾は寄与が薄い）
-        let taint_pool: Vec<(&Position, f64)> = if sample.is_empty() {
+        //
+        // taint 粒子は物理制約を緩めた「嘘の盤面」なので**敵玉の位置まで嘘になる**。
+        // 王手宣言の履歴から健全に絞れる候補集合（deduce::opp_king_candidates）へ
+        // 玉を引き戻してから使う（実測: 対人局 50手目で 6d/6e/7e/7d/7b に 6.7% の
+        // 質量が乗っていたが、演繹上は 3d/4e/5a/5e/6a/6b/6c の7マスしかあり得ない）。
+        // **棄却ではなく移動**なのは、玉位置の質量を潰す事故を避けるため（ansatsu 回帰の教訓）
+        let opp_color = view.your_color.other();
+        let taint_owned: Vec<(Position, f64)> = if sample.is_empty() {
             let mut pool = taint_particles(est);
             if pool.len() > TAINT_POOL_CAP {
                 pool.select_nth_unstable_by(TAINT_POOL_CAP, |a, b| {
@@ -1263,11 +1270,18 @@ impl Strategy for EstimatorStrategy {
                 });
                 pool.truncate(TAINT_POOL_CAP);
             }
-            pool
+            // 切り戻し・アブレーション用ノブ（既定は有効）
+            if std::env::var("TSUITATE_TAINT_KING_FIX").is_ok_and(|v| v == "0") {
+                pool.iter().map(|&(p, w)| (p.clone(), w)).collect()
+            } else {
+                let cands = crate::deduce::opp_king_candidates(view.your_color, log);
+                project_taint_kings(&pool, &cands, opp_color)
+            }
         } else {
             vec![]
         };
-        let opp_color = view.your_color.other();
+        let taint_pool: Vec<(&Position, f64)> =
+            taint_owned.iter().map(|(p, w)| (p, *w)).collect();
 
         // 王手中は粒子に依存しない制約推論で「王手を解消する確率」を出す
         // （粒子が枯渇する終盤の反則バースト対策。check.rs 参照）。
@@ -1761,6 +1775,41 @@ const TAINT_POOL_CAP: usize = 256;
 /// （taint_king_distribution・taint_square_coverage の共通部品。
 /// 深い taint は信用が下がるので 0.5^(taint-1) で減衰し、
 /// taint > TAINT_VOTE_MAX は除外する）
+/// taint 粒子の敵玉を、観測から健全に絞れる候補集合 `cands` の中へ引き戻す。
+///
+/// taint は物理制約を緩めて延命させた盤面なので敵玉の位置も嘘になりうるが、
+/// 「王手宣言の履歴」から絞れる玉位置は自分側の完全既知情報だけで決まるので、
+/// そちらを信じてよい。**棄却せず移動する**のは玉位置の質量を潰さないため
+/// （ansatsu 回帰: 王手中の再重み付けで玉位置の質量を潰すと悪化する）。
+///
+/// 移動先は現在位置から最も近い候補（チェビシェフ距離、同点は決定的に file→rank 順）。
+/// その粒子で移動先に相手駒が居れば**入れ替える**（駒種の多重集合＝持ち駒会計を壊さない）。
+fn project_taint_kings(
+    pool: &[(&Position, f64)],
+    cands: &std::collections::BTreeSet<Coord>,
+    opp: Color,
+) -> Vec<(Position, f64)> {
+    pool.iter()
+        .map(|&(pos, w)| {
+            let Some(k) = pos.king_square(opp) else {
+                return (pos.clone(), w);
+            };
+            if cands.is_empty() || cands.contains(&k) {
+                return (pos.clone(), w);
+            }
+            let dist = |a: Coord, b: Coord| (a.file - b.file).abs().max((a.rank - b.rank).abs());
+            let Some(&t) = cands.iter().min_by_key(|&&c| dist(c, k)) else {
+                return (pos.clone(), w);
+            };
+            let mut next = pos.clone();
+            let displaced = next.piece_at(t);
+            next.set(t, pos.piece_at(k));
+            next.set(k, displaced);
+            (next, w)
+        })
+        .collect()
+}
+
 fn taint_particles(est: &Estimator) -> Vec<(&Position, f64)> {
     let max_lw = est
         .log_weights()

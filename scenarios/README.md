@@ -150,6 +150,11 @@ JSON（DBの列をそのままJSON.parseして詰め直すだけでよい）。`
 suite から外したシナリオ置き場（suite は `scenarios/` 直下の `.kif` だけを読む）。
 パス指定で個別実行はできる: `cargo run --release --bin scenario -- scenarios/archive/125te.kif`
 
+- `king-deduction.kif` — 人間 vs bot の実戦83手（2026-07-25）。玉位置ビリーフ表示で
+  「あり得ない玉位置を考えている」と分かった局面を含む（49手目▲3c4cの王手 →
+  50手目△5b6bの逃げ）。`deduce::opp_king_candidates` の**健全性**（全168局面で
+  真実を落とさない）と**鋭さ**（50手目=7マス、79手目=1マスに確定）の回帰テストの
+  fixture。83手あり suite には重いので archive に置く
 - `125te.kif` / `132te.kif` — 長手数（100手超）の局面。リプレイが重い割に
   注目手の判定が意味を持たなくなっていたため suite から除外（2026-07-22、
   ユーザー判断）。TAINT_POOL_CAP（taint粒子の計算量爆発対策、strategy.rs）を

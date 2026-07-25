@@ -8,8 +8,9 @@ use std::collections::HashSet;
 
 use crate::protocol::{Color, Role, VisiblePiece};
 
-/// file 1〜9（右から）、rank 1〜9（上から。1='a'）
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// file 1〜9（右から）、rank 1〜9（上から。1='a'）。
+/// Ord は BTreeSet/BTreeMap で決定論的な順序を得るためだけのもの（file→rank 順）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Coord {
     pub file: i8,
     pub rank: i8,

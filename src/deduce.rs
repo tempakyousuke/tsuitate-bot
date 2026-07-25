@@ -15,6 +15,285 @@ use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{Color, Role};
 use crate::shogi::{Position, promote_role};
 
+/// **相手玉の位置候補**を観測履歴から健全に絞る（上の演繹の鏡像: あちらは
+/// 「自玉の王手履歴で相手駒の経路を刈る」、こちらは「自分が掛けた王手宣言で
+/// 相手玉の居場所を刈る」）。
+///
+/// 使う事実は全て自分側の完全既知情報だけ:
+/// - 初期局面の相手玉のマスは分かっている（そこから出発する）
+/// - 自分の手の直後に**王手宣言があった** → 相手玉は自駒の利きうるマスのどれか
+/// - 自分の手の直後に**王手宣言が無かった** → 相手玉は自駒の確実な利きのマスには居ない
+/// - 相手が指した直後も相手玉は自駒の確実な利きのマスには居ない
+///   （自玉を王手に晒す手は指せない）
+/// - 相手玉は自駒の居るマスには居ない
+/// - 相手の1手で玉は最大1マスしか動かない（動かない場合もある）
+///
+/// **健全性が命**（真実を絶対に除外しない）なので、利きの数え方を2種類に分ける:
+/// - 「確実に利いている」= 未知の駒に遮られ**得ない**利きだけ（隣接1マスと桂の跳び）。
+///   除外（＝候補を減らす）にはこちらしか使えない
+/// - 「利きうる」= 自駒だけの盤で走り駒のレイを最大まで伸ばしたもの（未知のマスは
+///   空とみなす上界）。王手宣言による絞り込み（＝候補を残す条件）にはこちらを使う
+///
+/// 万一 候補が空になったら演繹のどこかが不健全なので、**制約を捨てて広い集合へ
+/// 戻す**（玉位置の質量を潰す事故を避ける。ansatsu 回帰の教訓）。
+pub fn opp_king_candidates(my_color: Color, log: &ObservationLog) -> std::collections::BTreeSet<Coord> {
+    use std::collections::BTreeSet;
+    let opp = my_color.other();
+    let all_squares = || -> BTreeSet<Coord> {
+        (1..=9)
+            .flat_map(|file| (1..=9).map(move |rank| Coord { file, rank }))
+            .collect()
+    };
+    let mut model = crate::model::GameModel::new(my_color);
+    let mut cands: BTreeSet<Coord> = BTreeSet::new();
+    if let Some(k) = Position::initial().king_square(opp) {
+        cands.insert(k);
+    } else {
+        return all_squares();
+    }
+
+    let events = log.events();
+    // 直前の自分の手で王手を宣言していたら、そのときの自駒盤を持ち越す
+    // （相手の応手が「玉を動かすしかなかった」かの判定に使う）
+    let mut checking_board: Option<Position> = None;
+    for (i, e) in events.iter().enumerate() {
+        model.apply(e);
+        match e {
+            Observation::MyMove { usi, captured, .. } => {
+                let board = my_only_board(&model);
+                let declared = matches!(
+                    events.get(i + 1),
+                    Some(Observation::Check { in_check }) if *in_check == opp
+                );
+                let before = cands.clone();
+                if declared {
+                    // 新たに利きが生じ得たマスに限る（王手は必ず自分の手が作る）
+                    match crate::shogi::parse_usi(usi) {
+                        Some(mv) => {
+                            let (to, from) = match mv {
+                                crate::shogi::ShogiMove::Board { from, to, .. } => (to, Some(from)),
+                                crate::shogi::ShogiMove::Drop { to, .. } => (to, None),
+                            };
+                            let newly = newly_attacked_squares(
+                                &board,
+                                my_color,
+                                to,
+                                from,
+                                captured.is_some(),
+                            );
+                            cands.retain(|k| newly.contains(k));
+                        }
+                        // USI が読めないときは緩い上界に落とす
+                        None => cands.retain(|&k| possibly_attacked(&board, k, my_color)),
+                    }
+                } else {
+                    cands.retain(|&k| !surely_attacked(&board, k, my_color));
+                }
+                cands.retain(|&k| board.piece_at(k).is_none());
+                if cands.is_empty() {
+                    // 演繹が不健全（か観測が欠けている）。制約を捨てて安全側へ
+                    cands = before;
+                    cands.retain(|&k| board.piece_at(k).is_none());
+                    if cands.is_empty() {
+                        return all_squares();
+                    }
+                }
+                checking_board = declared.then_some(board);
+            }
+            Observation::OpponentMoved {
+                captured_my_piece_at,
+                ..
+            } => {
+                let captured_sq = captured_my_piece_at
+                    .as_deref()
+                    .and_then(crate::board::parse_usi_square);
+                // 玉は最大1マス動く（動かないこともある）。ただし直前に王手を
+                // 掛けていて、その王手駒が**隣接**していて（＝合駒で防げない）
+                // **取られてもいない**なら、玉は動くしかなかった＝居残りは除外できる
+                let mut next: BTreeSet<Coord> = BTreeSet::new();
+                for &k in &cands {
+                    let forced_to_move = checking_board.as_ref().is_some_and(|b| {
+                        b.pieces().any(|(from, pc)| {
+                            pc.color == my_color
+                                && unblockable(from, k)
+                                && b.attacks(from, k)
+                                && Some(from) != captured_sq
+                        })
+                    });
+                    if !forced_to_move {
+                        next.insert(k);
+                    }
+                    for df in -1..=1i8 {
+                        for dr in -1..=1i8 {
+                            if df == 0 && dr == 0 {
+                                continue;
+                            }
+                            let n = Coord { file: k.file + df, rank: k.rank + dr };
+                            if on_board(n) {
+                                next.insert(n);
+                            }
+                        }
+                    }
+                }
+                let board = my_only_board(&model);
+                // 相手は自玉を王手に晒す手を指せない
+                next.retain(|&k| !surely_attacked(&board, k, my_color));
+                next.retain(|&k| board.piece_at(k).is_none());
+                cands = if next.is_empty() { all_squares() } else { next };
+                checking_board = None;
+            }
+            _ => {}
+        }
+    }
+    cands
+}
+
+/// 自駒だけを置いた盤（未知のマスは空。走り駒のレイはここで最大まで伸びる）
+fn my_only_board(model: &crate::model::GameModel) -> Position {
+    let me = model.my_color();
+    let mut pos = Position::empty(me);
+    for p in model.my_pieces() {
+        if let Some(sq) = crate::board::parse_usi_square(&p.square) {
+            pos.set(sq, Some(crate::shogi::Piece { color: me, role: p.role }));
+        }
+    }
+    pos
+}
+
+/// from から to への攻撃が未知の駒に遮られ**得ない**か（隣接1マス or 桂の跳び）
+fn unblockable(from: Coord, to: Coord) -> bool {
+    let df = (from.file - to.file).abs();
+    let dr = (from.rank - to.rank).abs();
+    (df <= 1 && dr <= 1) || (df == 1 && dr == 2)
+}
+
+/// sq が me の駒に**確実に**利かれているか（遮られ得ない利きだけを数える）
+fn surely_attacked(board: &Position, sq: Coord, me: Color) -> bool {
+    board
+        .pieces()
+        .any(|(from, pc)| pc.color == me && unblockable(from, sq) && board.attacks(from, sq))
+}
+
+/// sq が me の駒に利き**うる**か（未知のマスを空とみなした上界）
+fn possibly_attacked(board: &Position, sq: Coord, me: Color) -> bool {
+    board
+        .pieces()
+        .any(|(from, pc)| pc.color == me && board.attacks(from, sq))
+}
+
+/// from から to への直線上（両端を除く）に x があるか。走り駒の「線が開いたか」判定用
+fn between(from: Coord, to: Coord, x: Coord) -> bool {
+    let (df, dr) = (to.file - from.file, to.rank - from.rank);
+    let step = |v: i8| v.signum();
+    // 直線（縦横斜め）でなければ通り道は無い
+    if !(df == 0 || dr == 0 || df.abs() == dr.abs()) {
+        return false;
+    }
+    let (sf, sr) = (step(df), step(dr));
+    let mut c = Coord { file: from.file + sf, rank: from.rank + sr };
+    while c != to {
+        if c == x {
+            return true;
+        }
+        c = Coord { file: c.file + sf, rank: c.rank + sr };
+    }
+    false
+}
+
+/// 自分の着手によって**新たに**自駒の利きが生じ得るマスの上界。
+/// 相手は自分から自玉を王手に晒す手を指せないので、新しい王手は必ず自分の手が作る。
+/// 作り方は3通りしかない:
+/// - (A) 着手した駒が着地点から利かせる
+/// - (B) 出て行ったマス（from）を通る自分の走り駒の線が開く（開き王手）
+/// - (C) 取った駒が居たマス（to）を通る自分の走り駒の線が開く
+///
+/// 集合の**差分**（after で利く ∧ before で利かない）では計算しない: 上界どうしの
+/// 差は上界にならず（before 側が過大に主張すると真の新規王手マスを落とす）健全性が壊れる。
+/// A/B/C を構成的に足し上げることで上界を保つ
+fn newly_attacked_squares(
+    after: &Position,
+    me: Color,
+    to: Coord,
+    from: Option<Coord>,
+    captured: bool,
+) -> std::collections::BTreeSet<Coord> {
+    let mut out = std::collections::BTreeSet::new();
+    for file in 1..=9i8 {
+        for rank in 1..=9i8 {
+            let s = Coord { file, rank };
+            if s == to {
+                continue; // 着地点には自駒が居る
+            }
+            // (A) 着手した駒の利き
+            if after.attacks(to, s) {
+                out.insert(s);
+                continue;
+            }
+            // (B)(C) 開いた線
+            let opened = after.pieces().any(|(p, pc)| {
+                pc.color == me
+                    && p != to
+                    && after.attacks(p, s)
+                    && (from.is_some_and(|f| between(p, s, f)) || (captured && between(p, s, to)))
+            });
+            if opened {
+                out.insert(s);
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod king_tests {
+    use super::*;
+    use crate::board::make_usi_square;
+    use crate::scenario_core::{load_scenario, replay, scenarios_dir, side_idx};
+
+    fn game() -> crate::kifu::Kifu {
+        let path = scenarios_dir().join("archive/king-deduction.kif");
+        load_scenario(&path.to_string_lossy(), Some(0), None, None)
+            .expect("archive/king-deduction.kif")
+            .kifu
+    }
+
+    /// **健全性**: 真の玉位置は必ず候補集合に含まれる（全 ply・両視点）。
+    /// ここが破れると玉位置の質量を誤って潰すので、絶対に落としてはいけない
+    #[test]
+    fn 敵玉候補は真実を落とさない() {
+        let kifu = game();
+        for ply in 0..=kifu.plies.len() {
+            let rep = replay(&kifu, ply);
+            for me in [Color::Sente, Color::Gote] {
+                let cands = opp_king_candidates(me, &rep.logs[side_idx(me)]);
+                let truth = rep.pos.king_square(me.other()).expect("玉");
+                assert!(
+                    cands.contains(&truth),
+                    "ply={ply} {me:?}視点: 真実 {} が候補{}件に無い",
+                    make_usi_square(truth),
+                    cands.len()
+                );
+            }
+        }
+    }
+
+    /// **鋭さ**: 王手の直後は候補が実用的な数まで絞れる。
+    /// 49手目 ▲3c4c（と金の王手）→ 50手目の逃げで7マス
+    #[test]
+    fn 王手の直後は敵玉候補が絞れる() {
+        let kifu = game();
+        let rep = replay(&kifu, 50);
+        let cands = opp_king_candidates(Color::Sente, &rep.logs[side_idx(Color::Sente)]);
+        // BTreeSet<Coord> は (file, rank) 昇順
+        let got: Vec<String> = cands.iter().map(|c| make_usi_square(*c)).collect();
+        assert_eq!(got, ["3d", "4e", "5a", "5e", "6a", "6b", "6c"], "50手目の候補");
+        // 79手目まで進めると1マスまで確定する
+        let rep = replay(&kifu, 79);
+        let cands = opp_king_candidates(Color::Sente, &rep.logs[side_idx(Color::Sente)]);
+        assert_eq!(cands.len(), 1, "79手目は1マスに確定するはず: {cands:?}");
+    }
+}
+
 /// 相手の各着手（OpponentMoved）の直前時点での「自玉の位置」と、
 /// その着手の直後に自玉への王手が観測されたか。自玉の位置は自分の手でしか
 /// 動かないので、直前=直後で同じ（この着手中は動いていない）

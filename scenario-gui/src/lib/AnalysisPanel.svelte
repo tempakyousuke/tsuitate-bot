@@ -104,6 +104,8 @@
       if (mode === "belief") {
         currentEngine = "estimator（粒子）";
         const result = await evalKingBelief(path, runPly, trials, runBudget);
+        // 評価が実際に使う粒子に既定を合わせる（厳密が生きていれば評価は厳密だけを見る）
+        beliefSource = result.strictUnique > 0 ? "strict" : "all";
         beliefResult = { ply: runPly, budgetMs: runBudget, result };
       } else if (mode === "ranking") {
         currentEngine = "estimator";
@@ -299,6 +301,20 @@
       <div class="hint warn">
         厳密整合の粒子が0個です。この局面の評価は taint 粒子と事前分布で走っているので、
         「taint込み全粒子」に切り替えてください
+      </div>
+    {/if}
+    {@const impossible = b.squares.filter(
+      (s) => (beliefSource === "strict" ? s.strict : s.all) > 0 && !b.deduced.includes(s.sq),
+    )}
+    <div class="hint">
+      王手履歴から健全に絞れる候補: {b.deduced.length}マス（{b.deduced.join(" ")}）
+    </div>
+    {#if impossible.length > 0}
+      <div class="hint warn">
+        論理的にあり得ないマスに信念がある: {impossible
+          .map((s) => `${s.sq} ${(((beliefSource === "strict" ? s.strict : s.all) * 100)).toFixed(1)}%`)
+          .join(" / ")}
+        （taint 粒子は評価に渡す前に候補集合へ引き戻すが、この表示は補正前の生の分布）
       </div>
     {/if}
     <div class="belief-scroll">

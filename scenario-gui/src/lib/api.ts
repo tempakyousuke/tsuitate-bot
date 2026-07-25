@@ -142,6 +142,8 @@ export interface KingBelief {
   unique: number;
   strictUnique: number;
   seeds: number;
+  /** 王手宣言の履歴から健全に絞れる玉位置候補。ここに無いマスの信念はあり得ない */
+  deduced: string[];
 }
 
 // ---------- 対局モード（play.rs） ----------
