@@ -1386,6 +1386,9 @@ impl Strategy for EstimatorStrategy {
         // 手番ごとに1回だけ計算する）
         let mut nn_state_cache: Vec<Option<[f64; crate::value_features::VALUE_FEATURES]>> =
             vec![None; sample.len()];
+        // 「指す前から付いていた当たり」の下駄（sample と同じ並び）。候補非依存なので
+        // 手番ごとに1回だけ計算する。詳細は threat_base_value のdocコメント
+        let mut threat_base_cache: Vec<Option<f64>> = vec![None; sample.len()];
         // 1段目: 全候補を1手読み（静的リスク項つき）で評価する。
         // (usi, mv, 内訳, gain外の補正, 1段目スコア)
         let mut scored: Vec<(String, ShogiMove, EvalOut, f64, f64)> = vec![];
@@ -1409,6 +1412,7 @@ impl Strategy for EstimatorStrategy {
                 &params,
                 budget,
                 &mut nn_state_cache,
+                &mut threat_base_cache,
             );
             // 王手中: 仮説条件付きの「王手駒の除去期待値」（check.rs::removal_term）。
             // 王手駒のマスを取る手は受理された未来で脅威ごと駒を排除し、玉逃げ等の
@@ -2233,6 +2237,8 @@ fn evaluate(
     // valueネットのstate特徴量キャッシュ（particles と同じ並び。候補間で共通なので
     // choose() が1手番ぶん保持し、最初に使う候補の評価時に遅延計算する）
     nn_state_cache: &mut [Option<[f64; crate::value_features::VALUE_FEATURES]>],
+    // 「指す前から付いていた当たり」の下駄のキャッシュ（particles と同じ並び）
+    threat_base_cache: &mut [Option<f64>],
 ) -> EvalOut {
     let me = view.your_color;
     let opp = me.other();
@@ -2346,9 +2352,13 @@ fn evaluate(
         v -= risk;
         risk_sum += w * risk;
 
-        // 自分が敵駒に当たりを付けている価値（露出リスクの鏡像）。
-        // 1手読みでは見えない「次の駒得」を作る手（大駒の頭への歩打ち等）に価値を与える
-        v += params.threat_w * threat_value(&next, me);
+        // この手で新たに当たりを付けた価値（露出リスクの鏡像）。
+        // 1手読みでは見えない「次の駒得」を作る手（大駒の頭への歩打ち等）に価値を与える。
+        // **候補間の序列を作るのはこの差分項だけ**
+        v += params.threat_w * new_threat_value(pos, &next, me);
+        // 指す前から付いていた当たりの下駄（候補非依存。gain のゼロ点を保つためだけ）
+        v += params.threat_w
+            * *threat_base_cache[pi].get_or_insert_with(|| threat_base_value(pos, me));
         // 桂馬の高跳び歩の餌食: 歩が敵桂馬の攻撃マスへ近づくほど加点
         v += params.knight_bait_w * knight_bait_value(&next, me, mv);
 
@@ -2718,10 +2728,63 @@ fn big_home_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
     n
 }
 
-/// 自分が当たりを付けている敵駒の最大価値（露出リスクの鏡像）。
-/// 紐つき（相手が守っている）なら取ったときに取り返されるぶん割り引く。
-/// 玉への当たりは王手であり合法性・王手ボーナス側で扱うので除く
-fn threat_value(pos: &Position, me: Color) -> f64 {
+/// 紐つき（相手が守っている）敵駒への当たりの割引率。取ったときに
+/// 取り返されるぶんを引く
+const THREAT_DEFENDED_DISCOUNT: f64 = 0.45;
+
+/// **この手で新たに**当たりを付けた敵駒の最大価値（露出リスクの鏡像）。
+/// 1手読みでは見えない「次の駒得」を作る手（大駒の頭への歩打ち等）に価値を与える。
+/// 紐つきなら割り引く。玉への当たりは王手であり合法性・王手ボーナス側で扱うので除く。
+///
+/// **差分（新規に付いた当たりだけ）で測るのが要点**（2026-07-25）。旧実装は
+/// `after` の盤面全体の max だったため、どこかに既に当たりがあるとその値が
+/// 全候補に等しく乗り、「新しく当たりを付けた手」と「何もしない手」の差が
+/// max に埋もれて消えていた（valueネットで `transition_features` を足して
+/// 直したのと同じ max型埋没。docs/nn-value-phase1.md）。発端の局面
+/// （scenarios/watch-estimator-vs-estimator-20260725-203544.kif 34手目）では
+/// 「取られないが相手陣への脅威にもならない歩打ち」が上位に並び、駒を寄せる手が
+/// 20位以下に沈んでいた。
+///
+/// 当たりを**失う**手（当たりを付けていた駒を動かす等）に対称の減点は入れない。
+/// 合法手全体を一律に減点する形は反則水位を割って反則が爆発する
+/// （removal_term の対称形で踏んだ罠。check.rs のdocコメント参照）ため、
+/// この項は従来どおり非負に保つ。
+///
+/// 水準（gain のゼロ点）は `threat_base_value` の下駄で旧実装に合わせる。
+/// 差分だけにすると全候補の gain が下駄のぶん下がって多くが負に入り、
+/// `combine_score` が `(p_legal×gain).min(gain)` の形なので **p_legal の割引が
+/// 効かなくなる**（実測 2026-07-25: dragon-check-drop の反則負けが 0/20 → 2/20、
+/// 追加反則 41 → 59）
+fn new_threat_value(before: &Position, after: &Position, me: Color) -> f64 {
+    let opp = me.other();
+    let mut best = 0.0f64;
+    for (sq, piece) in after.pieces() {
+        if piece.color != opp || piece.role == Role::King {
+            continue;
+        }
+        if !after.is_attacked(sq, me) {
+            continue;
+        }
+        // 指す前から当たっていた駒は「新規」ではない。動くのは自分の1手だけなので
+        // 同じマスの敵駒は同一（取ったマスは自駒になるので上の色判定で落ちる）
+        if before.is_attacked(sq, me) {
+            continue;
+        }
+        let defended = after.is_attacked(sq, opp);
+        let gain = exchange_value(piece.role) * if defended { THREAT_DEFENDED_DISCOUNT } else { 1.0 };
+        best = best.max(gain);
+    }
+    best
+}
+
+/// **指す前から**当たっていた敵駒の最大価値（旧 `threat_value`）。
+///
+/// 候補手に依存しない（粒子だけで決まる）ので、これ単体では手の序列を作らない。
+/// 置いてある理由は gain のゼロ点を旧実装と揃えることだけ:
+/// `combine_score` は負の gain を p_legal で割り引かない min 形なので、
+/// 下駄を外すと静かな手が負側へ落ちて反則の割引が消える（`new_threat_value` の
+/// docコメント参照）。粒子ごとに1回だけ計算して `threat_base_cache` に持つ
+fn threat_base_value(pos: &Position, me: Color) -> f64 {
     let opp = me.other();
     let mut best = 0.0f64;
     for (sq, piece) in pos.pieces() {
@@ -2732,7 +2795,8 @@ fn threat_value(pos: &Position, me: Color) -> f64 {
             continue;
         }
         let defended = pos.is_attacked(sq, opp);
-        let gain = exchange_value(piece.role) * if defended { 0.45 } else { 1.0 };
+        let gain =
+            exchange_value(piece.role) * if defended { THREAT_DEFENDED_DISCOUNT } else { 1.0 };
         best = best.max(gain);
     }
     best
@@ -3195,6 +3259,87 @@ pub(crate) mod tests {
         assert_eq!(tokin_probe(&view, &parse_usi("P*3f").unwrap()), 0.0);
         // 歩以外の打ちには付かない
         assert_eq!(tokin_probe(&view, &parse_usi("G*3d").unwrap()), 0.0);
+    }
+
+    /// 空盤に駒を置くヘルパ（new_threat_value のテスト用）
+    fn put(pos: &mut Position, sq: &str, color: Color, role: Role) {
+        pos.set(
+            parse_usi_square(sq).unwrap(),
+            Some(crate::shogi::Piece { color, role }),
+        );
+    }
+
+    #[test]
+    fn new_threat_value_counts_only_newly_created_threats() {
+        // 先手玉5九・後手玉5一（玉が無いと is_legal 等が壊れる）。
+        // 後手の飛車8二が既に後手から見た当たり… ではなく「先手番」で考える:
+        // 先手の飛車1八が後手の金1三に当たっている（既存の当たり）
+        let mut base = Position::empty(Color::Sente);
+        put(&mut base, "5i", Color::Sente, Role::King);
+        put(&mut base, "5a", Color::Gote, Role::King);
+        put(&mut base, "1h", Color::Sente, Role::Rook);
+        put(&mut base, "1c", Color::Gote, Role::Gold);
+        put(&mut base, "7c", Color::Gote, Role::Silver);
+        put(&mut base, "8g", Color::Sente, Role::Pawn);
+        assert!(base.is_attacked(parse_usi_square("1c").unwrap(), Color::Sente));
+
+        // 既存の当たり（1三金）を保つだけの無関係な手には付かない。
+        // 旧実装（after の盤面全体の max）ではここで金の価値が乗っていた
+        let quiet = parse_usi("5i4i").unwrap();
+        let mut after_quiet = base.clone();
+        after_quiet.play_unchecked(&quiet);
+        assert_eq!(new_threat_value(&base, &after_quiet, Color::Sente), 0.0);
+
+        // 新たに当たりを付ける手（8七歩 → 7三銀ではなく歩を進めて7六… ではなく
+        // 銀の頭に歩を進める形にする）: 8七歩が7三銀に当たるまでは距離があるので、
+        // ここは歩を打って直接当てる（持ち駒があるかは new_threat_value は見ない）
+        let mut after_new = base.clone();
+        let drop = ShogiMove::Drop {
+            role: Role::Pawn,
+            to: parse_usi_square("7d").unwrap(),
+        };
+        after_new.play_unchecked(&drop);
+        let v = new_threat_value(&base, &after_new, Color::Sente);
+        assert!(v > 0.0, "7四歩は7三銀に新しく当たりを付ける: {v}");
+
+        // 玉への当たり（王手）は王手ボーナス側で扱うので数えない
+        let mut king_only = Position::empty(Color::Sente);
+        put(&mut king_only, "5i", Color::Sente, Role::King);
+        put(&mut king_only, "5a", Color::Gote, Role::King);
+        let mut after_check = king_only.clone();
+        let check_drop = ShogiMove::Drop {
+            role: Role::Rook,
+            to: parse_usi_square("5e").unwrap(),
+        };
+        after_check.play_unchecked(&check_drop);
+        assert_eq!(new_threat_value(&king_only, &after_check, Color::Sente), 0.0);
+    }
+
+    #[test]
+    fn new_threat_value_discounts_defended_targets() {
+        let mut base = Position::empty(Color::Sente);
+        put(&mut base, "5i", Color::Sente, Role::King);
+        put(&mut base, "5a", Color::Gote, Role::King);
+        put(&mut base, "7c", Color::Gote, Role::Silver);
+        let drop = ShogiMove::Drop {
+            role: Role::Pawn,
+            to: parse_usi_square("7d").unwrap(),
+        };
+        let mut bare = base.clone();
+        bare.play_unchecked(&drop);
+        let undefended = new_threat_value(&base, &bare, Color::Sente);
+
+        // 銀に紐（6二金）を付けると割り引かれる
+        let mut guarded_base = base.clone();
+        put(&mut guarded_base, "6b", Color::Gote, Role::Gold);
+        let mut guarded = guarded_base.clone();
+        guarded.play_unchecked(&drop);
+        let defended = new_threat_value(&guarded_base, &guarded, Color::Sente);
+        assert!(
+            defended < undefended,
+            "紐つきは割引: {defended} < {undefended}"
+        );
+        assert!((defended - undefended * THREAT_DEFENDED_DISCOUNT).abs() < 1e-9);
     }
 
     /// 相手玉を kf筋・自陣に歩を1枚置いた盤（指紋がユニークになるよう pawn_sq を変える）
