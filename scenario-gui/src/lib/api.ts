@@ -120,6 +120,26 @@ export interface RankingResult {
   ranking: CandidateScore[];
 }
 
+// ---------- 玉位置ビリーフ（scenario_core::king_belief） ----------
+
+export interface KingBeliefSquare {
+  sq: string;
+  /** taint 込みの全粒子での割合 [0,1] */
+  all: number;
+  /** 厳密整合の粒子だけでの割合 [0,1]。厳密が全滅していれば全て 0 */
+  strict: number;
+}
+
+export interface KingBelief {
+  /** 信念を持っている側（= その局面の手番側）。相手玉の位置についての分布 */
+  side: Color;
+  squares: KingBeliefSquare[];
+  truth: string | null;
+  unique: number;
+  strictUnique: number;
+  seeds: number;
+}
+
 // ---------- 対局モード（play.rs） ----------
 
 export interface PlayHint {
@@ -169,6 +189,12 @@ export const evalRanking = (
   seed: number,
   budgetMs: number,
 ) => invoke<RankingResult>("eval_ranking", { path, ply, engine, seed, budgetMs });
+export const evalKingBelief = (
+  path: string,
+  ply: number,
+  seeds: number,
+  budgetMs: number,
+) => invoke<KingBelief>("eval_king_belief", { path, ply, seeds, budgetMs });
 export const cancelEval = (runId: number) => invoke<void>("cancel_eval", { runId });
 export const playStart = (
   engine: string,

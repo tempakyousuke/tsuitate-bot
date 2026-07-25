@@ -19,7 +19,8 @@ use tsuitate_bot::board::make_usi_square;
 use tsuitate_bot::kifu::{Kifu, parse_kif};
 use tsuitate_bot::protocol::{Color, Role};
 use tsuitate_bot::scenario_core::{
-    Replayed, choice_trial_one, ranking_one, replay, resolve_foul, scenarios_dir, side_idx,
+    self as scenario_core, Replayed, choice_trial_one, ranking_one, replay, resolve_foul,
+    scenarios_dir, side_idx,
 };
 use tsuitate_bot::shogi::{Position, ShogiMove, parse_usi};
 use tsuitate_bot::strategy::{self, CandidateScore};
@@ -487,6 +488,27 @@ async fn eval_ranking(
     .map_err(|e| format!("実行スレッドの異常終了: {e}"))?
 }
 
+/// 手番側の粒子が「相手玉はどこにいると思っているか」の分布。
+/// 盤に % を重ねて出すための最小データ（計算本体は scenario_core::king_belief で、
+/// `bin/scenario diag` の「相手玉の位置分布」と同じ重み規約）
+#[tauri::command]
+async fn eval_king_belief(
+    path: String,
+    ply: usize,
+    seeds: u64,
+    budget_ms: Option<u32>,
+) -> Result<scenario_core::KingBelief, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<scenario_core::KingBelief, String> {
+        let rep = replayed_at(&path, ply)?;
+        // 粒子数・リプレイ予算のスケールは他の分析と同じ規約（基準 900ms）
+        let ms = budget_ms.unwrap_or(2000).clamp(100, 60_000);
+        let scale = f64::from(ms) / 900.0;
+        with_budget(ms, || catch(|| scenario_core::king_belief(&rep, seeds.clamp(1, 32), scale)))
+    })
+    .await
+    .map_err(|e| format!("実行スレッドの異常終了: {e}"))?
+}
+
 #[tauri::command]
 fn cancel_eval(state: State<'_, EvalState>, run_id: u32) {
     if let Some(flag) = state.cancels.lock().unwrap().get(&run_id) {
@@ -563,6 +585,11 @@ mod tests {
             .unwrap(),
         );
 
+        write(
+            "king_belief",
+            serde_json::to_value(scenario_core::king_belief(&rep, 2, 2000.0 / 900.0)).unwrap(),
+        );
+
         let (chosen, ranking) = ranking_one(&rep, 0, "estimator").unwrap();
         write(
             "ranking",
@@ -619,6 +646,7 @@ fn main() {
             load_kifu,
             eval_tally,
             eval_ranking,
+            eval_king_belief,
             cancel_eval,
             play::play_start,
             play::play_human_move,

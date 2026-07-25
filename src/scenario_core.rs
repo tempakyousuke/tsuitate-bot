@@ -8,6 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::board::{make_usi_drop, make_usi_move, make_usi_square, parse_usi_square};
+use crate::estimator::Estimator;
 use crate::kifu::{Kifu, RawFoul, parse_kif};
 use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{ClockState, Color, FoulCounts, GameStatus, PlayerView};
@@ -297,6 +298,154 @@ pub fn ranking_one(
     Some((chosen, ranking))
 }
 
+/// 推定器を実対局と同じ**逐次 update** で構築する（`prewarm_strategy` と同じ理由:
+/// 一括 update だと制約列の解き方が変わって粒子集合が実対局とずれる）。
+/// `on_turn(&est, 手番番号)` が自分の手番ごとに呼ばれる（診断の進捗表示用）。
+pub fn build_estimator(
+    rep: &Replayed,
+    seed: u64,
+    scale: f64,
+    mut on_turn: impl FnMut(&Estimator, usize),
+) -> Estimator {
+    let side = rep.pos.turn();
+    let log = &rep.logs[side_idx(side)];
+    let mut est = Estimator::with_seed_and_scale(side, seed, scale);
+    let mut running = ObservationLog::default();
+    let mut turn_no = 0;
+    for e in log.events() {
+        if matches!(e, Observation::MyMove { .. } | Observation::MyFoul { .. }) {
+            est.update(&running);
+            turn_no += 1;
+            on_turn(&est, turn_no);
+        }
+        running.record(e.clone());
+    }
+    est.update(&running);
+    est
+}
+
+/// 推定器のユニーク粒子と**評価重み**。重みの規約は評価側 `stratified_sample`
+/// と同じ: 推定器内の logw を max で正規化し、同一指紋の質量 Σexp(logw) を
+/// 畳み込む（C-7 P1 の multiplicity 保持。ソフト減衰は logw に課金済み）。
+/// `strict` は「情報制約も物理制約も緩和していない」粒子（phys_taint>0 は
+/// info_miss を最低1として非厳密扱いにする、diag と同じ判定）。
+///
+/// 診断（bin/scenario の diag）と GUI の玉位置ビリーフが**同じ規約**で数える
+/// ための共通部品。ここが食い違うと較正の数字が意味を失う
+pub fn weighted_unique_particles(est: &Estimator) -> Vec<(&Position, f64, bool)> {
+    let max_logw = est.log_weights().iter().copied().fold(f64::MIN, f64::max);
+    let mut mass: HashMap<u64, (f64, u8)> = HashMap::new();
+    for (((pp, &miss), &taint), &lw) in est
+        .particles()
+        .iter()
+        .zip(est.info_miss())
+        .zip(est.phys_taint())
+        .zip(est.log_weights())
+    {
+        let miss_eff = if taint > 0 { miss.max(1) } else { miss };
+        let e = mass.entry(pp.fingerprint()).or_insert((0.0, miss_eff));
+        e.0 += (lw - max_logw).exp();
+        e.1 = e.1.min(miss_eff);
+    }
+    let mut seen: HashSet<u64> = HashSet::new();
+    let mut out = vec![];
+    for pp in est.particles() {
+        let fp = pp.fingerprint();
+        if !seen.insert(fp) {
+            continue;
+        }
+        let (w, penalty) = mass[&fp];
+        out.push((pp, w, penalty == 0));
+    }
+    out
+}
+
+/// 相手玉の位置ごとの信念（重み付き割合）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KingBeliefSquare {
+    /// USI マス（"7i"）
+    pub sq: String,
+    /// taint 込みの全粒子での割合 [0,1]
+    pub all: f64,
+    /// 厳密整合の粒子だけでの割合 [0,1]（厳密が全滅していれば 0）
+    pub strict: f64,
+}
+
+/// 手番側から見た相手玉の位置ビリーフ（`bin/scenario diag` の「相手玉の位置分布」と
+/// 同じ計算を、GUI から呼べる形で返す）。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KingBelief {
+    /// 信念を持っている側（= その局面の手番側）
+    pub side: Color,
+    /// 割合の降順
+    pub squares: Vec<KingBeliefSquare>,
+    /// 真実の相手玉のマス（GUI の答え合わせ表示用）
+    pub truth: Option<String>,
+    /// ユニーク粒子数と、そのうち厳密整合の数。**厳密が0なら評価は taint 頼り**で、
+    /// strict 側の列は全ゼロになる（mate-net 57手目のような終盤で普通に起きる）
+    pub unique: u32,
+    pub strict_unique: u32,
+    /// 集計に使った推定器（シード）の数
+    pub seeds: u64,
+}
+
+/// 推定器を seeds 個ぶん構築して相手玉の位置ビリーフを集計する
+pub fn king_belief(rep: &Replayed, seeds: u64, scale: f64) -> KingBelief {
+    let side = rep.pos.turn();
+    let mut all_tally: HashMap<String, f64> = HashMap::new();
+    let mut strict_tally: HashMap<String, f64> = HashMap::new();
+    let mut all_mass = 0.0f64;
+    let mut strict_mass = 0.0f64;
+    let mut unique = 0u32;
+    let mut strict_unique = 0u32;
+    for seed in 0..seeds.max(1) {
+        let est = build_estimator(rep, seed, scale, |_, _| {});
+        for (pp, w, strict) in weighted_unique_particles(&est) {
+            unique += 1;
+            if strict {
+                strict_unique += 1;
+            }
+            let Some(sq) = pp.king_square(side.other()) else {
+                continue;
+            };
+            let key = make_usi_square(sq);
+            *all_tally.entry(key.clone()).or_insert(0.0) += w;
+            all_mass += w;
+            if strict {
+                *strict_tally.entry(key).or_insert(0.0) += w;
+                strict_mass += w;
+            }
+        }
+    }
+    let mut squares: Vec<KingBeliefSquare> = all_tally
+        .into_iter()
+        .map(|(sq, m)| {
+            let strict = strict_tally.get(&sq).copied().unwrap_or(0.0);
+            KingBeliefSquare {
+                all: m / all_mass.max(1e-12),
+                strict: if strict_mass > 0.0 { strict / strict_mass } else { 0.0 },
+                sq,
+            }
+        })
+        .collect();
+    squares.sort_by(|a, b| {
+        b.all
+            .partial_cmp(&a.all)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.sq.cmp(&b.sq))
+    });
+    KingBelief {
+        side,
+        squares,
+        truth: rep.pos.king_square(side.other()).map(make_usi_square),
+        unique,
+        strict_unique,
+        seeds: seeds.max(1),
+    }
+}
+
 /// 手番側の一手の選択を seed 0..trials で試行して集計する。
 /// `on_trial(seed, 受理された手, 反則列)` が1試行終わるごとに呼ばれる
 /// （CLI の逐次表示・GUI の進捗イベント用）
@@ -395,6 +544,32 @@ mod tests {
             "注目手 {} が候補にない",
             sc.target
         );
+    }
+
+    /// 玉位置ビリーフ（scenario-gui の盤オーバーレイ）の形の検証。
+    /// 序盤（相手が玉をまだ動かしていない ply）なら初期マスに信念が集中するはず。
+    /// 推定器の構築が重いので release で実行する:
+    /// `cargo test --release -- --ignored ビリーフ`
+    #[test]
+    #[ignore]
+    fn 玉位置ビリーフは序盤なら初期マスに集中する() {
+        let sc = load("keima");
+        // 4手目まで = 後手は 3a3b / 2b3a しか指しておらず玉は 5a のまま
+        let rep = replay(&sc.kifu, 4);
+        assert_eq!(rep.pos.turn(), Color::Sente);
+        let b = king_belief(&rep, 2, 1.0);
+        assert_eq!(b.side, Color::Sente);
+        assert_eq!(b.truth.as_deref(), Some("5a"));
+        // 割合は正規化されている（全粒子側）
+        let sum: f64 = b.squares.iter().map(|s| s.all).sum();
+        assert!((sum - 1.0).abs() < 1e-6, "全粒子の割合の和が1でない: {sum}");
+        // 降順で返る
+        for w in b.squares.windows(2) {
+            assert!(w[0].all >= w[1].all, "割合の降順でない");
+        }
+        // 序盤は厳密粒子が生きていて、真実の 5a が最有力
+        assert!(b.strict_unique > 0, "序盤なのに厳密粒子が全滅している");
+        assert_eq!(b.squares[0].sq, "5a", "初期マスが最有力でない");
     }
 
     /// リプレイの裁定検証（合法手は合法・反則試行は非合法）が全編通ること

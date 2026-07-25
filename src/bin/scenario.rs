@@ -30,11 +30,11 @@ use std::path::PathBuf;
 
 use tsuitate_bot::board::{make_usi_square, parse_usi_square};
 use tsuitate_bot::estimator::Estimator;
-use tsuitate_bot::observation::{Observation, ObservationLog};
+use tsuitate_bot::observation::Observation;
 use tsuitate_bot::protocol::{Color, Role};
 use tsuitate_bot::scenario_core::{
-    ChoiceStats, Replayed, Scenario, choice_trials, clone_log, load_scenario, make_view, replay,
-    scenarios_dir, side_idx,
+    ChoiceStats, Replayed, Scenario, build_estimator, choice_trials, clone_log, load_scenario,
+    make_view, replay, scenarios_dir, side_idx, weighted_unique_particles,
 };
 use tsuitate_bot::shogi::{Outcome, Position, ShogiMove, parse_usi, unpromote_role};
 use tsuitate_bot::strategy;
@@ -125,7 +125,6 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
         .unwrap_or(1.0);
     let scale = 2000.0 / 900.0 * mult;
     let king_sq = rep.pos.king_square(side).expect("手番側の玉");
-    let log = &rep.logs[side_idx(side)];
     let diag_sqs: Vec<_> = sc
         .diag_squares
         .iter()
@@ -154,37 +153,29 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
     let mut total_unique = 0u32;
     let mut strict_unique = 0u32;
     for seed in 0..n_estimators {
-        let mut est = Estimator::with_seed_and_scale(side, seed, scale);
-        // 実対局と同じ逐次 update（prewarm_strategy と同じ理由）
-        let mut running = ObservationLog::default();
-        let mut turn_no = 0;
-        for e in log.events() {
-            if matches!(e, Observation::MyMove { .. } | Observation::MyFoul { .. }) {
-                est.update(&running);
-                turn_no += 1;
-                if seed == 0 {
-                    let strict = est
-                        .info_miss()
-                        .iter()
-                        .zip(est.phys_taint())
-                        .filter(|&(&m, &t)| m == 0 && t == 0)
-                        .count();
-                    let taint = est.phys_taint().iter().filter(|&&t| t > 0).count();
-                    let (repaired, revived) = est.rejuv_stats();
-                    eprintln!(
-                        "  [seed0] 手番{turn_no}: 粒子 {} (厳密{} taint{} healthy={} 修復{} 復活{})",
-                        est.particles().len(),
-                        strict,
-                        taint,
-                        est.healthy(),
-                        repaired,
-                        revived,
-                    );
-                }
+        // 構築は scenario_core と共有（GUI の玉位置ビリーフと同じ粒子集合になる）
+        let est = build_estimator(rep, seed, scale, |est: &Estimator, turn_no: usize| {
+            if seed != 0 {
+                return;
             }
-            running.record(e.clone());
-        }
-        est.update(&running);
+            let strict = est
+                .info_miss()
+                .iter()
+                .zip(est.phys_taint())
+                .filter(|&(&m, &t)| m == 0 && t == 0)
+                .count();
+            let taint = est.phys_taint().iter().filter(|&&t| t > 0).count();
+            let (repaired, revived) = est.rejuv_stats();
+            eprintln!(
+                "  [seed0] 手番{turn_no}: 粒子 {} (厳密{} taint{} healthy={} 修復{} 復活{})",
+                est.particles().len(),
+                strict,
+                taint,
+                est.healthy(),
+                repaired,
+                revived,
+            );
+        });
         if seed == 0 {
             let (repaired, revived) = est.rejuv_stats();
             eprintln!(
@@ -204,35 +195,11 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
                 eprintln!("  [seed0] 失敗制約: {}", top.join(" "));
             }
         }
-        // 推定器内の logw を max で正規化（評価側 stratified_sample と同じ規約）
-        let max_logw = est
-            .log_weights()
-            .iter()
-            .copied()
-            .fold(f64::MIN, f64::max);
-        // 重複局面は質量 Σexp(logw) を畳み込む（C-7 P1: multiplicity 保持。
-        // ソフト減衰はフィルタが logw へ課金済み。info_miss は厳密判定にだけ使う。
-        // phys_taint>0 は非厳密扱い: 王手駒の分布には出るが玉位置・利きの
-        // 「厳密のみ」集計からは外れる）
-        let mut mass: HashMap<u64, (f64, u8)> = HashMap::new();
-        for (((pp, &miss), &taint), &lw) in est
-            .particles()
-            .iter()
-            .zip(est.info_miss())
-            .zip(est.phys_taint())
-            .zip(est.log_weights())
-        {
-            let miss_eff = if taint > 0 { miss.max(1) } else { miss };
-            let e = mass.entry(pp.fingerprint()).or_insert((0.0, miss_eff));
-            e.0 += (lw - max_logw).exp();
-            e.1 = e.1.min(miss_eff);
-        }
-        let mut seen: HashSet<u64> = HashSet::new();
-        for pp in est.particles() {
-            if !seen.insert(pp.fingerprint()) {
-                continue;
-            }
-            let (w, penalty) = mass[&pp.fingerprint()];
+        // ユニーク粒子と評価重み（指紋ごとの正規化 Σexp(logw)。phys_taint>0 は
+        // 非厳密扱い: 王手駒の分布には出るが玉位置・利きの「厳密のみ」集計から
+        // 外れる）。規約は scenario_core と共有＝GUI の玉位置ビリーフと同じ
+        for (pp, w, strict) in weighted_unique_particles(&est) {
+            let penalty = u8::from(!strict);
             total_unique += 1;
             // taint 込みの全粒子での玉位置分布（ε_phys の信念の質の診断用。
             // 厳密のみの分布とは別枠で集計する）

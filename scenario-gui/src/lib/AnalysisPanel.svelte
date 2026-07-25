@@ -3,8 +3,10 @@
   import { listen, type UnlistenFn } from "@tauri-apps/api/event";
   import {
     cancelEval,
+    evalKingBelief,
     evalRanking,
     evalTally,
+    type KingBelief,
     type ProgressEvent,
     type RankingResult,
     type TallyResult,
@@ -16,14 +18,19 @@
     ply,
     target,
     engines,
+    onOverlay = null,
   }: {
     path: string;
     ply: number;
     target: string | null;
     engines: string[];
+    /** 盤に重ねる確率マップを親へ渡す（null でクリア） */
+    onOverlay?:
+      | ((data: { squares: Record<string, number>; truth: string | null } | null) => void)
+      | null;
   } = $props();
 
-  type Mode = "tally" | "ranking";
+  type Mode = "tally" | "ranking" | "belief";
   let mode: Mode = $state("tally");
   let engine1 = $state("estimator");
   let engine2 = $state("");
@@ -42,6 +49,10 @@
   let rankingResult = $state<{ ply: number; budgetMs: number; result: RankingResult } | null>(
     null,
   );
+  let beliefResult = $state<{ ply: number; budgetMs: number; result: KingBelief } | null>(null);
+  // 厳密整合の粒子だけで見るか、taint 込みの全粒子で見るか。
+  // 終盤は厳密が全滅していることが普通にあるので既定は taint 込み
+  let beliefSource = $state<"all" | "strict">("all");
   let error = $state("");
 
   let runCounter = 0;
@@ -63,18 +74,38 @@
     void ply;
     tallyResults = [];
     rankingResult = null;
+    beliefResult = null;
+    onOverlay?.(null);
     error = "";
+  });
+
+  // ビリーフ表示は「厳密のみ / taint込み」の切り替えに追随して盤へ流す
+  $effect(() => {
+    const b = beliefResult?.result;
+    if (!b) return;
+    const squares: Record<string, number> = {};
+    for (const s of b.squares) {
+      const v = beliefSource === "strict" ? s.strict : s.all;
+      if (v > 0) squares[s.sq] = v;
+    }
+    onOverlay?.({ squares, truth: b.truth });
   });
 
   async function run() {
     error = "";
     tallyResults = [];
     rankingResult = null;
+    beliefResult = null;
+    onOverlay?.(null);
     running = true;
     const runPly = ply;
     const runBudget = budgetMs;
     try {
-      if (mode === "ranking") {
+      if (mode === "belief") {
+        currentEngine = "estimator（粒子）";
+        const result = await evalKingBelief(path, runPly, trials, runBudget);
+        beliefResult = { ply: runPly, budgetMs: runBudget, result };
+      } else if (mode === "ranking") {
         currentEngine = "estimator";
         const result = await evalRanking(path, runPly, "estimator", seed, runBudget);
         rankingResult = { ply: runPly, budgetMs: runBudget, result };
@@ -114,9 +145,27 @@
       <select bind:value={mode} disabled={running}>
         <option value="tally">seed集計（全エンジン）</option>
         <option value="ranking">ランキング（estimatorのみ）</option>
+        <option value="belief">玉位置ビリーフ（盤に重ねる）</option>
       </select>
     </label>
-    {#if mode === "tally"}
+    {#if mode === "belief"}
+      <label>
+        推定器数
+        <select bind:value={trials} disabled={running}>
+          <option value={2}>2</option>
+          <option value={5}>5</option>
+          <option value={10}>10</option>
+          <option value={20}>20</option>
+        </select>
+      </label>
+      <label>
+        粒子
+        <select bind:value={beliefSource} disabled={running}>
+          <option value="all">taint込み全粒子</option>
+          <option value="strict">厳密整合のみ</option>
+        </select>
+      </label>
+    {:else if mode === "tally"}
       <label>
         エンジン
         <select bind:value={engine1} disabled={running}>
@@ -167,7 +216,12 @@
   </div>
 
   <div class="hint">
-    {ply}手まで再生した局面で {ply + 1} 手目を考えさせる（時間はエンジンの思考予算ぶんかかる）
+    {#if mode === "belief"}
+      {ply}手まで再生した局面で、{ply + 1} 手目を指す側の粒子が
+      「相手玉はどこにいると思っているか」を盤に % で重ねる（赤枠 = 真実）
+    {:else}
+      {ply}手まで再生した局面で {ply + 1} 手目を考えさせる（時間はエンジンの思考予算ぶんかかる）
+    {/if}
   </div>
 
   {#if running}
@@ -223,6 +277,58 @@
         </div>
       {/each}
     </div>
+  {/if}
+
+  {#if beliefResult}
+    {@const b = beliefResult.result}
+    {@const truthPct =
+      b.truth == null
+        ? null
+        : (b.squares.find((s) => s.sq === b.truth)?.[
+            beliefSource === "strict" ? "strict" : "all"
+          ] ?? 0)}
+    <div class="result-head">
+      <b>玉位置ビリーフ</b>
+      <span class="dim">
+        {beliefResult.ply + 1}手目 / 手番{b.side === "sente" ? "▲" : "△"} /
+        推定器{b.seeds}個 / 予算{beliefResult.budgetMs}ms /
+        ユニーク粒子 {b.unique}（厳密 {b.strictUnique}）
+      </span>
+    </div>
+    {#if beliefSource === "strict" && b.strictUnique === 0}
+      <div class="hint warn">
+        厳密整合の粒子が0個です。この局面の評価は taint 粒子と事前分布で走っているので、
+        「taint込み全粒子」に切り替えてください
+      </div>
+    {/if}
+    <div class="belief-scroll">
+      <table class="ranking">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>マス</th>
+            <th title="taint込みの全粒子での割合">全粒子</th>
+            <th title="厳密整合の粒子だけでの割合">厳密</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each b.squares.slice(0, 12) as s, i (s.sq)}
+            <tr class:truth-row={s.sq === b.truth}>
+              <td>{i + 1}</td>
+              <td>{s.sq}{s.sq === b.truth ? " ←真実" : ""}</td>
+              <td>{(s.all * 100).toFixed(1)}%</td>
+              <td>{(s.strict * 100).toFixed(1)}%</td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    </div>
+    {#if truthPct != null}
+      <div class="hint">
+        真実 {b.truth} への信念: <b>{(truthPct * 100).toFixed(1)}%</b>
+        {#if truthPct < 0.2}（較正不良: 玉位置を外している）{/if}
+      </div>
+    {/if}
   {/if}
 
   {#if rankingResult}
@@ -301,6 +407,19 @@
   .hint {
     color: var(--text-dim);
     font-size: 12px;
+  }
+
+  .hint.warn {
+    color: #e0a030;
+  }
+
+  .belief-scroll {
+    max-height: 260px;
+    overflow: auto;
+  }
+
+  tr.truth-row {
+    outline: 1px solid #d33;
   }
 
   .progress {

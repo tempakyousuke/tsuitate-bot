@@ -21,6 +21,8 @@
   let ply = $state(0);
   let flipped = $state(false);
   let loadError = $state("");
+  // 盤に重ねる確率マップ（AnalysisPanel の「玉位置ビリーフ」から流れてくる）
+  let overlay = $state<{ squares: Record<string, number>; truth: string | null } | null>(null);
 
   const snapshot = $derived(kifu ? kifu.snapshots[ply] : null);
 
@@ -126,7 +128,12 @@
   {#if mode === "replay" && kifu && snapshot}
     <div class="content">
       <section class="left">
-        <Board {snapshot} {flipped} />
+        <Board
+          {snapshot}
+          {flipped}
+          overlay={overlay?.squares ?? null}
+          overlayTruth={overlay?.truth ?? null}
+        />
         <div class="replay">
           <button onclick={() => (ply = 0)} disabled={ply === 0}>|◀</button>
           <button onclick={() => (ply = clampPly(ply - 1))} disabled={ply === 0}>◀</button>
@@ -175,7 +182,13 @@
       </section>
 
       <section class="right">
-        <AnalysisPanel path={kifu.path} {ply} target={kifu.target} {engines} />
+        <AnalysisPanel
+          path={kifu.path}
+          {ply}
+          target={kifu.target}
+          {engines}
+          onOverlay={(d) => (overlay = d)}
+        />
       </section>
     </div>
   {:else if mode === "replay"}

@@ -12,6 +12,9 @@
     handSide = null, // 持ち駒をクリックできる側
     selectedHandRole = null,
     onHandClick = null,
+    // マスに重ねる確率オーバーレイ（玉位置ビリーフ等）。値は [0,1]
+    overlay = null,
+    overlayTruth = null, // 真実のマス（枠で示す）
   }: {
     snapshot: Snapshot;
     flipped?: boolean;
@@ -22,6 +25,8 @@
     handSide?: Color | null;
     selectedHandRole?: Role | null;
     onHandClick?: ((role: Role) => void) | null;
+    overlay?: Record<string, number> | null;
+    overlayTruth?: string | null;
   } = $props();
 
   const KANJI: Record<Role, string> = {
@@ -64,6 +69,21 @@
   const topColor: Color = $derived(bottom === "sente" ? "gote" : "sente");
   const topHand = $derived(topColor === "sente" ? snapshot.handSente : snapshot.handGote);
   const bottomHand = $derived(bottom === "sente" ? snapshot.handSente : snapshot.handGote);
+
+  // オーバーレイの濃さ。最大値で正規化して「一番濃いマス」が常に読める明るさに
+  const overlayMax = $derived(
+    overlay ? Math.max(1e-9, ...Object.values(overlay)) : 1,
+  );
+  function overlayAlpha(p: number): number {
+    // sqrt で薄い側を持ち上げる（1%台の仮説も見えないと較正の診断にならない）
+    return 0.12 + 0.62 * Math.sqrt(Math.min(1, p / overlayMax));
+  }
+  function overlayLabel(p: number): string {
+    const pct = p * 100;
+    if (pct >= 10) return pct.toFixed(0);
+    if (pct >= 1) return pct.toFixed(0);
+    return pct.toFixed(1);
+  }
 
   function sideLabel(c: Color): string {
     const mark = c === "sente" ? "▲先手" : "△後手";
@@ -136,6 +156,18 @@
                 >
                   {KANJI[piece.role]}
                 </span>
+              {/if}
+              {#if overlay && (overlay[sq] ?? 0) > 0}
+                <span
+                  class="overlay"
+                  class:truth={overlayTruth === sq}
+                  style="background: rgba(106, 169, 255, {overlayAlpha(overlay[sq])})"
+                  title={`${sq}: ${(overlay[sq] * 100).toFixed(2)}%${overlayTruth === sq ? "（真実）" : ""}`}
+                >
+                  {overlayLabel(overlay[sq])}
+                </span>
+              {:else if overlayTruth === sq && overlay}
+                <span class="overlay truth zero" title={`${sq}: 0%（真実だが信念ゼロ）`}>0</span>
               {/if}
             </div>
           {/each}
@@ -242,6 +274,31 @@
     display: flex;
     align-items: center;
     justify-content: center;
+    position: relative;
+  }
+
+  /* 確率オーバーレイ: 駒の上に重ねるので絶対配置。数字は % */
+  .overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    font-weight: 700;
+    color: #0b1c33;
+    text-shadow: 0 0 3px rgba(255, 255, 255, 0.9);
+    user-select: none;
+    pointer-events: none;
+  }
+
+  .overlay.truth {
+    outline: 2px solid #d33;
+    outline-offset: -2px;
+  }
+
+  .overlay.zero {
+    color: #d33;
   }
 
   .board-grid.clickable .cell {

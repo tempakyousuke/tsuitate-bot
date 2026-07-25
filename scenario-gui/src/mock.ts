@@ -25,6 +25,8 @@ export async function installMockIfRequested(): Promise<void> {
           return fixture("tally");
         case "eval_ranking":
           return fixture("ranking");
+        case "eval_king_belief":
+          return fixture("king_belief");
         case "cancel_eval":
           return;
         default:

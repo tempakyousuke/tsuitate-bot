@@ -78,10 +78,15 @@
 - `cd scenario-gui` → `npm run tauri dev` — シナリオデバッグ GUI（Tauri）。
   `.kif` の取り込み・任意 ply までの再生・先後視点切り替え・候補手分析
   （seed集計=全エンジン対応で回帰比較可 / ランキング=現行 estimator の
-  スコア内訳）。思考予算も指定可（900ms=本番相当）。
+  スコア内訳 / **玉位置ビリーフ**=手番側の粒子が「相手玉はどこにいると
+  思っているか」を盤に % で重ねる。赤枠=真実、厳密粒子のみ↔taint込みを切替可）。
+  思考予算も指定可（900ms=本番相当）。
   リプレイ・選択試行の本体は `src/scenario_core.rs`
   （bin/scenario.rs と共有）。ランキングは `Strategy::last_ranking`
   （現行 estimator のみ実装。凍結版は編集しないため seed 集計のみ）。
+  玉位置ビリーフは `scenario_core::king_belief`（推定器の構築 `build_estimator` と
+  評価重み `weighted_unique_particles` は `bin/scenario ... diag` と共通。
+  診断とGUIで重み規約が食い違うと較正の数字が無意味になるため）。
   **対局モード**（ヘッダの「対局」タブ）で人間 vs bot をGUI内で直接対局できる:
   審判は selfplay.rs と同じ裁定（反則は手番維持でカウント・10回で反則負け・
   王手宣言）、人間側は自駒のみ表示＋自駒だけ考慮の候補ハイライト
