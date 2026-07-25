@@ -6,6 +6,7 @@
     playHumanMove,
     playResign,
     playStart,
+    playStartBots,
     type Color,
     type PlayView,
     type Role,
@@ -31,16 +32,28 @@
     foul_limit: "反則10回",
   };
 
-  // 設定
+  const randomSeed = () => Math.floor(Math.random() * 1_000_000);
+
+  // 設定（対人 / 観戦の2モード。予算は共通）
+  let panelMode = $state<"human" | "watch">("human");
+  let budgetMs = $state(900);
+  // 対人
   let engine = $state("estimator");
   let humanColor = $state<Color>("sente");
-  let budgetMs = $state(900);
-  let seed = $state(Math.floor(Math.random() * 1_000_000));
+  let seed = $state(randomSeed());
+  // 観戦（bot vs bot）
+  let senteEngine = $state("estimator");
+  let goteEngine = $state("estimator");
+  let senteSeed = $state(randomSeed());
+  let goteSeed = $state(randomSeed());
+  let watchFlipped = $state(false);
 
   // 対局状態
   let view = $state<PlayView | null>(null);
   let thinking = $state(false); // bot 思考中
   let busy = $state(false); // コマンド往復中
+  let auto = $state(false); // 観戦の自動再生
+  let autoIntervalMs = $state(300);
   let reveal = $state(false); // 真実（相手駒）を表示するデバッグトグル
   let log = $state<string[]>([]);
   let error = $state("");
@@ -56,31 +69,48 @@
   let exportedPath = $state("");
 
   const over = $derived(view?.outcome != null);
+  const watching = $derived(view != null && view.humanColor == null);
+  const locked = $derived(thinking || busy || auto);
   const humanTurn = $derived(
-    view != null && !over && !thinking && !busy && view.snapshot.turn === view.humanColor,
+    view != null &&
+      view.humanColor != null &&
+      !over &&
+      !locked &&
+      view.snapshot.turn === view.humanColor,
   );
-  const showTruth = $derived(reveal || over);
+  // 観戦は情報を隠す相手がいないので常に真実を出す
+  const showTruth = $derived(reveal || over || watching);
+
+  function sideLabel(v: PlayView, c: Color): string {
+    const i = c === "sente" ? 0 : 1;
+    return `${c === "sente" ? "▲先手" : "△後手"}（${v.names[i]}）`;
+  }
 
   // 隠し盤面: 自駒だけ・自分の持ち駒だけ・相手の直前手は隠す（実対局と同じ情報）
   const displaySnapshot = $derived.by((): Snapshot | null => {
     if (!view) return null;
     const s = view.snapshot;
-    if (showTruth) return s;
+    const human = view.humanColor;
+    if (showTruth || human == null) return s;
     const board: Snapshot["board"] = {};
     for (const [sq, p] of Object.entries(s.board)) {
-      if (p.color === view.humanColor) board[sq] = p;
+      if (p.color === human) board[sq] = p;
     }
     // 直前手の着地マスにいる駒の色で「誰の手か」を判別し、相手の手は隠す
     const lastPiece = s.lastMove ? s.board[s.lastMove.to] : undefined;
-    const lastMove = s.lastMove && lastPiece?.color === view.humanColor ? s.lastMove : null;
+    const lastMove = s.lastMove && lastPiece?.color === human ? s.lastMove : null;
     return {
       ...s,
       board,
       lastMove,
-      handSente: view.humanColor === "sente" ? s.handSente : {},
-      handGote: view.humanColor === "gote" ? s.handGote : {},
+      handSente: human === "sente" ? s.handSente : {},
+      handGote: human === "gote" ? s.handGote : {},
     };
   });
+
+  const boardFlipped = $derived(
+    view?.humanColor == null ? watchFlipped : view.humanColor === "gote",
+  );
 
   const targets = $derived.by((): string[] => {
     if (!view || !humanTurn || !selected) return [];
@@ -92,17 +122,24 @@
   });
 
   const statusText = $derived.by((): string => {
-    if (!view) return "";
-    if (view.outcome) {
-      const reason = REASON_JA[view.outcome.reason] ?? view.outcome.reason;
-      if (view.outcome.winner == null) return `終局（${reason}）`;
-      return view.outcome.winner === view.humanColor
+    const v = view;
+    if (!v) return "";
+    if (v.outcome) {
+      const reason = REASON_JA[v.outcome.reason] ?? v.outcome.reason;
+      if (v.outcome.winner == null) return `終局（${reason}）`;
+      if (v.humanColor == null) return `${sideLabel(v, v.outcome.winner)}の勝ち（${reason}）`;
+      return v.outcome.winner === v.humanColor
         ? `あなたの勝ち（${reason}）`
         : `botの勝ち（${reason}）`;
     }
-    if (thinking) return "bot 思考中…";
+    if (thinking) {
+      return v.humanColor == null
+        ? `${sideLabel(v, v.snapshot.turn)} 思考中…`
+        : "bot 思考中…";
+    }
     if (busy) return "…";
-    return view.snapshot.turn === view.humanColor ? "あなたの手番です" : "botの手番です";
+    if (v.humanColor == null) return `${sideLabel(v, v.snapshot.turn)} の手番`;
+    return v.snapshot.turn === v.humanColor ? "あなたの手番です" : "botの手番です";
   });
 
   // イベントログは常に末尾へスクロール
@@ -111,10 +148,16 @@
     if (logBox) logBox.scrollTop = logBox.scrollHeight;
   });
 
-  function defaultExportName(): string {
+  function stamp(): string {
     const d = new Date();
     const pad = (n: number) => String(n).padStart(2, "0");
-    return `play-${engine}-${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+    return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  }
+
+  function defaultExportName(): string {
+    return panelMode === "watch"
+      ? `watch-${senteEngine}-vs-${goteEngine}-${stamp()}`
+      : `play-${engine}-${stamp()}`;
   }
 
   function applyView(v: PlayView) {
@@ -122,37 +165,72 @@
     log = [...log, ...v.events];
   }
 
-  async function start() {
+  function resetForNewGame() {
     error = "";
     exportedPath = "";
     log = [];
     selected = null;
     promo = null;
     reveal = false;
+    auto = false;
+    exportPly = "";
+  }
+
+  async function start() {
+    resetForNewGame();
     busy = true;
     try {
-      const v = await playStart(engine, humanColor, seed, budgetMs);
+      const v =
+        panelMode === "watch"
+          ? await playStartBots(senteEngine, senteSeed, goteEngine, goteSeed, budgetMs)
+          : await playStart(engine, humanColor, seed, budgetMs);
       log = [];
       applyView(v);
       exportName = defaultExportName();
-      exportPly = "";
       busy = false;
-      if (v.snapshot.turn !== v.humanColor) await botTurn();
+      // 対人で bot が先手なら1手指させる。観戦は操作を待つ
+      if (v.humanColor != null && v.snapshot.turn !== v.humanColor) await botTurn();
     } catch (e) {
       error = String(e);
       busy = false;
     }
   }
 
-  async function botTurn() {
+  /** 手番側 bot に1手指させる。続行してよいなら true */
+  async function botTurn(): Promise<boolean> {
     thinking = true;
     try {
-      applyView(await playBotMove());
+      const v = await playBotMove();
+      applyView(v);
+      return v.outcome == null;
     } catch (e) {
       error = String(e);
+      return false;
     } finally {
       thinking = false;
     }
+  }
+
+  async function stepBot() {
+    error = "";
+    await botTurn();
+  }
+
+  async function toggleAuto() {
+    if (auto) {
+      auto = false; // 実行中のループは次の判定で抜ける
+      return;
+    }
+    error = "";
+    auto = true;
+    while (auto) {
+      if (!(await botTurn())) break;
+      if (!auto) break;
+      if (autoIntervalMs > 0) {
+        await new Promise((r) => setTimeout(r, autoIntervalMs));
+      }
+    }
+    auto = false;
   }
 
   async function send(usi: string) {
@@ -165,7 +243,9 @@
       const v = await playHumanMove(usi);
       applyView(v);
       busy = false;
-      if (!v.outcome && v.snapshot.turn !== v.humanColor) await botTurn();
+      if (!v.outcome && v.humanColor != null && v.snapshot.turn !== v.humanColor) {
+        await botTurn();
+      }
     } catch (e) {
       error = String(e);
       busy = false;
@@ -245,36 +325,99 @@
 
 <div class="play">
   <div class="setup">
-    <label>
-      エンジン
-      <select bind:value={engine} disabled={thinking || busy}>
-        {#each engines as e (e)}
-          <option value={e}>{e}</option>
-        {/each}
-      </select>
-    </label>
-    <label>
-      あなたの手番
-      <select bind:value={humanColor} disabled={thinking || busy}>
-        <option value="sente">▲先手</option>
-        <option value="gote">△後手</option>
-      </select>
-    </label>
+    <nav class="sub-nav">
+      <button
+        class:active={panelMode === "human"}
+        onclick={() => (panelMode = "human")}
+        disabled={locked}
+      >
+        対人
+      </button>
+      <button
+        class:active={panelMode === "watch"}
+        onclick={() => (panelMode = "watch")}
+        disabled={locked}
+      >
+        観戦（bot vs bot）
+      </button>
+    </nav>
+
+    {#if panelMode === "human"}
+      <label>
+        エンジン
+        <select bind:value={engine} disabled={locked}>
+          {#each engines as e (e)}
+            <option value={e}>{e}</option>
+          {/each}
+        </select>
+      </label>
+      <label>
+        あなたの手番
+        <select bind:value={humanColor} disabled={locked}>
+          <option value="sente">▲先手</option>
+          <option value="gote">△後手</option>
+        </select>
+      </label>
+      <label>
+        seed
+        <input type="number" bind:value={seed} min="0" style="width: 90px" disabled={locked} />
+      </label>
+    {:else}
+      <label>
+        ▲先手
+        <select bind:value={senteEngine} disabled={locked}>
+          {#each engines as e (e)}
+            <option value={e}>{e}</option>
+          {/each}
+        </select>
+        <input
+          type="number"
+          bind:value={senteSeed}
+          min="0"
+          style="width: 84px"
+          title="先手の seed"
+          disabled={locked}
+        />
+      </label>
+      <label>
+        △後手
+        <select bind:value={goteEngine} disabled={locked}>
+          {#each engines as e (e)}
+            <option value={e}>{e}</option>
+          {/each}
+        </select>
+        <input
+          type="number"
+          bind:value={goteSeed}
+          min="0"
+          style="width: 84px"
+          title="後手の seed"
+          disabled={locked}
+        />
+      </label>
+      <button
+        onclick={() => {
+          senteSeed = randomSeed();
+          goteSeed = randomSeed();
+        }}
+        disabled={locked}
+        title="両者の seed を引き直す"
+      >
+        seed 引き直し
+      </button>
+    {/if}
+
     <label>
       思考予算
-      <select bind:value={budgetMs} disabled={thinking || busy}>
+      <select bind:value={budgetMs} disabled={locked}>
         <option value={500}>500ms</option>
         <option value={900}>900ms（本番相当）</option>
         <option value={2000}>2000ms</option>
         <option value={5000}>5000ms</option>
       </select>
     </label>
-    <label>
-      seed
-      <input type="number" bind:value={seed} min="0" style="width: 90px" disabled={thinking || busy} />
-    </label>
-    <button onclick={start} disabled={thinking || busy}>
-      {view ? "新しい対局" : "対局開始"}
+    <button onclick={start} disabled={locked}>
+      {view ? (panelMode === "watch" ? "新しい観戦" : "新しい対局") : "対局開始"}
     </button>
   </div>
 
@@ -287,7 +430,7 @@
       <section class="board-col">
         <Board
           snapshot={displaySnapshot}
-          flipped={view.humanColor === "gote"}
+          flipped={boardFlipped}
           selected={selected?.kind === "board" ? selected.sq : null}
           {targets}
           danger={showTruth ? null : view.capturedSquare}
@@ -308,17 +451,47 @@
           <b class:danger-text={over}>{statusText}</b>
           {#if thinking}<span class="spinner">⏳</span>{/if}
         </div>
-        <div class="status dim">
-          {view.totalMoves}手 / 反則 ▲{view.snapshot.fouls[0]} △{view.snapshot.fouls[1]} /
-          bot={view.engine}（seed={view.seed}, {view.budgetMs}ms）
-        </div>
-        <div class="status">
-          <label class="reveal">
-            <input type="checkbox" bind:checked={reveal} disabled={over} />
-            真実を表示（デバッグ。終局後は常に表示）
-          </label>
-          <button onclick={resign} disabled={over || thinking || busy}>投了する</button>
-        </div>
+
+        {#if watching}
+          <div class="status">
+            <button onclick={stepBot} disabled={over || locked}>1手進める</button>
+            <button onclick={toggleAuto} disabled={over || busy}>
+              {auto ? "■ 停止" : "▶ 自動再生"}
+            </button>
+            <label>
+              間隔
+              <select bind:value={autoIntervalMs}>
+                <option value={0}>なし</option>
+                <option value={300}>0.3秒</option>
+                <option value={1000}>1秒</option>
+                <option value={3000}>3秒</option>
+              </select>
+            </label>
+            <button onclick={() => (watchFlipped = !watchFlipped)}>
+              視点: {watchFlipped ? "△後手" : "▲先手"}（切替）
+            </button>
+          </div>
+          <div class="status dim">
+            {view.totalMoves}手 / 反則 ▲{view.snapshot.fouls[0]} △{view.snapshot.fouls[1]}
+            / ▲{view.names[0]}（seed={view.seeds[0]}）vs △{view.names[1]}（seed={view
+              .seeds[1]}）{view.budgetMs}ms
+          </div>
+        {:else}
+          <div class="status dim">
+            {view.totalMoves}手 / 反則 ▲{view.snapshot.fouls[0]} △{view.snapshot.fouls[1]} /
+            bot={view.humanColor === "sente" ? view.names[1] : view.names[0]}（seed={view
+              .humanColor === "sente"
+              ? view.seeds[1]
+              : view.seeds[0]}, {view.budgetMs}ms）
+          </div>
+          <div class="status">
+            <label class="reveal">
+              <input type="checkbox" bind:checked={reveal} disabled={over} />
+              真実を表示（デバッグ。終局後は常に表示）
+            </label>
+            <button onclick={resign} disabled={over || locked}>投了する</button>
+          </div>
+        {/if}
       </section>
 
       <section class="side-col">
@@ -345,7 +518,7 @@
             />
           </label>
           <div class="export-actions">
-            <button onclick={doExport} disabled={view.totalMoves === 0 || thinking || busy}>
+            <button onclick={doExport} disabled={view.totalMoves === 0 || locked}>
               書き出す
             </button>
             {#if exportedPath !== ""}
@@ -360,9 +533,16 @@
     </div>
   {:else}
     <div class="placeholder">
-      エンジンと手番を選んで「対局開始」。相手の駒は見えません（実対局と同じ）。
-      候補ハイライトは自駒だけを考慮した移動先なので、そのまま指しても反則になることがあります。
-      終局後（または途中でも）kif を書き出して、リプレイ・シナリオ実験に使えます。
+      {#if panelMode === "human"}
+        エンジンと手番を選んで「対局開始」。相手の駒は見えません（実対局と同じ）。
+        候補ハイライトは自駒だけを考慮した移動先なので、そのまま指しても反則になることがあります。
+        終局後（または途中でも）kif を書き出して、リプレイ・シナリオ実験に使えます。
+      {:else}
+        先手・後手のエンジンと seed を選んで「対局開始」。1手送りか自動再生で観戦できます
+        （bot 同士も互いの盤面は見えません。観測ログは bot ごとに独立です）。
+        気になる局面で止めて kif を書き出せば、そのままリプレイの候補手分析・
+        玉位置ビリーフにかけられます。
+      {/if}
     </div>
   {/if}
 </div>
@@ -391,6 +571,25 @@
     gap: 5px;
     color: var(--text-dim);
     white-space: nowrap;
+  }
+
+  .sub-nav {
+    display: flex;
+    gap: 0;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+
+  .sub-nav button {
+    border: none;
+    border-radius: 0;
+    padding: 4px 12px;
+  }
+
+  .sub-nav button.active {
+    background: var(--accent);
+    color: #fff;
   }
 
   .game {
@@ -431,6 +630,7 @@
     gap: 12px;
     align-items: center;
     font-size: 13px;
+    flex-wrap: wrap;
   }
 
   .status.dim {

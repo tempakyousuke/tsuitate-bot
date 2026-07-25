@@ -724,6 +724,7 @@ fn main() {
             cancel_eval,
             clear_king_belief_cache,
             play::play_start,
+            play::play_start_bots,
             play::play_human_move,
             play::play_bot_move,
             play::play_resign,

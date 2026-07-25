@@ -161,19 +161,24 @@ export interface PlayOutcome {
 }
 
 export interface PlayView {
-  engine: string;
-  seed: number;
+  /** [先手, 後手] の表示名（人間は "人間"、bot はエンジン名） */
+  names: [string, string];
+  /** [先手, 後手] の seed（人間側は null） */
+  seeds: [number | null, number | null];
+  /** [先手が bot か, 後手が bot か] */
+  isBot: [boolean, boolean];
   budgetMs: number;
-  humanColor: Color;
+  /** 人間側の色。bot 同士の観戦では null */
+  humanColor: Color | null;
   /** 真実の局面（隠す表示はフロント側で行う） */
   snapshot: Snapshot;
   /** 人間の手番のときだけ非空 */
   hints: PlayHint[];
-  /** このコマンドで起きた人間向けイベント */
+  /** このコマンドで起きたイベント */
   events: string[];
   totalMoves: number;
   outcome: PlayOutcome | null;
-  /** bot の直前の手で取られた自駒のマス */
+  /** bot の直前の手で取られた人間の駒のマス */
   capturedSquare: string | null;
 }
 
@@ -210,6 +215,21 @@ export const playStart = (
   seed: number,
   budgetMs: number,
 ) => invoke<PlayView>("play_start", { engine, humanColor, seed, budgetMs });
+/** bot 同士の対局（観戦モード）を開始する */
+export const playStartBots = (
+  senteEngine: string,
+  senteSeed: number,
+  goteEngine: string,
+  goteSeed: number,
+  budgetMs: number,
+) =>
+  invoke<PlayView>("play_start_bots", {
+    senteEngine,
+    senteSeed,
+    goteEngine,
+    goteSeed,
+    budgetMs,
+  });
 export const playHumanMove = (usi: string) => invoke<PlayView>("play_human_move", { usi });
 export const playBotMove = () => invoke<PlayView>("play_bot_move");
 export const playResign = () => invoke<PlayView>("play_resign");
