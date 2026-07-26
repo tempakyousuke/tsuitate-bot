@@ -336,6 +336,8 @@ fn measure(
         p_legal_recap: recap.p_legal,
         p_legal_chosen: chosen_score.p_legal,
         chosen_recapture: took as u64,
+        // 真実側の値（部分集合の集計でも出せるよう one に載せる）
+        captured_value_sum: attacker_value,
         ..Summary::default()
     };
     if let Some(ShogiMove::Board { from, .. }) = parse_usi(&recap.usi) {
