@@ -308,6 +308,29 @@ impl Position {
     pub fn is_attacked(&self, sq: Coord, by: Color) -> bool {
         #[cfg(feature = "effect-profile")]
         crate::effect_profile::bump(&crate::effect_profile::IS_ATTACKED);
+        self.scan_attackers::<true>(sq, by) > 0
+    }
+
+    /// マス sq へ利いている by 側の駒の**枚数**（0〜10）。
+    ///
+    /// `is_attacked` の「あり/なし」を数え上げに一般化したもの
+    /// （docs/yaneuraou-lessons.md の V1。やねうら王は Lv4 で利き数を導入して +R30、
+    /// かつ紐/質の強弱と玉周辺の圧力はどちらも枚数がないと表現できない）。
+    /// 遮蔽の規約は `is_attacked` と同じなので、1方向からは最大1枚しか数えない
+    /// （＝飛の後ろに香が控える「二重の利き」は1枚と数える近似）。
+    ///
+    /// ついたてでは**自分の守り駒の枚数は完全既知**で、相手の攻め枚数だけが
+    /// 粒子ごとの推定になる、という非対称な使い方になる
+    pub fn attack_count(&self, sq: Coord, by: Color) -> u8 {
+        #[cfg(feature = "effect-profile")]
+        crate::effect_profile::bump(&crate::effect_profile::IS_ATTACKED);
+        self.scan_attackers::<false>(sq, by)
+    }
+
+    /// sq を攻撃している by 側の駒を数える。`FIRST` なら1枚見つけ次第打ち切る
+    /// （`is_attacked` の早期 return と同じ速度を保つため const generic にしている）
+    fn scan_attackers<const FIRST: bool>(&self, sq: Coord, by: Color) -> u8 {
+        let mut count = 0u8;
         // 桂: 攻撃側の桂が s にいて s + oriented(knight) == sq となる s を逆算
         for &delta in steps(Role::Knight) {
             let (df, dr) = orient(delta, by);
@@ -315,7 +338,10 @@ impl Position {
             if on_board(s)
                 && self.piece_at(s) == Some(Piece { color: by, role: Role::Knight })
             {
-                return true;
+                count += 1;
+                if FIRST {
+                    return count;
+                }
             }
         }
         // 8方向: 隣接ステップと、その先のレイ
@@ -330,15 +356,14 @@ impl Position {
                     if p.color == by {
                         // p が c から sq 方向 (-df, -dr) に利くか
                         let back = (-df, -dr);
-                        if dist == 1
-                            && steps(p.role)
-                                .iter()
-                                .any(|&d| orient(d, by) == back)
-                        {
-                            return true;
-                        }
-                        if rays(p.role).iter().any(|&d| orient(d, by) == back) {
-                            return true;
+                        let hits = (dist == 1
+                            && steps(p.role).iter().any(|&d| orient(d, by) == back))
+                            || rays(p.role).iter().any(|&d| orient(d, by) == back);
+                        if hits {
+                            count += 1;
+                            if FIRST {
+                                return count;
+                            }
                         }
                     }
                     break; // 先頭の駒で遮断（敵味方問わず）
@@ -347,7 +372,7 @@ impl Position {
                 dist += 1;
             }
         }
-        false
+        count
     }
 
     pub fn in_check(&self, color: Color) -> bool {
@@ -646,6 +671,47 @@ mod tests {
         let pos = Position::initial();
         assert_eq!(perft(&pos, 4), 719_731);
         assert_eq!(perft(&pos, 5), 19_861_490);
+    }
+
+    /// attack_count は is_attacked の数え上げ版なので、「1枚以上か」は必ず一致する
+    /// （V1: 早期 return の有無だけを const generic で切り替えているので、
+    /// 遮蔽・成り駒の扱いがズレていないことをここで担保する）
+    #[test]
+    fn attack_count_agrees_with_is_attacked() {
+        let mut pos = Position::initial();
+        for usi in ["7g7f", "3c3d", "8h3c+", "2b3c", "B*5e"] {
+            pos.play_unchecked(&parse_usi(usi).unwrap());
+            for file in 1..=9 {
+                for rank in 1..=9 {
+                    let sq = Coord { file, rank };
+                    for by in [Color::Sente, Color::Gote] {
+                        assert_eq!(
+                            pos.is_attacked(sq, by),
+                            pos.attack_count(sq, by) > 0,
+                            "{usi} 後の {file}{rank} / {by:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// 複数の駒が同じマスへ利いていれば枚数どおり数える（V1 の本題）。
+    /// 遮蔽の規約は is_attacked と同じで、1方向からは最大1枚
+    #[test]
+    fn attack_count_counts_multiple_attackers() {
+        let mut pos = Position::empty(Color::Sente);
+        let target = Coord { file: 5, rank: 5 };
+        // 5五へ利く先手の駒を3枚（歩5六・飛5九・角7七）。
+        // 5九の飛は5六の歩に遮られるので数えない = 遮蔽の確認も兼ねる
+        pos.set(Coord { file: 5, rank: 6 }, Some(Piece { color: Color::Sente, role: Role::Pawn }));
+        pos.set(Coord { file: 5, rank: 9 }, Some(Piece { color: Color::Sente, role: Role::Rook }));
+        pos.set(Coord { file: 7, rank: 7 }, Some(Piece { color: Color::Sente, role: Role::Bishop }));
+        assert_eq!(pos.attack_count(target, Color::Sente), 2);
+        // 歩を除けると飛の利きが通って枚数は変わらない（同じ方向なので1枚のまま）
+        pos.set(Coord { file: 5, rank: 6 }, None);
+        assert_eq!(pos.attack_count(target, Color::Sente), 2);
+        assert_eq!(pos.attack_count(target, Color::Gote), 0);
     }
 
     #[test]

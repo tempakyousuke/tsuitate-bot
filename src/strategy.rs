@@ -2971,10 +2971,16 @@ fn recapture_risk(pos: &Position, me: Color, to: Coord, defended_discount: f64) 
     let Some(piece) = pos.piece_at(to).filter(|p| p.color == me) else {
         return 0.0;
     };
-    if piece.role == Role::King || !pos.is_attacked(to, opp) {
+    if piece.role == Role::King {
         return 0.0;
     }
-    let defended = pos.is_attacked(to, me);
+    let attackers = pos.attack_count(to, opp);
+    if attackers == 0 {
+        return 0.0;
+    }
+    // V1: 「紐が1本でもあれば割り引く」から「守り枚数が攻め枚数以上なら割り引く」へ。
+    // 2枚で狙われて1枚で守っている駒は、取り返しても駒損が残るので割り引かない
+    let defended = pos.attack_count(to, me) >= attackers;
     exchange_value(piece.role) * if defended { defended_discount } else { 1.0 }
 }
 
@@ -3000,10 +3006,12 @@ fn exposed_capture_risk(
         if exclude == Some(sq) {
             continue;
         }
-        if !pos.is_attacked(sq, opp) {
+        let attackers = pos.attack_count(sq, opp);
+        if attackers == 0 {
             continue;
         }
-        let defended = pos.is_attacked(sq, me);
+        // V1: recapture_risk と同じく守り枚数 vs 攻め枚数で判定する
+        let defended = pos.attack_count(sq, me) >= attackers;
         let knownness = known.get(&sq).copied().unwrap_or(0.0);
         let weight = params.exposed_base + params.exposed_known * knownness;
         let loss = exchange_value(piece.role)
@@ -3092,24 +3100,44 @@ pub(crate) fn drop_check_danger(pos: &Position, me: Color) -> f64 {
     danger
 }
 
-/// owner 玉の周囲8マス（と玉のマス）に当たっている by 側の利きの数
+/// 1マスに m 枚の利きがあるときの価値（1枚を 1.0 とした逓減）。
+///
+/// docs/yaneuraou-lessons.md の V1。やねうら王 Lv4 の実測式
+/// `6365 - 0.8525^(m-1) × 5341` を 1枚 = 1024 で正規化したもので、
+/// 2枚目 1.77・3枚目 2.42・…と**明確に逓減するが飽和はしない**。
+/// 「2枚で狙われている」と「1枚で狙われている」を区別できるようにするのが目的で、
+/// 枚数に線形だと大駒1枚の睨みと歩3枚の押さえが同じ重みになってしまう
+fn effect_multiplicity_value(m: u8) -> f64 {
+    if m == 0 {
+        return 0.0;
+    }
+    // 逓減の実測値（m=1..=8）。9枚以上は 8枚と同じに丸める（盤上で起きない）
+    const TABLE: [f64; 8] = [1.000, 1.769, 2.419, 2.973, 3.446, 3.849, 4.192, 4.485];
+    TABLE[(m as usize - 1).min(TABLE.len() - 1)]
+}
+
+/// owner 玉の周囲8マス（と玉のマス）に当たっている by 側の利きの重み付き総和。
+///
+/// V1 以前は「攻撃されているマスの数」（各マス0/1）だった。同じ1マスに
+/// 2枚利いている形（＝実際に破られる形）と1枚だけ睨んでいる形が区別できず、
+/// 玉頭に駒を足す攻めにも、支えを1枚増やす受けにも勾配が立たなかった
 pub(crate) fn king_zone_pressure(pos: &Position, owner: Color, by: Color) -> f64 {
     let Some(king) = pos.king_square(owner) else {
         return 0.0;
     };
-    let mut pressure = 0;
+    let mut pressure = 0.0;
     for df in -1..=1i8 {
         for dr in -1..=1i8 {
             let c = crate::board::Coord {
                 file: king.file + df,
                 rank: king.rank + dr,
             };
-            if (1..=9).contains(&c.file) && (1..=9).contains(&c.rank) && pos.is_attacked(c, by) {
-                pressure += 1;
+            if (1..=9).contains(&c.file) && (1..=9).contains(&c.rank) {
+                pressure += effect_multiplicity_value(pos.attack_count(c, by));
             }
         }
     }
-    pressure as f64
+    pressure
 }
 
 #[cfg(test)]
