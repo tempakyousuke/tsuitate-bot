@@ -299,6 +299,21 @@ fn eval_taint_fallback() -> bool {
     })
 }
 
+/// V1（利き数）のアブレーション用ノブ。既定は両方 有効。
+/// 統合すると勝率が動かなかったため、どちらの半分が効いていないかを切り分ける
+/// （`TSUITATE_V1_PRESSURE=0` = 玉周辺の圧力を旧来の二値カウントに戻す、
+/// `TSUITATE_V1_DEFENDED=0` = 紐の判定を旧来の「1本でもあれば割引」に戻す）。
+/// 凍結版はこの名前を知らないので候補側にだけ効く
+fn v1_pressure_multiplicity() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !std::env::var("TSUITATE_V1_PRESSURE").is_ok_and(|v| v == "0"))
+}
+
+fn v1_defended_by_count() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !std::env::var("TSUITATE_V1_DEFENDED").is_ok_and(|v| v == "0"))
+}
+
 /// 思考予算に比例して各種の粒子数・読み幅を決める
 #[derive(Debug, Clone, Copy)]
 struct SearchBudget {
@@ -2980,7 +2995,12 @@ fn recapture_risk(pos: &Position, me: Color, to: Coord, defended_discount: f64) 
     }
     // V1: 「紐が1本でもあれば割り引く」から「守り枚数が攻め枚数以上なら割り引く」へ。
     // 2枚で狙われて1枚で守っている駒は、取り返しても駒損が残るので割り引かない
-    let defended = pos.attack_count(to, me) >= attackers;
+    let defenders = pos.attack_count(to, me);
+    let defended = if v1_defended_by_count() {
+        defenders >= attackers
+    } else {
+        defenders > 0
+    };
     exchange_value(piece.role) * if defended { defended_discount } else { 1.0 }
 }
 
@@ -3011,7 +3031,12 @@ fn exposed_capture_risk(
             continue;
         }
         // V1: recapture_risk と同じく守り枚数 vs 攻め枚数で判定する
-        let defended = pos.attack_count(sq, me) >= attackers;
+        let defenders = pos.attack_count(sq, me);
+        let defended = if v1_defended_by_count() {
+            defenders >= attackers
+        } else {
+            defenders > 0
+        };
         let knownness = known.get(&sq).copied().unwrap_or(0.0);
         let weight = params.exposed_base + params.exposed_known * knownness;
         let loss = exchange_value(piece.role)
@@ -3133,7 +3158,11 @@ pub(crate) fn king_zone_pressure(pos: &Position, owner: Color, by: Color) -> f64
                 rank: king.rank + dr,
             };
             if (1..=9).contains(&c.file) && (1..=9).contains(&c.rank) {
-                pressure += effect_multiplicity_value(pos.attack_count(c, by));
+                pressure += if v1_pressure_multiplicity() {
+                    effect_multiplicity_value(pos.attack_count(c, by))
+                } else {
+                    pos.is_attacked(c, by) as u8 as f64
+                };
             }
         }
     }
