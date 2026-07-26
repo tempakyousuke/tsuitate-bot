@@ -44,6 +44,24 @@ fn stats() -> &'static Mutex<BTreeMap<&'static str, TermStat>> {
     S.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
+/// 条件の発火率（やねうら王 `dbg_hit_on(cond)` に相当）。(発火, 総数)
+fn flags() -> &'static Mutex<BTreeMap<&'static str, (u64, u64)>> {
+    static S: OnceLock<Mutex<BTreeMap<&'static str, (u64, u64)>>> = OnceLock::new();
+    S.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// 条件が成り立った割合を数える。`enabled()` のときだけ呼ぶこと。
+///
+/// 「その評価項が発火する前提条件（粒子が生きている・王手でない等）を
+/// そもそも満たしているか」を測るためのもの。項の寄与を見る
+/// `observe_ranking` と違い、評価の**手前**の条件を見る
+pub fn flag(name: &'static str, cond: bool) {
+    let mut map = flags().lock().expect("hits のフラグロック");
+    let e = map.entry(name).or_insert((0, 0));
+    e.0 += cond as u64;
+    e.1 += 1;
+}
+
 /// gain の内側にある項の一覧。値は **gain への符号つき寄与**
 /// （正 = gain を押し上げている）。ここに足せば自動で集計対象になる
 fn terms() -> &'static [(&'static str, fn(&CandidateScore) -> f64)] {
@@ -129,7 +147,8 @@ pub fn dump() -> Option<String> {
         return None;
     }
     let map = stats().lock().expect("hits の集計ロック").clone();
-    if map.is_empty() {
+    let fl = flags().lock().expect("hits のフラグロック").clone();
+    if map.is_empty() && fl.is_empty() {
         return None;
     }
     let pct = |num: u64, den: u64| -> f64 {
@@ -154,6 +173,15 @@ pub fn dump() -> Option<String> {
             pct(s.top1_flips, s.decisions),
             pct(s.top1_flips, s.fired_decisions),
         ));
+    }
+    if !fl.is_empty() {
+        out.push_str("--- 条件の発火率（評価に入る手前の前提）---\n");
+        for (name, (hit, total)) in &fl {
+            out.push_str(&format!(
+                "{name:<24} {:>7.1}%  ({hit}/{total})\n",
+                pct(*hit, *total)
+            ));
+        }
     }
     Some(out)
 }

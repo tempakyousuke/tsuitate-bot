@@ -1494,6 +1494,18 @@ impl Strategy for EstimatorStrategy {
         // 盤上駒＝支え駒の有無で、そこは IfSupported 側が吸収する
         let mate_pool: &[(&Position, f64)] = if sample.is_empty() { &taint_pool } else { &sample };
 
+        // 評価の前提条件の発火率（src/hits.rs）。`expected` の内側にある項
+        // （駒得期待値・valueネット等）は厳密粒子が全滅すると丸ごと無効になるので、
+        // それがどれくらいの頻度で起きているかを測る
+        if crate::hits::enabled() {
+            crate::hits::flag("王手中", view.you_in_check);
+            crate::hits::flag("厳密粒子ゼロ", sample.is_empty());
+            crate::hits::flag(
+                "value_nn の前提充足",
+                !sample.is_empty() && !view.you_in_check,
+            );
+        }
+
         let rng = &mut self.rng;
         // valueネットのstate特徴量キャッシュ（sample と同じ並び。候補間で共通なので
         // 手番ごとに1回だけ計算する）

@@ -59,6 +59,12 @@ fn main() {
         let a = take(&IS_ATTACKED);
         let t = take(&MOVE_TARGETS);
         println!(
+            "  seed={seed}: legal_moves {} / opp_move_nn {} / value_nn {}",
+            take(&LEGAL_MOVES),
+            take(&OPP_MOVE_NN),
+            take(&VALUE_NN),
+        );
+        println!(
             "  seed={seed}: {ms:.0}ms / is_attacked {a} 回 / move_targets {t} 回{}",
             match got {
                 Some((usi, r)) => format!(" / 候補 {} 手・選択 {usi}", r.len()),
