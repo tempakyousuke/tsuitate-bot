@@ -28,9 +28,22 @@
   300秒+3秒に収める（強さと時間の調整ノブ）。
   `-f oracle=nofoul|check_nofoul` は診断用オラクル（候補側の反則を審判が握りつぶして
   指し直させる = 合法性知識の上限測定。記録は自動無効化）。
-  `-f env="TSUITATE_MATE_RISK_W=3 TSUITATE_MATE_THREAT_W=4"` で候補側の評価ノブを
-  渡せる（w スイープ用。`TSUITATE_*` のみ許可。凍結版は env を見ないので候補側に
-  だけ効く）。各シャードは `bin/analyze` も走らせ、**被詰めろオラクル**（相手に
+  `-f env="TSUITATE_MATE_RISK_W=3 TSUITATE_MATE_THREAT_W=4"` で評価ノブを渡せる
+  （w スイープ用。`TSUITATE_*` のみ許可）。**env はプロセス全体に効くので
+  「候補側だけ」になるのは、その凍結版が名前を知らないノブに限る**。
+  凍結版は**凍結時点で読んでいた env を今も読む**（実測 2026-07-26）:
+  - `TSUITATE_THINK_BUDGET_MS` — **v6〜v11 の全凍結版が読む**。思考予算の
+    スイープを `-f env=` でやると両側の予算が動いて比較にならない。候補側だけ
+    予算を変えたい場合は現行 `strategy.rs` だけが知る新しい名前を足すこと
+  - `TSUITATE_JOSEKI` / `TSUITATE_EPS_PHYS` / `TSUITATE_DISABLE_DEFEND_GUIDE` /
+    `TSUITATE_ENABLE_HANG_RISK` / `TSUITATE_FILTER_DEBUG` / `TSUITATE_DEBUG_CHECK`
+    — v7 以降（版により差あり）
+  - `TSUITATE_VALUE_NN_W` / `TSUITATE_CAPTURE_BET_VAR_W` / `TSUITATE_CHECKER_REMOVAL_W`
+    — v11 のみ。**v11 を基準にした w スイープでは基準側も反応する**
+  - `TSUITATE_MATE_*_W` / `TSUITATE_KING_HOLE_W` / `TSUITATE_TAINT_KING_FIX` は
+    どの凍結版も読まない（＝候補側だけに効く）
+
+  各シャードは `bin/analyze` も走らせ、**被詰めろオラクル**（相手に
   1手詰めを与えた局面数）・只取られ・反則内訳をジョブサマリーへ出す。
   実測 2026-07-16: vs v6 で nofoul 86.2%±4.8 / check_nofoul 59.5%±7.1 —
   反則経済に36ptの伸びしろが実在する（現状の評価構造のスカラー係数調整では
