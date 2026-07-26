@@ -375,6 +375,71 @@ fn coverage_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
     covered.len() as f64
 }
 
+/// この手の後、**自玉の8近傍のうち「玉以外の自駒の利きが無い」マスの数**（0〜8）。
+///
+/// docs/yaneuraou-lessons.md の V4（やねうら王 Lv8 で +R35）。ついたてと相性が
+/// 良いのは、**自分の駒だけで計算できる**から: 相手の駒が見えなくても自玉の位置も
+/// 自駒の利きも完全既知なので、粒子を使わずノイズゼロで測れる。
+///
+/// `coverage_after` と同じく `move_targets`（自駒だけを考慮した利き）を使う。
+/// 玉自身の利きは除く（玉が自分で守っているマスは「支えがある」とは言えない。
+/// 玉で取り返す形は詰みへ直結するため。やねうら王も「玉以外の味方の利き」で数える）。
+///
+/// 相手の駒が見えないので、やねうら王の「そこが空きか敵駒なら減点・味方の駒が
+/// あるなら加点」の区別はできない。ここでは**自駒が乗っているマスは穴に数えない**
+/// （壁として機能するため）という近似にする
+fn king_holes_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
+    let mut pieces: Vec<VisiblePiece> = view.your_pieces.clone();
+    match *mv {
+        ShogiMove::Board { from, to, promote } => {
+            let from_usi = make_usi_square(from);
+            let Some(p) = pieces.iter_mut().find(|p| p.square == from_usi) else {
+                return 0.0;
+            };
+            if promote {
+                if let Some(r) = promote_role(p.role) {
+                    p.role = r;
+                }
+            }
+            p.square = make_usi_square(to);
+        }
+        ShogiMove::Drop { role, to } => pieces.push(VisiblePiece {
+            square: make_usi_square(to),
+            role,
+        }),
+    }
+    let Some(king) = pieces
+        .iter()
+        .find(|p| p.role == Role::King)
+        .and_then(|p| parse_usi_square(&p.square))
+    else {
+        return 0.0;
+    };
+    // 玉以外の自駒が利かせているマス
+    let mut covered: HashSet<Coord> = HashSet::new();
+    for p in pieces.iter().filter(|p| p.role != Role::King) {
+        covered.extend(move_targets(&pieces, p, view.your_color));
+    }
+    let occupied: HashSet<Coord> =
+        pieces.iter().filter_map(|p| parse_usi_square(&p.square)).collect();
+    let mut holes = 0.0;
+    for df in -1..=1i8 {
+        for dr in -1..=1i8 {
+            if df == 0 && dr == 0 {
+                continue;
+            }
+            let c = Coord { file: king.file + df, rank: king.rank + dr };
+            if !(1..=9).contains(&c.file) || !(1..=9).contains(&c.rank) {
+                continue; // 盤外は穴ではない（壁として機能する）
+            }
+            if !covered.contains(&c) && !occupied.contains(&c) {
+                holes += 1.0;
+            }
+        }
+    }
+    holes
+}
+
 /// 持ち駒の歩を成れる圏内（敵陣＋一段手前）へ打つ手か（1.0/0.0）。
 /// 打った直後の利きは1マスだが、次に成れば利きが6マスへ広がる索敵ユニットになり、
 /// 取り返されても相手に渡るのは歩1枚で反動が最小。重みは params.tokin_probe_w
@@ -607,6 +672,16 @@ pub struct EvalParams {
     /// 支え駒が見えなくても評価できる（玉で取る以外に受けがない
     /// `MateThreat::IfSupported` を MATE_RISK_IF_SUPPORTED 倍で数える）。0 = 無効
     pub mate_risk_w: f64,
+    /// 自玉8近傍の「玉以外の自駒の利きが無いマス」1個あたりの減点
+    /// （docs/yaneuraou-lessons.md の V4。やねうら王 Lv8 で +R35）。
+    ///
+    /// **ついたてと相性が良い理由**: この量は自分の駒だけで計算できるので
+    /// 粒子が要らず、相手が見えなくても**正確**に測れる。既存の `hand_drop_w`
+    /// （相手の持ち駒による打ち込み王手の受け入れ面積）は「打ち込まれる面積」を
+    /// 測る対の項で、両方あって初めて「面積 × 支えの無さ」が表現できる。
+    /// `mate.rs` の被詰めろとも噛み合う（打ち一手詰めの成立条件は、まさに
+    /// 玉の近傍に支えの無いマクがあること）。0 = 無効（従来と同一挙動）
+    pub king_hole_w: f64,
 }
 
 impl Default for EvalParams {
@@ -686,6 +761,9 @@ impl Default for EvalParams {
             // 0 = 従来と同一挙動。未調整の新項なので w スイープで決める
             mate_threat_w: 0.0,
             mate_risk_w: 0.0,
+            // 自玉8近傍の穴（2026-07-26、docs/yaneuraou-lessons.md の V4）。
+            // 0 = 従来と同一挙動。未調整の新項なので w スイープで決める
+            king_hole_w: 0.0,
         }
     }
 }
@@ -698,7 +776,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 43] = [
+    pub const SPECS: [ParamSpec; 44] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -914,6 +992,11 @@ impl EvalParams {
             lo: 0.0,
             hi: 6.0,
         },
+        ParamSpec {
+            name: "king_hole_w",
+            lo: 0.0,
+            hi: 1.0,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -961,6 +1044,7 @@ impl EvalParams {
             self.capture_bet_var_w,
             self.mate_threat_w,
             self.mate_risk_w,
+            self.king_hole_w,
         ]
     }
 
@@ -1010,6 +1094,7 @@ impl EvalParams {
             capture_bet_var_w: v[40],
             mate_threat_w: v[41],
             mate_risk_w: v[42],
+            king_hole_w: v[43],
         }
     }
 }
@@ -1113,6 +1198,17 @@ impl EstimatorStrategy {
         {
             Some(w) => EvalParams {
                 mate_risk_w: w,
+                ..params
+            },
+            None => params,
+        };
+        // 自玉8近傍の穴の運用ノブ（w スイープ・切り戻し用）
+        let params = match std::env::var("TSUITATE_KING_HOLE_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+        {
+            Some(w) => EvalParams {
+                king_hole_w: w,
                 ..params
             },
             None => params,
@@ -2474,6 +2570,12 @@ fn evaluate(
     // どちらも粒子に依存しない自明な情報だけで計算できる
     let coverage = params.coverage_w * coverage_after(view, mv);
     let probe = params.tokin_probe_w * tokin_probe(view, mv);
+    // 自玉8近傍の支えの無いマス（V4）。自駒だけで決まるので粒子に依らない
+    let king_holes = if params.king_hole_w != 0.0 {
+        params.king_hole_w * king_holes_after(view, mv)
+    } else {
+        0.0
+    };
 
     // 詰めろ生成: この手の後、次の自分の手番で持ち駒打ちの一手詰めが成立するか
     // （mate.rs::drop_mate）。ついたて将棋では相手に脅威が見えないので、詰めろは
@@ -2543,7 +2645,8 @@ fn evaluate(
         (0.0, 0.0)
     };
 
-    let gain = expected + advance_bias + development + coverage + probe + mate_threat - mate_risk;
+    let gain = expected + advance_bias + development + coverage + probe + mate_threat - mate_risk
+        - king_holes;
     EvalOut {
         gain,
         risk_mean: if legal > 0.0 { risk_sum / legal } else { 0.0 },
@@ -3185,6 +3288,34 @@ pub(crate) mod tests {
         let promo = coverage_after(&view, &parse_usi("3d3c+").unwrap());
         assert_eq!(quiet, 1.0);
         assert_eq!(promo, 6.0, "と金は金の利き（6マス）");
+    }
+
+    #[test]
+    fn king_holes_counts_unsupported_neighbours() {
+        // 先手玉5九だけの盤。隣接8マスのうち盤内は5マス（4八,5八,6八,4九,6九）で
+        // 玉自身の利きは数えないので、守りが無ければ全部が穴
+        let lone_king = vec![VisiblePiece { square: "5i".into(), role: Role::King }];
+        let view = minimal_view(lone_king.clone(), HashMap::new());
+        // 玉から離れたマスへ歩を打つ = 近傍の穴は減らない
+        let far = king_holes_after(&view, &parse_usi("P*1e").unwrap());
+        assert_eq!(far, 5.0, "盤内の近傍5マスが全部穴のはず: {far}");
+
+        // 5八へ金を打つと、そのマスが埋まり（占有）、金の利きが 4八/6八/5七… を守る
+        let filled = king_holes_after(&view, &parse_usi("G*5h").unwrap());
+        assert!(filled < far, "支えを足せば穴は減る: {filled} < {far}");
+    }
+
+    #[test]
+    fn king_holes_ignores_the_kings_own_effect() {
+        // 玉の利きを数えてしまうと近傍が全部「守られている」ことになり、
+        // 項が常にゼロになる（やねうら王も「玉以外の味方の利き」で数える）
+        let view = minimal_view(
+            vec![VisiblePiece { square: "5e".into(), role: Role::King }],
+            HashMap::new(),
+        );
+        // 盤の中央なので近傍8マスすべてが盤内。玉の利きを除けば全部穴
+        let holes = king_holes_after(&view, &parse_usi("5e5f").unwrap());
+        assert_eq!(holes, 8.0, "玉自身の利きは支えに数えない: {holes}");
     }
 
     #[test]
