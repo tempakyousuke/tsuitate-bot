@@ -189,6 +189,11 @@ pub struct CandidateScore {
     pub king_holes: f64,
     /// gain に加算された valueネット項（value_nn_w × (勝率相当 − 0.5)）。符号つき
     pub value_nn: f64,
+    /// 粒子加重の期待駒得（この手で取れる敵駒の交換価値）。gain には加算済み
+    pub capture_value: f64,
+    /// 静的な取られリスク項の粒子加重平均（gain からは控除済みの正の値）。
+    /// 2手読みを通った候補では depth2_replace 分が実測へ置き換わっている
+    pub risk: f64,
 }
 
 /// 前進を好むヒューリスティック＋乱数（従来実装）
@@ -299,19 +304,22 @@ fn eval_taint_fallback() -> bool {
     })
 }
 
-/// V1（利き数）のアブレーション用ノブ。既定は両方 有効。
-/// 統合すると勝率が動かなかったため、どちらの半分が効いていないかを切り分ける
-/// （`TSUITATE_V1_PRESSURE=0` = 玉周辺の圧力を旧来の二値カウントに戻す、
-/// `TSUITATE_V1_DEFENDED=0` = 紐の判定を旧来の「1本でもあれば割引」に戻す）。
-/// 凍結版はこの名前を知らないので候補側にだけ効く
+/// V1（利き数）のノブ。**既定は両方 無効**（＝従来の二値の利き判定）。
+///
+/// やねうら王 Lv4 の「利き数」（+R30）をついたてへ持ち込む実験だったが、
+/// 200局×3形態（統合 53.3% / 紐だけ 50.0% / 圧力だけ 49.7%）がいずれも
+/// 対照 56.5%±6.9 を下回り、狙いの機械指標（只取られ 1050→1113、
+/// 損な交換 1934→2128）も改善しなかったため既定から外した。
+/// `attack_count` 自体は V3（予防的な紐）・V2（距離重み）で使えるので残す。
+/// `TSUITATE_V1_PRESSURE=1` / `TSUITATE_V1_DEFENDED=1` で再度有効化できる
 fn v1_pressure_multiplicity() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| !std::env::var("TSUITATE_V1_PRESSURE").is_ok_and(|v| v == "0"))
+    *V.get_or_init(|| std::env::var("TSUITATE_V1_PRESSURE").is_ok_and(|v| v == "1"))
 }
 
 fn v1_defended_by_count() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| !std::env::var("TSUITATE_V1_DEFENDED").is_ok_and(|v| v == "0"))
+    *V.get_or_init(|| std::env::var("TSUITATE_V1_DEFENDED").is_ok_and(|v| v == "1"))
 }
 
 /// 思考予算に比例して各種の粒子数・読み幅を決める
@@ -561,6 +569,8 @@ struct EvalOut {
     king_holes: f64,
     /// gain に加算された valueネット項（符号つき。内訳表示用）
     value_nn: f64,
+    /// 粒子加重の期待駒得（内訳表示用。gain には加算済み）
+    capture_value: f64,
 }
 
 impl EvalOut {
@@ -1685,6 +1695,8 @@ impl Strategy for EstimatorStrategy {
                 mate_risk: out.mate_risk,
                 king_holes: out.king_holes,
                 value_nn: out.value_nn,
+                capture_value: out.capture_value,
+                risk: out.risk_mean,
             });
             if best.as_ref().is_none_or(|(_, _, s)| final_score > *s) {
                 best = Some((usi, out.p_legal, final_score));
@@ -2749,6 +2761,11 @@ fn evaluate(
         mate_risk,
         king_holes,
         value_nn: value_nn_term,
+        capture_value: if legal > 0.0 {
+            capture_value_sum / legal
+        } else {
+            0.0
+        },
     }
 }
 

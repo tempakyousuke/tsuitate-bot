@@ -207,6 +207,8 @@ mod tests {
             mate_risk,
             king_holes: 0.0,
             value_nn: 0.0,
+            capture_value: 0.0,
+            risk: 0.0,
         }
     }
 
