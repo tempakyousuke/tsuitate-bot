@@ -8,6 +8,7 @@ pub mod check;
 pub mod client;
 pub mod deduce;
 pub mod estimator;
+pub mod effect_profile;
 pub mod frozen;
 pub mod hits;
 pub mod kifu;

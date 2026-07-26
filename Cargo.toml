@@ -4,6 +4,11 @@ version = "0.1.0"
 edition = "2024"
 description = "王様のかくれんぼ用の外部bot（Socket.IOクライアント）"
 
+[features]
+# 利き走査の呼び出し回数を数える（src/effect_profile.rs、bin/effect_cost）。
+# 既定オフ = カウンタの命令自体がコンパイルされないので通常ビルドは無影響
+effect-profile = []
+
 [dependencies]
 rust_socketio = "0.6"
 serde = { version = "1", features = ["derive"] }

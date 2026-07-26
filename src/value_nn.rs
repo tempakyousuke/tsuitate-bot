@@ -118,6 +118,8 @@ pub const VALUE_NN_B3: f64 = -3.74700166e-02;
 /// → Linear(32→1) → Sigmoid のforward pass（Dropoutは推論時無効なので存在しない）。
 /// 出力は [0,1]（手番側の勝率相当）
 pub fn value_nn_forward(features: &[f64; 22]) -> f64 {
+    #[cfg(feature = "effect-profile")]
+    crate::effect_profile::bump(&crate::effect_profile::VALUE_NN);
     let mut x = [0.0f64; 22];
     for i in 0..22 {
         x[i] = (features[i] - VALUE_NN_MEAN[i]) / VALUE_NN_STD[i];

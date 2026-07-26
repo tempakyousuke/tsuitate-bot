@@ -306,6 +306,8 @@ impl Position {
 
     /// マス sq が by 側の駒に利いているか（sq から逆引きで走査）
     pub fn is_attacked(&self, sq: Coord, by: Color) -> bool {
+        #[cfg(feature = "effect-profile")]
+        crate::effect_profile::bump(&crate::effect_profile::IS_ATTACKED);
         // 桂: 攻撃側の桂が s にいて s + oriented(knight) == sq となる s を逆算
         for &delta in steps(Role::Knight) {
             let (df, dr) = orient(delta, by);
@@ -565,6 +567,8 @@ impl Position {
 
     /// 手番側の全合法手
     pub fn legal_moves(&self) -> Vec<ShogiMove> {
+        #[cfg(feature = "effect-profile")]
+        crate::effect_profile::bump(&crate::effect_profile::LEGAL_MOVES);
         self.pseudo_legal_moves()
             .into_iter()
             .filter(|mv| {
