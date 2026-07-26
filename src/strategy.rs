@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use rand::Rng;
 
 use crate::board::{
-    Coord, Promotion, drop_targets, make_usi_drop, make_usi_move, make_usi_square, move_targets,
-    parse_usi_square, promotion_choice,
+    Coord, Promotion, defend_targets, drop_targets, make_usi_drop, make_usi_move, make_usi_square,
+    move_targets, parse_usi_square, promotion_choice,
 };
 use crate::check::CheckSolver;
 use crate::estimator::{EPS_INFO, Estimator, opp_reply_weights};
@@ -395,12 +395,32 @@ pub(crate) fn exchange_value(role: Role) -> f64 {
 /// 着手後の自駒の利き被覆マス数（自分に見える盤面だけの近似）。
 /// 相手の駒は見えないため飛び駒は自駒にだけ遮られる楽観値
 fn coverage_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
+    own_effects_after(view, mv).coverage
+}
+
+/// 自駒だけで決まる評価量（粒子不要・ノイズゼロ）。3項が同じ
+/// 「着手後の自駒配置と、その利き」を必要とするので1回の走査でまとめて出す
+#[derive(Debug, Default, Clone, Copy)]
+struct OwnEffects {
+    /// 自駒の利き被覆マス数（索敵網の広さ。`coverage_w`）
+    coverage: f64,
+    /// 自玉8近傍のうち「玉以外の自駒の利きが無い」マスの数（V4。`king_hole_w`）
+    king_holes: f64,
+    /// 紐のついた自駒の価値合計（V3。`link_w`）
+    linked_value: f64,
+}
+
+/// 着手後の自駒配置を作り、`OwnEffects` の3項をまとめて計算する。
+///
+/// ついたてで**相手の駒が見えなくても完全に既知**な情報だけを使う
+/// （自駒の位置と利き）。飛び駒は自駒にだけ遮られる楽観値になる。
+fn own_effects_after(view: &PlayerView, mv: &ShogiMove) -> OwnEffects {
     let mut pieces: Vec<VisiblePiece> = view.your_pieces.clone();
     match *mv {
         ShogiMove::Board { from, to, promote } => {
             let from_usi = make_usi_square(from);
             let Some(p) = pieces.iter_mut().find(|p| p.square == from_usi) else {
-                return 0.0;
+                return OwnEffects::default();
             };
             if promote {
                 if let Some(r) = promote_role(p.role) {
@@ -414,11 +434,67 @@ fn coverage_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
             role,
         }),
     }
+
+    // 移動できるマス（自駒のマスを含まない）= 索敵網の広さ
     let mut covered: HashSet<Coord> = HashSet::new();
+    // 利かせているマス（自駒のマスを含む）= 紐の判定用。玉の利きも数える
+    // （玉で取り返す形も守りとしては成立する。玉を除くのは V4 の穴の側だけ）
+    let mut defended: HashSet<Coord> = HashSet::new();
+    // 玉以外の自駒が利かせているマス（V4 の穴の判定用）
+    let mut defended_nonking: HashSet<Coord> = HashSet::new();
     for p in &pieces {
         covered.extend(move_targets(&pieces, p, view.your_color));
+        let d = defend_targets(&pieces, p, view.your_color);
+        if p.role != Role::King {
+            defended_nonking.extend(d.iter().copied());
+        }
+        defended.extend(d);
     }
-    covered.len() as f64
+
+    let king = pieces
+        .iter()
+        .find(|p| p.role == Role::King)
+        .and_then(|p| parse_usi_square(&p.square));
+    let occupied: HashSet<Coord> = pieces
+        .iter()
+        .filter_map(|p| parse_usi_square(&p.square))
+        .collect();
+    let mut king_holes = 0.0;
+    if let Some(king) = king {
+        for df in -1..=1i8 {
+            for dr in -1..=1i8 {
+                if df == 0 && dr == 0 {
+                    continue;
+                }
+                let c = Coord {
+                    file: king.file + df,
+                    rank: king.rank + dr,
+                };
+                if !(1..=9).contains(&c.file) || !(1..=9).contains(&c.rank) {
+                    continue; // 盤外は穴ではない（壁として機能する）
+                }
+                if !defended_nonking.contains(&c) && !occupied.contains(&c) {
+                    king_holes += 1.0;
+                }
+            }
+        }
+    }
+
+    // V3: 紐のついた自駒（玉を除く）の価値合計。自分の利きは自分のマスへは
+    // 届かないので、`defended` に載っている = 別の自駒が守っている
+    let linked_value = pieces
+        .iter()
+        .filter(|p| p.role != Role::King)
+        .filter_map(|p| parse_usi_square(&p.square).map(|c| (c, p.role)))
+        .filter(|(c, _)| defended.contains(c))
+        .map(|(_, role)| exchange_value(role))
+        .sum();
+
+    OwnEffects {
+        coverage: covered.len() as f64,
+        king_holes,
+        linked_value,
+    }
 }
 
 /// この手の後、**自玉の8近傍のうち「玉以外の自駒の利きが無い」マスの数**（0〜8）。
@@ -427,63 +503,13 @@ fn coverage_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
 /// 良いのは、**自分の駒だけで計算できる**から: 相手の駒が見えなくても自玉の位置も
 /// 自駒の利きも完全既知なので、粒子を使わずノイズゼロで測れる。
 ///
-/// `coverage_after` と同じく `move_targets`（自駒だけを考慮した利き）を使う。
 /// 玉自身の利きは除く（玉が自分で守っているマスは「支えがある」とは言えない。
 /// 玉で取り返す形は詰みへ直結するため。やねうら王も「玉以外の味方の利き」で数える）。
-///
 /// 相手の駒が見えないので、やねうら王の「そこが空きか敵駒なら減点・味方の駒が
-/// あるなら加点」の区別はできない。ここでは**自駒が乗っているマスは穴に数えない**
+/// あるなら加点」の区別はできない。**自駒が乗っているマスは穴に数えない**
 /// （壁として機能するため）という近似にする
 fn king_holes_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
-    let mut pieces: Vec<VisiblePiece> = view.your_pieces.clone();
-    match *mv {
-        ShogiMove::Board { from, to, promote } => {
-            let from_usi = make_usi_square(from);
-            let Some(p) = pieces.iter_mut().find(|p| p.square == from_usi) else {
-                return 0.0;
-            };
-            if promote {
-                if let Some(r) = promote_role(p.role) {
-                    p.role = r;
-                }
-            }
-            p.square = make_usi_square(to);
-        }
-        ShogiMove::Drop { role, to } => pieces.push(VisiblePiece {
-            square: make_usi_square(to),
-            role,
-        }),
-    }
-    let Some(king) = pieces
-        .iter()
-        .find(|p| p.role == Role::King)
-        .and_then(|p| parse_usi_square(&p.square))
-    else {
-        return 0.0;
-    };
-    // 玉以外の自駒が利かせているマス
-    let mut covered: HashSet<Coord> = HashSet::new();
-    for p in pieces.iter().filter(|p| p.role != Role::King) {
-        covered.extend(move_targets(&pieces, p, view.your_color));
-    }
-    let occupied: HashSet<Coord> =
-        pieces.iter().filter_map(|p| parse_usi_square(&p.square)).collect();
-    let mut holes = 0.0;
-    for df in -1..=1i8 {
-        for dr in -1..=1i8 {
-            if df == 0 && dr == 0 {
-                continue;
-            }
-            let c = Coord { file: king.file + df, rank: king.rank + dr };
-            if !(1..=9).contains(&c.file) || !(1..=9).contains(&c.rank) {
-                continue; // 盤外は穴ではない（壁として機能する）
-            }
-            if !covered.contains(&c) && !occupied.contains(&c) {
-                holes += 1.0;
-            }
-        }
-    }
-    holes
+    own_effects_after(view, mv).king_holes
 }
 
 /// 持ち駒の歩を成れる圏内（敵陣＋一段手前）へ打つ手か（1.0/0.0）。
@@ -734,6 +760,18 @@ pub struct EvalParams {
     /// `mate.rs` の被詰めろとも噛み合う（打ち一手詰めの成立条件は、まさに
     /// 玉の近傍に支えの無いマクがあること）。0 = 無効（従来と同一挙動）
     pub king_hole_w: f64,
+    /// 紐のついた自駒1点（交換価値）あたりの加点
+    /// （docs/yaneuraou-lessons.md の V3。やねうら王 Lv7 で +R25、
+    /// 向こうは駒価値の 0.8〜1.0% を加点している）。
+    ///
+    /// **ついたてでは将棋よりこの項の価値が高いはず**という理屈:
+    /// 将棋は「狙われてから紐をつける」で間に合うが、ついたては相手の攻めが
+    /// 見えないので狙われたことに気づけない。事前に紐がついている駒は、
+    /// 気づかないまま只取られされる確率がそもそも低い。
+    /// 既存の紐（`recapture_defended` / `exposed_defended`）は**すでに
+    /// 攻撃されている駒にしか効かない**ので、この事前の勾配は無かった。
+    /// 自駒同士の連結は完全既知なので粒子不要・ノイズゼロ
+    pub link_w: f64,
 }
 
 impl Default for EvalParams {
@@ -816,6 +854,10 @@ impl Default for EvalParams {
             // 自玉8近傍の穴（2026-07-26、docs/yaneuraou-lessons.md の V4）。
             // 0 = 従来と同一挙動。未調整の新項なので w スイープで決める
             king_hole_w: 0.0,
+            // 予防的な紐（2026-07-26、V3）。初期値はやねうら王 Lv7 の実測比率
+            // （駒価値の 0.8%）に合わせた。盤上20駒の交換価値合計が 60〜80 なので
+            // 全駒に紐がつけば 0.5〜0.6 点ぶんの加点になり、他のバイアス項と同程度
+            link_w: 0.008,
         }
     }
 }
@@ -828,7 +870,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 44] = [
+    pub const SPECS: [ParamSpec; 45] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -1049,6 +1091,11 @@ impl EvalParams {
             lo: 0.0,
             hi: 1.0,
         },
+        ParamSpec {
+            name: "link_w",
+            lo: 0.0,
+            hi: 0.1,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -1097,6 +1144,7 @@ impl EvalParams {
             self.mate_threat_w,
             self.mate_risk_w,
             self.king_hole_w,
+            self.link_w,
         ]
     }
 
@@ -1147,6 +1195,7 @@ impl EvalParams {
             mate_threat_w: v[41],
             mate_risk_w: v[42],
             king_hole_w: v[43],
+            link_w: v[44],
         }
     }
 }
@@ -1263,6 +1312,14 @@ impl EstimatorStrategy {
                 king_hole_w: w,
                 ..params
             },
+            None => params,
+        };
+        // 予防的な紐（V3）の運用ノブ（w スイープ・切り戻し用。0 で従来挙動）
+        let params = match std::env::var("TSUITATE_LINK_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+        {
+            Some(w) => EvalParams { link_w: w, ..params },
             None => params,
         };
         EstimatorStrategy {
@@ -2776,14 +2833,20 @@ fn evaluate(
 
     // 利き被覆（広い索敵網）と、成れる圏内への歩打ち（と金ポテンシャル）。
     // どちらも粒子に依存しない自明な情報だけで計算できる
-    let coverage = params.coverage_w * coverage_after(view, mv);
+    let own_effects = own_effects_after(view, mv);
+    let coverage = params.coverage_w * own_effects.coverage;
     let probe = params.tokin_probe_w * tokin_probe(view, mv);
     // 自玉8近傍の支えの無いマス（V4）。自駒だけで決まるので粒子に依らない
-    let king_holes = if params.king_hole_w != 0.0 {
-        params.king_hole_w * king_holes_after(view, mv)
-    } else {
-        0.0
-    };
+    let king_holes = params.king_hole_w * own_effects.king_holes;
+    // V3（予防的な紐、やねうら王 Lv7 で +R25）: 紐のついた自駒の価値合計。
+    // **ついたてでは将棋よりこの項の価値が高いはず**という理屈がある:
+    // 将棋なら「狙われてから紐をつける」で間に合うが、ついたては相手の攻めが
+    // 見えないので狙われたことに気づけない。事前に紐がついている駒は、
+    // 気づかないまま只取られされる確率がそもそも低い。
+    // 既存の紐（recapture_risk / exposed_capture_risk の割引）は
+    // **すでに攻撃されている駒にしか効かない**ので、この事前の勾配が無かった。
+    // 自駒同士の連結は完全既知なので粒子不要・ノイズゼロで計算できる
+    let link = params.link_w * own_effects.linked_value;
 
     // 詰めろ生成: この手の後、次の自分の手番で持ち駒打ちの一手詰めが成立するか
     // （mate.rs::drop_mate）。ついたて将棋では相手に脅威が見えないので、詰めろは
@@ -2855,6 +2918,7 @@ fn evaluate(
 
     let gain = expected + advance_bias + development + coverage + probe + mate_threat - mate_risk
         - king_holes
+        + link
         + blind_recapture;
     EvalOut {
         gain,
@@ -3575,6 +3639,39 @@ pub(crate) mod tests {
             captured_my_piece_at: None,
         });
         assert!(blind_recapture_target(&view, &log).is_none());
+    }
+
+    /// V3: 紐は「移動できるマス」ではなく「利かせているマス」で数える。
+    /// `move_targets` は自駒のいるマスを除くので、そのままでは紐が常にゼロになる
+    #[test]
+    fn linked_value_counts_pieces_defended_by_another_piece() {
+        let gold = VisiblePiece {
+            square: "5h".into(),
+            role: Role::Gold,
+        };
+        let king = VisiblePiece {
+            square: "5i".into(),
+            role: Role::King,
+        };
+        // 玉(5i)だけが金(5h)を守っている形。玉の利きも紐に数える
+        let view = minimal_view(vec![gold.clone(), king.clone()], HashMap::new());
+        let alone = own_effects_after(&view, &parse_usi("5h5g").unwrap());
+        assert_eq!(alone.linked_value, 0.0, "5g へ出れば玉から離れて紐が切れる");
+        let stay = own_effects_after(&view, &parse_usi("5i4i").unwrap());
+        assert!(
+            stay.linked_value > 0.0,
+            "玉が 4i へ寄っても金 5h は玉の利きに入ったまま"
+        );
+
+        // 銀を足すと紐が増える（価値の合計で数える）
+        let mut pieces = vec![gold, king];
+        pieces.push(VisiblePiece {
+            square: "4h".into(),
+            role: Role::Silver,
+        });
+        let view2 = minimal_view(pieces, HashMap::new());
+        let two = own_effects_after(&view2, &parse_usi("5i4i").unwrap());
+        assert!(two.linked_value > stay.linked_value);
     }
 
     #[test]

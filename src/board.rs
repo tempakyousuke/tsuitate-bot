@@ -170,6 +170,55 @@ pub fn move_targets(pieces: &[VisiblePiece], piece: &VisiblePiece, color: Color)
     targets
 }
 
+/// 盤上の自駒が「利かせている」マス（＝そこに敵駒が来たら取れるマス）。
+///
+/// `move_targets` との違いは**自駒のいるマスを含める**こと。移動先としては
+/// 反則だが、紐（味方の駒を守っている関係）を数えるにはこちらが要る
+/// （docs/yaneuraou-lessons.md の V3）。レイはそのマスで止まる。
+/// ついたてでは相手の駒が見えないので、遮蔽は自駒だけの楽観値になるのは
+/// `move_targets` と同じ
+pub fn defend_targets(pieces: &[VisiblePiece], piece: &VisiblePiece, color: Color) -> Vec<Coord> {
+    let own = occupied_set(pieces);
+    let Some(from) = parse_usi_square(&piece.square) else {
+        return vec![];
+    };
+    let mut targets = vec![];
+
+    // 自駒のマスも「利かせている」ので含めるが、そこでレイは止まる
+    let push = |c: Coord, targets: &mut Vec<Coord>| -> bool {
+        if !on_board(c) {
+            return false;
+        }
+        targets.push(c);
+        !own.contains(&c)
+    };
+
+    for &delta in steps(piece.role) {
+        let (df, dr) = orient(delta, color);
+        push(
+            Coord {
+                file: from.file + df,
+                rank: from.rank + dr,
+            },
+            &mut targets,
+        );
+    }
+    for &delta in rays(piece.role) {
+        let (df, dr) = orient(delta, color);
+        let mut c = Coord {
+            file: from.file + df,
+            rank: from.rank + dr,
+        };
+        while push(c, &mut targets) {
+            c = Coord {
+                file: c.file + df,
+                rank: c.rank + dr,
+            };
+        }
+    }
+    targets
+}
+
 /// 持ち駒を打てる候補（自駒のないマス。歩は自歩の筋と行き所を除外）
 pub fn drop_targets(pieces: &[VisiblePiece], role: Role, color: Color) -> Vec<Coord> {
     let own = occupied_set(pieces);
