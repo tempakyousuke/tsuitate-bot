@@ -289,6 +289,16 @@ fn think_budget_ms() -> u64 {
     DEFAULT_THINK_BUDGET_MS
 }
 
+/// 厳密粒子が全滅した決定で、評価本体（`expected`）を taint 粒子へ落とすか。
+/// 既定は無効（従来挙動）。`TSUITATE_EVAL_TAINT_FALLBACK=1` で有効。
+/// 凍結版はこの名前を知らないので候補側にだけ効く
+fn eval_taint_fallback() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_EVAL_TAINT_FALLBACK").is_ok_and(|v| v == "1")
+    })
+}
+
 /// 思考予算に比例して各種の粒子数・読み幅を決める
 #[derive(Debug, Clone, Copy)]
 struct SearchBudget {
@@ -1494,6 +1504,21 @@ impl Strategy for EstimatorStrategy {
         // 盤上駒＝支え駒の有無で、そこは IfSupported 側が吸収する
         let mate_pool: &[(&Position, f64)] = if sample.is_empty() { &taint_pool } else { &sample };
 
+        // 評価本体（`expected`）の粒子プール。厳密粒子が全滅した決定では
+        // 駒得期待値・情報利得・攻め圧力・valueネットが**丸ごとゼロ**になり、
+        // 着手が前進バイアスと事前確率だけで決まっていた（実測: 全決定の26%。
+        // src/hits.rs の「厳密粒子ゼロ」）。mate_pool・blind_king_attack・
+        // CheckSolver 投票が既に持っている「厳密が全滅していれば taint」の規約を
+        // 評価本体にも広げる。既定は無効（挙動不変）で、
+        // `TSUITATE_EVAL_TAINT_FALLBACK=1` で有効化する。
+        //
+        // **p_legal には混ぜない**: taint 粒子は反則の説明（打ちマス占有など）を
+        // 緩和して生かした粒子なので、合法性の証拠としては使えない。
+        // 反則マス記憶系4種が全滅した領域でもあるので、供給チャネルは
+        // gain 側（駒得・攻め）に限定する
+        let eval_taint = sample.is_empty() && !taint_pool.is_empty() && eval_taint_fallback();
+        let eval_pool: &[(&Position, f64)] = if eval_taint { &taint_pool } else { &sample };
+
         // 評価の前提条件の発火率（src/hits.rs）。`expected` の内側にある項
         // （駒得期待値・valueネット等）は厳密粒子が全滅すると丸ごと無効になるので、
         // それがどれくらいの頻度で起きているかを測る
@@ -1504,13 +1529,16 @@ impl Strategy for EstimatorStrategy {
                 "value_nn の前提充足",
                 !sample.is_empty() && !view.you_in_check,
             );
+            crate::hits::flag("taint 評価へ落ちた", eval_taint);
+            // 厳密も taint も無い = 事前確率と粒子に依らない項だけで指している決定
+            crate::hits::flag("粒子が全く無い", sample.is_empty() && taint_pool.is_empty());
         }
 
         let rng = &mut self.rng;
         // valueネットのstate特徴量キャッシュ（sample と同じ並び。候補間で共通なので
         // 手番ごとに1回だけ計算する）
         let mut nn_state_cache: Vec<Option<[f64; crate::value_features::VALUE_FEATURES]>> =
-            vec![None; sample.len()];
+            vec![None; eval_pool.len()];
         // 1段目: 全候補を1手読み（静的リスク項つき）で評価する。
         // (usi, mv, 内訳, gain外の補正, 1段目スコア)
         let mut scored: Vec<(String, ShogiMove, EvalOut, f64, f64)> = vec![];
@@ -1527,7 +1555,8 @@ impl Strategy for EstimatorStrategy {
             let mut out = evaluate(
                 view,
                 &mv,
-                &sample,
+                eval_pool,
+                eval_taint,
                 mate_pool,
                 prior,
                 &known,
@@ -2354,6 +2383,11 @@ fn evaluate(
     view: &PlayerView,
     mv: &ShogiMove,
     particles: &[(&Position, f64)],
+    // particles が taint 粒子（情報系の制約を緩めて生かした粒子）かどうか。
+    // 真なら **p_legal は事前確率のみ**にする: taint は「反則の説明」を
+    // 緩和して生き残った粒子なので、合法性の証拠に使ってはいけない
+    // （厳密粒子ゼロのときの従来挙動 p_legal = prior と一致する）
+    particles_are_taint: bool,
     // 詰めろ生成の判定に使う粒子プール。厳密粒子があれば `particles` と同じ、
     // 全滅していれば taint 粒子（choose() が渡す）。終盤のブラインドでは
     // 厳密粒子が枯れるので、詰めろが効く局面ほど `particles` は空になる
@@ -2528,7 +2562,11 @@ fn evaluate(
     let n: f64 = particles.iter().map(|(_, w)| w).sum();
     let degen = 1.0 - (n / budget.eval_particles as f64).min(1.0);
     let w = params.prior_weight + params.prior_weight_degen * degen;
-    let p_legal = (legal + prior * w) / (n + w);
+    let p_legal = if particles_are_taint {
+        prior
+    } else {
+        (legal + prior * w) / (n + w)
+    };
     // 賭け分散ペナルティの内訳（ランキング表示用に expected の外へ持ち出す）
     let mut capture_bet_penalty = 0.0;
     // valueネット項の内訳（同上。発火率フック src/hits.rs が使う）
