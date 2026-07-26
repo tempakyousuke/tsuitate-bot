@@ -128,6 +128,8 @@ fn occupied_set(pieces: &[VisiblePiece]) -> HashSet<Coord> {
 
 /// 盤上の自駒の移動候補（自駒にだけ塞がれる。相手駒は考慮しない）
 pub fn move_targets(pieces: &[VisiblePiece], piece: &VisiblePiece, color: Color) -> Vec<Coord> {
+    #[cfg(feature = "effect-profile")]
+    crate::effect_profile::bump(&crate::effect_profile::MOVE_TARGETS);
     let own = occupied_set(pieces);
     let Some(from) = parse_usi_square(&piece.square) else {
         return vec![];

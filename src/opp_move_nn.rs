@@ -38,6 +38,8 @@ pub const OPP_MOVE_NN_B2: f64 = 3.33522039e-04;
 /// 出力はlogit（Sigmoidではない）。呼び出し側は `clamp(-15, 15)` してから
 /// `exp(logit)` として使う
 pub fn opp_move_nn_forward(features: &[f64; 25]) -> f64 {
+    #[cfg(feature = "effect-profile")]
+    crate::effect_profile::bump(&crate::effect_profile::OPP_MOVE_NN);
     let mut x = [0.0f64; 25];
     for i in 0..25 {
         x[i] = (features[i] - OPP_MOVE_NN_MEAN[i]) / OPP_MOVE_NN_STD[i];

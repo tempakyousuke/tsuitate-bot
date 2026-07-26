@@ -32,8 +32,12 @@ on:
         description: "診断用オラクル（nofoul / check_nofoul。候補側の反則を審判が握りつぶす上限測定）"
         required: false
         default: ""
+      clock:
+        description: "フィッシャー時計（初期秒+加算秒。空なら 1000+3。本番相当は 300+3）"
+        required: false
+        default: ""
       env:
-        description: "候補側の評価ノブ（スペース区切りの TSUITATE_XXX=値。w スイープ用。例: TSUITATE_MATE_RISK_W=3 TSUITATE_MATE_THREAT_W=4）"
+        description: "評価ノブ（スペース区切りの TSUITATE_XXX=値。w スイープ用。例: TSUITATE_MATE_RISK_W=3。思考予算は TSUITATE_CAND_THINK_BUDGET_MS を使うこと）"
         required: false
         default: ""
 
@@ -77,7 +81,12 @@ jobs:
           ARENA_RECORD_DIR: arena-records
           ARENA_JSON: arena-summary.json
           ARENA_ORACLE_A: ${{ inputs.oracle }}
+          # 評価項の発火率（src/hits.rs）。中立だった変更が「効いていない」のか
+          # 「そもそも発火していない」のかを切り分けるため常時集計する
+          # （実測で思考時間への影響なし）
+          TSUITATE_DBG_HITS: "1"
           ARENA_EXTRA_ENV: ${{ inputs.env }}
+          ARENA_CLOCK: ${{ inputs.clock }}
         run: |
           # 共通seed指定時はシャードごとにずらす（シャード間の対局重複を防ぎつつ、
           # 同じ入力なら版をまたいで同じ対局条件列になる）
@@ -85,7 +94,20 @@ jobs:
           if [ -n "$seed" ]; then
             export ARENA_MATCH_SEED=$(( seed + ${{ matrix.shard }} ))
           fi
-          # 評価ノブ（TSUITATE_* のみ許可。凍結版は env を見ないので候補側にだけ効く）
+          # 時計（審判側の設定なので ARENA_*。両者に等しく効く）
+          if [ -n "$ARENA_CLOCK" ]; then
+            case "$ARENA_CLOCK" in
+              [0-9]*+[0-9]*)
+                export ARENA_FISCHER_INITIAL_MS=$(( ${ARENA_CLOCK%%+*} * 1000 ))
+                export ARENA_FISCHER_INCREMENT_MS=$(( ${ARENA_CLOCK##*+} * 1000 ))
+                ;;
+              *) echo "無視（初期秒+加算秒 の形式のみ）: ${ARENA_CLOCK}" ;;
+            esac
+          fi
+          # 評価ノブ（TSUITATE_* のみ許可）。
+          # 注意: env はプロセス全体に効き、凍結版も凍結時点で読んでいた env を読む
+          # （TSUITATE_THINK_BUDGET_MS は v6〜v11 全部、VALUE_NN_W 等は v11）。
+          # 候補側だけ予算を変えるには TSUITATE_CAND_THINK_BUDGET_MS を使う
           for kv in $ARENA_EXTRA_ENV; do
             case "$kv" in
               TSUITATE_*=*) export "$kv" ;;
@@ -175,6 +197,11 @@ jobs:
                 fouls_b_per_game: ((map(.fouls_b) | add) / (map(.games) | add)),
                 think_avg_ms_a: ((map(.think_avg_ms_a * .games) | add) / (map(.games) | add)),
                 think_p99_ms_a_max: (map(.think_p99_ms_a) | max),
+                clock_used_pct_a: (
+                  (map(.clock_granted_ms_a // 0) | add) as $g |
+                  if $g > 0 then (map(.clock_used_ms_a // 0) | add) / $g * 100 else 0 end
+                ),
+                clock_min_s_a: ((map(.clock_min_ms_a // empty) | min // 0) / 1000),
               } + (
                 if $dec > 0 then
                   ($w / $dec) as $rate |
@@ -187,11 +214,11 @@ jobs:
             )
           ' all.jsonl > combined.json
           {
-            echo "## 総合（全シャード合算・candidate=${{ inputs.candidate }}）"
+            echo "## 総合（全シャード合算・candidate=${{ inputs.candidate }}・時計 ${{ inputs.clock || '1000+3' }}・env '${{ inputs.env }}'）"
             echo ""
-            echo '| 基準 | 勝率 | 勝-負-分 | 詰み | 反則負け | 手数上限 | 平均手数 | 反則/局(A) | think avg/p99max (A) |'
-            echo '|---|---|---|---|---|---|---|---|---|'
-            jq -r '.[] | "| \(.baseline) | \(.rate_pct | . * 10 | round / 10)% ± \(.ci_pct | . * 10 | round / 10)% | \(.wins)-\(.losses)-\(.draws) | \(.checkmate) | \(.foul_limit) | \(.max_plies) | \(.avg_plies | . * 10 | round / 10) | \(.fouls_a_per_game | . * 100 | round / 100) | \(.think_avg_ms_a | round)ms / \(.think_p99_ms_a_max | round)ms |"' combined.json
+            echo '| 基準 | 勝率 | 勝-負-分 | 詰み | 反則負け | 時間切れ | 手数上限 | 平均手数 | 反則/局(A) | think avg/p99max (A) | クロック消費(A) | 残り最小(A) |'
+            echo '|---|---|---|---|---|---|---|---|---|---|---|---|'
+            jq -r '.[] | "| \(.baseline) | \(.rate_pct | . * 10 | round / 10)% ± \(.ci_pct | . * 10 | round / 10)% | \(.wins)-\(.losses)-\(.draws) | \(.checkmate) | \(.foul_limit) | \(.timeout) | \(.max_plies) | \(.avg_plies | . * 10 | round / 10) | \(.fouls_a_per_game | . * 100 | round / 100) | \(.think_avg_ms_a | round)ms / \(.think_p99_ms_a_max | round)ms | \(.clock_used_pct_a | . * 10 | round / 10)% | \(.clock_min_s_a | . * 10 | round / 10)s |"' combined.json
           } >> "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY"
 
