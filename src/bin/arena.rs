@@ -10,7 +10,7 @@
 //! （v2 に勝つが v1 に負ける、という非推移性の検出。src/frozen/ 参照）。
 
 use tsuitate_bot::selfplay::{
-    FISCHER_INCREMENT_MS, FISCHER_INITIAL_MS, MatchStats, run_match_with, run_match_with_seeds,
+    MatchStats, fischer_increment_ms, fischer_initial_ms, run_match_with, run_match_with_seeds,
     thread_count,
 };
 use tsuitate_bot::strategy;
@@ -50,6 +50,34 @@ fn print_match(stats: &MatchStats, name_a: &str, name_b: &str) {
     );
     println!("思考時間 A: {}", think_summary(&stats.think_us_a));
     println!("思考時間 B: {}", think_summary(&stats.think_us_b));
+    // クロック消費率: 支給された持ち時間のうち実際に使った割合。
+    // 時間配分（docs/improvement-plan-2026-07-26-yaneuraou.md 項目A）の伸びしろ
+    let clock_line = |used_us: &[u64], granted_ms: u64, min_ms: Option<i64>| -> String {
+        let used_ms = used_us.iter().sum::<u64>() as f64 / 1000.0;
+        let pct = if granted_ms > 0 {
+            used_ms / granted_ms as f64 * 100.0
+        } else {
+            0.0
+        };
+        format!(
+            "消費 {:.1}% （{:.0}秒 / 支給 {:.0}秒）/ 残り最小 {}",
+            pct,
+            used_ms / 1000.0,
+            granted_ms as f64 / 1000.0,
+            match min_ms {
+                Some(ms) => format!("{:.1}秒", ms as f64 / 1000.0),
+                None => "-".into(),
+            }
+        )
+    };
+    println!(
+        "クロック A: {}",
+        clock_line(&stats.think_us_a, stats.clock_granted_ms_a, stats.clock_min_ms_a)
+    );
+    println!(
+        "クロック B: {}",
+        clock_line(&stats.think_us_b, stats.clock_granted_ms_b, stats.clock_min_ms_b)
+    );
 }
 
 /// 1マッチアップの集計を機械可読に書き出す（CIのシャード集約用）。
@@ -90,6 +118,18 @@ fn summary_json(candidate: &str, baseline: &str, stats: &MatchStats) -> serde_js
         "think_p99_ms_a": a_p99,
         "think_avg_ms_b": b_avg,
         "think_p99_ms_b": b_p99,
+        // 時間配分の検証用（項目A）。消費 = think の総和、支給 = 初期＋加算の総和
+        "clock_used_ms_a": stats.think_us_a.iter().sum::<u64>() / 1000,
+        "clock_used_ms_b": stats.think_us_b.iter().sum::<u64>() / 1000,
+        "clock_granted_ms_a": stats.clock_granted_ms_a,
+        "clock_granted_ms_b": stats.clock_granted_ms_b,
+        "clock_min_ms_a": stats.clock_min_ms_a,
+        "clock_min_ms_b": stats.clock_min_ms_b,
+        "fischer_initial_ms": fischer_initial_ms(),
+        "fischer_increment_ms": fischer_increment_ms(),
+        "think_budget_ms_a": std::env::var("TSUITATE_CAND_THINK_BUDGET_MS")
+            .or_else(|_| std::env::var("TSUITATE_THINK_BUDGET_MS"))
+            .ok(),
     })
 }
 
@@ -118,8 +158,8 @@ fn main() {
     for (opp_idx, opp) in opponents.iter().enumerate() {
         println!(
             "=== アリーナ: {candidate} (A) vs {opp} (B), {games}局（先後交代・フィッシャー{}秒+{}秒・並列{}{}） ===",
-            FISCHER_INITIAL_MS / 1000,
-            FISCHER_INCREMENT_MS / 1000,
+            fischer_initial_ms() / 1000,
+            fischer_increment_ms() / 1000,
             thread_count().min(games.max(1) as usize),
             match match_seed {
                 Some(s) => format!("・seed {s}"),

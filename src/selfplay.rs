@@ -9,6 +9,7 @@
 //! - 詰み・ステイルメイト・投了（choose が None）・手数上限で終局
 
 use std::collections::HashSet;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use rand::Rng;
@@ -27,11 +28,38 @@ pub const MAX_FOULS: u32 = 10;
 /// 400手だと1ガントレットの実時間が長すぎるため200手に短縮
 /// （200手を超える対局は膠着がほとんどで、勝敗の判別力への寄与が薄い）
 pub const MAX_PLIES: u32 = 200;
-/// フィッシャー時計。本番サイトは 300秒+3秒 だが、このリポジトリの対戦は
+/// フィッシャー時計の既定。本番サイトは 300秒+3秒 だが、このリポジトリの対戦は
 /// 1000秒+3秒 で行う（思考予算を厚くして強さの上限を探るため。
 /// 本番へのデプロイ時は TSUITATE_THINK_BUDGET_MS で思考時間を絞って調整する）
-pub const FISCHER_INITIAL_MS: i64 = 1_000_000;
-pub const FISCHER_INCREMENT_MS: i64 = 3_000;
+pub const DEFAULT_FISCHER_INITIAL_MS: i64 = 1_000_000;
+pub const DEFAULT_FISCHER_INCREMENT_MS: i64 = 3_000;
+
+/// 持ち時間（ms）。`ARENA_FISCHER_INITIAL_MS` で上書きできる。
+/// **本番相当（300秒+3秒）でアリーナを回して時間配分を検証する**ためのノブ
+/// （docs/improvement-plan-2026-07-26-yaneuraou.md 項目1）。
+/// 名前を `ARENA_` にしているのは審判側の設定であり、戦略側が読む
+/// `TSUITATE_*`（凍結版も読む = 両側に効く）と混ぜないため
+pub fn fischer_initial_ms() -> i64 {
+    static V: OnceLock<i64> = OnceLock::new();
+    *V.get_or_init(|| env_i64("ARENA_FISCHER_INITIAL_MS", DEFAULT_FISCHER_INITIAL_MS))
+}
+
+/// 1手ごとの加算（ms）。`ARENA_FISCHER_INCREMENT_MS` で上書きできる。
+/// 受理された手の後にだけ加算される（反則には付かない）ので、
+/// 反則の多い戦略は同じ持ち時間でも実効の予算が薄くなる
+pub fn fischer_increment_ms() -> i64 {
+    static V: OnceLock<i64> = OnceLock::new();
+    *V.get_or_init(|| env_i64("ARENA_FISCHER_INCREMENT_MS", DEFAULT_FISCHER_INCREMENT_MS))
+}
+
+/// 対局ループから毎手呼ばれるので値はキャッシュする（env::var はロックを取る）
+fn env_i64(name: &str, default: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|&v| v >= 0)
+        .unwrap_or(default)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GameResult {
@@ -61,6 +89,15 @@ pub struct MatchStats {
     /// 1手ごとの思考時間（マイクロ秒）。時間切れ検証と改善の副作用チェック用
     pub think_us_a: Vec<u64>,
     pub think_us_b: Vec<u64>,
+    /// 支給された持ち時間の合計（初期持ち時間＋受理手ごとの加算）。
+    /// 消費（= think_us の合計）との比が「クロックの何%を使っているか」で、
+    /// 時間配分（docs/improvement-plan-2026-07-26-yaneuraou.md 項目A）の伸びしろそのもの
+    pub clock_granted_ms_a: u64,
+    pub clock_granted_ms_b: u64,
+    /// 対局中に残り時間が最も減った時点の値（ms）。時間切れまでの余裕の実測。
+    /// None は未計測（1手も指していない）
+    pub clock_min_ms_a: Option<i64>,
+    pub clock_min_ms_b: Option<i64>,
 }
 
 impl MatchStats {
@@ -101,7 +138,18 @@ impl MatchStats {
         self.fouls_in_check_b += other.fouls_in_check_b;
         self.think_us_a.extend(other.think_us_a);
         self.think_us_b.extend(other.think_us_b);
+        self.clock_granted_ms_a += other.clock_granted_ms_a;
+        self.clock_granted_ms_b += other.clock_granted_ms_b;
+        self.clock_min_ms_a = min_opt(self.clock_min_ms_a, other.clock_min_ms_a);
+        self.clock_min_ms_b = min_opt(self.clock_min_ms_b, other.clock_min_ms_b);
         self.games += other.games;
+    }
+}
+
+fn min_opt(a: Option<i64>, b: Option<i64>) -> Option<i64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (x, None) | (None, x) => x,
     }
 }
 
@@ -112,6 +160,10 @@ struct PlayerState {
     fouls_in_check: u32,
     foul_tried: HashSet<String>,
     clock_ms: i64,
+    /// この対局で支給された持ち時間（初期＋加算の累計）
+    clock_granted_ms: u64,
+    /// 残り時間の最小値（時間切れまでの余裕の実測）
+    clock_min_ms: Option<i64>,
     think_us: Vec<u64>,
     /// 選択の履歴 (move_number, usi, debug)。記録の chose イベント用
     /// （p_legal 較正の測定に使う。MyMove/MyFoul 観測と1:1で対応する）
@@ -186,6 +238,10 @@ fn play_game_with_oracle(
         let elapsed = started.elapsed();
         mover.think_us.push(elapsed.as_micros() as u64);
         mover.clock_ms -= elapsed.as_millis() as i64;
+        mover.clock_min_ms = Some(match mover.clock_min_ms {
+            Some(m) => m.min(mover.clock_ms),
+            None => mover.clock_ms,
+        });
         if mover.clock_ms <= 0 {
             return (GameResult::Win(side.other()), "timeout", plies, truth);
         }
@@ -250,7 +306,8 @@ fn play_game_with_oracle(
         let captured = pos.play_unchecked(&mv);
         plies += 1;
         players[idx(side)].foul_tried.clear();
-        players[idx(side)].clock_ms += FISCHER_INCREMENT_MS;
+        players[idx(side)].clock_ms += fischer_increment_ms();
+        players[idx(side)].clock_granted_ms += fischer_increment_ms() as u64;
 
         // 通知（game-room.ts と同じ内容・同じ moveNumber 規約 = 適用後の値）
         let move_number = pos.move_number();
@@ -375,6 +432,10 @@ fn record_game(
     stats.fouls_in_check_b += pb.fouls_in_check as u64;
     stats.think_us_a.extend(pa.think_us);
     stats.think_us_b.extend(pb.think_us);
+    stats.clock_granted_ms_a += pa.clock_granted_ms;
+    stats.clock_granted_ms_b += pb.clock_granted_ms;
+    stats.clock_min_ms_a = min_opt(stats.clock_min_ms_a, pa.clock_min_ms);
+    stats.clock_min_ms_b = min_opt(stats.clock_min_ms_b, pb.clock_min_ms);
     stats.total_plies += plies as u64;
     match reason {
         "checkmate" => stats.checkmate += 1,
@@ -511,7 +572,9 @@ where
                             fouls: 0,
                             fouls_in_check: 0,
                             foul_tried: HashSet::new(),
-                            clock_ms: FISCHER_INITIAL_MS,
+                            clock_ms: fischer_initial_ms(),
+                            clock_granted_ms: fischer_initial_ms() as u64,
+                            clock_min_ms: None,
                             think_us: Vec::new(),
                             chosen: Vec::new(),
                         };

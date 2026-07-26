@@ -268,12 +268,21 @@ const DEFAULT_THINK_BUDGET_MS: u64 = 2000;
 /// スケール1.0の基準予算。v5 までの暗黙の実測上限（p99 ≒ 900ms）
 const REFERENCE_BUDGET_MS: f64 = 900.0;
 
-/// 思考予算（ms）。環境変数 > 既定値
+/// 思考予算（ms）。`TSUITATE_CAND_THINK_BUDGET_MS` > `TSUITATE_THINK_BUDGET_MS` > 既定値。
+///
+/// **`TSUITATE_THINK_BUDGET_MS` は凍結版（`frozen/estimator_v6..v11`）も読む**ので、
+/// アリーナの `-f env=` で渡すと**両側の予算が動いて比較にならない**。
+/// 候補側だけ予算を変えたいとき（予算-強さ曲線の測定、時間配分の検証。
+/// docs/improvement-plan-2026-07-26-yaneuraou.md 項目1）は
+/// `TSUITATE_CAND_THINK_BUDGET_MS` を使う: この名前は現行 `strategy.rs` しか
+/// 知らないので、凍結版は既定（または `TSUITATE_THINK_BUDGET_MS`）のまま残る
 fn think_budget_ms() -> u64 {
-    std::env::var("TSUITATE_THINK_BUDGET_MS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_THINK_BUDGET_MS)
+    for name in ["TSUITATE_CAND_THINK_BUDGET_MS", "TSUITATE_THINK_BUDGET_MS"] {
+        if let Some(ms) = std::env::var(name).ok().and_then(|v| v.parse().ok()) {
+            return ms;
+        }
+    }
+    DEFAULT_THINK_BUDGET_MS
 }
 
 /// 思考予算に比例して各種の粒子数・読み幅を決める
