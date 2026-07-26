@@ -1544,6 +1544,10 @@ impl Strategy for EstimatorStrategy {
         let eval_taint = sample.is_empty() && !taint_pool.is_empty() && eval_taint_fallback();
         let eval_pool: &[(&Position, f64)] = if eval_taint { &taint_pool } else { &sample };
 
+        // ブラインド時の取り返し（観測だけで決まるので粒子の有無に依らず作れる。
+        // 実際に使うのは厳密粒子ゼロの決定だけ = evaluate 側で判定する）
+        let blind_recapture = blind_recapture_target(view, log);
+
         // 評価の前提条件の発火率（src/hits.rs）。`expected` の内側にある項
         // （駒得期待値・valueネット等）は厳密粒子が全滅すると丸ごと無効になるので、
         // それがどれくらいの頻度で起きているかを測る
@@ -1588,6 +1592,7 @@ impl Strategy for EstimatorStrategy {
                 &params,
                 budget,
                 &mut nn_state_cache,
+                blind_recapture,
             );
             // 王手中: 仮説条件付きの「王手駒の除去期待値」（check.rs::removal_term）。
             // 王手駒のマスを取る手は受理された未来で脅威ごと駒を排除し、玉逃げ等の
@@ -1950,6 +1955,79 @@ const TAINT_VOTE_MAX: u8 = 6;
 /// kakunari 実測: 玉位置信念は 91.8% で真実に集中するのに、評価が使えず
 /// 無目的手を選んでいた）
 const BLIND_KING_ATTACK_W: f64 = 2.0;
+
+/// ブラインド時の取り返しボーナスの重み（クリーン粒子全滅時のみ）。
+///
+/// **発端**（2026-07-26、`bin/recapture_probe` と発火率フック）: 厳密粒子は
+/// 決定の26%で全滅し、そのとき `expected`（駒得期待値を含む評価本体）が
+/// 丸ごとゼロになる。実測した1局面（相手の龍が自分の銀を取った直後）では
+/// シード6本中4本が「龍を取り返す 6a7a」を gain 11〜13 で1位に選ぶのに、
+/// **厳密粒子ゼロの2本では同じ手が gain 0.045 の89位**まで落ちていた。
+/// 只取られと取り返し逃しの主因はここ（評価が低いのではなく、消えている）。
+///
+/// 埋め方は `blind_king_attack` と同じ思想: **嘘の盤面（taint 粒子）は使わず、
+/// 観測だけから確実に言えること**を使う。相手が直前の手で自駒を取ったマスには
+/// **相手の駒が確実にいる**（観測 `OpponentMoved{captured_my_piece_at}` そのもの）。
+/// 駒種は不明なので、相手の盤上に残っているはずの駒の平均交換価値で見積もる
+/// （持ち駒の内訳まで含めて観測から一意に決まる。`blind_capture_estimate`）。
+/// taint フォールバックを評価本体へ広げる案は**別途200局で不採用**になっている
+/// （taint は物理制約を緩めた盤面なので、その 7a に駒がいる保証すら無い）
+const BLIND_RECAPTURE_W: f64 = 1.0;
+
+fn blind_recapture_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_BLIND_RECAPTURE_W")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(BLIND_RECAPTURE_W)
+    })
+}
+
+/// 「直前の相手手が自駒を取ったマス」と、そこにいる相手駒の期待交換価値。
+///
+/// 観測だけで決まる（粒子を使わない）:
+/// - マスは `OpponentMoved{captured_my_piece_at}` そのもの。直前の相手手に限る
+///   （それ以前のマスは相手がもう動かしているかもしれない）
+/// - 駒種は不明だが、**相手の盤上に残っている駒の多重集合は観測から一意に決まる**:
+///   初期配置 − 自分が取った駒（`MyMove{captured}`）＋ 相手が自分から取った駒
+///   （打ち直されて盤に戻りうる）。その平均交換価値を見積もりに使う。
+///   玉は除く（玉で取り返しに来る形は稀で、平均を押し上げるだけ）
+fn blind_recapture_target(view: &PlayerView, log: &ObservationLog) -> Option<(Coord, f64)> {
+    let square = log.events().iter().rev().find_map(|e| match e {
+        Observation::OpponentMoved {
+            captured_my_piece_at,
+            ..
+        } => Some(captured_my_piece_at.as_deref().and_then(parse_usi_square)),
+        _ => None,
+    })??;
+    let opp = view.your_color.other();
+    let mut roles: Vec<Role> = Position::initial()
+        .pieces_of(opp)
+        .iter()
+        .map(|p| p.role)
+        .filter(|r| *r != Role::King)
+        .collect();
+    for e in log.events() {
+        // 自分が取った駒は相手の盤上から消えている（自分の持ち駒になる）
+        if let Observation::MyMove {
+            captured: Some(role),
+            ..
+        } = e
+        {
+            if let Some(i) = roles.iter().position(|r| r == role) {
+                roles.swap_remove(i);
+            }
+        }
+    }
+    // 近似: 相手が自分から取った駒（相手の持ち駒 → 打てば盤に戻る）は数えない。
+    // 打たれた駒の多くは歩なので、数えないぶん見積もりはやや高めに出る
+    if roles.is_empty() {
+        return None;
+    }
+    let mean = roles.iter().map(|&r| exchange_value(r)).sum::<f64>() / roles.len() as f64;
+    Some((square, mean))
+}
 /// ブラインド時のハング回避リスクの重み（クリーン粒子全滅時のみ。追補2）。
 /// 個々の駒種・位置を特定しない「マスへの相手利き枚数の期待値」を使い、
 /// 着地マスの被覆度が高いほど期待損失（駒の価値×密度）を引く。今までは
@@ -2426,6 +2504,9 @@ fn evaluate(
     // valueネットのstate特徴量キャッシュ（particles と同じ並び。候補間で共通なので
     // choose() が1手番ぶん保持し、最初に使う候補の評価時に遅延計算する）
     nn_state_cache: &mut [Option<[f64; crate::value_features::VALUE_FEATURES]>],
+    // 直前に自駒を取られたマスと、そこにいる敵駒の期待交換価値（観測のみで決まる）。
+    // 厳密粒子が全滅した決定でだけ使う（`blind_recapture_target`）
+    blind_recapture_target: Option<(Coord, f64)>,
 ) -> EvalOut {
     let me = view.your_color;
     let opp = me.other();
@@ -2598,6 +2679,30 @@ fn evaluate(
     let mut capture_bet_penalty = 0.0;
     // valueネット項の内訳（同上。発火率フック src/hits.rs が使う）
     let mut value_nn_term = 0.0;
+    // ブラインド時（厳密粒子ゼロ）の取り返し。粒子が無いと `expected` が丸ごと
+    // ゼロになり、**位置が確実に分かっている敵駒を取る手**の駒得まで消える
+    // （実測: 龍を取り返す手が gain 11〜13 → 0.045）。観測だけで決まる量なので
+    // 粒子に依らずここで補う。取った後の取り返されリスク（下限）も同じ式で引く
+    let blind_recapture = if particles.is_empty() {
+        blind_recapture_target
+            .filter(|&(sq, _)| matches!(*mv, ShogiMove::Board { to, .. } if to == sq))
+            .map(|(sq, value)| {
+                let own_after = view
+                    .your_pieces
+                    .iter()
+                    .find(|p| {
+                        matches!(*mv, ShogiMove::Board { from, .. } if p.square == make_usi_square(from))
+                    })
+                    .map(|p| exchange_value(p.role))
+                    .unwrap_or(0.0);
+                let _ = sq;
+                blind_recapture_w()
+                    * (value - params.mover_w_captured * own_after * params.capture_reveal_risk)
+            })
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
     // 攻め圧力は粒子の健全度でゲートする。退化した粒子は間違った玉位置に
     // 固まりやすく、「誰もいない場所への攻め」が加点され続ける
     // （対人実戦: 終盤の成桂の徘徊）。健全度が低いときは確実な項だけ残す
@@ -2749,7 +2854,8 @@ fn evaluate(
     };
 
     let gain = expected + advance_bias + development + coverage + probe + mate_threat - mate_risk
-        - king_holes;
+        - king_holes
+        + blind_recapture;
     EvalOut {
         gain,
         risk_mean: if legal > 0.0 { risk_sum / legal } else { 0.0 },
@@ -3440,6 +3546,35 @@ pub(crate) mod tests {
         let promo = coverage_after(&view, &parse_usi("3d3c+").unwrap());
         assert_eq!(quiet, 1.0);
         assert_eq!(promo, 6.0, "と金は金の利き（6マス）");
+    }
+
+    /// ブラインド取り返し: 対象マスは**直前の相手手**で取られたマスに限る
+    /// （それ以前のマスは相手がもう動かしているかもしれない）。
+    /// 見積もりは相手の盤上に残っている駒の平均交換価値
+    #[test]
+    fn blind_recapture_target_uses_the_latest_capture_only() {
+        let view = minimal_view(
+            vec![VisiblePiece {
+                square: "5i".into(),
+                role: Role::King,
+            }],
+            HashMap::new(),
+        );
+        let mut log = ObservationLog::default();
+        log.record(Observation::OpponentMoved {
+            move_number: 2,
+            captured_my_piece_at: Some("7g".into()),
+        });
+        let (sq, value) = blind_recapture_target(&view, &log).expect("直前の手が捕獲なら対象あり");
+        assert_eq!(sq, Coord { file: 7, rank: 7 });
+        assert!(value > 0.0, "相手の盤上駒の平均交換価値が出る");
+
+        // 直前の相手手が捕獲でなければ対象なし（古い捕獲マスは使わない）
+        log.record(Observation::OpponentMoved {
+            move_number: 4,
+            captured_my_piece_at: None,
+        });
+        assert!(blind_recapture_target(&view, &log).is_none());
     }
 
     #[test]

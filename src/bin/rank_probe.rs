@@ -72,4 +72,9 @@ fn main() {
             );
         }
     }
+    // 評価項・前提条件の発火率（TSUITATE_DBG_HITS=1 のときだけ）。
+    // 「この局面で厳密粒子が生きていたか」= expected が効いていたかが分かる
+    if let Some(table) = tsuitate_bot::hits::dump() {
+        println!("{table}");
+    }
 }
