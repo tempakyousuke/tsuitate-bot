@@ -185,6 +185,12 @@ fn main() {
         results.push((opp.clone(), stats));
     }
 
+    // 評価項の発火率（TSUITATE_DBG_HITS=1 のときだけ）。候補・基準の両側を
+    // まとめた値だが、凍結版は last_ranking を作らないので実質候補側の統計
+    if let Some(table) = tsuitate_bot::hits::dump() {
+        println!("{table}");
+    }
+
     // ARENA_JSON: 集計をJSONL（1行=1マッチアップ）で書き出す（CIのシャード集約用）
     if let Ok(path) = std::env::var("ARENA_JSON") {
         if !path.is_empty() {

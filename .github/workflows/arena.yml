@@ -81,6 +81,10 @@ jobs:
           ARENA_RECORD_DIR: arena-records
           ARENA_JSON: arena-summary.json
           ARENA_ORACLE_A: ${{ inputs.oracle }}
+          # 評価項の発火率（src/hits.rs）。中立だった変更が「効いていない」のか
+          # 「そもそも発火していない」のかを切り分けるため常時集計する
+          # （実測で思考時間への影響なし）
+          TSUITATE_DBG_HITS: "1"
           ARENA_EXTRA_ENV: ${{ inputs.env }}
           ARENA_CLOCK: ${{ inputs.clock }}
         run: |

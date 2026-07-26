@@ -185,6 +185,10 @@ pub struct CandidateScore {
     /// gain から引かれた被詰めろペナルティ（mate_risk_w × 危険確率 × 健全度）。
     /// 正の値 = そのぶん gain が減っている
     pub mate_risk: f64,
+    /// gain から引かれた自玉8近傍の穴の減点（king_hole_w × 穴の数）。正の値
+    pub king_holes: f64,
+    /// gain に加算された valueネット項（value_nn_w × (勝率相当 − 0.5)）。符号つき
+    pub value_nn: f64,
 }
 
 /// 前進を好むヒューリスティック＋乱数（従来実装）
@@ -528,6 +532,10 @@ struct EvalOut {
     mate_threat: f64,
     /// gain から引かれた被詰めろペナルティ（正の値。内訳表示用）
     mate_risk: f64,
+    /// gain から引かれた自玉8近傍の穴の減点（正の値。内訳表示用）
+    king_holes: f64,
+    /// gain に加算された valueネット項（符号つき。内訳表示用）
+    value_nn: f64,
 }
 
 impl EvalOut {
@@ -540,7 +548,7 @@ impl EvalOut {
 /// 割り引くと「合法確率が低いほどスコアが高い」= わざと反則に寄る手が
 /// 選ばれてしまう。反則しても手番は残るので悪い局面からは逃げられず、
 /// 反則の価値は「次善手の価値 − 反則コスト」でしかない
-fn combine_score(gain: f64, p_legal: f64, foul_cost: f64) -> f64 {
+pub(crate) fn combine_score(gain: f64, p_legal: f64, foul_cost: f64) -> f64 {
     (p_legal * gain).min(gain) - (1.0 - p_legal) * foul_cost
 }
 
@@ -1619,12 +1627,19 @@ impl Strategy for EstimatorStrategy {
                 capture_bet_penalty: out.capture_bet_penalty,
                 mate_threat: out.mate_threat,
                 mate_risk: out.mate_risk,
+                king_holes: out.king_holes,
+                value_nn: out.value_nn,
             });
             if best.as_ref().is_none_or(|(_, _, s)| final_score > *s) {
                 best = Some((usi, out.p_legal, final_score));
             }
         }
         ranking.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        // 評価項の発火率フック（TSUITATE_DBG_HITS=1 のときだけ）。
+        // 「中立だった変更が効いていないのか発火していないのか」の切り分け用
+        if crate::hits::enabled() {
+            crate::hits::observe_ranking(&ranking);
+        }
         self.last_ranking = Some(ranking);
 
         let mut debug = debug_summary(est, &sample, push);
@@ -2504,6 +2519,8 @@ fn evaluate(
     let p_legal = (legal + prior * w) / (n + w);
     // 賭け分散ペナルティの内訳（ランキング表示用に expected の外へ持ち出す）
     let mut capture_bet_penalty = 0.0;
+    // valueネット項の内訳（同上。発火率フック src/hits.rs が使う）
+    let mut value_nn_term = 0.0;
     // 攻め圧力は粒子の健全度でゲートする。退化した粒子は間違った玉位置に
     // 固まりやすく、「誰もいない場所への攻め」が加点され続ける
     // （対人実戦: 終盤の成桂の徘徊）。健全度が低いときは確実な項だけ残す
@@ -2518,7 +2535,7 @@ fn evaluate(
         // valueネット項: 勝率相当[0,1]の重み付き平均を中心化して歩価値スケールへ。
         // gain の内側（= combine_score の p_legal 割引を受ける側）に置くことで、
         // 反則確実な手への加点素通り（dragon-check-drop の教訓）を構造的に防ぐ
-        let nn_term = if nn_w_sum > 0.0 {
+        value_nn_term = if nn_w_sum > 0.0 {
             params.value_nn_w * (nn_sum / nn_w_sum - 0.5)
         } else {
             0.0
@@ -2539,7 +2556,7 @@ fn evaluate(
         value_sum / legal - capture_bet_penalty
             + params.info_bonus * p_hit * (1.0 - p_hit)
             + params.king_probe_bonus * p_chk * (1.0 - p_chk)
-            + nn_term
+            + value_nn_term
             + (params.attack_w * confidence * attack_sum
                 - params.pressure_w * pressure_sum
                 - params.hand_drop_w * danger_sum)
@@ -2665,6 +2682,8 @@ fn evaluate(
         capture_bet_penalty,
         mate_threat,
         mate_risk,
+        king_holes,
+        value_nn: value_nn_term,
     }
 }
 
