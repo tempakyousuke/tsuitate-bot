@@ -72,6 +72,8 @@ fn terms() -> &'static [(&'static str, fn(&CandidateScore) -> f64)] {
         ("mate_threat", |c| c.mate_threat),
         ("mate_risk", |c| -c.mate_risk),
         ("king_hole", |c| -c.king_holes),
+        ("link", |c| c.link),
+        ("board_discount", |c| -c.board_discount),
     ]
 }
 
