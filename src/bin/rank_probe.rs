@@ -42,6 +42,16 @@ fn main() {
                     if c.mate_risk != 0.0 {
                         s.push_str(&format!(" 被詰めろ=-{:.3}", c.mate_risk));
                     }
+                    if c.king_holes != 0.0 {
+                        s.push_str(&format!(" 玉穴=-{:.3}", c.king_holes));
+                    }
+                    // 常時出す内訳（CandidateScore にあるのに表示していなかった）。
+                    // gain の差がどこから来ているかは、これが無いと env の
+                    // アブレーションで1項ずつ潰すしかない
+                    s.push_str(&format!(
+                        " NN={:+.3} 駒得={:+.3} リスク=-{:.3} 静的gain={:.3}",
+                        c.value_nn, c.capture_value, c.risk, c.static_gain
+                    ));
                     s
                 };
                 println!(
