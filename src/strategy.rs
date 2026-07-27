@@ -2842,14 +2842,27 @@ fn evaluate(
     };
     // ブラインド時の信念ネット供給（NN段階②）。blind_recapture の一般化で、
     // 「相手駒が確実にいる1マス」の代わりに **81マスの占有確率**を使う。
-    // 式は blind_recapture と同じ形（p=1 を入れると一致する）にしてある。
+    // 素の期待値は blind_recapture と同じ形（p=1 なら一致する）。
     //
     // 打ちは対象外: 占有マスへの打ちは捕獲ではなく反則なので、供給先は
     // p_legal 側になってしまう（反則マス記憶系4種が全滅したチャネル）。
-    // 直前に取られたマスは blind_recapture が p=1 で見ているので二重計上しない
+    // 直前に取られたマスは blind_recapture が p=1 で見ているので二重計上しない。
+    //
+    // **賭け分散の凹割引を通常経路と同じ式で引く**（`capture_bet_var_w`）:
+    // 素の p×stake は空振り分岐（賭けの前提が崩れ、進出駒だけが未知領域に
+    // 残る側）の質を数えない。初版（割引なし・王手中ゲート無し）は
+    // 200局ペア比較で3シャードとも対照割れ（42.8% vs 47.3%）し、
+    // **平均手数 104.5 → 112.8・手数上限による引き分け 0 → 5** という
+    // 「投機的な捕獲で手数だけ伸びる」形が出た。p が中間値のときに最も
+    // 加点される素の式ではこの分岐が数えられていない。
+    //
+    // **王手中は無効**: 候補の序列は解消確率（CheckSolver）が支配すべきで、
+    // 王手中の攻め加点は回避プローブの反則を増やす（value_nn_w / mate_*_w /
+    // capture_bet_var_w と同じゲート）。初版はシナリオ dragon-check-drop の
+    // 反則を 12 → 29 に増やしていた
     let blind_belief_gain = match (particles.is_empty(), blind_belief, *mv) {
         (true, Some((occ, mean_value)), ShogiMove::Board { from, to, .. })
-            if blind_recapture_target.is_none_or(|(sq, _)| sq != to) =>
+            if !view.you_in_check && blind_recapture_target.is_none_or(|(sq, _)| sq != to) =>
         {
             let p = occ[crate::belief_features::sq_index(to)];
             let own_after = view
@@ -2858,9 +2871,8 @@ fn evaluate(
                 .find(|q| q.square == make_usi_square(from))
                 .map(|q| exchange_value(q.role))
                 .unwrap_or(0.0);
-            belief_gain_w()
-                * p
-                * (mean_value - params.mover_w_captured * own_after * params.capture_reveal_risk)
+            let stake = mean_value - params.mover_w_captured * own_after * params.capture_reveal_risk;
+            belief_gain_w() * (p * stake - params.capture_bet_var_w * p * (1.0 - p) * mean_value)
         }
         _ => 0.0,
     };
