@@ -126,6 +126,96 @@ fn defend_guide_disabled() -> bool {
     *FLAG.get_or_init(|| std::env::var("TSUITATE_DISABLE_DEFEND_GUIDE").is_ok_and(|v| v == "1"))
 }
 
+/// 信念ネット（NN段階②）の prior を提案分布へ効かせる強さ。
+/// **既定 0 = 従来と完全に同一の挙動**（凍結版はこの名前を知らないので、
+/// `-f env=` のスイープは候補側にだけ効く）。
+///
+/// 2つに分けてあるのは「どの生成チャネルで分布が実際に変わるか」を
+/// 別々に測るため（docs/improvement-plan-2026-07-25.md 項目3の設計方針）:
+/// - `TSUITATE_BELIEF_LIVE_W`: 毎ターンの制約適用（生存粒子が必ず通る道）
+/// - `TSUITATE_BELIEF_GUIDE_W`: リプレイ・若返り・ソフト救済（再生成の道）
+fn belief_live_w() -> f64 {
+    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| env_f64("TSUITATE_BELIEF_LIVE_W"))
+}
+
+fn belief_guide_w() -> f64 {
+    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| env_f64("TSUITATE_BELIEF_GUIDE_W"))
+}
+
+fn env_f64(name: &str) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(0.0)
+}
+
+/// 信念 prior の対数オッズ差のクリップ。ネットが極端に自信を持ったマスでも
+/// 提案分布が1手に潰れないようにする（重み補正で正直に払うので不偏性は
+/// 保たれるが、実効サンプルサイズは守る必要がある）
+const BELIEF_LOGIT_CLIP: f64 = 4.0;
+
+/// 決定点ごとに1回だけ計算する、マスごとの占有ロジット（信念ネットの出力）。
+/// 粒子に依存しないので `update` の先頭で1度作って使い回す。
+///
+/// 使い方は**提案分布の prior** に限る（評価側の再重み付けは
+/// nn-particle-likelihood でチャネル飽和を実測済み。盤面の直接合成は
+/// 同時制約が壊れるので論外）。相手手 from→to は「to の占有が増え from の
+/// 占有が減る」遷移なので、ロジットの差をそのままブースト指数に使える。
+/// 打ちは出ていくマスが無いので、盤面平均を基準にする
+#[derive(Clone, Copy)]
+struct BeliefPrior {
+    logit: [f64; 81],
+    mean: f64,
+}
+
+impl BeliefPrior {
+    fn from_log(my_color: Color, log: &ObservationLog) -> BeliefPrior {
+        let ctx = crate::belief_features::BeliefContext::from_log(my_color, log);
+        let mut logit = [0.0f64; 81];
+        let mut sum = 0.0;
+        let mut n = 0.0;
+        for sq in crate::belief_features::all_squares() {
+            let i = crate::belief_features::sq_index(sq);
+            if ctx.is_mine(sq) {
+                // 自駒のマスに相手の駒は居ない。相手手の着地先にはなりうる
+                // （取り）ので、極端な負値ではなく盤面平均に寄せて中立にする
+                continue;
+            }
+            logit[i] = crate::belief_nn::occupancy_logit(&ctx.features(sq));
+            sum += logit[i];
+            n += 1.0;
+        }
+        let mean = if n > 0.0 { sum / n } else { 0.0 };
+        for sq in crate::belief_features::all_squares() {
+            if ctx.is_mine(sq) {
+                logit[crate::belief_features::sq_index(sq)] = mean;
+            }
+        }
+        BeliefPrior { logit, mean }
+    }
+
+    /// 相手手 mv の提案重みへの倍率。重み補正（ln p/g）で正直に払うので
+    /// 分布は歪まない（`guided_sampling_importance_correction_is_unbiased`）
+    fn boost(&self, mv: &ShogiMove, w: f64) -> f64 {
+        if w == 0.0 {
+            return 1.0;
+        }
+        let (to, from) = match *mv {
+            ShogiMove::Board { from, to, .. } => (to, Some(from)),
+            ShogiMove::Drop { to, .. } => (to, None),
+        };
+        let base = match from {
+            Some(f) => self.logit[crate::belief_features::sq_index(f)],
+            None => self.mean,
+        };
+        let d = self.logit[crate::belief_features::sq_index(to)] - base;
+        (w * d.clamp(-BELIEF_LOGIT_CLIP, BELIEF_LOGIT_CLIP)).exp()
+    }
+}
+
 /// 全滅時に保持する棄却粒子（墓場）の上限
 const GRAVEYARD_CAP: usize = 128;
 /// 墓場スナップショットの有効期限（決定点からの制約数。これを超えたら stale）
@@ -306,6 +396,9 @@ pub struct Estimator {
     /// in_check_at[i] = 制約 index i を処理する直前の被王手状態。
     /// king_at と同じ O(1) 参照用のキャッシュ（打ちマス反則の理由の一意性判定に使う）
     in_check_at: Vec<bool>,
+    /// 信念ネット（NN段階②）のマスごと占有ロジット。`update` の先頭で
+    /// 1度だけ計算する（粒子に依存しない）。重みが両方0なら計算もしない = None
+    belief: Option<BeliefPrior>,
     rng: StdRng,
 }
 
@@ -369,6 +462,7 @@ impl Estimator {
             king_at: vec![],
             in_check: false,
             in_check_at: vec![],
+            belief: None,
             rng: StdRng::seed_from_u64(seed),
         }
     }
@@ -443,6 +537,12 @@ impl Estimator {
 
     /// ログの未消化イベントを取り込み、粒子を前進・棄却・補充する
     pub fn update(&mut self, log: &ObservationLog) {
+        // 信念ネットの prior は「今の決定点の観測」から1度だけ作る（81マス
+        // ぶんの forward pass ≒ 0.2ms）。重みが両方0なら計算もしない ＝
+        // 既定では従来と1命令も変わらない
+        if belief_live_w() > 0.0 || belief_guide_w() > 0.0 {
+            self.belief = Some(BeliefPrior::from_log(self.my_color, log));
+        }
         let events = log.events();
         while self.cursor < events.len() {
             // 相手の反則は中身不明だが回数は実戦でもリアルタイムに観測できる。
@@ -563,6 +663,9 @@ impl Estimator {
 
     fn apply_constraint(&mut self, constraint: &Constraint) {
         let my_color = self.my_color;
+        // 信念 prior（Copy）。self.rng の可変借用と衝突しないよう手元へ写す
+        let belief = self.belief;
+        let live_w = belief_live_w();
         // 今回の制約が constraints に積まれる位置（update が適用後に push する）
         let cidx = self.constraints.len();
         let particles = std::mem::take(&mut self.particles);
@@ -628,6 +731,7 @@ impl Estimator {
                     &self.my_capture_sq,
                     &self.my_touched_sq,
                     &Guide::default(),
+                    belief.as_ref().map(|b| (b, live_w)),
                     &mut self.rng,
                 ),
             };
@@ -797,6 +901,8 @@ impl Estimator {
     /// 物理的な制約（自手の合法性・取った駒種・取られたマス）は緩和しない。
     /// 成功時は対数重みの増分（緩和クラスでの観測尤度）を返す
     fn apply_soft(&mut self, pos: &mut Position, constraint: &Constraint) -> Option<f64> {
+        let belief = self.belief;
+        let guide_w = belief_guide_w();
         match constraint {
             Constraint::MyMove { mv, captured, .. } => {
                 apply_my_move(pos, self.my_color, mv, *captured, None).then_some(0.0)
@@ -819,6 +925,7 @@ impl Estimator {
                 &self.my_capture_sq,
                 &self.my_touched_sq,
                 &Guide::default(),
+                belief.as_ref().map(|b| (b, guide_w)),
                 &mut self.rng,
             ),
         }
@@ -892,6 +999,8 @@ impl Estimator {
         let mut lw = snap.logw;
         let miss = snap.miss;
         let taint = snap.taint;
+        let belief = self.belief;
+        let guide_w = belief_guide_w();
         // 巻き戻し先より前のスナップショットは有効（snap.cidx のエントリは
         // 「この決定の適用前」の状態なので、引き直し後もそのまま正しい）。
         // wipe をまたぐエントリはエポック正規化済みなのでそのまま使える
@@ -942,6 +1051,7 @@ impl Estimator {
                         &self.my_capture_sq[..k],
                         &self.my_touched_sq[..t],
                         &guide,
+                        belief.as_ref().map(|b| (b, guide_w)),
                         &mut self.rng,
                     ) {
                         Some(dlw) => {
@@ -1251,6 +1361,8 @@ impl Estimator {
     /// スナップショット）も返す
     fn replay_once(&mut self) -> Option<(Position, f64, VecDeque<Snap>)> {
         let n = self.constraints.len();
+        let belief = self.belief;
+        let guide_w = belief_guide_w();
         let step_budget = n * 4 + 32;
         let mut steps = 0usize;
         let mut pos = Position::initial();
@@ -1295,6 +1407,7 @@ impl Estimator {
                         &self.my_capture_sq[..k],
                         &self.my_touched_sq[..t],
                         &guide,
+                        belief.as_ref().map(|b| (b, guide_w)),
                         &mut self.rng,
                     ) {
                         Some(dlw) => {
@@ -1480,6 +1593,7 @@ fn sample_opp_move(
     known_squares: &[Coord],
     my_touched: &[Coord],
     guide: &Guide,
+    belief: Option<(&BeliefPrior, f64)>,
     rng: &mut StdRng,
 ) -> Option<f64> {
     let opp = my_color.other();
@@ -1549,7 +1663,10 @@ fn sample_opp_move(
         );
         total_mass += w;
         if consistent {
-            let g = w * guide_boost_factor(pos, &next, &mv, guide, opp);
+            let mut g = w * guide_boost_factor(pos, &next, &mv, guide, opp);
+            if let Some((prior, bw)) = belief {
+                g *= prior.boost(&mv, bw);
+            }
             candidates.push((mv, w, g));
         }
     }
@@ -2651,6 +2768,7 @@ mod tests {
                 &[],
                 &[],
                 &Guide::default(),
+                None,
                 &mut rng,
             )
             .unwrap();
@@ -2680,6 +2798,7 @@ mod tests {
                 &[],
                 &[],
                 &wanted,
+                None,
                 &mut rng,
             )
             .unwrap();
@@ -2702,6 +2821,99 @@ mod tests {
             (corrected_freq - base_freq).abs() < 0.03,
             "補正済み分布がガイドなしと一致しない: corrected={corrected_freq:.4} base={base_freq:.4}"
         );
+    }
+
+    /// 信念 prior（NN段階②）も同じ不偏性を満たすこと。prior は提案分布だけを
+    /// 動かし、重み補正 ln(p/g) で正直に払うので、補正済みの分布は prior 無しと
+    /// 一致しなければならない（ここが崩れると粒子群が静かに嘘の分布へ寄る）
+    #[test]
+    fn belief_prior_sampling_is_unbiased() {
+        let mut pos0 = Position::initial();
+        pos0.play_unchecked(&parse_usi("7g7f").unwrap());
+        // 3四（後手の歩の行き先）だけ占有ロジットを高くした人工の prior
+        let mut logit = [0.0f64; 81];
+        logit[crate::belief_features::sq_index(Coord { file: 3, rank: 4 })] = 3.0;
+        let prior = BeliefPrior { logit, mean: 0.0 };
+        let n = 4000;
+
+        let mut rng = StdRng::seed_from_u64(11);
+        let mut base_hits = 0.0f64;
+        let hit_3d = |pos: &Position| {
+            pos.piece_at(Coord { file: 3, rank: 4 }).is_some()
+                && pos.piece_at(Coord { file: 3, rank: 3 }).is_none()
+        };
+        for _ in 0..n {
+            let mut pos = pos0.clone();
+            sample_opp_move(
+                &mut pos,
+                Color::Sente,
+                None,
+                Some(false),
+                0,
+                0,
+                &[],
+                &[],
+                &Guide::default(),
+                None,
+                &mut rng,
+            )
+            .unwrap();
+            if hit_3d(&pos) {
+                base_hits += 1.0;
+            }
+        }
+        let base_freq = base_hits / n as f64;
+
+        let mut rng = StdRng::seed_from_u64(12);
+        let (mut w_total, mut w_hits, mut raw_hits) = (0.0f64, 0.0f64, 0usize);
+        for _ in 0..n {
+            let mut pos = pos0.clone();
+            let dlw = sample_opp_move(
+                &mut pos,
+                Color::Sente,
+                None,
+                Some(false),
+                0,
+                0,
+                &[],
+                &[],
+                &Guide::default(),
+                Some((&prior, 1.0)),
+                &mut rng,
+            )
+            .unwrap();
+            let w = dlw.exp();
+            w_total += w;
+            if hit_3d(&pos) {
+                w_hits += w;
+                raw_hits += 1;
+            }
+        }
+        let guided_freq = raw_hits as f64 / n as f64;
+        let corrected_freq = w_hits / w_total;
+        assert!(
+            guided_freq > base_freq * 1.5,
+            "prior が提案頻度を上げているはず: guided={guided_freq:.4} base={base_freq:.4}"
+        );
+        assert!(
+            (corrected_freq - base_freq).abs() < 0.03,
+            "補正済み分布が prior 無しと一致しない: corrected={corrected_freq:.4} base={base_freq:.4}"
+        );
+    }
+
+    /// 既定（重み0）では prior が一切効かない = 従来と完全に同じ挙動
+    #[test]
+    fn belief_prior_is_inert_at_zero_weight() {
+        let mut logit = [0.0f64; 81];
+        logit[0] = 5.0;
+        logit[80] = -5.0;
+        let prior = BeliefPrior { logit, mean: 0.0 };
+        for mv in [
+            parse_usi("3c3d").unwrap(),
+            parse_usi("P*5e").unwrap(),
+        ] {
+            assert_eq!(prior.boost(&mv, 0.0), 1.0);
+        }
     }
 
     #[test]
