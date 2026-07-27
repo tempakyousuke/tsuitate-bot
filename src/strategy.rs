@@ -1615,6 +1615,18 @@ impl Strategy for EstimatorStrategy {
         // ブラインド時の取り返し（観測だけで決まるので粒子の有無に依らず作れる。
         // 実際に使うのは厳密粒子ゼロの決定だけ = evaluate 側で判定する）
         let blind_recapture = blind_recapture_target(view, log);
+        // ブラインド時の信念ネット供給（NN段階②、`belief_gain_w`）。
+        // 81マスぶんの forward pass は決定点ごとに1回で足りる（粒子に依存しない）。
+        // 重み0（既定）なら計算もしない = 挙動不変
+        let blind_belief_board: Option<([f64; 81], f64)> =
+            (belief_gain_w() > 0.0 && sample.is_empty()).then(|| {
+                let ctx = crate::belief_features::BeliefContext::from_log(view.your_color, log);
+                (
+                    crate::belief_nn::board_occupancy(&ctx),
+                    blind_capture_estimate(view, log),
+                )
+            });
+        let blind_belief = blind_belief_board.as_ref().map(|(o, v)| (o, *v));
 
         // 評価の前提条件の発火率（src/hits.rs）。`expected` の内側にある項
         // （駒得期待値・valueネット等）は厳密粒子が全滅すると丸ごと無効になるので、
@@ -1661,6 +1673,7 @@ impl Strategy for EstimatorStrategy {
                 budget,
                 &mut nn_state_cache,
                 blind_recapture,
+                blind_belief,
             );
             // 王手中: 仮説条件付きの「王手駒の除去期待値」（check.rs::removal_term）。
             // 王手駒のマスを取る手は受理された未来で脅威ごと駒を排除し、玉逃げ等の
@@ -2095,6 +2108,58 @@ fn blind_recapture_target(view: &PlayerView, log: &ObservationLog) -> Option<(Co
     }
     let mean = roles.iter().map(|&r| exchange_value(r)).sum::<f64>() / roles.len() as f64;
     Some((square, mean))
+}
+
+/// 信念ネット（NN段階②）を**厳密粒子ゼロの決定でだけ** gain 側へ供給する重み。
+/// 既定 0 = 挙動不変。`TSUITATE_BELIEF_GAIN_W` で上書き（凍結版は知らない名前）。
+///
+/// 位置づけ: `BLIND_RECAPTURE_W` の**盤面全体への一般化**。あちらは
+/// 「直前に自駒が取られたマスには相手駒が確実にいる」という観測1点だけを使い、
+/// こちらは81マスの占有確率を使う。実測（`bin/belief_probe`、アリーナ
+/// ホールドアウト30局）で、**厳密粒子ゼロの決定は全体の 29.2%** を占め、
+/// そこでの粒子の占有信念は AUC 0.685（ほぼ無情報）／対数損失 1.0657 なのに対し、
+/// 信念ネットは AUC 0.821 ／ 0.4418。粒子が「無い」のではなく「嘘」なので、
+/// taint フォールバック（`TSUITATE_EVAL_TAINT_FALLBACK`）とは供給源が違う。
+///
+/// **p_legal には混ぜない**（反則マス記憶系4種が全滅したチャネル）。
+/// **既存粒子の再重み付けでもない**（nn-particle-likelihood で飽和済み）。
+/// 「粒子が1つも無いときに信念を供給する」チャネルに限定する
+fn belief_gain_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_BELIEF_GAIN_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
+/// ブラインド時に使う「盤上に残っている相手駒の平均交換価値」。
+/// `blind_recapture_target` の駒種会計と同じもの（あちらはマスとセットで返す）
+fn blind_capture_estimate(view: &PlayerView, log: &ObservationLog) -> f64 {
+    let opp = view.your_color.other();
+    let mut roles: Vec<Role> = Position::initial()
+        .pieces_of(opp)
+        .iter()
+        .map(|p| p.role)
+        .filter(|r| *r != Role::King)
+        .collect();
+    for e in log.events() {
+        if let Observation::MyMove {
+            captured: Some(role),
+            ..
+        } = e
+        {
+            if let Some(i) = roles.iter().position(|r| r == role) {
+                roles.swap_remove(i);
+            }
+        }
+    }
+    if roles.is_empty() {
+        return 0.0;
+    }
+    roles.iter().map(|&r| exchange_value(r)).sum::<f64>() / roles.len() as f64
 }
 /// ブラインド時のハング回避リスクの重み（クリーン粒子全滅時のみ。追補2）。
 /// 個々の駒種・位置を特定しない「マスへの相手利き枚数の期待値」を使い、
@@ -2575,6 +2640,10 @@ fn evaluate(
     // 直前に自駒を取られたマスと、そこにいる敵駒の期待交換価値（観測のみで決まる）。
     // 厳密粒子が全滅した決定でだけ使う（`blind_recapture_target`）
     blind_recapture_target: Option<(Coord, f64)>,
+    // 信念ネットのマスごと占有確率と、盤上に残る相手駒の平均交換価値。
+    // 上と同じく**厳密粒子が全滅した決定でだけ**使う（`belief_gain_w`）。
+    // 重みが 0 なら choose() が None を渡すので計算もしない
+    blind_belief: Option<(&[f64; 81], f64)>,
 ) -> EvalOut {
     let me = view.your_color;
     let opp = me.other();
@@ -2771,6 +2840,30 @@ fn evaluate(
     } else {
         0.0
     };
+    // ブラインド時の信念ネット供給（NN段階②）。blind_recapture の一般化で、
+    // 「相手駒が確実にいる1マス」の代わりに **81マスの占有確率**を使う。
+    // 式は blind_recapture と同じ形（p=1 を入れると一致する）にしてある。
+    //
+    // 打ちは対象外: 占有マスへの打ちは捕獲ではなく反則なので、供給先は
+    // p_legal 側になってしまう（反則マス記憶系4種が全滅したチャネル）。
+    // 直前に取られたマスは blind_recapture が p=1 で見ているので二重計上しない
+    let blind_belief_gain = match (particles.is_empty(), blind_belief, *mv) {
+        (true, Some((occ, mean_value)), ShogiMove::Board { from, to, .. })
+            if blind_recapture_target.is_none_or(|(sq, _)| sq != to) =>
+        {
+            let p = occ[crate::belief_features::sq_index(to)];
+            let own_after = view
+                .your_pieces
+                .iter()
+                .find(|q| q.square == make_usi_square(from))
+                .map(|q| exchange_value(q.role))
+                .unwrap_or(0.0);
+            belief_gain_w()
+                * p
+                * (mean_value - params.mover_w_captured * own_after * params.capture_reveal_risk)
+        }
+        _ => 0.0,
+    };
     // 攻め圧力は粒子の健全度でゲートする。退化した粒子は間違った玉位置に
     // 固まりやすく、「誰もいない場所への攻め」が加点され続ける
     // （対人実戦: 終盤の成桂の徘徊）。健全度が低いときは確実な項だけ残す
@@ -2946,7 +3039,8 @@ fn evaluate(
     let gain = expected + advance_bias + development + coverage + probe + mate_threat - mate_risk
         - king_holes
         + link
-        + blind_recapture;
+        + blind_recapture
+        + blind_belief_gain;
     EvalOut {
         gain,
         risk_mean: if legal > 0.0 { risk_sum / legal } else { 0.0 },
@@ -3666,6 +3760,48 @@ pub(crate) mod tests {
             captured_my_piece_at: None,
         });
         assert!(blind_recapture_target(&view, &log).is_none());
+    }
+
+    /// NN段階②のブラインド供給は blind_recapture の一般化なので、**同じ駒種会計**を
+    /// 使わなければならない（p=1 のとき blind_recapture と一致する設計）。
+    /// 会計がズレると「一般化」ではなく別物の項になる
+    #[test]
+    fn blind_capture_estimate_matches_blind_recapture_value() {
+        let view = minimal_view(
+            vec![VisiblePiece {
+                square: "5i".into(),
+                role: Role::King,
+            }],
+            HashMap::new(),
+        );
+        let mut log = ObservationLog::default();
+        log.record(Observation::OpponentMoved {
+            move_number: 2,
+            captured_my_piece_at: Some("7g".into()),
+        });
+        let (_, value) = blind_recapture_target(&view, &log).unwrap();
+        assert!((blind_capture_estimate(&view, &log) - value).abs() < 1e-12);
+
+        // 自分が相手の飛車を取ったら、相手の盤上に残る駒の平均は下がる
+        log.record(Observation::MyMove {
+            move_number: 3,
+            usi: "2h2b".into(),
+            captured: Some(Role::Rook),
+        });
+        let after = blind_capture_estimate(&view, &log);
+        assert!(after < value, "取った駒は相手の盤上から消える: {after} < {value}");
+        let (_, value_after) = blind_recapture_target(&view, &log).unwrap();
+        assert!((after - value_after).abs() < 1e-12);
+    }
+
+    /// 既定（重み0）ではブラインド供給が働かない = 従来と同じ挙動
+    #[test]
+    fn belief_gain_is_disabled_by_default() {
+        assert_eq!(
+            belief_gain_w(),
+            0.0,
+            "TSUITATE_BELIEF_GAIN_W の既定は0（挙動不変）でなければならない"
+        );
     }
 
     /// V3: 紐は「移動できるマス」ではなく「利かせているマス」で数える。
