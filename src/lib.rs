@@ -3,6 +3,7 @@
 //! main.rs（本番bot）と bin/arena.rs（戦略同士のローカル対戦）が共有する。
 
 pub mod belief_features;
+pub mod belief_nn;
 pub mod board;
 pub mod bridge;
 pub mod check;
