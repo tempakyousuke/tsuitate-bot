@@ -209,6 +209,8 @@ mod tests {
             value_nn: 0.0,
             capture_value: 0.0,
             risk: 0.0,
+            link: 0.0,
+            board_discount: 0.0,
         }
     }
 

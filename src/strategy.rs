@@ -198,6 +198,12 @@ pub struct CandidateScore {
     /// 静的な取られリスク項の粒子加重平均（gain からは控除済みの正の値）。
     /// 2手読みを通った候補では depth2_replace 分が実測へ置き換わっている
     pub risk: f64,
+    /// gain に加算された紐の項（link_w × 紐のついた自駒の価値合計。V3）。
+    /// 候補間でほぼ定数なので、見るのは**候補どうしの差**
+    pub link: f64,
+    /// gain から引かれた盤上駒の減価（board_discount_w × 盤上の自駒の価値合計。V5）。
+    /// 正の値 = そのぶん gain が減っている。これも見るのは差
+    pub board_discount: f64,
 }
 
 /// 前進を好むヒューリスティック＋乱数（従来実装）
@@ -402,7 +408,7 @@ fn coverage_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
     own_effects_after(view, mv).coverage
 }
 
-/// 自駒だけで決まる評価量（粒子不要・ノイズゼロ）。3項が同じ
+/// 自駒だけで決まる評価量（粒子不要・ノイズゼロ）。4項が同じ
 /// 「着手後の自駒配置と、その利き」を必要とするので1回の走査でまとめて出す
 #[derive(Debug, Default, Clone, Copy)]
 struct OwnEffects {
@@ -412,6 +418,17 @@ struct OwnEffects {
     king_holes: f64,
     /// 紐のついた自駒の価値合計（V3。`link_w`）
     linked_value: f64,
+    /// **この手で盤上に増える自駒の価値**（V5。`board_discount_w`）。
+    /// 打ち = 打った駒の価値、成り = 増えた価値、それ以外 = 0。
+    ///
+    /// やねうら王 Lv2 は盤上の全駒に一律の減点を掛けるが、そのまま写すと
+    /// 盤上価値の合計（70前後）が gain の定数オフセットになり、w=0.1 で
+    /// **全候補の gain が −7 ほど下がって負に振り切る**。`combine_score` は
+    /// `(p_legal×gain).min(gain)` なので、gain が負だと p_legal の割引が
+    /// 丸ごと効かなくなり反則確率の序列が壊れる（threat_value の差分化が
+    /// vs v9 −12pt で否定されたのと同じ罠）。候補間の差は増分だけなので、
+    /// **増分だけを持つ**ことで順位への効果を保ったままゼロ点を動かさない
+    board_material_added: f64,
 }
 
 /// 着手後の自駒配置を作り、`OwnEffects` の3項をまとめて計算する。
@@ -494,10 +511,23 @@ fn own_effects_after(view: &PlayerView, mv: &ShogiMove) -> OwnEffects {
         .map(|(_, role)| exchange_value(role))
         .sum();
 
+    // V5: この手で盤上に増える自駒の価値（打ち＝打った駒、成り＝増えたぶん）
+    let board_material_added = match *mv {
+        ShogiMove::Drop { role, .. } => piece_value(role),
+        ShogiMove::Board { from, promote: true, .. } => view
+            .your_pieces
+            .iter()
+            .find(|p| p.square == make_usi_square(from))
+            .and_then(|p| promote_role(p.role).map(|r| piece_value(r) - piece_value(p.role)))
+            .unwrap_or(0.0),
+        ShogiMove::Board { .. } => 0.0,
+    };
+
     OwnEffects {
         coverage: covered.len() as f64,
         king_holes,
         linked_value,
+        board_material_added,
     }
 }
 
@@ -601,6 +631,10 @@ struct EvalOut {
     value_nn: f64,
     /// 粒子加重の期待駒得（内訳表示用。gain には加算済み）
     capture_value: f64,
+    /// gain に加算された紐の項（V3。内訳表示用）
+    link: f64,
+    /// gain から引かれた盤上駒の減価（V5。正の値。内訳表示用）
+    board_discount: f64,
 }
 
 impl EvalOut {
@@ -776,6 +810,26 @@ pub struct EvalParams {
     /// 攻撃されている駒にしか効かない**ので、この事前の勾配は無かった。
     /// 自駒同士の連結は完全既知なので粒子不要・ノイズゼロ
     pub link_w: f64,
+    /// **盤上の自駒**の駒価値1点あたりの減点（V5。docs/yaneuraou-lessons.md 1-6）。
+    /// やねうら王 Lv2 は `score -= piece_value × 104/1024`（≒10%）**だけで +R50**
+    /// と、連載中2番目に大きい単独項。含意は「同じ駒なら持ち駒のほうが価値が高い」。
+    ///
+    /// 盤上の合計は候補間でほぼ定数なので、**順位に効くのは差分だけ**:
+    /// - 打ち → 打った駒の価値ぶん盤上が増える = 打つこと自体のコスト
+    /// - 成り → 増えた価値ぶんのコスト（やねうら王も同じ扱い）
+    /// - 取り → 自分の盤上は変わらず持ち駒が増えるので、相対的に得になる
+    ///
+    /// **ついたてでは持ち駒の優位がさらに大きいはずだという理屈**: 持ち駒は
+    /// (a) 相手から見えない、(b) 任意のマスに打てる（＝索敵ユニットにもなる）。
+    /// **ただし逆向きの力もある**: 打ちマス反則は反則原因の最多カテゴリで、
+    /// 持ち駒は「打てるマスが分からない」というついたて固有のコストを負う。
+    /// どちらが勝つかは実測でしか分からないので、SPSA の範囲は**正負にまたがらせる**。
+    ///
+    /// 発端は watch-estimator 17手目の `L*1b`（自分のと金の直前に香を打って
+    /// その香が最後まで一度も動けない手）。紐（`link_w`）と低い取られリスクが
+    /// 加点する一方、**打つこと自体のコストがゼロ**だったのが症状の半分。
+    /// 0 = 無効（従来と同一挙動）
+    pub board_discount_w: f64,
 }
 
 impl Default for EvalParams {
@@ -867,6 +921,7 @@ impl Default for EvalParams {
             // 目的化して攻めなくなり手数だけ伸びる変質（85手→112手）。
             // 平坦部の下端を採るのは、手数が短く引き分け化のリスクが小さいため
             link_w: 0.06,
+            board_discount_w: 0.0,
         }
     }
 }
@@ -879,7 +934,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 45] = [
+    pub const SPECS: [ParamSpec; 46] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -1107,6 +1162,14 @@ impl EvalParams {
             lo: 0.0,
             hi: 0.25,
         },
+        ParamSpec {
+            name: "board_discount_w",
+            // やねうら王は 104/1024 ≒ 0.102。ついたては持ち駒優位（不可視・
+            // 索敵）と打ちマス反則（打てるマスが分からない）が逆向きに働くので、
+            // **符号を固定せず正負にまたがらせる**（1-6 の指摘）
+            lo: -0.2,
+            hi: 0.2,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -1156,6 +1219,7 @@ impl EvalParams {
             self.mate_risk_w,
             self.king_hole_w,
             self.link_w,
+            self.board_discount_w,
         ]
     }
 
@@ -1207,6 +1271,7 @@ impl EvalParams {
             mate_risk_w: v[42],
             king_hole_w: v[43],
             link_w: v[44],
+            board_discount_w: v[45],
         }
     }
 }
@@ -1331,6 +1396,19 @@ impl EstimatorStrategy {
             .and_then(|v| v.parse::<f64>().ok())
         {
             Some(w) => EvalParams { link_w: w, ..params },
+            None => params,
+        };
+        // 盤上駒の減価（V5）の運用ノブ（w スイープ用。0 で従来挙動。
+        // やねうら王の比率は 0.102。負の値も許す＝持ち駒より盤上を好む側）
+        let params = match std::env::var("TSUITATE_BOARD_DISCOUNT_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+        {
+            Some(w) => EvalParams {
+                board_discount_w: w,
+                ..params
+            },
             None => params,
         };
         EstimatorStrategy {
@@ -1783,6 +1861,8 @@ impl Strategy for EstimatorStrategy {
                 value_nn: out.value_nn,
                 capture_value: out.capture_value,
                 risk: out.risk_mean,
+                link: out.link,
+                board_discount: out.board_discount,
             });
             if best.as_ref().is_none_or(|(_, _, s)| final_score > *s) {
                 best = Some((usi, out.p_legal, final_score));
@@ -2980,6 +3060,13 @@ fn evaluate(
     // ここで紐を切ると反則経済がそのまま悪化する（vs v11 の反則/局 6.20 → 6.71）
     let link = params.link_w * own_effects.linked_value;
 
+    // V5（盤上駒の減価、やねうら王 Lv2 で +R50）: 「同じ駒なら持ち駒のほうが
+    // 価値が高い」。この手で**盤上に増えた自駒の価値**にだけ比例して引く
+    // （打ち＝打った駒、成り＝増えたぶん。盤上の合計は定数なので持たない
+    // ＝ gain のゼロ点を動かさない。`board_material_added` の doc 参照）。
+    // 紐（link）と同じく自駒だけで決まるので粒子不要・ノイズゼロ
+    let board_discount = params.board_discount_w * own_effects.board_material_added;
+
     // 詰めろ生成: この手の後、次の自分の手番で持ち駒打ちの一手詰めが成立するか
     // （mate.rs::drop_mate）。ついたて将棋では相手に脅威が見えないので、詰めろは
     // 実質「次で詰む」に近い（発端の対人局 2026-07-25: 58手目 N*6六 の詰めろに
@@ -3051,6 +3138,7 @@ fn evaluate(
     let gain = expected + advance_bias + development + coverage + probe + mate_threat - mate_risk
         - king_holes
         + link
+        - board_discount
         + blind_recapture
         + blind_belief_gain;
     EvalOut {
@@ -3069,6 +3157,8 @@ fn evaluate(
         } else {
             0.0
         },
+        link,
+        board_discount,
     }
 }
 
@@ -3804,6 +3894,44 @@ pub(crate) mod tests {
         assert!(after < value, "取った駒は相手の盤上から消える: {after} < {value}");
         let (_, value_after) = blind_recapture_target(&view, &log).unwrap();
         assert!((after - value_after).abs() < 1e-12);
+    }
+
+    /// V5（盤上駒の減価）は「この手で盤上に増えた自駒の価値」だけを持つ。
+    /// 盤上の合計を持つと gain のゼロ点が下がり、combine_score の min 形で
+    /// p_legal 割引が消える（threat_value の差分化で踏んだ罠）
+    #[test]
+    fn board_material_added_counts_only_the_increment() {
+        let view = minimal_view(
+            vec![
+                VisiblePiece {
+                    square: "5i".into(),
+                    role: Role::King,
+                },
+                VisiblePiece {
+                    square: "2d".into(),
+                    role: Role::Pawn,
+                },
+            ],
+            HashMap::from([(Role::Lance, 1)]),
+        );
+        // 打ち: 打った駒の価値そのもの
+        let drop = own_effects_after(&view, &parse_usi("L*1b").unwrap());
+        assert_eq!(drop.board_material_added, piece_value(Role::Lance));
+        // 静かな盤上の手: 増分ゼロ
+        let quiet = own_effects_after(&view, &parse_usi("2d2c").unwrap());
+        assert_eq!(quiet.board_material_added, 0.0);
+        // 成り: 増えたぶんだけ（歩1 → と6）
+        let promo = own_effects_after(&view, &parse_usi("2d2c+").unwrap());
+        assert_eq!(
+            promo.board_material_added,
+            piece_value(Role::Tokin) - piece_value(Role::Pawn)
+        );
+    }
+
+    /// 既定（重み0）では V5 が働かない = 従来と同じ挙動
+    #[test]
+    fn board_discount_is_disabled_by_default() {
+        assert_eq!(EvalParams::default().board_discount_w, 0.0);
     }
 
     /// 既定（重み0）ではブラインド供給が働かない = 従来と同じ挙動
