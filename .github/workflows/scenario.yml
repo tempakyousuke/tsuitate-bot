@@ -18,6 +18,10 @@ on:
         description: "対象シナリオ（スペース区切り。空なら scenarios/*.kif 全部）"
         required: false
         default: ""
+      env:
+        description: "評価ノブ（スペース区切りの TSUITATE_XXX=値。arena.yml と同じ形式）"
+        required: false
+        default: ""
 
 jobs:
   plan:
@@ -50,7 +54,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run scenario
+        env:
+          SCENARIO_EXTRA_ENV: ${{ inputs.env }}
         run: |
+          # 評価ノブ（TSUITATE_* のみ許可）。arena.yml と同じ規約
+          for kv in $SCENARIO_EXTRA_ENV; do
+            case "$kv" in
+              TSUITATE_*=*) export "$kv" ;;
+              *) echo "無視（TSUITATE_XXX=値 のみ許可）: ${kv}" ;;
+            esac
+          done
           cargo run --release --bin scenario -- \
             "${{ matrix.scenario }}" \
             "${{ inputs.trials }}" \
@@ -108,7 +121,7 @@ jobs:
       - name: Aggregate
         run: |
           {
-            echo "## Scenario Suite（各 ${{ inputs.trials }} 試行 / 戦略 ${{ inputs.strategy }}）"
+            echo "## Scenario Suite（各 ${{ inputs.trials }} 試行 / 戦略 ${{ inputs.strategy }} / env '${{ inputs.env }}'）"
             echo ""
             echo '| シナリオ | 注目手 | 選択 | 反則 | 他の選択 |'
             echo '|---|---|---|---|---|'
