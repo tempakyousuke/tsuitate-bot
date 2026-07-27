@@ -157,14 +157,29 @@ fn env_f64(name: &str) -> f64 {
 /// 保たれるが、実効サンプルサイズは守る必要がある）
 const BELIEF_LOGIT_CLIP: f64 = 4.0;
 
-/// リプレイ中に信念 prior を効かせる決定点の範囲（末尾から数えた相手決定点の数）。
+/// リプレイ中に信念 prior を効かせる決定点の範囲（末尾から数えた相手決定点の数。
+/// **0 = 制限なし＝リプレイ全体**。`TSUITATE_BELIEF_SPAN` で上書き可）。
 ///
-/// ネットの出力は**現在の局面**の周辺分布なので、遠い過去の相手手に当てると
-/// 意味が逆になる（当時その駒が着地したマスは、今はもう空いているのが普通
-/// ＝正しい歴史の手を罰してしまう）。リプレイの成功率はもともと needle を
-/// 通す確率なので、無関係な prior で提案を歪めると素直に落ちる。
-/// 末尾の決定点だけに絞れば「今の信念に合う最後の1手」を選ぶ意味になる
-const BELIEF_RECENT_DECISIONS: usize = 1;
+/// 理屈の上では狭いほうが正しい: ネットの出力は**現在の局面**の周辺分布なので、
+/// 遠い過去の相手手に当てると意味が逆になる（当時その駒が着地したマスは、今は
+/// もう空いているのが普通 ＝ 正しい歴史の手を罰してしまう）。
+///
+/// **しかし実測は逆だった**（対人15局、2026-07-27）: span=1（末尾の決定点だけ）
+/// にすると w=1 でもブラインド率は 20.2% → 12.2% と正常化するが、粒子の信念は
+/// p_all 0.4983 と対照（0.4545〜0.4796）に届かない。制限なしの w=0.25 は
+/// p_all 0.4526・ブラインド時 0.6289 で全対照より良い。
+/// 駒はそう遠くへ動かないので現在の周辺分布は近い過去とも強く相関しており、
+/// **軌跡全体を今の信念へ寄せた粒子のほうが、評価が見る最終配置として正しい**
+/// —— という読み。既定は実測の良かった「制限なし」にする
+fn belief_span() -> usize {
+    static SPAN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *SPAN.get_or_init(|| {
+        std::env::var("TSUITATE_BELIEF_SPAN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
 
 /// 決定点ごとに1回だけ計算する、マスごとの占有ロジット（信念ネットの出力）。
 /// 粒子に依存しないので `update` の先頭で1度作って使い回す。
@@ -533,14 +548,17 @@ impl Estimator {
     }
 
     /// 信念 prior を効かせてよい最も古い制約 index（これ以降の相手決定点だけ
-    /// prior を掛ける）。ネットの信念は現在の局面のものなので、遠い過去の
-    /// 相手手に当てると意味が逆になる（BELIEF_RECENT_DECISIONS 参照）
+    /// prior を掛ける）。既定は 0 = リプレイ全体（`belief_span` の doc 参照）
     fn belief_from_cidx(&self) -> usize {
+        let span = belief_span();
+        if span == 0 {
+            return 0;
+        }
         let mut seen = 0usize;
         for (i, c) in self.constraints.iter().enumerate().rev() {
             if matches!(c, Constraint::OppMove { .. }) {
                 seen += 1;
-                if seen >= BELIEF_RECENT_DECISIONS {
+                if seen >= span {
                     return i;
                 }
             }
