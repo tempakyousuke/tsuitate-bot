@@ -157,6 +157,15 @@ fn env_f64(name: &str) -> f64 {
 /// 保たれるが、実効サンプルサイズは守る必要がある）
 const BELIEF_LOGIT_CLIP: f64 = 4.0;
 
+/// リプレイ中に信念 prior を効かせる決定点の範囲（末尾から数えた相手決定点の数）。
+///
+/// ネットの出力は**現在の局面**の周辺分布なので、遠い過去の相手手に当てると
+/// 意味が逆になる（当時その駒が着地したマスは、今はもう空いているのが普通
+/// ＝正しい歴史の手を罰してしまう）。リプレイの成功率はもともと needle を
+/// 通す確率なので、無関係な prior で提案を歪めると素直に落ちる。
+/// 末尾の決定点だけに絞れば「今の信念に合う最後の1手」を選ぶ意味になる
+const BELIEF_RECENT_DECISIONS: usize = 1;
+
 /// 決定点ごとに1回だけ計算する、マスごとの占有ロジット（信念ネットの出力）。
 /// 粒子に依存しないので `update` の先頭で1度作って使い回す。
 ///
@@ -521,6 +530,22 @@ impl Estimator {
         if let Some(m) = &mut self.debug_fail {
             *m.entry(i).or_insert(0) += 1;
         }
+    }
+
+    /// 信念 prior を効かせてよい最も古い制約 index（これ以降の相手決定点だけ
+    /// prior を掛ける）。ネットの信念は現在の局面のものなので、遠い過去の
+    /// 相手手に当てると意味が逆になる（BELIEF_RECENT_DECISIONS 参照）
+    fn belief_from_cidx(&self) -> usize {
+        let mut seen = 0usize;
+        for (i, c) in self.constraints.iter().enumerate().rev() {
+            if matches!(c, Constraint::OppMove { .. }) {
+                seen += 1;
+                if seen >= BELIEF_RECENT_DECISIONS {
+                    return i;
+                }
+            }
+        }
+        0
     }
 
     /// particles() と同じ並びの観測尤度の対数重み。粒子間の相対値だけに意味が
@@ -1010,6 +1035,7 @@ impl Estimator {
         let taint = snap.taint;
         let belief = self.belief;
         let guide_w = belief_guide_w();
+        let belief_from = self.belief_from_cidx();
         // 巻き戻し先より前のスナップショットは有効（snap.cidx のエントリは
         // 「この決定の適用前」の状態なので、引き直し後もそのまま正しい）。
         // wipe をまたぐエントリはエポック正規化済みなのでそのまま使える
@@ -1060,7 +1086,7 @@ impl Estimator {
                         &self.my_capture_sq[..k],
                         &self.my_touched_sq[..t],
                         &guide,
-                        belief.as_ref().map(|b| (b, guide_w)),
+                        belief.as_ref().filter(|_| i >= belief_from).map(|b| (b, guide_w)),
                         &mut self.rng,
                     ) {
                         Some(dlw) => {
@@ -1372,6 +1398,7 @@ impl Estimator {
         let n = self.constraints.len();
         let belief = self.belief;
         let guide_w = belief_guide_w();
+        let belief_from = self.belief_from_cidx();
         let step_budget = n * 4 + 32;
         let mut steps = 0usize;
         let mut pos = Position::initial();
@@ -1416,7 +1443,7 @@ impl Estimator {
                         &self.my_capture_sq[..k],
                         &self.my_touched_sq[..t],
                         &guide,
-                        belief.as_ref().map(|b| (b, guide_w)),
+                        belief.as_ref().filter(|_| i >= belief_from).map(|b| (b, guide_w)),
                         &mut self.rng,
                     ) {
                         Some(dlw) => {
