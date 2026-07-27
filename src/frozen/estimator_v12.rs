@@ -1,163 +1,2514 @@
-//! 指し手の選択。
+//! estimator の凍結版 v12（2026-07-27 凍結）。
 //!
-//! `Strategy` trait の実装を差し替えて強さを比較する（bin/arena.rs で対戦できる）。
-//! - `Heuristic`: サイト内蔵の簡易botと同じ「前進を好むヒューリスティック＋乱数」
-//! - `EstimatorStrategy`: 観測履歴から相手局面の粒子集合を維持し（estimator.rs）、
-//!   候補手を粒子平均で評価する
+//! v11 からの主な差分:
+//! - **ブラインド取り返し BLIND_RECAPTURE_W=1.0**: 厳密粒子が全滅した決定
+//!   （実測26%）では evaluate() の expected ごと駒得が消え、位置が確実に
+//!   分かっている敵駒すら取らなくなっていた（実例: タダの龍が gain 11〜13 →
+//!   0.045 で89位）。観測（直前に自駒を取られたマス）と、相手の盤上に残る駒の
+//!   多重集合から期待交換価値を作り、粒子に依らず gain を補う。
+//! - **予防的な紐 link_w=0.06**（docs/yaneuraou-lessons.md の V3）: 紐のついた
+//!   自駒の価値合計を gain へ加点する。自駒同士の連結は完全既知なので粒子不要。
+//!   ついたてでは相手の攻めが見えず「狙われてから紐をつける」が間に合わないため、
+//!   将棋よりこの項の価値が高い。**王手中も有効**（他の項と違いゲートしない:
+//!   ゲートすると vs v10/v11 が約9pt落ち、kakutori の反則が 7→51 に増える）。
+//!
+//! 凍結時の成績（GitHub Actions、match_seed=20260728、各200局、2026-07-27）:
+//! vs v11 61.5%±6.7 / vs v10 61.3%±6.8 / vs v9 60.3%±6.8。全凍結版に有意勝ち越し。
+//! 反則/局は v11 比で減少（6.48→6.20）、只取られ 1003→約860、思考時間は横ばい。
+//!
+//! 凍結後は編集しない（シード注入等の挙動を変えない追加のみ許容）。
+//!
+//! このファイルは `scripts/freeze_estimator.py` が
+//! estimator.rs / check.rs / strategy.rs から生成したもの。
+#![allow(dead_code)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use rand::Rng;
-
-use crate::board::{
-    Coord, Promotion, defend_targets, drop_targets, make_usi_drop, make_usi_move, make_usi_square,
-    move_targets, parse_usi_square, promotion_choice,
-};
-use crate::check::CheckSolver;
-use crate::estimator::{EPS_INFO, Estimator, opp_reply_weights};
-use crate::likelihood::{FITTED_THETA, ParticleCtx, particle_features, particle_log_weight};
-use crate::observation::{Observation, ObservationLog};
-use crate::opening::OpeningBook;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 
+use crate::board::{
+    Coord, Promotion, dead_end_rank, defend_targets, drop_targets, make_usi_drop, make_usi_move,
+    make_usi_square, move_targets, parse_usi_square, promotion_choice,
+};
+use crate::likelihood::{FITTED_THETA, ParticleCtx, particle_features, particle_log_weight};
+use crate::model::GameModel;
+use crate::observation::{Observation, ObservationLog};
+use crate::opening::OpeningBook;
 use crate::protocol::{Color, PlayerView, Role, VisiblePiece};
-use crate::shogi::{Position, ShogiMove, parse_usi, piece_value, promote_role, unpromote_role};
+use crate::shogi::{
+    Piece, Position, ShogiMove, parse_usi, piece_value, promote_role, unpromote_role,
+};
+use crate::strategy::Strategy;
 
-/// 1インスタンス = 1対局。対局開始ごとに `make` で作り直す。
-pub trait Strategy {
-    /// 自分の手番で呼ばれる。foul_tried の手は除外すること。
-    /// None を返したら投了（指せる手がない）。
-    fn choose(
+/// 粒子の目標数。1手あたりの計算量はこれ*候補手数に比例する
+const TARGET_PARTICLES: usize = 512;
+/// 1回の update での再生成リプレイ試行の上限（時間予算の担保）。
+/// 複製よりリプレイのほうが粒子の多様性を保てるので多めに取る。
+/// v6: 相手モデルのフィット（2026-07-09）で提案分布の打率が上がったぶん
+/// 試行回数の効果が大きくなったので、思考予算の余り（平均360ms/目安1〜2秒）を
+/// リプレイに振る
+const REGEN_ATTEMPTS: usize = 320;
+/// リプレイ中バックトラックの1決定点あたりの再サンプル回数
+const BACKTRACK_ATTEMPTS: u32 = 4;
+/// ソフト救済の累積回数の上限。超えた粒子は棄却する
+/// （観測と何度も矛盾した粒子は近似としても信用できない）。
+/// ソフト救済の発動閾値は target/4（apply_constraint 参照）
+const INFO_MISS_CAP: u8 = 3;
+/// 情報系ソフト救済1回あたりの観測尤度（logw へ ln(EPS_INFO) を課金）。
+/// 評価側の較正（証拠数の勘定）にも同じ値を使うため pub。
+/// C-7 P1 で評価側の soft_decay^penalty（旧0.6753）を置き換えた。
+/// フィルタ超パラメータなので調整は SPSA でなくグリッド＋シナリオ目的で行う
+pub const EPS_INFO: f64 = 0.1;
+/// ESS がこの割合（対 現粒子数）を下回ったら systematic resampling
+const ESS_THRESHOLD: f64 = 0.5;
+/// 各粒子が保持する直近の相手決定点スナップショット数（若返りの巻き戻し窓）
+const REJUV_SNAPSHOTS: usize = 8;
+/// 若返りの巻き戻し深さの試行順（近い決定点から adaptive に広げる。
+/// 固定深さだと「原因が窓の少し前」を拾えず、常に深いとコスト過剰）。
+/// 主経路ではスナップショットを制約適用前に積むため、depth=1 は同じ決定点として
+/// 常にスキップされる
+const REJUV_DEPTHS: [usize; 4] = [1, 2, 4, 8];
+/// 1つの巻き戻し深さあたりの再サンプル試行回数
+const REJUV_TRIES: u32 = 3;
+/// 若返り全体の時間予算（ms、スケール比例）。発動は厳密生存 < target/4 の
+/// ターンだけなので、健全なターンのコストはゼロ
+const REJUV_MS: f64 = 150.0;
+/// 制約後読みガイドのブースト倍率（提案分布側。重み補正で正直に払うので
+/// 分布は歪まない。needle 突破には複数決定点での連続命中が要るため強めに取る）
+const GUIDE_BOOST: f64 = 24.0;
+/// ガイドの後読み幅（決定点から先読みする制約数の上限）。
+/// 24まで拡張して測定したが、kakunari continue の遂行率（14/20、
+/// ブラインド玉攻め単体の既知基準13/20からノイズ内）・アリーナ vs v7
+/// （48.5%±9.7%、有意勝ち越し未達）のいずれでも効果を確認できず、
+/// guide_boost_factor 内の空盤BFS呼び出し回数だけが比例して増えて
+/// kakunari continue の実行時間が約60%増加した（2026-07-19測定）。
+/// 効果未確認・コストありのため、検証済みの8へ戻す
+const GUIDE_HORIZON: usize = 8;
+
+/// 診断用: TSUITATE_DISABLE_DEFEND_GUIDE=1 で「MyFoul由来のガイド」
+/// （自玉移動反則→guide.attacks、打ちマス反則→guide.occupies）を
+/// まとめて無効化できる（速度差の切り分け専用。一時的なフラグ）
+fn defend_guide_disabled() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("TSUITATE_DISABLE_DEFEND_GUIDE").is_ok_and(|v| v == "1"))
+}
+
+/// 全滅時に保持する棄却粒子（墓場）の上限
+const GRAVEYARD_CAP: usize = 128;
+/// 墓場スナップショットの有効期限（決定点からの制約数。これを超えたら stale）
+const GRAVEYARD_MAX_SEGMENT: usize = 24;
+/// 物理不整合の最後の砦（C-7 P3 / D4）: 完全全滅時だけ、棄却粒子を
+/// logw += ln(EPS_PHYS) と phys_taint+1 で残す（TSUITATE_EPS_PHYS で上書き可、
+/// 0 で無効）。嘘の盤面なので評価側は玉位置系の用途（王手ソルバーの投票）に限定。
+/// 救済に回数上限は設けない（kakunari 型の多段 needle は4連続以上の全滅を起こし、
+/// 上限があると結局ブラインドに落ちる）。深く汚れた粒子は ε の累積課金と
+/// truncate の taint 優先淘汰で、修復・復活・リプレイが成功し次第自然に消える
+const EPS_PHYS_DEFAULT: f64 = 0.01;
+
+/// 若返り用のスナップショット: 相手決定点 cidx の適用**前**の状態
+#[derive(Clone)]
+struct Snap {
+    /// この決定点の制約 index（constraints[cidx] が相手手）
+    cidx: usize,
+    pos: Position,
+    logw: f64,
+    miss: u8,
+    taint: u8,
+}
+
+/// スナップショット付きの棄却粒子（若返り→ソフト救済→墓場の受け渡し用）。
+/// (局面, info_miss, logw, 窓, phys_taint)
+type Rejected = (Position, u8, f64, VecDeque<Snap>, u8);
+/// 若返りの成功結果。(局面, info_miss, logw, 窓, phys_taint)
+type Repaired = (Position, u8, f64, VecDeque<Snap>, u8);
+
+/// 制約後読みガイド: 巻き戻し区間の再サンプルで満たしたい将来の状態条件
+#[derive(Default)]
+struct Guide {
+    /// 後続 MyMove(to=X, captured=R) 由来: 「X に相手の R を立てる手」をブースト
+    lands: Vec<(Coord, Role)>,
+    /// 後続 OppMove(captured_at=X) 由来: 「X へ利きを作る手」をブースト
+    /// （取り返しには X に利く駒が事前に必要）
+    attacks: Vec<Coord>,
+    /// 多段ガイド（C-7 追補）: `lands` と同じ future MyMove(to=X, captured=R) 由来
+    /// だが、「今すぐ X に着地する」手ではなく「駒種 R を持つ駒が X へ**近づく**手」
+    /// を弱くブーストする。needle が複数手先にある場合（kakunari c42 型の
+    /// サイレント再配置）、1手先しか見ない lands/attacks では見つからない
+    approach: Vec<(Role, Coord)>,
+    /// 打ちマス反則ガイド: 後続 MyFoul(歩以外の打ち, 王手中でない) 由来:
+    /// 「X に（駒種不明の）相手駒を置く手」をブースト。王手中でない打ちが
+    /// 反則になる理由は二歩・行き所のない駒（自分の情報だけで既に候補から
+    /// 除外済み）を除けば「着地マスに見えない相手駒がいる」でほぼ一意
+    /// （lands と違い駒種は分からないので role を問わず着地だけを見る）。
+    /// 歩打ちだけは打ち歩詰め（相手玉が見えないので自分からは判定不能）と
+    /// いう別の反則理由がありうるため対象外にする
+    occupies: Vec<Coord>,
+}
+
+impl Guide {
+    fn is_empty(&self) -> bool {
+        self.lands.is_empty()
+            && self.attacks.is_empty()
+            && self.approach.is_empty()
+            && self.occupies.is_empty()
+    }
+}
+
+fn shift_hist(hist: &mut VecDeque<Snap>, d: f64) {
+    for s in hist.iter_mut() {
+        s.logw += d;
+    }
+}
+
+/// 観測列を推定に使える形に正規化した制約
+#[derive(Debug, Clone)]
+enum Constraint {
+    /// 受理された自分の手（gives_check: 直後に相手玉へ王手宣言があったか）
+    MyMove {
+        mv: ShogiMove,
+        captured: Option<Role>,
+        gives_check: bool,
+    },
+    /// 反則になった自分の手（真の局面では非合法）
+    MyFoul { mv: ShogiMove },
+    /// 相手の着手（captured_at: 自駒が取られたマス、gives_check: 自玉への王手宣言、
+    /// foul_count: この手番で相手がこの着手に至るまでに試みた反則の回数。
+    /// 反則の中身は不明だが回数は Observation::OpponentFoul でリアルタイムに
+    /// 観測できる。opp_move_weight の特徴量として使う。
+    /// my_foul_count: 直前の自分手番で自分が試みた反則の回数。相手側も
+    /// 反則宣言（回数のみ）を観測しているので、相手の指し手はこれに
+    /// 反応しうる = my_foul_count_last_turn 特徴量の逆方向配線）
+    OppMove {
+        captured_at: Option<Coord>,
+        gives_check: bool,
+        foul_count: u32,
+        my_foul_count: u32,
+    },
+}
+
+pub struct Estimator {
+    my_color: Color,
+    particles: Vec<Position>,
+    /// particles と同じ並びのソフト救済回数（0 = 全制約と厳密整合）。
+    /// 尤度の課金（EPS_INFO）は logw 側で行い、これは回数の別勘定
+    /// （上限管理と評価側の証拠数較正用）。リサンプリングでもリセットしない
+    info_miss: Vec<u8>,
+    /// particles と同じ並びの観測尤度の対数重み（SIR の重み更新）。
+    /// 相手手の制約適用ごとに log(整合クラスの事前質量 / 全合法手の事前質量) を
+    /// 累積する。「観測と整合する手はあるが、それが相手として指しにくい手しか
+    /// ない粒子」（例: 幻の角の飛び込み王手でしか王手を説明できない粒子）を
+    /// 粒子間で相対的に軽くする。リプレイ生成粒子も全制約ぶん累積するので
+    /// 生存粒子と比較可能。絶対値に意味はなく、評価側が max を引いて正規化する
+    logw: Vec<f64>,
+    /// particles と同じ並びの若返り窓（直近の相手決定点スナップショット）
+    hist: Vec<VecDeque<Snap>>,
+    /// particles と同じ並びの物理不整合カウンタ（ε_phys の最後の砦で残した回数。
+    /// 0 = 物理的に厳密。リサンプリングでもリセットしない。評価側は taint>0 を
+    /// 通常サンプルから除外し、玉位置系の用途にだけ使う）
+    phys_taint: Vec<u8>,
+    /// ε_phys（TSUITATE_EPS_PHYS で上書き。0 = 最後の砦無効）
+    eps_phys: f64,
+    /// 思考予算に応じた粒子の目標数（スケール1.0で TARGET_PARTICLES）
+    target: usize,
+    /// リプレイ試行回数の上限（スケール比例）
+    regen_attempts: usize,
+    /// 通常リプレイの時間打ち切り（ms、スケール比例）
+    regen_deadline_ms: u64,
+    /// 全滅時に粘る時間の上限（ms、スケール比例）
+    empty_deadline_ms: u64,
+    /// 若返りの時間打ち切り（ms、スケール比例）
+    rejuv_deadline_ms: u64,
+    constraints: Vec<Constraint>,
+    /// 自分が駒を取ったマス（= 相手は自駒がそこで死んだことを知っている）。
+    /// 相手手の事前分布の threat_known 特徴量に使う。idx は制約列上の位置
+    my_capture_idx: Vec<usize>,
+    my_capture_sq: Vec<Coord>,
+    /// 自分の手が触れたマス（from/to）。初期配置から動いていない自駒
+    /// （相手が推論で狙ってくる = threat_home 特徴量）の判定に使う
+    my_touched_idx: Vec<usize>,
+    my_touched_sq: Vec<Coord>,
+    /// ObservationLog の消化済みイベント数
+    cursor: usize,
+    /// この手番でここまでに観測した相手の反則回数（Observation::OpponentFoul
+    /// の累積）。次の Constraint::OppMove が確定した時点でその制約へ焼き込み、
+    /// 0へリセットする
+    pending_opp_foul_count: u32,
+    /// この手番でここまでに自分が試みた反則の回数（Constraint::MyFoul の累積）。
+    /// 自分の着手（MyMove）確定時に last_my_foul_count へ移して0へ戻す
+    pending_my_foul_count: u32,
+    /// 直前の自分手番で自分が試みた反則の回数。次の Constraint::OppMove へ
+    /// 焼き込む（相手は反則宣言の回数を観測している = my_foul_count_last_turn）
+    last_my_foul_count: u32,
+    /// 観測との矛盾（リプレイでも整合局面を作れない等）で信頼できなくなったら false
+    healthy: bool,
+    /// 直近の replenish で測った ESS（診断用）
+    last_ess: f64,
+    /// systematic resampling の累計回数（診断用）
+    resamples: u64,
+    /// logw の基準点（制約 index）。リサンプリングで logw が 0 に再ベースされた後、
+    /// 初期リプレイの新粒子が絶対スケール（全制約の累積）を持つと生存粒子に対して
+    /// 不当に軽くなるため、リプレイの logw はこの位置以降の累積だけを数える
+    /// （それ以前の質量は「集団の典型と同じ」とみなす近似。ソフト救済の
+    /// strict_dlw_median と同じ哲学）
+    rebase_cidx: usize,
+    /// 全滅時の棄却粒子の保管庫。以後のターンで制約列が伸びても、スナップショット
+    /// からの若返りで復活を試み続けられる（全滅からの回復手段。stale になったら破棄）
+    graveyard: Vec<Rejected>,
+    /// 若返りで修復した粒子の累計（診断用）
+    rejuv_repaired: u64,
+    /// 墓場から復活した粒子の累計（診断用）
+    revived: u64,
+    /// TSUITATE_FILTER_DEBUG=1 のとき、リプレイ/若返りが失敗した制約 index の
+    /// ヒストグラムを集める（needle の特定用）
+    debug_fail: Option<std::collections::HashMap<usize, u32>>,
+    /// 現在の自玉位置（自分の手でしか動かないので常に厳密に分かる）
+    my_king: Coord,
+    /// king_at[i] = 制約 index i を処理する直前の自玉位置。build_guide が
+    /// 王手宣言との整合を確かめるたびに全体を舐め直さずに済むよう、
+    /// 制約追加時にインクリメンタルに更新する（O(1) 参照用のキャッシュ）
+    king_at: Vec<Coord>,
+    /// 現在の自玉の被王手状態（直近の OppMove.gives_check で更新。MyMove が
+    /// 受理された時点で必ず解消されているので false に戻す）
+    in_check: bool,
+    /// in_check_at[i] = 制約 index i を処理する直前の被王手状態。
+    /// king_at と同じ O(1) 参照用のキャッシュ（打ちマス反則の理由の一意性判定に使う）
+    in_check_at: Vec<bool>,
+    rng: StdRng,
+}
+
+impl Estimator {
+    pub fn new(my_color: Color) -> Self {
+        Estimator::with_seed(my_color, rand::rng().random())
+    }
+
+    pub fn with_seed(my_color: Color, seed: u64) -> Self {
+        Estimator::with_seed_and_scale(my_color, seed, 1.0)
+    }
+
+    /// 思考予算スケールつきで作る（1.0 = 従来基準。strategy.rs の
+    /// TSUITATE_THINK_BUDGET_MS から渡される）。粒子数・リプレイ回数・
+    /// 時間打ち切りがスケールに比例する
+    pub fn with_scale(my_color: Color, scale: f64) -> Self {
+        Estimator::with_seed_and_scale(my_color, rand::rng().random(), scale)
+    }
+
+    pub fn with_seed_and_scale(my_color: Color, seed: u64, scale: f64) -> Self {
+        let scale = scale.clamp(0.25, 8.0);
+        let target = ((TARGET_PARTICLES as f64 * scale) as usize).clamp(128, 4096);
+        Estimator {
+            my_color,
+            particles: vec![Position::initial(); target],
+            info_miss: vec![0; target],
+            logw: vec![0.0; target],
+            hist: vec![VecDeque::new(); target],
+            phys_taint: vec![0; target],
+            eps_phys: std::env::var("TSUITATE_EPS_PHYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(EPS_PHYS_DEFAULT),
+            target,
+            regen_attempts: (REGEN_ATTEMPTS as f64 * scale) as usize,
+            regen_deadline_ms: (500.0 * scale) as u64,
+            empty_deadline_ms: (900.0 * scale) as u64,
+            rejuv_deadline_ms: (REJUV_MS * scale) as u64,
+            constraints: vec![],
+            my_capture_idx: vec![],
+            my_capture_sq: vec![],
+            my_touched_idx: vec![],
+            my_touched_sq: vec![],
+            cursor: 0,
+            pending_opp_foul_count: 0,
+            pending_my_foul_count: 0,
+            last_my_foul_count: 0,
+            healthy: true,
+            last_ess: target as f64,
+            resamples: 0,
+            rebase_cidx: 0,
+            graveyard: vec![],
+            rejuv_repaired: 0,
+            revived: 0,
+            debug_fail: std::env::var("TSUITATE_FILTER_DEBUG")
+                .is_ok_and(|v| v == "1")
+                .then(std::collections::HashMap::new),
+            my_king: Position::initial()
+                .king_square(my_color)
+                .expect("初期局面に玉がない"),
+            king_at: vec![],
+            in_check: false,
+            in_check_at: vec![],
+            rng: StdRng::seed_from_u64(seed),
+        }
+    }
+
+    /// 粒子の目標数（思考予算に応じてスケール済み）
+    pub fn target(&self) -> usize {
+        self.target
+    }
+
+    pub fn my_color(&self) -> Color {
+        self.my_color
+    }
+
+    /// 現在の粒子集合。空なら推定は信頼できない（呼び出し側でフォールバック）
+    pub fn particles(&self) -> &[Position] {
+        &self.particles
+    }
+
+    /// particles() と同じ並びのソフト救済回数。評価側の証拠数較正に使う
+    /// （尤度の減衰は logw 側に課金済みなので、重みには二重に掛けない）
+    pub fn info_miss(&self) -> &[u8] {
+        &self.info_miss
+    }
+
+    /// 直近の replenish で測った ESS（診断用）
+    pub fn last_ess(&self) -> f64 {
+        self.last_ess
+    }
+
+    /// systematic resampling の累計回数（診断用）
+    pub fn resamples(&self) -> u64 {
+        self.resamples
+    }
+
+    /// (若返りで修復した粒子, 墓場から復活した粒子) の累計（診断用）
+    pub fn rejuv_stats(&self) -> (u64, u64) {
+        (self.rejuv_repaired, self.revived)
+    }
+
+    /// TSUITATE_FILTER_DEBUG=1 のときの失敗制約ヒストグラム（(制約idx, 回数) を
+    /// 回数降順で返す）。リプレイ・若返りがどの制約で死んでいるかの特定用
+    pub fn fail_report(&self) -> Vec<(usize, u32)> {
+        let Some(m) = &self.debug_fail else {
+            return vec![];
+        };
+        let mut v: Vec<(usize, u32)> = m.iter().map(|(&k, &c)| (k, c)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v
+    }
+
+    fn note_fail(&mut self, i: usize) {
+        if let Some(m) = &mut self.debug_fail {
+            *m.entry(i).or_insert(0) += 1;
+        }
+    }
+
+    /// particles() と同じ並びの観測尤度の対数重み。粒子間の相対値だけに意味が
+    /// ある（評価側で max を引いて exp し正規化する）。複製粒子は同じ値を持つ
+    pub fn log_weights(&self) -> &[f64] {
+        &self.logw
+    }
+
+    /// particles() と同じ並びの物理不整合カウンタ（0 = 物理的に厳密）。
+    /// 評価側は taint>0 を通常サンプルから除外し、玉位置系の用途にだけ使う
+    pub fn phys_taint(&self) -> &[u8] {
+        &self.phys_taint
+    }
+
+    pub fn healthy(&self) -> bool {
+        self.healthy && !self.particles.is_empty()
+    }
+
+    /// ログの未消化イベントを取り込み、粒子を前進・棄却・補充する
+    pub fn update(&mut self, log: &ObservationLog) {
+        let events = log.events();
+        while self.cursor < events.len() {
+            // 相手の反則は中身不明だが回数は実戦でもリアルタイムに観測できる。
+            // 次の相手着手（OppMove）が確定するまで累積し、そちらへ焼き込む
+            if matches!(events[self.cursor], Observation::OpponentFoul { .. }) {
+                self.pending_opp_foul_count += 1;
+                self.cursor += 1;
+                continue;
+            }
+            let (constraint, consumed) = self.normalize(&events[self.cursor..]);
+            self.cursor += consumed;
+            let Some(constraint) = constraint else {
+                continue;
+            };
+            self.apply_constraint(&constraint);
+            // king_at[idx] = この制約を処理する直前の自玉位置（build_guide の
+            // O(1) 参照用。king_square_before の全体再走査を避けるため
+            // インクリメンタルに維持する）
+            self.king_at.push(self.my_king);
+            if let Constraint::MyMove {
+                mv: ShogiMove::Board { from, to, .. },
+                ..
+            } = &constraint
+            {
+                if *from == self.my_king {
+                    self.my_king = *to;
+                }
+            }
+            // in_check_at[idx] = この制約を処理する直前の被王手状態
+            self.in_check_at.push(self.in_check);
+            match &constraint {
+                Constraint::OppMove { gives_check, .. } => {
+                    self.in_check = *gives_check;
+                    self.pending_opp_foul_count = 0;
+                }
+                Constraint::MyMove { .. } => {
+                    self.in_check = false;
+                    // 自分手番の反則回数を確定（次の OppMove が
+                    // my_foul_count_last_turn として焼き込む）
+                    self.last_my_foul_count = self.pending_my_foul_count;
+                    self.pending_my_foul_count = 0;
+                }
+                Constraint::MyFoul { .. } => self.pending_my_foul_count += 1,
+            }
+            if let Constraint::MyMove { mv, captured, .. } = &constraint {
+                let idx = self.constraints.len();
+                let to = match *mv {
+                    ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+                };
+                if captured.is_some() {
+                    self.my_capture_idx.push(idx);
+                    self.my_capture_sq.push(to);
+                }
+                if let ShogiMove::Board { from, .. } = *mv {
+                    self.my_touched_idx.push(idx);
+                    self.my_touched_sq.push(from);
+                }
+                self.my_touched_idx.push(idx);
+                self.my_touched_sq.push(to);
+            }
+            self.constraints.push(constraint);
+        }
+        self.replenish();
+    }
+
+    /// 先頭イベントを制約へ正規化する。直後の Check イベントも一緒に消化する
+    fn normalize(&self, events: &[Observation]) -> (Option<Constraint>, usize) {
+        let head = &events[0];
+        // 手の直後に王手宣言が続いているか（同じ着手の結果として扱う）
+        let followed_by_check = |on: Color| -> bool {
+            matches!(events.get(1), Some(Observation::Check { in_check }) if *in_check == on)
+        };
+        match head {
+            Observation::MyMove { usi, captured, .. } => {
+                let Some(mv) = parse_usi(usi) else {
+                    return (None, 1);
+                };
+                let gives_check = followed_by_check(self.my_color.other());
+                let consumed = if gives_check { 2 } else { 1 };
+                (
+                    Some(Constraint::MyMove {
+                        mv,
+                        captured: *captured,
+                        gives_check,
+                    }),
+                    consumed,
+                )
+            }
+            Observation::MyFoul { usi, .. } => match parse_usi(usi) {
+                Some(mv) => (Some(Constraint::MyFoul { mv }), 1),
+                None => (None, 1),
+            },
+            Observation::OpponentMoved {
+                captured_my_piece_at,
+                ..
+            } => {
+                let captured_at = captured_my_piece_at
+                    .as_deref()
+                    .and_then(crate::board::parse_usi_square);
+                let gives_check = followed_by_check(self.my_color);
+                let consumed = if gives_check { 2 } else { 1 };
+                (
+                    Some(Constraint::OppMove {
+                        captured_at,
+                        gives_check,
+                        foul_count: self.pending_opp_foul_count,
+                        my_foul_count: self.last_my_foul_count,
+                    }),
+                    consumed,
+                )
+            }
+            // 相手の反則は中身（どの手を試みたか）は分からないが、回数は
+            // update() が pending_opp_foul_count へ累積し次の OppMove へ渡す
+            // （opp_move_weight の特徴量。単独で現れた Check は手側で消化済みのはず）
+            Observation::OpponentFoul { .. } | Observation::Check { .. } => (None, 1),
+        }
+    }
+
+    fn apply_constraint(&mut self, constraint: &Constraint) {
+        let my_color = self.my_color;
+        // 今回の制約が constraints に積まれる位置（update が適用後に push する）
+        let cidx = self.constraints.len();
+        let particles = std::mem::take(&mut self.particles);
+        let penalties = std::mem::take(&mut self.info_miss);
+        let logws = std::mem::take(&mut self.logw);
+        let hists = std::mem::take(&mut self.hist);
+        let taints = std::mem::take(&mut self.phys_taint);
+        let mut surv_pos = Vec::with_capacity(particles.len());
+        let mut surv_pen = Vec::with_capacity(particles.len());
+        let mut surv_logw = Vec::with_capacity(particles.len());
+        let mut surv_hist = Vec::with_capacity(particles.len());
+        let mut surv_taint = Vec::with_capacity(particles.len());
+        // 棄却された粒子は適用前の局面を保持しておく（若返り・ソフト救済用。
+        // apply_my_move / sample_opp_move は失敗時も局面を汚しうる）
+        let mut failed: Vec<Rejected> = vec![];
+        // 厳密生存者が今回の制約で得た対数重み増分（ソフト救済の課金基準に使う）
+        let mut strict_dls: Vec<f64> = vec![];
+        for ((((mut pos, pen), lw), mut hist), taint) in particles
+            .into_iter()
+            .zip(penalties)
+            .zip(logws)
+            .zip(hists)
+            .zip(taints)
+        {
+            let backup = pos.clone();
+            // 相手決定点なら適用前の状態をスナップショット（若返りの巻き戻し先）
+            if matches!(constraint, Constraint::OppMove { .. }) {
+                if hist.len() == REJUV_SNAPSHOTS {
+                    hist.pop_front();
+                }
+                hist.push_back(Snap {
+                    cidx,
+                    pos: backup.clone(),
+                    logw: lw,
+                    miss: pen,
+                    taint,
+                });
+            }
+            // 自分の手・反則は決定的（尤度 0/1）なので重みは変えない。
+            // 相手手は観測クラスの尤度（対数）を累積する
+            let ok = match constraint {
+                Constraint::MyMove {
+                    mv,
+                    captured,
+                    gives_check,
+                } => apply_my_move(&mut pos, my_color, mv, *captured, Some(*gives_check))
+                    .then_some(0.0),
+                Constraint::MyFoul { mv } => {
+                    foul_consistent(&pos, my_color, mv).then_some(0.0)
+                }
+                Constraint::OppMove {
+                    captured_at,
+                    gives_check,
+                    foul_count,
+                    my_foul_count,
+                } => sample_opp_move(
+                    &mut pos,
+                    my_color,
+                    *captured_at,
+                    Some(*gives_check),
+                    *foul_count,
+                    *my_foul_count,
+                    &self.my_capture_sq,
+                    &self.my_touched_sq,
+                    &Guide::default(),
+                    &mut self.rng,
+                ),
+            };
+            if let Some(dlw) = ok {
+                surv_pos.push(pos);
+                surv_pen.push(pen);
+                surv_logw.push(lw + dlw);
+                surv_hist.push(hist);
+                surv_taint.push(taint);
+                strict_dls.push(dlw);
+            } else {
+                failed.push((backup, pen, lw, hist, taint));
+            }
+        }
+        // 若返り（C-7 P2 / D3）: 厳密生存が薄いときは、棄却粒子を直近の
+        // 相手決定点へ巻き戻して制約後読みガイド付きで引き直す。修復粒子は
+        // 厳密整合（info_miss/phys_taint はスナップショット時点の値へ戻る）。
+        // ゲートは**厳密生存数**（info_miss=0 かつ phys_taint=0）で判定する
+        // （codex レビュー指摘: ソフト/taint は独立証拠ではない）。
+        // 完全全滅（生存ゼロ）のときは予算を regen_deadline 級へ引き上げる
+        // （どうせブラインドになるならリプレイ予算を前借りして修復に使う）
+        let strict_count = |pens: &[u8], taints: &[u8]| -> usize {
+            pens.iter()
+                .zip(taints)
+                .filter(|&(&m, &t)| m == 0 && t == 0)
+                .count()
+        };
+        if strict_count(&surv_pen, &surv_taint) < self.target / 4 && !failed.is_empty() {
+            let budget_ms = if surv_pos.is_empty() {
+                self.regen_deadline_ms
+            } else {
+                self.rejuv_deadline_ms
+            };
+            let deadline =
+                std::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+            let (repaired, still) =
+                self.rejuvenate_batch(failed, cidx, Some(constraint), self.target, deadline);
+            for (pos, pen, lw, hist, taint) in repaired {
+                self.rejuv_repaired += 1;
+                surv_pos.push(pos);
+                surv_pen.push(pen);
+                surv_logw.push(lw);
+                surv_hist.push(hist);
+                surv_taint.push(taint);
+            }
+            failed = still;
+        }
+        // ソフト救済: 若返り後も厳密整合の生存が少ないときだけ、情報系の制約を
+        // 緩和して棄却粒子を info_miss+1 で生かす（物理制約は緩和しない）
+        let mut graveyard_candidates: Vec<Rejected> = vec![];
+        if strict_count(&surv_pen, &surv_taint) < self.target / 4 {
+            // ソフト粒子の観測尤度: 本当は P(観測|粒子)=0 だが近似として生かす
+            // ので、「典型的な厳密生存者と同じ増分」（中央値）を課す。緩和クラスの
+            // r（≈1）をそのまま使うと、観測を説明できない粒子のほうが正直に
+            // 小さい r を払った厳密粒子より重くなってしまう。厳密生存者がいない
+            // ときだけ緩和クラスの r で代用する（全員ソフトなら相対値として無害で、
+            // 後からリプレイされる厳密粒子は正直な累積 r を持つので比較もできる）
+            let strict_dlw_median = (!strict_dls.is_empty()).then(|| {
+                strict_dls.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                strict_dls[strict_dls.len() / 2]
+            });
+            for (mut pos, pen, lw, hist, taint) in failed {
+                if pen >= INFO_MISS_CAP {
+                    continue;
+                }
+                if let Some(dlw) = self.apply_soft(&mut pos, constraint) {
+                    surv_pos.push(pos);
+                    surv_pen.push(pen + 1);
+                    // 観測を説明できなかった近似粒子の課金: 典型的な厳密生存者と
+                    // 同じ増分（中央値）に加えて、情報系ソフトの尤度 EPS_INFO を払う
+                    // （旧: 評価側の soft_decay^penalty。C-7 P1 で logw へ統合）
+                    surv_logw.push(lw + strict_dlw_median.unwrap_or(dlw) + EPS_INFO.ln());
+                    surv_hist.push(hist);
+                    surv_taint.push(taint);
+                } else {
+                    graveyard_candidates.push((pos, pen, lw, hist, taint));
+                }
+            }
+        }
+        // ε_phys の最後の砦（C-7 P3 / D4）: 完全全滅（ソフトも含め生存ゼロ）の
+        // ときだけ、物理不整合の棄却粒子を強制適用して phys_taint+1 で残す。
+        // 狙いは信念の連続性（玉位置などの大域情報）で、盤面は観測と厳密整合
+        // しない「嘘」— 評価側は taint>0 を通常サンプルから除外し、
+        // 玉位置系の用途（王手ソルバーの投票）にだけ使う。
+        //
+        // エポック正規化（codex P3 レビュー指摘への対応）: wipe をまたぐと
+        // 旧スケールの logw（全制約の累積）と、rebase 後の新規リプレイ粒子
+        // （rebase_cidx 以降のみ課金 ≈ 0 基準）が混在してしまう。wipe 時点で
+        // 生き残る taint 粒子・墓場エントリの logw とスナップショットを
+        // **共通定数（候補内の max logw）だけシフト**して新エポックの 0 基準へ
+        // 揃える。共通シフトなので相対重みは保存され、以後の若返り修復・
+        // 墓場復活はどちらも「スナップショット値から再出発」の一本の規約で
+        // 新規リプレイ粒子と比較可能になる
+        let complete_wipe = surv_pos.is_empty();
+        let epoch_shift = if complete_wipe {
+            graveyard_candidates
+                .iter()
+                .map(|(_, _, lw, _, _)| *lw)
+                .fold(f64::MIN, f64::max)
+        } else {
+            0.0
+        };
+        let epoch_shift = if epoch_shift == f64::MIN { 0.0 } else { epoch_shift };
+        if complete_wipe && self.eps_phys > 0.0 && !graveyard_candidates.is_empty() {
+            for (pos, pen, lw, hist, taint) in &graveyard_candidates {
+                if surv_pos.len() >= self.target {
+                    break;
+                }
+                let mut forced = pos.clone();
+                force_apply(&mut forced, my_color, constraint);
+                let mut h = hist.clone();
+                shift_hist(&mut h, -epoch_shift);
+                surv_pos.push(forced);
+                surv_pen.push(*pen);
+                surv_logw.push(lw - epoch_shift + self.eps_phys.ln());
+                surv_hist.push(h);
+                surv_taint.push(taint.saturating_add(1));
+            }
+        }
+        // 厳密全滅なら棄却粒子を墓場へ保管する（以後のターンで復活を試みる。
+        // 物理的にはスナップショット時点まで整合していた歴史なので嘘ではないが、
+        // snap.miss > 0 のものは情報観測に info_miss 分だけ汚染されている —
+        // miss は復活後も維持されるので較正は保たれる）。
+        // 完全全滅（ソフトもゼロ。taint 救済は数えない）のときだけ logw の
+        // 基準点を今へ再ベースし、墓場エントリも同じエポックへシフトする
+        if strict_count(&surv_pen, &surv_taint) == 0 && !graveyard_candidates.is_empty() {
+            if complete_wipe {
+                for (_, _, lw, hist, _) in graveyard_candidates.iter_mut() {
+                    *lw -= epoch_shift;
+                    shift_hist(hist, -epoch_shift);
+                }
+            }
+            graveyard_candidates.sort_by_key(|(_, pen, _, _, taint)| (*taint, *pen));
+            graveyard_candidates.truncate(GRAVEYARD_CAP);
+            self.graveyard = graveyard_candidates;
+            if complete_wipe {
+                self.rebase_cidx = cidx;
+            }
+        }
+        if self.debug_fail.is_some() {
+            let strict = strict_count(&surv_pen, &surv_taint);
+            let taint_n = surv_taint.iter().filter(|&&t| t > 0).count();
+            let soft = surv_pen.len() - strict - taint_n;
+            let kind = match constraint {
+                Constraint::MyMove { captured, gives_check, .. } => {
+                    format!("MyMove(cap={captured:?},chk={gives_check})")
+                }
+                Constraint::MyFoul { .. } => "MyFoul".into(),
+                Constraint::OppMove { captured_at, gives_check, .. } => {
+                    format!("OppMove(cap_at={captured_at:?},chk={gives_check})")
+                }
+            };
+            eprintln!(
+                "    [c{cidx}] {kind}: 厳密{strict} soft{soft} taint{taint_n} 墓場{} 修復累計{}",
+                self.graveyard.len(),
+                self.rejuv_repaired,
+            );
+        }
+        self.particles = surv_pos;
+        self.info_miss = surv_pen;
+        self.logw = surv_logw;
+        self.hist = surv_hist;
+        self.phys_taint = surv_taint;
+    }
+
+    /// 情報系の制約（王手宣言の一致・自分の反則の説明）だけを緩和した適用。
+    /// 物理的な制約（自手の合法性・取った駒種・取られたマス）は緩和しない。
+    /// 成功時は対数重みの増分（緩和クラスでの観測尤度）を返す
+    fn apply_soft(&mut self, pos: &mut Position, constraint: &Constraint) -> Option<f64> {
+        match constraint {
+            Constraint::MyMove { mv, captured, .. } => {
+                apply_my_move(pos, self.my_color, mv, *captured, None).then_some(0.0)
+            }
+            // 粒子上では合法だった手が実際は反則だった: この粒子は反則を
+            // 説明できないが、盤面自体は生かす（反則手は実行されていない）
+            Constraint::MyFoul { .. } => Some(0.0),
+            Constraint::OppMove {
+                captured_at,
+                foul_count,
+                my_foul_count,
+                ..
+            } => sample_opp_move(
+                pos,
+                self.my_color,
+                *captured_at,
+                None,
+                *foul_count,
+                *my_foul_count,
+                &self.my_capture_sq,
+                &self.my_touched_sq,
+                &Guide::default(),
+                &mut self.rng,
+            ),
+        }
+    }
+
+    /// depth-major の若返りバッチ: **浅い巻き戻しを全粒子に先に試し、だめなら
+    /// 深くする**。1粒子に深い試行を使い切るより、多様な粒子の浅い修復を
+    /// 先に広く拾うほうが予算効率がよい（kakunari c42 の教訓: 深い巻き戻しが
+    /// 必要な needle では、粒子ごとの深さ内訳よりバッチ全体の深さ配分が効く）。
+    /// max 件修復するか deadline で打ち切り、(修復済み, 未修復) を返す
+    fn rejuvenate_batch(
         &mut self,
-        view: &PlayerView,
-        log: &ObservationLog,
-        foul_tried: &HashSet<String>,
-    ) -> Option<String>;
-
-    fn name(&self) -> &'static str;
-
-    /// 直近の choose 時点の内部状態（対局記録のデバッグ用）。推定系のみ実装する
-    fn debug_state(&self) -> Option<serde_json::Value> {
-        None
-    }
-
-    /// 直近の choose 時点の全候補評価（スコア降順）。scenario-gui のデバッグ表示用。
-    /// 現行 estimator のみ実装する（凍結版は編集しないので既定 None のまま）。
-    /// 定跡で指した手番・候補ゼロの手番は None
-    fn last_ranking(&self) -> Option<&[CandidateScore]> {
-        None
-    }
-
-    /// 観測ログを内部推定器に先行反映する（候補評価はしない）。
-    /// 実対局では choose が自分の手番ごとに呼ばれて推定器が逐次更新される
-    /// （リプレイ予算も手番ごとに与えられる）。局面再現実験（bin/scenario）が
-    /// 履歴の途中時点の update を再現するために使う。既定は何もしない
-    fn prewarm(&mut self, _view: &PlayerView, _log: &ObservationLog) {}
-}
-
-/// 蓄積済みの観測ログを「自分の手番ごとの逐次 update」で戦略に温めさせる。
-/// 一括 update だとリプレイ予算が1回分しか与えられず、長い履歴では粒子が
-/// 完全枯渇する（kakunari の69手を一括で食わせるとユニーク粒子0になる）。
-/// bin/scenario.rs（棋譜の途中局面再現）と webhook_session.rs
-/// （プロセス再起動後などのコールドスタート復元）の両方が使う共通部品
-pub fn prewarm_strategy(strat: &mut dyn Strategy, view: &PlayerView, full: &ObservationLog) {
-    prewarm_strategy_with_budget(strat, view, full, None);
-}
-
-/// 履歴を逐次prewarmするが、HTTP webhookのコールドスタートなどでは時間上限を
-/// 設ける。途中で打ち切っても、次の choose が残りのイベントを通常updateする。
-pub fn prewarm_strategy_with_budget(
-    strat: &mut dyn Strategy,
-    view: &PlayerView,
-    full: &ObservationLog,
-    max_duration: Option<Duration>,
-) {
-    let deadline = max_duration.map(|d| Instant::now() + d);
-    let mut running = ObservationLog::default();
-    for e in full.events() {
-        if matches!(e, Observation::MyMove { .. } | Observation::MyFoul { .. }) {
-            if deadline.is_some_and(|d| Instant::now() >= d) {
+        failed: Vec<Rejected>,
+        upto: usize,
+        current: Option<&Constraint>,
+        max: usize,
+        deadline: std::time::Instant,
+    ) -> (Vec<Repaired>, Vec<Rejected>) {
+        let mut repaired = vec![];
+        let mut pool: Vec<Option<Rejected>> = failed.into_iter().map(Some).collect();
+        // deadline まで depth スイープを周回する（1周の固定試行で打ち切ると
+        // 予算が余る。毎周 rng が進むので同じ粒子でも別の経路を引ける）
+        'outer: loop {
+            let mut attempts = 0usize;
+            for &depth in &REJUV_DEPTHS {
+                for slot in pool.iter_mut() {
+                    if repaired.len() >= max || std::time::Instant::now() > deadline {
+                        break 'outer;
+                    }
+                    let Some(f) = slot else { continue };
+                    let hist = &f.3;
+                    if depth > hist.len() {
+                        continue;
+                    }
+                    let snap = &hist[hist.len() - depth];
+                    if snap.cidx == upto || upto - snap.cidx > GRAVEYARD_MAX_SEGMENT {
+                        continue;
+                    }
+                    attempts += 1;
+                    for _ in 0..REJUV_TRIES {
+                        if let Some(out) = self.replay_segment(snap, hist, upto, current) {
+                            repaired.push(out);
+                            *slot = None;
+                            break;
+                        }
+                    }
+                }
+            }
+            // 試行対象がもう無い（全修復 or 全 stale）なら周回しても無駄
+            if attempts == 0 {
                 break;
             }
-            strat.prewarm(view, &running);
         }
-        running.record(e.clone());
+        let still: Vec<Rejected> = pool.into_iter().flatten().collect();
+        (repaired, still)
     }
+
+    /// 巻き戻し区間のリプレイ: snap の状態から constraints[snap.cidx..upto] と
+    /// current（upto 位置の未登録制約。None なら constraints のみ）を再適用する。
+    /// 相手決定点は制約後読みガイド付きでサンプルし、重み補正（ln r + ln p/g）を
+    /// logw へ累積する。logw はスナップショット値から再出発する（旧セグメントの
+    /// 累積は捨てる = 二重計上なし）。成功時は新しいスナップショット窓も返す
+    fn replay_segment(
+        &mut self,
+        snap: &Snap,
+        hist: &VecDeque<Snap>,
+        upto: usize,
+        current: Option<&Constraint>,
+    ) -> Option<Repaired> {
+        let mut pos = snap.pos.clone();
+        let mut lw = snap.logw;
+        let miss = snap.miss;
+        let taint = snap.taint;
+        // 巻き戻し先より前のスナップショットは有効（snap.cidx のエントリは
+        // 「この決定の適用前」の状態なので、引き直し後もそのまま正しい）。
+        // wipe をまたぐエントリはエポック正規化済みなのでそのまま使える
+        let mut new_hist: VecDeque<Snap> =
+            hist.iter().filter(|s| s.cidx <= snap.cidx).cloned().collect();
+        let end = upto + usize::from(current.is_some());
+        for i in snap.cidx..end {
+            let c: &Constraint = if i < upto {
+                &self.constraints[i]
+            } else {
+                current.expect("i == upto は current がある場合のみ")
+            };
+            let ok = match c {
+                Constraint::MyMove {
+                    mv,
+                    captured,
+                    gives_check,
+                } => apply_my_move(&mut pos, self.my_color, mv, *captured, Some(*gives_check)),
+                Constraint::MyFoul { mv } => foul_consistent(&pos, self.my_color, mv),
+                Constraint::OppMove {
+                    captured_at,
+                    gives_check,
+                    foul_count,
+                    my_foul_count,
+                } => {
+                    if i > snap.cidx {
+                        if new_hist.len() == REJUV_SNAPSHOTS {
+                            new_hist.pop_front();
+                        }
+                        new_hist.push_back(Snap {
+                            cidx: i,
+                            pos: pos.clone(),
+                            logw: lw,
+                            miss,
+                            taint,
+                        });
+                    }
+                    let k = self.my_capture_idx.partition_point(|&j| j < i);
+                    let t = self.my_touched_idx.partition_point(|&j| j < i);
+                    let guide = self.build_guide(i, upto, current);
+                    match sample_opp_move(
+                        &mut pos,
+                        self.my_color,
+                        *captured_at,
+                        Some(*gives_check),
+                        *foul_count,
+                        *my_foul_count,
+                        &self.my_capture_sq[..k],
+                        &self.my_touched_sq[..t],
+                        &guide,
+                        &mut self.rng,
+                    ) {
+                        Some(dlw) => {
+                            lw += dlw;
+                            true
+                        }
+                        None => false,
+                    }
+                }
+            };
+            if !ok {
+                self.note_fail(i);
+                return None;
+            }
+        }
+        Some((pos, miss, lw, new_hist, taint))
+    }
+
+    /// 制約後読みガイド: 決定点 i の後（最大 GUIDE_HORIZON 制約先まで）から
+    /// 状態条件を集める。
+    /// - MyMove(to=X, captured=R) → 「X に相手の R が立つ」（lands）
+    /// - OppMove(captured_at=X) → 「X へ利きを作る」（attacks。取り返しには
+    ///   X に利く駒が事前に必要 — kakunari の同桂成の型）
+    /// - MyFoul(自玉が X への移動を試みて反則) → 「X は他の相手駒に守られて
+    ///   いる」ことが確定する（自玉の移動は経路遮蔽が起きないので、反則の
+    ///   理由は必ず「移動先が相手の利きにある」）。「X へ利きを作る」という
+    ///   意味では attacks と同じブースト対象なので同じ場に積む（新しい
+    ///   フィールドは作らない。窓探索実験で確認した mover/defender 構成の
+    ///   考え方を、既存の重み付きサンプリングへ再利用する形）
+    /// - MyFoul(打ち to=X, 王手中でない) → 「X に相手駒がいる」ことがほぼ確定
+    ///   する（二歩・行き所のない駒は自分の情報だけで候補から除外済みなので、
+    ///   残る理由は着地マスの占有がほぼ全て。王手中は「合駒のはずが実は違う
+    ///   ラインだった」という別説明があるので除外する）→ occupies
+    /// upto 位置には current（未登録の制約）が入る。None なら constraints のみ
+    fn build_guide(&self, i: usize, upto: usize, current: Option<&Constraint>) -> Guide {
+        let mut guide = Guide::default();
+        // king_at は O(1) 参照（king_square_before の全体再走査版は廃止）。
+        // i が未記録の最新位置なら self.my_king が正しい値
+        let mut king = self.king_at.get(i).copied().unwrap_or(self.my_king);
+        for j in (i + 1)..=(i + GUIDE_HORIZON) {
+            let c = match j.cmp(&upto) {
+                std::cmp::Ordering::Less => &self.constraints[j],
+                std::cmp::Ordering::Equal => match current {
+                    Some(c) => c,
+                    None => break,
+                },
+                std::cmp::Ordering::Greater => break,
+            };
+            match c {
+                Constraint::MyMove {
+                    mv,
+                    captured: Some(role),
+                    ..
+                } => {
+                    let to = match *mv {
+                        ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+                    };
+                    guide.lands.push((to, *role));
+                    guide.approach.push((*role, to));
+                }
+                Constraint::OppMove {
+                    captured_at: Some(at),
+                    ..
+                } => guide.attacks.push(*at),
+                Constraint::MyFoul {
+                    mv: ShogiMove::Board { from, to, .. },
+                } if *from == king && !defend_guide_disabled() => {
+                    guide.attacks.push(*to);
+                }
+                Constraint::MyFoul {
+                    mv: ShogiMove::Drop { to, role },
+                } if *role != Role::Pawn
+                    && !self.in_check_at.get(j).copied().unwrap_or(self.in_check)
+                    && !defend_guide_disabled() =>
+                {
+                    // 歩打ちだけは打ち歩詰め（自分からは判定不能: 相手玉の位置が
+                    // 見えないので王手/詰みの成否を検証できない）という別の反則
+                    // 理由がありうるため除外する（codex 指摘、2026-07-19）
+                    guide.occupies.push(*to);
+                }
+                _ => {}
+            }
+            // ガイド窓の中でも自玉が動く可能性があるので追跡を続ける
+            if let Constraint::MyMove {
+                mv: ShogiMove::Board { from, to, .. },
+                ..
+            } = c
+            {
+                if *from == king {
+                    king = *to;
+                }
+            }
+        }
+        guide
+    }
+
+    /// 粒子が減っていたら、制約列のリプレイ（多様性）と生存粒子の複製（安価）で補充。
+    /// 枯渇時は時間予算いっぱいまでリプレイで粘る（観測が正しい限り整合局面は必ず存在する）。
+    /// リプレイ1回のコストは手数に比例するため、回数と時間の両方で打ち切る
+    fn replenish(&mut self) {
+        let start = std::time::Instant::now();
+        let regen_deadline = start + std::time::Duration::from_millis(self.regen_deadline_ms);
+        // 墓場からの復活（C-7 P2）: 厳密生存がゼロなら、保管してある棄却粒子の
+        // スナップショットから若返りを試みる。初期局面からの前向きリプレイより
+        // 成功率がはるかに高い（巻き戻し幅が窓に収まるため）。制約列が伸びて
+        // stale になったエントリは破棄する。
+        // logw のスケール: ソフトが生きている（集団のスケールが継続している）
+        // ときは snap.logw から再出発（rebase なし）、完全全滅後の再建なら
+        // rebase 規約（0 起点、rebase_cidx 以降のみ課金）で揃える
+        let strict0 = self
+            .info_miss
+            .iter()
+            .zip(&self.phys_taint)
+            .filter(|&(&m, &t)| m == 0 && t == 0)
+            .count();
+        if strict0 < self.target / 4 && !self.graveyard.is_empty() {
+            let n = self.constraints.len();
+            self.graveyard.retain(|(_, _, _, hist, _)| {
+                hist.back().is_some_and(|s| n - s.cidx <= GRAVEYARD_MAX_SEGMENT)
+            });
+            let graveyard = std::mem::take(&mut self.graveyard);
+            // 全滅時（ブラインド確定）は empty 予算まで使って復活に賭ける。
+            // 復活の成功機会は全滅直後の数ターンに集中する（セグメントが
+            // 伸びるほど needle が累積して通らなくなる）
+            let budget_ms = if self.particles.is_empty() {
+                self.empty_deadline_ms
+            } else {
+                self.regen_deadline_ms
+            };
+            let deadline = start + std::time::Duration::from_millis(budget_ms);
+            let (repaired, still) =
+                self.rejuvenate_batch(graveyard, n, None, self.target / 4, deadline);
+            for (pos, pen, lw, hist, taint) in repaired {
+                self.revived += 1;
+                self.particles.push(pos);
+                self.info_miss.push(pen);
+                self.logw.push(lw);
+                self.hist.push(hist);
+                self.phys_taint.push(taint);
+            }
+            // 修復できなかった分は墓場に残す（stale で自然消滅）
+            self.graveyard = still;
+        }
+        // リプレイの目標は「厳密整合の粒子数」。ソフト粒子で頭数が足りていても
+        // 厳密粒子が薄ければリプレイで置き換えにいく（ソフトはあくまで近似）
+        let mut strict = self
+            .info_miss
+            .iter()
+            .zip(&self.phys_taint)
+            .filter(|&(&m, &t)| m == 0 && t == 0)
+            .count();
+        if strict < self.target {
+            for _ in 0..self.regen_attempts {
+                if strict >= self.target || std::time::Instant::now() > regen_deadline {
+                    break;
+                }
+                if let Some((pos, lw, hist)) = self.replay_once() {
+                    self.particles.push(pos);
+                    self.info_miss.push(0);
+                    self.logw.push(lw);
+                    self.hist.push(hist);
+                    self.phys_taint.push(0);
+                    strict += 1;
+                }
+            }
+        }
+        let deadline = start + std::time::Duration::from_millis(self.empty_deadline_ms);
+        while self.particles.is_empty() && std::time::Instant::now() < deadline {
+            if let Some((pos, lw, hist)) = self.replay_once() {
+                self.particles.push(pos);
+                self.info_miss.push(0);
+                self.logw.push(lw);
+                self.hist.push(hist);
+                self.phys_taint.push(0);
+            }
+        }
+        // ラッチしない: 粒子が戻れば健全に戻る（呼び出し側は毎手 update する）
+        self.healthy = !self.particles.is_empty();
+        if self.particles.is_empty() {
+            return;
+        }
+        // 溢れの整理: info_miss 昇順（厳密優先）→ logw 降順で target まで絞る
+        if self.particles.len() > self.target {
+            let mut quints: Vec<(u8, u8, f64, Position, VecDeque<Snap>)> =
+                std::mem::take(&mut self.info_miss)
+                    .into_iter()
+                    .zip(std::mem::take(&mut self.phys_taint))
+                    .zip(std::mem::take(&mut self.logw))
+                    .zip(std::mem::take(&mut self.particles))
+                    .zip(std::mem::take(&mut self.hist))
+                    .map(|((((pen, taint), lw), pos), hist)| (taint, pen, lw, pos, hist))
+                    .collect();
+            quints.sort_by(|a, b| {
+                (a.0, a.1)
+                    .cmp(&(b.0, b.1))
+                    .then(b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
+            });
+            quints.truncate(self.target);
+            for (taint, pen, lw, pos, hist) in quints {
+                self.info_miss.push(pen);
+                self.phys_taint.push(taint);
+                self.logw.push(lw);
+                self.particles.push(pos);
+                self.hist.push(hist);
+            }
+        }
+        // ESS 監視（C-7 P1 / D2）: 重みが退化していたら systematic resampling で
+        // 質量を複製数へ実現し logw をリセットする。退化していないが頭数が
+        // 足りないときは質量保存の分割複製で埋める（logw の相対値 = 評価側の
+        // 重み付けを崩さずに、次の相手手サンプルで分岐する多様性の種を蒔く）
+        let m = self.particles.len();
+        let max_lw = self.logw.iter().copied().fold(f64::MIN, f64::max);
+        let ws: Vec<f64> = self.logw.iter().map(|&lw| (lw - max_lw).exp()).collect();
+        let total: f64 = ws.iter().sum();
+        let sum2: f64 = ws.iter().map(|w| w * w).sum();
+        self.last_ess = if sum2 > 0.0 { total * total / sum2 } else { 0.0 };
+        if self.last_ess < m as f64 * ESS_THRESHOLD {
+            self.systematic_resample(&ws, total);
+            self.resamples += 1;
+        } else if m < self.target {
+            self.split_fill(&ws, total);
+        }
+    }
+
+    /// systematic resampling: 正規化重み比例で target 個へ複製し logw を
+    /// リセットする（質量が複製数へ実現される）。低分散・O(n)。
+    /// info_miss は各コピーへ引き継ぐ（較正・上限管理はカウンタが担う）。
+    /// スナップショットの logw もリセットと同じ量シフトする（相対会計の保存:
+    /// 巻き戻し時に「旧セグメント分を新セグメント分へ差し替える」が成り立つ）
+    fn systematic_resample(&mut self, ws: &[f64], total: f64) {
+        let m = self.particles.len();
+        let want = self.target;
+        let step = total / want as f64;
+        let mut u = self.rng.random_range(0.0..step);
+        let mut new_pos = Vec::with_capacity(want);
+        let mut new_miss = Vec::with_capacity(want);
+        let mut new_hist = Vec::with_capacity(want);
+        let mut new_taint = Vec::with_capacity(want);
+        let mut i = 0usize;
+        let mut cum = ws[0];
+        for _ in 0..want {
+            while cum < u && i + 1 < m {
+                i += 1;
+                cum += ws[i];
+            }
+            new_pos.push(self.particles[i].clone());
+            new_miss.push(self.info_miss[i]);
+            new_taint.push(self.phys_taint[i]);
+            let mut h = self.hist[i].clone();
+            shift_hist(&mut h, -self.logw[i]);
+            new_hist.push(h);
+            u += step;
+        }
+        self.particles = new_pos;
+        self.info_miss = new_miss;
+        self.logw = vec![0.0; want];
+        self.hist = new_hist;
+        self.phys_taint = new_taint;
+        // 以後の新規リプレイ粒子はここ以降の累積だけを課金する（スケール整合）
+        self.rebase_cidx = self.constraints.len();
+    }
+
+    /// 質量保存の分割複製: 重み比例で複製先を選び、同一個体群（元+コピー）で
+    /// exp(logw) を等分する。指紋ごとの合計質量が変わらないため、評価側の
+    /// multiplicity 畳み込みと二重に効かない（旧複製埋めの後継）。
+    /// スナップショットの logw も同じ量シフトする（相対会計の保存）
+    fn split_fill(&mut self, ws: &[f64], total: f64) {
+        let m = self.particles.len();
+        let mut cum = Vec::with_capacity(m);
+        let mut acc = 0.0f64;
+        for &w in ws {
+            acc += w;
+            cum.push(acc);
+        }
+        let mut copies = vec![0usize; m];
+        for _ in m..self.target {
+            let t = self.rng.random_range(0.0..total);
+            let i = cum.partition_point(|&c| c < t).min(m - 1);
+            copies[i] += 1;
+        }
+        for (i, &c) in copies.iter().enumerate() {
+            if c == 0 {
+                continue;
+            }
+            let d = -(((c + 1) as f64).ln());
+            self.logw[i] += d;
+            shift_hist(&mut self.hist[i], d);
+            let share = self.logw[i];
+            for _ in 0..c {
+                self.particles.push(self.particles[i].clone());
+                self.info_miss.push(self.info_miss[i]);
+                self.logw.push(share);
+                self.hist.push(self.hist[i].clone());
+                self.phys_taint.push(self.phys_taint[i]);
+            }
+        }
+    }
+
+    /// 制約列を最初からリプレイして整合する粒子を1つ作る。
+    ///
+    /// 相手手のサンプルは確率的なので、後続の制約（自分の手の合法性・反則・
+    /// 取られたマス・王手宣言）と矛盾して失敗しうる。全部やり直すと手数に対して
+    /// 成功率が指数的に落ちるため、失敗したら直近の決定点（相手手）まで戻って
+    /// 引き直す限定バックトラックにする。ステップ予算で最悪時間を抑える。
+    /// 相手決定点は制約後読みガイド付きでサンプルする（C-7 P2。重み補正で
+    /// 正直に払うので分布は歪まない）。成功時は若返り窓（直近決定点の
+    /// スナップショット）も返す
+    fn replay_once(&mut self) -> Option<(Position, f64, VecDeque<Snap>)> {
+        let n = self.constraints.len();
+        let step_budget = n * 4 + 32;
+        let mut steps = 0usize;
+        let mut pos = Position::initial();
+        let mut lw = 0.0f64;
+        // 決定点スタック: (制約index, 適用前の局面, 適用前の対数重み, 再試行回数)
+        let mut stack: Vec<(usize, Position, f64, u32)> = vec![];
+        let mut i = 0;
+        while i < n {
+            steps += 1;
+            if steps > step_budget {
+                return None;
+            }
+            let ok = match &self.constraints[i] {
+                Constraint::MyMove {
+                    mv,
+                    captured,
+                    gives_check,
+                } => apply_my_move(&mut pos, self.my_color, mv, *captured, Some(*gives_check)),
+                Constraint::MyFoul { mv } => foul_consistent(&pos, self.my_color, mv),
+                Constraint::OppMove {
+                    captured_at,
+                    gives_check,
+                    foul_count,
+                    my_foul_count,
+                } => {
+                    // バックトラックで戻ってきた再訪なら積み直さない
+                    let is_retry = stack.last().is_some_and(|(j, _, _, _)| *j == i);
+                    if !is_retry {
+                        stack.push((i, pos.clone(), lw, 0));
+                    }
+                    // この時点までに自分が駒を取ったマス／触れたマス
+                    let k = self.my_capture_idx.partition_point(|&j| j < i);
+                    let t = self.my_touched_idx.partition_point(|&j| j < i);
+                    let guide = self.build_guide(i, n, None);
+                    match sample_opp_move(
+                        &mut pos,
+                        self.my_color,
+                        *captured_at,
+                        Some(*gives_check),
+                        *foul_count,
+                        *my_foul_count,
+                        &self.my_capture_sq[..k],
+                        &self.my_touched_sq[..t],
+                        &guide,
+                        &mut self.rng,
+                    ) {
+                        Some(dlw) => {
+                            // logw は再ベース点以降だけ課金する（リサンプリングで
+                            // 0 に再ベースされた生存粒子とのスケール合わせ。
+                            // それ以前の質量は「集団の典型と同じ」とみなす近似）
+                            if i >= self.rebase_cidx {
+                                lw += dlw;
+                            }
+                            true
+                        }
+                        None => false,
+                    }
+                }
+            };
+            if ok {
+                i += 1;
+                continue;
+            }
+            self.note_fail(i);
+            // 失敗: 直近の決定点に戻って引き直す。試行を使い切った点はさらに前へ
+            loop {
+                let Some((j, snapshot, snapshot_lw, attempts)) = stack.pop() else {
+                    return None;
+                };
+                // 失敗した制約自身が決定点なら、同じ局面からの再試行は無意味
+                // （整合候補ゼロは決定的）なのでさらに前へ戻る
+                if j == i {
+                    continue;
+                }
+                if attempts + 1 < BACKTRACK_ATTEMPTS {
+                    pos = snapshot.clone();
+                    lw = snapshot_lw;
+                    stack.push((j, snapshot, snapshot_lw, attempts + 1));
+                    i = j;
+                    break;
+                }
+            }
+        }
+        // スタックには全決定点の適用前状態が積まれている（成功時は pop されない）
+        // ので、末尾 REJUV_SNAPSHOTS 件がそのまま若返り窓になる
+        let hist: VecDeque<Snap> = stack
+            .iter()
+            .rev()
+            .take(REJUV_SNAPSHOTS)
+            .rev()
+            .map(|(j, p, l, _)| Snap {
+                cidx: *j,
+                pos: p.clone(),
+                logw: *l,
+                miss: 0,
+                taint: 0,
+            })
+            .collect();
+        Some((pos, lw, hist))
+    }
+}
+
+/// 受理された自分の手を粒子に適用する。粒子と観測が矛盾したら false。
+/// gives_check が None のときは王手宣言との一致を検査しない（ソフト救済用）
+fn apply_my_move(
+    pos: &mut Position,
+    my_color: Color,
+    mv: &ShogiMove,
+    captured: Option<Role>,
+    gives_check: Option<bool>,
+) -> bool {
+    if pos.turn() != my_color || !pos.is_legal(mv) {
+        return false;
+    }
+    let actual = pos.play_unchecked(mv).map(unpromote_role);
+    if actual != captured {
+        return false;
+    }
+    gives_check.is_none_or(|gc| pos.in_check(my_color.other()) == gc)
+}
+
+/// 反則になった手との整合: 粒子上でも非合法であること
+fn foul_consistent(pos: &Position, my_color: Color, mv: &ShogiMove) -> bool {
+    pos.turn() == my_color && !pos.is_legal(mv)
+}
+
+/// 物理不整合の粒子への制約の強制適用（ε_phys の最後の砦専用）。
+/// 自分側の状態（自駒配置・持ち駒・手番）は真実と同期させ、相手側は
+/// 分かる範囲（取られた自駒 → 相手の持ち駒）だけ反映する。結果の盤面は
+/// 観測と厳密整合しない近似なので、評価側は玉位置系の用途に限定すること
+fn force_apply(pos: &mut Position, my_color: Color, constraint: &Constraint) {
+    match constraint {
+        Constraint::MyMove { mv, captured, .. } => {
+            // 盤面: 自駒を強制移動（to の相手駒は盤から消えるだけ）。
+            // 持ち駒: **観測された captured（真実）**だけを加える — 粒子上の
+            // 嘘の駒種で自分の持ち駒を汚さない（codex P3 レビュー指摘）。
+            // 合法時の play_unchecked も同じ理由で使わない（粒子上の to の駒種が
+            // 真実と違うと持ち駒がズレる）
+            match *mv {
+                ShogiMove::Board { from, to, promote } => {
+                    if let Some(mut p) =
+                        pos.piece_at(from).filter(|p| p.color == my_color)
+                    {
+                        if promote {
+                            if let Some(pr) = promote_role(p.role) {
+                                p.role = pr;
+                            }
+                        }
+                        pos.set(from, None);
+                        pos.set(to, Some(p));
+                    }
+                }
+                ShogiMove::Drop { role, to } => {
+                    // 真実では打てた手なので必ず置く（粒子の持ち駒は saturating）
+                    let h = pos.hand_count(my_color, role);
+                    pos.set_hand(my_color, role, h.saturating_sub(1));
+                    pos.set(
+                        to,
+                        Some(Piece {
+                            color: my_color,
+                            role,
+                        }),
+                    );
+                }
+            }
+            if let Some(r) = captured {
+                pos.set_hand(my_color, *r, pos.hand_count(my_color, *r) + 1);
+            }
+            pos.set_turn(my_color.other());
+        }
+        // 反則は指されていないので盤面維持（説明できない、は情報系の嘘として飲む）
+        Constraint::MyFoul { .. } => {}
+        Constraint::OppMove { captured_at, .. } => {
+            // 幽霊取り: 取られた自駒だけ盤から除き、相手の持ち駒へ移す
+            // （どの相手駒が来たかは分からないので相手駒は置かない）
+            if let Some(sq) = captured_at {
+                if let Some(p) = pos.piece_at(*sq).filter(|p| p.color == my_color) {
+                    let r = unpromote_role(p.role);
+                    let opp = my_color.other();
+                    pos.set_hand(opp, r, pos.hand_count(opp, r) + 1);
+                    pos.set(*sq, None);
+                }
+            }
+            pos.set_turn(my_color);
+        }
+    }
+}
+
+/// 動かした駒（着地点）が対象マスのどれかへ新たに利きを付けたか。
+/// 「新たに」= 移動元からは利いていなかった（打ちは常に新規）。
+/// **定義は bin/fit_opp の newly_threatens と一致させること**（学習と推論の整合）
+fn newly_threatens(pos: &Position, next: &Position, mv: &ShogiMove, targets: &[Coord]) -> bool {
+    let to = match *mv {
+        ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+    };
+    targets.iter().any(|&s| {
+        if s == to || !next.attacks(to, s) {
+            return false;
+        }
+        match *mv {
+            ShogiMove::Board { from, .. } => !pos.attacks(from, s),
+            ShogiMove::Drop { .. } => true,
+        }
+    })
+}
+
+/// 観測と整合する相手の合法手をサンプルして適用する。整合手がなければ None。
+/// 成功時は対数重みの増分 Δlogw = ln(r) + ln(p_class/g_class) を返す
+/// （SIR の重み更新。r = 整合クラスの素の事前質量 / 全合法手の素の事前質量、
+/// p/g = クラス内での素の事前分布／ガイド付き提案分布における選択手の確率。
+/// guide が空なら g = p で補正は 0、従来の ln(r) に一致する）。
+/// - gives_check: None なら王手宣言との一致を検査しない（ソフト救済用）
+/// - known_squares: 自分が駒を取ったマス（相手は自駒がそこで死んだことを知っている）
+/// - my_touched: 自分の手が触れたマス（初期配置のまま動いていない自駒の判定用。
+///   相手はそれらを推論で狙ってくる = 飛車頭への歩打ち等）
+/// - guide: 制約後読みガイド（若返り・リプレイ用）。該当手を GUIDE_BOOST 倍した
+///   提案分布から選ぶ。マスクはしない（成功しうる素の経路を提案の台から消すと
+///   補正が定義できない）
+#[allow(clippy::too_many_arguments)]
+fn sample_opp_move(
+    pos: &mut Position,
+    my_color: Color,
+    captured_at: Option<Coord>,
+    gives_check: Option<bool>,
+    foul_count_this_turn: u32,
+    my_foul_count_last_turn: u32,
+    known_squares: &[Coord],
+    my_touched: &[Coord],
+    guide: &Guide,
+    rng: &mut StdRng,
+) -> Option<f64> {
+    let opp = my_color.other();
+    if pos.turn() != opp {
+        return None;
+    }
+    // 初期配置から動いていない自駒のマス（粒子内の実配置と突き合わせる）
+    let initial = Position::initial();
+    let homes: Vec<Coord> = initial
+        .pieces()
+        .filter(|(sq, p)| {
+            p.color == my_color
+                && !my_touched.contains(sq)
+                && pos
+                    .piece_at(*sq)
+                    .is_some_and(|cur| cur.color == my_color && cur.role == p.role)
+        })
+        .map(|(sq, _)| sq)
+        .collect();
+
+    // (手, 素の重み w, ガイド後の提案重み g)
+    let mut candidates: Vec<(ShogiMove, f64, f64)> = vec![];
+    let mut total_mass = 0.0f64;
+    for mv in pos.legal_moves() {
+        // 取られたマスとの整合（取りがなかったなら自駒のあるマスへは来ていない）
+        let to_capture = match mv {
+            ShogiMove::Board { to, .. } => pos
+                .piece_at(to)
+                .filter(|p| p.color == my_color)
+                .map(|p| (to, p.role)),
+            ShogiMove::Drop { .. } => None,
+        };
+        let capture_ok = match (captured_at, to_capture) {
+            (Some(at), Some((to, _))) => at == to,
+            (None, None) => true,
+            _ => false,
+        };
+        let mut next = pos.clone();
+        next.play_unchecked(&mv);
+        // 分母（total_mass）には全合法手の重みが要るが、王手判定はクラス判定に
+        // しか使わないので capture_ok の短絡で省く（in_check は比較的重い）
+        let consistent =
+            capture_ok && gives_check.is_none_or(|gc| next.in_check(my_color) == gc);
+        let threat_known = newly_threatens(pos, &next, &mv, known_squares);
+        let threat_home = newly_threatens(pos, &next, &mv, &homes);
+        let (is_king, flee) = match mv {
+            ShogiMove::Board { from, to, .. } => {
+                let is_king = pos.piece_at(from).is_some_and(|p| p.role == Role::King);
+                (is_king, is_king && flees_danger(from, to, known_squares))
+            }
+            ShogiMove::Drop { .. } => (false, false),
+        };
+        let w = opp_move_weight(
+            pos,
+            opp,
+            &mv,
+            threat_known,
+            threat_home,
+            is_king,
+            flee,
+            moved_is_minor(pos, &mv),
+            deep_unsupported(&next, &mv, opp),
+            hangs_on_landing(pos, &next, &mv, opp),
+            foul_count_this_turn,
+            my_foul_count_last_turn,
+            moved_from_known_attacked(pos, &mv, opp, known_squares),
+        );
+        total_mass += w;
+        if consistent {
+            let g = w * guide_boost_factor(pos, &next, &mv, guide, opp);
+            candidates.push((mv, w, g));
+        }
+    }
+    // 選択はガイド後の提案分布 g から。補正はクラス内確率の比 p/g で払う
+    let idx = weighted_choice_idx(candidates.iter().map(|(_, _, g)| *g), rng)?;
+    let class_mass: f64 = candidates.iter().map(|(_, w, _)| w).sum();
+    let guide_mass: f64 = candidates.iter().map(|(_, _, g)| g).sum();
+    let (chosen, w_c, g_c) = &candidates[idx];
+    pos.play_unchecked(chosen);
+    // weighted_choice_idx が成功した時点で class_mass > 0、total_mass ≥ class_mass
+    let r = (class_mass / total_mass).min(1.0);
+    Some(r.ln() + (w_c / class_mass).ln() - (g_c / guide_mass).ln())
+}
+
+/// 多段ガイドの接近ブースト倍率（GUIDE_BOOST より弱め。「向かっている」だけで
+/// 確定ではないため、exact landing/attacks ほど強くは信じない）
+const GUIDE_APPROACH_BOOST: f64 = 3.0;
+
+/// ガイド条件に合う手のブースト倍率（1.0 = ブーストなし）:
+/// - lands: マス sq に（成りを剥がした）駒種 role を立てる手 → GUIDE_BOOST。
+///   取得駒の観測（captured）は unpromote 済みの駒種なので、成り駒も剥がして照合
+/// - occupies: マス sq に駒種を問わず着地する手（打ちマス反則由来）→ GUIDE_BOOST
+/// - attacks: 着地点から対象マスへ利きを作る手（取り返しの事前準備）→ GUIDE_BOOST
+/// - approach（多段ガイド）: 駒種が一致し、空盤上の最短手数（deduce の BFS）が
+///   目的地へ真に縮む手 → GUIDE_APPROACH_BOOST。1手先しか見ない lands/attacks
+///   では拾えない「複数手先の目的地への接近」を弱くブーストする
+fn guide_boost_factor(pos: &Position, next: &Position, mv: &ShogiMove, guide: &Guide, mover: Color) -> f64 {
+    if guide.is_empty() {
+        return 1.0;
+    }
+    let (to, role, from) = match *mv {
+        ShogiMove::Board { from, to, .. } => match pos.piece_at(from) {
+            Some(p) => (to, unpromote_role(p.role), Some(from)),
+            None => return 1.0,
+        },
+        ShogiMove::Drop { to, role } => (to, role, None),
+    };
+    if guide.lands.iter().any(|&(sq, r)| sq == to && r == role) {
+        return GUIDE_BOOST;
+    }
+    if guide.occupies.iter().any(|&sq| sq == to) {
+        return GUIDE_BOOST;
+    }
+    if guide.attacks.iter().any(|&sq| sq != to && next.attacks(to, sq)) {
+        return GUIDE_BOOST;
+    }
+    if let Some(from) = from {
+        for &(r, target) in &guide.approach {
+            if r != role || target == to {
+                continue; // target==to は既に lands で処理済み（二重ブースト回避）
+            }
+            let before = crate::deduce::distance_empty_board(role, mover, from, target, false)
+                .into_iter()
+                .chain(crate::deduce::distance_empty_board(
+                    role, mover, from, target, true,
+                ))
+                .min();
+            let after = crate::deduce::distance_empty_board(role, mover, to, target, false)
+                .into_iter()
+                .chain(crate::deduce::distance_empty_board(role, mover, to, target, true))
+                .min();
+            if let (Some(b), Some(a)) = (before, after) {
+                if a < b {
+                    return GUIDE_APPROACH_BOOST;
+                }
+            }
+        }
+    }
+    1.0
+}
+
+/// 露見マス（自分が駒を取った=相手に通知されたマス）での取り返しブースト。
+/// 事前分布のフィットでは駒取りは観測条件で絞られるため学習されていない。
+/// 対人実戦では露見駒の回収はほぼ必ず実行されるので予測では強く優先する
+const PREDICT_RECAPTURE_BOOST: f64 = 8.0;
+
+/// 相手の応手を事前分布モデルで1手サンプルする（2手読み用の予測）。
+/// sample_opp_move と同じ尤度モデルだが、これから指される手の予測なので
+/// 観測（取られたマス・王手宣言）による絞り込みは行わない。
+/// known_squares / my_touched の意味は sample_opp_move と同じ
+pub fn predict_opp_reply<R: Rng>(
+    pos: &Position,
+    my_color: Color,
+    known_squares: &[Coord],
+    my_touched: &[Coord],
+    my_foul_count_this_turn: u32,
+    rng: &mut R,
+) -> Option<ShogiMove> {
+    weighted_choice(
+        &opp_reply_weights(pos, my_color, known_squares, my_touched, my_foul_count_this_turn),
+        rng,
+    )
+}
+
+/// 相手の全合法応手と方策重み（事前分布モデル＋露見マスの取り返しブースト）。
+/// 2手読みの期待値評価用: サンプルせず重み付き平均を取れる。
+/// my_foul_count_this_turn: この手番でここまでに自分が試みた反則の回数
+/// （相手は応手時にこれを反則宣言として観測している = 応手予測の
+/// my_foul_count_last_turn 特徴量）
+pub fn opp_reply_weights(
+    pos: &Position,
+    my_color: Color,
+    known_squares: &[Coord],
+    my_touched: &[Coord],
+    my_foul_count_this_turn: u32,
+) -> Vec<(ShogiMove, f64)> {
+    let opp = my_color.other();
+    if pos.turn() != opp {
+        return vec![];
+    }
+    let initial = Position::initial();
+    let homes: Vec<Coord> = initial
+        .pieces()
+        .filter(|(sq, p)| {
+            p.color == my_color
+                && !my_touched.contains(sq)
+                && pos
+                    .piece_at(*sq)
+                    .is_some_and(|cur| cur.color == my_color && cur.role == p.role)
+        })
+        .map(|(sq, _)| sq)
+        .collect();
+    let mut candidates: Vec<(ShogiMove, f64)> = vec![];
+    for mv in pos.legal_moves() {
+        let mut next = pos.clone();
+        next.play_unchecked(&mv);
+        let threat_known = newly_threatens(pos, &next, &mv, known_squares);
+        let threat_home = newly_threatens(pos, &next, &mv, &homes);
+        let (is_king, flee) = match mv {
+            ShogiMove::Board { from, to, .. } => {
+                let is_king = pos.piece_at(from).is_some_and(|p| p.role == Role::King);
+                (is_king, is_king && flees_danger(from, to, known_squares))
+            }
+            ShogiMove::Drop { .. } => (false, false),
+        };
+        // 2手読み予測はまだ起きていない相手の応手を当てるので、相手手番の
+        // 反則回数は未知（観測なし）。既定値0（実データの最頻値）を使う。
+        // 一方こちらの反則回数（my_foul_count_this_turn）は既知: 相手は
+        // 応手時にこの手番の反則宣言を観測済みのはず
+        let mut w = opp_move_weight(
+            pos,
+            opp,
+            &mv,
+            threat_known,
+            threat_home,
+            is_king,
+            flee,
+            moved_is_minor(pos, &mv),
+            deep_unsupported(&next, &mv, opp),
+            hangs_on_landing(pos, &next, &mv, opp),
+            0,
+            my_foul_count_this_turn,
+            moved_from_known_attacked(pos, &mv, opp, known_squares),
+        );
+        if let ShogiMove::Board { to, .. } = mv {
+            let captures_mine = pos.piece_at(to).is_some_and(|p| p.color == my_color);
+            if captures_mine && known_squares.contains(&to) {
+                w *= PREDICT_RECAPTURE_BOOST;
+            }
+        }
+        candidates.push((mv, w));
+    }
+    candidates
+}
+
+/// 動かす駒種（移動前の役）が歩・香・桂の小駒か。
+/// **定義は bin/fit_opp の moved_is_minor と一致させること**
+fn moved_is_minor(pos: &Position, mv: &ShogiMove) -> bool {
+    let role = match *mv {
+        ShogiMove::Board { from, .. } => pos.piece_at(from).map(|p| p.role),
+        ShogiMove::Drop { role, .. } => Some(role),
+    };
+    matches!(role, Some(Role::Pawn | Role::Lance | Role::Knight))
+}
+
+/// 相手の利きがあるマスへの紐なし着地か（取りは除く = 交換ではなく差し出し）。
+/// 利き・紐とも着地後の盤面（next）で判定する（開き駒の利きを含む）。
+/// 相手の玉の利きも数える（紐がなければ玉に取られる）。銀以上の駒での該当は
+/// 実質タダの駒捨てで人間はほぼ指さない（馬@62 のような幻の飛び込み王手の
+/// 過大評価を抑える）。**定義は opp_move_features::hangs_on_landing と一致させること**
+fn hangs_on_landing(pos: &Position, next: &Position, mv: &ShogiMove, mover: Color) -> bool {
+    let to = match *mv {
+        ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+    };
+    if pos.piece_at(to).is_some() {
+        return false; // 取り（交換の文脈）は対象外
+    }
+    let opp = mover.other();
+    let attacked = next
+        .pieces()
+        .any(|(sq, p)| p.color == opp && next.attacks(sq, to));
+    attacked
+        && !next
+            .pieces()
+            .any(|(sq, p)| p.color == mover && sq != to && next.attacks(sq, to))
+}
+
+/// 敵陣（成れる3段）への紐なし着地か。着地点に自分の別の駒の利きが無い。
+/// **定義は opp_move_features::deep_unsupported と一致させること**
+fn deep_unsupported(next: &Position, mv: &ShogiMove, mover: Color) -> bool {
+    let to = match *mv {
+        ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+    };
+    let deep = match mover {
+        Color::Sente => to.rank <= 3,
+        Color::Gote => to.rank >= 7,
+    };
+    deep && !next
+        .pieces()
+        .any(|(sq, p)| p.color == mover && sq != to && next.attacks(sq, to))
+}
+
+/// チェビシェフ距離（玉の歩数）
+fn dist(a: Coord, b: Coord) -> i8 {
+    (a.file - b.file).abs().max((a.rank - b.rank).abs())
+}
+
+/// 玉の移動が危険地点集合（自分が駒を取ったマス = 相手にとっての露見地点）から
+/// 遠ざかる手か。**定義は opp_move_features::flees_danger と一致させること**
+fn flees_danger(from: Coord, to: Coord, danger: &[Coord]) -> bool {
+    let near = |sq: Coord| danger.iter().map(|&d| dist(sq, d)).min();
+    match (near(from), near(to)) {
+        (Some(a), Some(b)) => b > a,
+        _ => false,
+    }
+}
+
+/// 位置が既知の敵駒（known 上に立つ mover の敵駒）から当たりを付けられている
+/// マスの駒（玉以外）を動かす手か（en-prise 回避）。
+/// **定義は opp_move_features::moved_from_known_attacked と一致させること**
+fn moved_from_known_attacked(
+    pos: &Position,
+    mv: &ShogiMove,
+    mover: Color,
+    known: &[Coord],
+) -> bool {
+    let ShogiMove::Board { from, .. } = *mv else {
+        return false;
+    };
+    if pos.piece_at(from).is_some_and(|p| p.role == Role::King) {
+        return false;
+    }
+    known.iter().any(|&s| {
+        s != from
+            && pos.piece_at(s).is_some_and(|p| p.color != mover)
+            && pos.attacks(s, from)
+    })
+}
+
+/// 相手の手の尤度づけ。2026-07-21、NN段階①-a: bin/fit_opp の12特徴量
+/// 線形フィット（旧実装、パープレキシティ24.2）を1隠れ層MLP
+/// （`opp_move_nn::opp_move_nn_forward`）へ置き換えた。
+/// 2026-07-22、①-b: 駒種特化ブロック（駒種one-hot・成駒・移動距離・
+/// 初期配置マスからの移動）を追加して13→23特徴量。kakutoriで露呈した
+/// 「角・飛の長距離移動を表現できない」欠陥と、home_lance_move の
+/// 駒種横断への一般化（未観測の駒は初期配置のまま）が狙い。
+/// 旧実装で別立てだった home_lance の-1.3加点は、NNが from_home×lance を
+/// 直接表現できるようになったため二重計上を避けて廃止した。
+/// 呼び出し頻度が1手の意思決定あたり最大10万回超のオーダーのため、
+/// ONNX等の推論クレートは使わず手書きforward pass（外部依存ゼロ、
+/// 数百FLOP）にしている（詳細は`opp_move_nn.rs`のモジュールコメント）
+#[allow(clippy::too_many_arguments)]
+fn opp_move_weight(
+    pos: &Position,
+    opp: Color,
+    mv: &ShogiMove,
+    threat_known: bool,
+    threat_home: bool,
+    is_king_move: bool,
+    king_flee: bool,
+    moved_minor: bool,
+    deep_unsup: bool,
+    hang: bool,
+    foul_count_this_turn: u32,
+    my_foul_count_last_turn: u32,
+    en_prise_flee: bool,
+) -> f64 {
+    let (advance, is_drop, promotes) = match *mv {
+        ShogiMove::Board { from, to, promote } => {
+            let advance = match opp {
+                Color::Sente => (from.rank - to.rank) as f64,
+                Color::Gote => (to.rank - from.rank) as f64,
+            };
+            (advance, false, promote)
+        }
+        ShogiMove::Drop { .. } => (0.0, true, false),
+    };
+    let pt = crate::opp_move_features::piece_type_features(pos, mv, opp);
+    let features = [
+        advance,
+        (promotes && moved_minor) as u8 as f64,
+        (promotes && !moved_minor) as u8 as f64,
+        is_drop as u8 as f64,
+        threat_known as u8 as f64,
+        threat_home as u8 as f64,
+        is_king_move as u8 as f64,
+        king_flee as u8 as f64,
+        (deep_unsup && moved_minor) as u8 as f64,
+        (deep_unsup && !moved_minor) as u8 as f64,
+        (hang && moved_minor) as u8 as f64,
+        (hang && !moved_minor) as u8 as f64,
+        f64::from(foul_count_this_turn),
+        pt[0],
+        pt[1],
+        pt[2],
+        pt[3],
+        pt[4],
+        pt[5],
+        pt[6],
+        pt[7],
+        pt[8],
+        pt[9],
+        f64::from(my_foul_count_last_turn),
+        en_prise_flee as u8 as f64,
+    ];
+    // クランプ: NNは訓練データの分布から外れた入力（リプレイの仮説探索中に
+    // 現れる、実戦ではまれな特徴量の組み合わせ）に対して極端なlogitを出しうる
+    // （旧線形モデルは係数が小さく手作りなので自然に有界だった）。診断で
+    // 反則中の王手駒探索（kakutori.kif）の粒子再生成コストが2〜3倍以上に
+    // 悪化する事例を確認したため、外挿時の暴走を防ぐ安全弁として導入
+    let s = crate::opp_move_nn::opp_move_nn_forward(&features).clamp(-15.0, 15.0);
+    s.exp()
+}
+
+fn weighted_choice<R: Rng>(candidates: &[(ShogiMove, f64)], rng: &mut R) -> Option<ShogiMove> {
+    let total: f64 = candidates.iter().map(|(_, w)| w).sum();
+    if candidates.is_empty() || total <= 0.0 {
+        return None;
+    }
+    let mut t = rng.random_range(0.0..total);
+    for (mv, w) in candidates {
+        t -= w;
+        if t <= 0.0 {
+            return Some(*mv);
+        }
+    }
+    candidates.last().map(|(mv, _)| *mv)
+}
+
+/// 重み比例で index を選ぶ（weighted_choice の index 版）
+fn weighted_choice_idx<R: Rng>(
+    weights: impl Iterator<Item = f64> + Clone,
+    rng: &mut R,
+) -> Option<usize> {
+    let total: f64 = weights.clone().sum();
+    if total <= 0.0 {
+        return None;
+    }
+    let mut t = rng.random_range(0.0..total);
+    let mut last = None;
+    for (i, w) in weights.enumerate() {
+        t -= w;
+        last = Some(i);
+        if t <= 0.0 {
+            return Some(i);
+        }
+    }
+    last
+}
+
+/// synth_particle が棄却サンプリングで試す回数の上限
+const SYNTH_ATTEMPTS: u32 = 64;
+
+/// C-8 MVP（直接盤面合成）: 履歴の指し手列を再現せず、既知の制約
+/// （自分側は真実そのまま・相手の持ち駒は既知・相手の盤上駒の役割別内訳は
+/// 初期20枚から取られた駒を引いて既知）だけを満たす盤面を直接サンプルする。
+///
+/// **意図的に最小版**: テンポ収支・負の証拠・配置事前分布はまだ実装しない。
+/// 相手の残り駒は「取られる前の役割（成りを剥がした生駒）」で配置し、
+/// 空きマスは二歩・行き所のない駒の配置合法性だけを守って一様ランダムに選ぶ。
+/// 成り（どの駒が成っているか・どこに成ったか）は一切推定しない —
+/// これは意図的で、「単純な配置サンプルだけでどこまで再現できるか」を
+/// 検証するための基準線（bin/synth_check で確認する）。
+///
+/// **手番側の静的合法性**（cursor の C-8 設計レビュー指摘。deduce.rs の
+/// 部品で実装）: `you_in_check`（今まさに自玉が王手されているか。観測から
+/// 厳密に分かる）と矛盾する配置は棄却して引き直す。手番はこちらなので、
+/// 王手されているならその通り、されていないなら相手の駒が誰も自玉に
+/// 利いていない、という静的な整合性だけを見る（経路・履歴は見ない）。
+/// 玉位置バイアス等の事前分布は後続フェーズで追加する
+pub fn synth_particle(
+    my_color: Color,
+    model: &GameModel,
+    you_in_check: bool,
+    rng: &mut StdRng,
+) -> Option<Position> {
+    let opp = my_color.other();
+    for _ in 0..SYNTH_ATTEMPTS {
+        if let Some(pos) = synth_particle_once(my_color, model, rng) {
+            let actually_in_check = pos
+                .king_square(my_color)
+                .is_some_and(|k| pos.pieces().any(|(sq, p)| p.color == opp && pos.attacks(sq, k)));
+            if actually_in_check == you_in_check {
+                return Some(pos);
+            }
+        }
+    }
+    None
+}
+
+/// 玉の配置事前分布の減衰率（本国からのチェビシェフ距離 1 につき exp(-λ)）。
+/// **注意**: 当初 likelihood.rs の FITTED_THETA（king_advance に上限なし）を
+/// そのまま生成分布として流用したところ、盤の隅（本国から最遠）に確率が
+/// 集中する誤った挙動になった（実測: 1a・8a等の隅に上位が集中）。
+/// FITTED_THETA は「候補粒子群の中で真実を判別する」識別モデルであり、
+/// 候補群自体が指し手の連鎖で自然に生成される（＝隅は元々出現しにくい）
+/// という前提の上に成り立つ相対的な重みなので、一様な全マスに対する
+/// 生成分布としては使えない。代わりに「本国から離れるほど単調に減衰する」
+/// 素直な事前分布に置き換えた。
+/// λ は kakunari 1点（診断的中率）への簡易スイープで選定
+/// （0.15→5.2% / 0.35→6.0% / 0.5→7.2% / 0.8→8.8% / 1.2→8.7%、0.8-1.2で頭打ち）。
+/// **1シナリオだけへの過学習リスクに注意**——他のシナリオでの再検証が必要
+const KING_DISTANCE_DECAY: f64 = 0.8;
+
+/// 玉の配置事前分布スコア: 本国からのチェビシェフ距離だけで単調減衰する
+fn king_placement_score(king_home: Coord, candidate: Coord) -> f64 {
+    let dist = (candidate.file - king_home.file)
+        .abs()
+        .max((candidate.rank - king_home.rank).abs());
+    -KING_DISTANCE_DECAY * f64::from(dist)
+}
+
+fn synth_particle_once(my_color: Color, model: &GameModel, rng: &mut StdRng) -> Option<Position> {
+    let opp = my_color.other();
+    let mut pos = Position::empty(my_color);
+    for p in model.my_pieces() {
+        let sq = parse_usi_square(&p.square)?;
+        pos.set(
+            sq,
+            Some(Piece {
+                color: my_color,
+                role: p.role,
+            }),
+        );
+    }
+    for (role, n) in model.my_hand() {
+        pos.set_hand(my_color, role, n as u8);
+    }
+    for (role, n) in model.opponent_hand() {
+        pos.set_hand(opp, role, n as u8);
+    }
+
+    // 相手の盤上駒（生駒ベースの役割）の残り枚数 = 初期配置 − 取られた駒
+    let mut counts: HashMap<Role, i32> = HashMap::new();
+    for (_, p) in Position::initial().pieces() {
+        if p.color == opp {
+            *counts.entry(p.role).or_insert(0) += 1;
+        }
+    }
+    for (_, role) in model.lost_pieces() {
+        *counts.entry(unpromote_role(*role)).or_insert(0) -= 1;
+    }
+    let mut remaining: Vec<Role> = vec![];
+    for (&role, &c) in &counts {
+        for _ in 0..c.max(0) {
+            remaining.push(role);
+        }
+    }
+
+    // 空きマスの初期プール
+    let mut empties: Vec<Coord> = (1..=9)
+        .flat_map(|file| (1..=9).map(move |rank| Coord { file, rank }))
+        .filter(|&sq| pos.piece_at(sq).is_none())
+        .collect();
+
+    // 玉だけ先に配置事前分布で重み付きサンプリングする（taint に頼らない
+    // 玉位置ビリーフ。他の駒は依然として一様ランダム — 意図的な最小拡張）
+    if let Some(king_idx) = remaining.iter().position(|&r| r == Role::King) {
+        remaining.remove(king_idx);
+        let king_home = Position::initial().king_square(opp);
+        let placed = king_home.and_then(|home| {
+            let weights: Vec<f64> = empties
+                .iter()
+                .map(|&sq| king_placement_score(home, sq).exp())
+                .collect();
+            weighted_choice_idx(weights.into_iter(), rng)
+        });
+        match placed {
+            Some(i) => {
+                let sq = empties.remove(i);
+                pos.set(
+                    sq,
+                    Some(Piece {
+                        color: opp,
+                        role: Role::King,
+                    }),
+                );
+            }
+            // 万一重み付きサンプリングが失敗したら通常の一様配置へ戻す
+            None => remaining.push(Role::King),
+        }
+    }
+
+    // 残りの駒をシャッフルして順に置く（二歩・行き所のない駒だけ回避）
+    empties.shuffle(rng);
+    remaining.shuffle(rng);
+    let mut ei = 0usize;
+    for role in remaining {
+        let mut placed = false;
+        while ei < empties.len() {
+            let sq = empties[ei];
+            ei += 1;
+            if role == Role::Pawn
+                && pos
+                    .pieces()
+                    .any(|(s, p)| p.color == opp && p.role == Role::Pawn && s.file == sq.file)
+            {
+                continue; // 二歩
+            }
+            if dead_end_rank(role, sq.rank, opp) {
+                continue;
+            }
+            pos.set(sq, Some(Piece { color: opp, role }));
+            placed = true;
+            break;
+        }
+        if !placed {
+            return None;
+        }
+    }
+    Some(pos)
+}
+
+/// 王手駒になりうる駒種（玉は王手できない）
+const CHECKER_ROLES: [Role; 13] = [
+    Role::Pawn,
+    Role::Lance,
+    Role::Knight,
+    Role::Silver,
+    Role::Gold,
+    Role::Bishop,
+    Role::Rook,
+    Role::Tokin,
+    Role::Promotedlance,
+    Role::Promotedknight,
+    Role::Promotedsilver,
+    Role::Horse,
+    Role::Dragon,
+];
+
+/// 反則が仮説で説明できない（仮説の下では合法だったはず）ときの減衰係数。
+/// 0にしない: 反則の真因が別の隠れ駒（経路封鎖・別の利き）の可能性があるため
+const UNEXPLAINED_FOUL_DECAY: f64 = 0.15;
+
+/// 粒子投票の強さ（全粒子が一致した仮説は一様仮説の 1+PARTICLE_VOTE_W 倍）
+const PARTICLE_VOTE_W: f64 = 8.0;
+
+/// 残存脅威（threat_of）の重み: 王手駒に攻撃されている自駒の交換価値に掛ける係数
+const THREAT_MATERIAL_W: f64 = 0.5;
+/// 残存脅威の重み: 自玉の隣接マス1つへの利き（逃げ場を縛り続ける圧力）の価値
+const THREAT_KING_ZONE_W: f64 = 0.5;
+
+struct Hypothesis {
+    square: Coord,
+    role: Role,
+    weight: f64,
+}
+
+pub struct CheckSolver {
+    /// 自駒＋持ち駒だけを置いたスパース盤面（手番=自分）。仮説の駒を載せて使う
+    base: Position,
+    my_color: Color,
+    hypotheses: Vec<Hypothesis>,
+    /// 仮説ごとの残存脅威（threat_of）の遅延キャッシュ。hypotheses と同じ並び
+    threat_cache: Vec<Option<f64>>,
+}
+
+impl CheckSolver {
+    /// 王手中の view から作る。自玉が見つからない等で推論できなければ None。
+    /// particles はソフト救済の重みつき（strategy.rs の評価サンプルと同じ）
+    pub fn new(
+        view: &PlayerView,
+        particles: &[(&Position, f64)],
+        fouls_this_turn: &[ShogiMove],
+        log: &ObservationLog,
+    ) -> Option<CheckSolver> {
+        let my_color = view.your_color;
+        let mut base = Position::empty(my_color);
+        for piece in &view.your_pieces {
+            let sq = crate::board::parse_usi_square(&piece.square)?;
+            base.set(
+                sq,
+                Some(crate::shogi::Piece {
+                    color: my_color,
+                    role: piece.role,
+                }),
+            );
+        }
+        for (&role, &count) in &view.your_hand {
+            base.set_hand(my_color, role, count as u8);
+        }
+        base.king_square(my_color)?;
+
+        // 位置が既知の敵駒（自駒が死んだマス = 敵駒がそこへ来た。取り返し済みは除く）を
+        // 盤に載せる。回避先がこれらの利きに覆われているかを全仮説共通で判定できる
+        // （対人実戦: 5三の既知の成駒が 4二/5二/6二 を覆っているのに順に試して4反則）。
+        // **直近8手以内**の新鮮な情報に限定する: 古いマスは駒が動いて陳腐化しやすく、
+        // 幻の駒が合法な逃げ場を塞ぐ害が実測で上回った（vs v5 アブレーション 2026-07-10）。
+        // 駒種は不明なので粒子の多数決、なければ成駒の最頻・金動き（と金）で近似する
+        for sq in known_enemy_squares(log, view.move_number.saturating_sub(8)) {
+            if base.piece_at(sq).is_some() {
+                continue;
+            }
+            let role = particle_majority_role(particles, my_color.other(), sq)
+                .unwrap_or(Role::Tokin);
+            base.set(
+                sq,
+                Some(crate::shogi::Piece {
+                    color: my_color.other(),
+                    role,
+                }),
+            );
+            // 近似駒種が王を攻撃してしまう（本物の王手駒と区別できない）配置は
+            // 仮説列挙を壊すので載せない
+            if base.in_check(my_color) {
+                base.set(sq, None);
+            }
+        }
+
+        let mut solver = CheckSolver {
+            base,
+            my_color,
+            hypotheses: vec![],
+            threat_cache: vec![],
+        };
+        solver.enumerate(&opponent_role_counts(view, log));
+        if solver.hypotheses.is_empty() {
+            return None;
+        }
+        solver.threat_cache = vec![None; solver.hypotheses.len()];
+        solver.vote_by_particles(particles);
+        for foul in fouls_this_turn {
+            solver.observe_foul(foul);
+        }
+        Some(solver)
+    }
+
+    /// 自玉を攻撃しうる（マス, 駒種）を全列挙する。
+    /// 相手が1枚も持ちえない駒種（総数制約）は仮説から外す
+    fn enumerate(&mut self, opp_counts: &HashMap<Role, i32>) {
+        let opp = self.my_color.other();
+        let king = self.base.king_square(self.my_color).expect("new で確認済み");
+        for file in 1..=9i8 {
+            for rank in 1..=9i8 {
+                let sq = Coord { file, rank };
+                if self.base.piece_at(sq).is_some() {
+                    // 自駒・既知の敵駒のあるマスに（新たな）王手駒はいない
+                    // （既知の敵駒が王手していたなら以前から王手宣言されているはず）
+                    continue;
+                }
+                if sq == king {
+                    continue;
+                }
+                for role in CHECKER_ROLES {
+                    if opp_counts
+                        .get(&unpromote_role(role))
+                        .is_none_or(|&n| n <= 0)
+                    {
+                        continue;
+                    }
+                    self.base.set(
+                        sq,
+                        Some(crate::shogi::Piece { color: opp, role }),
+                    );
+                    let checks = self.base.in_check(self.my_color);
+                    self.base.set(sq, None);
+                    if checks {
+                        self.hypotheses.push(Hypothesis {
+                            square: sq,
+                            role,
+                            weight: 1.0,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// 粒子中の実際の王手駒に投票させる（粒子が健全なら仮説が鋭くなる）。
+    /// ソフト救済の粒子は重みぶんだけ薄く投票する
+    fn vote_by_particles(&mut self, particles: &[(&Position, f64)]) {
+        let opp = self.my_color.other();
+        let mut voters = 0.0f64;
+        let mut votes: Vec<f64> = vec![0.0; self.hypotheses.len()];
+        for (pos, w) in particles {
+            if !pos.in_check(self.my_color) {
+                continue; // 王手を反映していない粒子は情報にならない
+            }
+            voters += w;
+            for (i, h) in self.hypotheses.iter().enumerate() {
+                if pos.piece_at(h.square)
+                    .is_some_and(|p| p.color == opp && p.role == h.role)
+                {
+                    // 粒子上でその駒が実際に王を攻撃しているかまでは見ない
+                    // （enumerate 済みの仮説は自駒配置的に攻撃可能）
+                    votes[i] += w;
+                }
+            }
+        }
+        if voters <= 0.0 {
+            return;
+        }
+        for (h, &v) in self.hypotheses.iter_mut().zip(&votes) {
+            h.weight *= 1.0 + PARTICLE_VOTE_W * (v / voters);
+        }
+    }
+
+    /// この手番の反則を観測: 仮説の下で合法だったはずの手が反則になった
+    /// → その仮説の重みを減衰させる
+    fn observe_foul(&mut self, foul: &ShogiMove) {
+        for i in 0..self.hypotheses.len() {
+            if self.legal_under(i, foul) {
+                self.hypotheses[i].weight *= UNEXPLAINED_FOUL_DECAY;
+            }
+        }
+    }
+
+    /// 仮説 i の下で（他の隠れ駒を無視して）mv が合法か = 王手を解消するか
+    fn legal_under(&mut self, i: usize, mv: &ShogiMove) -> bool {
+        let h = &self.hypotheses[i];
+        let piece = crate::shogi::Piece {
+            color: self.my_color.other(),
+            role: h.role,
+        };
+        let sq = h.square;
+        self.base.set(sq, Some(piece));
+        let legal = self.base.is_legal(mv);
+        self.base.set(sq, None);
+        legal
+    }
+
+    /// 候補手が王手を解消する確率（仮説の重み付き割合）
+    pub fn resolve_probability(&mut self, mv: &ShogiMove) -> f64 {
+        let mut total = 0.0;
+        let mut resolved = 0.0;
+        for i in 0..self.hypotheses.len() {
+            let w = self.hypotheses[i].weight;
+            total += w;
+            if self.legal_under(i, mv) {
+                resolved += w;
+            }
+        }
+        if total <= 0.0 {
+            return 0.5; // 全仮説が死んだ（両王手など）: 情報なしに戻す
+        }
+        resolved / total
+    }
+
+    /// mv が「王手駒仮説のマスへ、自玉以外の駒で移動して、その仮説の下で
+    /// 王手が解消する」手か = 王手駒を捕獲しに行く手か。
+    ///
+    /// かつては p_legal フロア（CHECK_CAPTURE_P_LEGAL_FLOOR）の発動条件
+    /// だったが、フロアは removal_term（仮説条件付き期待値）に置き換えられた。
+    /// 診断・テスト用に残している
+    pub fn captures_checker(&mut self, mv: &ShogiMove) -> bool {
+        let ShogiMove::Board { from, to, .. } = *mv else {
+            return false;
+        };
+        if self.base.king_square(self.my_color) == Some(from) {
+            return false;
+        }
+        for i in 0..self.hypotheses.len() {
+            if self.hypotheses[i].square == to && self.legal_under(i, mv) {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 仮説 i の王手駒が（王手解消後も）盤に残った場合に自陣へ残す圧力
+    /// （歩価値スケール）。攻撃されている自駒の交換価値と、自玉隣接マスへの
+    /// 利き（逃げ場を縛り続ける圧力）の和。候補手にほぼ依存しないので
+    /// 仮説ごとに1回だけ計算してキャッシュする（着手による自駒配置の変化は
+    /// 無視する近似）
+    fn threat_of(&mut self, i: usize) -> f64 {
+        if let Some(t) = self.threat_cache[i] {
+            return t;
+        }
+        let (sq, role) = {
+            let h = &self.hypotheses[i];
+            (h.square, h.role)
+        };
+        let opp = self.my_color.other();
+        self.base
+            .set(sq, Some(crate::shogi::Piece { color: opp, role }));
+        let targets: Vec<(Coord, Role)> = self
+            .base
+            .pieces()
+            .filter(|(_, p)| p.color == self.my_color && p.role != Role::King)
+            .map(|(c, p)| (c, p.role))
+            .collect();
+        let mut t = 0.0;
+        for (c, r) in targets {
+            if self.base.attacks(sq, c) {
+                t += THREAT_MATERIAL_W * crate::strategy::exchange_value(r);
+            }
+        }
+        if let Some(king) = self.base.king_square(self.my_color) {
+            for df in -1..=1i8 {
+                for dr in -1..=1i8 {
+                    if df == 0 && dr == 0 {
+                        continue;
+                    }
+                    let a = Coord {
+                        file: king.file + df,
+                        rank: king.rank + dr,
+                    };
+                    if (1..=9).contains(&a.file)
+                        && (1..=9).contains(&a.rank)
+                        && self.base.attacks(sq, a)
+                    {
+                        t += THREAT_KING_ZONE_W;
+                    }
+                }
+            }
+        }
+        self.base.set(sq, None);
+        self.threat_cache[i] = Some(t);
+        t
+    }
+
+    /// 仮説条件付きの「王手駒の除去期待値」（歩価値スケール、非負）。
+    /// mv が受理された（=王手を解消した）と条件付けた仮説の事後分布で、
+    /// 王手駒のマスを取る未来の +（交換価値 + 回避された残存脅威 threat_of）を
+    /// 平均する。捕獲は受理された未来では王手駒が消えており、玉逃げ等の解消手は
+    /// 王手駒（1五角だったなら角）が盤に残って自陣を睨み続ける、という非対称を
+    /// gain 側へ伝える。p_legal（resolve_probability）は合法性しか平均しない
+    /// ため、粒子が真の王手駒を外している局面ではこの差が評価のどこにも
+    /// 現れず、捕獲が玉逃げに完敗していた（kakutori.kif）。
+    ///
+    /// **正項のみ**にする理由: 王手駒が生き残る未来に −threat を課す対称形は
+    /// 候補間の相対順序こそ同じだが、合法な解消手ほぼ全員の絶対水準を沈める。
+    /// min 形式の combine_score では負の gain は p_legal で割り引かれず全額
+    /// 効くため、ペナルティが反則コストの水位を越えると非合法寄りのプローブが
+    /// 相対的に浮上する（実測: kakutori 20試行で追加反則 4→28 に爆発）。
+    /// 王手中の候補はその手番内でしか比較されないので、全体を正側へ平行移動
+    /// しても選択への副作用はない。
+    ///
+    /// **玉による捕獲は加点しない**（captures_checker と同じ除外）: 隣接マスへの
+    /// 玉移動はすべて「そのマスの王手駒仮説の捕獲」になるため、加点すると
+    /// 逃げ手全員が capture 並みに膨らんで相対差が消える（実測: kakutori で
+    /// 3g2g の gain 0.3→10.4）。玉捕獲は相手駒に紐があれば反則になるだけで、
+    /// 駒を失わずに王手駒を排除しに行く探索プローブの非対称な価値も持たない。
+    /// mv がどの仮説の下でも受理されない・仮説が全滅している場合は None
+    pub fn removal_term(&mut self, mv: &ShogiMove) -> Option<f64> {
+        let to = match *mv {
+            ShogiMove::Board { to, .. } => to,
+            ShogiMove::Drop { to, .. } => to,
+        };
+        let from_king = match *mv {
+            ShogiMove::Board { from, .. } => self.base.king_square(self.my_color) == Some(from),
+            ShogiMove::Drop { .. } => false,
+        };
+        let mut legal_w = 0.0;
+        let mut term = 0.0;
+        for i in 0..self.hypotheses.len() {
+            if !self.legal_under(i, mv) {
+                continue;
+            }
+            let (w, sq, role) = {
+                let h = &self.hypotheses[i];
+                (h.weight, h.square, h.role)
+            };
+            legal_w += w;
+            if sq == to && !from_king {
+                term += w * (crate::strategy::exchange_value(role) + self.threat_of(i));
+            }
+        }
+        if legal_w <= 1e-12 {
+            return None;
+        }
+        Some(term / legal_w)
+    }
+
+    #[cfg(test)]
+    fn hypothesis_count(&self) -> usize {
+        self.hypotheses.len()
+    }
+}
+
+/// 位置が既知の敵駒のマス: 自駒が取られたマス（敵駒がそこへ来た事実）のうち、
+/// その後に自分が取り返しておらず、かつ since_move 手目以降の新しいもの
+fn known_enemy_squares(log: &ObservationLog, since_move: u32) -> Vec<Coord> {
+    let mut map: HashMap<Coord, u32> = HashMap::new();
+    for e in log.events() {
+        match e {
+            crate::observation::Observation::OpponentMoved {
+                move_number,
+                captured_my_piece_at: Some(sq),
+            } => {
+                if let Some(c) = crate::board::parse_usi_square(sq) {
+                    map.insert(c, *move_number);
+                }
+            }
+            crate::observation::Observation::MyMove {
+                usi,
+                captured: Some(_),
+                ..
+            } => {
+                if let Some(ShogiMove::Board { to, .. }) = crate::shogi::parse_usi(usi) {
+                    map.remove(&to);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out: Vec<Coord> = map
+        .into_iter()
+        .filter(|(_, mn)| *mn >= since_move)
+        .map(|(c, _)| c)
+        .collect();
+    out.sort_by_key(|c| (c.file, c.rank));
+    out
+}
+
+/// 粒子の加重多数決でそのマスの敵駒の駒種を推定する（過半に満たなければ None）。
+/// ソフト救済の粒子は重みぶんだけ薄く数える
+fn particle_majority_role(particles: &[(&Position, f64)], opp: Color, sq: Coord) -> Option<Role> {
+    if particles.is_empty() {
+        return None;
+    }
+    let total: f64 = particles.iter().map(|(_, w)| w).sum();
+    let mut counts: HashMap<Role, f64> = HashMap::new();
+    for (pos, w) in particles {
+        if let Some(p) = pos.piece_at(sq) {
+            if p.color == opp {
+                *counts.entry(p.role).or_default() += w;
+            }
+        }
+    }
+    let (role, n) = counts
+        .into_iter()
+        .max_by(|(ra, a), (rb, b)| {
+            a.partial_cmp(b)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| role_order(*rb).cmp(&role_order(*ra)))
+        })?;
+    if n * 2.0 > total {
+        Some(role)
+    } else {
+        None
+    }
+}
+
+fn role_order(role: Role) -> u8 {
+    match role {
+        Role::Pawn => 0,
+        Role::Lance => 1,
+        Role::Knight => 2,
+        Role::Silver => 3,
+        Role::Gold => 4,
+        Role::Bishop => 5,
+        Role::Rook => 6,
+        Role::King => 7,
+        Role::Tokin => 8,
+        Role::Promotedlance => 9,
+        Role::Promotedknight => 10,
+        Role::Promotedsilver => 11,
+        Role::Horse => 12,
+        Role::Dragon => 13,
+    }
+}
+
+/// 相手が盤上・持ち駒に持ちうる駒種の枚数（基本駒種で数える）。
+/// = 初期枚数 + こちらが取られた枚数 − こちらが取った枚数（自分の持ち駒）
+fn opponent_role_counts(view: &PlayerView, log: &ObservationLog) -> HashMap<Role, i32> {
+    let mut counts: HashMap<Role, i32> = [
+        (Role::Pawn, 9),
+        (Role::Lance, 2),
+        (Role::Knight, 2),
+        (Role::Silver, 2),
+        (Role::Gold, 2),
+        (Role::Bishop, 1),
+        (Role::Rook, 1),
+    ]
+    .into();
+    for (_, role) in GameModel::from_log(view.your_color, log).lost_pieces() {
+        *counts.entry(unpromote_role(*role)).or_default() += 1;
+    }
+    for (&role, &n) in &view.your_hand {
+        *counts.entry(unpromote_role(role)).or_default() -= n as i32;
+    }
+    counts
 }
 
 pub const DEFAULT_STRATEGY: &str = "estimator";
 
-/// 戦略名からインスタンスを作る。未知の名前は None。
-/// `estimator_vN` はアリーナ比較用の凍結版（src/frozen/）
-/// シード付きで戦略を作る（SPSA の f+/f− 評価で対局条件を揃える共通乱数法用）。
-/// シード注入に対応していない戦略は通常の make にフォールバックする
-/// （その場合、その戦略側の乱数はペアリングされない）
-pub fn make_seeded(name: &str, seed: u64) -> Option<Box<dyn Strategy + Send>> {
-    match name {
-        "estimator" => Some(Box::new(EstimatorStrategy::with_params_line_seed(
-            EvalParams::default(),
-            None,
-            Some(seed),
-        ))),
-        "estimator_rush" => {
-            let idx = OpeningBook::line_index("居飛車速攻")?;
-            Some(Box::new(EstimatorStrategy::with_params_line_seed(
-                EvalParams::default(),
-                Some(idx),
-                Some(seed),
-            )))
-        }
-        "estimator_v6" => Some(Box::new(
-            crate::frozen::estimator_v6::EstimatorV6::with_seed(seed),
-        )),
-        "estimator_v7" => Some(Box::new(
-            crate::frozen::estimator_v7::EstimatorV7::with_seed(seed),
-        )),
-        "estimator_v8" => Some(Box::new(
-            crate::frozen::estimator_v8::EstimatorV8::with_seed(seed),
-        )),
-        "estimator_v9" => Some(Box::new(
-            crate::frozen::estimator_v9::EstimatorV9::with_seed(seed),
-        )),
-        "estimator_v10" => Some(Box::new(
-            crate::frozen::estimator_v10::EstimatorV10::with_seed(seed),
-        )),
-        "estimator_v11" => Some(Box::new(
-            crate::frozen::estimator_v11::EstimatorV11::with_seed(seed),
-        )),
-        "estimator_v12" => Some(Box::new(
-            crate::frozen::estimator_v12::EstimatorV12::with_seed(seed),
-        )),
-        _ => make(name),
-    }
-}
 
-pub fn make(name: &str) -> Option<Box<dyn Strategy + Send>> {
-    match name {
-        "heuristic" => Some(Box::new(Heuristic)),
-        "estimator" => Some(Box::new(EstimatorStrategy::new())),
-        // Claude（対話セッション）が直接指す実験用（bridge.rs）。アリーナでは使わない
-        "bridge" => Some(Box::new(crate::bridge::FileBridge::new())),
-        // 定跡特化チューニングの基準用: 居飛車速攻ラインだけを指す現行estimator
-        "estimator_rush" => {
-            let idx = OpeningBook::line_index("居飛車速攻")?;
-            Some(Box::new(EstimatorStrategy::with_params_and_line(
-                EvalParams::default(),
-                Some(idx),
-            )))
-        }
-        "estimator_v6" => Some(Box::new(crate::frozen::estimator_v6::EstimatorV6::new())),
-        "estimator_v7" => Some(Box::new(crate::frozen::estimator_v7::EstimatorV7::new())),
-        "estimator_v8" => Some(Box::new(crate::frozen::estimator_v8::EstimatorV8::new())),
-        "estimator_v9" => Some(Box::new(crate::frozen::estimator_v9::EstimatorV9::new())),
-        "estimator_v10" => Some(Box::new(crate::frozen::estimator_v10::EstimatorV10::new())),
-        "estimator_v11" => Some(Box::new(crate::frozen::estimator_v11::EstimatorV11::new())),
-        "estimator_v12" => Some(Box::new(crate::frozen::estimator_v12::EstimatorV12::new())),
-        _ => None,
-    }
-}
 
 /// 1候補の評価内訳（`Strategy::last_ranking` 用）。
 /// score = combine_score(gain, p_legal, foul_cost) + adjust で、
@@ -200,75 +2551,8 @@ pub struct CandidateScore {
     pub risk: f64,
 }
 
-/// 前進を好むヒューリスティック＋乱数（従来実装）
-pub struct Heuristic;
 
-impl Strategy for Heuristic {
-    fn choose(
-        &mut self,
-        view: &PlayerView,
-        _log: &ObservationLog,
-        foul_tried: &HashSet<String>,
-    ) -> Option<String> {
-        choose_move(view, foul_tried)
-    }
 
-    fn name(&self) -> &'static str {
-        "heuristic"
-    }
-}
-
-/// 候補手を生成してスコア最大の手を返す。foul_tried の手は除外。
-/// 候補が尽きたら None（呼び出し側で投了する）。
-pub fn choose_move(view: &PlayerView, foul_tried: &HashSet<String>) -> Option<String> {
-    let mut rng = rand::rng();
-    let mut best: Option<(String, f64)> = None;
-    let consider = |usi: String, score: f64, best: &mut Option<(String, f64)>| {
-        if foul_tried.contains(&usi) {
-            return;
-        }
-        if best.as_ref().is_none_or(|(_, s)| score > *s) {
-            *best = Some((usi, score));
-        }
-    };
-
-    let color = view.your_color;
-    for piece in &view.your_pieces {
-        let Some(from) = parse_usi_square(&piece.square) else {
-            continue;
-        };
-        for to in move_targets(&view.your_pieces, piece, color) {
-            let promote = promotion_choice(piece.role, from, to, color) != Promotion::None;
-            // 前進を好む（先手は rank 減少が前進）
-            let advance = match color {
-                Color::Sente => (from.rank - to.rank) as f64,
-                Color::Gote => (to.rank - from.rank) as f64,
-            };
-            let mut score = advance + rng.random_range(0.0..4.0);
-            if promote {
-                score += 3.0;
-            }
-            if piece.role == Role::King {
-                score -= 2.0; // 玉は無闇に動かさない
-            }
-            consider(make_usi_move(from, to, promote), score, &mut best);
-        }
-    }
-
-    for (&role, &count) in &view.your_hand {
-        if count == 0 {
-            continue;
-        }
-        for to in drop_targets(&view.your_pieces, role, color) {
-            if let Some(usi) = make_usi_drop(role, to) {
-                // 打ちは控えめに（乱数のみ）
-                consider(usi, rng.random_range(0.0..3.0), &mut best);
-            }
-        }
-    }
-
-    best.map(|(usi, _)| usi)
-}
 
 /// 評価に使う粒子数の基準値（スケール1.0時）。実際の値は思考予算に比例する
 const EVAL_PARTICLES: usize = 192;
@@ -302,10 +2586,7 @@ fn think_budget_ms() -> u64 {
 /// 既定は無効（従来挙動）。`TSUITATE_EVAL_TAINT_FALLBACK=1` で有効。
 /// 凍結版はこの名前を知らないので候補側にだけ効く
 fn eval_taint_fallback() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_EVAL_TAINT_FALLBACK").is_ok_and(|v| v == "1")
-    })
+    false
 }
 
 /// V1（利き数）のノブ。**既定は両方 無効**（＝従来の二値の利き判定）。
@@ -317,13 +2598,11 @@ fn eval_taint_fallback() -> bool {
 /// `attack_count` 自体は V3（予防的な紐）・V2（距離重み）で使えるので残す。
 /// `TSUITATE_V1_PRESSURE=1` / `TSUITATE_V1_DEFENDED=1` で再度有効化できる
 fn v1_pressure_multiplicity() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_V1_PRESSURE").is_ok_and(|v| v == "1"))
+    false
 }
 
 fn v1_defended_by_count() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_V1_DEFENDED").is_ok_and(|v| v == "1"))
+    false
 }
 
 /// 思考予算に比例して各種の粒子数・読み幅を決める
@@ -1218,7 +3497,7 @@ impl EvalParams {
 /// - 反則確率（粒子上で非合法な割合）× 反則コスト（残り反則数が減るほど高い）
 /// - 指した直後に取り返されるリスク（粒子上での相手の即時駒取り）
 /// - 王手・詰みボーナス
-pub struct EstimatorStrategy {
+pub struct EstimatorV12 {
     est: Option<Estimator>,
     book: Option<OpeningBook>,
     /// Some なら定跡をこのラインに固定する（定跡特化チューニング用）
@@ -1237,7 +3516,7 @@ pub struct EstimatorStrategy {
     last_ranking: Option<Vec<CandidateScore>>,
 }
 
-impl EstimatorStrategy {
+impl EstimatorV12 {
     pub fn new() -> Self {
         Self::with_params(EvalParams::default())
     }
@@ -1333,7 +3612,7 @@ impl EstimatorStrategy {
             Some(w) => EvalParams { link_w: w, ..params },
             None => params,
         };
-        EstimatorStrategy {
+        EstimatorV12 {
             est: None,
             book: None,
             book_line,
@@ -1350,13 +3629,13 @@ impl EstimatorStrategy {
     }
 }
 
-impl Default for EstimatorStrategy {
+impl Default for EstimatorV12 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Strategy for EstimatorStrategy {
+impl Strategy for EstimatorV12 {
     fn prewarm(&mut self, view: &PlayerView, log: &ObservationLog) {
         let budget = self.budget;
         let seed = self.seed;
@@ -1619,17 +3898,6 @@ impl Strategy for EstimatorStrategy {
         // 評価の前提条件の発火率（src/hits.rs）。`expected` の内側にある項
         // （駒得期待値・valueネット等）は厳密粒子が全滅すると丸ごと無効になるので、
         // それがどれくらいの頻度で起きているかを測る
-        if crate::hits::enabled() {
-            crate::hits::flag("王手中", view.you_in_check);
-            crate::hits::flag("厳密粒子ゼロ", sample.is_empty());
-            crate::hits::flag(
-                "value_nn の前提充足",
-                !sample.is_empty() && !view.you_in_check,
-            );
-            crate::hits::flag("taint 評価へ落ちた", eval_taint);
-            // 厳密も taint も無い = 事前確率と粒子に依らない項だけで指している決定
-            crate::hits::flag("粒子が全く無い", sample.is_empty() && taint_pool.is_empty());
-        }
 
         let rng = &mut self.rng;
         // valueネットのstate特徴量キャッシュ（sample と同じ並び。候補間で共通なので
@@ -1778,9 +4046,6 @@ impl Strategy for EstimatorStrategy {
         ranking.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         // 評価項の発火率フック（TSUITATE_DBG_HITS=1 のときだけ）。
         // 「中立だった変更が効いていないのか発火していないのか」の切り分け用
-        if crate::hits::enabled() {
-            crate::hits::observe_ranking(&ranking);
-        }
         self.last_ranking = Some(ranking);
 
         let mut debug = debug_summary(est, &sample, push);
@@ -1797,16 +4062,13 @@ impl Strategy for EstimatorStrategy {
     }
 
     fn name(&self) -> &'static str {
-        "estimator"
+        "estimator_v12"
     }
 
     fn debug_state(&self) -> Option<serde_json::Value> {
         self.last_debug.clone()
     }
 
-    fn last_ranking(&self) -> Option<&[CandidateScore]> {
-        self.last_ranking.as_deref()
-    }
 }
 
 /// 評価用の粒子サンプルを相手玉の位置で**層化抽出**する。
@@ -2043,13 +4305,7 @@ const BLIND_KING_ATTACK_W: f64 = 2.0;
 const BLIND_RECAPTURE_W: f64 = 1.0;
 
 fn blind_recapture_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_BLIND_RECAPTURE_W")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(BLIND_RECAPTURE_W)
-    })
+    BLIND_RECAPTURE_W
 }
 
 /// 「直前の相手手が自駒を取ったマス」と、そこにいる相手駒の期待交換価値。
@@ -3383,745 +5639,10 @@ pub(crate) fn king_zone_pressure(pos: &Position, owner: Color, by: Color) -> f64
     pressure
 }
 
-#[cfg(test)]
-pub(crate) mod tests {
-    use std::collections::HashMap;
-
-    use super::*;
-    use crate::protocol::{ClockState, FoulCounts, GameStatus, VisiblePiece};
-
-    pub(crate) fn minimal_view(pieces: Vec<VisiblePiece>, hand: HashMap<Role, u32>) -> PlayerView {
-        PlayerView {
-            game_id: "g".into(),
-            your_color: Color::Sente,
-            your_pieces: pieces,
-            your_hand: hand,
-            turn: Color::Sente,
-            move_number: 1,
-            clocks: ClockState {
-                sente_ms: 300_000,
-                gote_ms: 300_000,
-                running: Some(Color::Sente),
-                server_time: 0,
-            },
-            fouls: FoulCounts {
-                you: 0,
-                opponent: 0,
-            },
-            you_in_check: false,
-            opponent_in_check: false,
-            status: GameStatus::Playing,
-        }
-    }
-
-    #[test]
-    fn endgame_push_ramps_with_moves_and_lead() {
-        // 序盤は掛けない
-        assert_eq!(endgame_push(1, 10.0), 0.0);
-        assert_eq!(endgame_push(59, 10.0), 0.0);
-        // 終盤リードありで強く掛かる
-        assert!(endgame_push(160, ANTI_DRAW_LEAD_UNIT) > 1.0);
-        // 互角でも弱く掛けて膠着を破りにいく
-        let even = endgame_push(160, 0.0);
-        assert!(even > 0.0 && even < 0.5, "even={even}");
-        // 負けているときは掛けない（引き分けは0.5勝の価値）
-        assert_eq!(endgame_push(160, -10.0), 0.0);
-        // 手数で単調増加
-        assert!(endgame_push(100, 8.0) < endgame_push(160, 8.0));
-    }
-
-    #[test]
-    fn material_lead_is_relative_and_symmetric() {
-        let initial_pieces: Vec<VisiblePiece> = Position::initial()
-            .pieces()
-            .filter(|(_, p)| p.color == Color::Sente)
-            .map(|(sq, p)| VisiblePiece {
-                square: crate::board::make_usi_square(sq),
-                role: p.role,
-            })
-            .collect();
-        // 歩を1枚取った（持ち駒+1、盤上そのまま）→ 相対リード+2
-        let mut hand = HashMap::new();
-        hand.insert(Role::Pawn, 1);
-        let view = minimal_view(initial_pieces.clone(), hand);
-        assert!((material_lead(&view) - 2.0).abs() < 1e-9);
-        // 飛車を1枚失った → 相対リードは飛車価値の2倍のマイナス
-        // （相手の持ち駒に飛車が入るぶんも含む）
-        let without_rook: Vec<VisiblePiece> = initial_pieces
-            .into_iter()
-            .filter(|p| p.role != Role::Rook)
-            .collect();
-        let view = minimal_view(without_rook, HashMap::new());
-        let expected = -2.0 * piece_value(Role::Rook);
-        assert!((material_lead(&view) - expected).abs() < 1e-9);
-    }
-
-    #[test]
-    fn knight_bait_rewards_pawn_on_attack_square_only() {
-        // 後手番。先手桂馬が3七（file3,rank7）にいる → 攻撃マスは3六（file3,rank6）
-        let knight_sq = Coord { file: 3, rank: 7 };
-        let attack_sq = Coord { file: 3, rank: 6 };
-        let mut next = Position::empty(Color::Sente);
-        next.set(
-            knight_sq,
-            Some(crate::shogi::Piece {
-                color: Color::Sente,
-                role: Role::Knight,
-            }),
-        );
-        next.set(
-            attack_sq,
-            Some(crate::shogi::Piece {
-                color: Color::Gote,
-                role: Role::Pawn,
-            }),
-        );
-        let mv = ShogiMove::Drop {
-            role: Role::Pawn,
-            to: attack_sq,
-        };
-        let v = knight_bait_value(&next, Color::Gote, &mv);
-        assert!((v - exchange_value(Role::Knight)).abs() < 1e-9, "v={v}");
-
-        // 違う筋への歩打ちは桂馬に届かないのでゼロ
-        let off_file = Coord { file: 7, rank: 6 };
-        let mut next2 = Position::empty(Color::Sente);
-        next2.set(
-            knight_sq,
-            Some(crate::shogi::Piece {
-                color: Color::Sente,
-                role: Role::Knight,
-            }),
-        );
-        next2.set(
-            off_file,
-            Some(crate::shogi::Piece {
-                color: Color::Gote,
-                role: Role::Pawn,
-            }),
-        );
-        let mv2 = ShogiMove::Drop {
-            role: Role::Pawn,
-            to: off_file,
-        };
-        assert_eq!(knight_bait_value(&next2, Color::Gote, &mv2), 0.0);
-
-        // 歩以外の駒（例: 香）を敵桂馬の攻撃マスへ打ってもゼロ（歩限定）
-        let mut next3 = Position::empty(Color::Sente);
-        next3.set(
-            knight_sq,
-            Some(crate::shogi::Piece {
-                color: Color::Sente,
-                role: Role::Knight,
-            }),
-        );
-        next3.set(
-            attack_sq,
-            Some(crate::shogi::Piece {
-                color: Color::Gote,
-                role: Role::Lance,
-            }),
-        );
-        let mv3 = ShogiMove::Drop {
-            role: Role::Lance,
-            to: attack_sq,
-        };
-        assert_eq!(knight_bait_value(&next3, Color::Gote, &mv3), 0.0);
-    }
-
-    #[test]
-    fn combine_score_handles_gain_signs() {
-        // 正のgain: p_legal で割り引かれる
-        assert!((combine_score(2.0, 0.5, 0.0) - 1.0).abs() < 1e-9);
-        // 負のgain: 割り引かない（min形。反則に寄るインセンティブを作らない）
-        assert!((combine_score(-2.0, 0.5, 0.0) + 2.0).abs() < 1e-9);
-        // 反則コストは (1-p_legal) 倍で引かれる
-        assert!((combine_score(0.0, 0.75, 1.0) + 0.25).abs() < 1e-9);
-        // 2手読みのリスク置換で符号が変わるケース: gain=-0.5 → +0.5 に
-        // 再構築した場合、min形が正側の割引へ正しく切り替わる
-        let before = combine_score(-0.5, 0.5, 0.0);
-        let after = combine_score(0.5, 0.5, 0.0);
-        assert!((before + 0.5).abs() < 1e-9);
-        assert!((after - 0.25).abs() < 1e-9);
-    }
-
-    #[test]
-    fn search_budget_scales_with_think_time() {
-        let base = SearchBudget::from_ms(900);
-        assert_eq!(base.eval_particles, EVAL_PARTICLES);
-        assert_eq!(base.depth2_top_k, DEPTH2_TOP_K);
-        let big = SearchBudget::from_ms(2000);
-        assert!(big.eval_particles > base.eval_particles);
-        assert!(big.depth2_top_k > base.depth2_top_k);
-        assert!(big.depth2_particles > base.depth2_particles);
-        // 極端な予算でも上限で頭打ち
-        assert!(SearchBudget::from_ms(600_000).eval_particles <= 2048);
-        // 本番向けに絞れば従来より軽くなる
-        let small = SearchBudget::from_ms(450);
-        assert!(small.eval_particles < base.eval_particles);
-    }
-
-    #[test]
-    fn eval_params_specs_to_vec_from_vec_stay_aligned() {
-        fn changed_indices(a: &[f64], b: &[f64]) -> Vec<usize> {
-            a.iter()
-                .zip(b)
-                .enumerate()
-                .filter_map(|(i, (&x, &y))| ((x - y).abs() > 1e-12).then_some(i))
-                .collect()
-        }
-
-        fn spec_index(name: &str) -> usize {
-            EvalParams::SPECS
-                .iter()
-                .position(|s| s.name == name)
-                .unwrap_or_else(|| panic!("SPECSに {name} がない"))
-        }
-
-        let base = EvalParams::default();
-        let base_vec = base.to_vec();
-        assert_eq!(base_vec.len(), EvalParams::SPECS.len());
-        assert_eq!(EvalParams::from_vec(&base_vec).to_vec(), base_vec);
-
-        for i in 0..base_vec.len() {
-            let mut v = base_vec.clone();
-            v[i] += 1.0;
-            let round = EvalParams::from_vec(&v).to_vec();
-            assert_eq!(changed_indices(&base_vec, &round), vec![i]);
-        }
-
-        macro_rules! assert_field_index {
-            ($field:ident) => {{
-                let mut p = base.clone();
-                p.$field += 1.0;
-                assert_eq!(
-                    changed_indices(&base_vec, &p.to_vec()),
-                    vec![spec_index(stringify!($field))]
-                );
-            }};
-        }
-
-        assert_field_index!(check_bonus);
-        assert_field_index!(foul_cost_base);
-        assert_field_index!(knight_bait_w);
-        assert_field_index!(depth2_replace);
-        assert_field_index!(check_limit_accel);
-    }
-
-    #[test]
-    fn exchange_value_discounts_promoted_pieces() {
-        // 素の駒は piece_value と一致
-        assert_eq!(exchange_value(Role::Silver), piece_value(Role::Silver));
-        // と金の反動は (盤上6 + 持ち駒1) / 2 = 3.5 で歩由来の駒として安い
-        assert!((exchange_value(Role::Tokin) - 3.5).abs() < 1e-9);
-        assert!(exchange_value(Role::Tokin) < exchange_value(Role::Silver));
-        // 龍も持ち駒に入るのは飛車ぶん
-        assert!(exchange_value(Role::Dragon) < piece_value(Role::Dragon));
-        // 元手が安い成駒ほど反動が小さい（と金 < 成香 < 成桂 < 成銀）
-        assert!(exchange_value(Role::Tokin) < exchange_value(Role::Promotedlance));
-        assert!(exchange_value(Role::Promotedlance) < exchange_value(Role::Promotedknight));
-        assert!(exchange_value(Role::Promotedknight) < exchange_value(Role::Promotedsilver));
-    }
-
-    #[test]
-    fn promotion_widens_coverage() {
-        // 3d の歩: 利きは 3c の1マス。成れば金の利き6マスに広がる
-        let view = minimal_view(
-            vec![VisiblePiece {
-                square: "3d".into(),
-                role: Role::Pawn,
-            }],
-            HashMap::new(),
-        );
-        let quiet = coverage_after(&view, &parse_usi("3d3c").unwrap());
-        let promo = coverage_after(&view, &parse_usi("3d3c+").unwrap());
-        assert_eq!(quiet, 1.0);
-        assert_eq!(promo, 6.0, "と金は金の利き（6マス）");
-    }
-
-    /// ブラインド取り返し: 対象マスは**直前の相手手**で取られたマスに限る
-    /// （それ以前のマスは相手がもう動かしているかもしれない）。
-    /// 見積もりは相手の盤上に残っている駒の平均交換価値
-    #[test]
-    fn blind_recapture_target_uses_the_latest_capture_only() {
-        let view = minimal_view(
-            vec![VisiblePiece {
-                square: "5i".into(),
-                role: Role::King,
-            }],
-            HashMap::new(),
-        );
-        let mut log = ObservationLog::default();
-        log.record(Observation::OpponentMoved {
-            move_number: 2,
-            captured_my_piece_at: Some("7g".into()),
-        });
-        let (sq, value) = blind_recapture_target(&view, &log).expect("直前の手が捕獲なら対象あり");
-        assert_eq!(sq, Coord { file: 7, rank: 7 });
-        assert!(value > 0.0, "相手の盤上駒の平均交換価値が出る");
-
-        // 直前の相手手が捕獲でなければ対象なし（古い捕獲マスは使わない）
-        log.record(Observation::OpponentMoved {
-            move_number: 4,
-            captured_my_piece_at: None,
-        });
-        assert!(blind_recapture_target(&view, &log).is_none());
-    }
-
-    /// V3: 紐は「移動できるマス」ではなく「利かせているマス」で数える。
-    /// `move_targets` は自駒のいるマスを除くので、そのままでは紐が常にゼロになる
-    #[test]
-    fn linked_value_counts_pieces_defended_by_another_piece() {
-        let gold = VisiblePiece {
-            square: "5h".into(),
-            role: Role::Gold,
-        };
-        let king = VisiblePiece {
-            square: "5i".into(),
-            role: Role::King,
-        };
-        // 玉(5i)だけが金(5h)を守っている形。玉の利きも紐に数える
-        let view = minimal_view(vec![gold.clone(), king.clone()], HashMap::new());
-        let alone = own_effects_after(&view, &parse_usi("5h5g").unwrap());
-        assert_eq!(alone.linked_value, 0.0, "5g へ出れば玉から離れて紐が切れる");
-        let stay = own_effects_after(&view, &parse_usi("5i4i").unwrap());
-        assert!(
-            stay.linked_value > 0.0,
-            "玉が 4i へ寄っても金 5h は玉の利きに入ったまま"
-        );
-
-        // 銀を足すと紐が増える（価値の合計で数える）
-        let mut pieces = vec![gold, king];
-        pieces.push(VisiblePiece {
-            square: "4h".into(),
-            role: Role::Silver,
-        });
-        let view2 = minimal_view(pieces, HashMap::new());
-        let two = own_effects_after(&view2, &parse_usi("5i4i").unwrap());
-        assert!(two.linked_value > stay.linked_value);
-    }
-
-    #[test]
-    fn king_holes_counts_unsupported_neighbours() {
-        // 先手玉5九だけの盤。隣接8マスのうち盤内は5マス（4八,5八,6八,4九,6九）で
-        // 玉自身の利きは数えないので、守りが無ければ全部が穴
-        let lone_king = vec![VisiblePiece { square: "5i".into(), role: Role::King }];
-        let view = minimal_view(lone_king.clone(), HashMap::new());
-        // 玉から離れたマスへ歩を打つ = 近傍の穴は減らない
-        let far = king_holes_after(&view, &parse_usi("P*1e").unwrap());
-        assert_eq!(far, 5.0, "盤内の近傍5マスが全部穴のはず: {far}");
-
-        // 5八へ金を打つと、そのマスが埋まり（占有）、金の利きが 4八/6八/5七… を守る
-        let filled = king_holes_after(&view, &parse_usi("G*5h").unwrap());
-        assert!(filled < far, "支えを足せば穴は減る: {filled} < {far}");
-    }
-
-    #[test]
-    fn king_holes_ignores_the_kings_own_effect() {
-        // 玉の利きを数えてしまうと近傍が全部「守られている」ことになり、
-        // 項が常にゼロになる（やねうら王も「玉以外の味方の利き」で数える）
-        let view = minimal_view(
-            vec![VisiblePiece { square: "5e".into(), role: Role::King }],
-            HashMap::new(),
-        );
-        // 盤の中央なので近傍8マスすべてが盤内。玉の利きを除けば全部穴
-        let holes = king_holes_after(&view, &parse_usi("5e5f").unwrap());
-        assert_eq!(holes, 8.0, "玉自身の利きは支えに数えない: {holes}");
-    }
-
-    #[test]
-    fn tokin_probe_rewards_pawn_drops_near_promotion_zone() {
-        let view = minimal_view(vec![], HashMap::new());
-        // 成れる圏内（先手なら 4段目以浅）への歩打ちだけ加点
-        assert!(tokin_probe(&view, &parse_usi("P*3d").unwrap()) > 0.0);
-        assert_eq!(tokin_probe(&view, &parse_usi("P*3f").unwrap()), 0.0);
-        // 歩以外の打ちには付かない
-        assert_eq!(tokin_probe(&view, &parse_usi("G*3d").unwrap()), 0.0);
-    }
-
-    /// 相手玉を kf筋・自陣に歩を1枚置いた盤（指紋がユニークになるよう pawn_sq を変える）
-    fn synth_position(king_file: i8, pawn_rank: i8) -> Position {
-        let mut pos = Position::empty(Color::Sente);
-        pos.set(
-            Coord { file: 5, rank: 9 },
-            Some(crate::shogi::Piece {
-                color: Color::Sente,
-                role: Role::King,
-            }),
-        );
-        pos.set(
-            Coord {
-                file: king_file,
-                rank: 1,
-            },
-            Some(crate::shogi::Piece {
-                color: Color::Gote,
-                role: Role::King,
-            }),
-        );
-        pos.set(
-            Coord {
-                file: 5,
-                rank: pawn_rank,
-            },
-            Some(crate::shogi::Piece {
-                color: Color::Sente,
-                role: Role::Pawn,
-            }),
-        );
-        pos
-    }
-
-    #[test]
-    fn stratified_sample_respects_count_cap_and_prefix_diversity() {
-        let mut rng = StdRng::seed_from_u64(1);
-        // 9層（玉位置 file 1..=9）× 各6粒子 = 54ユニーク
-        let mut particles = vec![];
-        for kf in 1..=9i8 {
-            for pr in 2..=7i8 {
-                particles.push(synth_position(kf, pr));
-            }
-        }
-        let miss = vec![0u8; particles.len()];
-        // 上限16 < 層数9×最低枠4=36: 件数は必ず16以下
-        let sample = stratified_sample(
-            &particles,
-            &miss,
-            &vec![0u8; particles.len()],
-            &vec![0.0f64; particles.len()],
-            Color::Sente,
-            &ParticleCtx::default(),
-            16,
-            &mut rng,
-        );
-        assert!(sample.len() <= 16, "len={}", sample.len());
-        // ラウンドロビン順: 先頭9件で9層すべての玉位置が現れる
-        let prefix_kings: HashSet<_> = sample
-            .iter()
-            .take(9)
-            .map(|(p, _)| p.king_square(Color::Gote))
-            .collect();
-        assert_eq!(prefix_kings.len(), 9, "prefixが層化されていない");
-        // 上限が大きい場合も件数はユニーク数以下・重みは旧方式と一致
-        // （不変条件①: 全ユニーク・logw=0・ソフトなしなら重み和 = ユニーク数）
-        let sample = stratified_sample(
-            &particles,
-            &miss,
-            &vec![0u8; particles.len()],
-            &vec![0.0f64; particles.len()],
-            Color::Sente,
-            &ParticleCtx::default(),
-            512,
-            &mut rng,
-        );
-        assert_eq!(sample.len(), 54);
-        let mass: f64 = sample.iter().map(|(_, w)| w).sum();
-        assert!((mass - 54.0).abs() < 1e-6, "mass={mass}");
-    }
-
-    #[test]
-    fn stratified_sample_excludes_tainted_particles() {
-        // 物理不整合（phys_taint>0）の粒子は通常サンプルに混ざらない（C-7 P3）
-        let mut rng = StdRng::seed_from_u64(11);
-        let clean = synth_position(1, 2);
-        let tainted = synth_position(2, 3);
-        let particles = vec![clean.clone(), tainted.clone()];
-        let miss = vec![0u8, 0u8];
-        let taints = vec![0u8, 1u8];
-        let logw = vec![0.0f64, 0.0];
-        let sample = stratified_sample(
-            &particles,
-            &miss,
-            &taints,
-            &logw,
-            Color::Sente,
-            &ParticleCtx::default(),
-            16,
-            &mut rng,
-        );
-        assert!(!sample.is_empty());
-        assert!(
-            sample
-                .iter()
-                .all(|(p, _)| p.fingerprint() == clean.fingerprint()),
-            "taint 粒子がサンプルに混ざっている"
-        );
-        // 較正: ユニーク1件（クリーンのみ）
-        let mass: f64 = sample.iter().map(|(_, w)| w).sum();
-        assert!((mass - 1.0).abs() < 1e-6, "mass={mass}");
-    }
-
-    #[test]
-    fn multiplicity_survives_unique_folding() {
-        // 不変条件②（C-7 P1）: ESSリサンプリング後の複製数は事後質量。
-        // 同一指紋3個+別指紋1個（全て logw=0）→ 質量比はちょうど 3:1 になり、
-        // 合計は較正アンカー（ユニーク2件×1.0）へ正規化される
-        let a = synth_position(1, 2);
-        let b = synth_position(1, 4); // 同じ玉位置 = 同じ層、別指紋
-        let particles = vec![a.clone(), a.clone(), a.clone(), b.clone()];
-        let miss = vec![0u8; 4];
-        let logw = vec![0.0f64; 4];
-        let a_fp = a.fingerprint();
-        let trials = 200;
-        let mut a_share_sum = 0.0;
-        for seed in 0..trials {
-            let mut rng = StdRng::seed_from_u64(seed);
-            let sample = stratified_sample(
-                &particles,
-                &miss,
-                &vec![0u8; particles.len()],
-                &logw,
-                Color::Sente,
-                &ParticleCtx::default(),
-                16,
-                &mut rng,
-            );
-            let total: f64 = sample.iter().map(|(_, w)| w).sum();
-            assert!((total - 2.0).abs() < 1e-6, "較正: ユニーク2件で mass=2.0");
-            let a_mass: f64 = sample
-                .iter()
-                .filter(|(p, _)| p.fingerprint() == a_fp)
-                .map(|(_, w)| w)
-                .sum();
-            a_share_sum += a_mass / total;
-        }
-        let avg = a_share_sum / trials as f64;
-        assert!(
-            (avg - 0.75).abs() < 0.05,
-            "multiplicity が評価重みに反映されていない: a_share={avg}（期待 0.75）"
-        );
-    }
-
-    #[test]
-    fn stratum_representative_is_weight_proportional() {
-        // 同一層に重み 1.0 と 0.125（logw = ln 0.125。フィルタが課金済みの想定）の
-        // 2粒子。quota=1 のとき層代表は重み比例（重い側 ≈ 89%）で選ばれるべき。
-        // 一様シャッフルだと 50% になる（回帰: 2026-07-15 追加レビュー）
-        let strict = synth_position(1, 2);
-        let soft = synth_position(1, 3); // 同じ玉位置 = 同じ層、別指紋
-        let particles = vec![strict.clone(), soft];
-        let miss = vec![0u8, 0u8];
-        let logw = vec![0.0f64, 0.125f64.ln()];
-        let strict_fp = strict.fingerprint();
-        let mut strict_hits = 0;
-        let trials = 400;
-        for seed in 0..trials {
-            let mut rng = StdRng::seed_from_u64(seed);
-            let sample = stratified_sample(
-                &particles,
-                &miss,
-                &vec![0u8; particles.len()],
-                &logw,
-                Color::Sente,
-                &ParticleCtx::default(),
-                1,
-                &mut rng,
-            );
-            assert_eq!(sample.len(), 1);
-            if sample[0].0.fingerprint() == strict_fp {
-                strict_hits += 1;
-            }
-        }
-        let share = strict_hits as f64 / trials as f64;
-        // 期待値 1.0/(1.0+0.125) ≒ 0.889。一様（0.5）とも過剰（→1.0）とも
-        // 区別できる両側の閾値で検証
-        assert!(
-            share > 0.84 && share < 0.94,
-            "strictの代表率が重み比例になっていない: {share}"
-        );
-    }
-
-    #[test]
-    fn resampling_does_not_double_apply_weights() {
-        // 同一層に [1.0, 1.0, 0.125（logw課金済み）] の3粒子、quota=2。
-        // 軽い粒子の期待質量シェアは 0.125/2.125 ≒ 5.9%。
-        // 「重み比例で選び、さらに元の重みも配る」二重適用だと ~1.8% に沈む
-        // （2026-07-15 追加レビューの回帰テスト）
-        let s1 = synth_position(1, 2);
-        let s2 = synth_position(1, 4);
-        let soft = synth_position(1, 6); // 同じ玉位置 = 同じ層
-        let soft_fp = soft.fingerprint();
-        let particles = vec![s1, s2, soft];
-        let miss = vec![0u8, 0u8, 0u8];
-        let logw = vec![0.0f64, 0.0, 0.125f64.ln()];
-        let trials = 400;
-        let mut share_sum = 0.0;
-        for seed in 0..trials {
-            let mut rng = StdRng::seed_from_u64(1000 + seed);
-            let sample = stratified_sample(
-                &particles,
-                &miss,
-                &vec![0u8; particles.len()],
-                &logw,
-                Color::Sente,
-                &ParticleCtx::default(),
-                2,
-                &mut rng,
-            );
-            let total: f64 = sample.iter().map(|(_, w)| w).sum();
-            let soft_mass: f64 = sample
-                .iter()
-                .filter(|(p, _)| p.fingerprint() == soft_fp)
-                .map(|(_, w)| w)
-                .sum();
-            share_sum += soft_mass / total.max(1e-9);
-        }
-        let avg = share_sum / trials as f64;
-        assert!(
-            avg > 0.03 && avg < 0.09,
-            "軽い粒子の期待寄与が歪んでいる: avg={avg}（期待 ≒ 0.059）"
-        );
-    }
-
-    #[test]
-    fn stratified_sample_keeps_soft_evidence_calibration() {
-        let mut rng = StdRng::seed_from_u64(2);
-        // 20ユニーク全てが info_miss=1（フィルタが logw へ ln(EPS_INFO) 課金済み）。
-        // 較正アンカー = min(16,20) × EPS_INFO（ソフトは証拠として EPS_INFO 人分）
-        let particles: Vec<Position> = (2..=7)
-            .flat_map(|pr| (1..=4).map(move |kf| synth_position(kf, pr)))
-            .take(20)
-            .collect();
-        let miss = vec![1u8; particles.len()];
-        let logw = vec![EPS_INFO.ln(); particles.len()];
-        let sample = stratified_sample(
-            &particles,
-            &miss,
-            &vec![0u8; particles.len()],
-            &logw,
-            Color::Sente,
-            &ParticleCtx::default(),
-            16,
-            &mut rng,
-        );
-        assert!(sample.len() <= 16);
-        let mass: f64 = sample.iter().map(|(_, w)| w).sum();
-        let expected = 16.0 * EPS_INFO;
-        assert!(
-            (mass - expected).abs() < 1e-6,
-            "ソフト証拠の較正が崩れている: mass={mass}（期待{expected}）"
-        );
-    }
-
-    #[test]
-    fn chooses_some_move() {
-        let view = minimal_view(
-            vec![VisiblePiece {
-                square: "7g".into(),
-                role: Role::Pawn,
-            }],
-            HashMap::new(),
-        );
-        assert_eq!(
-            choose_move(&view, &HashSet::new()),
-            Some("7g7f".to_string())
-        );
-    }
-
-    #[test]
-    fn skips_fouled_moves_and_resigns_when_exhausted() {
-        let view = minimal_view(
-            vec![VisiblePiece {
-                square: "7g".into(),
-                role: Role::Pawn,
-            }],
-            HashMap::new(),
-        );
-        let mut tried = HashSet::new();
-        tried.insert("7g7f".to_string());
-        assert_eq!(choose_move(&view, &tried), None);
-    }
-
-    #[test]
-    fn may_resolve_check_filters_hopeless_moves() {
-        // 先手玉 5i。ライン外への手・桂の利き元以外は王手を解消しえない
-        let view = minimal_view(
-            vec![
-                VisiblePiece {
-                    square: "5i".into(),
-                    role: Role::King,
-                },
-                VisiblePiece {
-                    square: "7g".into(),
-                    role: Role::Pawn,
-                },
-            ],
-            HashMap::new(),
-        );
-        let ok = |usi: &str| may_resolve_check(&view, &parse_usi(usi).unwrap());
-        assert!(ok("5i5h"), "玉移動は常に候補");
-        assert!(
-            ok("7g5g"),
-            "自玉と同段（ライン上）への移動は合駒/取りになりうる"
-        );
-        assert!(ok("7g5e"), "架空の手でも判定対象はライン（5筋）上の着地点");
-        assert!(!ok("7g7f"), "ライン外への移動は王手放置が確定");
-    }
-
-    #[test]
-    fn may_resolve_check_knight_source_and_drops() {
-        let view = minimal_view(
-            vec![VisiblePiece {
-                square: "5i".into(),
-                role: Role::King,
-            }],
-            HashMap::new(),
-        );
-        let mv = |usi: &str| parse_usi(usi).unwrap();
-        // 4g/6g は相手桂の利き元 → 盤上の駒での取りは候補
-        assert!(may_resolve_check(&view, &mv("4f4g")));
-        // 打ちは駒を取れないので桂の利き元でも解消しえない
-        assert!(!may_resolve_check(&view, &mv("P*4g")));
-        // ライン上への打ちは合駒
-        assert!(may_resolve_check(&view, &mv("P*5e")));
-        assert!(!may_resolve_check(&view, &mv("P*4e")));
-    }
-
-    #[test]
-    fn estimator_in_check_prefers_resolving_moves() {
-        // 粒子が王手を反映していなくても（空ログ = 初期局面粒子）、
-        // you_in_check なら解消しうる手（ここでは玉移動のみ）しか指さない
-        let mut view = minimal_view(
-            vec![
-                VisiblePiece {
-                    square: "5i".into(),
-                    role: Role::King,
-                },
-                VisiblePiece {
-                    square: "7g".into(),
-                    role: Role::Pawn,
-                },
-            ],
-            HashMap::new(),
-        );
-        view.you_in_check = true;
-        let mut strat = EstimatorStrategy::new();
-        let log = ObservationLog::default();
-        let usi = strat.choose(&view, &log, &HashSet::new()).unwrap();
-        assert!(
-            usi.starts_with("5i"),
-            "王手中は玉移動を選ぶはず（選ばれた手: {usi}）"
-        );
-    }
-
-    #[test]
-    fn make_knows_heuristic() {
-        assert!(make("heuristic").is_some());
-        assert!(make("nonsense").is_none());
-    }
-
-    #[test]
-    fn make_knows_frozen_versions() {
-        assert!(make("estimator").is_some());
-        assert!(make("estimator_v6").is_some());
-        assert!(make("estimator_v7").is_some());
-        assert!(make("estimator_v8").is_some());
-        assert!(make("estimator_v9").is_some());
-        assert!(make("estimator_v10").is_some());
-        assert!(make("estimator_v11").is_some());
-        assert!(make("estimator_v12").is_some());
-        assert!(make_seeded("estimator_v12", 1).is_some());
-        // 破棄済みの凍結版は登録されていない
-        assert!(make("estimator_v5").is_none());
+impl EstimatorV12 {
+    /// アリーナの共通乱数法用（挙動は with_params_line_seed と同じ）
+    pub fn with_seed(seed: u64) -> Self {
+        EstimatorV12::with_params_line_seed(EvalParams::default(), None, Some(seed))
     }
 }
+
