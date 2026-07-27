@@ -399,6 +399,9 @@ pub struct Estimator {
     /// 信念ネット（NN段階②）のマスごと占有ロジット。`update` の先頭で
     /// 1度だけ計算する（粒子に依存しない）。重みが両方0なら計算もしない = None
     belief: Option<BeliefPrior>,
+    /// belief を計算した時点の観測イベント数。同じ履歴で `update` が複数回
+    /// 呼ばれても（prewarm・webhook のコールドスタート）作り直さないためのキャッシュ鍵
+    belief_at: usize,
     rng: StdRng,
 }
 
@@ -463,6 +466,7 @@ impl Estimator {
             in_check: false,
             in_check_at: vec![],
             belief: None,
+            belief_at: usize::MAX,
             rng: StdRng::seed_from_u64(seed),
         }
     }
@@ -538,10 +542,15 @@ impl Estimator {
     /// ログの未消化イベントを取り込み、粒子を前進・棄却・補充する
     pub fn update(&mut self, log: &ObservationLog) {
         // 信念ネットの prior は「今の決定点の観測」から1度だけ作る（81マス
-        // ぶんの forward pass ≒ 0.2ms）。重みが両方0なら計算もしない ＝
-        // 既定では従来と1命令も変わらない
-        if belief_live_w() > 0.0 || belief_guide_w() > 0.0 {
+        // ぶんの forward pass + BeliefContext の履歴走査）。重みが両方0なら
+        // 計算もしない ＝ 既定では従来と1命令も変わらない。
+        // 履歴が伸びていないなら作り直さない（prewarm や webhook の
+        // コールドスタートで同じログに対して update が何度も呼ばれる）
+        if (belief_live_w() > 0.0 || belief_guide_w() > 0.0)
+            && self.belief_at != log.events().len()
+        {
             self.belief = Some(BeliefPrior::from_log(self.my_color, log));
+            self.belief_at = log.events().len();
         }
         let events = log.events();
         while self.cursor < events.len() {
