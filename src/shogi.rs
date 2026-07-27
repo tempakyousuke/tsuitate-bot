@@ -679,7 +679,9 @@ mod tests {
     #[test]
     fn attack_count_agrees_with_is_attacked() {
         let mut pos = Position::initial();
-        for usi in ["7g7f", "3c3d", "8h3c+", "2b3c", "B*5e"] {
+        // 角交換を経由して先手の持ち駒に角を作ってから打つ（8h3c+ は 3c が空なので
+        // 何も取れず、続く B*5e が持っていない角の打ちになって hands が桁溢れしていた）
+        for usi in ["7g7f", "3c3d", "8h2b+", "3a2b", "B*5e"] {
             pos.play_unchecked(&parse_usi(usi).unwrap());
             for file in 1..=9 {
                 for rank in 1..=9 {
