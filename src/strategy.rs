@@ -425,6 +425,34 @@ fn king_dist_weight(d: i8) -> f64 {
     1.0 / (1.0 + d as f64)
 }
 
+/// 紐（V3）を守られる駒の「働き」で重み付ける度合い。
+/// 0 = 従来どおり交換価値だけで数える（挙動不変）、1 = 完全に働きで重み付け。
+/// `TSUITATE_LINK_WORK_W` で上書き
+fn link_work_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_LINK_WORK_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+            .unwrap_or(0.0)
+    })
+}
+
+/// 働きの飽和基準。これ以上の働きがある駒は係数1（＝従来と同じ満額）になる。
+/// `1/(1+d)` は距離1で0.5・距離8で0.11 と平坦なので、基準値の取り方で
+/// 「遊び駒」と「働いている駒」の分離度が決まる。`TSUITATE_LINK_WORK_REF` で上書き
+fn link_work_ref() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_LINK_WORK_REF")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(2.0)
+    })
+}
+
 /// チェビシェフ距離（将棋の玉が届くまでの手数と同じ尺度）
 fn cheb(a: Coord, b: Coord) -> i8 {
     (a.file - b.file).abs().max((a.rank - b.rank).abs())
@@ -521,6 +549,11 @@ fn own_effects_after(
         }),
     }
 
+    let king = pieces
+        .iter()
+        .find(|p| p.role == Role::King)
+        .and_then(|p| parse_usi_square(&p.square));
+
     // 移動できるマス（自駒のマスを含まない）= 索敵網の広さ
     let mut covered: HashSet<Coord> = HashSet::new();
     // 利かせているマス（自駒のマスを含む）= 紐の判定用。玉の利きも数える
@@ -528,19 +561,27 @@ fn own_effects_after(
     let mut defended: HashSet<Coord> = HashSet::new();
     // 玉以外の自駒が利かせているマス（V4 の穴の判定用）
     let mut defended_nonking: HashSet<Coord> = HashSet::new();
+    // V2 の副産物: 駒ごとの「働き」= その駒の利きを玉からの距離で重み付けた和。
+    // 紐（V3）を「守る価値のある駒か」で重み付けるのに使う（下記 linked_value）
+    let mut work_by_sq: HashMap<Coord, f64> = HashMap::new();
     for p in &pieces {
         covered.extend(move_targets(&pieces, p, view.your_color));
         let d = defend_targets(&pieces, p, view.your_color);
+        if let Some(sq) = parse_usi_square(&p.square) {
+            let work: f64 = d
+                .iter()
+                .map(|&s| {
+                    king.map_or(0.0, |k| king_dist_weight(cheb(s, k)))
+                        + opp_king_w.map_or(0.0, |w| w[crate::belief_features::sq_index(s)])
+                })
+                .sum();
+            work_by_sq.insert(sq, work);
+        }
         if p.role != Role::King {
             defended_nonking.extend(d.iter().copied());
         }
         defended.extend(d);
     }
-
-    let king = pieces
-        .iter()
-        .find(|p| p.role == Role::King)
-        .and_then(|p| parse_usi_square(&p.square));
     let occupied: HashSet<Coord> = pieces
         .iter()
         .filter_map(|p| parse_usi_square(&p.square))
@@ -567,13 +608,33 @@ fn own_effects_after(
     }
 
     // V3: 紐のついた自駒（玉を除く）の価値合計。自分の利きは自分のマスへは
-    // 届かないので、`defended` に載っている = 別の自駒が守っている
+    // 届かないので、`defended` に載っている = 別の自駒が守っている。
+    //
+    // **働きによる重み付け**（2026-07-28、ユーザー指摘）: 素の交換価値だけで
+    // 数えると「隅で何もしていないと金」に紐をつける手が、実戦的に価値のある
+    // 紐と同じ重みで評価される（発端: watch-estimator 17手目の L*1b で、
+    // 1一のと金と打った香が**相互に守り合う**ので単発の打ちで得られる紐の
+    // 最大値になっていた）。守る価値は駒の材料価値だけでなく**その駒が
+    // 働いているか**にも依るので、V2 の距離重み付き利きで係数を掛ける。
+    //
+    // `link_work_w` は補間ノブ（0 = 従来どおり係数1で挙動不変、1 = 完全に
+    // 働きで重み付け）。飽和の基準 `link_work_ref()` 以上の働きがあれば係数1。
+    let lw = link_work_w();
+    let work_ref = link_work_ref();
     let linked_value = pieces
         .iter()
         .filter(|p| p.role != Role::King)
         .filter_map(|p| parse_usi_square(&p.square).map(|c| (c, p.role)))
         .filter(|(c, _)| defended.contains(c))
-        .map(|(_, role)| exchange_value(role))
+        .map(|(c, role)| {
+            let factor = if lw == 0.0 {
+                1.0
+            } else {
+                let work = work_by_sq.get(&c).copied().unwrap_or(0.0);
+                (1.0 - lw) + lw * (work / work_ref).min(1.0)
+            };
+            exchange_value(role) * factor
+        })
         .sum();
 
     // V5: この手で盤上に増える自駒の価値（打ち＝打った駒、成り＝増えたぶん）
@@ -1856,7 +1917,10 @@ impl Strategy for EstimatorStrategy {
         // V2（玉距離重み付き利き）の相手玉側。玉位置の信念は評価に使う粒子から
         // 取る（厳密が生きていればそちら、全滅していれば taint = mate_pool と
         // 同じ規約）。重みが両方0（既定）なら 81マスぶんの表も作らない
-        let opp_king_w: Option<[f64; 81]> = (params.effect_opp_w != 0.0)
+        // 紐の働き重み付け（`link_work_w`）も相手玉側の距離重みを使うので、
+        // effect_opp_w が 0 でもそちらが有効なら表を作る（作り忘れると
+        // 「自玉側だけの働き」という別物の量になる）
+        let opp_king_w: Option<[f64; 81]> = (params.effect_opp_w != 0.0 || link_work_w() != 0.0)
             .then(|| {
                 let src: &[(&Position, f64)] = if sample.is_empty() { &taint_pool } else { &sample };
                 opp_king_effect_weights(&taint_king_distribution(src, opp_color))
