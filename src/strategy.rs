@@ -17,6 +17,7 @@ use crate::board::{
 use crate::check::CheckSolver;
 use crate::estimator::{EPS_INFO, Estimator, opp_reply_weights};
 use crate::likelihood::{FITTED_THETA, ParticleCtx, particle_features, particle_log_weight};
+use crate::model::GameModel;
 use crate::observation::{Observation, ObservationLog};
 use crate::opening::OpeningBook;
 use rand::SeedableRng;
@@ -730,6 +731,86 @@ fn endgame_push(move_number: u32, lead: f64) -> f64 {
     (ramp * (0.3 + (lead / ANTI_DRAW_LEAD_UNIT).clamp(-0.3, 1.2))).max(0.0)
 }
 
+/// **自分側の配置**（盤上の自駒と持ち駒）の指紋。
+///
+/// ついたてでは自分側の情報は完全既知なので、この量は**粒子を使わず
+/// ノイズゼロ**で計算できる。同じ指紋がまた出る = 「その間に何も起きていない
+/// のに同じ形へ戻った」ということで、無意味な往復の直接の証拠になる
+/// （相手に駒を取られた／自分が取ったなら持ち駒か盤上が変わるので指紋も変わる）。
+fn own_config_fingerprint<'a>(
+    pieces: impl Iterator<Item = (&'a str, Role)>,
+    hand: &HashMap<Role, u32>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut items: Vec<(&str, Role)> = pieces.collect();
+    items.sort_unstable();
+    let mut hands: Vec<(u8, u32)> = hand
+        .iter()
+        .filter(|&(_, &n)| n > 0)
+        .map(|(&r, &n)| (r as u8, n))
+        .collect();
+    hands.sort_unstable();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    items.hash(&mut h);
+    hands.hash(&mut h);
+    h.finish()
+}
+
+/// これまでに出現した自分側の配置と、その出現回数。
+/// 受理された自分の手のたびに1つ記録する（初期配置も1回として数える）
+fn own_config_history(my_color: Color, log: &ObservationLog) -> HashMap<u64, u32> {
+    let mut model = GameModel::new(my_color);
+    let mut counts: HashMap<u64, u32> = HashMap::new();
+    let mut record = |m: &GameModel| {
+        let pieces = m.my_pieces();
+        let hand = m.my_hand();
+        let fp = own_config_fingerprint(pieces.iter().map(|p| (p.square.as_str(), p.role)), &hand);
+        *counts.entry(fp).or_insert(0) += 1;
+    };
+    record(&model);
+    for e in log.events() {
+        model.apply(e);
+        if matches!(e, Observation::MyMove { .. }) {
+            record(&model);
+        }
+    }
+    counts
+}
+
+/// 候補手を指した**後**の自分側配置の指紋。
+///
+/// 取りが成立するかは指してみないと分からない（相手の駒は見えない）ので、
+/// **取らなかった場合**の配置で数える。実際に取れたなら持ち駒が増えて
+/// 次からは別の指紋になるので、往復の連鎖はそこで自然に切れる
+fn own_config_fingerprint_after(view: &PlayerView, mv: &ShogiMove) -> u64 {
+    let mut pieces: Vec<(String, Role)> = view
+        .your_pieces
+        .iter()
+        .map(|p| (p.square.clone(), p.role))
+        .collect();
+    let mut hand: HashMap<Role, u32> = view.your_hand.iter().map(|(&r, &n)| (r, n)).collect();
+    match *mv {
+        ShogiMove::Board { from, to, promote } => {
+            let from_usi = make_usi_square(from);
+            if let Some(p) = pieces.iter_mut().find(|p| p.0 == from_usi) {
+                if promote {
+                    if let Some(r) = promote_role(p.1) {
+                        p.1 = r;
+                    }
+                }
+                p.0 = make_usi_square(to);
+            }
+        }
+        ShogiMove::Drop { role, to } => {
+            if let Some(n) = hand.get_mut(&role) {
+                *n = n.saturating_sub(1);
+            }
+            pieces.push((make_usi_square(to), role));
+        }
+    }
+    own_config_fingerprint(pieces.iter().map(|(s, r)| (s.as_str(), *r)), &hand)
+}
+
 /// 観測から確実に分かる素材リード（歩換算・相対値）。
 /// 自分の駒の増減は取った駒（持ち駒に入る）と取られた駒を両方含み、
 /// 相手側は鏡像（自分が+vなら相手は-v）なので、リード = 自分の変化×2。
@@ -1004,6 +1085,24 @@ pub struct EvalParams {
     /// 一貫）。ついたて側の既存 SPSA も `pressure_w`(0.0918) > `attack_w`(0.0434) と
     /// 同じ非対称を独立に見つけているので、初期値・範囲もその想定でよい。0 = 無効
     pub effect_opp_w: f64,
+    /// **自分側の配置が過去に出現した回数**1回あたりの減点。
+    ///
+    /// 既存の `backtrack_penalty` / `shuffle_penalty` は**直前の1手しか見ない
+    /// うえに固定値**なので、何度繰り返しても同じ額しか引かれない。実戦で
+    /// 3四角↔2五角を6手繰り返した局（watch-estimator-20260728-122107 の
+    /// 57〜67手目）を `rank_probe` で見ると、手戻り減点 −0.369 は効いているのに
+    /// **ブラインド玉攻めボーナス +1.8 が上回っていた**: 角が動くたびに
+    /// 「信念上の敵玉マスへ利きを作る手」として加点され直すため、
+    /// 同じ攻めを何度でも作り直せてしまう。
+    /// `endgame_push`（手戻り減点を増幅する仕組み）も ANTI_DRAW_START=60手 から
+    /// しか立ち上がらないのでこの局面では効いていなかった。
+    ///
+    /// そこで「直前の手の逆か」ではなく**同じ配置に戻った回数**で数える。
+    /// 往復を続けると 0→1→1→2→2→3… と単調に増えるので、繰り返すほど重くなる。
+    /// 自分側の配置は完全既知なので粒子不要・ノイズゼロ。相手に取られたり
+    /// 自分が取ったりすれば指紋が変わって回数がリセットされる ＝
+    /// 「**何も起きていないのに同じ形へ戻る**」ときだけ効く。0 = 無効
+    pub repeat_penalty_w: f64,
 }
 
 impl Default for EvalParams {
@@ -1098,6 +1197,7 @@ impl Default for EvalParams {
             board_discount_w: 0.0,
             effect_own_w: 0.0,
             effect_opp_w: 0.0,
+            repeat_penalty_w: 0.0,
         }
     }
 }
@@ -1110,7 +1210,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 48] = [
+    pub const SPECS: [ParamSpec; 49] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -1352,6 +1452,13 @@ impl EvalParams {
             hi: 0.2,
         },
         ParamSpec {
+            // 出現回数1回あたり。ブラインド玉攻めボーナス（実測 +1.8）を
+            // 数回の往復で上回れる水準まで範囲を取る
+            name: "repeat_penalty_w",
+            lo: 0.0,
+            hi: 2.0,
+        },
+        ParamSpec {
             name: "board_discount_w",
             // やねうら王は 104/1024 ≒ 0.102。ついたては持ち駒優位（不可視・
             // 索敵）と打ちマス反則（打てるマスが分からない）が逆向きに働くので、
@@ -1410,6 +1517,7 @@ impl EvalParams {
             self.link_w,
             self.effect_own_w,
             self.effect_opp_w,
+            self.repeat_penalty_w,
             self.board_discount_w,
         ]
     }
@@ -1464,7 +1572,8 @@ impl EvalParams {
             link_w: v[44],
             effect_own_w: v[45],
             effect_opp_w: v[46],
-            board_discount_w: v[47],
+            repeat_penalty_w: v[47],
+            board_discount_w: v[48],
         }
     }
 }
@@ -1589,6 +1698,18 @@ impl EstimatorStrategy {
             .and_then(|v| v.parse::<f64>().ok())
         {
             Some(w) => EvalParams { link_w: w, ..params },
+            None => params,
+        };
+        // 同じ自陣形への往復の累積減点（0 で従来挙動）
+        let params = match std::env::var("TSUITATE_REPEAT_PENALTY_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+        {
+            Some(w) => EvalParams {
+                repeat_penalty_w: w,
+                ..params
+            },
             None => params,
         };
         // 玉距離重み付き利き（V2）の運用ノブ（w スイープ用。0 で従来挙動）
@@ -1841,6 +1962,14 @@ impl Strategy for EstimatorStrategy {
             }
         }
 
+        // 同じ自陣形へ戻る手の累積減点用（`repeat_penalty_w`）。
+        // 自分側の配置は完全既知なので粒子不要・ノイズゼロ
+        let own_config_history = if self.params.repeat_penalty_w != 0.0 {
+            own_config_history(view.your_color, log)
+        } else {
+            HashMap::new()
+        };
+
         // アンチドロー: 終盤にリードがあるほど攻め項を増幅して膠着を破る。
         // 手戻り/シャッフルの減点も同時に強めて「その場で回る」手を締め出す
         let push = endgame_push(view.move_number, material_lead(view));
@@ -2040,6 +2169,17 @@ impl Strategy for EstimatorStrategy {
                 } else if from == pt {
                     adjust -= params.shuffle_penalty;
                 }
+            }
+            // 同じ自陣形へ戻る手の累積減点。上の2つは直前の1手しか見ず固定額
+            // なので、往復を繰り返しても減点が増えない（`repeat_penalty_w` の
+            // doc 参照: 実戦で角が 3四↔2五 を6手繰り返した局面では、
+            // ブラインド玉攻めの +1.8 が固定の −0.369 を上回り続けていた）
+            if params.repeat_penalty_w != 0.0 {
+                let seen = own_config_history
+                    .get(&own_config_fingerprint_after(view, &mv))
+                    .copied()
+                    .unwrap_or(0);
+                adjust -= params.repeat_penalty_w * f64::from(seen);
             }
             let score = out.score() + adjust;
             scored.push((usi, mv, out, adjust, score));
@@ -4133,6 +4273,75 @@ pub(crate) mod tests {
         assert!(after < value, "取った駒は相手の盤上から消える: {after} < {value}");
         let (_, value_after) = blind_recapture_target(&view, &log).unwrap();
         assert!((after - value_after).abs() < 1e-12);
+    }
+
+    /// 同じ自陣形へ戻る手の累積カウント。往復を続けるほど回数が増えること、
+    /// 途中で駒を取られたら（＝何かが起きたら）別の形になって数え直しになることを
+    /// 確かめる。既存の backtrack_penalty は直前の1手しか見ず固定額なので、
+    /// 実戦の 3四角↔2五角 6連続（watch-estimator-20260728-122107）を止められなかった
+    #[test]
+    fn own_config_repeat_count_grows_with_shuffling() {
+        let mut log = ObservationLog::default();
+        let mv = |n: u32, usi: &str| Observation::MyMove {
+            move_number: n,
+            usi: usi.into(),
+            captured: None,
+        };
+        // 玉を 5九 → 5八 → 5九 → 5八 と往復させる（5八は初期局面で空きマス。
+        // 自駒の上へ動かす手を書くと GameModel がその駒を上書きしてしまい、
+        // 「同じ形へ戻った」ことにならないので注意）
+        log.record(mv(1, "5i5h"));
+        log.record(mv(3, "5h5i"));
+        log.record(mv(5, "5i5h"));
+        let counts = own_config_history(Color::Sente, &log);
+
+        // 「5八に玉がいる」形は 1手目と5手目の2回出ている
+        let mut model = GameModel::new(Color::Sente);
+        for e in log.events() {
+            model.apply(e);
+        }
+        let now = model.my_pieces();
+        let fp_now = own_config_fingerprint(
+            now.iter().map(|p| (p.square.as_str(), p.role)),
+            &model.my_hand(),
+        );
+        assert_eq!(counts.get(&fp_now), Some(&2), "5八の形は2回出ている");
+
+        // ここから 5九へ戻す手を指すと、その形は初期局面と3手目の2回ぶん既出
+        let view = minimal_view(now.clone(), model.my_hand());
+        let back = own_config_fingerprint_after(&view, &parse_usi("5h5i").unwrap());
+        assert_eq!(counts.get(&back), Some(&2), "5九の形も2回出ている＝往復の証拠");
+
+        // 一度も出ていない形（別の駒を動かす）は 0
+        let fresh = own_config_fingerprint_after(&view, &parse_usi("2g2f").unwrap());
+        assert_eq!(counts.get(&fresh), None, "新しい形は既出でない");
+    }
+
+    /// 間に駒を取られたら形が変わるので、往復カウントは持ち越さない
+    /// （「何も起きていないのに同じ形へ戻る」ときだけ効かせるための性質）
+    #[test]
+    fn own_config_repeat_resets_when_material_changes() {
+        let mut log = ObservationLog::default();
+        log.record(Observation::MyMove {
+            move_number: 1,
+            usi: "2h5h".into(),
+            captured: None,
+        });
+        // 相手に 5八の飛車を取られる
+        log.record(Observation::OpponentMoved {
+            move_number: 2,
+            captured_my_piece_at: Some("5h".into()),
+        });
+        let counts = own_config_history(Color::Sente, &log);
+        let mut model = GameModel::new(Color::Sente);
+        for e in log.events() {
+            model.apply(e);
+        }
+        let view = minimal_view(model.my_pieces(), model.my_hand());
+        // 飛車を失った後の形は、それ以前のどの形とも一致しない
+        let fresh = own_config_fingerprint_after(&view, &parse_usi("2g2f").unwrap());
+        assert_eq!(counts.get(&fresh), None);
+        assert_eq!(counts.len(), 2, "初期形と 5八飛の形の2つだけが記録されている");
     }
 
     /// V2 の要点は「可動性」ではなく「**利きがどこを向いているか**」であること。
