@@ -314,6 +314,13 @@ fn main() {
     let mut total_check_turns = 0;
     let mut total_check_actual_fouls = 0;
     let mut total_check_solved = 0;
+    // 王手駒の即取られ: bot の手が直接王手（動かした/打った駒自身が敵玉へ利く）
+    // になり、その駒を相手の直後の手で取られた回数。玉位置ビリーフが外れている
+    // ときの典型（信念上の玉へ向けた王手が、実際には守られたマスへ着地している）
+    // を数える。取り返せなかったもの（駒損の確定）は別勘定
+    let mut total_bot_checks = 0u32;
+    let mut total_checker_lost = 0u32;
+    let mut total_checker_lost_free = 0u32;
     let mut total_recap_ops = 0;
     let mut total_recap_taken = 0;
     let mut total_recap_missed_good = 0;
@@ -525,6 +532,59 @@ fn main() {
         }
         println!("  駒得収支: 取った {bot_captured:.0} / 取られた {bot_lost:.0}（歩=1換算）");
 
+        // 王手駒の即取られ（変異救済 / 玉位置ビリーフ系の効果測定用）
+        for (i, m) in rec.end.moves.iter().enumerate() {
+            if m.by_color != bot {
+                continue;
+            }
+            let Some(mv) = parse_usi(&m.usi) else { break };
+            let to = match mv {
+                ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+            };
+            let Some(after) = positions.get(i + 1) else { break };
+            if !after.in_check(bot.other()) {
+                continue;
+            }
+            let Some(opp_king) = after.king_square(bot.other()) else {
+                continue;
+            };
+            // 直接王手のみ（開き王手は動かした駒が王手駒ではない）
+            if !after.attacks(to, opp_king) {
+                continue;
+            }
+            total_bot_checks += 1;
+            let taken = rec.end.moves.get(i + 1).is_some_and(|n| {
+                n.by_color != bot
+                    && parse_usi(&n.usi).is_some_and(|nm| match nm {
+                        ShogiMove::Board { to: t, .. } | ShogiMove::Drop { to: t, .. } => t == to,
+                    })
+            });
+            if !taken {
+                continue;
+            }
+            total_checker_lost += 1;
+            let recaptured = rec.end.moves.get(i + 2).is_some_and(|n| {
+                n.by_color == bot
+                    && parse_usi(&n.usi).is_some_and(|nm| match nm {
+                        ShogiMove::Board { to: t, .. } | ShogiMove::Drop { to: t, .. } => t == to,
+                    })
+            });
+            if !recaptured {
+                total_checker_lost_free += 1;
+            }
+            println!(
+                "  王手駒の即取られ {}手目 {}: {:?}{}",
+                i + 1,
+                m.usi,
+                after.piece_at(to).map(|p| p.role),
+                if recaptured {
+                    "（取り返しあり）"
+                } else {
+                    "（取り返しなし）"
+                }
+            );
+        }
+
         // 王手ソルバーの再現検証（王手中に反則した手番それぞれを指し直す）
         let (tested, actual, sim) = simulate_check_solver(&rec, &positions, bot);
         total_check_turns += tested;
@@ -671,6 +731,9 @@ fn main() {
     println!("1手詰みの存在（参考値・玉位置は不可視）: {total_missed_mates}回");
     println!(
         "被詰めろ（相手に1手詰めを与えた局面）: {total_mate_allowed}回 / {games_mate_allowed}局（うち打ち詰み {total_mate_allowed_drop}回・実際に詰まされた {total_mate_executed}回）"
+    );
+    println!(
+        "王手駒の即取られ: {total_checker_lost}回（うち取り返しなし {total_checker_lost_free}回）/ 直接王手 {total_bot_checks}回"
     );
     if total_occupancy_fouls > 0 {
         println!(
