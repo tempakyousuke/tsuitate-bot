@@ -49,8 +49,13 @@ fn main() {
                     // gain の差がどこから来ているかは、これが無いと env の
                     // アブレーションで1項ずつ潰すしかない
                     s.push_str(&format!(
-                        " NN={:+.3} 駒得={:+.3} リスク=-{:.3} 静的gain={:.3}",
-                        c.value_nn, c.capture_value, c.risk, c.static_gain
+                        " NN={:+.3} 駒得={:+.3} リスク=-{:.3} 紐={:+.3} 盤上減価=-{:.3} 静的gain={:.3}",
+                        c.value_nn,
+                        c.capture_value,
+                        c.risk,
+                        c.link,
+                        c.board_discount,
+                        c.static_gain
                     ));
                     s
                 };

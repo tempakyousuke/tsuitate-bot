@@ -17,6 +17,7 @@ use crate::board::{
 use crate::check::CheckSolver;
 use crate::estimator::{EPS_INFO, Estimator, opp_reply_weights};
 use crate::likelihood::{FITTED_THETA, ParticleCtx, particle_features, particle_log_weight};
+use crate::model::GameModel;
 use crate::observation::{Observation, ObservationLog};
 use crate::opening::OpeningBook;
 use rand::SeedableRng;
@@ -198,6 +199,12 @@ pub struct CandidateScore {
     /// 静的な取られリスク項の粒子加重平均（gain からは控除済みの正の値）。
     /// 2手読みを通った候補では depth2_replace 分が実測へ置き換わっている
     pub risk: f64,
+    /// gain に加算された紐の項（link_w × 紐のついた自駒の価値合計。V3）。
+    /// 候補間でほぼ定数なので、見るのは**候補どうしの差**
+    pub link: f64,
+    /// gain から引かれた盤上駒の減価（board_discount_w × 盤上の自駒の価値合計。V5）。
+    /// 正の値 = そのぶん gain が減っている。これも見るのは差
+    pub board_discount: f64,
 }
 
 /// 前進を好むヒューリスティック＋乱数（従来実装）
@@ -343,6 +350,11 @@ struct SearchBudget {
     depth2_particles: usize,
     /// 詰めろ生成（mate.rs::drop_mate）を判定する粒子数
     mate_samples: usize,
+    /// 構想（自分の手 → 相手の応手 → 自分の手）を読む粒子数。
+    /// **思考予算をここに使う**: 予算を増やしても強くならないのは、粒子数と
+    /// 読み幅を比例させるだけで「同じことを多くやって」いるからで、
+    /// 深さは買えていなかった（2000ms で飽和、8000ms でも +0.5pt）
+    plan_particles: usize,
 }
 
 impl SearchBudget {
@@ -357,6 +369,7 @@ impl SearchBudget {
             depth2_top_k: f(DEPTH2_TOP_K, 4, 32),
             depth2_particles: f(DEPTH2_PARTICLES, 16, 384),
             mate_samples: f(MATE_SAMPLES, 2, 32),
+            plan_particles: f(PLAN_PARTICLES, 4, 128),
         }
     }
 }
@@ -388,6 +401,12 @@ const MATE_RISK_IF_SUPPORTED: f64 = 0.5;
 /// 圧力項（PRESSURE_SAMPLES）よりさらに絞る
 const MATE_SAMPLES: usize = 6;
 
+/// 構想（自分の手 → 相手の応手 → 自分の手）を読む粒子数の基準値。
+/// 1粒子あたり `PLAN_REPLY_SAMPLES` 本の応手サンプル × `legal_moves()` 1回。
+/// **思考予算をここに使う**方針なので depth2 と同オーダーで取る
+/// （既存の項は予算を増やしても飽和していて、深さだけが未使用の余地だった）
+const PLAN_PARTICLES: usize = 16;
+
 /// 駒交換で動く価値: 盤上価値と持ち駒価値（基本駒種）の平均。
 /// 素の駒は piece_value と一致し、成駒は取られても相手の持ち駒に入るのは
 /// 基本駒種ぶんなので割り引かれる（と金を取り返された反動 = (6+1)/2 = 3.5）。
@@ -399,10 +418,60 @@ pub(crate) fn exchange_value(role: Role) -> f64 {
 /// 着手後の自駒の利き被覆マス数（自分に見える盤面だけの近似）。
 /// 相手の駒は見えないため飛び駒は自駒にだけ遮られる楽観値
 fn coverage_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
-    own_effects_after(view, mv).coverage
+    own_effects_after(view, mv, None, &EvalParams::default()).coverage
 }
 
-/// 自駒だけで決まる評価量（粒子不要・ノイズゼロ）。3項が同じ
+/// 玉からの距離による利きの価値の減衰（V2。docs/yaneuraou-lessons.md 1-2）。
+///
+/// やねうら王 Lv3（利きの価値を玉からの距離で重み付ける）は連載中で最大の
+/// 伸び（+R200）。向こうの optimizer が出した実測値は距離0〜8で
+/// 1024 / 496 / 297 / 272 / 184 / 166 / 146 / 116 / 117 だが、**テーブルを
+/// 写すのではなく**、それによく一致する近似式 `1/(1+d)` を使う
+/// （0.5 / 0.333 / 0.25 … 対 実測 0.484 / 0.290 / 0.266 …。
+/// やねうら王のコメントにある手決めの式 `83×1024/(d+1)` と同じ形）。
+/// ついたての最適点は向こうと違うはずなので、係数は SPSA で別途調整する。
+///
+/// **底歩が可動性ゼロでも価値がある**のはこの重み付けで説明できる:
+/// 利きは1マスでも、それが自玉の隣（距離1）なら 0.5。隅で誰も脅かしていない
+/// と金は利きが2マスあっても両玉から遠い（距離7〜8）ので 0.25 前後にしかならない
+fn king_dist_weight(d: i8) -> f64 {
+    1.0 / (1.0 + d as f64)
+}
+
+/// チェビシェフ距離（将棋の玉が届くまでの手数と同じ尺度）
+fn cheb(a: Coord, b: Coord) -> i8 {
+    (a.file - b.file).abs().max((a.rank - b.rank).abs())
+}
+
+/// マスごとの「相手玉の信念位置からの距離重み」の期待値
+/// `Σ_k P(玉=k) × king_dist_weight(dist(マス, k))`。
+///
+/// 相手玉の位置は粒子の信念なので、候補ごとに粒子を舐め直すと重い。
+/// **決定点ごとに1度だけ**81マスぶん作って使い回す（`blind_king_attack` が
+/// 玉位置分布を1度だけ作るのと同じ方針）。分布が空なら None = この項は無効
+fn opp_king_effect_weights(dist: &[(Coord, f64)]) -> Option<[f64; 81]> {
+    if dist.is_empty() {
+        return None;
+    }
+    let total: f64 = dist.iter().map(|&(_, p)| p).sum();
+    if total <= 0.0 {
+        return None;
+    }
+    let mut w = [0.0f64; 81];
+    for file in 1..=9i8 {
+        for rank in 1..=9i8 {
+            let sq = Coord { file, rank };
+            let acc: f64 = dist
+                .iter()
+                .map(|&(k, p)| p * king_dist_weight(cheb(sq, k)))
+                .sum();
+            w[crate::belief_features::sq_index(sq)] = acc / total;
+        }
+    }
+    Some(w)
+}
+
+/// 自駒だけで決まる評価量（粒子不要・ノイズゼロ）。4項が同じ
 /// 「着手後の自駒配置と、その利き」を必要とするので1回の走査でまとめて出す
 #[derive(Debug, Default, Clone, Copy)]
 struct OwnEffects {
@@ -412,13 +481,40 @@ struct OwnEffects {
     king_holes: f64,
     /// 紐のついた自駒の価値合計（V3。`link_w`）
     linked_value: f64,
+    /// **自玉からの距離で重み付けた自駒の利き**の総和（V2。`effect_own_w`）。
+    /// 底歩のように「可動性はほぼ無いが自玉の隣に利いている駒」を正しく
+    /// 拾うための量（可動性そのものではない、が要点）
+    effect_own: f64,
+    /// **相手玉の信念位置からの距離で重み付けた自駒の利き**の総和
+    /// （V2。`effect_opp_w`）。相手玉の位置は粒子の信念なので、
+    /// マスごとに `Σ_k P(玉=k) × w(dist)` を決定点ごとに1度だけ先に作る
+    effect_opp: f64,
+    /// **この手で盤上に増える自駒の価値**（V5。`board_discount_w`）。
+    /// 打ち = 打った駒の価値、成り = 増えた価値、それ以外 = 0。
+    ///
+    /// やねうら王 Lv2 は盤上の全駒に一律の減点を掛けるが、そのまま写すと
+    /// 盤上価値の合計（70前後）が gain の定数オフセットになり、w=0.1 で
+    /// **全候補の gain が −7 ほど下がって負に振り切る**。`combine_score` は
+    /// `(p_legal×gain).min(gain)` なので、gain が負だと p_legal の割引が
+    /// 丸ごと効かなくなり反則確率の序列が壊れる（threat_value の差分化が
+    /// vs v9 −12pt で否定されたのと同じ罠）。候補間の差は増分だけなので、
+    /// **増分だけを持つ**ことで順位への効果を保ったままゼロ点を動かさない
+    board_material_added: f64,
 }
 
-/// 着手後の自駒配置を作り、`OwnEffects` の3項をまとめて計算する。
+/// 着手後の自駒配置を作り、`OwnEffects` の各項をまとめて計算する。
 ///
 /// ついたてで**相手の駒が見えなくても完全に既知**な情報だけを使う
 /// （自駒の位置と利き）。飛び駒は自駒にだけ遮られる楽観値になる。
-fn own_effects_after(view: &PlayerView, mv: &ShogiMove) -> OwnEffects {
+///
+/// `opp_king_w` は相手玉の信念からの距離重み（`opp_king_effect_weights`）。
+/// None なら V2 の相手玉側（`effect_opp`）は 0 のまま
+fn own_effects_after(
+    view: &PlayerView,
+    mv: &ShogiMove,
+    opp_king_w: Option<&[f64; 81]>,
+    params: &EvalParams,
+) -> OwnEffects {
     let mut pieces: Vec<VisiblePiece> = view.your_pieces.clone();
     match *mv {
         ShogiMove::Board { from, to, promote } => {
@@ -439,6 +535,11 @@ fn own_effects_after(view: &PlayerView, mv: &ShogiMove) -> OwnEffects {
         }),
     }
 
+    let king = pieces
+        .iter()
+        .find(|p| p.role == Role::King)
+        .and_then(|p| parse_usi_square(&p.square));
+
     // 移動できるマス（自駒のマスを含まない）= 索敵網の広さ
     let mut covered: HashSet<Coord> = HashSet::new();
     // 利かせているマス（自駒のマスを含む）= 紐の判定用。玉の利きも数える
@@ -446,19 +547,27 @@ fn own_effects_after(view: &PlayerView, mv: &ShogiMove) -> OwnEffects {
     let mut defended: HashSet<Coord> = HashSet::new();
     // 玉以外の自駒が利かせているマス（V4 の穴の判定用）
     let mut defended_nonking: HashSet<Coord> = HashSet::new();
+    // V2 の副産物: 駒ごとの「働き」= その駒の利きを玉からの距離で重み付けた和。
+    // 紐（V3）を「守る価値のある駒か」で重み付けるのに使う（下記 linked_value）
+    let mut work_by_sq: HashMap<Coord, f64> = HashMap::new();
     for p in &pieces {
         covered.extend(move_targets(&pieces, p, view.your_color));
         let d = defend_targets(&pieces, p, view.your_color);
+        if let Some(sq) = parse_usi_square(&p.square) {
+            let work: f64 = d
+                .iter()
+                .map(|&s| {
+                    king.map_or(0.0, |k| king_dist_weight(cheb(s, k)))
+                        + opp_king_w.map_or(0.0, |w| w[crate::belief_features::sq_index(s)])
+                })
+                .sum();
+            work_by_sq.insert(sq, work);
+        }
         if p.role != Role::King {
             defended_nonking.extend(d.iter().copied());
         }
         defended.extend(d);
     }
-
-    let king = pieces
-        .iter()
-        .find(|p| p.role == Role::King)
-        .and_then(|p| parse_usi_square(&p.square));
     let occupied: HashSet<Coord> = pieces
         .iter()
         .filter_map(|p| parse_usi_square(&p.square))
@@ -485,19 +594,80 @@ fn own_effects_after(view: &PlayerView, mv: &ShogiMove) -> OwnEffects {
     }
 
     // V3: 紐のついた自駒（玉を除く）の価値合計。自分の利きは自分のマスへは
-    // 届かないので、`defended` に載っている = 別の自駒が守っている
+    // 届かないので、`defended` に載っている = 別の自駒が守っている。
+    //
+    // **働きによる重み付け**（2026-07-28、ユーザー指摘）: 素の交換価値だけで
+    // 数えると「隅で何もしていないと金」に紐をつける手が、実戦的に価値のある
+    // 紐と同じ重みで評価される（発端: watch-estimator 17手目の L*1b で、
+    // 1一のと金と打った香が**相互に守り合う**ので単発の打ちで得られる紐の
+    // 最大値になっていた）。守る価値は駒の材料価値だけでなく**その駒が
+    // 働いているか**にも依るので、V2 の距離重み付き利きで係数を掛ける。
+    //
+    // `link_work_w` は補間ノブ（0 = 従来どおり係数1で挙動不変、1 = 完全に
+    // 働きで重み付け）。飽和の基準 `link_work_ref()` 以上の働きがあれば係数1。
+    //
+    // **王手中は重み付けしない**（＝従来どおり満額の紐）。v12 の実測で
+    // 「紐は王手中もゲートしてはいけない」（ゲートすると kakutori の反則が
+    // 7 → 51）と分かっており、王手中の紐は反則経済に効いている。働きで
+    // 薄めるとその効果を部分的に打ち消す（重み付け版の実測: kakutori の反則
+    // 18 → 38、dragon-check-drop 12 → 23）。**遊び駒に紐をつけるな**という
+    // 狙いは王手中には関係がないので、ここだけ従来の挙動に戻すのが素直
+    let lw = if view.you_in_check {
+        0.0
+    } else {
+        params.link_work_w
+    };
+    let work_ref = params.link_work_ref.max(1e-6);
     let linked_value = pieces
         .iter()
         .filter(|p| p.role != Role::King)
         .filter_map(|p| parse_usi_square(&p.square).map(|c| (c, p.role)))
         .filter(|(c, _)| defended.contains(c))
-        .map(|(_, role)| exchange_value(role))
+        .map(|(c, role)| {
+            let factor = if lw == 0.0 {
+                1.0
+            } else {
+                let work = work_by_sq.get(&c).copied().unwrap_or(0.0);
+                (1.0 - lw) + lw * (work / work_ref).min(1.0)
+            };
+            exchange_value(role) * factor
+        })
         .sum();
+
+    // V5: この手で盤上に増える自駒の価値（打ち＝打った駒、成り＝増えたぶん）
+    let board_material_added = match *mv {
+        ShogiMove::Drop { role, .. } => piece_value(role),
+        ShogiMove::Board { from, promote: true, .. } => view
+            .your_pieces
+            .iter()
+            .find(|p| p.square == make_usi_square(from))
+            .and_then(|p| promote_role(p.role).map(|r| piece_value(r) - piece_value(p.role)))
+            .unwrap_or(0.0),
+        ShogiMove::Board { .. } => 0.0,
+    };
+
+    // V2: 利きを「玉からの距離」で重み付ける。自玉側は完全既知なのでノイズゼロ、
+    // 相手玉側は粒子の信念（決定点ごとに1度だけ作った期待重み）を使う。
+    // 数えるのは `defended`（自駒の乗ったマスも含む利き）: 底歩が自玉の隣の
+    // 自駒を守っている形も「利き」として拾う必要がある
+    let mut effect_own = 0.0f64;
+    let mut effect_opp = 0.0f64;
+    for &sq in &defended {
+        if let Some(k) = king {
+            effect_own += king_dist_weight(cheb(sq, k));
+        }
+        if let Some(w) = opp_king_w {
+            effect_opp += w[crate::belief_features::sq_index(sq)];
+        }
+    }
 
     OwnEffects {
         coverage: covered.len() as f64,
         king_holes,
         linked_value,
+        effect_own,
+        effect_opp,
+        board_material_added,
     }
 }
 
@@ -513,7 +683,7 @@ fn own_effects_after(view: &PlayerView, mv: &ShogiMove) -> OwnEffects {
 /// あるなら加点」の区別はできない。**自駒が乗っているマスは穴に数えない**
 /// （壁として機能するため）という近似にする
 fn king_holes_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
-    own_effects_after(view, mv).king_holes
+    own_effects_after(view, mv, None, &EvalParams::default()).king_holes
 }
 
 /// 持ち駒の歩を成れる圏内（敵陣＋一段手前）へ打つ手か（1.0/0.0）。
@@ -549,6 +719,87 @@ fn endgame_push(move_number: u32, lead: f64) -> f64 {
         .clamp(0.0, 1.0);
     (ramp * (0.3 + (lead / ANTI_DRAW_LEAD_UNIT).clamp(-0.3, 1.2))).max(0.0)
 }
+
+/// **自分側の配置**（盤上の自駒と持ち駒）の指紋。
+///
+/// ついたてでは自分側の情報は完全既知なので、この量は**粒子を使わず
+/// ノイズゼロ**で計算できる。同じ指紋がまた出る = 「その間に何も起きていない
+/// のに同じ形へ戻った」ということで、無意味な往復の直接の証拠になる
+/// （相手に駒を取られた／自分が取ったなら持ち駒か盤上が変わるので指紋も変わる）。
+fn own_config_fingerprint<'a>(
+    pieces: impl Iterator<Item = (&'a str, Role)>,
+    hand: &HashMap<Role, u32>,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut items: Vec<(&str, Role)> = pieces.collect();
+    items.sort_unstable();
+    let mut hands: Vec<(u8, u32)> = hand
+        .iter()
+        .filter(|&(_, &n)| n > 0)
+        .map(|(&r, &n)| (r as u8, n))
+        .collect();
+    hands.sort_unstable();
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    items.hash(&mut h);
+    hands.hash(&mut h);
+    h.finish()
+}
+
+/// これまでに出現した自分側の配置と、その出現回数。
+/// 受理された自分の手のたびに1つ記録する（初期配置も1回として数える）
+fn own_config_history(my_color: Color, log: &ObservationLog) -> HashMap<u64, u32> {
+    let mut model = GameModel::new(my_color);
+    let mut counts: HashMap<u64, u32> = HashMap::new();
+    let mut record = |m: &GameModel| {
+        let pieces = m.my_pieces();
+        let hand = m.my_hand();
+        let fp = own_config_fingerprint(pieces.iter().map(|p| (p.square.as_str(), p.role)), &hand);
+        *counts.entry(fp).or_insert(0) += 1;
+    };
+    record(&model);
+    for e in log.events() {
+        model.apply(e);
+        if matches!(e, Observation::MyMove { .. }) {
+            record(&model);
+        }
+    }
+    counts
+}
+
+/// 候補手を指した**後**の自分側配置の指紋。
+///
+/// 取りが成立するかは指してみないと分からない（相手の駒は見えない）ので、
+/// **取らなかった場合**の配置で数える。実際に取れたなら持ち駒が増えて
+/// 次からは別の指紋になるので、往復の連鎖はそこで自然に切れる
+fn own_config_fingerprint_after(view: &PlayerView, mv: &ShogiMove) -> u64 {
+    let mut pieces: Vec<(String, Role)> = view
+        .your_pieces
+        .iter()
+        .map(|p| (p.square.clone(), p.role))
+        .collect();
+    let mut hand: HashMap<Role, u32> = view.your_hand.iter().map(|(&r, &n)| (r, n)).collect();
+    match *mv {
+        ShogiMove::Board { from, to, promote } => {
+            let from_usi = make_usi_square(from);
+            if let Some(p) = pieces.iter_mut().find(|p| p.0 == from_usi) {
+                if promote {
+                    if let Some(r) = promote_role(p.1) {
+                        p.1 = r;
+                    }
+                }
+                p.0 = make_usi_square(to);
+            }
+        }
+        ShogiMove::Drop { role, to } => {
+            if let Some(n) = hand.get_mut(&role) {
+                *n = n.saturating_sub(1);
+            }
+            pieces.push((make_usi_square(to), role));
+        }
+    }
+    own_config_fingerprint(pieces.iter().map(|(s, r)| (s.as_str(), *r)), &hand)
+}
+
 
 /// 観測から確実に分かる素材リード（歩換算・相対値）。
 /// 自分の駒の増減は取った駒（持ち駒に入る）と取られた駒を両方含み、
@@ -601,6 +852,10 @@ struct EvalOut {
     value_nn: f64,
     /// 粒子加重の期待駒得（内訳表示用。gain には加算済み）
     capture_value: f64,
+    /// gain に加算された紐の項（V3。内訳表示用）
+    link: f64,
+    /// gain から引かれた盤上駒の減価（V5。正の値。内訳表示用）
+    board_discount: f64,
 }
 
 impl EvalOut {
@@ -776,6 +1031,102 @@ pub struct EvalParams {
     /// 攻撃されている駒にしか効かない**ので、この事前の勾配は無かった。
     /// 自駒同士の連結は完全既知なので粒子不要・ノイズゼロ
     pub link_w: f64,
+    /// **盤上の自駒**の駒価値1点あたりの減点（V5。docs/yaneuraou-lessons.md 1-6）。
+    /// やねうら王 Lv2 は `score -= piece_value × 104/1024`（≒10%）**だけで +R50**
+    /// と、連載中2番目に大きい単独項。含意は「同じ駒なら持ち駒のほうが価値が高い」。
+    ///
+    /// 盤上の合計は候補間でほぼ定数なので、**順位に効くのは差分だけ**:
+    /// - 打ち → 打った駒の価値ぶん盤上が増える = 打つこと自体のコスト
+    /// - 成り → 増えた価値ぶんのコスト（やねうら王も同じ扱い）
+    /// - 取り → 自分の盤上は変わらず持ち駒が増えるので、相対的に得になる
+    ///
+    /// **ついたてでは持ち駒の優位がさらに大きいはずだという理屈**: 持ち駒は
+    /// (a) 相手から見えない、(b) 任意のマスに打てる（＝索敵ユニットにもなる）。
+    /// **ただし逆向きの力もある**: 打ちマス反則は反則原因の最多カテゴリで、
+    /// 持ち駒は「打てるマスが分からない」というついたて固有のコストを負う。
+    /// どちらが勝つかは実測でしか分からないので、SPSA の範囲は**正負にまたがらせる**。
+    ///
+    /// 発端は watch-estimator 17手目の `L*1b`（自分のと金の直前に香を打って
+    /// その香が最後まで一度も動けない手）。紐（`link_w`）と低い取られリスクが
+    /// 加点する一方、**打つこと自体のコストがゼロ**だったのが症状の半分。
+    /// 0 = 無効（従来と同一挙動）
+    pub board_discount_w: f64,
+    /// **自玉からの距離で重み付けた自駒の利き**への加点（V2。やねうら王 Lv3 は
+    /// これ単独で **+R200** と連載中で最大。docs/yaneuraou-lessons.md 1-2）。
+    ///
+    /// 既存の `coverage_w` は「利き被覆マス数を**全マス平等に**数える」量で、
+    /// SPSA が 0.0013（実質ゼロ）まで潰した。やねうら王の知見は
+    /// 「利きの価値は玉からの距離に強く依存する」なので、**同じ利き情報でも
+    /// 重み付けを変えれば生き返る**はずだ、という賭け。
+    ///
+    /// **底歩の説明が付くのがこの形の要点**: 可動性はほぼゼロでも、利きが
+    /// 自玉の隣（距離1）なら重みは 0.5。隅で何も脅かしていないと金は
+    /// 利きが2マスあっても両玉から遠いので小さくなる。**可動性そのものでは
+    /// 「動かないが働いている駒」を取りこぼす**（ユーザー指摘、2026-07-28）。
+    ///
+    /// 自玉の位置は完全既知なのでこちら側は**粒子不要・ノイズゼロ**。0 = 無効
+    pub effect_own_w: f64,
+    /// **相手玉の信念位置からの距離で重み付けた自駒の利き**への加点（V2 の攻め側）。
+    /// 相手玉の位置は粒子の信念なので、`blind_king_attack` と同じく玉位置分布を
+    /// 決定点ごとに1度だけ作って使う（`opp_king_effect_weights`）。
+    /// 玉位置の不確かさで自然に薄まるので、信念が割れている局面では小さくなる。
+    ///
+    /// やねうら王は自玉側より相手玉側をやや重く見ている（`their > our` が全距離で
+    /// 一貫）。ついたて側の既存 SPSA も `pressure_w`(0.0918) > `attack_w`(0.0434) と
+    /// 同じ非対称を独立に見つけているので、初期値・範囲もその想定でよい。0 = 無効
+    pub effect_opp_w: f64,
+    /// 紐（V3）を**守られる駒の「働き」**で重み付ける度合い。
+    /// 0 = 交換価値だけで数える（従来）、1 = 完全に働きで重み付け。
+    ///
+    /// 発端はユーザー指摘（2026-07-28）: 「1二香車の筋の悪さは、そこにいるだけだと
+    /// ほとんど価値のないと金に対して紐をつけていることにも起因する。紐をつける際に
+    /// その駒の働きも考慮する必要がある」。素の交換価値だけで数えると、隅で何も
+    /// していないと金に紐をつける手が、実戦的に価値のある紐と同じ重みになる。
+    ///
+    /// 働きは V2（玉距離重み付き利き）を流用する。**可動性ではない**のが要点で、
+    /// 底歩は利き1マスでも自玉の隣なので働きを確保する（「動けない駒は価値なし」
+    /// では底歩を取りこぼす）。**王手中は適用しない**（v12 の実測で「紐は王手中も
+    /// ゲートしてはいけない」＝ゲートすると kakutori の反則が 7→51）。
+    ///
+    /// 実測（200局×2シード、vs v12）: 対照 51.5/52.0% に対し 53.5/54.3%、
+    /// 反則/局 6.64 → 6.37、詰み 39 → 50。シナリオでは狙いの悪手が
+    /// 20/20 → 2/20 になり、良い打ち（kakudo の R*2d、mate-net の R*7h）は維持
+    pub link_work_w: f64,
+    /// 働きの飽和基準。これ以上の働きがある駒は係数1（＝満額の紐）になる。
+    /// `1/(1+d)` は距離1で0.5・距離8で0.11 と平坦なので、基準値の取り方で
+    /// 「遊び駒」と「働いている駒」の分離度が決まる。
+    /// 実測では 2.0 が最良（3.0 はシナリオでは良いが勝率が落ちる）
+    pub link_work_ref: f64,
+    /// **自分側の配置が過去に出現した回数**1回あたりの減点。
+    ///
+    /// 既存の `backtrack_penalty` / `shuffle_penalty` は**直前の1手しか見ない
+    /// うえに固定値**なので、何度繰り返しても同じ額しか引かれない。実戦で
+    /// 3四角↔2五角を6手繰り返した局（watch-estimator-20260728-122107 の
+    /// 57〜67手目）を `rank_probe` で見ると、手戻り減点 −0.369 は効いているのに
+    /// **ブラインド玉攻めボーナス +1.8 が上回っていた**: 角が動くたびに
+    /// 「信念上の敵玉マスへ利きを作る手」として加点され直すため、
+    /// 同じ攻めを何度でも作り直せてしまう。
+    /// `endgame_push`（手戻り減点を増幅する仕組み）も ANTI_DRAW_START=60手 から
+    /// しか立ち上がらないのでこの局面では効いていなかった。
+    ///
+    /// そこで「直前の手の逆か」ではなく**同じ配置に戻った回数**で数える。
+    /// 往復を続けると 0→1→1→2→2→3… と単調に増えるので、繰り返すほど重くなる。
+    /// 自分側の配置は完全既知なので粒子不要・ノイズゼロ。相手に取られたり
+    /// 自分が取ったりすれば指紋が変わって回数がリセットされる ＝
+    /// 「**何も起きていないのに同じ形へ戻る**」ときだけ効く。0 = 無効
+    pub repeat_penalty_w: f64,
+    /// **構想の読み**（自分の手 → 自分の次の手）の利得に掛ける重み。
+    ///
+    /// 既存の2手読みは「自分の手 → **相手の**応手」しか見ないので、
+    /// 「**支えを作ってから出る**」型の組み立てを評価できない。
+    /// 発端（watch-estimator-20260728-130424 の55手目、ユーザー指摘）:
+    /// `9五歩打 → 9四金打` は歩で支えてから金を出す2手の構想だが、
+    /// `G*9d` 単独ではリスク −3.078（他の金打ちは −0.8前後）で113位、
+    /// `P*9e` も「ただ歩を打っただけ」で31位にしかならない。
+    ///
+    /// 相手の応手を挟まない楽観値なので、そのまま足すと攻めが軽くなりすぎる。
+    /// 1未満の重みで割り引く前提。0 = 無効（従来と同一挙動）
+    pub plan_w: f64,
 }
 
 impl Default for EvalParams {
@@ -867,6 +1218,14 @@ impl Default for EvalParams {
             // 目的化して攻めなくなり手数だけ伸びる変質（85手→112手）。
             // 平坦部の下端を採るのは、手数が短く引き分け化のリスクが小さいため
             link_w: 0.06,
+            board_discount_w: 0.0,
+            effect_own_w: 0.0,
+            effect_opp_w: 0.0,
+            // 2026-07-28 採用（200局×2シードで再現。詳細は link_work_w の doc）
+            link_work_w: 1.0,
+            link_work_ref: 2.0,
+            repeat_penalty_w: 0.3,
+            plan_w: 0.0,
         }
     }
 }
@@ -879,7 +1238,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 45] = [
+    pub const SPECS: [ParamSpec; 52] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -1107,6 +1466,52 @@ impl EvalParams {
             lo: 0.0,
             hi: 0.25,
         },
+        ParamSpec {
+            // V2。利き1本あたりの加点なので、被覆マス数（40〜80）× 距離重み
+            // （0.1〜0.5）= 10〜30 スケールの量に掛かる。coverage_w が 0.0013 に
+            // 潰された前例があるので範囲は小さめから
+            name: "effect_own_w",
+            lo: 0.0,
+            hi: 0.2,
+        },
+        ParamSpec {
+            name: "effect_opp_w",
+            lo: 0.0,
+            hi: 0.2,
+        },
+        ParamSpec {
+            // 0 = 交換価値だけ、1 = 完全に働きで重み付け。補間なので [0,1]
+            name: "link_work_w",
+            lo: 0.0,
+            hi: 1.0,
+        },
+        ParamSpec {
+            // 飽和基準。小さいほど「遊び駒」の判定が緩い
+            name: "link_work_ref",
+            lo: 0.5,
+            hi: 4.0,
+        },
+        ParamSpec {
+            // 出現回数1回あたり。ブラインド玉攻めボーナス（実測 +1.8）を
+            // 数回の往復で上回れる水準まで範囲を取る
+            name: "repeat_penalty_w",
+            lo: 0.0,
+            hi: 2.0,
+        },
+        ParamSpec {
+            // 相手の応手を挟まない楽観値なので 1 未満で割り引く前提
+            name: "plan_w",
+            lo: 0.0,
+            hi: 0.5,
+        },
+        ParamSpec {
+            name: "board_discount_w",
+            // やねうら王は 104/1024 ≒ 0.102。ついたては持ち駒優位（不可視・
+            // 索敵）と打ちマス反則（打てるマスが分からない）が逆向きに働くので、
+            // **符号を固定せず正負にまたがらせる**（1-6 の指摘）
+            lo: -0.2,
+            hi: 0.2,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -1156,6 +1561,13 @@ impl EvalParams {
             self.mate_risk_w,
             self.king_hole_w,
             self.link_w,
+            self.effect_own_w,
+            self.effect_opp_w,
+            self.link_work_w,
+            self.link_work_ref,
+            self.repeat_penalty_w,
+            self.plan_w,
+            self.board_discount_w,
         ]
     }
 
@@ -1207,6 +1619,13 @@ impl EvalParams {
             mate_risk_w: v[42],
             king_hole_w: v[43],
             link_w: v[44],
+            effect_own_w: v[45],
+            effect_opp_w: v[46],
+            link_work_w: v[47],
+            link_work_ref: v[48],
+            repeat_penalty_w: v[49],
+            plan_w: v[50],
+            board_discount_w: v[51],
         }
     }
 }
@@ -1331,6 +1750,86 @@ impl EstimatorStrategy {
             .and_then(|v| v.parse::<f64>().ok())
         {
             Some(w) => EvalParams { link_w: w, ..params },
+            None => params,
+        };
+        // 紐の働き重み付け（V3 の拡張）の運用ノブ（w スイープ・切り戻し用）
+        let params = match std::env::var("TSUITATE_LINK_WORK_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        {
+            Some(w) => EvalParams {
+                link_work_w: w,
+                ..params
+            },
+            None => params,
+        };
+        let params = match std::env::var("TSUITATE_LINK_WORK_REF")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+        {
+            Some(r) => EvalParams {
+                link_work_ref: r,
+                ..params
+            },
+            None => params,
+        };
+        // 構想の読み（自分の手 → 自分の次の手）の運用ノブ（0 で従来挙動）
+        let params = match std::env::var("TSUITATE_PLAN_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+        {
+            Some(w) => EvalParams { plan_w: w, ..params },
+            None => params,
+        };
+        // 同じ自陣形への往復の累積減点（0 で従来挙動）
+        let params = match std::env::var("TSUITATE_REPEAT_PENALTY_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+        {
+            Some(w) => EvalParams {
+                repeat_penalty_w: w,
+                ..params
+            },
+            None => params,
+        };
+        // 玉距離重み付き利き（V2）の運用ノブ（w スイープ用。0 で従来挙動）
+        let params = match std::env::var("TSUITATE_EFFECT_OWN_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+        {
+            Some(w) => EvalParams {
+                effect_own_w: w,
+                ..params
+            },
+            None => params,
+        };
+        let params = match std::env::var("TSUITATE_EFFECT_OPP_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+        {
+            Some(w) => EvalParams {
+                effect_opp_w: w,
+                ..params
+            },
+            None => params,
+        };
+        // 盤上駒の減価（V5）の運用ノブ（w スイープ用。0 で従来挙動。
+        // やねうら王の比率は 0.102。負の値も許す＝持ち駒より盤上を好む側）
+        let params = match std::env::var("TSUITATE_BOARD_DISCOUNT_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+        {
+            Some(w) => EvalParams {
+                board_discount_w: w,
+                ..params
+            },
             None => params,
         };
         EstimatorStrategy {
@@ -1547,6 +2046,14 @@ impl Strategy for EstimatorStrategy {
             }
         }
 
+        // 同じ自陣形へ戻る手の累積減点用（`repeat_penalty_w`）。
+        // 自分側の配置は完全既知なので粒子不要・ノイズゼロ
+        let own_config_history = if self.params.repeat_penalty_w != 0.0 {
+            own_config_history(view.your_color, log)
+        } else {
+            HashMap::new()
+        };
+
         // アンチドロー: 終盤にリードがあるほど攻め項を増幅して膠着を破る。
         // 手戻り/シャッフルの減点も同時に強めて「その場で回る」手を締め出す
         let push = endgame_push(view.move_number, material_lead(view));
@@ -1627,6 +2134,18 @@ impl Strategy for EstimatorStrategy {
                 )
             });
         let blind_belief = blind_belief_board.as_ref().map(|(o, v)| (o, *v));
+        // V2（玉距離重み付き利き）の相手玉側。玉位置の信念は評価に使う粒子から
+        // 取る（厳密が生きていればそちら、全滅していれば taint = mate_pool と
+        // 同じ規約）。重みが両方0（既定）なら 81マスぶんの表も作らない
+        // 紐の働き重み付け（`link_work_w`）も相手玉側の距離重みを使うので、
+        // effect_opp_w が 0 でもそちらが有効なら表を作る（作り忘れると
+        // 「自玉側だけの働き」という別物の量になる）
+        let opp_king_w: Option<[f64; 81]> = (params.effect_opp_w != 0.0 || params.link_work_w != 0.0)
+            .then(|| {
+                let src: &[(&Position, f64)] = if sample.is_empty() { &taint_pool } else { &sample };
+                opp_king_effect_weights(&taint_king_distribution(src, opp_color))
+            })
+            .flatten();
 
         // 評価の前提条件の発火率（src/hits.rs）。`expected` の内側にある項
         // （駒得期待値・valueネット等）は厳密粒子が全滅すると丸ごと無効になるので、
@@ -1674,6 +2193,7 @@ impl Strategy for EstimatorStrategy {
                 &mut nn_state_cache,
                 blind_recapture,
                 blind_belief,
+                opp_king_w.as_ref(),
             );
             // 王手中: 仮説条件付きの「王手駒の除去期待値」（check.rs::removal_term）。
             // 王手駒のマスを取る手は受理された未来で脅威ごと駒を排除し、玉逃げ等の
@@ -1734,6 +2254,17 @@ impl Strategy for EstimatorStrategy {
                     adjust -= params.shuffle_penalty;
                 }
             }
+            // 同じ自陣形へ戻る手の累積減点。上の2つは直前の1手しか見ず固定額
+            // なので、往復を繰り返しても減点が増えない（`repeat_penalty_w` の
+            // doc 参照: 実戦で角が 3四↔2五 を6手繰り返した局面では、
+            // ブラインド玉攻めの +1.8 が固定の −0.369 を上回り続けていた）
+            if params.repeat_penalty_w != 0.0 {
+                let seen = own_config_history
+                    .get(&own_config_fingerprint_after(view, &mv))
+                    .copied()
+                    .unwrap_or(0);
+                adjust -= params.repeat_penalty_w * f64::from(seen);
+            }
             let score = out.score() + adjust;
             scored.push((usi, mv, out, adjust, score));
         }
@@ -1760,6 +2291,9 @@ impl Strategy for EstimatorStrategy {
                     budget,
                     &mut *rng,
                 );
+                // 構想（自分の手 → 相手の応手 → 自分の手）は depth2_delta の
+                // 内側へ統合した（`plan_w`）。応手を挟まない外付けの加点は
+                // 200局で -6pt と明確に負だったので廃止
                 let gain2 = out.gain + params.depth2_replace * (out.risk_mean + delta);
                 (gain2, combine_score(gain2, out.p_legal, out.foul_cost) + adjust)
             } else {
@@ -1783,6 +2317,8 @@ impl Strategy for EstimatorStrategy {
                 value_nn: out.value_nn,
                 capture_value: out.capture_value,
                 risk: out.risk_mean,
+                link: out.link,
+                board_discount: out.board_discount,
             });
             if best.as_ref().is_none_or(|(_, _, s)| final_score > *s) {
                 best = Some((usi, out.p_legal, final_score));
@@ -2644,6 +3180,9 @@ fn evaluate(
     // 上と同じく**厳密粒子が全滅した決定でだけ**使う（`belief_gain_w`）。
     // 重みが 0 なら choose() が None を渡すので計算もしない
     blind_belief: Option<(&[f64; 81], f64)>,
+    // V2: マスごとの「相手玉の信念位置からの距離重み」（`opp_king_effect_weights`）。
+    // 決定点ごとに1度だけ作って全候補で使い回す
+    opp_king_w: Option<&[f64; 81]>,
 ) -> EvalOut {
     let me = view.your_color;
     let opp = me.other();
@@ -2949,7 +3488,7 @@ fn evaluate(
 
     // 利き被覆（広い索敵網）と、成れる圏内への歩打ち（と金ポテンシャル）。
     // どちらも粒子に依存しない自明な情報だけで計算できる
-    let own_effects = own_effects_after(view, mv);
+    let own_effects = own_effects_after(view, mv, opp_king_w, params);
     let coverage = params.coverage_w * own_effects.coverage;
     let probe = params.tokin_probe_w * tokin_probe(view, mv);
     // 自玉8近傍の支えの無いマス（V4）。自駒だけで決まるので粒子に依らない
@@ -2979,6 +3518,19 @@ fn evaluate(
     // 王手中は反則が最も出る場面（analyze: 反則の約半数）なので、
     // ここで紐を切ると反則経済がそのまま悪化する（vs v11 の反則/局 6.20 → 6.71）
     let link = params.link_w * own_effects.linked_value;
+
+    // V5（盤上駒の減価、やねうら王 Lv2 で +R50）: 「同じ駒なら持ち駒のほうが
+    // 価値が高い」。この手で**盤上に増えた自駒の価値**にだけ比例して引く
+    // （打ち＝打った駒、成り＝増えたぶん。盤上の合計は定数なので持たない
+    // ＝ gain のゼロ点を動かさない。`board_material_added` の doc 参照）。
+    // 紐（link）と同じく自駒だけで決まるので粒子不要・ノイズゼロ
+    let board_discount = params.board_discount_w * own_effects.board_material_added;
+
+    // V2（玉距離重み付き利き、やねうら王 Lv3 で +R200）。自玉側は完全既知で
+    // ノイズゼロ、相手玉側は粒子の信念で薄まる。既存の coverage（全マス平等）が
+    // SPSA で潰されたのは重み付けが無かったせいだ、という賭け
+    let effect_value =
+        params.effect_own_w * own_effects.effect_own + params.effect_opp_w * own_effects.effect_opp;
 
     // 詰めろ生成: この手の後、次の自分の手番で持ち駒打ちの一手詰めが成立するか
     // （mate.rs::drop_mate）。ついたて将棋では相手に脅威が見えないので、詰めろは
@@ -3051,6 +3603,8 @@ fn evaluate(
     let gain = expected + advance_bias + development + coverage + probe + mate_threat - mate_risk
         - king_holes
         + link
+        - board_discount
+        + effect_value
         + blind_recapture
         + blind_belief_gain;
     EvalOut {
@@ -3069,6 +3623,8 @@ fn evaluate(
         } else {
             0.0
         },
+        link,
+        board_discount,
     }
 }
 
@@ -3111,7 +3667,11 @@ fn depth2_delta(
     };
     let mut sum = 0.0;
     let mut n = 0.0;
-    for (pos, w) in particles.iter().take(budget.depth2_particles) {
+    // 構想（3手目）の累積。相手の応手を1手挟んだ**後**の自分の駒得を見る。
+    // 応手を挟まない楽観版（plan_bonus）は 200局で -6pt と明確に負だった
+    let mut plan_sum = 0.0;
+    let mut plan_n = 0.0;
+    for (i, (pos, w)) in particles.iter().take(budget.depth2_particles).enumerate() {
         if !pos.is_legal(mv) {
             continue;
         }
@@ -3206,9 +3766,86 @@ fn depth2_delta(
             exp_delta -= quiet_w * pen / samples as f64;
         }
         sum += w * (exp_delta / total_rw);
+
+        // --- 構想（自分の手 → 相手の応手 → 自分の手）---
+        //
+        // やねうら王のような完全情報エンジンは、この「自分→相手→自分」を
+        // 深さぶん展開するのが探索そのもの。ついたて側で深さが買えないのは
+        // **1ノードの単価**が違う（粒子集合の上で評価するので NNUE の差分計算に
+        // 比べて3桁重い）ことと、期待値を取るまで打ち切れないので αβ カットが
+        // 効かないことによる。そこでここでは
+        // 「応手を1つサンプル → 自分の最善の駒得だけ見る」に絞る。
+        // 全評価（evaluate）ではなく駒得だけなので、legal_moves 1回ぶんで済む。
+        //
+        // 応手を挟まない版（旧 plan_bonus）は 200局で 45.5%（対照 51.5%）と
+        // 明確に負だった: 「支えを作れば次に出られる」を数える一方で、相手が
+        // その間に支えを崩したり、より速い攻めを通したりするのを見ていなかった
+        if params.plan_w != 0.0 && i < budget.plan_particles {
+            // 応手は**複数サンプルして平均**する。1本だけだと分散が大きく、
+            // 「たまたま楽な応手を引いた候補」が浮く（旧版の負けの一因）
+            let mut acc = 0.0f64;
+            for _ in 0..PLAN_REPLY_SAMPLES {
+                let mut t = rng.random_range(0.0..total_rw);
+                let mut chosen = &replies[replies.len() - 1].0;
+                for (r, rw) in &replies {
+                    t -= rw;
+                    if t <= 0.0 {
+                        chosen = r;
+                        break;
+                    }
+                }
+                let mut next2 = next.clone();
+                next2.play_unchecked(chosen);
+                // ここで手番は自分。相手の応手を織り込んだうえでの自分の最善手。
+                // 3手目は**駒得と王手**だけ見る（全評価を回すと粒子×応手×候補で
+                // 桁が違う。やねうら王が深く読めるのは1ノードの単価が3桁安い
+                // からで、こちらは同じ深さを同じ値段では買えない）
+                let mut best = 0.0f64;
+                for m2 in next2.legal_moves() {
+                    let to2 = match m2 {
+                        ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+                    };
+                    let gain3 = match next2.piece_at(to2).filter(|p| p.color != me) {
+                        Some(target) => {
+                            // 取り返される見込みは「着地マスに相手の利きが
+                            // 残っているか」で近似する（候補ごとの clone+play は重い）
+                            let comp = if next2.is_attacked(to2, me.other()) {
+                                match m2 {
+                                    ShogiMove::Board { from, .. } => next2
+                                        .piece_at(from)
+                                        .map(|p| exchange_value(p.role))
+                                        .unwrap_or(0.0),
+                                    ShogiMove::Drop { role, .. } => exchange_value(role),
+                                }
+                            } else {
+                                0.0
+                            };
+                            exchange_value(target.role) - comp
+                        }
+                        None => 0.0,
+                    };
+                    if gain3 > best {
+                        best = gain3;
+                    }
+                }
+                acc += best;
+            }
+            plan_sum += w * acc / f64::from(PLAN_REPLY_SAMPLES);
+            plan_n += w;
+        }
     }
-    if n > 0.0 { sum / n } else { 0.0 }
+    let base = if n > 0.0 { sum / n } else { 0.0 };
+    let plan = if plan_n > 0.0 {
+        params.plan_w * (plan_sum / plan_n)
+    } else {
+        0.0
+    };
+    base + plan
 }
+
+/// 構想（3手目）で相手の応手をサンプルする本数。1本だけだと分散が大きく、
+/// 「たまたま楽な応手を引いた候補」が浮いてしまう
+const PLAN_REPLY_SAMPLES: u32 = 3;
 
 /// この手の後も初期位置に残っている自分の大駒（飛・角）の枚数
 fn big_home_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
@@ -3806,6 +4443,168 @@ pub(crate) mod tests {
         assert!((after - value_after).abs() < 1e-12);
     }
 
+    /// 同じ自陣形へ戻る手の累積カウント。往復を続けるほど回数が増えること、
+    /// 途中で駒を取られたら（＝何かが起きたら）別の形になって数え直しになることを
+    /// 確かめる。既存の backtrack_penalty は直前の1手しか見ず固定額なので、
+    /// 実戦の 3四角↔2五角 6連続（watch-estimator-20260728-122107）を止められなかった
+    #[test]
+    fn own_config_repeat_count_grows_with_shuffling() {
+        let mut log = ObservationLog::default();
+        let mv = |n: u32, usi: &str| Observation::MyMove {
+            move_number: n,
+            usi: usi.into(),
+            captured: None,
+        };
+        // 玉を 5九 → 5八 → 5九 → 5八 と往復させる（5八は初期局面で空きマス。
+        // 自駒の上へ動かす手を書くと GameModel がその駒を上書きしてしまい、
+        // 「同じ形へ戻った」ことにならないので注意）
+        log.record(mv(1, "5i5h"));
+        log.record(mv(3, "5h5i"));
+        log.record(mv(5, "5i5h"));
+        let counts = own_config_history(Color::Sente, &log);
+
+        // 「5八に玉がいる」形は 1手目と5手目の2回出ている
+        let mut model = GameModel::new(Color::Sente);
+        for e in log.events() {
+            model.apply(e);
+        }
+        let now = model.my_pieces();
+        let fp_now = own_config_fingerprint(
+            now.iter().map(|p| (p.square.as_str(), p.role)),
+            &model.my_hand(),
+        );
+        assert_eq!(counts.get(&fp_now), Some(&2), "5八の形は2回出ている");
+
+        // ここから 5九へ戻す手を指すと、その形は初期局面と3手目の2回ぶん既出
+        let view = minimal_view(now.clone(), model.my_hand());
+        let back = own_config_fingerprint_after(&view, &parse_usi("5h5i").unwrap());
+        assert_eq!(counts.get(&back), Some(&2), "5九の形も2回出ている＝往復の証拠");
+
+        // 一度も出ていない形（別の駒を動かす）は 0
+        let fresh = own_config_fingerprint_after(&view, &parse_usi("2g2f").unwrap());
+        assert_eq!(counts.get(&fresh), None, "新しい形は既出でない");
+    }
+
+    /// 間に駒を取られたら形が変わるので、往復カウントは持ち越さない
+    /// （「何も起きていないのに同じ形へ戻る」ときだけ効かせるための性質）
+    #[test]
+    fn own_config_repeat_resets_when_material_changes() {
+        let mut log = ObservationLog::default();
+        log.record(Observation::MyMove {
+            move_number: 1,
+            usi: "2h5h".into(),
+            captured: None,
+        });
+        // 相手に 5八の飛車を取られる
+        log.record(Observation::OpponentMoved {
+            move_number: 2,
+            captured_my_piece_at: Some("5h".into()),
+        });
+        let counts = own_config_history(Color::Sente, &log);
+        let mut model = GameModel::new(Color::Sente);
+        for e in log.events() {
+            model.apply(e);
+        }
+        let view = minimal_view(model.my_pieces(), model.my_hand());
+        // 飛車を失った後の形は、それ以前のどの形とも一致しない
+        let fresh = own_config_fingerprint_after(&view, &parse_usi("2g2f").unwrap());
+        assert_eq!(counts.get(&fresh), None);
+        assert_eq!(counts.len(), 2, "初期形と 5八飛の形の2つだけが記録されている");
+    }
+
+    /// V2 の要点は「可動性」ではなく「**利きがどこを向いているか**」であること。
+    /// 底歩（可動性ほぼゼロ・自玉の隣に利く）と、隅で何もしていないと金
+    /// （可動性はあるが両玉から遠い）が分かれなければ意味がない
+    /// （ユーザー指摘、2026-07-28: 「動けない駒＝価値なし」では底歩を取りこぼす）
+    #[test]
+    fn effect_own_separates_bottom_pawn_from_idle_corner_tokin() {
+        // 自玉 5九。底歩 5八（利きは 5七の1マスだけ = 可動性は最低）
+        let bottom_pawn = minimal_view(
+            vec![
+                VisiblePiece {
+                    square: "5i".into(),
+                    role: Role::King,
+                },
+                VisiblePiece {
+                    square: "5h".into(),
+                    role: Role::Pawn,
+                },
+            ],
+            HashMap::new(),
+        );
+        // 同じ玉位置で、と金が隅 1一（利きは 2一・1二の2マス = 可動性は上）
+        let corner_tokin = minimal_view(
+            vec![
+                VisiblePiece {
+                    square: "5i".into(),
+                    role: Role::King,
+                },
+                VisiblePiece {
+                    square: "1a".into(),
+                    role: Role::Tokin,
+                },
+            ],
+            HashMap::new(),
+        );
+        // 玉を 5九→4九 に動かす（どちらも同じ手）ことで、駒の配置だけが違う
+        // 2局面の effect_own を比べる
+        let a = own_effects_after(&bottom_pawn, &parse_usi("5i4i").unwrap(), None, &EvalParams::default());
+        let b = own_effects_after(&corner_tokin, &parse_usi("5i4i").unwrap(), None, &EvalParams::default());
+        assert!(
+            a.effect_own > b.effect_own,
+            "底歩（可動性ゼロだが玉の近く）が隅のと金（可動性はあるが遠い）より \
+             高く評価されるべき: 底歩={} 隅のと金={}",
+            a.effect_own,
+            b.effect_own
+        );
+        // 可動性そのものは逆順（と金2マス > 底歩1マス）であることも確かめておく。
+        // ここが逆順でなければ、このテストは V2 の性質を検証していない
+        assert!(
+            b.coverage > a.coverage,
+            "可動性は隅のと金のほうが大きいはず: 底歩={} 隅のと金={}",
+            a.coverage,
+            b.coverage
+        );
+    }
+
+    /// V5（盤上駒の減価）は「この手で盤上に増えた自駒の価値」だけを持つ。
+    /// 盤上の合計を持つと gain のゼロ点が下がり、combine_score の min 形で
+    /// p_legal 割引が消える（threat_value の差分化で踏んだ罠）
+    #[test]
+    fn board_material_added_counts_only_the_increment() {
+        let view = minimal_view(
+            vec![
+                VisiblePiece {
+                    square: "5i".into(),
+                    role: Role::King,
+                },
+                VisiblePiece {
+                    square: "2d".into(),
+                    role: Role::Pawn,
+                },
+            ],
+            HashMap::from([(Role::Lance, 1)]),
+        );
+        // 打ち: 打った駒の価値そのもの
+        let drop = own_effects_after(&view, &parse_usi("L*1b").unwrap(), None, &EvalParams::default());
+        assert_eq!(drop.board_material_added, piece_value(Role::Lance));
+        // 静かな盤上の手: 増分ゼロ
+        let quiet = own_effects_after(&view, &parse_usi("2d2c").unwrap(), None, &EvalParams::default());
+        assert_eq!(quiet.board_material_added, 0.0);
+        // 成り: 増えたぶんだけ（歩1 → と6）
+        let promo = own_effects_after(&view, &parse_usi("2d2c+").unwrap(), None, &EvalParams::default());
+        assert_eq!(
+            promo.board_material_added,
+            piece_value(Role::Tokin) - piece_value(Role::Pawn)
+        );
+    }
+
+    /// 既定（重み0）では V5 が働かない = 従来と同じ挙動
+    #[test]
+    fn board_discount_is_disabled_by_default() {
+        assert_eq!(EvalParams::default().board_discount_w, 0.0);
+    }
+
     /// 既定（重み0）ではブラインド供給が働かない = 従来と同じ挙動
     #[test]
     fn belief_gain_is_disabled_by_default() {
@@ -3830,9 +4629,9 @@ pub(crate) mod tests {
         };
         // 玉(5i)だけが金(5h)を守っている形。玉の利きも紐に数える
         let view = minimal_view(vec![gold.clone(), king.clone()], HashMap::new());
-        let alone = own_effects_after(&view, &parse_usi("5h5g").unwrap());
+        let alone = own_effects_after(&view, &parse_usi("5h5g").unwrap(), None, &EvalParams::default());
         assert_eq!(alone.linked_value, 0.0, "5g へ出れば玉から離れて紐が切れる");
-        let stay = own_effects_after(&view, &parse_usi("5i4i").unwrap());
+        let stay = own_effects_after(&view, &parse_usi("5i4i").unwrap(), None, &EvalParams::default());
         assert!(
             stay.linked_value > 0.0,
             "玉が 4i へ寄っても金 5h は玉の利きに入ったまま"
@@ -3845,7 +4644,7 @@ pub(crate) mod tests {
             role: Role::Silver,
         });
         let view2 = minimal_view(pieces, HashMap::new());
-        let two = own_effects_after(&view2, &parse_usi("5i4i").unwrap());
+        let two = own_effects_after(&view2, &parse_usi("5i4i").unwrap(), None, &EvalParams::default());
         assert!(two.linked_value > stay.linked_value);
     }
 
