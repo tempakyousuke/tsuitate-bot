@@ -619,7 +619,14 @@ fn own_effects_after(
     //
     // `link_work_w` は補間ノブ（0 = 従来どおり係数1で挙動不変、1 = 完全に
     // 働きで重み付け）。飽和の基準 `link_work_ref()` 以上の働きがあれば係数1。
-    let lw = link_work_w();
+    //
+    // **王手中は重み付けしない**（＝従来どおり満額の紐）。v12 の実測で
+    // 「紐は王手中もゲートしてはいけない」（ゲートすると kakutori の反則が
+    // 7 → 51）と分かっており、王手中の紐は反則経済に効いている。働きで
+    // 薄めるとその効果を部分的に打ち消す（重み付け版の実測: kakutori の反則
+    // 18 → 38、dragon-check-drop 12 → 23）。**遊び駒に紐をつけるな**という
+    // 狙いは王手中には関係がないので、ここだけ従来の挙動に戻すのが素直
+    let lw = if view.you_in_check { 0.0 } else { link_work_w() };
     let work_ref = link_work_ref();
     let linked_value = pieces
         .iter()
