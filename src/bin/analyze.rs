@@ -321,6 +321,13 @@ fn main() {
     let mut total_bot_checks = 0u32;
     let mut total_checker_lost = 0u32;
     let mut total_checker_lost_free = 0u32;
+    // 王手の強さ: bot が王手をかけた各局面（開き王手含む・詰みは除く）で
+    // 相手に残る合法解消手数（王手中の合法手 = 解消手）。少ないほど相手は
+    // 正解を引くまで反則を積みやすい（強い王手。tuyoi_oote の教訓:
+    // 解消手1手の王手は反則負けを直接狙える）。[1, 2, 3..=5, 6..=10, 11+]
+    let mut check_resolution_hist = [0u32; 5];
+    let mut check_resolution_sum = 0u64;
+    let mut check_resolution_n = 0u64;
     let mut total_recap_ops = 0;
     let mut total_recap_taken = 0;
     let mut total_recap_missed_good = 0;
@@ -545,10 +552,27 @@ fn main() {
             if !after.in_check(bot.other()) {
                 continue;
             }
+            // 王手の強さ（相手の合法解消手数）。詰みは outcome 側で数える
+            if after.outcome().is_none() {
+                let n = after.legal_moves().len();
+                let bucket = match n {
+                    0 | 1 => 0,
+                    2 => 1,
+                    3..=5 => 2,
+                    6..=10 => 3,
+                    _ => 4,
+                };
+                check_resolution_hist[bucket] += 1;
+                check_resolution_sum += n as u64;
+                check_resolution_n += 1;
+                if n <= 2 {
+                    println!("  強い王手 {}手目 {}: 相手の合法解消手は{n}手", i + 1, m.usi);
+                }
+            }
             let Some(opp_king) = after.king_square(bot.other()) else {
                 continue;
             };
-            // 直接王手のみ（開き王手は動かした駒が王手駒ではない）
+            // 以降は直接王手のみ（開き王手は動かした駒が王手駒ではない）
             if !after.attacks(to, opp_king) {
                 continue;
             }
@@ -735,6 +759,17 @@ fn main() {
     println!(
         "王手駒の即取られ: {total_checker_lost}回（うち取り返しなし {total_checker_lost_free}回）/ 直接王手 {total_bot_checks}回"
     );
+    if check_resolution_n > 0 {
+        println!(
+            "王手の強さ（相手の合法解消手数）: 1手:{} 2手:{} 3〜5手:{} 6〜10手:{} 11手以上:{} / 平均 {:.1}手",
+            check_resolution_hist[0],
+            check_resolution_hist[1],
+            check_resolution_hist[2],
+            check_resolution_hist[3],
+            check_resolution_hist[4],
+            check_resolution_sum as f64 / check_resolution_n as f64,
+        );
+    }
     if total_occupancy_fouls > 0 {
         println!(
             "占有マス反則（打ちマス/経路封鎖）の再訪率: {total_repeat_avoidable}/{total_occupancy_fouls}（同一局内で過去の占有反則マスと一致。反則マスを覚える対策の理論上限）"
