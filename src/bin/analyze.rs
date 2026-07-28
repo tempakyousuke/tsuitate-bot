@@ -339,6 +339,11 @@ fn main() {
     let mut chk_strong_wide = (0u32, 0u32);
     let mut chk_strong_narrow = (0u32, 0u32);
     let mut chk_weak = (0u32, 0u32);
+    // 玉移動の解消手の有無での分割（rei3 のユーザー指摘 2026-07-29）:
+    // 玉の移動（逃げ/取り）は受け側が最初に試す自然なクラスで、しかも自陣側への
+    // 退路は仮説によらずほぼ確実に合法（見えない駒の利きが通りにくい）。
+    // 解消手に玉移動が含まれる王手は K が小さくても反則を稼げないはず
+    let mut chk_kesc = [(0u32, 0u32); 4]; // [K≤2玉逃げあり, K≤2なし, K≥3あり, K≥3なし]
     let mut total_recap_ops = 0;
     let mut total_recap_taken = 0;
     let mut total_recap_missed_good = 0;
@@ -566,7 +571,13 @@ fn main() {
             // 王手の強さ（相手の合法解消手数 K と、受け側の選択肢 N）。
             // 詰みは outcome 側で数える
             if after.outcome().is_none() {
-                let k = after.legal_moves().len();
+                let resolutions = after.legal_moves();
+                let k = resolutions.len();
+                // 解消手に玉の移動（逃げ/取り）が含まれるか
+                let king_escape = resolutions.iter().any(|rm| {
+                    matches!(rm, ShogiMove::Board { from, .. }
+                        if after.piece_at(*from).is_some_and(|p| p.role == Role::King))
+                });
                 let bucket = match k {
                     0 | 1 => 0,
                     2 => 1,
@@ -624,11 +635,20 @@ fn main() {
                 };
                 slot.0 += 1;
                 slot.1 += actual;
+                let kesc_idx = match (k <= 2, king_escape) {
+                    (true, true) => 0,
+                    (true, false) => 1,
+                    (false, true) => 2,
+                    (false, false) => 3,
+                };
+                chk_kesc[kesc_idx].0 += 1;
+                chk_kesc[kesc_idx].1 += actual;
                 if k <= 2 {
                     println!(
-                        "  強い王手 {}手目 {}: 解消{k}手 / 選択肢{n_opts}手 / 直後の反則{actual}回",
+                        "  強い王手 {}手目 {}: 解消{k}手{} / 選択肢{n_opts}手 / 直後の反則{actual}回",
                         i + 1,
-                        m.usi
+                        m.usi,
+                        if king_escape { "（玉逃げ可）" } else { "（玉逃げ不可）" },
                     );
                 }
             }
@@ -850,6 +870,13 @@ fn main() {
             per(chk_strong_wide),
             per(chk_strong_narrow),
             per(chk_weak),
+        );
+        println!(
+            "  玉移動の解消手の有無: K≤2玉逃げあり {} / K≤2玉逃げなし {} / K≥3あり {} / K≥3なし {}",
+            per(chk_kesc[0]),
+            per(chk_kesc[1]),
+            per(chk_kesc[2]),
+            per(chk_kesc[3]),
         );
     }
     if total_occupancy_fouls > 0 {
