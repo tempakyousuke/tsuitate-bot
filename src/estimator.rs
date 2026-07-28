@@ -252,6 +252,25 @@ const GRAVEYARD_MAX_SEGMENT: usize = 24;
 /// truncate の taint 優先淘汰で、修復・復活・リプレイが成功し次第自然に消える
 const EPS_PHYS_DEFAULT: f64 = 0.01;
 
+/// 変異救済（コピー＋最小編集）: 完全全滅時、force_apply（観測の説明を放棄した
+/// 強制適用）の前に、棄却粒子のコピーへ「相手駒の移設・持ち駒からの配置」の
+/// 最小編集を行い、**通常の制約適用を通せる**盤面を作る。駒は湧かせない
+/// （多重集合・二歩・行き所を保つ）ので局面としては正規で、現在の観測を
+/// 本当に説明する — 王手駒が盤に実在し、取りには取り手が居るので、
+/// 玉位置・王手駒などの信念の連続性が force_apply の「幽霊取り」より保たれ、
+/// 以後の観測も本当に説明できるため粒子として生き続けられる。
+/// 歴史との整合（その移設が過去の手数で実現可能だったか）は検証しない嘘なので
+/// taint マークと評価側の契約（通常サンプルから除外）は force_apply と同じ。
+/// 編集1回あたり ln(EPS_MUT) を logw へ課金する。ε_phys より軽い嘘なので
+/// 高めに置き、同じ wipe で force_apply 粒子と混在したときに taint プール内で
+/// 自然に勝たせる
+const EPS_MUT: f64 = 0.05;
+/// 変異救済の1粒子あたりの試行回数の既定値（TSUITATE_MUT_RESCUE で上書き、0=無効）
+const MUT_RESCUE_ATTEMPTS_DEFAULT: usize = 6;
+/// 変異救済の1試行で調べる移設元駒数の上限（最悪コストの抑制。
+/// 試行ごとにシャッフルし直すので、複数試行では別の駒も引ける）
+const MUT_SOURCE_TRIES: usize = 6;
+
 /// 若返り用のスナップショット: 相手決定点 cidx の適用**前**の状態
 #[derive(Clone)]
 struct Snap {
@@ -355,6 +374,11 @@ pub struct Estimator {
     phys_taint: Vec<u8>,
     /// ε_phys（TSUITATE_EPS_PHYS で上書き。0 = 最後の砦無効）
     eps_phys: f64,
+    /// 変異救済の1粒子あたりの試行回数（TSUITATE_MUT_RESCUE で上書き。
+    /// 0 = 無効 = 従来どおり force_apply のみ）
+    mut_attempts: usize,
+    /// 変異救済で生かした粒子の累計（診断用）
+    mut_rescued: u64,
     /// 思考予算に応じた粒子の目標数（スケール1.0で TARGET_PARTICLES）
     target: usize,
     /// リプレイ試行回数の上限（スケール比例）
@@ -459,6 +483,11 @@ impl Estimator {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(EPS_PHYS_DEFAULT),
+            mut_attempts: std::env::var("TSUITATE_MUT_RESCUE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(MUT_RESCUE_ATTEMPTS_DEFAULT),
+            mut_rescued: 0,
             target,
             regen_attempts: (REGEN_ATTEMPTS as f64 * scale) as usize,
             regen_deadline_ms: (500.0 * scale) as u64,
@@ -576,6 +605,11 @@ impl Estimator {
     /// 評価側は taint>0 を通常サンプルから除外し、玉位置系の用途にだけ使う
     pub fn phys_taint(&self) -> &[u8] {
         &self.phys_taint
+    }
+
+    /// 変異救済（コピー＋最小編集）で生かした粒子の累計（診断用）
+    pub fn mut_rescued(&self) -> u64 {
+        self.mut_rescued
     }
 
     pub fn healthy(&self) -> bool {
@@ -845,10 +879,14 @@ impl Estimator {
                 strict_dls.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
                 strict_dls[strict_dls.len() / 2]
             });
-            for (mut pos, pen, lw, hist, taint) in failed {
+            for (backup, pen, lw, hist, taint) in failed {
                 if pen >= INFO_MISS_CAP {
                     continue;
                 }
+                // apply_soft は失敗時も局面を汚しうる（例: MyMove の captured
+                // 不一致は play_unchecked 実行後に判明する）ので、墓場候補には
+                // 適用前の清潔な局面を渡す（変異救済・force_apply の前提）
+                let mut pos = backup.clone();
                 if let Some(dlw) = self.apply_soft(&mut pos, constraint) {
                     surv_pos.push(pos);
                     surv_pen.push(pen + 1);
@@ -859,7 +897,7 @@ impl Estimator {
                     surv_hist.push(hist);
                     surv_taint.push(taint);
                 } else {
-                    graveyard_candidates.push((pos, pen, lw, hist, taint));
+                    graveyard_candidates.push((backup, pen, lw, hist, taint));
                 }
             }
         }
@@ -888,17 +926,35 @@ impl Estimator {
         };
         let epoch_shift = if epoch_shift == f64::MIN { 0.0 } else { epoch_shift };
         if complete_wipe && self.eps_phys > 0.0 && !graveyard_candidates.is_empty() {
+            // 変異救済を force_apply より先に試す（EPS_MUT のdocコメント参照）。
+            // 時間は wipe のときだけの追加予算（empty_deadline の 1/4）で打ち切り、
+            // 予算切れ・編集不能の粒子は従来どおり force_apply で残す
+            let mut_deadline = std::time::Instant::now()
+                + std::time::Duration::from_millis(self.empty_deadline_ms / 4);
             for (pos, pen, lw, hist, taint) in &graveyard_candidates {
                 if surv_pos.len() >= self.target {
                     break;
                 }
-                let mut forced = pos.clone();
-                force_apply(&mut forced, my_color, constraint);
+                let rescued = (self.mut_attempts > 0
+                    && std::time::Instant::now() < mut_deadline)
+                    .then(|| self.mutate_and_apply(pos, constraint))
+                    .flatten();
+                let (next, dlw) = match rescued {
+                    Some((mutated, edits, dlw)) => {
+                        self.mut_rescued += 1;
+                        (mutated, EPS_MUT.ln() * f64::from(edits) + dlw)
+                    }
+                    None => {
+                        let mut forced = pos.clone();
+                        force_apply(&mut forced, my_color, constraint);
+                        (forced, self.eps_phys.ln())
+                    }
+                };
                 let mut h = hist.clone();
                 shift_hist(&mut h, -epoch_shift);
-                surv_pos.push(forced);
+                surv_pos.push(next);
                 surv_pen.push(*pen);
-                surv_logw.push(lw - epoch_shift + self.eps_phys.ln());
+                surv_logw.push(lw - epoch_shift + dlw);
                 surv_hist.push(h);
                 surv_taint.push(taint.saturating_add(1));
             }
@@ -937,9 +993,10 @@ impl Estimator {
                 }
             };
             eprintln!(
-                "    [c{cidx}] {kind}: 厳密{strict} soft{soft} taint{taint_n} 墓場{} 修復累計{}",
+                "    [c{cidx}] {kind}: 厳密{strict} soft{soft} taint{taint_n} 墓場{} 修復累計{} 変異累計{}",
                 self.graveyard.len(),
                 self.rejuv_repaired,
+                self.mut_rescued,
             );
         }
         self.particles = surv_pos;
@@ -981,6 +1038,85 @@ impl Estimator {
                 &mut self.rng,
             ),
         }
+    }
+
+    /// 変異救済（完全全滅時専用）: 棄却粒子（制約適用前の局面）をコピーし、
+    /// 制約を満たすための最小限の標的編集（相手駒の移設・持ち駒からの配置。
+    /// 駒は湧かせない）をしてから、**通常の制約適用**を通す。
+    /// 成功したら (適用後の局面, 編集回数, 適用の対数尤度増分)。
+    /// 呼び出し側は force_apply と同じく taint を立てること（歴史との整合は
+    /// 検証していないため）。
+    /// 完全全滅に到達する制約は物理的な説明不能だけ（王手宣言のみの不一致と
+    /// MyFoul はソフト救済が必ず拾う）なので、編集対象は MyMove の物理修正と
+    /// OppMove の捕獲説明・手詰まり解消に絞っている
+    fn mutate_and_apply(
+        &mut self,
+        backup: &Position,
+        constraint: &Constraint,
+    ) -> Option<(Position, u32, f64)> {
+        let my_color = self.my_color;
+        for _ in 0..self.mut_attempts {
+            let mut pos = backup.clone();
+            let edits = match constraint {
+                Constraint::MyMove {
+                    mv,
+                    captured,
+                    gives_check,
+                } => mutate_for_my_move(
+                    &mut pos,
+                    my_color,
+                    mv,
+                    *captured,
+                    *gives_check,
+                    &mut self.rng,
+                ),
+                // MyFoul の完全全滅は起きない（apply_soft が常に生かす）
+                Constraint::MyFoul { .. } => None,
+                Constraint::OppMove {
+                    captured_at,
+                    gives_check,
+                    ..
+                } => mutate_for_opp_move(
+                    &mut pos,
+                    my_color,
+                    *captured_at,
+                    *gives_check,
+                    &mut self.rng,
+                ),
+            };
+            let Some(edits) = edits else { continue };
+            let dlw = match constraint {
+                Constraint::MyMove {
+                    mv,
+                    captured,
+                    gives_check,
+                } => apply_my_move(&mut pos, my_color, mv, *captured, Some(*gives_check))
+                    .then_some(0.0),
+                Constraint::MyFoul { mv } => foul_consistent(&pos, my_color, mv).then_some(0.0),
+                Constraint::OppMove {
+                    captured_at,
+                    gives_check,
+                    foul_count,
+                    my_foul_count,
+                } => sample_opp_move(
+                    &mut pos,
+                    my_color,
+                    *captured_at,
+                    Some(*gives_check),
+                    *foul_count,
+                    *my_foul_count,
+                    &self.my_capture_sq,
+                    &self.my_touched_sq,
+                    &Guide::default(),
+                    None,
+                    &mut self.rng,
+                ),
+            };
+            if let Some(dlw) = dlw {
+                return Some((pos, edits, dlw));
+            }
+        }
+        None
     }
 
     /// depth-major の若返りバッチ: **浅い巻き戻しを全粒子に先に試し、だめなら
@@ -1604,6 +1740,387 @@ fn force_apply(pos: &mut Position, my_color: Color, constraint: &Constraint) {
             pos.set_turn(my_color);
         }
     }
+}
+
+/// 変異救済の編集素材: 盤上の相手駒（玉以外）または相手の持ち駒
+#[derive(Clone, Copy)]
+enum MutSource {
+    Board(Coord),
+    Hand(Role),
+}
+
+/// 移設に使える相手駒の一覧（シャッフル済み・MUT_SOURCE_TRIES 件まで）。
+/// 盤上駒を先に並べる（持ち駒からの配置は「過去に打っていた」という
+/// より強い嘘なので後回し）
+fn mut_sources(pos: &Position, opp: Color, rng: &mut StdRng) -> Vec<(MutSource, Piece)> {
+    let mut board: Vec<(MutSource, Piece)> = pos
+        .pieces()
+        .filter(|(_, p)| p.color == opp && p.role != Role::King)
+        .map(|(sq, p)| (MutSource::Board(sq), p))
+        .collect();
+    board.shuffle(rng);
+    let mut hand: Vec<(MutSource, Piece)> = [
+        Role::Rook,
+        Role::Bishop,
+        Role::Gold,
+        Role::Silver,
+        Role::Knight,
+        Role::Lance,
+        Role::Pawn,
+    ]
+    .into_iter()
+    .filter(|&r| pos.hand_count(opp, r) > 0)
+    .map(|r| (MutSource::Hand(r), Piece { color: opp, role: r }))
+    .collect();
+    hand.shuffle(rng);
+    board.extend(hand);
+    board.truncate(MUT_SOURCE_TRIES);
+    board
+}
+
+/// 移設元から駒を取り除く（配置は呼び出し側）
+fn take_source(pos: &mut Position, src: MutSource, opp: Color) {
+    match src {
+        MutSource::Board(sq) => pos.set(sq, None),
+        MutSource::Hand(r) => {
+            let h = pos.hand_count(opp, r);
+            pos.set_hand(opp, r, h.saturating_sub(1));
+        }
+    }
+}
+
+/// take_source の巻き戻し
+fn restore_source(pos: &mut Position, src: MutSource, piece: Piece, opp: Color) {
+    match src {
+        MutSource::Board(sq) => pos.set(sq, Some(piece)),
+        MutSource::Hand(r) => {
+            let h = pos.hand_count(opp, r);
+            pos.set_hand(opp, r, h + 1);
+        }
+    }
+}
+
+/// piece を sq へ置いてよいか（空きマス・二歩・行き所なし）
+fn placement_ok(pos: &Position, piece: Piece, sq: Coord) -> bool {
+    if pos.piece_at(sq).is_some() || dead_end_rank(piece.role, sq.rank, piece.color) {
+        return false;
+    }
+    if piece.role == Role::Pawn {
+        let nifu = (1..=9).any(|rank| {
+            pos.piece_at(Coord { file: sq.file, rank })
+                .is_some_and(|p| p.color == piece.color && p.role == Role::Pawn)
+        });
+        if nifu {
+            return false;
+        }
+    }
+    true
+}
+
+/// 全マスのうち空いているものをシャッフルして返す
+fn empty_squares_shuffled(pos: &Position, rng: &mut StdRng) -> Vec<Coord> {
+    let mut v: Vec<Coord> = (1..=9)
+        .flat_map(|file| (1..=9).map(move |rank| Coord { file, rank }))
+        .filter(|&sq| pos.piece_at(sq).is_none())
+        .collect();
+    v.shuffle(rng);
+    v
+}
+
+/// from と to の間（両端を除く）のマス列。直線・斜めの並びでなければ空
+fn between_squares(from: Coord, to: Coord) -> Vec<Coord> {
+    let df = (to.file - from.file).signum();
+    let dr = (to.rank - from.rank).signum();
+    let steps_f = (to.file - from.file).abs();
+    let steps_r = (to.rank - from.rank).abs();
+    if steps_f != 0 && steps_r != 0 && steps_f != steps_r {
+        return vec![]; // 桂馬跳びなど、直線・斜めでない移動
+    }
+    let n = steps_f.max(steps_r);
+    (1..n)
+        .map(|i| Coord {
+            file: from.file + df * i,
+            rank: from.rank + dr * i,
+        })
+        .collect()
+}
+
+/// 変異編集の不変条件: 編集で両玉の被王手状態を変えないこと
+/// （王手中でないのに王手が付く・王手中なのに消える編集は、観測済みの
+/// 王手宣言の歴史とあからさまに矛盾する）
+fn checks_unchanged(pos: &Position, before: (bool, bool)) -> bool {
+    (pos.in_check(Color::Sente), pos.in_check(Color::Gote)) == before
+}
+
+fn check_states(pos: &Position) -> (bool, bool) {
+    (pos.in_check(Color::Sente), pos.in_check(Color::Gote))
+}
+
+/// src の相手駒をランダムな空きマスへ移設する（forbidden のマスは避ける）。
+/// 両玉の被王手状態を変えない移設先だけを許す。成功したら true
+fn relocate_away(
+    pos: &mut Position,
+    src: Coord,
+    forbidden: &[Coord],
+    rng: &mut StdRng,
+) -> bool {
+    let Some(piece) = pos.piece_at(src) else {
+        return false;
+    };
+    let before = check_states(pos);
+    pos.set(src, None);
+    for sq in empty_squares_shuffled(pos, rng) {
+        if sq == src || forbidden.contains(&sq) || !placement_ok(pos, piece, sq) {
+            continue;
+        }
+        pos.set(sq, Some(piece));
+        if checks_unchanged(pos, before) {
+            return true;
+        }
+        pos.set(sq, None);
+    }
+    pos.set(src, Some(piece));
+    false
+}
+
+/// piece（必要なら成りへ切り替えて）を sq へ置く。置けたら true
+fn place_flexible(pos: &mut Position, mut piece: Piece, sq: Coord) -> bool {
+    if placement_ok(pos, piece, sq) {
+        pos.set(sq, Some(piece));
+        return true;
+    }
+    if let Some(pr) = promote_role(unpromote_role(piece.role)) {
+        piece.role = pr;
+        if placement_ok(pos, piece, sq) {
+            pos.set(sq, Some(piece));
+            return true;
+        }
+    }
+    false
+}
+
+/// 受理された自分の手を粒子上で合法・観測一致にする編集（変異救済）。
+/// 自分側は真実同期なので、直せるのは相手駒に起因する失敗だけ:
+/// 経路封鎖の解消・着地マスの中身を captured と一致させる・
+/// 王手宣言との不一致は相手玉の移設で合わせる。
+/// 成功したら編集回数（0編集 = 再適用しても同じ失敗なので None）
+fn mutate_for_my_move(
+    pos: &mut Position,
+    my_color: Color,
+    mv: &ShogiMove,
+    captured: Option<Role>,
+    gives_check: bool,
+    rng: &mut StdRng,
+) -> Option<u32> {
+    let opp = my_color.other();
+    let mut edits = 0u32;
+    let to = match *mv {
+        ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+    };
+    // 移設先として使ってはいけないマス（この手の経路と着地点）
+    let mut forbidden = vec![to];
+    // 1) 経路封鎖の解消(盤上移動のみ。自分側は真実同期なので封鎖は相手駒)
+    if let ShogiMove::Board { from, .. } = *mv {
+        forbidden.extend(between_squares(from, to));
+        for sq in between_squares(from, to) {
+            if pos.piece_at(sq).is_some_and(|p| p.color == opp) {
+                if !relocate_away(pos, sq, &forbidden, rng) {
+                    return None;
+                }
+                edits += 1;
+            }
+        }
+    }
+    // 2) 着地マスの中身を captured と一致させる
+    let cur = pos.piece_at(to);
+    if cur.is_some_and(|p| p.color == my_color) {
+        return None; // 自駒の上への着手は真実側でありえない
+    }
+    match captured {
+        Some(r) => {
+            if !cur.is_some_and(|p| unpromote_role(p.role) == r) {
+                if cur.is_some() {
+                    if !relocate_away(pos, to, &forbidden, rng) {
+                        return None;
+                    }
+                    edits += 1;
+                }
+                // 盤上の同駒種(成りを剥がして一致)を to へ移設、無ければ持ち駒から
+                let before = check_states(pos);
+                let donor = pos
+                    .pieces()
+                    .find(|(sq, p)| *sq != to && p.color == opp && unpromote_role(p.role) == r);
+                if let Some((sq, p)) = donor {
+                    pos.set(sq, None);
+                    if !place_flexible(pos, p, to) {
+                        pos.set(sq, Some(p));
+                        return None;
+                    }
+                } else if pos.hand_count(opp, r) > 0 {
+                    let p = Piece { color: opp, role: r };
+                    if !place_flexible(pos, p, to) {
+                        return None;
+                    }
+                    pos.set_hand(opp, r, pos.hand_count(opp, r) - 1);
+                } else {
+                    return None; // その駒種はもう盤にも持ち駒にも無い
+                }
+                if !checks_unchanged(pos, before) {
+                    return None;
+                }
+                edits += 1;
+            }
+        }
+        None => {
+            if cur.is_some() {
+                if !relocate_away(pos, to, &forbidden, rng) {
+                    return None;
+                }
+                edits += 1;
+            }
+        }
+    }
+    // 3) 王手宣言との一致（相手玉の位置に依存）。適用シミュレーションで検査し、
+    //    不一致なら相手玉を宣言と整合する空きマスへ移設する。
+    //    相手玉の真の位置についての知識（王手宣言）を盤面へ反映する編集で、
+    //    taint 玉の事後補正（strategy::project_taint_kings）の生成時版に相当する
+    let check_after = |pos: &Position| -> Option<bool> {
+        let mut sim = pos.clone();
+        apply_my_move(&mut sim, my_color, mv, captured, None).then(|| sim.in_check(opp))
+    };
+    match check_after(pos) {
+        None => return None, // 編集後も物理的に通らない
+        Some(chk) if chk == gives_check => {}
+        Some(_) => {
+            let king_sq = pos.king_square(opp)?;
+            let king = pos.piece_at(king_sq)?;
+            pos.set(king_sq, None);
+            let mut placed = false;
+            for sq in empty_squares_shuffled(pos, rng) {
+                if sq == king_sq || forbidden.contains(&sq) {
+                    continue;
+                }
+                pos.set(sq, Some(king));
+                // 移設した時点で王手が掛かっていてはいけない（自分の直前の手は
+                // 王手宣言なしで受理されている）。玉同士の隣接もここで弾かれる
+                if !pos.in_check(opp) && check_after(pos) == Some(gives_check) {
+                    placed = true;
+                    break;
+                }
+                pos.set(sq, None);
+            }
+            if !placed {
+                pos.set(king_sq, Some(king));
+                return None;
+            }
+            edits += 1;
+        }
+    }
+    (edits > 0).then_some(edits)
+}
+
+/// OppMove の制約を説明できるようにする編集（変異救済）。
+/// captured_at=Some(x): x へ利く空きマスへ相手駒を移設する（取り手を作る）。
+/// captured_at=None かつ gives_check: 自玉へ利く着地マス T と、そこへ1手で
+/// 行けるマス S を探して S へ移設する（王手を指せる駒を作る）。
+/// どちらも無し: 手詰まりに近い粒子なので、相手駒を空きマスへ移設して密集を解く。
+/// 編集後の着手の選択・合法性・宣言との整合は呼び出し側の sample_opp_move が
+/// 通常規約で検証する。成功したら編集回数
+fn mutate_for_opp_move(
+    pos: &mut Position,
+    my_color: Color,
+    captured_at: Option<Coord>,
+    gives_check: bool,
+    rng: &mut StdRng,
+) -> Option<u32> {
+    let opp = my_color.other();
+    let my_king = pos.king_square(my_color)?;
+    let before = check_states(pos);
+    if let Some(x) = captured_at {
+        // 自駒が x に居るはず（自分側は真実同期）
+        pos.piece_at(x).filter(|p| p.color == my_color)?;
+        // 「x で取ったとき自玉へ利くか」で移設候補を宣言と整合しやすい順に並べる
+        let mut ranked: Vec<(bool, MutSource, Piece)> = vec![];
+        for (src, piece) in mut_sources(pos, opp, rng) {
+            let saved = pos.piece_at(x);
+            pos.set(x, Some(piece));
+            let checks_from_x = pos.attacks(x, my_king);
+            pos.set(x, saved);
+            if !gives_check && checks_from_x {
+                continue; // 取った瞬間に王手になる駒は宣言なしと矛盾
+            }
+            ranked.push((gives_check && checks_from_x, src, piece));
+        }
+        ranked.sort_by_key(|&(pref, _, _)| std::cmp::Reverse(pref));
+        for (_, src, piece) in ranked {
+            take_source(pos, src, opp);
+            let mut done = false;
+            for s in empty_squares_shuffled(pos, rng) {
+                if s == x || !placement_ok(pos, piece, s) {
+                    continue;
+                }
+                pos.set(s, Some(piece));
+                if pos.attacks(s, x) && checks_unchanged(pos, before) {
+                    done = true;
+                    break;
+                }
+                pos.set(s, None);
+            }
+            if done {
+                return Some(1);
+            }
+            restore_source(pos, src, piece, opp);
+        }
+        return None;
+    }
+    if gives_check {
+        // 打ちで王手できるなら粒子は生きていたはずなので、盤上駒の移設だけ試す
+        let sources: Vec<(MutSource, Piece)> = mut_sources(pos, opp, rng)
+            .into_iter()
+            .filter(|(src, _)| matches!(src, MutSource::Board(_)))
+            .collect();
+        for (src, piece) in sources {
+            take_source(pos, src, opp);
+            let empties = empty_squares_shuffled(pos, rng);
+            let mut chosen = None;
+            'outer: for &t in &empties {
+                if !placement_ok(pos, piece, t) {
+                    continue;
+                }
+                pos.set(t, Some(piece));
+                let checks = pos.attacks(t, my_king);
+                pos.set(t, None);
+                if !checks {
+                    continue;
+                }
+                for &s in &empties {
+                    if s == t || !placement_ok(pos, piece, s) {
+                        continue;
+                    }
+                    pos.set(s, Some(piece));
+                    if pos.attacks(s, t) && checks_unchanged(pos, before) {
+                        chosen = Some(s);
+                        break 'outer;
+                    }
+                    pos.set(s, None);
+                }
+            }
+            if chosen.is_some() {
+                return Some(1);
+            }
+            restore_source(pos, src, piece, opp);
+        }
+        return None;
+    }
+    // 取りも王手も無い手が1つも指せない（手詰まりに近い粒子）: 密集を解く
+    for (src, _) in mut_sources(pos, opp, rng) {
+        if let MutSource::Board(sq) = src {
+            if relocate_away(pos, sq, &[], rng) {
+                return Some(1);
+            }
+        }
+    }
+    None
 }
 
 /// 動かした駒（着地点）が対象マスのどれかへ新たに利きを付けたか。
@@ -2580,6 +3097,134 @@ mod tests {
                 Some((Color::Sente, Role::Pawn))
             );
             assert_eq!(pos.turn(), Color::Gote);
+        }
+    }
+
+    /// 盤上（成りを剥がして数える）と両者の持ち駒を合わせた駒種 role の総数
+    fn total_role_count(pos: &Position, role: Role) -> u32 {
+        let board = pos
+            .pieces()
+            .filter(|(_, p)| unpromote_role(p.role) == role)
+            .count() as u32;
+        board
+            + u32::from(pos.hand_count(Color::Sente, role))
+            + u32::from(pos.hand_count(Color::Gote, role))
+    }
+
+    #[test]
+    fn mutation_rescue_explains_impossible_my_capture() {
+        // 初手 2g2f で歩を取った、という観測はどの粒子でも物理的に説明不能
+        // （2f に相手駒が居る粒子は無い）。変異救済は相手の歩を 2f へ移設して
+        // から通常適用を通すので、幽霊取り（歩が19枚に増える）にならない
+        let mut est = Estimator::with_seed(Color::Sente, 5);
+        let c = Constraint::MyMove {
+            mv: parse_usi("2g2f").unwrap(),
+            captured: Some(Role::Pawn),
+            gives_check: false,
+        };
+        est.apply_constraint(&c);
+        assert!(est.mut_rescued() > 0, "変異救済が1粒子も成功していない");
+        assert!(est.phys_taint.iter().all(|&t| t == 1), "変異粒子も taint を維持する");
+        let mut mutated = 0;
+        for (pos, lw) in est.particles().iter().zip(est.log_weights()) {
+            // 適用後の共通状態: 自分の歩が 2f に立ち、持ち駒に歩1枚
+            assert_eq!(
+                pos.piece_at(Coord { file: 2, rank: 6 }).map(|p| (p.color, p.role)),
+                Some((Color::Sente, Role::Pawn))
+            );
+            if total_role_count(pos, Role::Pawn) == 18 {
+                // 変異救済の粒子: 駒の多重集合が保存され、課金は ln(EPS_MUT)×1
+                mutated += 1;
+                assert_eq!(pos.hand_count(Color::Sente, Role::Pawn), 1);
+                assert!(
+                    (lw - EPS_MUT.ln()).abs() < 1e-9,
+                    "変異の課金が logw に乗っていない: {lw}"
+                );
+            } else {
+                // force_apply の粒子: 取った歩が湧いて19枚になる（従来の嘘）
+                assert_eq!(total_role_count(pos, Role::Pawn), 19);
+            }
+        }
+        assert!(mutated > 0, "多重集合を保存した粒子が1つもない");
+    }
+
+    #[test]
+    fn mutation_rescue_places_real_capturer_for_opp_move() {
+        // 7g7f のあと「相手が 1g の歩を取った」— 初期配置から1手で 1g に利く
+        // 相手駒は無いので物理的に説明不能（ソフト救済も captured_at は緩和しない）。
+        // 変異救済は相手駒を 1g へ利くマスへ移設し、実際に取る手を指させるので、
+        // 取り手が盤に実在する（force_apply の幽霊取りは 1g が空になる）
+        let mut est = Estimator::with_seed(Color::Sente, 7);
+        est.apply_constraint(&Constraint::MyMove {
+            mv: parse_usi("7g7f").unwrap(),
+            captured: None,
+            gives_check: false,
+        });
+        est.apply_constraint(&Constraint::OppMove {
+            captured_at: Some(Coord { file: 1, rank: 7 }),
+            gives_check: false,
+            foul_count: 0,
+            my_foul_count: 0,
+        });
+        assert!(est.mut_rescued() > 0, "変異救済が1粒子も成功していない");
+        let sq_1g = Coord { file: 1, rank: 7 };
+        let mut with_capturer = 0;
+        for pos in est.particles() {
+            assert_eq!(pos.turn(), Color::Sente);
+            // 取られた歩は相手の持ち駒へ（変異・force_apply 共通）
+            assert_eq!(pos.hand_count(Color::Gote, Role::Pawn), 1);
+            if pos.piece_at(sq_1g).is_some_and(|p| p.color == Color::Gote) {
+                with_capturer += 1;
+                // 取り手が実在する粒子は駒の総数も40のまま
+                let total: u32 = (1..=9)
+                    .flat_map(|f| (1..=9).map(move |r| Coord { file: f, rank: r }))
+                    .filter(|&sq| pos.piece_at(sq).is_some())
+                    .count() as u32
+                    + [
+                        Role::Rook,
+                        Role::Bishop,
+                        Role::Gold,
+                        Role::Silver,
+                        Role::Knight,
+                        Role::Lance,
+                        Role::Pawn,
+                    ]
+                    .into_iter()
+                    .map(|r| {
+                        u32::from(pos.hand_count(Color::Sente, r))
+                            + u32::from(pos.hand_count(Color::Gote, r))
+                    })
+                    .sum::<u32>();
+                assert_eq!(total, 40);
+                // 王手宣言なしの観測と整合（取り手は自玉へ利いていない）
+                assert!(!pos.in_check(Color::Sente));
+            }
+        }
+        assert!(with_capturer > 0, "取り手が盤に実在する粒子が1つもない");
+    }
+
+    #[test]
+    fn mutation_rescue_disabled_falls_back_to_force_apply() {
+        // TSUITATE_MUT_RESCUE=0 相当（mut_attempts=0）では従来どおり
+        // force_apply だけで残る（挙動の切り戻しノブ）
+        let mut est = Estimator::with_seed(Color::Sente, 7);
+        est.mut_attempts = 0;
+        est.apply_constraint(&Constraint::MyMove {
+            mv: parse_usi("7g7f").unwrap(),
+            captured: None,
+            gives_check: false,
+        });
+        est.apply_constraint(&Constraint::OppMove {
+            captured_at: Some(Coord { file: 1, rank: 7 }),
+            gives_check: false,
+            foul_count: 0,
+            my_foul_count: 0,
+        });
+        assert_eq!(est.mut_rescued(), 0);
+        assert!(!est.particles.is_empty());
+        for pos in est.particles() {
+            // 幽霊取り: 1g は空になり、取り手はどこにも現れない
+            assert!(pos.piece_at(Coord { file: 1, rank: 7 }).is_none());
         }
     }
 
