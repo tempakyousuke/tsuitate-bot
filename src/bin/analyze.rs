@@ -328,6 +328,17 @@ fn main() {
     let mut check_resolution_hist = [0u32; 5];
     let mut check_resolution_sum = 0u64;
     let mut check_resolution_n = 0u64;
+    // 王手の強さの本体（ユーザー指摘 2026-07-29）: 解消手数 K は分母でしかなく、
+    // 期待反則数は「受け側が試しうる選択肢 N」との比で決まる。
+    // N = 相手の視界（相手駒＋持ち駒のみ。bot 駒を消した盤面）での合法手数
+    // = 王手駒が見えないので王手フィルタが掛からない「試しうる手」の上界。
+    // 実際に直後の相手手番で出た反則数も対で数え、定義の妥当性を実測で検証する
+    let mut chk_options_sum = 0u64;
+    let mut chk_actual_fouls = 0u64;
+    // (回数, 直後の実反則) を「解消≤2手 × 選択肢の広い/狭い」と「解消≥3手」で分ける
+    let mut chk_strong_wide = (0u32, 0u32);
+    let mut chk_strong_narrow = (0u32, 0u32);
+    let mut chk_weak = (0u32, 0u32);
     let mut total_recap_ops = 0;
     let mut total_recap_taken = 0;
     let mut total_recap_missed_good = 0;
@@ -552,10 +563,11 @@ fn main() {
             if !after.in_check(bot.other()) {
                 continue;
             }
-            // 王手の強さ（相手の合法解消手数）。詰みは outcome 側で数える
+            // 王手の強さ（相手の合法解消手数 K と、受け側の選択肢 N）。
+            // 詰みは outcome 側で数える
             if after.outcome().is_none() {
-                let n = after.legal_moves().len();
-                let bucket = match n {
+                let k = after.legal_moves().len();
+                let bucket = match k {
                     0 | 1 => 0,
                     2 => 1,
                     3..=5 => 2,
@@ -563,10 +575,46 @@ fn main() {
                     _ => 4,
                 };
                 check_resolution_hist[bucket] += 1;
-                check_resolution_sum += n as u64;
+                check_resolution_sum += k as u64;
                 check_resolution_n += 1;
-                if n <= 2 {
-                    println!("  強い王手 {}手目 {}: 相手の合法解消手は{n}手", i + 1, m.usi);
+                // N: 相手の視界（bot 駒を消した盤面）での合法手数。
+                // 王手駒が見えないので王手解消フィルタは掛からない
+                let mut view = after.clone();
+                for file in 1..=9i8 {
+                    for rank in 1..=9i8 {
+                        let sq = Coord { file, rank };
+                        if view.piece_at(sq).is_some_and(|p| p.color == bot) {
+                            view.set(sq, None);
+                        }
+                    }
+                }
+                let n_opts = view.legal_moves().len();
+                chk_options_sum += n_opts as u64;
+                // 実際に直後の相手手番で出た反則（move_number = i+2 手目）
+                let actual = rec
+                    .end
+                    .foul_attempts
+                    .iter()
+                    .filter(|f| f.by_color != bot && f.move_number as usize == i + 2)
+                    .count() as u32;
+                chk_actual_fouls += u64::from(actual);
+                let slot = if k <= 2 {
+                    if n_opts >= 10 {
+                        &mut chk_strong_wide
+                    } else {
+                        &mut chk_strong_narrow
+                    }
+                } else {
+                    &mut chk_weak
+                };
+                slot.0 += 1;
+                slot.1 += actual;
+                if k <= 2 {
+                    println!(
+                        "  強い王手 {}手目 {}: 解消{k}手 / 選択肢{n_opts}手 / 直後の反則{actual}回",
+                        i + 1,
+                        m.usi
+                    );
                 }
             }
             let Some(opp_king) = after.king_square(bot.other()) else {
@@ -761,13 +809,32 @@ fn main() {
     );
     if check_resolution_n > 0 {
         println!(
-            "王手の強さ（相手の合法解消手数）: 1手:{} 2手:{} 3〜5手:{} 6〜10手:{} 11手以上:{} / 平均 {:.1}手",
+            "王手の強さ（相手の合法解消手数K）: 1手:{} 2手:{} 3〜5手:{} 6〜10手:{} 11手以上:{} / 平均 {:.1}手",
             check_resolution_hist[0],
             check_resolution_hist[1],
             check_resolution_hist[2],
             check_resolution_hist[3],
             check_resolution_hist[4],
             check_resolution_sum as f64 / check_resolution_n as f64,
+        );
+        let per = |c: (u32, u32)| -> String {
+            if c.0 == 0 {
+                "-".into()
+            } else {
+                format!("{}回→反則{}回 ({:.2}回/王手)", c.0, c.1, f64::from(c.1) / f64::from(c.0))
+            }
+        };
+        println!(
+            "  受け側の選択肢N 平均 {:.1}手 / 王手直後の実反則 合計{} ({:.2}回/王手)",
+            chk_options_sum as f64 / check_resolution_n as f64,
+            chk_actual_fouls,
+            chk_actual_fouls as f64 / check_resolution_n as f64,
+        );
+        println!(
+            "  解消≤2手×選択肢≥10: {} / 解消≤2手×選択肢<10: {} / 解消≥3手: {}",
+            per(chk_strong_wide),
+            per(chk_strong_narrow),
+            per(chk_weak),
         );
     }
     if total_occupancy_fouls > 0 {
