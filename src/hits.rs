@@ -213,7 +213,6 @@ mod tests {
             risk: 0.0,
             link: 0.0,
             board_discount: 0.0,
-            plan: 0.0,
         }
     }
 
