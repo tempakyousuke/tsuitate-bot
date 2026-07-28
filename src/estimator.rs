@@ -379,6 +379,13 @@ pub struct Estimator {
     mut_attempts: usize,
     /// 変異救済で生かした粒子の累計（診断用）
     mut_rescued: u64,
+    /// 変異救済の玉補正用: `deduce::opp_king_candidates` の健全な相手玉候補。
+    /// update のたびに履歴が伸びていれば作り直す（belief と同じキャッシュ規約。
+    /// 変異救済が無効なら計算しない）。apply_constraint を直接呼ぶ経路
+    /// （テスト等）では None のままで、玉補正は無制約になる
+    king_cands: Option<std::collections::BTreeSet<Coord>>,
+    /// king_cands を計算した時点の観測イベント数
+    king_cands_at: usize,
     /// 思考予算に応じた粒子の目標数（スケール1.0で TARGET_PARTICLES）
     target: usize,
     /// リプレイ試行回数の上限（スケール比例）
@@ -488,6 +495,8 @@ impl Estimator {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(MUT_RESCUE_ATTEMPTS_DEFAULT),
             mut_rescued: 0,
+            king_cands: None,
+            king_cands_at: usize::MAX,
             target,
             regen_attempts: (REGEN_ATTEMPTS as f64 * scale) as usize,
             regen_deadline_ms: (500.0 * scale) as u64,
@@ -628,6 +637,13 @@ impl Estimator {
         {
             self.belief = Some(BeliefPrior::from_log(self.my_color, log));
             self.belief_at = log.events().len();
+        }
+        // 変異救済の玉補正用に、演繹で健全な相手玉候補を持っておく
+        // （strategy::project_taint_kings が決定点ごとに計算しているのと同じもの。
+        // 生成時に使えば、変異粒子の玉は最初から候補集合の中に立つ）
+        if self.mut_attempts > 0 && self.king_cands_at != log.events().len() {
+            self.king_cands = Some(crate::deduce::opp_king_candidates(self.my_color, log));
+            self.king_cands_at = log.events().len();
         }
         let events = log.events();
         while self.cursor < events.len() {
@@ -1057,6 +1073,13 @@ impl Estimator {
         let my_color = self.my_color;
         for _ in 0..self.mut_attempts {
             let mut pos = backup.clone();
+            // 玉補正（strategy::project_taint_kings の生成時版）: 相手玉が演繹の
+            // 健全な候補集合の外に居るコピーは、先に最も近い候補マスへ玉を移す。
+            // deduce は真実を絶対に落とさないので、この移動は嘘でなく演繹済み
+            // 知識の反映 — 編集数（EPS_MUT の課金）には数えない
+            if let Some(cands) = &self.king_cands {
+                project_king_into_cands(&mut pos, my_color.other(), cands);
+            }
             let edits = match constraint {
                 Constraint::MyMove {
                     mv,
@@ -1068,6 +1091,7 @@ impl Estimator {
                     mv,
                     *captured,
                     *gives_check,
+                    self.king_cands.as_ref(),
                     &mut self.rng,
                 ),
                 // MyFoul の完全全滅は起きない（apply_soft が常に生かす）
@@ -1899,6 +1923,45 @@ fn place_flexible(pos: &mut Position, mut piece: Piece, sq: Coord) -> bool {
     false
 }
 
+/// 変異救済の玉補正（strategy::project_taint_kings の生成時版）: 相手玉が
+/// deduce の健全な候補集合の外に居るなら、最も近い候補マスへ玉を移す
+/// （占有マスなら居た相手駒と入れ替え。自駒は真実同期なので動かさない）。
+/// 棄却でなく移動なのは玉位置の質量を潰さないため（ansatsu 回帰の教訓）。
+/// 両玉の被王手状態を変える移動先はスキップする。補正できたか（元々候補内
+/// だった場合も含む）を返す
+fn project_king_into_cands(
+    pos: &mut Position,
+    opp: Color,
+    cands: &std::collections::BTreeSet<Coord>,
+) -> bool {
+    let Some(ksq) = pos.king_square(opp) else {
+        return false;
+    };
+    if cands.is_empty() || cands.contains(&ksq) {
+        return true;
+    }
+    let Some(king) = pos.piece_at(ksq) else {
+        return false;
+    };
+    let before = check_states(pos);
+    let mut sorted: Vec<Coord> = cands.iter().copied().collect();
+    sorted.sort_by_key(|c| (c.file - ksq.file).abs().max((c.rank - ksq.rank).abs()));
+    for c in sorted {
+        let occupant = pos.piece_at(c);
+        if occupant.is_some_and(|p| p.color != opp) {
+            continue;
+        }
+        pos.set(ksq, occupant);
+        pos.set(c, Some(king));
+        if checks_unchanged(pos, before) {
+            return true;
+        }
+        pos.set(c, occupant);
+        pos.set(ksq, Some(king));
+    }
+    false
+}
+
 /// 受理された自分の手を粒子上で合法・観測一致にする編集（変異救済）。
 /// 自分側は真実同期なので、直せるのは相手駒に起因する失敗だけ:
 /// 経路封鎖の解消・着地マスの中身を captured と一致させる・
@@ -1910,6 +1973,7 @@ fn mutate_for_my_move(
     mv: &ShogiMove,
     captured: Option<Role>,
     gives_check: bool,
+    king_cands: Option<&std::collections::BTreeSet<Coord>>,
     rng: &mut StdRng,
 ) -> Option<u32> {
     let opp = my_color.other();
@@ -1998,6 +2062,12 @@ fn mutate_for_my_move(
             let mut placed = false;
             for sq in empty_squares_shuffled(pos, rng) {
                 if sq == king_sq || forbidden.contains(&sq) {
+                    continue;
+                }
+                // 演繹の健全な玉候補があるなら、その外へは移設しない
+                // （王手整合するだけのランダムなマスは、演繹で否定済みの
+                // 「あり得ない玉位置」を信念へ注入してしまう）
+                if king_cands.is_some_and(|cs| !cs.contains(&sq)) {
                     continue;
                 }
                 pos.set(sq, Some(king));
@@ -3201,6 +3271,65 @@ mod tests {
             }
         }
         assert!(with_capturer > 0, "取り手が盤に実在する粒子が1つもない");
+    }
+
+    #[test]
+    fn project_king_moves_to_nearest_candidate_with_swap() {
+        // 空きマス候補へは単純移動、占有マス（相手駒）候補へは入れ替え
+        let mut pos = Position::initial();
+        let cands: std::collections::BTreeSet<Coord> =
+            [Coord { file: 5, rank: 2 }].into_iter().collect();
+        assert!(project_king_into_cands(&mut pos, Color::Gote, &cands));
+        assert_eq!(pos.king_square(Color::Gote), Some(Coord { file: 5, rank: 2 }));
+        let mut pos = Position::initial();
+        let cands: std::collections::BTreeSet<Coord> =
+            [Coord { file: 5, rank: 3 }].into_iter().collect();
+        assert!(project_king_into_cands(&mut pos, Color::Gote, &cands));
+        assert_eq!(pos.king_square(Color::Gote), Some(Coord { file: 5, rank: 3 }));
+        // 5c に居た歩は玉の元居た 5a へ
+        assert_eq!(
+            pos.piece_at(Coord { file: 5, rank: 1 }).map(|p| (p.color, p.role)),
+            Some((Color::Gote, Role::Pawn))
+        );
+    }
+
+    #[test]
+    fn mutation_king_relocation_respects_deduce_candidates() {
+        let sq_2e = Coord { file: 2, rank: 5 };
+        let c = Constraint::MyMove {
+            mv: parse_usi("2g2f").unwrap(),
+            captured: Some(Role::Pawn),
+            gives_check: true,
+        };
+        // 候補が {2e} なら: 玉補正が 2e へ移し、2f の歩を取る手が王手宣言と整合する
+        let mut est = Estimator::with_seed(Color::Sente, 5);
+        est.king_cands = Some([sq_2e].into_iter().collect());
+        est.apply_constraint(&c);
+        assert!(est.mut_rescued() > 0, "候補内で王手宣言を説明できるはず");
+        assert!(
+            est.particles()
+                .iter()
+                .any(|p| p.king_square(Color::Gote) == Some(sq_2e)),
+            "変異粒子の玉は候補集合の中に立つ"
+        );
+        // 候補が {9a} なら: 王手宣言を候補内で説明できず、変異救済は成立しない
+        // （候補外のランダムな王手整合マスへ逃げてはいけない）
+        let mut est = Estimator::with_seed(Color::Sente, 5);
+        est.king_cands = Some([Coord { file: 9, rank: 1 }].into_iter().collect());
+        est.apply_constraint(&c);
+        assert_eq!(est.mut_rescued(), 0);
+    }
+
+    #[test]
+    fn update_populates_king_candidates_for_mutation() {
+        let mut est = Estimator::with_seed(Color::Sente, 3);
+        let mut log = ObservationLog::default();
+        record_my_move(&mut log, "7g7f", None);
+        record_opp_move(&mut log, None);
+        est.update(&log);
+        let cands = est.king_cands.as_ref().expect("update が玉候補を計算する");
+        // 演繹は健全（真実を落とさない）: 初期位置の相手玉は必ず候補に残る
+        assert!(cands.contains(&Coord { file: 5, rank: 1 }));
     }
 
     #[test]
