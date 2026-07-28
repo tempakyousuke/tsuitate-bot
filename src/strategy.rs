@@ -418,7 +418,7 @@ pub(crate) fn exchange_value(role: Role) -> f64 {
 /// 着手後の自駒の利き被覆マス数（自分に見える盤面だけの近似）。
 /// 相手の駒は見えないため飛び駒は自駒にだけ遮られる楽観値
 fn coverage_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
-    own_effects_after(view, mv, None).coverage
+    own_effects_after(view, mv, None, &EvalParams::default()).coverage
 }
 
 /// 玉からの距離による利きの価値の減衰（V2。docs/yaneuraou-lessons.md 1-2）。
@@ -436,34 +436,6 @@ fn coverage_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
 /// と金は利きが2マスあっても両玉から遠い（距離7〜8）ので 0.25 前後にしかならない
 fn king_dist_weight(d: i8) -> f64 {
     1.0 / (1.0 + d as f64)
-}
-
-/// 紐（V3）を守られる駒の「働き」で重み付ける度合い。
-/// 0 = 従来どおり交換価値だけで数える（挙動不変）、1 = 完全に働きで重み付け。
-/// `TSUITATE_LINK_WORK_W` で上書き
-fn link_work_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_LINK_WORK_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
-            .unwrap_or(0.0)
-    })
-}
-
-/// 働きの飽和基準。これ以上の働きがある駒は係数1（＝従来と同じ満額）になる。
-/// `1/(1+d)` は距離1で0.5・距離8で0.11 と平坦なので、基準値の取り方で
-/// 「遊び駒」と「働いている駒」の分離度が決まる。`TSUITATE_LINK_WORK_REF` で上書き
-fn link_work_ref() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_LINK_WORK_REF")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .unwrap_or(2.0)
-    })
 }
 
 /// チェビシェフ距離（将棋の玉が届くまでの手数と同じ尺度）
@@ -541,6 +513,7 @@ fn own_effects_after(
     view: &PlayerView,
     mv: &ShogiMove,
     opp_king_w: Option<&[f64; 81]>,
+    params: &EvalParams,
 ) -> OwnEffects {
     let mut pieces: Vec<VisiblePiece> = view.your_pieces.clone();
     match *mv {
@@ -639,8 +612,12 @@ fn own_effects_after(
     // 薄めるとその効果を部分的に打ち消す（重み付け版の実測: kakutori の反則
     // 18 → 38、dragon-check-drop 12 → 23）。**遊び駒に紐をつけるな**という
     // 狙いは王手中には関係がないので、ここだけ従来の挙動に戻すのが素直
-    let lw = if view.you_in_check { 0.0 } else { link_work_w() };
-    let work_ref = link_work_ref();
+    let lw = if view.you_in_check {
+        0.0
+    } else {
+        params.link_work_w
+    };
+    let work_ref = params.link_work_ref.max(1e-6);
     let linked_value = pieces
         .iter()
         .filter(|p| p.role != Role::King)
@@ -706,7 +683,7 @@ fn own_effects_after(
 /// あるなら加点」の区別はできない。**自駒が乗っているマスは穴に数えない**
 /// （壁として機能するため）という近似にする
 fn king_holes_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
-    own_effects_after(view, mv, None).king_holes
+    own_effects_after(view, mv, None, &EvalParams::default()).king_holes
 }
 
 /// 持ち駒の歩を成れる圏内（敵陣＋一段手前）へ打つ手か（1.0/0.0）。
@@ -1098,6 +1075,28 @@ pub struct EvalParams {
     /// 一貫）。ついたて側の既存 SPSA も `pressure_w`(0.0918) > `attack_w`(0.0434) と
     /// 同じ非対称を独立に見つけているので、初期値・範囲もその想定でよい。0 = 無効
     pub effect_opp_w: f64,
+    /// 紐（V3）を**守られる駒の「働き」**で重み付ける度合い。
+    /// 0 = 交換価値だけで数える（従来）、1 = 完全に働きで重み付け。
+    ///
+    /// 発端はユーザー指摘（2026-07-28）: 「1二香車の筋の悪さは、そこにいるだけだと
+    /// ほとんど価値のないと金に対して紐をつけていることにも起因する。紐をつける際に
+    /// その駒の働きも考慮する必要がある」。素の交換価値だけで数えると、隅で何も
+    /// していないと金に紐をつける手が、実戦的に価値のある紐と同じ重みになる。
+    ///
+    /// 働きは V2（玉距離重み付き利き）を流用する。**可動性ではない**のが要点で、
+    /// 底歩は利き1マスでも自玉の隣なので働きを確保する（「動けない駒は価値なし」
+    /// では底歩を取りこぼす）。**王手中は適用しない**（v12 の実測で「紐は王手中も
+    /// ゲートしてはいけない」＝ゲートすると kakutori の反則が 7→51）。
+    ///
+    /// 実測（200局×2シード、vs v12）: 対照 51.5/52.0% に対し 53.5/54.3%、
+    /// 反則/局 6.64 → 6.37、詰み 39 → 50。シナリオでは狙いの悪手が
+    /// 20/20 → 2/20 になり、良い打ち（kakudo の R*2d、mate-net の R*7h）は維持
+    pub link_work_w: f64,
+    /// 働きの飽和基準。これ以上の働きがある駒は係数1（＝満額の紐）になる。
+    /// `1/(1+d)` は距離1で0.5・距離8で0.11 と平坦なので、基準値の取り方で
+    /// 「遊び駒」と「働いている駒」の分離度が決まる。
+    /// 実測では 2.0 が最良（3.0 はシナリオでは良いが勝率が落ちる）
+    pub link_work_ref: f64,
     /// **自分側の配置が過去に出現した回数**1回あたりの減点。
     ///
     /// 既存の `backtrack_penalty` / `shuffle_penalty` は**直前の1手しか見ない
@@ -1222,7 +1221,10 @@ impl Default for EvalParams {
             board_discount_w: 0.0,
             effect_own_w: 0.0,
             effect_opp_w: 0.0,
-            repeat_penalty_w: 0.0,
+            // 2026-07-28 採用（200局×2シードで再現。詳細は link_work_w の doc）
+            link_work_w: 1.0,
+            link_work_ref: 2.0,
+            repeat_penalty_w: 0.3,
             plan_w: 0.0,
         }
     }
@@ -1236,7 +1238,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 50] = [
+    pub const SPECS: [ParamSpec; 52] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -1478,6 +1480,18 @@ impl EvalParams {
             hi: 0.2,
         },
         ParamSpec {
+            // 0 = 交換価値だけ、1 = 完全に働きで重み付け。補間なので [0,1]
+            name: "link_work_w",
+            lo: 0.0,
+            hi: 1.0,
+        },
+        ParamSpec {
+            // 飽和基準。小さいほど「遊び駒」の判定が緩い
+            name: "link_work_ref",
+            lo: 0.5,
+            hi: 4.0,
+        },
+        ParamSpec {
             // 出現回数1回あたり。ブラインド玉攻めボーナス（実測 +1.8）を
             // 数回の往復で上回れる水準まで範囲を取る
             name: "repeat_penalty_w",
@@ -1549,6 +1563,8 @@ impl EvalParams {
             self.link_w,
             self.effect_own_w,
             self.effect_opp_w,
+            self.link_work_w,
+            self.link_work_ref,
             self.repeat_penalty_w,
             self.plan_w,
             self.board_discount_w,
@@ -1605,9 +1621,11 @@ impl EvalParams {
             link_w: v[44],
             effect_own_w: v[45],
             effect_opp_w: v[46],
-            repeat_penalty_w: v[47],
-            plan_w: v[48],
-            board_discount_w: v[49],
+            link_work_w: v[47],
+            link_work_ref: v[48],
+            repeat_penalty_w: v[49],
+            plan_w: v[50],
+            board_discount_w: v[51],
         }
     }
 }
@@ -1732,6 +1750,29 @@ impl EstimatorStrategy {
             .and_then(|v| v.parse::<f64>().ok())
         {
             Some(w) => EvalParams { link_w: w, ..params },
+            None => params,
+        };
+        // 紐の働き重み付け（V3 の拡張）の運用ノブ（w スイープ・切り戻し用）
+        let params = match std::env::var("TSUITATE_LINK_WORK_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+        {
+            Some(w) => EvalParams {
+                link_work_w: w,
+                ..params
+            },
+            None => params,
+        };
+        let params = match std::env::var("TSUITATE_LINK_WORK_REF")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+        {
+            Some(r) => EvalParams {
+                link_work_ref: r,
+                ..params
+            },
             None => params,
         };
         // 構想の読み（自分の手 → 自分の次の手）の運用ノブ（0 で従来挙動）
@@ -2099,7 +2140,7 @@ impl Strategy for EstimatorStrategy {
         // 紐の働き重み付け（`link_work_w`）も相手玉側の距離重みを使うので、
         // effect_opp_w が 0 でもそちらが有効なら表を作る（作り忘れると
         // 「自玉側だけの働き」という別物の量になる）
-        let opp_king_w: Option<[f64; 81]> = (params.effect_opp_w != 0.0 || link_work_w() != 0.0)
+        let opp_king_w: Option<[f64; 81]> = (params.effect_opp_w != 0.0 || params.link_work_w != 0.0)
             .then(|| {
                 let src: &[(&Position, f64)] = if sample.is_empty() { &taint_pool } else { &sample };
                 opp_king_effect_weights(&taint_king_distribution(src, opp_color))
@@ -3447,7 +3488,7 @@ fn evaluate(
 
     // 利き被覆（広い索敵網）と、成れる圏内への歩打ち（と金ポテンシャル）。
     // どちらも粒子に依存しない自明な情報だけで計算できる
-    let own_effects = own_effects_after(view, mv, opp_king_w);
+    let own_effects = own_effects_after(view, mv, opp_king_w, params);
     let coverage = params.coverage_w * own_effects.coverage;
     let probe = params.tokin_probe_w * tokin_probe(view, mv);
     // 自玉8近傍の支えの無いマス（V4）。自駒だけで決まるので粒子に依らない
@@ -4507,8 +4548,8 @@ pub(crate) mod tests {
         );
         // 玉を 5九→4九 に動かす（どちらも同じ手）ことで、駒の配置だけが違う
         // 2局面の effect_own を比べる
-        let a = own_effects_after(&bottom_pawn, &parse_usi("5i4i").unwrap(), None);
-        let b = own_effects_after(&corner_tokin, &parse_usi("5i4i").unwrap(), None);
+        let a = own_effects_after(&bottom_pawn, &parse_usi("5i4i").unwrap(), None, &EvalParams::default());
+        let b = own_effects_after(&corner_tokin, &parse_usi("5i4i").unwrap(), None, &EvalParams::default());
         assert!(
             a.effect_own > b.effect_own,
             "底歩（可動性ゼロだが玉の近く）が隅のと金（可動性はあるが遠い）より \
@@ -4545,13 +4586,13 @@ pub(crate) mod tests {
             HashMap::from([(Role::Lance, 1)]),
         );
         // 打ち: 打った駒の価値そのもの
-        let drop = own_effects_after(&view, &parse_usi("L*1b").unwrap(), None);
+        let drop = own_effects_after(&view, &parse_usi("L*1b").unwrap(), None, &EvalParams::default());
         assert_eq!(drop.board_material_added, piece_value(Role::Lance));
         // 静かな盤上の手: 増分ゼロ
-        let quiet = own_effects_after(&view, &parse_usi("2d2c").unwrap(), None);
+        let quiet = own_effects_after(&view, &parse_usi("2d2c").unwrap(), None, &EvalParams::default());
         assert_eq!(quiet.board_material_added, 0.0);
         // 成り: 増えたぶんだけ（歩1 → と6）
-        let promo = own_effects_after(&view, &parse_usi("2d2c+").unwrap(), None);
+        let promo = own_effects_after(&view, &parse_usi("2d2c+").unwrap(), None, &EvalParams::default());
         assert_eq!(
             promo.board_material_added,
             piece_value(Role::Tokin) - piece_value(Role::Pawn)
@@ -4588,9 +4629,9 @@ pub(crate) mod tests {
         };
         // 玉(5i)だけが金(5h)を守っている形。玉の利きも紐に数える
         let view = minimal_view(vec![gold.clone(), king.clone()], HashMap::new());
-        let alone = own_effects_after(&view, &parse_usi("5h5g").unwrap(), None);
+        let alone = own_effects_after(&view, &parse_usi("5h5g").unwrap(), None, &EvalParams::default());
         assert_eq!(alone.linked_value, 0.0, "5g へ出れば玉から離れて紐が切れる");
-        let stay = own_effects_after(&view, &parse_usi("5i4i").unwrap(), None);
+        let stay = own_effects_after(&view, &parse_usi("5i4i").unwrap(), None, &EvalParams::default());
         assert!(
             stay.linked_value > 0.0,
             "玉が 4i へ寄っても金 5h は玉の利きに入ったまま"
@@ -4603,7 +4644,7 @@ pub(crate) mod tests {
             role: Role::Silver,
         });
         let view2 = minimal_view(pieces, HashMap::new());
-        let two = own_effects_after(&view2, &parse_usi("5i4i").unwrap(), None);
+        let two = own_effects_after(&view2, &parse_usi("5i4i").unwrap(), None, &EvalParams::default());
         assert!(two.linked_value > stay.linked_value);
     }
 
