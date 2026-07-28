@@ -577,8 +577,11 @@ fn main() {
                 check_resolution_hist[bucket] += 1;
                 check_resolution_sum += k as u64;
                 check_resolution_n += 1;
-                // N: 相手の視界（bot 駒を消した盤面）での合法手数。
-                // 王手駒が見えないので王手解消フィルタは掛からない
+                // N: 相手の視界（bot 駒を消した盤面）で試せる「異なる確かめ」の数。
+                // 王手駒が見えないので王手解消フィルタは掛からない。
+                // 「マス X を（駒を問わず）取りに行く/塞ぐ」は1回の実験なので、
+                // 玉以外の移動は行き先ごとに1、打ちも行き先ごとに1へ重複排除する
+                // （玉の移動だけは逃げ/取りとして別勘定。成/不成も自然に統合）
                 let mut view = after.clone();
                 for file in 1..=9i8 {
                     for rank in 1..=9i8 {
@@ -588,7 +591,19 @@ fn main() {
                         }
                     }
                 }
-                let n_opts = view.legal_moves().len();
+                let mut probes: HashSet<(u8, Coord)> = HashSet::new();
+                for vm in view.legal_moves() {
+                    let key = match vm {
+                        ShogiMove::Board { from, to, .. } => {
+                            let is_king =
+                                view.piece_at(from).is_some_and(|p| p.role == Role::King);
+                            (u8::from(is_king), to)
+                        }
+                        ShogiMove::Drop { to, .. } => (2u8, to),
+                    };
+                    probes.insert(key);
+                }
+                let n_opts = probes.len();
                 chk_options_sum += n_opts as u64;
                 // 実際に直後の相手手番で出た反則（move_number = i+2 手目）
                 let actual = rec
