@@ -1127,7 +1127,28 @@ pub struct EvalParams {
     /// 相手の応手を挟まない楽観値なので、そのまま足すと攻めが軽くなりすぎる。
     /// 1未満の重みで割り引く前提。0 = 無効（従来と同一挙動）
     pub plan_w: f64,
+    /// **王手の強さ**による値付け（2026-07-29、tuyoi_oote/rei2 のユーザー指導）。
+    /// 王手の期待反則数は相手に残る合法解消手数 K に強く依存する
+    /// （実測 800局: K≤2 の王手は直後の実反則 0.81〜1.17回/王手、
+    /// K≥3 は 0.40〜0.46回 = 約2.4倍。bin/analyze の「王手の強さ」）。
+    /// 粒子ごとに K = 王手後の相手の合法手数を数え、
+    /// g(K) = CHECK_STRENGTH_CURVE/(1+K) − CHECK_STRENGTH_CENTER を w 倍して加算する。
+    /// 中心化（平均的な王手 K≈3.7 で g≈0）してあるので、強い王手（K=1 で +0.69w）を
+    /// 押し上げ、解消の多い王手（K=10 で −0.29w）を抑える**再配分**であり、
+    /// 王手全体への食欲は従来どおり check_bonus / check_foul_scale の責務のまま。
+    /// K は詰み判定で既に呼んでいた legal_moves() の流用なので追加コストほぼゼロ。
+    /// 受け側の選択肢 N は実測でアリーナでは常に広い（N<10 出現ゼロ）ため v1 では
+    /// 見ない（対人・終盤で効く可能性はメモリ strong-check-few-resolutions 参照）。
+    /// 0 = 無効（従来と同一挙動）
+    pub check_strength_w: f64,
 }
+
+/// check_strength_w の g(K) 曲線: 実測の「王手直後の実反則数」の K 依存を
+/// 双曲線で近似（K=1: 1.2, K=2: 0.8, K=5: 0.4 — 実測バケット平均に整合）
+const CHECK_STRENGTH_CURVE: f64 = 2.4;
+/// g(K) の中心化定数（平均的な王手 K≈3.7 で g≈0 になるよう
+/// CHECK_STRENGTH_CURVE/(1+3.7) を丸めた値）
+const CHECK_STRENGTH_CENTER: f64 = 0.51;
 
 impl Default for EvalParams {
     fn default() -> Self {
@@ -1226,6 +1247,8 @@ impl Default for EvalParams {
             link_work_ref: 2.0,
             repeat_penalty_w: 0.3,
             plan_w: 0.0,
+            // 王手の強さ（2026-07-29）。未調整の新項なので w スイープで決める
+            check_strength_w: 0.0,
         }
     }
 }
@@ -1238,7 +1261,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 52] = [
+    pub const SPECS: [ParamSpec; 53] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -1512,6 +1535,12 @@ impl EvalParams {
             lo: -0.2,
             hi: 0.2,
         },
+        ParamSpec {
+            // g(K) の振れ幅は ±0.7 なので、w=3 で約 ±2歩相当の再配分
+            name: "check_strength_w",
+            lo: 0.0,
+            hi: 3.0,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -1568,6 +1597,7 @@ impl EvalParams {
             self.repeat_penalty_w,
             self.plan_w,
             self.board_discount_w,
+            self.check_strength_w,
         ]
     }
 
@@ -1626,6 +1656,7 @@ impl EvalParams {
             repeat_penalty_w: v[49],
             plan_w: v[50],
             board_discount_w: v[51],
+            check_strength_w: v[52],
         }
     }
 }
@@ -1771,6 +1802,18 @@ impl EstimatorStrategy {
         {
             Some(r) => EvalParams {
                 link_work_ref: r,
+                ..params
+            },
+            None => params,
+        };
+        // 王手の強さ（解消手数Kによる値付け）の運用ノブ（w スイープ・切り戻し用）
+        let params = match std::env::var("TSUITATE_CHECK_STRENGTH_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+        {
+            Some(w) => EvalParams {
+                check_strength_w: w,
                 ..params
             },
             None => params,
@@ -3247,8 +3290,17 @@ fn evaluate(
             v += params.check_bonus
                 + params.check_foul_scale * f64::from(view.fouls.opponent) * accel;
             check_hits += w;
-            if next.legal_moves().is_empty() {
+            // K = この粒子での相手の合法解消手数（王手中の合法手 = 解消手）。
+            // 0 なら詰み。それ以外は「王手の強さ」で再配分する（check_strength_w
+            // の doc 参照。逃げ場・合駒・王手駒の取りが少ない王手ほど、受け側は
+            // 正解を引くまで反則を積む — tuyoi_oote / rei2 のユーザー指導）
+            let resolutions = next.legal_moves().len();
+            if resolutions == 0 {
                 v += 1000.0; // 詰み（真の局面がこの粒子なら勝ち）
+            } else if params.check_strength_w != 0.0 {
+                v += params.check_strength_w
+                    * (CHECK_STRENGTH_CURVE / (1.0 + resolutions as f64)
+                        - CHECK_STRENGTH_CENTER);
             }
         }
 
@@ -4349,6 +4401,21 @@ pub(crate) mod tests {
         assert_field_index!(knight_bait_w);
         assert_field_index!(depth2_replace);
         assert_field_index!(check_limit_accel);
+        assert_field_index!(check_strength_w);
+    }
+
+    #[test]
+    fn check_strength_curve_matches_measured_fouls() {
+        // g(K) の符号と単調性: 強い王手（K=1..2）は正、平均的（K≈3.7）でほぼ0、
+        // 解消の多い王手は負（再配分であって王手全体の食欲を変えない）
+        let g = |k: usize| CHECK_STRENGTH_CURVE / (1.0 + k as f64) - CHECK_STRENGTH_CENTER;
+        assert!(g(1) > 0.5);
+        assert!(g(2) > 0.2);
+        assert!(g(4) < 0.05, "g(4)={}", g(4));
+        assert!(g(10) < -0.2);
+        for k in 1..20 {
+            assert!(g(k) > g(k + 1), "単調減少");
+        }
     }
 
     #[test]
