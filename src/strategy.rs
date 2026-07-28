@@ -205,6 +205,9 @@ pub struct CandidateScore {
     /// gain から引かれた盤上駒の減価（board_discount_w × 盤上の自駒の価値合計。V5）。
     /// 正の値 = そのぶん gain が減っている。これも見るのは差
     pub board_discount: f64,
+    /// score に加算された構想の読みの利得（plan_w × p_legal × 追随手の改善幅）。
+    /// gain ではなく score 側（adjust と同じ層）に乗る
+    pub plan: f64,
 }
 
 /// 前進を好むヒューリスティック＋乱数（従来実装）
@@ -811,6 +814,197 @@ fn own_config_fingerprint_after(view: &PlayerView, mv: &ShogiMove) -> u64 {
     own_config_fingerprint(pieces.iter().map(|(s, r)| (s.as_str(), *r)), &hand)
 }
 
+/// 自分の手を指した**後**の自分視点 view（自駒・持ち駒だけを更新する）。
+/// 取りの成否は指してみないと分からないので、取らなかった場合を作る。
+/// 構想の読み（`plan_bonus`）が「次に自分が何を指せるか」を数えるのに使う
+fn view_after_own_move(view: &PlayerView, mv: &ShogiMove) -> PlayerView {
+    let mut after = view.clone();
+    match *mv {
+        ShogiMove::Board { from, to, promote } => {
+            let from_usi = make_usi_square(from);
+            if let Some(p) = after.your_pieces.iter_mut().find(|p| p.square == from_usi) {
+                if promote {
+                    if let Some(r) = promote_role(p.role) {
+                        p.role = r;
+                    }
+                }
+                p.square = make_usi_square(to);
+            }
+        }
+        ShogiMove::Drop { role, to } => {
+            if let Some(n) = after.your_hand.get_mut(&role) {
+                *n = n.saturating_sub(1);
+            }
+            after.your_pieces.push(VisiblePiece {
+                square: make_usi_square(to),
+                role,
+            });
+        }
+    }
+    after.move_number += 2;
+    // 王手されているかは相手の応手次第で分からない。構想は「静かに続く」前提で読む
+    after.you_in_check = false;
+    after
+}
+
+/// 自駒が利かせているマスの集合（自駒の乗ったマスも含む＝紐の判定と同じ規約）
+fn defended_squares(pieces: &[VisiblePiece], color: Color) -> HashSet<Coord> {
+    let mut out = HashSet::new();
+    for p in pieces {
+        out.extend(defend_targets(pieces, p, color));
+    }
+    out
+}
+
+/// 構想の読み（**自分の手 → 自分の次の手**）の1手ぶんの利得。
+///
+/// 既存の2手読み（`depth2_delta`）は「自分の手 → **相手の**応手」しか見ないので、
+/// **自分の手が自分の次の手を可能にする**という関係を評価できない。
+/// 実例（watch-estimator-20260728-130424 の55手目）: `9五歩打` → `9四金打` は
+/// 「歩で支えてから金を出す」組み立てだが、`G*9d` を単独で評価すると支えが無く
+/// リスク −3.078（他の金打ちは −0.8前後）で113位まで沈み、`P*9e` のほうも
+/// 「ただ歩を打っただけ」として31位にしかならない。
+///
+/// **追随手は「この手で新たに支えができたマスへの着手」に限る**のが要点:
+/// これが「組み立て」の定義そのもので、候補数も数手に収まる（全合法手を
+/// 読み直すと上位K候補ぶんで数千評価になり予算に載らない）。
+/// 相手の応手は挟まないので楽観値。呼び出し側で割り引くこと。
+#[allow(clippy::too_many_arguments)]
+fn plan_bonus(
+    view: &PlayerView,
+    mv: &ShogiMove,
+    particles: &[(&Position, f64)],
+    known: &HashMap<Coord, f64>,
+    opp_board_n: f64,
+    params: &EvalParams,
+    budget: SearchBudget,
+    opp_king_w: Option<&[f64; 81]>,
+) -> f64 {
+    let before = defended_squares(&view.your_pieces, view.your_color);
+    let after_view = view_after_own_move(view, mv);
+    let after = defended_squares(&after_view.your_pieces, view.your_color);
+    // この手で新たに支えができたマス（＝次の手で安心して使えるようになったマス）
+    let opened: HashSet<Coord> = after.difference(&before).copied().collect();
+    if opened.is_empty() {
+        return 0.0;
+    }
+
+    // 追随手はその新しいマスへの着手だけ。さらに**この手を指す前からも候補で
+    // あった手**に限る（前後で同じ手を評価して差を取るため。指した駒自身の
+    // 移動のように「指す前には存在しない手」は比較できない）
+    let before_usis: HashSet<String> = candidate_moves(view, &HashSet::new())
+        .into_iter()
+        .map(|(u, _)| u)
+        .collect();
+    let follow: Vec<(String, ShogiMove)> = candidate_moves(&after_view, &HashSet::new())
+        .into_iter()
+        .filter(|(u, m)| {
+            let to = match *m {
+                ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+            };
+            opened.contains(&to) && before_usis.contains(u)
+        })
+        .take(PLAN_FOLLOW_CAP)
+        .collect();
+    if follow.is_empty() {
+        return 0.0;
+    }
+
+    // 候補手を適用できた粒子だけを使い、**同じ部分集合**の適用前／適用後で
+    // 追随手を評価して差を取る。絶対値を足すと `link`（盤面ほぼ定数で +4 前後）
+    // のような項がそのまま乗ってしまい、「どの手を指しても追随手の絶対値は
+    // 同じくらい高い」という無意味な加点になる（V5 で踏んだのと同じ罠）
+    let picked: Vec<&Position> = particles
+        .iter()
+        .take(budget.pressure_samples)
+        .filter(|(pos, _)| pos.is_legal(mv))
+        .map(|&(pos, _)| pos)
+        .collect();
+    if picked.is_empty() {
+        return 0.0;
+    }
+    let next: Vec<Position> = picked
+        .iter()
+        .map(|pos| {
+            let mut p = (*pos).clone();
+            p.play_unchecked(mv);
+            // **手番を自分へ戻す**。構想の読みは「自分が2手続けて指したら」を
+            // 見るものなので、play_unchecked が相手へ渡した手番のままだと
+            // `evaluate` の中の `pos.is_legal(追随手)` が全て false になり、
+            // legal≒0 で `expected` が丸ごと消える（実測: 追随手のスコアが
+            // どれも 0.3 前後に潰れ、差が全部大きな負になっていた）
+            p.set_turn(view.your_color);
+            p
+        })
+        .collect();
+    let pool_before: Vec<(&Position, f64)> = picked.iter().map(|&p| (p, 1.0)).collect();
+    let pool_after: Vec<(&Position, f64)> = next.iter().map(|p| (p, 1.0)).collect();
+
+    let debug = std::env::var("TSUITATE_PLAN_DEBUG").is_ok_and(|v| v == "1");
+    let mut best = 0.0f64;
+    let mut best_usi = String::new();
+    let mut cache_before = vec![None; pool_before.len()];
+    let mut cache_after = vec![None; pool_after.len()];
+    for (u, m) in &follow {
+        let after_score = evaluate(
+            &after_view,
+            m,
+            &pool_after,
+            false,
+            &[],
+            prior_legal(&after_view, m, opp_board_n),
+            known,
+            params,
+            budget,
+            &mut cache_after,
+            None,
+            None,
+            opp_king_w,
+        )
+        .score();
+        let before_score = evaluate(
+            view,
+            m,
+            &pool_before,
+            false,
+            &[],
+            prior_legal(view, m, opp_board_n),
+            known,
+            params,
+            budget,
+            &mut cache_before,
+            None,
+            None,
+            opp_king_w,
+        )
+        .score();
+        if debug {
+            eprintln!(
+                "  [plan] {} → 追随 {u}: 前 {before_score:.3} 後 {after_score:.3} 差 {:+.3}",
+                match *mv {
+                    ShogiMove::Board { from, to, .. } =>
+                        format!("{}{}", make_usi_square(from), make_usi_square(to)),
+                    ShogiMove::Drop { to, role } =>
+                        format!("{role:?}*{}", make_usi_square(to)),
+                },
+                after_score - before_score
+            );
+        }
+        if after_score - before_score > best {
+            best = after_score - before_score;
+            best_usi = u.clone();
+        }
+    }
+    if debug && !best_usi.is_empty() {
+        eprintln!("  [plan] 最良の追随手 {best_usi} 差 {best:+.3}（開いたマス {}）", opened.len());
+    }
+    best.max(0.0)
+}
+
+/// 構想の読みで見る追随手の上限（候補は「新たに支えたマス」への着手だけなので
+/// 通常は数手。病的な局面での暴走だけを止める）
+const PLAN_FOLLOW_CAP: usize = 12;
+
 /// 観測から確実に分かる素材リード（歩換算・相対値）。
 /// 自分の駒の増減は取った駒（持ち駒に入る）と取られた駒を両方含み、
 /// 相手側は鏡像（自分が+vなら相手は-v）なので、リード = 自分の変化×2。
@@ -1103,6 +1297,18 @@ pub struct EvalParams {
     /// 自分が取ったりすれば指紋が変わって回数がリセットされる ＝
     /// 「**何も起きていないのに同じ形へ戻る**」ときだけ効く。0 = 無効
     pub repeat_penalty_w: f64,
+    /// **構想の読み**（自分の手 → 自分の次の手）の利得に掛ける重み。
+    ///
+    /// 既存の2手読みは「自分の手 → **相手の**応手」しか見ないので、
+    /// 「**支えを作ってから出る**」型の組み立てを評価できない。
+    /// 発端（watch-estimator-20260728-130424 の55手目、ユーザー指摘）:
+    /// `9五歩打 → 9四金打` は歩で支えてから金を出す2手の構想だが、
+    /// `G*9d` 単独ではリスク −3.078（他の金打ちは −0.8前後）で113位、
+    /// `P*9e` も「ただ歩を打っただけ」で31位にしかならない。
+    ///
+    /// 相手の応手を挟まない楽観値なので、そのまま足すと攻めが軽くなりすぎる。
+    /// 1未満の重みで割り引く前提。0 = 無効（従来と同一挙動）
+    pub plan_w: f64,
 }
 
 impl Default for EvalParams {
@@ -1198,6 +1404,7 @@ impl Default for EvalParams {
             effect_own_w: 0.0,
             effect_opp_w: 0.0,
             repeat_penalty_w: 0.0,
+            plan_w: 0.0,
         }
     }
 }
@@ -1210,7 +1417,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 49] = [
+    pub const SPECS: [ParamSpec; 50] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -1459,6 +1666,12 @@ impl EvalParams {
             hi: 2.0,
         },
         ParamSpec {
+            // 相手の応手を挟まない楽観値なので 1 未満で割り引く前提
+            name: "plan_w",
+            lo: 0.0,
+            hi: 0.5,
+        },
+        ParamSpec {
             name: "board_discount_w",
             // やねうら王は 104/1024 ≒ 0.102。ついたては持ち駒優位（不可視・
             // 索敵）と打ちマス反則（打てるマスが分からない）が逆向きに働くので、
@@ -1518,6 +1731,7 @@ impl EvalParams {
             self.effect_own_w,
             self.effect_opp_w,
             self.repeat_penalty_w,
+            self.plan_w,
             self.board_discount_w,
         ]
     }
@@ -1573,7 +1787,8 @@ impl EvalParams {
             effect_own_w: v[45],
             effect_opp_w: v[46],
             repeat_penalty_w: v[47],
-            board_discount_w: v[48],
+            plan_w: v[48],
+            board_discount_w: v[49],
         }
     }
 }
@@ -1698,6 +1913,15 @@ impl EstimatorStrategy {
             .and_then(|v| v.parse::<f64>().ok())
         {
             Some(w) => EvalParams { link_w: w, ..params },
+            None => params,
+        };
+        // 構想の読み（自分の手 → 自分の次の手）の運用ノブ（0 で従来挙動）
+        let params = match std::env::var("TSUITATE_PLAN_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+        {
+            Some(w) => EvalParams { plan_w: w, ..params },
             None => params,
         };
         // 同じ自陣形への往復の累積減点（0 で従来挙動）
@@ -2192,8 +2416,10 @@ impl Strategy for EstimatorStrategy {
         // (usi, 選択手の p_legal, スコア)
         let mut best: Option<(String, f64, f64)> = None;
         let mut ranking: Vec<CandidateScore> = vec![];
+        let mut plan_term = 0.0f64;
         for (i, (usi, mv, out, adjust, score)) in scored.into_iter().enumerate() {
             let depth2 = i < budget.depth2_top_k;
+            plan_term = 0.0;
             let (final_gain, final_score) = if depth2 {
                 let delta = depth2_delta(
                     view,
@@ -2207,8 +2433,32 @@ impl Strategy for EstimatorStrategy {
                     budget,
                     &mut *rng,
                 );
+                // 構想の読み（自分の手 → 自分の次の手）。2手読みと同じ上位候補に
+                // だけ掛ける。相手の応手を挟まない楽観値なので plan_w で割り引き、
+                // さらに p_legal を掛ける（反則確実な手への加点素通りを防ぐ。
+                // blind_king_attack で踏んだ dragon-check-drop の教訓と同じ）
+                let plan = if params.plan_w != 0.0 {
+                    params.plan_w
+                        * out.p_legal
+                        * plan_bonus(
+                            view,
+                            &mv,
+                            &sample,
+                            &known,
+                            opp_board_n,
+                            &params,
+                            budget,
+                            opp_king_w.as_ref(),
+                        )
+                } else {
+                    0.0
+                };
+                plan_term = plan;
                 let gain2 = out.gain + params.depth2_replace * (out.risk_mean + delta);
-                (gain2, combine_score(gain2, out.p_legal, out.foul_cost) + adjust)
+                (
+                    gain2,
+                    combine_score(gain2, out.p_legal, out.foul_cost) + adjust + plan,
+                )
             } else {
                 (out.gain, score)
             };
@@ -2232,6 +2482,7 @@ impl Strategy for EstimatorStrategy {
                 risk: out.risk_mean,
                 link: out.link,
                 board_discount: out.board_discount,
+                plan: plan_term,
             });
             if best.as_ref().is_none_or(|(_, _, s)| final_score > *s) {
                 best = Some((usi, out.p_legal, final_score));

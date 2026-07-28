@@ -21,7 +21,7 @@ use tsuitate_bot::mate::{drop_mate, mate_in_1};
 use tsuitate_bot::model::GameModel;
 use tsuitate_bot::observation::{Observation, ObservationLog};
 use tsuitate_bot::protocol::{
-    ClockState, Color, FoulCounts, FoulRecord, GameEndPayload, GameStatus, PlayerView,
+    ClockState, Color, FoulCounts, FoulRecord, GameEndPayload, GameStatus, PlayerView, Role,
 };
 use tsuitate_bot::shogi::{Outcome, Position, ShogiMove, parse_usi, piece_value};
 use tsuitate_bot::strategy::candidate_moves;
@@ -326,6 +326,14 @@ fn main() {
     // 防げる範囲の上限を測る診断
     let mut total_occupancy_fouls = 0u32;
     let mut total_repeat_avoidable = 0u32;
+    // 無意味な往復: bot が指した後の**自陣形**（盤上の自駒＋持ち駒）が、
+    // その対局で既に出現していた回数。ついたてでは自分側は完全既知なので
+    // ノイズゼロで測れる。「何も起きていないのに同じ形へ戻った」= 手番を
+    // 捨てているので、`repeat_penalty_w` が狙う現象そのもの。
+    // **この頻度が改善の天井**になる（実測 2026-07-28: 200局で 0.9%）
+    let mut total_bot_moves = 0u32;
+    let mut total_repeat_configs = 0u32;
+    let mut games_with_repeat = 0u32;
 
     for path in &paths {
         let Some(rec) = load(path) else {
@@ -403,6 +411,36 @@ fn main() {
         let mut bot_lost = 0.0;
         let mut free_losses: Vec<String> = vec![];
         let mut bad_trades: Vec<String> = vec![];
+        // 無意味な往復の頻度（bot 側の自陣形の再出現）。真の局面から
+        // bot 側だけを射影して数える（bot は自分側を完全に知っているので、
+        // これは bot が実際に持っている情報だけで判定できる量）
+        {
+            let mut seen: HashMap<Vec<(String, Role)>, u32> = HashMap::new();
+            let mut repeats_here = 0u32;
+            for (i, m) in rec.end.moves.iter().enumerate() {
+                if m.by_color != bot {
+                    continue;
+                }
+                let after = &positions[i + 1.min(positions.len() - 1 - i)];
+                let mut own: Vec<(String, Role)> = after
+                    .pieces_of(bot)
+                    .iter()
+                    .map(|p| (p.square.clone(), p.role))
+                    .collect();
+                own.sort();
+                let e = seen.entry(own).or_insert(0);
+                total_bot_moves += 1;
+                if *e > 0 {
+                    total_repeat_configs += 1;
+                    repeats_here += 1;
+                }
+                *e += 1;
+            }
+            if repeats_here > 0 {
+                games_with_repeat += 1;
+            }
+        }
+
         for (i, m) in rec.end.moves.iter().enumerate() {
             let pos = &positions[i];
             let Some(mv) = parse_usi(&m.usi) else { break };
@@ -637,6 +675,12 @@ fn main() {
     if total_occupancy_fouls > 0 {
         println!(
             "占有マス反則（打ちマス/経路封鎖）の再訪率: {total_repeat_avoidable}/{total_occupancy_fouls}（同一局内で過去の占有反則マスと一致。反則マスを覚える対策の理論上限）"
+        );
+    }
+    if total_bot_moves > 0 {
+        println!(
+            "無意味な往復（自陣形の再出現）: {total_repeat_configs}/{total_bot_moves}手 ({:.1}%) / {games_with_repeat}局（自分側は完全既知なのでノイズゼロ。repeat_penalty_w が狙う現象の頻度＝改善の天井）",
+            100.0 * f64::from(total_repeat_configs) / f64::from(total_bot_moves)
         );
     }
     if total_check_actual_fouls > 0 {
