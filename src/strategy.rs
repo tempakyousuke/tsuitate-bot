@@ -315,6 +315,35 @@ fn eval_taint_fallback() -> bool {
     })
 }
 
+/// 王手中の玉の手の gain を「玉の手全体の平均」に揃えるか（既定 on、
+/// `TSUITATE_CHECK_KING_GAIN_MEAN=0` で従来挙動。凍結版はこの名前を知らない）。
+/// = 玉の手**どうし**の序列は p_legal（CheckSolver の解消確率）と反則コストだけで
+/// 決める。「王手中の候補序列は p_legal が支配すべき」（value_nn / 詰めろ2項 /
+/// capture_bet_var の王手中ゲートと同じ教義）を玉の手の evaluate 本体にも適用する。
+///
+/// 発端は king-evade.kif（対人局レビュー 2026-07-29 の64手目、追加反則65回/20試行）。
+/// 粒子が退化した終盤の王手では幻の敵駒が gain を両方向に歪める:
+/// - 正解の逃げ手が**負**に沈む（実測: 7a が p_legal 0.887 と解消確率最上位なのに
+///   露出リスク・圧力の幻で gain −1.5。min 形の combine_score は負の gain を
+///   p_legal で割り引かないため全額効く）
+/// - 間違った逃げ手が**正**に浮く（実測: 6b/7b が gain +1.1 前後。幻の gain 差
+///   ±1 が p_legal の差 0.3 の序列を上書きする）
+///
+/// **0 への固定ではなく平均に揃えるのが要点**: 0 固定版は king-evade の反則を
+/// 65→29 に減らしたが、玉の手全体の水準が下がって除去期待値つきの非玉プローブが
+/// 相対的に浮上し、kakutori 17→50・dragon-check-drop 19→41 と押し出しの反則が
+/// 爆発した（玉の逃げへの一律割引がアリーナ3シード全て悪化した king-prior の
+/// 第1版と同型）。平均への揃えは玉の手どうしの分散（幻ノイズ）だけを消し、
+/// 玉の手 vs 玉以外（合駒・捕獲プローブ）の相対水準を保存する。
+/// 玉以外の手はそのまま: 駒を差し出す手の駒損は実在のコストで、王手駒捕獲の
+/// 価値は removal_term（仮説条件付き期待値）が持つ
+fn check_king_gain_mean() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_CHECK_KING_GAIN_MEAN").map_or(true, |v| v != "0")
+    })
+}
+
 /// V1（利き数）のノブ。**既定は両方 無効**（＝従来の二値の利き判定）。
 ///
 /// やねうら王 Lv4 の「利き数」（+R30）をついたてへ持ち込む実験だったが、
@@ -1141,6 +1170,26 @@ pub struct EvalParams {
     /// 見ない（対人・終盤で効く可能性はメモリ strong-check-few-resolutions 参照）。
     /// 0 = 無効（従来と同一挙動）
     pub check_strength_w: f64,
+    /// **逃げマス被覆**の凸ボーナス（2026-07-29、対人局レビュー
+    /// human-play-review-2026-07-29 の N*6四が発端）。粒子上の相手玉の隣接マスの
+    /// うち「逃げ先になり得る」（相手自身の駒に塞がれていない）のに自分の利きが
+    /// 当たっていないマス数 U に対し、w × 1/(1+U) を加点する。
+    ///
+    /// 既存の `attack_w`（king_zone_pressure）は被覆マス数に**線形**なので、
+    /// 「最後の逃げ道を塞ぐ手」（U 1→0）と「既に厚い包囲へ5本目の利きを足す手」の
+    /// 増分が同じになる。王手の期待反則数は相手の解消手数 K にほぼ反比例する
+    /// （実測: K≤2 の王手は実反則約2.4倍、メモリ strong-check-few-resolutions）ので、
+    /// U が小さいほど1マスの限界価値が跳ねる**凸形**でなければ「強い王手が成立する
+    /// 形を作る」勾配にならない。check_strength_w（王手時点の再配分）が勝率中立
+    /// だったのは王手の瞬間には形が決まっているからで、これはその前段の中期項。
+    /// 王手中は無効（CheckSolver の領分）。0 = 無効
+    pub escape_cover_w: f64,
+    /// **守り駒の捕獲**ボーナス（同レビューの 6一成銀が発端。ユーザー聞き取りで
+    /// 「金取り＋守り駒削減が主目的」と確認済み）。粒子上の相手玉の8近傍にいる
+    /// 相手駒を取る手へ、交換価値とは**別に**フラットな加点。玉の守りが1枚減る
+    /// 価値（以後の王手が強くなる・詰み網が作りやすくなる）は素材価値に含まれない。
+    /// 王手中は無効（CheckSolver の領分）。0 = 無効
+    pub defender_capture_w: f64,
 }
 
 /// check_strength_w の g(K) 曲線: 実測の「王手直後の実反則数」の K 依存を
@@ -1249,6 +1298,10 @@ impl Default for EvalParams {
             plan_w: 0.0,
             // 王手の強さ（2026-07-29）。未調整の新項なので w スイープで決める
             check_strength_w: 0.0,
+            // 逃げマス被覆・守り駒捕獲（2026-07-29、対人局レビュー）。
+            // 未調整の新項なので w スイープで決める
+            escape_cover_w: 0.0,
+            defender_capture_w: 0.0,
         }
     }
 }
@@ -1261,7 +1314,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 53] = [
+    pub const SPECS: [ParamSpec; 55] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -1541,6 +1594,19 @@ impl EvalParams {
             lo: 0.0,
             hi: 3.0,
         },
+        ParamSpec {
+            // 値域は 1/(1+U) ∈ [0.11, 1.0]。w=2 で「最後の逃げ道を塞ぐ手」が
+            // 約1歩相当になるスケール
+            name: "escape_cover_w",
+            lo: 0.0,
+            hi: 3.0,
+        },
+        ParamSpec {
+            // 捕獲1回あたりのフラット加点（交換価値の外）。歩1〜2枚相当まで
+            name: "defender_capture_w",
+            lo: 0.0,
+            hi: 3.0,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -1598,6 +1664,8 @@ impl EvalParams {
             self.plan_w,
             self.board_discount_w,
             self.check_strength_w,
+            self.escape_cover_w,
+            self.defender_capture_w,
         ]
     }
 
@@ -1657,6 +1725,8 @@ impl EvalParams {
             plan_w: v[50],
             board_discount_w: v[51],
             check_strength_w: v[52],
+            escape_cover_w: v[53],
+            defender_capture_w: v[54],
         }
     }
 }
@@ -1871,6 +1941,30 @@ impl EstimatorStrategy {
         {
             Some(w) => EvalParams {
                 board_discount_w: w,
+                ..params
+            },
+            None => params,
+        };
+        // 逃げマス被覆（凸）の運用ノブ（w スイープ用。0 で従来挙動）
+        let params = match std::env::var("TSUITATE_ESCAPE_COVER_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+        {
+            Some(w) => EvalParams {
+                escape_cover_w: w,
+                ..params
+            },
+            None => params,
+        };
+        // 守り駒捕獲ボーナスの運用ノブ（w スイープ用。0 で従来挙動）
+        let params = match std::env::var("TSUITATE_DEFENDER_CAPTURE_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+        {
+            Some(w) => EvalParams {
+                defender_capture_w: w,
                 ..params
             },
             None => params,
@@ -2206,6 +2300,20 @@ impl Strategy for EstimatorStrategy {
         }
 
         let rng = &mut self.rng;
+        // 王手中の玉の手の gain 平均化判定用（check_king_gain_mean の doc 参照）
+        let my_king = king_square(view);
+        let is_king_move = |mv: &ShogiMove| {
+            matches!(*mv, ShogiMove::Board { from, .. } if Some(from) == my_king)
+        };
+        // 平均化の対象となる玉の手（直前に自駒が取られたマスへの玉捕獲は
+        // 観測確実な取り返しなので除外。平均化ブロックの doc 参照）
+        let equalized_king_move = |mv: &ShogiMove| {
+            is_king_move(mv)
+                && !matches!(
+                    (*mv, blind_recapture),
+                    (ShogiMove::Board { to, .. }, Some((sq, _))) if to == sq
+                )
+        };
         // valueネットのstate特徴量キャッシュ（sample と同じ並び。候補間で共通なので
         // 手番ごとに1回だけ計算する）
         let mut nn_state_cache: Vec<Option<[f64; crate::value_features::VALUE_FEATURES]>> =
@@ -2312,6 +2420,30 @@ impl Strategy for EstimatorStrategy {
             scored.push((usi, mv, out, adjust, score));
         }
 
+        // 王手中の玉の手は gain を「玉の手全体の平均」に揃える
+        // （doc は check_king_gain_mean。分散＝幻の敵駒ノイズだけを消し、
+        // 玉の手 vs 非玉プローブの相対水準は保存する）。
+        // **直前に自駒が取られたマスへの玉捕獲は除外する**: そこに相手駒が
+        // いるのは観測事実で、その捕獲 gain（blind_recapture / 粒子の駒得）は
+        // 幻ではない。巻き込むと確実な取り返しのベイトが消える
+        // （実測: recap-dragon の 6a7a が 19/20 → 13/20 に落ちた）
+        if view.you_in_check && check_king_gain_mean() {
+            let king_idx: Vec<usize> = scored
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| equalized_king_move(&s.1))
+                .map(|(i, _)| i)
+                .collect();
+            if king_idx.len() > 1 {
+                let mean =
+                    king_idx.iter().map(|&i| scored[i].2.gain).sum::<f64>() / king_idx.len() as f64;
+                for &i in &king_idx {
+                    scored[i].2.gain = mean;
+                    scored[i].4 = scored[i].2.score() + scored[i].3;
+                }
+            }
+        }
+
         // 2段目: 上位候補だけ相手の応手をサンプルして再評価。
         // gain 内の静的リスク項の depth2_replace 分を実測の期待損失で
         // 置き換えて（一致するなら無変化）、最終式を適用し直す
@@ -2320,7 +2452,10 @@ impl Strategy for EstimatorStrategy {
         let mut best: Option<(String, f64, f64)> = None;
         let mut ranking: Vec<CandidateScore> = vec![];
         for (i, (usi, mv, out, adjust, score)) in scored.into_iter().enumerate() {
-            let depth2 = i < budget.depth2_top_k;
+            // 平均化した玉の手は2手読みで gain を再構成しない（応手サンプルも
+            // 同じ幻の粒子が源で、揃えた序列が壊れるだけ）
+            let depth2 = i < budget.depth2_top_k
+                && !(view.you_in_check && check_king_gain_mean() && equalized_king_move(&mv));
             let (final_gain, final_score) = if depth2 {
                 let delta = depth2_delta(
                     view,
@@ -3244,6 +3379,8 @@ fn evaluate(
     let mut pressure_sum = 0.0;
     let mut attack_sum = 0.0;
     let mut danger_sum = 0.0;
+    // 逃げマス被覆（escape_cover_w）。圧力項と同じ少数粒子サンプルで測る
+    let mut escape_sum = 0.0;
     let mut pressure_n = 0usize;
     // 圧力項もソフト粒子の重みで加重する（他の項と同じ扱い）
     let mut pressure_w_sum = 0.0f64;
@@ -3301,6 +3438,18 @@ fn evaluate(
                 v += params.check_strength_w
                     * (CHECK_STRENGTH_CURVE / (1.0 + resolutions as f64)
                         - CHECK_STRENGTH_CENTER);
+            }
+        }
+
+        // 守り駒の捕獲: 相手玉（この粒子）の8近傍にいる相手駒を取る手は、
+        // 交換価値とは別に「守りが1枚減る」価値を持つ（対人局の6一成銀:
+        // 金取り＋守り駒削減が主目的、というユーザー聞き取り。
+        // human-play-review-2026-07-29）。王手中は無効（CheckSolver の領分）
+        if params.defender_capture_w != 0.0 && !view.you_in_check && captured_value > 0.0 {
+            if let (ShogiMove::Board { to, .. }, Some(ok)) = (*mv, pos.king_square(opp)) {
+                if cheb(to, ok) <= 1 {
+                    v += params.defender_capture_w;
+                }
             }
         }
 
@@ -3364,6 +3513,12 @@ fn evaluate(
             // 相手の持ち駒による王手打ちの受け入れ面積（対局実験の教訓:
             // 飛車を持たれた瞬間、玉への開いた直線はすべて即王手の入口になる）
             danger_sum += w * drop_check_danger(&next, me);
+            // 逃げマス被覆（凸）: 相手玉の未被覆の逃げ先が残り U 個のとき
+            // 1/(1+U)。「最後の逃げ道を塞ぐ手」ほど増分が大きい
+            // （escape_cover_w の doc 参照）。王手中は無効
+            if params.escape_cover_w != 0.0 && !view.you_in_check {
+                escape_sum += w * escape_cover_value(&next, opp, me);
+            }
             pressure_w_sum += w;
             pressure_n += 1;
         }
@@ -3504,6 +3659,7 @@ fn evaluate(
             + params.king_probe_bonus * p_chk * (1.0 - p_chk)
             + value_nn_term
             + (params.attack_w * confidence * attack_sum
+                + params.escape_cover_w * confidence * escape_sum
                 - params.pressure_w * pressure_sum
                 - params.hand_drop_w * danger_sum)
                 / pressure_w_sum.max(1e-9)
@@ -4178,6 +4334,40 @@ pub(crate) fn king_zone_pressure(pos: &Position, owner: Color, by: Color) -> f64
     pressure
 }
 
+/// owner 玉の隣接8マスのうち「逃げ先になり得る」（owner 自身の駒に塞がれて
+/// いない）のに by の利きが当たっていないマス数 U を数え、1/(1+U) を返す。
+/// U=0（全逃げ先を被覆）で 1.0、U=8 で 0.11 の凸形。king_zone_pressure が
+/// 被覆マス数に線形なのと違い、「最後の逃げ道」ほど1マスの価値が跳ねる
+/// （escape_cover_w の doc 参照）。by の駒がいるマスは玉に取られ得るので、
+/// 支え（他の by 駒の利き）が無ければ未被覆と数える
+pub(crate) fn escape_cover_value(pos: &Position, owner: Color, by: Color) -> f64 {
+    let Some(king) = pos.king_square(owner) else {
+        return 0.0;
+    };
+    let mut uncovered = 0u32;
+    for df in -1..=1i8 {
+        for dr in -1..=1i8 {
+            if df == 0 && dr == 0 {
+                continue;
+            }
+            let c = crate::board::Coord {
+                file: king.file + df,
+                rank: king.rank + dr,
+            };
+            if !(1..=9).contains(&c.file) || !(1..=9).contains(&c.rank) {
+                continue;
+            }
+            if pos.piece_at(c).is_some_and(|p| p.color == owner) {
+                continue;
+            }
+            if !pos.is_attacked(c, by) {
+                uncovered += 1;
+            }
+        }
+    }
+    1.0 / (1.0 + f64::from(uncovered))
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::HashMap;
@@ -4402,6 +4592,8 @@ pub(crate) mod tests {
         assert_field_index!(depth2_replace);
         assert_field_index!(check_limit_accel);
         assert_field_index!(check_strength_w);
+        assert_field_index!(escape_cover_w);
+        assert_field_index!(defender_capture_w);
     }
 
     #[test]
@@ -4416,6 +4608,53 @@ pub(crate) mod tests {
         for k in 1..20 {
             assert!(g(k) > g(k + 1), "単調減少");
         }
+    }
+
+    #[test]
+    fn escape_cover_value_is_convex_in_uncovered_squares() {
+        // 後手玉 5a: 逃げ先候補は 4a,6a,4b,5b,6b の5マス（盤端）
+        let king = Coord { file: 5, rank: 1 };
+        let mut pos = Position::empty(Color::Sente);
+        pos.set(
+            king,
+            Some(crate::shogi::Piece {
+                color: Color::Gote,
+                role: Role::King,
+            }),
+        );
+        // 利き無し → U=5 → 1/6
+        assert!((escape_cover_value(&pos, Color::Gote, Color::Sente) - 1.0 / 6.0).abs() < 1e-9);
+
+        // 先手金を 5c へ: 4b,5b,6b を被覆 → U=2 → 1/3
+        pos.set(
+            Coord { file: 5, rank: 3 },
+            Some(crate::shogi::Piece {
+                color: Color::Sente,
+                role: Role::Gold,
+            }),
+        );
+        assert!((escape_cover_value(&pos, Color::Gote, Color::Sente) - 1.0 / 3.0).abs() < 1e-9);
+
+        // 後手自身の歩が 4a を塞ぐ → 逃げ先候補から除外 → U=1 → 1/2。
+        // 凸性: 被覆1マスの増分が U が小さいほど大きい（1/6→1/3→1/2）
+        pos.set(
+            Coord { file: 4, rank: 1 },
+            Some(crate::shogi::Piece {
+                color: Color::Gote,
+                role: Role::Pawn,
+            }),
+        );
+        assert!((escape_cover_value(&pos, Color::Gote, Color::Sente) - 0.5).abs() < 1e-9);
+
+        // 銀を 5b へ: 残る 6a を被覆（5b 自体は金の利きが支える）→ U=0 → 1.0
+        pos.set(
+            Coord { file: 5, rank: 2 },
+            Some(crate::shogi::Piece {
+                color: Color::Sente,
+                role: Role::Silver,
+            }),
+        );
+        assert!((escape_cover_value(&pos, Color::Gote, Color::Sente) - 1.0).abs() < 1e-9);
     }
 
     #[test]
