@@ -32,9 +32,10 @@ struct GameRecord {
     strategy: String,
     observations: Vec<Observation>,
     end: GameEndPayload,
-    /// (選択時の p_legal 予測, 実際に合法だったか)。chose イベントの
-    /// debug.p_legal と、その手の受理/反則の突き合わせ（C-7 P3 の較正測定）
-    p_legal_outcomes: Vec<(f64, bool)>,
+    /// (選択時の p_legal 予測, 実際に合法だったか, move_number)。chose イベントの
+    /// debug.p_legal と、その手の受理/反則の突き合わせ（C-7 P3 の較正測定）。
+    /// move_number は王手中の手番だけに絞った較正（王手中の p_legal 過信の診断）用
+    p_legal_outcomes: Vec<(f64, bool, u32)>,
 }
 
 fn load(path: &str) -> Option<GameRecord> {
@@ -66,12 +67,16 @@ fn load(path: &str) -> Option<GameRecord> {
             Some("obs") => {
                 if let Ok(obs) = serde_json::from_value::<Observation>(v["event"].clone()) {
                     match (&obs, &pending_chose) {
-                        (Observation::MyMove { usi, .. }, Some((cu, p))) if usi == cu => {
-                            p_legal_outcomes.push((*p, true));
+                        (Observation::MyMove { usi, move_number, .. }, Some((cu, p)))
+                            if usi == cu =>
+                        {
+                            p_legal_outcomes.push((*p, true, *move_number));
                             pending_chose = None;
                         }
-                        (Observation::MyFoul { usi, .. }, Some((cu, p))) if usi == cu => {
-                            p_legal_outcomes.push((*p, false));
+                        (Observation::MyFoul { usi, move_number }, Some((cu, p)))
+                            if usi == cu =>
+                        {
+                            p_legal_outcomes.push((*p, false, *move_number));
                             pending_chose = None;
                         }
                         _ => {}
@@ -195,6 +200,181 @@ fn simulate_check_solver(rec: &GameRecord, positions: &[Position], bot: Color) -
     (tested, actual_total, solver_total)
 }
 
+/// 王手中の実反則それぞれについて「その瞬間にソルバーが知っていた最善解消確率
+/// p_max」と「実際に選んだ（反則になった）手の解消確率 p_chosen」を監査する。
+/// p_max が高い（ほぼ確実な解消手を既に知っていた）のに低い p の手で反則して
+/// いる質量が大きければ、王手中の gain が p_legal を上書きしている構造的な
+/// 欠陥がある（966 vs 611 のソルバー方策ギャップの内訳を取る診断。2026-07-29）。
+/// 戻り値: [p_max≥0.9, 0.5..0.9, <0.5] ごとの (反則数, p_chosen の合計)。
+/// solver_p_outcomes には王手中の全決定（反則・受理とも）の
+/// (ソルバー単体の p, 実際に合法だったか) を積む（エンジンの p_legal 較正との
+/// 比較用。ソルバー単体のほうが当たるなら evaluate() のブレンドが希釈している）
+/// 王手中の決定について「真の王手駒だけを置いた単独盤面なら合法」だった手の
+/// 手種別の実際の合法率を測る。CheckSolver::legal_under は仮説の王手駒1枚
+/// しか置かないため、見えない支え駒・利きの被覆を無視して玉の手を過信する
+/// （実測: p=1.00 と断言した玉での王手駒捕獲が支え付きで反則 = 健全性違反）。
+/// ここで測る「単独仮説合法 → 実際合法」の手種別の率が、resolve_probability に
+/// 掛けるべき事前確率の実測値になる。
+/// 種別: [玉で王手駒マスを捕獲, 玉のその他の移動, 玉以外の捕獲, 打ち, その他]
+fn tally_single_hyp_legality(
+    truth: &Position,
+    bot: Color,
+    mv: &ShogiMove,
+    was_legal: bool,
+    counts: &mut [(u32, u32); 5],
+) {
+    let Some(king) = truth.king_square(bot) else {
+        return;
+    };
+    // 真の王手駒（複数=両王手もそのまま全部置く）
+    let checkers: Vec<(Coord, Role)> = truth
+        .pieces()
+        .filter(|(sq, p)| p.color != bot && truth.attacks(*sq, king))
+        .map(|(sq, p)| (sq, p.role))
+        .collect();
+    if checkers.is_empty() {
+        return;
+    }
+    // 単独盤面: 自駒・自持ち駒・真の王手駒だけ
+    let mut base = Position::empty(bot);
+    for (sq, p) in truth.pieces() {
+        if p.color == bot {
+            base.set(sq, Some(p));
+        }
+    }
+    for (&role, &n) in &truth.hand_map(bot) {
+        base.set_hand(bot, role, n as u8);
+    }
+    for &(sq, role) in &checkers {
+        base.set(
+            sq,
+            Some(tsuitate_bot::shogi::Piece {
+                color: bot.other(),
+                role,
+            }),
+        );
+    }
+    if !base.is_legal(mv) {
+        return; // 単独仮説でも反則予測 → ソルバーの過信の対象外
+    }
+    let to = match *mv {
+        ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+    };
+    let kind = match *mv {
+        ShogiMove::Board { from, .. } if from == king => {
+            if checkers.iter().any(|&(sq, _)| sq == to) {
+                0 // 玉で王手駒を捕獲
+            } else {
+                1 // 玉の移動（逃げ・王手駒以外の捕獲）
+            }
+        }
+        ShogiMove::Board { .. } if truth.piece_at(to).is_some_and(|p| p.color != bot) => 2,
+        ShogiMove::Board { .. } => 4,
+        ShogiMove::Drop { .. } => 3,
+    };
+    counts[kind].0 += 1;
+    if was_legal {
+        counts[kind].1 += 1;
+    }
+}
+
+fn audit_check_fouls(
+    rec: &GameRecord,
+    positions: &[Position],
+    bot: Color,
+    solver_p_outcomes: &mut Vec<(f64, bool)>,
+    single_hyp_counts: &mut [(u32, u32); 5],
+) -> [(u32, f64); 3] {
+    let mut buckets = [(0u32, 0.0f64); 3];
+    for (i, obs) in rec.observations.iter().enumerate() {
+        // 着手時局面: MyFoul は move_number-1、MyMove は適用後の値なので -2
+        let (move_number, usi, was_legal) = match obs {
+            Observation::MyFoul { move_number, usi } => (*move_number, usi, false),
+            Observation::MyMove { move_number, usi, .. } => {
+                (move_number.saturating_sub(1), usi, true)
+            }
+            _ => continue,
+        };
+        let idx = (move_number as usize).saturating_sub(1);
+        let Some(truth) = positions.get(idx) else {
+            continue;
+        };
+        if !truth.in_check(bot) {
+            continue;
+        }
+        let Some(chosen_mv) = parse_usi(usi) else {
+            continue;
+        };
+        tally_single_hyp_legality(truth, bot, &chosen_mv, was_legal, single_hyp_counts);
+        let mut log = ObservationLog::default();
+        for prev in &rec.observations[..i] {
+            log.record(prev.clone());
+        }
+        // この手番でここまでに試した反則（仮説消去に使う）
+        let mut fouls: Vec<ShogiMove> = vec![];
+        let mut tried: HashSet<String> = HashSet::new();
+        for prev in &rec.observations[..i] {
+            if let Observation::MyFoul { move_number: mn, usi: u } = prev {
+                if *mn == move_number {
+                    if let Some(m) = parse_usi(u) {
+                        fouls.push(m);
+                    }
+                    tried.insert(u.clone());
+                }
+            }
+        }
+        let model = GameModel::from_log(bot, &log);
+        let view = view_from_model(&model, true);
+        let Some(mut solver) = CheckSolver::new(&view, &[], &fouls, &log) else {
+            continue;
+        };
+        let p_chosen = solver.resolve_probability(&chosen_mv);
+        solver_p_outcomes.push((p_chosen, was_legal));
+        if was_legal {
+            continue; // p_max 別の内訳は反則だけ数える
+        }
+        let p_max = candidate_moves(&view, &tried)
+            .iter()
+            .map(|(_, mv)| solver.resolve_probability(mv))
+            .fold(0.0f64, f64::max);
+        let bucket = if p_max >= 0.9 {
+            0
+        } else if p_max >= 0.5 {
+            1
+        } else {
+            2
+        };
+        buckets[bucket].0 += 1;
+        buckets[bucket].1 += p_chosen;
+        // p_max≥0.9 なのに選ばれなかった反則の性質: 捕獲試み（プローブ＝
+        // kakutori 型の意図された挙動でありうる）か、打ちの合駒か、その他か
+        if bucket == 0 {
+            let kind = match chosen_mv {
+                ShogiMove::Board { to, .. }
+                    if truth.piece_at(to).is_some_and(|p| p.color != bot) =>
+                {
+                    "捕獲試み(真に敵駒あり)"
+                }
+                ShogiMove::Board { .. } => "盤上移動(捕獲空振り含む)",
+                ShogiMove::Drop { .. } => "打ち(合駒試み)",
+            };
+            println!(
+                "  王手中反則(安全手p{p_max:.2}を無視) {}手目 {}: p{:.2} {} [{:?}]",
+                move_number,
+                usi,
+                p_chosen,
+                kind,
+                classify_foul(truth, &FoulRecord {
+                    move_number,
+                    by_color: bot,
+                    usi: usi.clone(),
+                }),
+            );
+        }
+    }
+    buckets
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum FoulCause {
     /// 経路上に見えない相手駒があって届かない（or 移動先の自駒 = 起きないはず）
@@ -314,6 +494,8 @@ fn main() {
     let mut total_check_turns = 0;
     let mut total_check_actual_fouls = 0;
     let mut total_check_solved = 0;
+    // 王手中の実反則の監査: その瞬間のソルバー p_max 別の (反則数, p_chosen合計)
+    let mut check_foul_audit = [(0u32, 0.0f64); 3];
     // 王手駒の即取られ: bot の手が直接王手（動かした/打った駒自身が敵玉へ利く）
     // になり、その駒を相手の直後の手で取られた回数。玉位置ビリーフが外れている
     // ときの典型（信念上の玉へ向けた王手が、実際には守られたマスへ着地している）
@@ -344,12 +526,26 @@ fn main() {
     // 退路は仮説によらずほぼ確実に合法（見えない駒の利きが通りにくい）。
     // 解消手に玉移動が含まれる王手は K が小さくても反則を稼げないはず
     let mut chk_kesc = [(0u32, 0u32); 4]; // [K≤2玉逃げあり, K≤2なし, K≥3あり, K≥3なし]
+    // 手段クラス数（rei2 の第2次元の実測、2026-07-29）: 期待反則数は K の逆数
+    // だけでなく「受け側が区別できない手段クラスの数 × 解消手の互いに素性」で
+    // 決まるはず。受け側は攻め側の持ち駒を被captureから正確に知っているので、
+    // 王手時の攻め側の持ち駒の多様性（歩以外の異なる駒種数）が打ち王手の
+    // 仮説クラス数の代理になる。「強い王手が成立する形を作る」中期項
+    // （持ち駒の多様性への値付け）に先立つ相関の検証
+    // [K≤2, K≥3] × [持ち駒クラス 0〜1 / 2 / 3+] で (回数, 直後の実反則)
+    let mut chk_hand = [[(0u32, 0u32); 3]; 2];
     let mut total_recap_ops = 0;
     let mut total_recap_taken = 0;
     let mut total_recap_missed_good = 0;
     let mut games = 0;
     let mut bot_wins = 0;
     let mut p_legal_all: Vec<(f64, bool)> = vec![];
+    // 王手中の手番だけの p_legal 較正（王手中の過信の診断）
+    let mut p_legal_check: Vec<(f64, bool)> = vec![];
+    // 王手中の全決定に対する CheckSolver 単体の p（エンジン p_legal との比較）
+    let mut solver_p_check: Vec<(f64, bool)> = vec![];
+    // 「真の王手駒の単独仮説なら合法」だった手の手種別 (試行, 実際合法)
+    let mut single_hyp = [(0u32, 0u32); 5];
     // 占有マス反則（Blocked/DropOccupied）が、同じ対局内で過去の占有マス
     // 反則が実際に示していたマスと重なっていたか。「反則が起きたマスを
     // 覚えて避ける」系の対策（Guide::occupies/path_blocks）が原理的に
@@ -371,7 +567,6 @@ fn main() {
             continue;
         };
         games += 1;
-        p_legal_all.extend(rec.p_legal_outcomes.iter().copied());
         let bot = rec.bot_color;
         let bot_won = matches!(
             (rec.end.result.as_str(), bot),
@@ -401,6 +596,17 @@ fn main() {
             };
             next.play_unchecked(&mv);
             positions.push(next);
+        }
+
+        // p_legal 較正の分母（全手番と、王手中の手番だけの2系統）。
+        // 着手時の局面: MyMove の move_number は適用後の値なので -2、
+        // MyFoul は手番維持なので -1（selfplay.rs の moveNumber 規約）
+        for &(p, y, mn) in &rec.p_legal_outcomes {
+            p_legal_all.push((p, y));
+            let idx = (mn as usize).saturating_sub(if y { 2 } else { 1 });
+            if positions.get(idx).is_some_and(|pos| pos.in_check(bot)) {
+                p_legal_check.push((p, y));
+            }
         }
 
         let mut known_risky_squares: HashSet<Coord> = HashSet::new();
@@ -643,6 +849,24 @@ fn main() {
                 };
                 chk_kesc[kesc_idx].0 += 1;
                 chk_kesc[kesc_idx].1 += actual;
+                let hand_classes = [
+                    Role::Lance,
+                    Role::Knight,
+                    Role::Silver,
+                    Role::Gold,
+                    Role::Bishop,
+                    Role::Rook,
+                ]
+                .iter()
+                .filter(|&&r| after.hand_count(bot, r) > 0)
+                .count();
+                let hc = match hand_classes {
+                    0 | 1 => 0,
+                    2 => 1,
+                    _ => 2,
+                };
+                chk_hand[usize::from(k > 2)][hc].0 += 1;
+                chk_hand[usize::from(k > 2)][hc].1 += actual;
                 if k <= 2 {
                     println!(
                         "  強い王手 {}手目 {}: 解消{k}手{} / 選択肢{n_opts}手 / 直後の反則{actual}回",
@@ -697,6 +921,12 @@ fn main() {
         total_check_turns += tested;
         total_check_actual_fouls += actual;
         total_check_solved += sim;
+        let audit =
+            audit_check_fouls(&rec, &positions, bot, &mut solver_p_check, &mut single_hyp);
+        for (t, a) in check_foul_audit.iter_mut().zip(audit) {
+            t.0 += a.0;
+            t.1 += a.1;
+        }
 
         // 取り返し機会: 相手に駒を取られた直後の bot 手番で、そのマスを合法に
         // 取り返せたか（bot は取られたマス = 相手駒の現在地を正確に知っている）
@@ -878,6 +1108,15 @@ fn main() {
             per(chk_kesc[2]),
             per(chk_kesc[3]),
         );
+        println!(
+            "  攻め側の持ち駒クラス数（歩以外の駒種数）:\n    K≤2: 0〜1種 {} / 2種 {} / 3種以上 {}\n    K≥3: 0〜1種 {} / 2種 {} / 3種以上 {}",
+            per(chk_hand[0][0]),
+            per(chk_hand[0][1]),
+            per(chk_hand[0][2]),
+            per(chk_hand[1][0]),
+            per(chk_hand[1][1]),
+            per(chk_hand[1][2]),
+        );
     }
     if total_occupancy_fouls > 0 {
         println!(
@@ -894,6 +1133,22 @@ fn main() {
         println!(
             "王手中の反則: {total_check_turns}手番で実際 {total_check_actual_fouls}回 → ソルバー方策なら {total_check_solved}回"
         );
+        let audited: u32 = check_foul_audit.iter().map(|c| c.0).sum();
+        if audited > 0 {
+            let fmt = |c: (u32, f64)| -> String {
+                if c.0 == 0 {
+                    "-".into()
+                } else {
+                    format!("{}回 (選択手の平均p {:.2})", c.0, c.1 / f64::from(c.0))
+                }
+            };
+            println!(
+                "  反則時点のソルバー最善p_max別: ≥0.9 {} / 0.5〜0.9 {} / <0.5 {}",
+                fmt(check_foul_audit[0]),
+                fmt(check_foul_audit[1]),
+                fmt(check_foul_audit[2]),
+            );
+        }
     }
     // p_legal の較正（C-7 P3）: 選択手の合法確率予測 vs 実際の受理/反則。
     // Brier = mean((p-y)^2)（小さいほど良い）。参考: 常に基底率を答える予測の Brier
@@ -924,6 +1179,67 @@ fn main() {
             brier,
             base_brier,
             logloss,
+        );
+    }
+    // 王手中の手番だけの較正。全体より悪ければ「王手中の p_legal 過信」が
+    // 王手中反則（ソルバー方策とのギャップ）の説明になる
+    if !p_legal_check.is_empty() {
+        let n = p_legal_check.len() as f64;
+        let base_rate = p_legal_check.iter().filter(|(_, y)| *y).count() as f64 / n;
+        let brier: f64 = p_legal_check
+            .iter()
+            .map(|(p, y)| {
+                let y = if *y { 1.0 } else { 0.0 };
+                (p - y) * (p - y)
+            })
+            .sum::<f64>()
+            / n;
+        let mean_p: f64 = p_legal_check.iter().map(|(p, _)| p).sum::<f64>() / n;
+        println!(
+            "p_legal 較正・王手中のみ（{}手 合法率{:.1}% 平均予測{:.1}%）: Brier {:.4}（基底率予測 {:.4}）",
+            p_legal_check.len(),
+            base_rate * 100.0,
+            mean_p * 100.0,
+            brier,
+            base_rate * (1.0 - base_rate),
+        );
+    }
+    if !solver_p_check.is_empty() {
+        let n = solver_p_check.len() as f64;
+        let base_rate = solver_p_check.iter().filter(|(_, y)| *y).count() as f64 / n;
+        let brier: f64 = solver_p_check
+            .iter()
+            .map(|(p, y)| {
+                let y = if *y { 1.0 } else { 0.0 };
+                (p - y) * (p - y)
+            })
+            .sum::<f64>()
+            / n;
+        let mean_p: f64 = solver_p_check.iter().map(|(p, _)| p).sum::<f64>() / n;
+        println!(
+            "CheckSolver単体p 較正・王手中のみ（{}手 合法率{:.1}% 平均予測{:.1}%）: Brier {:.4}（基底率予測 {:.4}）",
+            solver_p_check.len(),
+            base_rate * 100.0,
+            mean_p * 100.0,
+            brier,
+            base_rate * (1.0 - base_rate),
+        );
+    }
+    if single_hyp.iter().any(|c| c.0 > 0) {
+        let rate = |c: (u32, u32)| -> String {
+            if c.0 == 0 {
+                "-".into()
+            } else {
+                format!("{}/{} ({:.0}%)", c.1, c.0, 100.0 * f64::from(c.1) / f64::from(c.0))
+            }
+        };
+        println!(
+            "単独仮説合法→実際合法の率（真の王手駒を置いた単独盤面で合法だった手。ソルバー legal_under の過信の実測）:\n  玉で王手駒捕獲 {} / 玉の移動 {} / 玉以外の捕獲 {} / 打ち {} / その他 {}",
+            rate(single_hyp[0]),
+            rate(single_hyp[1]),
+            rate(single_hyp[2]),
+            rate(single_hyp[3]),
+            rate(single_hyp[4]),
         );
     }
 }

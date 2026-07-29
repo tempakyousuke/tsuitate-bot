@@ -43,6 +43,32 @@ const CHECKER_ROLES: [Role; 13] = [
 /// 0にしない: 反則の真因が別の隠れ駒（経路封鎖・別の利き）の可能性があるため
 const UNEXPLAINED_FOUL_DECAY: f64 = 0.15;
 
+/// 「単独仮説では合法」だった手が実際にも合法だった率の実測値
+/// （アリーナ400局・王手中2481決定、bin/analyze の拡張で計測 2026-07-29）。
+/// legal_under は仮説の王手駒1枚しか置かないため、見えない支え駒・利きの
+/// 被覆を無視する。この過信は**玉の手に集中する**（支え・被覆は玉の手に
+/// しか効かない）: 玉で王手駒捕獲 73%（405件）・玉のその他の移動 77%
+/// （672件）に対し、玉以外の捕獲 97%・打ち 100%。放置すると「支え付き
+/// 王手駒を玉で取る手」を p=1.00 と断言して反則する健全性違反になる
+/// （実測: p=1.00 断言の反則が400局で8件、p≥0.9 まで含めると28件。
+/// ユーザー指導の強い王手の構造②「王手駒は見えない駒に支えられ玉で
+/// 取れない」が自玉の受け側の盲点になっていた）
+const KING_CAPTURE_LEGAL_PRIOR: f64 = 0.73;
+const KING_MOVE_LEGAL_PRIOR: f64 = 0.77;
+
+/// 玉の手の過信補正の強さ（0 = 従来挙動、1 = 実測事前確率をフルに適用）。
+/// `TSUITATE_CHECK_KING_PRIOR_W` で上書き可（切り戻し・スイープ用。
+/// 凍結版はこの名前を知らないので -f env= は候補側にだけ効く）
+fn king_prior_w() -> f64 {
+    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("TSUITATE_CHECK_KING_PRIOR_W")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0)
+    })
+}
+
 /// 粒子投票の強さ（全粒子が一致した仮説は一様仮説の 1+PARTICLE_VOTE_W 倍）
 const PARTICLE_VOTE_W: f64 = 8.0;
 
@@ -206,12 +232,34 @@ impl CheckSolver {
         }
     }
 
+    /// 単独仮説（王手駒1枚だけの盤面）で合法だった手が、実際にも合法である
+    /// 事前確率。玉の手だけ実測値で割り引く（定数の doc 参照）。
+    /// hyp_square = 判定対象の仮説の王手駒マス（玉での捕獲の判別に使う）
+    fn single_hyp_legal_prior(&self, mv: &ShogiMove, hyp_square: Coord) -> f64 {
+        let ShogiMove::Board { from, to, .. } = *mv else {
+            return 1.0;
+        };
+        if self.base.king_square(self.my_color) != Some(from) {
+            return 1.0;
+        }
+        let measured = if to == hyp_square {
+            KING_CAPTURE_LEGAL_PRIOR
+        } else {
+            KING_MOVE_LEGAL_PRIOR
+        };
+        1.0 - king_prior_w() * (1.0 - measured)
+    }
+
     /// この手番の反則を観測: 仮説の下で合法だったはずの手が反則になった
-    /// → その仮説の重みを減衰させる
+    /// → その仮説の重みを減衰させる。
+    /// 玉の手の反則は「仮説が正しくても隠れた支え・利きの被覆で反則になる」
+    /// 確率が高い（実測23〜27%）ので、減衰を 1 − 事前確率 まで緩めて
+    /// 真の仮説を殺しにくくする（玉以外の手は従来の減衰のまま）
     fn observe_foul(&mut self, foul: &ShogiMove) {
         for i in 0..self.hypotheses.len() {
             if self.legal_under(i, foul) {
-                self.hypotheses[i].weight *= UNEXPLAINED_FOUL_DECAY;
+                let prior = self.single_hyp_legal_prior(foul, self.hypotheses[i].square);
+                self.hypotheses[i].weight *= UNEXPLAINED_FOUL_DECAY.max(1.0 - prior);
             }
         }
     }
@@ -230,7 +278,10 @@ impl CheckSolver {
         legal
     }
 
-    /// 候補手が王手を解消する確率（仮説の重み付き割合）
+    /// 候補手が王手を解消する確率（仮説の重み付き割合）。
+    /// 玉の手は「単独仮説で合法」でも隠れた支え・被覆で反則になりうるので、
+    /// 実測の事前確率（single_hyp_legal_prior）を掛けて過信を抑える
+    /// （= p=1.00 の断言をしない。玉以外の捕獲・打ちは実測97〜100%なのでそのまま）
     pub fn resolve_probability(&mut self, mv: &ShogiMove) -> f64 {
         let mut total = 0.0;
         let mut resolved = 0.0;
@@ -238,7 +289,7 @@ impl CheckSolver {
             let w = self.hypotheses[i].weight;
             total += w;
             if self.legal_under(i, mv) {
-                resolved += w;
+                resolved += w * self.single_hyp_legal_prior(mv, self.hypotheses[i].square);
             }
         }
         if total <= 0.0 {
@@ -546,9 +597,59 @@ mod tests {
         let fouls = [mv("5e5d"), mv("5e5f")];
         let mut solver = CheckSolver::new(&view, &[], &fouls, &ObservationLog::default()).unwrap();
         let side = solver.resolve_probability(&mv("5e4e"));
+        // 玉の手は実測事前確率（KING_MOVE_LEGAL_PRIOR）で一律割引されるので、
+        // 閾値もそのスケールで見る（意図は「縦に留まる手より横逃げが高い」の相対比較）
         assert!(
-            side > 0.7,
+            side > 0.7 * KING_MOVE_LEGAL_PRIOR,
             "縦筋仮説の下で横逃げは解消するはず（p={side:.2}）"
+        );
+    }
+
+    #[test]
+    fn king_moves_are_never_certain_resolutions() {
+        // 玉の手は単独仮説で全て解消でも p=1.00 と断言しない（見えない支え駒・
+        // 利きの被覆で反則になる実測23〜27%を織り込む）。支え付き王手駒を
+        // 玉で取って反則、が p=1.00 断言で起きていた健全性違反の再発防止
+        let view = view_with(vec![("5e", Role::King)]);
+        let mut solver = CheckSolver::new(&view, &[], &[], &ObservationLog::default()).unwrap();
+        for usi in ["5e5d", "5e4e", "5e4d"] {
+            let p = solver.resolve_probability(&mv(usi));
+            assert!(
+                p <= KING_MOVE_LEGAL_PRIOR + 1e-9,
+                "{usi} の解消確率 {p:.3} は玉の手の実測事前確率を超えない"
+            );
+        }
+    }
+
+    #[test]
+    fn king_move_foul_decays_hypotheses_less_than_non_king_foul() {
+        // 玉の手の反則は「仮説が正しくても隠れた支えで説明できる」ので、
+        // その仮説の減衰は非玉の手の反則（0.15）より緩い（1 − 0.77 = 0.23）
+        let view = view_with(vec![("5e", Role::King), ("4e", Role::Gold)]);
+        // 4d に王手駒仮説がある。5e4d（玉で4dへ）の反則と 4e4d（金で4dへ）の
+        // 反則で、4d 仮説の減衰量を比べる
+        let base_p = {
+            let mut s = CheckSolver::new(&view, &[], &[], &ObservationLog::default()).unwrap();
+            s.resolve_probability(&mv("4e4d"))
+        };
+        let after_king_foul = {
+            let fouls = [mv("5e4d")];
+            let mut s = CheckSolver::new(&view, &[], &fouls, &ObservationLog::default()).unwrap();
+            s.resolve_probability(&mv("4e4d"))
+        };
+        let after_gold_foul = {
+            let fouls = [mv("4e4d")];
+            let mut s = CheckSolver::new(&view, &[], &fouls, &ObservationLog::default()).unwrap();
+            s.resolve_probability(&mv("4e4d"))
+        };
+        // 金の反則は 4d 系仮説だけを 0.15 に選択的に減衰させるので鋭く下がる。
+        // 玉の反則は（4d 系を含む）広い仮説を 0.23 で減衰させるので下がり方が緩い。
+        // 注: after_king_foul は base_p より下がるとは限らない（広範な減衰は
+        // 比率の分母も削るため）ので、比較は gold 側とだけ行う
+        assert!(after_gold_foul < base_p);
+        assert!(
+            after_king_foul > after_gold_foul,
+            "玉の手の反則 {after_king_foul:.3} は金の反則 {after_gold_foul:.3} より仮説を殺さない"
         );
     }
 
