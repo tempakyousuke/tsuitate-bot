@@ -47,16 +47,22 @@ const UNEXPLAINED_FOUL_DECAY: f64 = 0.15;
 /// （アリーナ400局・王手中2481決定、bin/analyze の拡張で計測 2026-07-29）。
 /// legal_under は仮説の王手駒1枚しか置かないため、見えない支え駒・利きの
 /// 被覆を無視する。この過信は**玉の手に集中する**（支え・被覆は玉の手に
-/// しか効かない）: 玉で王手駒捕獲 73%（405件）・玉のその他の移動 77%
-/// （672件）に対し、玉以外の捕獲 97%・打ち 100%。放置すると「支え付き
+/// しか効かない）: 玉で王手駒捕獲 73%（405件）・玉の後退 81%・玉の横/前進
+/// 75% に対し、玉以外の捕獲 97%・打ち 100%。放置すると「支え付き
 /// 王手駒を玉で取る手」を p=1.00 と断言して反則する健全性違反になる
-/// （実測: p=1.00 断言の反則が400局で8件、p≥0.9 まで含めると28件。
+/// （実測: p=1.00 断言の反則が400局で8件中6件が玉での王手駒捕獲）。
 /// ユーザー指導の強い王手の構造②「王手駒は見えない駒に支えられ玉で
-/// 取れない」が自玉の受け側の盲点になっていた）
+/// 取れない」が自玉の受け側の盲点になっていた。
+///
+/// **割引は玉での王手駒（仮説マス）捕獲だけに掛ける**: 玉の逃げ（75〜81%）
+/// まで一律に割り引いた第1版は、較正は正しいのにアリーナ3シードのペア比較で
+/// 全て悪化した（−1.0/−1.0/−3.5pt、2026-07-29）。逃げの割引は選択を
+/// p_max 0.5〜0.9 の不確実な合駒・捕獲プローブへ押し出し、反則が増える
+/// （ソルバー argmax シミュでも 611→630 と悪化を予告していた）。
+/// 玉捕獲の割引は「玉以外の駒で取る手（97%正確）」への安全な誘導なので害がない
 const KING_CAPTURE_LEGAL_PRIOR: f64 = 0.73;
-const KING_MOVE_LEGAL_PRIOR: f64 = 0.77;
 
-/// 玉の手の過信補正の強さ（0 = 従来挙動、1 = 実測事前確率をフルに適用）。
+/// 玉での王手駒捕獲の過信補正の強さ（0 = 従来挙動、1 = 実測事前確率をフルに適用）。
 /// `TSUITATE_CHECK_KING_PRIOR_W` で上書き可（切り戻し・スイープ用。
 /// 凍結版はこの名前を知らないので -f env= は候補側にだけ効く）
 fn king_prior_w() -> f64 {
@@ -233,28 +239,24 @@ impl CheckSolver {
     }
 
     /// 単独仮説（王手駒1枚だけの盤面）で合法だった手が、実際にも合法である
-    /// 事前確率。玉の手だけ実測値で割り引く（定数の doc 参照）。
-    /// hyp_square = 判定対象の仮説の王手駒マス（玉での捕獲の判別に使う）
+    /// 事前確率。**玉でその仮説の王手駒マスを取る手だけ**実測値で割り引く
+    /// （定数の doc 参照。玉の逃げまで割り引くとアリーナで悪化する）。
+    /// hyp_square = 判定対象の仮説の王手駒マス
     fn single_hyp_legal_prior(&self, mv: &ShogiMove, hyp_square: Coord) -> f64 {
         let ShogiMove::Board { from, to, .. } = *mv else {
             return 1.0;
         };
-        if self.base.king_square(self.my_color) != Some(from) {
+        if to != hyp_square || self.base.king_square(self.my_color) != Some(from) {
             return 1.0;
         }
-        let measured = if to == hyp_square {
-            KING_CAPTURE_LEGAL_PRIOR
-        } else {
-            KING_MOVE_LEGAL_PRIOR
-        };
-        1.0 - king_prior_w() * (1.0 - measured)
+        1.0 - king_prior_w() * (1.0 - KING_CAPTURE_LEGAL_PRIOR)
     }
 
     /// この手番の反則を観測: 仮説の下で合法だったはずの手が反則になった
     /// → その仮説の重みを減衰させる。
-    /// 玉の手の反則は「仮説が正しくても隠れた支え・利きの被覆で反則になる」
-    /// 確率が高い（実測23〜27%）ので、減衰を 1 − 事前確率 まで緩めて
-    /// 真の仮説を殺しにくくする（玉以外の手は従来の減衰のまま）
+    /// 玉でその仮説の王手駒マスを取る手の反則は「仮説が正しくても隠れた
+    /// 支えで反則になる」確率が高い（実測27%）ので、減衰を 1 − 事前確率
+    /// まで緩めて真の仮説を殺しにくくする（他の手は従来の減衰のまま）
     fn observe_foul(&mut self, foul: &ShogiMove) {
         for i in 0..self.hypotheses.len() {
             if self.legal_under(i, foul) {
@@ -279,9 +281,10 @@ impl CheckSolver {
     }
 
     /// 候補手が王手を解消する確率（仮説の重み付き割合）。
-    /// 玉の手は「単独仮説で合法」でも隠れた支え・被覆で反則になりうるので、
-    /// 実測の事前確率（single_hyp_legal_prior）を掛けて過信を抑える
-    /// （= p=1.00 の断言をしない。玉以外の捕獲・打ちは実測97〜100%なのでそのまま）
+    /// 玉でその仮説の王手駒マスを取る手は「単独仮説で合法」でも隠れた支えで
+    /// 反則になりうるので、実測の事前確率（single_hyp_legal_prior）を掛けて
+    /// 過信を抑える（= p=1.00 の断言をしない。玉以外の捕獲は実測97%なので
+    /// そのまま = 支え付き王手駒は玉以外の駒で取る序列へ自然に誘導される）
     pub fn resolve_probability(&mut self, mv: &ShogiMove) -> f64 {
         let mut total = 0.0;
         let mut resolved = 0.0;
@@ -597,34 +600,35 @@ mod tests {
         let fouls = [mv("5e5d"), mv("5e5f")];
         let mut solver = CheckSolver::new(&view, &[], &fouls, &ObservationLog::default()).unwrap();
         let side = solver.resolve_probability(&mv("5e4e"));
-        // 玉の手は実測事前確率（KING_MOVE_LEGAL_PRIOR）で一律割引されるので、
-        // 閾値もそのスケールで見る（意図は「縦に留まる手より横逃げが高い」の相対比較）
+        // 玉の逃げは割引かない（割引は玉での仮説マス捕獲のみ）ので、
+        // 4e 仮説ぶんのわずかな割引を除き従来の閾値のまま
         assert!(
-            side > 0.7 * KING_MOVE_LEGAL_PRIOR,
+            side > 0.7,
             "縦筋仮説の下で横逃げは解消するはず（p={side:.2}）"
         );
     }
 
     #[test]
-    fn king_moves_are_never_certain_resolutions() {
-        // 玉の手は単独仮説で全て解消でも p=1.00 と断言しない（見えない支え駒・
-        // 利きの被覆で反則になる実測23〜27%を織り込む）。支え付き王手駒を
-        // 玉で取って反則、が p=1.00 断言で起きていた健全性違反の再発防止
-        let view = view_with(vec![("5e", Role::King)]);
-        let mut solver = CheckSolver::new(&view, &[], &[], &ObservationLog::default()).unwrap();
-        for usi in ["5e5d", "5e4e", "5e4d"] {
-            let p = solver.resolve_probability(&mv(usi));
-            assert!(
-                p <= KING_MOVE_LEGAL_PRIOR + 1e-9,
-                "{usi} の解消確率 {p:.3} は玉の手の実測事前確率を超えない"
-            );
-        }
+    fn only_king_capture_of_hypothesis_square_is_discounted() {
+        // 割引の対象は「玉でその仮説の王手駒マスを取る手」だけ（実測73%）。
+        // 玉の逃げ・玉以外の捕獲は割引かない（一律割引の第1版はアリーナ
+        // 3シードのペア比較で全て悪化した）
+        let view = view_with(vec![("5e", Role::King), ("4e", Role::Gold)]);
+        let solver = CheckSolver::new(&view, &[], &[], &ObservationLog::default()).unwrap();
+        let hyp = Coord { file: 5, rank: 4 }; // 5d
+        let discounted = solver.single_hyp_legal_prior(&mv("5e5d"), hyp);
+        assert!(
+            (discounted - KING_CAPTURE_LEGAL_PRIOR).abs() < 1e-9,
+            "玉で仮説マス 5d を取る手は実測事前確率へ割引（{discounted:.2}）"
+        );
+        assert_eq!(solver.single_hyp_legal_prior(&mv("5e4d"), hyp), 1.0);
+        assert_eq!(solver.single_hyp_legal_prior(&mv("4e5d"), hyp), 1.0);
     }
 
     #[test]
     fn king_move_foul_decays_hypotheses_less_than_non_king_foul() {
-        // 玉の手の反則は「仮説が正しくても隠れた支えで説明できる」ので、
-        // その仮説の減衰は非玉の手の反則（0.15）より緩い（1 − 0.77 = 0.23）
+        // 玉で仮説マスを取る手の反則は「仮説が正しくても隠れた支えで説明できる」
+        // ので、その仮説の減衰は非玉の反則（0.15）より緩い（1 − 0.73 = 0.27）
         let view = view_with(vec![("5e", Role::King), ("4e", Role::Gold)]);
         // 4d に王手駒仮説がある。5e4d（玉で4dへ）の反則と 4e4d（金で4dへ）の
         // 反則で、4d 仮説の減衰量を比べる

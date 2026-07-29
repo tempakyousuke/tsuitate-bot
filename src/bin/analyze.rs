@@ -215,13 +215,16 @@ fn simulate_check_solver(rec: &GameRecord, positions: &[Position], bot: Color) -
 /// （実測: p=1.00 と断言した玉での王手駒捕獲が支え付きで反則 = 健全性違反）。
 /// ここで測る「単独仮説合法 → 実際合法」の手種別の率が、resolve_probability に
 /// 掛けるべき事前確率の実測値になる。
-/// 種別: [玉で王手駒マスを捕獲, 玉のその他の移動, 玉以外の捕獲, 打ち, その他]
+/// 種別: [玉で王手駒マスを捕獲, 玉の自陣方向への後退, 玉のその他の移動,
+///        玉以外の捕獲, 打ち, その他]
+/// 後退を別枠にするのは rei3 のユーザー指導「自陣奥への退路は仮説によらず
+/// ほぼ確実に合法」の検証（一律の玉の手割引はアリーナ3シードで悪化した）
 fn tally_single_hyp_legality(
     truth: &Position,
     bot: Color,
     mv: &ShogiMove,
     was_legal: bool,
-    counts: &mut [(u32, u32); 5],
+    counts: &mut [(u32, u32); 6],
 ) {
     let Some(king) = truth.king_square(bot) else {
         return;
@@ -265,12 +268,20 @@ fn tally_single_hyp_legality(
             if checkers.iter().any(|&(sq, _)| sq == to) {
                 0 // 玉で王手駒を捕獲
             } else {
-                1 // 玉の移動（逃げ・王手駒以外の捕獲）
+                let backward = match bot {
+                    Color::Sente => to.rank > from.rank,
+                    Color::Gote => to.rank < from.rank,
+                };
+                if backward {
+                    1 // 玉の自陣方向への後退
+                } else {
+                    2 // 玉のその他の移動（横・前進）
+                }
             }
         }
-        ShogiMove::Board { .. } if truth.piece_at(to).is_some_and(|p| p.color != bot) => 2,
-        ShogiMove::Board { .. } => 4,
-        ShogiMove::Drop { .. } => 3,
+        ShogiMove::Board { .. } if truth.piece_at(to).is_some_and(|p| p.color != bot) => 3,
+        ShogiMove::Board { .. } => 5,
+        ShogiMove::Drop { .. } => 4,
     };
     counts[kind].0 += 1;
     if was_legal {
@@ -283,7 +294,7 @@ fn audit_check_fouls(
     positions: &[Position],
     bot: Color,
     solver_p_outcomes: &mut Vec<(f64, bool)>,
-    single_hyp_counts: &mut [(u32, u32); 5],
+    single_hyp_counts: &mut [(u32, u32); 6],
 ) -> [(u32, f64); 3] {
     let mut buckets = [(0u32, 0.0f64); 3];
     for (i, obs) in rec.observations.iter().enumerate() {
@@ -545,7 +556,7 @@ fn main() {
     // 王手中の全決定に対する CheckSolver 単体の p（エンジン p_legal との比較）
     let mut solver_p_check: Vec<(f64, bool)> = vec![];
     // 「真の王手駒の単独仮説なら合法」だった手の手種別 (試行, 実際合法)
-    let mut single_hyp = [(0u32, 0u32); 5];
+    let mut single_hyp = [(0u32, 0u32); 6];
     // 占有マス反則（Blocked/DropOccupied）が、同じ対局内で過去の占有マス
     // 反則が実際に示していたマスと重なっていたか。「反則が起きたマスを
     // 覚えて避ける」系の対策（Guide::occupies/path_blocks）が原理的に
@@ -1234,12 +1245,13 @@ fn main() {
             }
         };
         println!(
-            "単独仮説合法→実際合法の率（真の王手駒を置いた単独盤面で合法だった手。ソルバー legal_under の過信の実測）:\n  玉で王手駒捕獲 {} / 玉の移動 {} / 玉以外の捕獲 {} / 打ち {} / その他 {}",
+            "単独仮説合法→実際合法の率（真の王手駒を置いた単独盤面で合法だった手。ソルバー legal_under の過信の実測）:\n  玉で王手駒捕獲 {} / 玉の後退（自陣方向） {} / 玉の横・前進 {} / 玉以外の捕獲 {} / 打ち {} / その他 {}",
             rate(single_hyp[0]),
             rate(single_hyp[1]),
             rate(single_hyp[2]),
             rate(single_hyp[3]),
             rate(single_hyp[4]),
+            rate(single_hyp[5]),
         );
     }
 }
