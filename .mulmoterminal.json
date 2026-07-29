@@ -1,0 +1,28 @@
+{
+  "name": "tsuitate-bot",
+  "badgeColor": "#c94f4f",
+  "headerColor": "#2b1212",
+  "headerTextColor": "#f7dcdc",
+  "cellColor": "#1a1010",
+  "cellBorderColor": "#5c2c2c",
+  "dotColor": "#c94f4f",
+  "buttonColor": "#e8a09a",
+  "theme": "midnight",
+  "colors": {
+    "background": "#171010",
+    "foreground": "#ece0dc",
+    "cursor": "#c94f4f",
+    "cursorAccent": "#171010",
+    "selectionBackground": "#4a2626",
+    "red": "#e06c5a",
+    "green": "#a3b565",
+    "yellow": "#e0a458",
+    "blue": "#7d9bb5",
+    "magenta": "#c98bb0",
+    "cyan": "#79b0a8"
+  },
+  "fontSize": 13,
+  "buttons": [
+    { "id": "diff", "icon": "difference", "label": "Diff", "run": "open", "open": { "view": "diff" }, "when": "isGitRepo" }
+  ]
+}
