@@ -143,7 +143,9 @@ JSON（DBの列をそのままJSON.parseして詰め直すだけでよい）。`
   対局）に詰めろ局面がほぼ無い。
   対策として `mate.rs`（打ち限定の一手詰め検出）と `mate_risk_w`（被詰めろ）/
   `mate_threat_w`（詰めろ生成）を追加した。**攻め側は `--ply 57` で測る**
-  （後手番として `N*6六` を選べるか）。受け・攻めの両方の回帰テストとして常設する
+  （後手番として `N*6六` を選べるか）。受け・攻めの両方の回帰テストとして常設する。
+  攻め側は CI（scenario.yml は ply 指定を渡せない）でも回せるよう
+  `mate-net-attack.kif`（ply=57 のコピー、escape_cover_w の回帰用）を常設した
 
 - `king-evade.kif` / `dragon-evac.kif` / `lance-donate.kif` / `defender-capture.kif`
   — 対人局 `archive/play-estimator-20260729-155549.kif`（人間=先手が65手で詰み勝ち。
