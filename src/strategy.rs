@@ -2305,6 +2305,15 @@ impl Strategy for EstimatorStrategy {
         let is_king_move = |mv: &ShogiMove| {
             matches!(*mv, ShogiMove::Board { from, .. } if Some(from) == my_king)
         };
+        // 平均化の対象となる玉の手（直前に自駒が取られたマスへの玉捕獲は
+        // 観測確実な取り返しなので除外。平均化ブロックの doc 参照）
+        let equalized_king_move = |mv: &ShogiMove| {
+            is_king_move(mv)
+                && !matches!(
+                    (*mv, blind_recapture),
+                    (ShogiMove::Board { to, .. }, Some((sq, _))) if to == sq
+                )
+        };
         // valueネットのstate特徴量キャッシュ（sample と同じ並び。候補間で共通なので
         // 手番ごとに1回だけ計算する）
         let mut nn_state_cache: Vec<Option<[f64; crate::value_features::VALUE_FEATURES]>> =
@@ -2413,12 +2422,16 @@ impl Strategy for EstimatorStrategy {
 
         // 王手中の玉の手は gain を「玉の手全体の平均」に揃える
         // （doc は check_king_gain_mean。分散＝幻の敵駒ノイズだけを消し、
-        // 玉の手 vs 非玉プローブの相対水準は保存する）
+        // 玉の手 vs 非玉プローブの相対水準は保存する）。
+        // **直前に自駒が取られたマスへの玉捕獲は除外する**: そこに相手駒が
+        // いるのは観測事実で、その捕獲 gain（blind_recapture / 粒子の駒得）は
+        // 幻ではない。巻き込むと確実な取り返しのベイトが消える
+        // （実測: recap-dragon の 6a7a が 19/20 → 13/20 に落ちた）
         if view.you_in_check && check_king_gain_mean() {
             let king_idx: Vec<usize> = scored
                 .iter()
                 .enumerate()
-                .filter(|(_, s)| is_king_move(&s.1))
+                .filter(|(_, s)| equalized_king_move(&s.1))
                 .map(|(i, _)| i)
                 .collect();
             if king_idx.len() > 1 {
@@ -2442,7 +2455,7 @@ impl Strategy for EstimatorStrategy {
             // 平均化した玉の手は2手読みで gain を再構成しない（応手サンプルも
             // 同じ幻の粒子が源で、揃えた序列が壊れるだけ）
             let depth2 = i < budget.depth2_top_k
-                && !(view.you_in_check && check_king_gain_mean() && is_king_move(&mv));
+                && !(view.you_in_check && check_king_gain_mean() && equalized_king_move(&mv));
             let (final_gain, final_score) = if depth2 {
                 let delta = depth2_delta(
                     view,
