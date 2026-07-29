@@ -315,6 +315,35 @@ fn eval_taint_fallback() -> bool {
     })
 }
 
+/// 王手中の玉の手の gain を「玉の手全体の平均」に揃えるか（既定 on、
+/// `TSUITATE_CHECK_KING_GAIN_MEAN=0` で従来挙動。凍結版はこの名前を知らない）。
+/// = 玉の手**どうし**の序列は p_legal（CheckSolver の解消確率）と反則コストだけで
+/// 決める。「王手中の候補序列は p_legal が支配すべき」（value_nn / 詰めろ2項 /
+/// capture_bet_var の王手中ゲートと同じ教義）を玉の手の evaluate 本体にも適用する。
+///
+/// 発端は king-evade.kif（対人局レビュー 2026-07-29 の64手目、追加反則65回/20試行）。
+/// 粒子が退化した終盤の王手では幻の敵駒が gain を両方向に歪める:
+/// - 正解の逃げ手が**負**に沈む（実測: 7a が p_legal 0.887 と解消確率最上位なのに
+///   露出リスク・圧力の幻で gain −1.5。min 形の combine_score は負の gain を
+///   p_legal で割り引かないため全額効く）
+/// - 間違った逃げ手が**正**に浮く（実測: 6b/7b が gain +1.1 前後。幻の gain 差
+///   ±1 が p_legal の差 0.3 の序列を上書きする）
+///
+/// **0 への固定ではなく平均に揃えるのが要点**: 0 固定版は king-evade の反則を
+/// 65→29 に減らしたが、玉の手全体の水準が下がって除去期待値つきの非玉プローブが
+/// 相対的に浮上し、kakutori 17→50・dragon-check-drop 19→41 と押し出しの反則が
+/// 爆発した（玉の逃げへの一律割引がアリーナ3シード全て悪化した king-prior の
+/// 第1版と同型）。平均への揃えは玉の手どうしの分散（幻ノイズ）だけを消し、
+/// 玉の手 vs 玉以外（合駒・捕獲プローブ）の相対水準を保存する。
+/// 玉以外の手はそのまま: 駒を差し出す手の駒損は実在のコストで、王手駒捕獲の
+/// 価値は removal_term（仮説条件付き期待値）が持つ
+fn check_king_gain_mean() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_CHECK_KING_GAIN_MEAN").map_or(true, |v| v != "0")
+    })
+}
+
 /// V1（利き数）のノブ。**既定は両方 無効**（＝従来の二値の利き判定）。
 ///
 /// やねうら王 Lv4 の「利き数」（+R30）をついたてへ持ち込む実験だったが、
@@ -2271,6 +2300,11 @@ impl Strategy for EstimatorStrategy {
         }
 
         let rng = &mut self.rng;
+        // 王手中の玉の手の gain 平均化判定用（check_king_gain_mean の doc 参照）
+        let my_king = king_square(view);
+        let is_king_move = |mv: &ShogiMove| {
+            matches!(*mv, ShogiMove::Board { from, .. } if Some(from) == my_king)
+        };
         // valueネットのstate特徴量キャッシュ（sample と同じ並び。候補間で共通なので
         // 手番ごとに1回だけ計算する）
         let mut nn_state_cache: Vec<Option<[f64; crate::value_features::VALUE_FEATURES]>> =
@@ -2377,6 +2411,26 @@ impl Strategy for EstimatorStrategy {
             scored.push((usi, mv, out, adjust, score));
         }
 
+        // 王手中の玉の手は gain を「玉の手全体の平均」に揃える
+        // （doc は check_king_gain_mean。分散＝幻の敵駒ノイズだけを消し、
+        // 玉の手 vs 非玉プローブの相対水準は保存する）
+        if view.you_in_check && check_king_gain_mean() {
+            let king_idx: Vec<usize> = scored
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| is_king_move(&s.1))
+                .map(|(i, _)| i)
+                .collect();
+            if king_idx.len() > 1 {
+                let mean =
+                    king_idx.iter().map(|&i| scored[i].2.gain).sum::<f64>() / king_idx.len() as f64;
+                for &i in &king_idx {
+                    scored[i].2.gain = mean;
+                    scored[i].4 = scored[i].2.score() + scored[i].3;
+                }
+            }
+        }
+
         // 2段目: 上位候補だけ相手の応手をサンプルして再評価。
         // gain 内の静的リスク項の depth2_replace 分を実測の期待損失で
         // 置き換えて（一致するなら無変化）、最終式を適用し直す
@@ -2385,7 +2439,10 @@ impl Strategy for EstimatorStrategy {
         let mut best: Option<(String, f64, f64)> = None;
         let mut ranking: Vec<CandidateScore> = vec![];
         for (i, (usi, mv, out, adjust, score)) in scored.into_iter().enumerate() {
-            let depth2 = i < budget.depth2_top_k;
+            // 平均化した玉の手は2手読みで gain を再構成しない（応手サンプルも
+            // 同じ幻の粒子が源で、揃えた序列が壊れるだけ）
+            let depth2 = i < budget.depth2_top_k
+                && !(view.you_in_check && check_king_gain_mean() && is_king_move(&mv));
             let (final_gain, final_score) = if depth2 {
                 let delta = depth2_delta(
                     view,

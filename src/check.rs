@@ -78,6 +78,24 @@ fn king_prior_w() -> f64 {
 /// 粒子投票の強さ（全粒子が一致した仮説は一様仮説の 1+PARTICLE_VOTE_W 倍）
 const PARTICLE_VOTE_W: f64 = 8.0;
 
+/// 王手宣言と同時に自駒が取られたマス（= 直前の相手手の着地点）の仮説ブースト。
+/// 「そこへ来た駒がそのまま王手している」は最有力の説明で、開き王手（動いた駒と
+/// 別の駒が王手）は少数派。間違っていても反則の減衰で自然に解ける。
+/// `TSUITATE_CHECK_CAPTURE_BOOST` で上書き可（切り戻し・スイープ用。1.0 で無効。
+/// 凍結版はこの名前を知らない）
+const CAPTURE_CHECKER_BOOST: f64 = 4.0;
+
+fn capture_checker_boost() -> f64 {
+    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("TSUITATE_CHECK_CAPTURE_BOOST")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|v: &f64| v.is_finite() && *v >= 1.0)
+            .unwrap_or(CAPTURE_CHECKER_BOOST)
+    })
+}
+
 /// 残存脅威（threat_of）の重み: 王手駒に攻撃されている自駒の交換価値に掛ける係数
 const THREAT_MATERIAL_W: f64 = 0.5;
 /// 残存脅威の重み: 自玉の隣接マス1つへの利き（逃げ場を縛り続ける圧力）の価値
@@ -161,6 +179,36 @@ impl CheckSolver {
             return None;
         }
         solver.threat_cache = vec![None; solver.hypotheses.len()];
+        // 王手宣言と同時に自駒が取られた（= 直前の相手手がそのマスへ来た）なら、
+        // そのマスの仮説を強める。粒子投票より前ではなく後でもよい（乗算なので
+        // 順序は結果に影響しない）が、粒子が退化していて投票が無情報でも
+        // このブーストだけで「来た駒が王手駒」の説明が支配的になる
+        // （king-evade.kif の実測: 5二で金を取られた直後の王手で、taint 落ち時は
+        // 5二の仮説が既知敵駒の近似駒種に塞がれて列挙されず、解消確率が
+        // 7一 0.55 / 6二 0.53 とほぼ無差別だった）
+        let last_opp_capture = log
+            .events()
+            .iter()
+            .rev()
+            .find_map(|e| match e {
+                crate::observation::Observation::OpponentMoved {
+                    captured_my_piece_at,
+                    ..
+                } => Some(
+                    captured_my_piece_at
+                        .as_deref()
+                        .and_then(crate::board::parse_usi_square),
+                ),
+                _ => None,
+            })
+            .flatten();
+        if let Some(sq) = last_opp_capture {
+            for h in &mut solver.hypotheses {
+                if h.square == sq {
+                    h.weight *= capture_checker_boost();
+                }
+            }
+        }
         solver.vote_by_particles(particles);
         for foul in fouls_this_turn {
             solver.observe_foul(foul);
@@ -169,16 +217,23 @@ impl CheckSolver {
     }
 
     /// 自玉を攻撃しうる（マス, 駒種）を全列挙する。
-    /// 相手が1枚も持ちえない駒種（総数制約）は仮説から外す
+    /// 相手が1枚も持ちえない駒種（総数制約）は仮説から外す。
+    ///
+    /// **既知の敵駒のマスも仮説の対象にする**（2026-07-29）: そのマスの駒種は
+    /// 粒子の多数決による近似でしかなく、近似が「王手しない駒種」を返すと
+    /// 真の王手駒マスが仮説集合から丸ごと消える（king-evade.kif: 5二で金を
+    /// 取られた直後の王手なのに、taint 粒子の多数決が5二を非王手駒と近似して
+    /// 仮説が列挙されなかった）。健全性（真の王手駒を仮説から落とさない）を
+    /// 優先し、近似駒種は他の仮説の判定時の遮蔽・利き被覆にだけ使う
     fn enumerate(&mut self, opp_counts: &HashMap<Role, i32>) {
         let opp = self.my_color.other();
         let king = self.base.king_square(self.my_color).expect("new で確認済み");
         for file in 1..=9i8 {
             for rank in 1..=9i8 {
                 let sq = Coord { file, rank };
-                if self.base.piece_at(sq).is_some() {
-                    // 自駒・既知の敵駒のあるマスに（新たな）王手駒はいない
-                    // （既知の敵駒が王手していたなら以前から王手宣言されているはず）
+                let existing = self.base.piece_at(sq);
+                if existing.is_some_and(|p| p.color == self.my_color) {
+                    // 自駒のあるマスに王手駒はいない
                     continue;
                 }
                 if sq == king {
@@ -196,7 +251,7 @@ impl CheckSolver {
                         Some(crate::shogi::Piece { color: opp, role }),
                     );
                     let checks = self.base.in_check(self.my_color);
-                    self.base.set(sq, None);
+                    self.base.set(sq, existing);
                     if checks {
                         self.hypotheses.push(Hypothesis {
                             square: sq,
@@ -266,7 +321,8 @@ impl CheckSolver {
         }
     }
 
-    /// 仮説 i の下で（他の隠れ駒を無視して）mv が合法か = 王手を解消するか
+    /// 仮説 i の下で（他の隠れ駒を無視して）mv が合法か = 王手を解消するか。
+    /// 仮説マスが既知の敵駒マス（近似駒種を載せてある）なら復元する
     fn legal_under(&mut self, i: usize, mv: &ShogiMove) -> bool {
         let h = &self.hypotheses[i];
         let piece = crate::shogi::Piece {
@@ -274,9 +330,10 @@ impl CheckSolver {
             role: h.role,
         };
         let sq = h.square;
+        let prev = self.base.piece_at(sq);
         self.base.set(sq, Some(piece));
         let legal = self.base.is_legal(mv);
-        self.base.set(sq, None);
+        self.base.set(sq, prev);
         legal
     }
 
@@ -336,6 +393,7 @@ impl CheckSolver {
             (h.square, h.role)
         };
         let opp = self.my_color.other();
+        let prev = self.base.piece_at(sq);
         self.base
             .set(sq, Some(crate::shogi::Piece { color: opp, role }));
         let targets: Vec<(Coord, Role)> = self
@@ -369,7 +427,7 @@ impl CheckSolver {
                 }
             }
         }
-        self.base.set(sq, None);
+        self.base.set(sq, prev);
         self.threat_cache[i] = Some(t);
         t
     }
@@ -589,6 +647,73 @@ mod tests {
         )
         .unwrap();
         assert!(blocked.hypothesis_count() < open.hypothesis_count());
+    }
+
+    #[test]
+    fn known_enemy_square_is_still_enumerated_as_checker_hypothesis() {
+        // 5d で自駒が取られた直後の王手。粒子の多数決が「王手しない駒種」
+        // （ここでは桂: 後手桂@5dは5eを攻撃しない）を返すと、旧実装は 5d に
+        // 近似駒種を載せたまま仮説列挙から除外し、真の王手駒マスが仮説集合から
+        // 消えていた（king-evade.kif の故障モードB）。健全性のため、既知の
+        // 敵駒マスでも王手駒仮説は列挙する
+        let view = view_with(vec![("5e", Role::King)]);
+        let mut log = ObservationLog::default();
+        log.record(crate::observation::Observation::OpponentMoved {
+            move_number: 10,
+            captured_my_piece_at: Some("5d".into()),
+        });
+        let mut particle = Position::empty(Color::Sente);
+        particle.set(
+            Coord { file: 5, rank: 5 },
+            Some(crate::shogi::Piece {
+                color: Color::Sente,
+                role: Role::King,
+            }),
+        );
+        particle.set(
+            Coord { file: 5, rank: 4 },
+            Some(crate::shogi::Piece {
+                color: Color::Gote,
+                role: Role::Knight,
+            }),
+        );
+        let particles = [(&particle, 1.0)];
+        let solver = CheckSolver::new(&view, &particles, &[], &log).unwrap();
+        let sq = Coord { file: 5, rank: 4 };
+        assert!(
+            solver.hypotheses.iter().any(|h| h.square == sq),
+            "既知の敵駒マス 5d にも王手駒仮説が必要"
+        );
+    }
+
+    #[test]
+    fn capture_square_hypotheses_are_boosted() {
+        // 王手宣言と同時に自駒が取られたマス（直前の相手手の着地点）の仮説は
+        // CAPTURE_CHECKER_BOOST 倍される（開き王手より「来た駒が王手駒」が優勢）
+        let view = view_with(vec![("5e", Role::King)]);
+        let mut log = ObservationLog::default();
+        log.record(crate::observation::Observation::OpponentMoved {
+            move_number: 10,
+            captured_my_piece_at: Some("5d".into()),
+        });
+        let solver = CheckSolver::new(&view, &[], &[], &log).unwrap();
+        let sq = Coord { file: 5, rank: 4 };
+        let boosted = solver
+            .hypotheses
+            .iter()
+            .filter(|h| h.square == sq)
+            .map(|h| h.weight)
+            .fold(f64::MIN, f64::max);
+        let other = solver
+            .hypotheses
+            .iter()
+            .filter(|h| h.square != sq)
+            .map(|h| h.weight)
+            .fold(f64::MIN, f64::max);
+        assert!(
+            boosted >= other * (CAPTURE_CHECKER_BOOST - 1e-9),
+            "捕獲マスの仮説がブーストされていない（5d={boosted:.2} 他={other:.2}）"
+        );
     }
 
     #[test]
