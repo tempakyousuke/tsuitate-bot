@@ -85,10 +85,18 @@
   判別する条件付きMLE（`bin/fit_particles`）を回し、係数を `src/likelihood.rs` の
   `FITTED_THETA` へ手で反映する。評価側は `stratified_sample` が exp(θ·φ) を
   粒子重みに乗じる（fit_opp の局面版。2026-07-16 のフィットで実効候補数 59→33）
-- `cargo run --release --bin scenario -- <名前|suite>` — 実戦棋譜の局面再現実験。
+- `cargo run --release --bin scenario -- <名前|suite|batch <名前...>>` — 実戦棋譜の
+  局面再現実験。
   `scenarios/*.kif`（Shogi Quest エクスポート + `*scenario ply=N` 行）を再生して
   特定局面での選択・粒子の信念（diag）・終局までの遂行（continue）を測る。
   追加手順は `scenarios/README.md`。
+  `target=` は注目手、`bad=` は**不合格リスト**（選んだら悪手として数える手の全量。
+  kakudo方式で target が悪手なら重複して入れる。出力とsuite行に「不合格計」が出る）。
+  **同一棋譜から切り出した ply 違いのシナリオ群のローカル計測は batch（suiteも同経路）
+  で回す**: 同一棋譜×同一手番側はシードごとに prewarm 済み戦略を ply 昇順で継ぎ足して
+  共有し、各決定点は `Strategy::clone_boxed` のスナップショットに試行させる
+  （GUI の IncrementalEstimator の Strategy 版。等価性はテストで担保。
+  凍結版は clone_boxed 非対応なので従来どおり毎回作り直し）。
   **suite はローカル直列だと30分超かかるので CI で並列実行できる**
   （`.github/workflows/scenario.yml`、手動起動のみ）:
   `gh workflow run scenario.yml --ref <ブランチ> -f trials=20`。

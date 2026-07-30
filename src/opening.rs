@@ -108,6 +108,7 @@ fn mirror_usi(usi: &str) -> Option<String> {
     Some(mirrored.to_usi())
 }
 
+#[derive(Clone)]
 pub struct OpeningBook {
     /// 対局開始時に選んだライン（自色向けにミラー済み）
     line: Vec<String>,

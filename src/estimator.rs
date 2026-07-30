@@ -352,6 +352,7 @@ enum Constraint {
     },
 }
 
+#[derive(Clone)]
 pub struct Estimator {
     my_color: Color,
     particles: Vec<Position>,

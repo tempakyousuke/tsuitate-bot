@@ -56,6 +56,14 @@ pub trait Strategy {
     /// （リプレイ予算も手番ごとに与えられる）。局面再現実験（bin/scenario）が
     /// 履歴の途中時点の update を再現するために使う。既定は何もしない
     fn prewarm(&mut self, _view: &PlayerView, _log: &ObservationLog) {}
+
+    /// 現在の内部状態ごと複製する（bin/scenario のバッチ実行が、prewarm 済みの
+    /// 推定器を「決定点ごとのスナップショット」として使い回すため）。
+    /// 対応しない戦略は None（凍結版は編集しないので既定 None のまま。
+    /// その場合バッチ実行は従来どおり毎回作り直しにフォールバックする）
+    fn clone_boxed(&self) -> Option<Box<dyn Strategy>> {
+        None
+    }
 }
 
 /// 蓄積済みの観測ログを「自分の手番ごとの逐次 update」で戦略に温めさせる。
@@ -1742,6 +1750,7 @@ impl EvalParams {
 /// - 反則確率（粒子上で非合法な割合）× 反則コスト（残り反則数が減るほど高い）
 /// - 指した直後に取り返されるリスク（粒子上での相手の即時駒取り）
 /// - 王手・詰みボーナス
+#[derive(Clone)]
 pub struct EstimatorStrategy {
     est: Option<Estimator>,
     book: Option<OpeningBook>,
@@ -1764,6 +1773,11 @@ pub struct EstimatorStrategy {
 impl EstimatorStrategy {
     pub fn new() -> Self {
         Self::with_params(EvalParams::default())
+    }
+
+    /// 内部推定器への参照（scenario_core の継ぎ足し等価性テスト用）
+    pub fn estimator(&self) -> Option<&Estimator> {
+        self.est.as_ref()
     }
 
     /// パラメータを差し替えて作る（bin/tune.rs のSPSA評価用）
@@ -1997,6 +2011,10 @@ impl Default for EstimatorStrategy {
 }
 
 impl Strategy for EstimatorStrategy {
+    fn clone_boxed(&self) -> Option<Box<dyn Strategy>> {
+        Some(Box::new(self.clone()))
+    }
+
     fn prewarm(&mut self, view: &PlayerView, log: &ObservationLog) {
         let budget = self.budget;
         let seed = self.seed;

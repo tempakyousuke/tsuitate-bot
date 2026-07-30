@@ -20,6 +20,11 @@ pub struct Scenario {
     pub desc: String,
     /// 注目している手（一致したら出力に印をつける）。既定は棋譜の ply+1 手目
     pub target: String,
+    /// 不合格リスト（`bad=<USI,USI,...>`）: 選んだら悪手として数える手の全量。
+    /// kakudo方式（target=悪手）のシナリオで「別の悪手へ逃げただけ」を検出する
+    /// ためのもので、target が悪手ならこのリストにも重複して入れる（自己完結。
+    /// suite の「不合格計」はこのリストだけで数える）。空なら従来どおり
+    pub bad: Vec<String>,
     /// 何手目まで再生するか（ply+1 手目を考えさせる）
     pub ply: usize,
     /// diag で相手駒の利き枚数分布を測るマス
@@ -62,6 +67,17 @@ pub fn load_scenario(
         .or_else(|| kifu.directives.get("target").cloned())
         .or_else(|| kifu.plies.get(ply).map(|p| p.mv.to_usi()))
         .unwrap_or_default();
+    let bad: Vec<String> = kifu
+        .directives
+        .get("bad")
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim())
+                .filter(|x| !x.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     let diag_squares: Vec<String> = diag_flag
         .or_else(|| kifu.directives.get("diag").cloned())
         .map(|s| {
@@ -95,6 +111,7 @@ pub fn load_scenario(
         name,
         desc,
         target,
+        bad,
         ply,
         diag_squares,
         limit,
@@ -252,8 +269,16 @@ impl ChoiceStats {
 pub fn choice_trial_one(rep: &Replayed, seed: u64, name: &str) -> (String, Vec<String>) {
     let side = rep.pos.turn();
     let mut strat = strategy::make_seeded(name, seed).expect("未知の戦略名");
-    let mut log = clone_log(&rep.logs[side_idx(side)]);
+    let log = clone_log(&rep.logs[side_idx(side)]);
     strategy::prewarm_strategy(&mut *strat, &make_view(&rep.pos, side, &rep.fouls), &log);
+    choice_trial_body(&mut *strat, rep)
+}
+
+/// prewarm 済みの戦略で choice_trial_one の選択ループだけを実行する
+/// （バッチ実行がスナップショットに対して呼ぶ共通部品）
+fn choice_trial_body(strat: &mut dyn strategy::Strategy, rep: &Replayed) -> (String, Vec<String>) {
+    let side = rep.pos.turn();
+    let mut log = clone_log(&rep.logs[side_idx(side)]);
     let mut foul_tried: HashSet<String> = HashSet::new();
     let mut fouls = rep.fouls;
     let mut foul_seq: Vec<String> = vec![];
@@ -538,6 +563,111 @@ pub fn choice_trials(
     ChoiceStats { tally, total_fouls }
 }
 
+/// 棋譜の同一性キー（バッチ実行のグループ化用）。指し手列と反則試行列が
+/// 完全一致する棋譜だけが同じキーになる（＝観測ログがプレフィックス拡張の
+/// 関係になることの保証）
+pub fn kifu_key(kifu: &Kifu) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for p in &kifu.plies {
+        p.mv.to_usi().hash(&mut h);
+        format!("{:?}", p.fouls).hash(&mut h);
+    }
+    h.finish()
+}
+
+/// 複数シナリオの選択試行をまとめて実行する。**同一棋譜×同一手番側**の
+/// シナリオはシードごとに prewarm 済み戦略を ply 昇順で継ぎ足して共有し、
+/// 各決定点では `clone_boxed` のスナップショットに試行させる
+/// （scenario-gui の IncrementalEstimator と同じ原理の Strategy 版。
+/// 推定器の構築が ply に比例して重いので、同一棋譜から切り出した ply 違いの
+/// シナリオ群では最深 ply 1本ぶんのコストに近づく）。
+/// clone_boxed 非対応の戦略（凍結版）は従来どおり毎回作り直す。
+/// 返り値は items と同順の ChoiceStats。on_trial(シナリオindex, seed, 受理手, 反則列)
+pub fn choice_trials_batch(
+    items: &[(&Scenario, &Replayed)],
+    trials: u64,
+    name: &str,
+    mut on_trial: impl FnMut(usize, u64, &str, &[String]),
+) -> Vec<ChoiceStats> {
+    let mut tallies: Vec<HashMap<String, u32>> = vec![HashMap::new(); items.len()];
+    let mut fouls_total: Vec<u32> = vec![0; items.len()];
+
+    // clone 対応か（戦略の構築だけなら安い。est は遅延構築なので空のまま）
+    let supports_clone = strategy::make_seeded(name, 0)
+        .expect("未知の戦略名")
+        .clone_boxed()
+        .is_some();
+
+    // (棋譜キー, 手番側) でグループ化し、グループ内は ply 昇順
+    let mut groups: Vec<((u64, Color), Vec<usize>)> = vec![];
+    for (i, (sc, rep)) in items.iter().enumerate() {
+        let key = (kifu_key(&sc.kifu), rep.pos.turn());
+        match groups.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, v)) => v.push(i),
+            None => groups.push((key, vec![i])),
+        }
+    }
+    for (_, idxs) in &mut groups {
+        idxs.sort_by_key(|&i| items[i].0.ply);
+    }
+
+    for ((_, _side), idxs) in &groups {
+        for seed in 0..trials {
+            let mut record = |i: usize, accepted: String, foul_seq: Vec<String>| {
+                on_trial(i, seed, &accepted, &foul_seq);
+                *tallies[i].entry(accepted).or_insert(0) += 1;
+                fouls_total[i] += foul_seq.len() as u32;
+            };
+            if !supports_clone || idxs.len() == 1 {
+                for &i in idxs {
+                    let (accepted, foul_seq) = choice_trial_one(items[i].1, seed, name);
+                    record(i, accepted, foul_seq);
+                }
+                continue;
+            }
+            // 継ぎ足し共有: prewarm_strategy と同じ規約（自分手番イベントの直前で
+            // prewarm、最後の update は choose に任せる）を consumed から再開する
+            let mut strat = strategy::make_seeded(name, seed).expect("未知の戦略名");
+            let mut running = ObservationLog::default();
+            let mut consumed = 0usize;
+            for &i in idxs {
+                let (_sc, rep) = items[i];
+                let side = rep.pos.turn();
+                let view = make_view(&rep.pos, side, &rep.fouls);
+                let log = &rep.logs[side_idx(side)];
+                let events = log.events();
+                while consumed < events.len() {
+                    let e = &events[consumed];
+                    if matches!(e, Observation::MyMove { .. } | Observation::MyFoul { .. }) {
+                        strat.prewarm(&view, &running);
+                    }
+                    running.record(e.clone());
+                    consumed += 1;
+                }
+                let mut snap = strat
+                    .clone_boxed()
+                    .expect("clone_boxed 対応確認済みの戦略で clone に失敗");
+                let (accepted, foul_seq) = choice_trial_body(&mut *snap, rep);
+                record(i, accepted, foul_seq);
+            }
+        }
+    }
+
+    tallies
+        .into_iter()
+        .zip(fouls_total)
+        .map(|(t, f)| {
+            let mut tally: Vec<_> = t.into_iter().collect();
+            tally.sort_by(|a, b| b.1.cmp(&a.1));
+            ChoiceStats {
+                tally,
+                total_fouls: f,
+            }
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -667,6 +797,94 @@ mod tests {
             v
         };
         assert_eq!(key(inc.est()), key(&fresh), "引き継ぎと作り直しで粒子集合が違う");
+    }
+
+    /// バッチ実行の Strategy 版の担保: 「ply A まで prewarm → 続きを ply B まで
+    /// 継ぎ足し」た戦略の推定器が、ゼロから ply B まで prewarm した戦略と一致する。
+    /// スナップショット（clone_boxed）が元の状態を変えないことも見る
+    #[test]
+    fn 戦略のprewarm継ぎ足しは作り直しと一致する() {
+        use crate::observation::Observation;
+        let sc = load("keima");
+        let rep2 = replay(&sc.kifu, 2);
+        let rep4 = replay(&sc.kifu, 4);
+        let side = rep4.pos.turn();
+        assert_eq!(rep2.pos.turn(), side, "ply2 と ply4 で手番側が違う");
+
+        let key = |est: &Estimator| -> Vec<(u64, u64)> {
+            let mut v: Vec<(u64, u64)> = weighted_unique_particles(est)
+                .iter()
+                .map(|(p, w, _)| (p.fingerprint(), (w * 1e9) as u64))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+
+        // 作り直し: ゼロから ply4 まで
+        let mut fresh = strategy::EstimatorStrategy::with_params_line_seed(
+            strategy::EvalParams::default(),
+            None,
+            Some(0),
+        );
+        strategy::prewarm_strategy(
+            &mut fresh,
+            &make_view(&rep4.pos, side, &rep4.fouls),
+            &rep4.logs[side_idx(side)],
+        );
+
+        // 継ぎ足し: ply2 まで → 続きを ply4 まで（choice_trials_batch と同じ手順）
+        let mut inc = strategy::EstimatorStrategy::with_params_line_seed(
+            strategy::EvalParams::default(),
+            None,
+            Some(0),
+        );
+        strategy::prewarm_strategy(
+            &mut inc,
+            &make_view(&rep2.pos, side, &rep2.fouls),
+            &rep2.logs[side_idx(side)],
+        );
+        assert!(
+            crate::strategy::Strategy::clone_boxed(&inc).is_some(),
+            "EstimatorStrategy が clone_boxed 非対応"
+        );
+        let snap = inc.clone();
+        let mut running = clone_log(&rep2.logs[side_idx(side)]);
+        let mut consumed = running.events().len();
+        let events4 = rep4.logs[side_idx(side)].events().to_vec();
+        let view4 = make_view(&rep4.pos, side, &rep4.fouls);
+        while consumed < events4.len() {
+            let e = &events4[consumed];
+            if matches!(e, Observation::MyMove { .. } | Observation::MyFoul { .. }) {
+                crate::strategy::Strategy::prewarm(&mut inc, &view4, &running);
+            }
+            running.record(e.clone());
+            consumed += 1;
+        }
+        // choose 相当の最終 update（prewarm_strategy はループ内でしか update
+        // しないので、比較のため両者へ同じ最終消化を与える）
+        crate::strategy::Strategy::prewarm(&mut fresh, &view4, &rep4.logs[side_idx(side)]);
+        crate::strategy::Strategy::prewarm(&mut inc, &view4, &running);
+        assert_eq!(
+            key(fresh.estimator().unwrap()),
+            key(inc.estimator().unwrap()),
+            "継ぎ足しと作り直しで粒子集合が違う"
+        );
+        // スナップショットは ply2 時点のまま（元を ply4 へ進めても変わらない）
+        let mut fresh_at2 = strategy::EstimatorStrategy::with_params_line_seed(
+            strategy::EvalParams::default(),
+            None,
+            Some(0),
+        );
+        strategy::prewarm_strategy(
+            &mut fresh_at2,
+            &make_view(&rep2.pos, side, &rep2.fouls),
+            &rep2.logs[side_idx(side)],
+        );
+        assert_eq!(
+            key(snap.estimator().unwrap()),
+            key(fresh_at2.estimator().unwrap()),
+            "スナップショットが元の進行に引きずられている"
+        );
     }
 
     /// リプレイの裁定検証（合法手は合法・反則試行は非合法）が全編通ること

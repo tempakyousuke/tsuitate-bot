@@ -33,7 +33,8 @@ use tsuitate_bot::estimator::Estimator;
 use tsuitate_bot::observation::Observation;
 use tsuitate_bot::protocol::{Color, Role};
 use tsuitate_bot::scenario_core::{
-    ChoiceStats, Replayed, Scenario, build_estimator, choice_trials, clone_log, load_scenario,
+    ChoiceStats, Replayed, Scenario, build_estimator, choice_trials, choice_trials_batch,
+    clone_log, load_scenario,
     make_view, replay, scenarios_dir, side_idx, weighted_unique_particles,
 };
 use tsuitate_bot::shogi::{Outcome, Position, ShogiMove, parse_usi, unpromote_role};
@@ -89,7 +90,13 @@ fn run_choice_trials(
 
     let stats = choice_trials(rep, trials, name, |seed, accepted, foul_seq| {
         if verbose {
-            let note = if accepted == sc.target { "（注目手）" } else { "" };
+            let note = if accepted == sc.target {
+                "（注目手）"
+            } else if sc.bad.iter().any(|b| b == accepted) {
+                "（不合格）"
+            } else {
+                ""
+            };
             let foul_note = if foul_seq.is_empty() {
                 String::new()
             } else {
@@ -101,14 +108,83 @@ fn run_choice_trials(
 
     if verbose {
         println!();
-        println!("受理された手の内訳:");
-        for (usi, n) in &stats.tally {
-            let mark = if *usi == sc.target { " ← 注目手" } else { "" };
-            println!("  {usi}: {n}/{trials}{mark}");
-        }
-        println!("追加の反則の総数: {}", stats.total_fouls);
+        print_tally(sc, &stats, trials);
     }
     stats
+}
+
+/// 受理された手の内訳・不合格計・追加反則の表示（単発実行とバッチ実行で共通）
+fn print_tally(sc: &Scenario, stats: &ChoiceStats, trials: u64) {
+    println!("受理された手の内訳:");
+    for (usi, n) in &stats.tally {
+        let mark = if *usi == sc.target {
+            " ← 注目手"
+        } else if sc.bad.iter().any(|b| b == usi) {
+            " ← 不合格"
+        } else {
+            ""
+        };
+        println!("  {usi}: {n}/{trials}{mark}");
+    }
+    if !sc.bad.is_empty() {
+        let bad_hits: u32 = stats
+            .tally
+            .iter()
+            .filter(|(usi, _)| sc.bad.iter().any(|b| b == usi))
+            .map(|(_, n)| *n)
+            .sum();
+        println!("不合格計: {bad_hits}/{trials}");
+    }
+    println!("追加の反則の総数: {}", stats.total_fouls);
+}
+
+/// 複数シナリオの一括選択試行。同一棋譜×同一手番側のシナリオは推定器の構築を
+/// 継ぎ足しで共有する（詳細は scenario_core::choice_trials_batch）
+fn run_batch(specs: &[String], trials: u64, name: &str) {
+    let mut loaded: Vec<(Scenario, Replayed)> = vec![];
+    for spec in specs {
+        let sc = match load_scenario(spec, None, None, None) {
+            Ok(sc) => sc,
+            Err(e) => {
+                eprintln!("{spec}: 読み込み失敗: {e}");
+                std::process::exit(1);
+            }
+        };
+        let rep = replay(&sc.kifu, sc.ply);
+        if let Some(outcome) = rep.pos.outcome() {
+            eprintln!("{spec}: ply={} の局面は終局しています（{outcome:?}）", sc.ply);
+            std::process::exit(1);
+        }
+        loaded.push((sc, rep));
+    }
+    println!(
+        "バッチ: {} 件 / 戦略 {name} / 各 {trials} 試行（同一棋譜×同一手番は構築を共有）",
+        loaded.len()
+    );
+    println!();
+    let items: Vec<(&Scenario, &Replayed)> = loaded.iter().map(|(sc, rep)| (sc, rep)).collect();
+    let width = loaded.iter().map(|(sc, _)| sc.name.len()).max().unwrap_or(0);
+    let stats = choice_trials_batch(&items, trials, name, |i, seed, accepted, foul_seq| {
+        let sc = items[i].0;
+        let note = if accepted == sc.target {
+            "（注目手）"
+        } else if sc.bad.iter().any(|b| b == accepted) {
+            "（不合格）"
+        } else {
+            ""
+        };
+        let foul_note = if foul_seq.is_empty() {
+            String::new()
+        } else {
+            format!(" 反則: {}", foul_seq.join(", "))
+        };
+        println!("{:<width$} seed {seed:2}: {accepted}{note}{foul_note}", sc.name);
+    });
+    for ((sc, _), st) in loaded.iter().zip(&stats) {
+        println!();
+        println!("===== {}（{}手目） =====", sc.name, sc.ply + 1);
+        print_tally(sc, st, trials);
+    }
 }
 
 /// 粒子集合の診断: 王手駒の分布・相手玉位置の分布・注目マスへの相手利き枚数。
@@ -495,7 +571,13 @@ fn continue_games(sc: &Scenario, rep: &Replayed, games: u64, name_me: &str, name
         }
         println!(
             "game {seed:2}: 初手 {first}{} → {} ({reason}, +{}手, 反則 先手{} 後手{})",
-            if first == sc.target { "（注目手）" } else { "" },
+            if first == sc.target {
+                "（注目手）"
+            } else if sc.bad.iter().any(|b| *b == first) {
+                "（不合格）"
+            } else {
+                ""
+            },
             match winner {
                 Some(c) if c == me => "勝ち",
                 Some(_) => "負け",
@@ -524,7 +606,13 @@ fn continue_games(sc: &Scenario, rep: &Replayed, games: u64, name_me: &str, name
     sorted.sort_by(|a, b| b.1.cmp(&a.1));
     println!("初手の内訳:");
     for (usi, n) in sorted {
-        let mark = if usi == sc.target { " ← 注目手" } else { "" };
+        let mark = if usi == sc.target {
+            " ← 注目手"
+        } else if sc.bad.iter().any(|b| *b == usi) {
+            " ← 不合格"
+        } else {
+            ""
+        };
         println!("  {usi}: {n}/{games}{mark}");
     }
     let mut sorted: Vec<_> = reasons.into_iter().collect();
@@ -544,8 +632,12 @@ fn run_suite(trials: u64, name: &str) {
         .filter(|p| p.extension().is_some_and(|x| x == "kif"))
         .collect();
     paths.sort();
-    println!("スイート: {} 件 / 戦略 {name} / 各 {trials} 試行", paths.len());
+    println!(
+        "スイート: {} 件 / 戦略 {name} / 各 {trials} 試行（同一棋譜×同一手番は構築を共有）",
+        paths.len()
+    );
     println!();
+    let mut loaded: Vec<(Scenario, Replayed)> = vec![];
     for path in paths {
         let sc = match load_scenario(&path.to_string_lossy(), None, None, None) {
             Ok(sc) => sc,
@@ -555,7 +647,17 @@ fn run_suite(trials: u64, name: &str) {
             }
         };
         let rep = replay(&sc.kifu, sc.ply);
-        let stats = run_choice_trials(&sc, &rep, trials, name, false);
+        loaded.push((sc, rep));
+    }
+    let items: Vec<(&Scenario, &Replayed)> = loaded.iter().map(|(sc, rep)| (sc, rep)).collect();
+    let total = items.len() as u64 * trials;
+    let mut done = 0u64;
+    let all_stats = choice_trials_batch(&items, trials, name, |_, _, _, _| {
+        done += 1;
+        eprint!("\r{done}/{total} 試行");
+    });
+    eprintln!();
+    for ((sc, _), stats) in loaded.iter().zip(&all_stats) {
         let hits = stats.target_hits(&sc.target);
         let others: Vec<String> = stats
             .tally
@@ -564,8 +666,19 @@ fn run_suite(trials: u64, name: &str) {
             .take(3)
             .map(|(usi, n)| format!("{usi}×{n}"))
             .collect();
+        let bad_note = if sc.bad.is_empty() {
+            String::new()
+        } else {
+            let bad_hits: u32 = stats
+                .tally
+                .iter()
+                .filter(|(usi, _)| sc.bad.iter().any(|b| b == usi))
+                .map(|(_, n)| *n)
+                .sum();
+            format!(" 不合格計 {bad_hits}/{trials}")
+        };
         println!(
-            "{:<12} {}手目 注目手 {:<6} {hits}/{trials} 反則{} 他: {}",
+            "{:<12} {}手目 注目手 {:<6} {hits}/{trials}{bad_note} 反則{} 他: {}",
             sc.name,
             sc.ply + 1,
             sc.target,
@@ -625,6 +738,27 @@ fn main() {
         let name = args.get(2).map(String::as_str).unwrap_or("estimator");
         validate_strategy_name(name);
         run_suite(trials, name);
+        return;
+    }
+    if spec == "batch" {
+        // batch <名前...> [試行数] [戦略名]（数値は試行数、戦略として解釈できる
+        // 名前は戦略、それ以外はシナリオ名として扱う）
+        let mut specs: Vec<String> = vec![];
+        let mut trials = 20u64;
+        let mut name = "estimator".to_string();
+        for a in &args[1..] {
+            if let Ok(n) = a.parse::<u64>() {
+                trials = n;
+            } else if strategy::make(a).is_some() {
+                name = a.clone();
+            } else {
+                specs.push(a.clone());
+            }
+        }
+        if specs.is_empty() {
+            exit_usage("batch にはシナリオ名を1つ以上指定してください");
+        }
+        run_batch(&specs, trials, &name);
         return;
     }
 

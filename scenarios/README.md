@@ -42,6 +42,10 @@ npm run tauri dev
    ```
    - `ply=N` — N手目まで再生して **N+1手目を考えさせる**
    - `target=<USI>` — 注目手。省略時は棋譜で実際に指された N+1手目
+   - `bad=<USI,USI,...>` — **不合格リスト**（省略可）。選んだら悪手として数える手の
+     **全量**で、kakudo方式（target=悪手）のシナリオで「別の悪手へ逃げただけ」を
+     検出する。target が悪手ならこのリストにも重複して入れる（自己完結）。
+     出力に「不合格計 n/試行」が加わり、suite の行にも出る
    - `diag=<マス,マス>` — diag モードで相手利き枚数を測るマス（省略可）
 3. 実行:
    ```
@@ -49,7 +53,15 @@ npm run tauri dev
    cargo run --release --bin scenario -- <名前> diag         # 粒子の信念分布
    cargo run --release --bin scenario -- <名前> continue 10  # bot同士で終局まで
    cargo run --release --bin scenario -- suite               # 全シナリオの注目手一致率
+   cargo run --release --bin scenario -- batch <名前...> [試行数]  # 複数まとめて
    ```
+   **同一棋譜から切り出した ply 違いのシナリオ群は batch（または suite）で回す**こと:
+   同一棋譜×同一手番側のシナリオはシードごとに prewarm 済み推定器を ply 昇順で
+   継ぎ足して共有し（scenario-gui の IncrementalEstimator と同じ原理。各決定点は
+   クローンに試行させるので結果は個別実行と同じ意味論）、最深 ply 1本ぶんの
+   構築コストに近づく。悪手8シナリオ（1棋譜×8 ply）の実測はシナリオ個別の
+   直列実行に対して大幅短縮。凍結版戦略は継ぎ足し非対応（clone_boxed が None）
+   なので従来どおり毎回作り直しになる
    `--ply N` で同じ棋譜の別の局面をアドホックに試せる。
 
 ### tsuitate の対局DB（自分でbotと対局した記録）から
@@ -171,6 +183,51 @@ JSON（DBの列をそのままJSON.parseして詰め直すだけでよい）。`
     玉だけなので位置も確定する（実戦は4手後に詰み）。defender_capture_w
     （守り駒捕獲ボーナス）の検証用
 
+- `rook-selfdrop.kif` / `lance-selfdrop.kif` / `lance-tether.kif` / `lance-for-pawn.kif` /
+  `pawn-tether.kif` / `pawn-hoard.kif` / `focal-lance.kif` / `lance-aimless.kif`
+  — 観戦局 `archive/watch-estimator-vs-estimator-20260730-014534.kif`（estimator同士、
+  147手目で先手反則負け）からユーザーが指摘した悪手8件の ply 違いコピー
+  （2026-07-30）。全て**打つ手**で、注目手=悪手なので**一致率0/20が目標**
+  （kakudo方式。pawn-hoard だけは「大悪手ではないが勿体ない」判定なので参考値）。
+  共通の根は4つ:
+  ①**持ち駒の温存価値が無い**（rook-selfdrop=R*5i, lance-selfdrop=L*8b,
+  lance-aimless=L*9g。取った駒を反則リスクゼロの自陣打ち＋紐の小さい正gainで
+  即座に打ってしまう。link_work_w は「働きの低い紐」の割引であって
+  「打たずに持っておく」選択肢を浮かせる項ではない）、
+  ②**同じ仕事なら最安の駒で、の経済性が無い**（lance-for-pawn=L*1b,
+  pawn-tether=P*1e, pawn-hoard=P*5b。歩で足りる仕事に香・筋の希少な歩を薄い受けに消費）、
+  ③**香の成り込み価値が無い**（lance-selfdrop・lance-tether=L*1a・pawn-tether。
+  と金ポテンシャル項は歩専用で、9八香成/1八香成が浮かばない）、
+  ④**焦点（利きの集中する地点）での交換の分の悪さを読めない**（focal-lance=L*5c。
+  歩の前の香打ち＋双方の角筋が通る5五での交換）。
+  改善は今回見送り（ユーザー判断）、回帰テストとして常設する。
+  **一致率が低いシナリオは「別の悪手へ逃げているだけ」のことがある**ので、
+  各ファイルに `bad=` の不合格リストを持たせて「**不合格計**」で判定する。
+  ベースライン（2026-07-30 main=v13相当、20試行・予算2000ms、不合格計）:
+  lance-tether **19/20**・lance-for-pawn **18/20**（L*1b 単体は3〜4/20だが
+  香打ちの悪手ファミリーでほぼ全部）・rook-selfdrop **17/20**・
+  pawn-tether **15/20**・pawn-hoard 9/20・lance-selfdrop 8/20（首位は
+  P*9h=垂れ歩11/20で、これは良い手側）・lance-aimless 5/20・focal-lance 4/20
+  （L*5c 単体は0〜1/20。悪手が分散するので不合格計で見る）。
+  seed 同一でも壁時計予算で選択は揺れる（ラン間で±3件程度）ため、
+  新しい悪手バリアントが出たら `bad=` へ追記して育てること。
+  ユーザー推奨手の一致率上昇も副指標になる: 9二歩の成り `9b9a+`
+  （lance-for-pawn 2/20・lance-aimless 8/20）。
+  逆に「良い/普通」と判定して不合格に**入れない**手も記録しておく:
+  lance-aimless の 6四桂 `5f6d` / 4四桂 `5f4d`（ユーザー判定 2026-07-30:
+  6三/4三歩の利き上でも**移動は相手から観測されないのですぐ取られる確率は
+  低い**し、桂が5六からどくと5九飛の利きが5五角に通る。この局面ではたまたま
+  玉位置の関係で王手になり宣言で存在がバレて取られそうなだけ。**同じマスへの
+  香打ち `L*6d`/`L*4d` は打った駒を失うだけなので不合格のまま**）、
+  rook-selfdrop の R*9b（安全マスから既知駒9四香への当たり＋玉筋＋成り含み）、
+  lance-selfdrop の P*9h（垂れ歩=ユーザー自身の代替案の系統）、
+  2e2f（タダの歩得）・9h9i+（と金作り）・1d1c+（と金作り）・
+  L*2c（浮いた2一金への当たり＋成り含み）・8d8e・7e7d・8i7g・1e1f・5d5e
+  （普通の歩交換・駒組み）。判断保留（不合格に入れていない）:
+  1f1g+ / 9d9g+（香成りだが成り先が2九桂/8九桂の利き）・9d9e（香の只の前進）・
+  2a2b / 2a3a（無目的な金のシャッフル）・P*1h / P*5f（価値の低い垂れ歩）・
+  3e3f（3七歩に取られる突き捨て）・6h5h / 6i7i（無目的な玉・金の横移動）
+
 ## archive/
 
 suite から外したシナリオ置き場（suite は `scenarios/` 直下の `.kif` だけを読む）。
@@ -178,6 +235,8 @@ suite から外したシナリオ置き場（suite は `scenarios/` 直下の `.
 
 - `play-estimator-20260729-155549.kif` — 対人局の元棋譜（65手）。suite 用の
   4シナリオ（king-evade ほか）はこのコピーなので、原本は archive に置く
+- `watch-estimator-vs-estimator-20260730-014534.kif` — 観戦局の元棋譜（147手目で
+  先手反則負け）。悪手8シナリオ（rook-selfdrop ほか）はこのコピーなので原本を置く
 - `king-deduction.kif` — 人間 vs bot の実戦83手（2026-07-25）。玉位置ビリーフ表示で
   「あり得ない玉位置を考えている」と分かった局面を含む（49手目▲3c4cの王手 →
   50手目△5b6bの逃げ）。`deduce::opp_king_candidates` の**健全性**（全168局面で
