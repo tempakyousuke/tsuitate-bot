@@ -22,6 +22,16 @@ use crate::shogi::{Piece, Position, ShogiMove, parse_usi, promote_role, unpromot
 
 pub const BELIEF_FEATURES: usize = 35;
 
+/// 玉位置ネット専用の追加特徴量（既存の35次元 `BELIEF_FEATURES` は
+/// belief_nn の凍結済み重みと共有しているので増やせない。玉ネットは
+/// 35 + この次元を入力にする）
+pub const KING_EXTRA_FEATURES: usize = 1;
+
+pub const KING_EXTRA_FEATURE_NAMES: [&str; KING_EXTRA_FEATURES] = [
+    "dist_init_king", // 相手玉の初期マスからのチェビシェフ距離 ÷ 8
+    // （玉は1手1マスなので進行度 opp_moves_n との組で到達可能性の勾配になる）
+];
+
 pub const BELIEF_FEATURE_NAMES: [&str; BELIEF_FEATURES] = [
     // --- 局面全体の量（マス間で共通だが、pointwise ネットが条件付けに使う） ---
     "prior_occ",   // 相手の盤上駒数（下限）÷ 未知マス数 = 基準占有率
@@ -396,6 +406,15 @@ impl BeliefContext {
                 0.0
             },
         ]
+    }
+
+    /// 玉位置ネット用の追加特徴量（`KING_EXTRA_FEATURE_NAMES` 参照）
+    pub fn king_extra(&self, sq: Coord) -> [f64; KING_EXTRA_FEATURES] {
+        let opp = self.my_color.other();
+        let dist_init = Position::initial().king_square(opp).map_or(1.0, |k| {
+            (sq.file - k.file).abs().max((sq.rank - k.rank).abs()) as f64 / 8.0
+        });
+        [dist_init]
     }
 }
 
