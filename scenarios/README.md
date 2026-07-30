@@ -219,6 +219,12 @@ JSON（DBの列をそのままJSON.parseして詰め直すだけでよい）。`
   （P*9h 11/20 維持）・pawn-hoard 4/20・lance-aimless 2/20・focal-lance 3/20・
   lance-for-pawn **19/20**（唯一改善せず = 持ち駒経済の既知ギャップ。首位は
   L*9i へ移動）。悪手 L*1b（223458 の17手目）は 10→0/20。
+  **hand_option_w（持ち駒オプション価値、2026-07-30 実装・既定0）の実測**:
+  `-f env="TSUITATE_HAND_OPTION_W=1.0"` で不合格計の合計 39→7
+  （lance-for-pawn 19→3・lance-tether 8→0・pawn-tether 5→0・focal-lance 3→0・
+  pawn-hoard 4→0〜3、9b9a+ 2→10/20 で首位）。w=0.5 は合計 20（lance-for-pawn
+  12/20 残り）。アリーナ中立〜微負のため既定0のまま（CLAUDE.md の同ノブの節参照）。
+  この項の回帰を測るときは env を付けて回す。
   seed 同一でも壁時計予算で選択は揺れる（ラン間で±3件程度）ため、
   新しい悪手バリアントが出たら `bad=` へ追記して育てること。
   ユーザー推奨手の一致率上昇も副指標になる: 9二歩の成り `9b9a+`

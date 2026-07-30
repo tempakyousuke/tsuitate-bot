@@ -74,6 +74,7 @@ fn terms() -> &'static [(&'static str, fn(&CandidateScore) -> f64)] {
         ("king_hole", |c| -c.king_holes),
         ("link", |c| c.link),
         ("promo", |c| c.promo),
+        ("hand_option", |c| -c.hand_option),
         ("board_discount", |c| -c.board_discount),
     ]
 }
@@ -214,6 +215,7 @@ mod tests {
             risk: 0.0,
             link: 0.0,
             promo: 0.0,
+            hand_option: 0.0,
             board_discount: 0.0,
         }
     }
