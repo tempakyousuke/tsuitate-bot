@@ -80,6 +80,10 @@ fn main() {
     // 玉位置ネット（king_belief_nn）。粒子と**同一の決定点**で測る（ゲート1）
     let mut net_all = Score::default();
     let mut net_blind = Score::default();
+    // ブレンド p=(1−λ)·p_taint+λ·p_net の λ 選定用（供給先 blind_king_dist と
+    // 同じ量になるのはブラインド決定点だけなので、そこだけ測る）
+    const LAMBDAS: [f64; 3] = [0.25, 0.5, 0.75];
+    let mut blend_blind: [Score; 3] = Default::default();
     let mut decisions = 0u64;
     let mut blind_decisions = 0u64;
     let mut games = 0u64;
@@ -159,6 +163,23 @@ fn main() {
                 blind_decisions += 1;
                 blind_all.add(p_all, top1);
                 net_blind.add(p_net, net_top1);
+                // ブレンド（粒子分布は per_sq を正規化して使う）
+                for (li, &lambda) in LAMBDAS.iter().enumerate() {
+                    let mut mix: std::collections::HashMap<tsuitate_bot::board::Coord, f64> =
+                        std::collections::HashMap::new();
+                    for (&sq, &m) in &per_sq {
+                        *mix.entry(sq).or_insert(0.0) += (1.0 - lambda) * m / mass_total;
+                    }
+                    for (sq, p) in &net {
+                        *mix.entry(*sq).or_insert(0.0) += lambda * p;
+                    }
+                    let p_mix = mix.get(&true_king).copied().unwrap_or(0.0);
+                    let mix_top1 = mix
+                        .iter()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                        .is_some_and(|(sq, _)| *sq == true_king);
+                    blend_blind[li].add(p_mix, mix_top1);
+                }
             }
         });
         if !ok {
@@ -178,4 +199,7 @@ fn main() {
     blind_all.report("全粒子／厳密ゼロの決定点だけ");
     net_all.report("玉位置ネット（全決定点）");
     net_blind.report("玉位置ネット／厳密ゼロの決定点だけ");
+    for (li, &lambda) in LAMBDAS.iter().enumerate() {
+        blend_blind[li].report(&format!("ブレンド λ={lambda}／厳密ゼロの決定点だけ"));
+    }
 }

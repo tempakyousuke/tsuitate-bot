@@ -355,6 +355,19 @@
     `_GAIN_W` は厳密粒子ゼロの決定での gain 供給。**どれも単体では勝率中立**
     （実測は docs/nn-stage2-belief-net.md）。0 のときはネットを評価すらしない。
     凍結版はこれらの名前を知らないので `-f env=` は候補側にだけ効く
+  - `TSUITATE_KING_NET_W` / `TSUITATE_KING_NET_PROJ`（どちらも既定 0/off = 挙動不変）—
+    **玉位置ネット**（`king_belief_nn.rs`、2026-07-31）。段階②の pointwise ネットが
+    表現できない「玉1枚の同時分布」を、`deduce::opp_king_candidates`（健全な候補
+    集合）− 自駒マスの上の softmax として学習したカテゴリカル分布。教師は
+    アリーナ2400局（`bin/export_king_belief_data`、健全性違反0）、学習は
+    tsuitate-nn の train_king_belief.py（4シードで val NLL 1.73〜1.83 /
+    top1 44.6〜47.3%、一様対照 3.40 / 4.1%）。供給は**厳密粒子ゼロの決定のみ**:
+    `_W`（λ∈[0,1]）は `blind_king_dist`（ブラインド玉攻めの玉位置分布）への
+    ブレンド p=(1−λ)·p_taint+λ·p_net（taint 空でもネットだけで供給可）、
+    `_PROJ=1` は `project_taint_kings` の玉移設先を最近傍でなくネット分布の
+    分位点サンプルで選ぶ（決定的・分布比例、argmax 集中で多様性を潰さない）。
+    オフライン診断は `king_probe`（ネット列を常設。粒子と同一決定点で比較）。
+    凍結版はこの名前を知らない
   - `TSUITATE_STRATEGY`（既定 `estimator`。旧来の単純botは `heuristic`）
   - `TSUITATE_QUEUE_RETRY_MS`（既定 60000）: キュー参加拒否・受付終了後の再試行間隔
   - `TSUITATE_RECORD_DIR`（既定 `records`。空文字で無効）: 対局記録（JSONL）の出力先。
