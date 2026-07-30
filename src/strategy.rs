@@ -214,6 +214,9 @@ pub struct CandidateScore {
     /// gain に加算された紐の項（link_w × 紐のついた自駒の価値合計。V3）。
     /// 候補間でほぼ定数なので、見るのは**候補どうしの差**
     pub link: f64,
+    /// gain に加算された成りポテンシャルの差分
+    /// （promo_potential_w × (着手後 − 現局面)。符号つき）
+    pub promo: f64,
     /// gain から引かれた盤上駒の減価（board_discount_w × 盤上の自駒の価値合計。V5）。
     /// 正の値 = そのぶん gain が減っている。これも見るのは差
     pub board_discount: f64,
@@ -535,6 +538,11 @@ struct OwnEffects {
     /// 交換価値合計。「相手が歩を持っているか」のゲートは呼び出し側
     /// （choose → evaluate）が観測ログから掛ける
     drop_hit_exposure: f64,
+    /// **成りで増える利きのポテンシャル**（`promo_potential_w`）: 未成駒ごとの
+    /// 「成ったら増える利き数 × 減衰^(成りマスまでの手数)」の合計。
+    /// `promo_potential()` の doc 参照。`promo_potential_w == 0` か王手中は
+    /// 計算しない（0 のまま）
+    promo_potential: f64,
     /// **この手で盤上に増える自駒の価値**（V5。`board_discount_w`）。
     /// 打ち = 打った駒の価値、成り = 増えた価値、それ以外 = 0。
     ///
@@ -714,6 +722,11 @@ fn own_effects_after(
         effect_own,
         effect_opp,
         drop_hit_exposure: drop_hit_exposure(&pieces, view.your_color),
+        promo_potential: if params.promo_potential_w != 0.0 && !view.you_in_check {
+            promo_potential(&pieces, view.your_color)
+        } else {
+            0.0
+        },
         board_material_added,
     }
 }
@@ -758,6 +771,182 @@ fn drop_hit_exposure(pieces: &[VisiblePiece], me: Color) -> f64 {
         })
         .map(|(_, role)| exchange_value(role))
         .sum()
+}
+
+/// 成りポテンシャルの手数減衰（1手遠いごとに半減）
+const PROMO_POTENTIAL_DECAY: f64 = 0.5;
+/// 成りマス探索（BFS）の手数上限。0.5^8 ≈ 0.004 で寄与が消えるので打ち切る
+const PROMO_BFS_MAX_DEPTH: u32 = 8;
+
+/// **成りで増える利きのポテンシャル**（`promo_potential_w` の素材）。
+///
+/// やねうら王に成りの専用項は無く、成りの価値は「利きの全マス評価（Lv3、+R200）が
+/// 成った瞬間に増える」＋「深い探索が成りの未来を実際に読む」から出てくる
+/// （docs/yaneuraou-lessons.md）。この bot は探索が1〜2手で打ち切られるので、
+/// 探索の代わりに**将来の利き増加を静的な勾配で前借り**する。旧 tokin_probe_w
+/// （歩専用・削除済み）の一般化で、駒種ハードコードなしに
+/// 「歩→と金 +5利き ≫ 銀→成銀 +1利き」の序列が自然に出る。
+///
+/// 未成駒ごとに: Δ利き（成り駒種の利き数 − 現駒種の利き数、成りマス上で測る）
+/// × 減衰^(成りマスまでの最短手数)。成りマスと手数は自駒ブロッカーだけを見る
+/// BFS の下限（相手駒は見えないので楽観値 = `move_targets` と同じ規約）。
+/// 自駒に道を塞がれて成れない駒（と金の裏に打った香など）はポテンシャル 0。
+/// 成り済みの駒は「実現した利き増加」を減衰なしの満額で数える —— これが無いと
+/// 成る手自体が「ポテンシャルを失う手」になって差分が負に出る。
+///
+/// 呼び出し側は `drop_hit_evac_w` と同じ**差分形**（着手後 − 現局面）で gain へ
+/// 加算するので、無関係な候補は 0 でゼロ点が動かない（threat_value 差分化の罠を
+/// 回避）。自駒だけで決まるので粒子不要・ノイズゼロ
+fn promo_potential(pieces: &[VisiblePiece], me: Color) -> f64 {
+    let occupied: HashSet<Coord> = pieces
+        .iter()
+        .filter_map(|p| parse_usi_square(&p.square))
+        .collect();
+    let mut total = 0.0f64;
+    for p in pieces {
+        let Some(origin) = parse_usi_square(&p.square) else {
+            continue;
+        };
+        if unpromote_role(p.role) != p.role {
+            // 成り済み: 実現した利き増加（成る手の差分を正にするための対）
+            total += promo_effect_gain(&occupied, origin, unpromote_role(p.role), origin, me);
+        } else if promote_role(p.role).is_some() {
+            if let Some((d, sq)) = promo_distance(&occupied, origin, p.role, me) {
+                total += promo_effect_gain(&occupied, origin, p.role, sq, me)
+                    * PROMO_POTENTIAL_DECAY.powi(d as i32);
+            }
+        }
+    }
+    total
+}
+
+/// 駒種 `base` がマス `at` で成ったときに増える利き数（負なら 0）。
+/// `vacated`（駒の元位置）は空きマスとして扱う。利きは `defend_targets` と
+/// 同じ規約（自駒の乗ったマスも利きに数え、レイはそこで止まる）
+fn promo_effect_gain(
+    occupied: &HashSet<Coord>,
+    vacated: Coord,
+    base: Role,
+    at: Coord,
+    me: Color,
+) -> f64 {
+    let Some(promoted) = promote_role(base) else {
+        return 0.0;
+    };
+    (count_effects(occupied, vacated, promoted, at, me)
+        - count_effects(occupied, vacated, base, at, me))
+    .max(0.0)
+}
+
+/// 駒種 `role` がマス `at` から利かせているマス数（`vacated` は空き扱い）
+fn count_effects(occupied: &HashSet<Coord>, vacated: Coord, role: Role, at: Coord, me: Color) -> f64 {
+    use crate::board::{on_board, orient, rays, steps};
+    let blocked = |c: Coord| c != vacated && occupied.contains(&c);
+    let mut n = 0.0;
+    for &delta in steps(role) {
+        let (df, dr) = orient(delta, me);
+        let c = Coord {
+            file: at.file + df,
+            rank: at.rank + dr,
+        };
+        if on_board(c) {
+            n += 1.0;
+        }
+    }
+    for &delta in rays(role) {
+        let (df, dr) = orient(delta, me);
+        let mut c = Coord {
+            file: at.file + df,
+            rank: at.rank + dr,
+        };
+        while on_board(c) {
+            n += 1.0;
+            if blocked(c) {
+                break;
+            }
+            c = Coord {
+                file: c.file + df,
+                rank: c.rank + dr,
+            };
+        }
+    }
+    n
+}
+
+/// `origin` の未成駒 `role` が成る手を指せるまでの最短手数と、その成りマス。
+/// 自駒ブロッカーだけを見た BFS の下限（`move_targets` と同じ規約で、
+/// 自駒のいるマスには行けずレイもそこで止まる。`origin` は空き扱い）。
+/// すでに敵陣にいて動ける駒は (1, 現在地) —— 敵陣からの移動は着地がどこでも成れる。
+/// `PROMO_BFS_MAX_DEPTH` 手以内に成りマスへ届かなければ None
+fn promo_distance(
+    occupied: &HashSet<Coord>,
+    origin: Coord,
+    role: Role,
+    me: Color,
+) -> Option<(u32, Coord)> {
+    use crate::board::{on_board, orient, rays, steps};
+    let in_zone = |c: Coord| match me {
+        Color::Sente => c.rank <= 3,
+        Color::Gote => c.rank >= 7,
+    };
+    let blocked = |c: Coord| c != origin && occupied.contains(&c);
+    let targets = |s: Coord, out: &mut Vec<Coord>| {
+        for &delta in steps(role) {
+            let (df, dr) = orient(delta, me);
+            let c = Coord {
+                file: s.file + df,
+                rank: s.rank + dr,
+            };
+            if on_board(c) && !blocked(c) {
+                out.push(c);
+            }
+        }
+        for &delta in rays(role) {
+            let (df, dr) = orient(delta, me);
+            let mut c = Coord {
+                file: s.file + df,
+                rank: s.rank + dr,
+            };
+            while on_board(c) && !blocked(c) {
+                out.push(c);
+                c = Coord {
+                    file: c.file + df,
+                    rank: c.rank + dr,
+                };
+            }
+        }
+    };
+    let mut buf = vec![];
+    if in_zone(origin) {
+        targets(origin, &mut buf);
+        if !buf.is_empty() {
+            return Some((1, origin));
+        }
+        return None; // 敵陣内で動けない駒（と金の裏の香など）は成れない
+    }
+    let mut visited: HashSet<Coord> = HashSet::new();
+    visited.insert(origin);
+    let mut frontier = vec![origin];
+    for depth in 1..=PROMO_BFS_MAX_DEPTH {
+        let mut next_frontier = vec![];
+        for &s in &frontier {
+            buf.clear();
+            targets(s, &mut buf);
+            for &t in &buf {
+                if in_zone(t) {
+                    return Some((depth, t));
+                }
+                if visited.insert(t) {
+                    next_frontier.push(t);
+                }
+            }
+        }
+        if next_frontier.is_empty() {
+            return None;
+        }
+        frontier = next_frontier;
+    }
+    None
 }
 
 /// この手の後、**自玉の8近傍のうち「玉以外の自駒の利きが無い」マスの数**（0〜8）。
@@ -925,6 +1114,8 @@ struct EvalOut {
     capture_value: f64,
     /// gain に加算された紐の項（V3。内訳表示用）
     link: f64,
+    /// gain に加算された成りポテンシャルの差分（符号つき。内訳表示用）
+    promo: f64,
     /// gain から引かれた盤上駒の減価（V5。正の値。内訳表示用）
     board_discount: f64,
 }
@@ -1245,6 +1436,20 @@ pub struct EvalParams {
     /// 相手が歩を持つ局面で大駒を敵陣へ突っ込む手が負になる。
     /// 王手中は無効（CheckSolver の領分）。0 = 無効
     pub drop_hit_evac_w: f64,
+    /// **成りで増える利きのポテンシャル**（2026-07-30、駒種特化2項
+    /// knight_bait_w / tokin_probe_w の削除で残った「歩を敵陣側へ働かせる勾配」の
+    /// 穴を一般項で埋める。ユーザー方針: 成り価値は素材差でなく**成ることで
+    /// 増える利きの多さ**で測る = やねうら王の利き評価（Lv3）が成りを自動で
+    /// 値付けする構造の静的近似）。
+    ///
+    /// 未成駒ごとの「Δ利き × 減衰^(成りマスまでの手数)」の合計を、着手後 −
+    /// 現局面の**差分形**で gain へ加算（`promo_potential()` の doc 参照）。
+    /// 歩→と金 +5利き ≫ 香(深)→成香 +4〜5 ≫ 銀→成銀 +1 の序列が駒種
+    /// ハードコードなしで出る。垂れ歩・香の成り込みが浮き、自駒に道を塞がれた
+    /// 打ち（L*1b 型）は 0。検証セットは tokin-bet / lance-selfdrop /
+    /// lance-tether / pawn-tether / lance-for-pawn（9b9a+ が副指標）。
+    /// 王手中は無効（CheckSolver の領分）。0 = 無効
+    pub promo_potential_w: f64,
 }
 
 /// check_strength_w の g(K) 曲線: 実測の「王手直後の実反則数」の K 依存を
@@ -1356,6 +1561,10 @@ impl Default for EvalParams {
             // 打ち当て露出（2026-07-30、dragon-evac）。未調整の新項なので
             // w スイープで決める
             drop_hit_evac_w: 0.0,
+            // 成りで増える利きのポテンシャル（2026-07-30 採用）。w スイープの実測で
+            // 0.2（0.5 は垂れ歩の常用化・成り済み駒のマス好み副作用で過剰）。
+            // シナリオ大幅改善・ペアアリーナ3シード中立で採用（CLAUDE.md 参照）
+            promo_potential_w: 0.2,
         }
     }
 }
@@ -1368,7 +1577,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 54] = [
+    pub const SPECS: [ParamSpec; 55] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -1658,6 +1867,13 @@ impl EvalParams {
             lo: 0.0,
             hi: 1.0,
         },
+        ParamSpec {
+            // Δ利きの振れ幅は歩→と金の +5 × 減衰。垂れ歩(d=1)で 2.5 なので
+            // w=0.2 で旧 tokin_probe_w（0.2×1.0）と同スケール
+            name: "promo_potential_w",
+            lo: 0.0,
+            hi: 1.0,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -1716,6 +1932,7 @@ impl EvalParams {
             self.escape_cover_w,
             self.defender_capture_w,
             self.drop_hit_evac_w,
+            self.promo_potential_w,
         ]
     }
 
@@ -1776,6 +1993,7 @@ impl EvalParams {
             escape_cover_w: v[51],
             defender_capture_w: v[52],
             drop_hit_evac_w: v[53],
+            promo_potential_w: v[54],
         }
     }
 }
@@ -2032,6 +2250,18 @@ impl EstimatorStrategy {
         {
             Some(w) => EvalParams {
                 drop_hit_evac_w: w,
+                ..params
+            },
+            None => params,
+        };
+        // 成りポテンシャルの運用ノブ（w スイープ用。0 で従来挙動）
+        let params = match std::env::var("TSUITATE_PROMO_POTENTIAL_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+        {
+            Some(w) => EvalParams {
+                promo_potential_w: w,
                 ..params
             },
             None => params,
@@ -2384,6 +2614,12 @@ impl Strategy for EstimatorStrategy {
             })
             .flatten();
 
+        // 成りポテンシャル（`promo_potential_w`）の現局面の値。着手後との差分を
+        // gain へ加算する。王手中は無効（CheckSolver の領分）
+        let promo_pot_before: Option<f64> = (params.promo_potential_w != 0.0
+            && !view.you_in_check)
+            .then(|| promo_potential(&view.your_pieces, view.your_color));
+
         let rng = &mut self.rng;
         // 王手中の玉の手の gain 平均化判定用（check_king_gain_mean の doc 参照）
         let my_king = king_square(view);
@@ -2431,6 +2667,7 @@ impl Strategy for EstimatorStrategy {
                 blind_belief,
                 opp_king_w.as_ref(),
                 drop_hit_expo_before,
+                promo_pot_before,
             );
             // 王手中: 仮説条件付きの「王手駒の除去期待値」（check.rs::removal_term）。
             // 王手駒のマスを取る手は受理された未来で脅威ごと駒を排除し、玉逃げ等の
@@ -2582,6 +2819,7 @@ impl Strategy for EstimatorStrategy {
                 capture_value: out.capture_value,
                 risk: out.risk_mean,
                 link: out.link,
+                promo: out.promo,
                 board_discount: out.board_discount,
             });
             if best.as_ref().is_none_or(|(_, _, s)| final_score > *s) {
@@ -3451,6 +3689,10 @@ fn evaluate(
     // 有効（choose() が「w≠0・相手の確定持ち駒に歩あり・王手中でない」の
     // ゲートを掛けて渡す）。着手後の露出との差分を gain へ加点する
     drop_hit_expo_before: Option<f64>,
+    // 成りポテンシャル（`promo_potential_w`）の**現局面**の値。Some のときだけ
+    // 項が有効（choose() が「w≠0・王手中でない」のゲートを掛けて渡す）。
+    // 着手後との差分を gain へ加点する
+    promo_pot_before: Option<f64>,
 ) -> EvalOut {
     let me = view.your_color;
     let opp = me.other();
@@ -3820,6 +4062,13 @@ fn evaluate(
         .map(|before| params.drop_hit_evac_w * (before - own_effects.drop_hit_exposure))
         .unwrap_or(0.0);
 
+    // 成りポテンシャルの差分（`promo_potential_w` の doc 参照）。未成駒を
+    // 成りマスへ近づける手・垂れ歩・成る手自体が正、後退・自駒の道を塞ぐ
+    // 打ちが負。大半の候補は 0 なので gain のゼロ点は動かない
+    let promo = promo_pot_before
+        .map(|before| params.promo_potential_w * (own_effects.promo_potential - before))
+        .unwrap_or(0.0);
+
     // V5（盤上駒の減価、やねうら王 Lv2 で +R50）: 「同じ駒なら持ち駒のほうが
     // 価値が高い」。この手で**盤上に増えた自駒の価値**にだけ比例して引く
     // （打ち＝打った駒、成り＝増えたぶん。盤上の合計は定数なので持たない
@@ -3905,6 +4154,7 @@ fn evaluate(
         - king_holes
         + link
         + drop_hit_evac
+        + promo
         - board_discount
         + effect_value
         + blind_recapture
@@ -3926,6 +4176,7 @@ fn evaluate(
             0.0
         },
         link,
+        promo,
         board_discount,
     }
 }
@@ -4523,6 +4774,105 @@ pub(crate) mod tests {
         assert!(
             (drop_hit_exposure(&pieces, Color::Sente) - exchange_value(Role::Bishop)).abs() < 1e-9
         );
+    }
+
+    #[test]
+    fn promo_potential_scales_with_distance_and_effect_gain() {
+        let vp = |file, rank, role| VisiblePiece {
+            square: crate::board::make_usi_square(Coord { file, rank }),
+            role,
+        };
+        // 先手の歩: 4段目（成りマスまで1手）は 7段目（4手）より大きい
+        let near = promo_potential(&[vp(5, 4, Role::Pawn)], Color::Sente);
+        let far = promo_potential(&[vp(5, 7, Role::Pawn)], Color::Sente);
+        assert!(near > far, "near={near} far={far}");
+        assert!(far > 0.0);
+        // 歩→と金は Δ利き5（中央）× 0.5^1
+        assert!((near - 5.0 * 0.5).abs() < 1e-9, "near={near}");
+        // 前に自分の歩がいる歩は成れない（道を塞がれた駒はポテンシャル 0）
+        let blocked =
+            promo_potential(&[vp(5, 4, Role::Pawn), vp(5, 3, Role::Pawn)], Color::Sente);
+        let solo_5c = promo_potential(&[vp(5, 3, Role::Pawn)], Color::Sente);
+        assert!((blocked - solo_5c).abs() < 1e-9, "5四の歩の寄与が 0 になるはず");
+        // 後手向き: 6段目の歩（成りマス7段目まで1手）も同じ値
+        let gote = promo_potential(&[vp(5, 6, Role::Pawn)], Color::Gote);
+        assert!((gote - 5.0 * 0.5).abs() < 1e-9, "gote={gote}");
+    }
+
+    #[test]
+    fn promo_potential_zero_for_lance_behind_own_tokin() {
+        // watch-…223458 の悪手 L*1b の形: と金1一の裏に打った香は永久に動けない
+        let vp = |file, rank, role| VisiblePiece {
+            square: crate::board::make_usi_square(Coord { file, rank }),
+            role,
+        };
+        let with_lance = promo_potential(
+            &[vp(1, 1, Role::Tokin), vp(1, 2, Role::Lance)],
+            Color::Sente,
+        );
+        let without = promo_potential(&[vp(1, 1, Role::Tokin)], Color::Sente);
+        assert!((with_lance - without).abs() < 1e-9, "塞がれた香の寄与は 0");
+    }
+
+    #[test]
+    fn promo_potential_promotion_move_realizes_gain() {
+        // 成る手は「ポテンシャル（減衰つき）→ 実現値（満額）」で差分が正になる
+        let vp = |file, rank, role| VisiblePiece {
+            square: crate::board::make_usi_square(Coord { file, rank }),
+            role,
+        };
+        let before = promo_potential(&[vp(9, 3, Role::Lance)], Color::Sente);
+        let after = promo_potential(&[vp(9, 3, Role::Promotedlance)], Color::Sente);
+        assert!(before > 0.0);
+        assert!(after > before, "after={after} before={before}");
+    }
+
+    #[test]
+    fn own_effects_promo_potential_diff_favors_advance_and_deep_drop() {
+        let vp = |file, rank, role| VisiblePiece {
+            square: crate::board::make_usi_square(Coord { file, rank }),
+            role,
+        };
+        let mut hand = HashMap::new();
+        hand.insert(Role::Pawn, 1);
+        let view = minimal_view(vec![vp(5, 5, Role::Pawn), vp(5, 9, Role::King)], hand);
+        let params = EvalParams {
+            promo_potential_w: 1.0,
+            ..EvalParams::default()
+        };
+        // 歩を進める手 > 玉を動かす手（歩のポテンシャルが 0.5^2 → 0.5^1 に上がる）
+        let advance = ShogiMove::Board {
+            from: Coord { file: 5, rank: 5 },
+            to: Coord { file: 5, rank: 4 },
+            promote: false,
+        };
+        let idle = ShogiMove::Board {
+            from: Coord { file: 5, rank: 9 },
+            to: Coord { file: 5, rank: 8 },
+            promote: false,
+        };
+        let adv_pot = own_effects_after(&view, &advance, None, &params).promo_potential;
+        let idle_pot = own_effects_after(&view, &idle, None, &params).promo_potential;
+        assert!(adv_pot > idle_pot, "adv={adv_pot} idle={idle_pot}");
+        // 垂れ歩（4段目打ち）> 自陣打ち（8段目）
+        let deep = ShogiMove::Drop {
+            role: Role::Pawn,
+            to: Coord { file: 7, rank: 4 },
+        };
+        let shallow = ShogiMove::Drop {
+            role: Role::Pawn,
+            to: Coord { file: 7, rank: 8 },
+        };
+        let deep_pot = own_effects_after(&view, &deep, None, &params).promo_potential;
+        let shallow_pot = own_effects_after(&view, &shallow, None, &params).promo_potential;
+        assert!(deep_pot > shallow_pot, "deep={deep_pot} shallow={shallow_pot}");
+        // w=0 なら計算ごとスキップ（切り戻しノブの担保）
+        let params_off = EvalParams {
+            promo_potential_w: 0.0,
+            ..EvalParams::default()
+        };
+        let off = own_effects_after(&view, &advance, None, &params_off);
+        assert_eq!(off.promo_potential, 0.0);
     }
 
     #[test]

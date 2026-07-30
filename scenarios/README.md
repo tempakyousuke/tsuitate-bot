@@ -214,6 +214,11 @@ JSON（DBの列をそのままJSON.parseして詰め直すだけでよい）。`
   pawn-tether **15/20**・pawn-hoard 9/20・lance-selfdrop 8/20（首位は
   P*9h=垂れ歩11/20で、これは良い手側）・lance-aimless 5/20・focal-lance 4/20
   （L*5c 単体は0〜1/20。悪手が分散するので不合格計で見る）。
+  **promo_potential_w=0.2 採用後（2026-07-30、これが現行 main の新ベースライン）**:
+  rook-selfdrop 0/20・lance-tether 8/20・pawn-tether 5/20・lance-selfdrop 0/20
+  （P*9h 11/20 維持）・pawn-hoard 4/20・lance-aimless 2/20・focal-lance 3/20・
+  lance-for-pawn **19/20**（唯一改善せず = 持ち駒経済の既知ギャップ。首位は
+  L*9i へ移動）。悪手 L*1b（223458 の17手目）は 10→0/20。
   seed 同一でも壁時計予算で選択は揺れる（ラン間で±3件程度）ため、
   新しい悪手バリアントが出たら `bad=` へ追記して育てること。
   ユーザー推奨手の一致率上昇も副指標になる: 9二歩の成り `9b9a+`
