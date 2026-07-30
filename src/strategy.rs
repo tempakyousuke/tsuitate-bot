@@ -217,6 +217,10 @@ pub struct CandidateScore {
     /// gain に加算された成りポテンシャルの差分
     /// （promo_potential_w × (着手後 − 現局面)。符号つき）
     pub promo: f64,
+    /// gain から引かれた持ち駒オプションの不足分
+    /// （hand_option_w × (その駒の最良打ちポテンシャル − この打ちマスの実現値)。
+    /// 打つ手にだけ非ゼロが入る正の値。gain には控除済み）
+    pub hand_option: f64,
     /// gain から引かれた盤上駒の減価（board_discount_w × 盤上の自駒の価値合計。V5）。
     /// 正の値 = そのぶん gain が減っている。これも見るのは差
     pub board_discount: f64,
@@ -810,14 +814,62 @@ fn promo_potential(pieces: &[VisiblePiece], me: Color) -> f64 {
         if unpromote_role(p.role) != p.role {
             // 成り済み: 実現した利き増加（成る手の差分を正にするための対）
             total += promo_effect_gain(&occupied, origin, unpromote_role(p.role), origin, me);
-        } else if promote_role(p.role).is_some() {
-            if let Some((d, sq)) = promo_distance(&occupied, origin, p.role, me) {
-                total += promo_effect_gain(&occupied, origin, p.role, sq, me)
-                    * PROMO_POTENTIAL_DECAY.powi(d as i32);
-            }
+        } else {
+            total += piece_promo_potential(&occupied, origin, p.role, me);
         }
     }
     total
+}
+
+/// 未成駒 `role` がマス `at` にいる（または打たれる）ときの成りポテンシャル
+/// 「Δ利き × 減衰^(成りマスまでの手数)」。`promo_potential()` の1駒ぶんと、
+/// 持ち駒オプション（`hand_option_w`）の打ちマス実現値の共通部品
+fn piece_promo_potential(occupied: &HashSet<Coord>, at: Coord, role: Role, me: Color) -> f64 {
+    if promote_role(role).is_none() {
+        return 0.0;
+    }
+    match promo_distance(occupied, at, role, me) {
+        Some((d, sq)) => {
+            promo_effect_gain(occupied, at, role, sq, me) * PROMO_POTENTIAL_DECAY.powi(d as i32)
+        }
+        None => 0.0,
+    }
+}
+
+/// 持ち駒オプション価値（`hand_option_w`）の決定点コンテキスト。
+/// choose() が1度だけ作り、evaluate() が打つ手の不足分を引くのに使う
+struct HandOption {
+    /// 自駒の占有マス（`piece_promo_potential` のブロッカー）
+    occupied: HashSet<Coord>,
+    /// 手持ち駒種ごとの最良打ちポテンシャル h(r) = max_s pp(r, s)。
+    /// s は自分視点の合法な打ちマス（二歩・行き所を除外 = `drop_targets`）。
+    /// h が 0 の駒種（金・全マス塞がり）は載せない = 減点なし
+    best: HashMap<Role, f64>,
+}
+
+/// 手持ち駒ごとの最良打ちポテンシャルを計算する（`hand_option_w` の素材）。
+/// 自駒配置と持ち駒だけで決まるので粒子不要・ノイズゼロ
+fn hand_option_context(view: &PlayerView) -> HandOption {
+    let me = view.your_color;
+    let occupied: HashSet<Coord> = view
+        .your_pieces
+        .iter()
+        .filter_map(|p| parse_usi_square(&p.square))
+        .collect();
+    let mut best = HashMap::new();
+    for (&role, &count) in &view.your_hand {
+        if count == 0 || promote_role(role).is_none() {
+            continue;
+        }
+        let h = crate::board::drop_targets(&view.your_pieces, role, me)
+            .into_iter()
+            .map(|s| piece_promo_potential(&occupied, s, role, me))
+            .fold(0.0f64, f64::max);
+        if h > 0.0 {
+            best.insert(role, h);
+        }
+    }
+    HandOption { occupied, best }
 }
 
 /// 駒種 `base` がマス `at` で成ったときに増える利き数（負なら 0）。
@@ -1116,6 +1168,8 @@ struct EvalOut {
     link: f64,
     /// gain に加算された成りポテンシャルの差分（符号つき。内訳表示用）
     promo: f64,
+    /// gain から引かれた持ち駒オプションの不足分（正の値。内訳表示用）
+    hand_option: f64,
     /// gain から引かれた盤上駒の減価（V5。正の値。内訳表示用）
     board_discount: f64,
 }
@@ -1450,6 +1504,22 @@ pub struct EvalParams {
     /// lance-tether / pawn-tether / lance-for-pawn（9b9a+ が副指標）。
     /// 王手中は無効（CheckSolver の領分）。0 = 無効
     pub promo_potential_w: f64,
+    /// **持ち駒のオプション価値**（2026-07-30、観戦局レビューの悪手8件の根
+    /// ①「打つより持つ」②「同じ仕事なら最安の駒で」= 持ち駒経済の一般項。
+    /// promo_potential_w の対で、検証セットは lance-for-pawn（不合格計19/20が
+    /// 発端）・lance-tether / pawn-tether / pawn-hoard、副指標 9b9a+）。
+    ///
+    /// 手持ち駒 r の保持価値 h(r) = 空きマス全体での最良打ちポテンシャル
+    /// max_s pp(r, s)（pp = promo_potential と同じ「Δ利き × 減衰^成りまで手数」。
+    /// 二歩・行き所は除外）。打つ手 (r, s) に **不足分 w × (h(r) − pp(r, s))** を
+    /// gain から引く。最良マスへの打ち（垂れ歩など）は減点 0、ポテンシャルを
+    /// 捨てる打ち（と金の裏の香 L*1b・自陣の香打ち L*9i）ほど満額に近づく。
+    ///
+    /// 性質: どの打ちにも**加点はしない**（安全方向のみ = 打ちを浮かせる
+    /// 副作用が無い）・移動の手は 0 でゼロ点不動・自駒と持ち駒だけで決まるので
+    /// 粒子不要・ノイズゼロ。成れない駒（金）は h=0 で対象外。
+    /// 王手中は無効（合駒は CheckSolver の領分）。0 = 無効
+    pub hand_option_w: f64,
 }
 
 /// check_strength_w の g(K) 曲線: 実測の「王手直後の実反則数」の K 依存を
@@ -1565,6 +1635,9 @@ impl Default for EvalParams {
             // 0.2（0.5 は垂れ歩の常用化・成り済み駒のマス好み副作用で過剰）。
             // シナリオ大幅改善・ペアアリーナ3シード中立で採用（CLAUDE.md 参照）
             promo_potential_w: 0.2,
+            // 持ち駒のオプション価値（2026-07-30）。未調整の新項なので
+            // w スイープで決める
+            hand_option_w: 0.0,
         }
     }
 }
@@ -1577,7 +1650,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 55] = [
+    pub const SPECS: [ParamSpec; 56] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -1874,6 +1947,13 @@ impl EvalParams {
             lo: 0.0,
             hi: 1.0,
         },
+        ParamSpec {
+            // 不足分の振れ幅は最良打ちポテンシャル（歩→と金で 2〜2.5）。
+            // w=0.5 で悪い打ちが歩1枚強沈む。実用域は 0.2〜1.0 を想定
+            name: "hand_option_w",
+            lo: 0.0,
+            hi: 2.0,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -1933,6 +2013,7 @@ impl EvalParams {
             self.defender_capture_w,
             self.drop_hit_evac_w,
             self.promo_potential_w,
+            self.hand_option_w,
         ]
     }
 
@@ -1994,6 +2075,7 @@ impl EvalParams {
             defender_capture_w: v[52],
             drop_hit_evac_w: v[53],
             promo_potential_w: v[54],
+            hand_option_w: v[55],
         }
     }
 }
@@ -2262,6 +2344,18 @@ impl EstimatorStrategy {
         {
             Some(w) => EvalParams {
                 promo_potential_w: w,
+                ..params
+            },
+            None => params,
+        };
+        // 持ち駒オプション価値の運用ノブ（w スイープ用。0 で従来挙動）
+        let params = match std::env::var("TSUITATE_HAND_OPTION_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+        {
+            Some(w) => EvalParams {
+                hand_option_w: w,
                 ..params
             },
             None => params,
@@ -2620,6 +2714,12 @@ impl Strategy for EstimatorStrategy {
             && !view.you_in_check)
             .then(|| promo_potential(&view.your_pieces, view.your_color));
 
+        // 持ち駒オプション価値（`hand_option_w`）の決定点コンテキスト。
+        // 王手中は無効（合駒は CheckSolver の領分）
+        let hand_option: Option<HandOption> = (params.hand_option_w != 0.0
+            && !view.you_in_check)
+            .then(|| hand_option_context(view));
+
         let rng = &mut self.rng;
         // 王手中の玉の手の gain 平均化判定用（check_king_gain_mean の doc 参照）
         let my_king = king_square(view);
@@ -2668,6 +2768,7 @@ impl Strategy for EstimatorStrategy {
                 opp_king_w.as_ref(),
                 drop_hit_expo_before,
                 promo_pot_before,
+                hand_option.as_ref(),
             );
             // 王手中: 仮説条件付きの「王手駒の除去期待値」（check.rs::removal_term）。
             // 王手駒のマスを取る手は受理された未来で脅威ごと駒を排除し、玉逃げ等の
@@ -2820,6 +2921,7 @@ impl Strategy for EstimatorStrategy {
                 risk: out.risk_mean,
                 link: out.link,
                 promo: out.promo,
+                hand_option: out.hand_option,
                 board_discount: out.board_discount,
             });
             if best.as_ref().is_none_or(|(_, _, s)| final_score > *s) {
@@ -3693,6 +3795,10 @@ fn evaluate(
     // 項が有効（choose() が「w≠0・王手中でない」のゲートを掛けて渡す）。
     // 着手後との差分を gain へ加点する
     promo_pot_before: Option<f64>,
+    // 持ち駒オプション価値（`hand_option_w`）の決定点コンテキスト。Some のとき
+    // だけ項が有効（choose() が「w≠0・王手中でない」のゲートを掛けて渡す）。
+    // 打つ手に「最良打ちポテンシャルとの不足分」の減点を掛ける
+    hand_option: Option<&HandOption>,
 ) -> EvalOut {
     let me = view.your_color;
     let opp = me.other();
@@ -4069,6 +4175,22 @@ fn evaluate(
         .map(|before| params.promo_potential_w * (own_effects.promo_potential - before))
         .unwrap_or(0.0);
 
+    // 持ち駒オプションの不足分（`hand_option_w` の doc 参照）。打つ手にだけ
+    // 「その駒種の最良打ちポテンシャル − この打ちマスでの実現値」を引く。
+    // 最良マスへの打ち（垂れ歩）は 0、ポテンシャルを捨てる打ちほど満額。
+    // 移動の手は 0 なのでゼロ点は動かない
+    let hand_option_pen = match (hand_option, mv) {
+        (Some(ctx), &ShogiMove::Drop { role, to }) => ctx
+            .best
+            .get(&role)
+            .map(|&h| {
+                params.hand_option_w
+                    * (h - piece_promo_potential(&ctx.occupied, to, role, me)).max(0.0)
+            })
+            .unwrap_or(0.0),
+        _ => 0.0,
+    };
+
     // V5（盤上駒の減価、やねうら王 Lv2 で +R50）: 「同じ駒なら持ち駒のほうが
     // 価値が高い」。この手で**盤上に増えた自駒の価値**にだけ比例して引く
     // （打ち＝打った駒、成り＝増えたぶん。盤上の合計は定数なので持たない
@@ -4155,6 +4277,7 @@ fn evaluate(
         + link
         + drop_hit_evac
         + promo
+        - hand_option_pen
         - board_discount
         + effect_value
         + blind_recapture
@@ -4177,6 +4300,7 @@ fn evaluate(
         },
         link,
         promo,
+        hand_option: hand_option_pen,
         board_discount,
     }
 }
@@ -4812,6 +4936,82 @@ pub(crate) mod tests {
         );
         let without = promo_potential(&[vp(1, 1, Role::Tokin)], Color::Sente);
         assert!((with_lance - without).abs() < 1e-9, "塞がれた香の寄与は 0");
+    }
+
+    #[test]
+    fn hand_option_shortfall_zero_at_best_square_full_when_blocked() {
+        let vp = |file, rank, role| VisiblePiece {
+            square: crate::board::make_usi_square(Coord { file, rank }),
+            role,
+        };
+        // 歩1枚持ち: 最良打ちマス（成りマスまで1手）での不足分は 0、
+        // 自陣深くの打ちは満額に近い
+        let mut hand = HashMap::new();
+        hand.insert(Role::Pawn, 1);
+        let view = minimal_view(vec![vp(5, 9, Role::King)], hand);
+        let ctx = hand_option_context(&view);
+        let h = ctx.best[&Role::Pawn];
+        assert!((h - 5.0 * 0.5).abs() < 1e-9, "h={h}");
+        let near = piece_promo_potential(
+            &ctx.occupied,
+            Coord { file: 5, rank: 3 },
+            Role::Pawn,
+            Color::Sente,
+        );
+        let deep = piece_promo_potential(
+            &ctx.occupied,
+            Coord { file: 5, rank: 8 },
+            Role::Pawn,
+            Color::Sente,
+        );
+        assert!((h - near).abs() < 1e-9, "敵陣近くの打ちは不足分 0");
+        assert!(h - deep > 1.0, "自陣深くの打ちは不足分が大きい: h={h} deep={deep}");
+    }
+
+    #[test]
+    fn hand_option_lance_behind_tokin_forfeits_everything() {
+        // lance-for-pawn の悪手 L*1b の形: と金1一の裏への香打ちは実現値 0 =
+        // 最良打ちポテンシャルを丸ごと捨てる
+        let vp = |file, rank, role| VisiblePiece {
+            square: crate::board::make_usi_square(Coord { file, rank }),
+            role,
+        };
+        let mut hand = HashMap::new();
+        hand.insert(Role::Lance, 1);
+        let view = minimal_view(
+            vec![vp(1, 1, Role::Tokin), vp(5, 9, Role::King)],
+            hand,
+        );
+        let ctx = hand_option_context(&view);
+        let h = ctx.best[&Role::Lance];
+        assert!(h > 0.0);
+        let blocked = piece_promo_potential(
+            &ctx.occupied,
+            Coord { file: 1, rank: 2 },
+            Role::Lance,
+            Color::Sente,
+        );
+        assert_eq!(blocked, 0.0, "と金の裏の香は成りへの道が無い");
+    }
+
+    #[test]
+    fn hand_option_skips_unpromotable_and_nifu_blocked() {
+        let vp = |file, rank, role| VisiblePiece {
+            square: crate::board::make_usi_square(Coord { file, rank }),
+            role,
+        };
+        // 金は成れないので対象外（打ちに減点が掛からない）
+        let mut hand = HashMap::new();
+        hand.insert(Role::Gold, 1);
+        let view = minimal_view(vec![vp(5, 9, Role::King)], hand);
+        assert!(!hand_option_context(&view).best.contains_key(&Role::Gold));
+        // 全筋に自歩がいれば歩は打てるマスが無い = h 無し
+        let mut pieces: Vec<VisiblePiece> = (1..=9).map(|f| vp(f, 7, Role::Pawn)).collect();
+        pieces.push(vp(5, 9, Role::King));
+        let mut hand = HashMap::new();
+        hand.insert(Role::Pawn, 1);
+        let view = minimal_view(pieces, hand);
+        assert!(!hand_option_context(&view).best.contains_key(&Role::Pawn));
     }
 
     #[test]
