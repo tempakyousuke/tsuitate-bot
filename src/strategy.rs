@@ -530,6 +530,11 @@ struct OwnEffects {
     /// （V2。`effect_opp_w`）。相手玉の位置は粒子の信念なので、
     /// マスごとに `Σ_k P(玉=k) × w(dist)` を決定点ごとに1度だけ先に作る
     effect_opp: f64,
+    /// **打ち当て露出**（`drop_hit_evac_w`）: 敵陣にいる自分の大駒（飛角竜馬）の
+    /// うち、頭（自分の前進方向1マス先）が盤内かつ自駒で塞がれていないものの
+    /// 交換価値合計。「相手が歩を持っているか」のゲートは呼び出し側
+    /// （choose → evaluate）が観測ログから掛ける
+    drop_hit_exposure: f64,
     /// **この手で盤上に増える自駒の価値**（V5。`board_discount_w`）。
     /// 打ち = 打った駒の価値、成り = 増えた価値、それ以外 = 0。
     ///
@@ -708,8 +713,51 @@ fn own_effects_after(
         linked_value,
         effect_own,
         effect_opp,
+        drop_hit_exposure: drop_hit_exposure(&pieces, view.your_color),
         board_material_added,
     }
+}
+
+/// 打ち当て露出（`drop_hit_evac_w` の素材）。敵陣（自分から見て最奥3段）に
+/// いる自分の大駒（飛角竜馬）のうち、**頭**（自分の前進方向に1マス先 =
+/// 相手の歩がそこへ打たれると次の相手の手でこの駒を取れるマス）が盤内かつ
+/// 自駒で塞がれていないものの交換価値の合計。
+///
+/// 頭のマスに**敵駒**がいる可能性（打てない）は見えないので無視する =
+/// 露出は上界。逆に相手の二歩制約も相手の歩の配置が見えないので無視する。
+/// 紐（自分の利き）は軽減に数えない: 歩打ちは観測されないため取られてから
+/// 取り返しても「大駒 ↔ 歩」の交換にしかならない
+fn drop_hit_exposure(pieces: &[VisiblePiece], me: Color) -> f64 {
+    let occupied: HashSet<Coord> = pieces
+        .iter()
+        .filter_map(|p| parse_usi_square(&p.square))
+        .collect();
+    pieces
+        .iter()
+        .filter(|p| {
+            matches!(
+                p.role,
+                Role::Rook | Role::Bishop | Role::Dragon | Role::Horse
+            )
+        })
+        .filter_map(|p| parse_usi_square(&p.square).map(|c| (c, p.role)))
+        .filter(|&(c, _)| match me {
+            // 段の向き: 先手は rank 減少方向へ前進（advance_bias と同じ規約）
+            Color::Sente => c.rank <= 3,
+            Color::Gote => c.rank >= 7,
+        })
+        .filter(|&(c, _)| {
+            let head = Coord {
+                file: c.file,
+                rank: match me {
+                    Color::Sente => c.rank - 1,
+                    Color::Gote => c.rank + 1,
+                },
+            };
+            (1..=9).contains(&head.rank) && !occupied.contains(&head)
+        })
+        .map(|(_, role)| exchange_value(role))
+        .sum()
 }
 
 /// この手の後、**自玉の8近傍のうち「玉以外の自駒の利きが無い」マスの数**（0〜8）。
@@ -1202,6 +1250,28 @@ pub struct EvalParams {
     /// 価値（以後の王手が強くなる・詰み網が作りやすくなる）は素材価値に含まれない。
     /// 王手中は無効（CheckSolver の領分）。0 = 無効
     pub defender_capture_w: f64,
+    /// **打ち当て露出**（2026-07-30、対人局レビュー human-play-review-2026-07-29 の
+    /// 竜退避拒否 = scenarios/dragon-evac.kif が発端）。敵陣にいる自分の大駒
+    /// （飛角竜馬）は、相手が歩を持った瞬間に「頭への歩打ち → 次の手で捕獲」の
+    /// 的になる。ついたてでは**その歩打ちは観測されない**ので、当たりに気づいて
+    /// から逃げることが原理的にできない（発端の実戦: 8七竜の頭8八へ見えない歩、
+    /// bot は S*7八 の紐付けを選んで次手で竜が歩に取られた）。事前の退避だけが
+    /// 対策で、これは flee-probe（bot相手の追撃実被害2.7%）とは逆に**人間・bot
+    /// どちらが相手でも実行される脅威**（歩打ちは安く、頭の歩は定石）。
+    ///
+    /// 使う情報は全て完全既知: 自駒の位置と、相手の持ち駒
+    /// （`GameModel::opponent_hand` = 取られた自駒。相手が見えない打ちで消費した
+    /// 分は引けないが「脅威が既に着地している」ケースなので上界のままでよい =
+    /// 発端の局面がまさにこれ）。粒子不要・ノイズゼロ（link_w / king_hole_w と
+    /// 同じクラス）。
+    ///
+    /// 形は**露出の差分** `w × (現局面の露出 − 着手後の露出)`: 露出 = 敵陣の
+    /// 大駒のうち頭（自分の前進方向1マス先）が盤内かつ自駒で塞がれていないもの
+    /// の交換価値合計。差分なので大半の候補は 0（gain のゼロ点を動かさない =
+    /// threat_value 差分化 −12pt の罠を回避）、退避・頭を自駒で埋める手が正、
+    /// 相手が歩を持つ局面で大駒を敵陣へ突っ込む手が負になる。
+    /// 王手中は無効（CheckSolver の領分）。0 = 無効
+    pub drop_hit_evac_w: f64,
 }
 
 /// check_strength_w の g(K) 曲線: 実測の「王手直後の実反則数」の K 依存を
@@ -1314,6 +1384,9 @@ impl Default for EvalParams {
             // 未調整の新項なので w スイープで決める
             escape_cover_w: 0.0,
             defender_capture_w: 0.0,
+            // 打ち当て露出（2026-07-30、dragon-evac）。未調整の新項なので
+            // w スイープで決める
+            drop_hit_evac_w: 0.0,
         }
     }
 }
@@ -1326,7 +1399,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 55] = [
+    pub const SPECS: [ParamSpec; 56] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -1619,6 +1692,13 @@ impl EvalParams {
             lo: 0.0,
             hi: 3.0,
         },
+        ParamSpec {
+            // 差分の振れ幅は大駒1枚の交換価値（8〜10.75）。w=1 は「留まれば
+            // 確実に死ぬ」相当なので過大、実用域は 0.1〜0.5 を想定
+            name: "drop_hit_evac_w",
+            lo: 0.0,
+            hi: 1.0,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -1678,6 +1758,7 @@ impl EvalParams {
             self.check_strength_w,
             self.escape_cover_w,
             self.defender_capture_w,
+            self.drop_hit_evac_w,
         ]
     }
 
@@ -1739,6 +1820,7 @@ impl EvalParams {
             check_strength_w: v[52],
             escape_cover_w: v[53],
             defender_capture_w: v[54],
+            drop_hit_evac_w: v[55],
         }
     }
 }
@@ -1983,6 +2065,18 @@ impl EstimatorStrategy {
         {
             Some(w) => EvalParams {
                 defender_capture_w: w,
+                ..params
+            },
+            None => params,
+        };
+        // 打ち当て露出の運用ノブ（w スイープ用。0 で従来挙動）
+        let params = match std::env::var("TSUITATE_DROP_HIT_EVAC_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+        {
+            Some(w) => EvalParams {
+                drop_hit_evac_w: w,
                 ..params
             },
             None => params,
@@ -2321,6 +2415,20 @@ impl Strategy for EstimatorStrategy {
             crate::hits::flag("粒子が全く無い", sample.is_empty() && taint_pool.is_empty());
         }
 
+        // 打ち当て露出（`drop_hit_evac_w`）の現局面の露出。相手の持ち駒は
+        // 取られた自駒から完全に決まる（GameModel::opponent_hand。相手が
+        // 見えない打ちで消費した分は引けないが上界のままでよい = doc 参照）。
+        // 歩を持たれていなければ脅威が無いので項ごと無効にする。王手中も無効
+        // （CheckSolver の領分）
+        let drop_hit_expo_before: Option<f64> = (params.drop_hit_evac_w != 0.0
+            && !view.you_in_check)
+            .then(|| {
+                let opp_hand = GameModel::from_log(view.your_color, log).opponent_hand();
+                (opp_hand.get(&Role::Pawn).copied().unwrap_or(0) > 0)
+                    .then(|| drop_hit_exposure(&view.your_pieces, view.your_color))
+            })
+            .flatten();
+
         let rng = &mut self.rng;
         // 王手中の玉の手の gain 平均化判定用（check_king_gain_mean の doc 参照）
         let my_king = king_square(view);
@@ -2367,6 +2475,7 @@ impl Strategy for EstimatorStrategy {
                 blind_recapture,
                 blind_belief,
                 opp_king_w.as_ref(),
+                drop_hit_expo_before,
             );
             // 王手中: 仮説条件付きの「王手駒の除去期待値」（check.rs::removal_term）。
             // 王手駒のマスを取る手は受理された未来で脅威ごと駒を排除し、玉逃げ等の
@@ -3383,6 +3492,10 @@ fn evaluate(
     // V2: マスごとの「相手玉の信念位置からの距離重み」（`opp_king_effect_weights`）。
     // 決定点ごとに1度だけ作って全候補で使い回す
     opp_king_w: Option<&[f64; 81]>,
+    // 打ち当て露出（`drop_hit_evac_w`）の**現局面**の露出。Some のときだけ項が
+    // 有効（choose() が「w≠0・相手の確定持ち駒に歩あり・王手中でない」の
+    // ゲートを掛けて渡す）。着手後の露出との差分を gain へ加点する
+    drop_hit_expo_before: Option<f64>,
 ) -> EvalOut {
     let me = view.your_color;
     let opp = me.other();
@@ -3749,6 +3862,13 @@ fn evaluate(
     // ここで紐を切ると反則経済がそのまま悪化する（vs v11 の反則/局 6.20 → 6.71）
     let link = params.link_w * own_effects.linked_value;
 
+    // 打ち当て露出の差分（`drop_hit_evac_w` の doc 参照）。退避・頭を自駒で
+    // 埋める手が正、相手が歩を持つ局面で大駒を敵陣へ突っ込む手が負。
+    // 大半の候補は 0 なので gain のゼロ点は動かない
+    let drop_hit_evac = drop_hit_expo_before
+        .map(|before| params.drop_hit_evac_w * (before - own_effects.drop_hit_exposure))
+        .unwrap_or(0.0);
+
     // V5（盤上駒の減価、やねうら王 Lv2 で +R50）: 「同じ駒なら持ち駒のほうが
     // 価値が高い」。この手で**盤上に増えた自駒の価値**にだけ比例して引く
     // （打ち＝打った駒、成り＝増えたぶん。盤上の合計は定数なので持たない
@@ -3833,6 +3953,7 @@ fn evaluate(
     let gain = expected + advance_bias + development + coverage + probe + mate_threat - mate_risk
         - king_holes
         + link
+        + drop_hit_evac
         - board_discount
         + effect_value
         + blind_recapture
@@ -4461,6 +4582,79 @@ pub(crate) mod tests {
         let view = minimal_view(without_rook, HashMap::new());
         let expected = -2.0 * piece_value(Role::Rook);
         assert!((material_lead(&view) - expected).abs() < 1e-9);
+    }
+
+    #[test]
+    fn drop_hit_exposure_counts_open_headed_majors_in_enemy_camp() {
+        let vp = |file, rank, role| VisiblePiece {
+            square: crate::board::make_usi_square(Coord { file, rank }),
+            role,
+        };
+        // 先手の竜が2段目（敵陣）、頭=1段目が空き → 露出は竜の交換価値
+        let pieces = vec![vp(5, 2, Role::Dragon), vp(5, 9, Role::King)];
+        assert!(
+            (drop_hit_exposure(&pieces, Color::Sente) - exchange_value(Role::Dragon)).abs() < 1e-9
+        );
+        // 頭を自駒が塞ぐと露出ゼロ（相手はそこへ歩を打てない）
+        let pieces = vec![vp(5, 2, Role::Dragon), vp(5, 1, Role::Gold), vp(5, 9, Role::King)];
+        assert_eq!(drop_hit_exposure(&pieces, Color::Sente), 0.0);
+        // 最奥段は頭が盤外 → 露出ゼロ
+        let pieces = vec![vp(5, 1, Role::Dragon)];
+        assert_eq!(drop_hit_exposure(&pieces, Color::Sente), 0.0);
+        // 敵陣外（4段目）は数えない
+        let pieces = vec![vp(5, 4, Role::Dragon)];
+        assert_eq!(drop_hit_exposure(&pieces, Color::Sente), 0.0);
+        // 大駒以外は数えない
+        let pieces = vec![vp(5, 2, Role::Gold)];
+        assert_eq!(drop_hit_exposure(&pieces, Color::Sente), 0.0);
+        // 後手: 8七の竜の頭は8八（dragon-evac の実局面と同じ向き）
+        let pieces = vec![vp(8, 7, Role::Dragon)];
+        assert!(
+            (drop_hit_exposure(&pieces, Color::Gote) - exchange_value(Role::Dragon)).abs() < 1e-9
+        );
+        // 飛角馬も対象（角 @敵陣・頭空き）
+        let pieces = vec![vp(2, 3, Role::Bishop)];
+        assert!(
+            (drop_hit_exposure(&pieces, Color::Sente) - exchange_value(Role::Bishop)).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn own_effects_drop_hit_exposure_tracks_evacuation_and_blocking() {
+        let vp = |file, rank, role| VisiblePiece {
+            square: crate::board::make_usi_square(Coord { file, rank }),
+            role,
+        };
+        // 先手の竜が2二（敵陣）・頭2一空き、金を1枚持っている想定
+        let mut hand = HashMap::new();
+        hand.insert(Role::Gold, 1);
+        let view = minimal_view(vec![vp(2, 2, Role::Dragon), vp(5, 9, Role::King)], hand);
+        let params = EvalParams::default();
+        // 退避（2二→2六 = 敵陣外）で露出が消える
+        let evac = ShogiMove::Board {
+            from: Coord { file: 2, rank: 2 },
+            to: Coord { file: 2, rank: 6 },
+            promote: false,
+        };
+        assert_eq!(own_effects_after(&view, &evac, None, &params).drop_hit_exposure, 0.0);
+        // 無関係の手（玉を動かす）では露出が残る
+        let idle = ShogiMove::Board {
+            from: Coord { file: 5, rank: 9 },
+            to: Coord { file: 5, rank: 8 },
+            promote: false,
+        };
+        assert!(
+            (own_effects_after(&view, &idle, None, &params).drop_hit_exposure
+                - exchange_value(Role::Dragon))
+            .abs()
+                < 1e-9
+        );
+        // 頭（2一）へ持ち駒を打って塞ぐと露出が消える
+        let block = ShogiMove::Drop {
+            role: Role::Gold,
+            to: Coord { file: 2, rank: 1 },
+        };
+        assert_eq!(own_effects_after(&view, &block, None, &params).drop_hit_exposure, 0.0);
     }
 
     #[test]
