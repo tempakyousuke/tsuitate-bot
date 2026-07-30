@@ -1561,9 +1561,10 @@ impl Default for EvalParams {
             // 打ち当て露出（2026-07-30、dragon-evac）。未調整の新項なので
             // w スイープで決める
             drop_hit_evac_w: 0.0,
-            // 成りで増える利きのポテンシャル（2026-07-30）。未調整の新項なので
-            // w スイープで決める
-            promo_potential_w: 0.0,
+            // 成りで増える利きのポテンシャル（2026-07-30 採用）。w スイープの実測で
+            // 0.2（0.5 は垂れ歩の常用化・成り済み駒のマス好み副作用で過剰）。
+            // シナリオ大幅改善・ペアアリーナ3シード中立で採用（CLAUDE.md 参照）
+            promo_potential_w: 0.2,
         }
     }
 }
@@ -4865,8 +4866,12 @@ pub(crate) mod tests {
         let deep_pot = own_effects_after(&view, &deep, None, &params).promo_potential;
         let shallow_pot = own_effects_after(&view, &shallow, None, &params).promo_potential;
         assert!(deep_pot > shallow_pot, "deep={deep_pot} shallow={shallow_pot}");
-        // w=0 なら計算ごとスキップ（挙動不変の担保）
-        let off = own_effects_after(&view, &advance, None, &EvalParams::default());
+        // w=0 なら計算ごとスキップ（切り戻しノブの担保）
+        let params_off = EvalParams {
+            promo_potential_w: 0.0,
+            ..EvalParams::default()
+        };
+        let off = own_effects_after(&view, &advance, None, &params_off);
         assert_eq!(off.promo_potential, 0.0);
     }
 
