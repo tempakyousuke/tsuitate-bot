@@ -775,24 +775,6 @@ fn king_holes_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
     own_effects_after(view, mv, None, &EvalParams::default()).king_holes
 }
 
-/// 持ち駒の歩を成れる圏内（敵陣＋一段手前）へ打つ手か（1.0/0.0）。
-/// 打った直後の利きは1マスだが、次に成れば利きが6マスへ広がる索敵ユニットになり、
-/// 取り返されても相手に渡るのは歩1枚で反動が最小。重みは params.tokin_probe_w
-fn tokin_probe(view: &PlayerView, mv: &ShogiMove) -> f64 {
-    let ShogiMove::Drop {
-        role: Role::Pawn,
-        to,
-    } = *mv
-    else {
-        return 0.0;
-    };
-    let depth_from_back = match view.your_color {
-        Color::Sente => to.rank,
-        Color::Gote => 10 - to.rank,
-    };
-    if depth_from_back <= 4 { 1.0 } else { 0.0 }
-}
-
 /// アンチドロー（終盤の寄せ）: 増幅を始める手数（plies）
 const ANTI_DRAW_START: f64 = 60.0;
 /// 増幅が最大になる手数。アリーナの手数上限200の手前で全開にする
@@ -1020,13 +1002,6 @@ pub struct EvalParams {
     /// 着手後に自分が当たりを付けている敵駒の価値への重み（露出リスクの鏡像）。
     /// 1手読みでは見えない「次の駒得」（飛車頭への歩打ち等）を作る手に価値を与える
     pub threat_w: f64,
-    /// 桂馬の高跳び歩の餌食: 敵桂馬への攻撃マス（桂馬の直前1マス）への歩の
-    /// 接近を評価する重み。桂馬は後退できないので安い歩で追い詰めれば
-    /// 駒得が確定しやすい（人間レビューでの指摘: 序盤に安全に桂馬を狙う
-    /// 手段として大駒より歩が優先されるべき）。threat_w は着手直後に当たりが
-    /// 「付いている」手しか拾えない（1手読み）ため、複数手かけて歩を寄せる
-    /// 「狙いに行く」計画性は別項として持つ
-    pub knight_bait_w: f64,
     /// 探索ボーナス: 着地マスの敵駒有無について粒子が割れているほど加点。
     /// 取れても空振りでも観測が推定を絞る（情報の価値）
     pub info_bonus: f64,
@@ -1052,8 +1027,6 @@ pub struct EvalParams {
     pub king_probe_bonus: f64,
     /// 利き被覆1マスあたりの加点（自駒のみ考慮の近似被覆）
     pub coverage_w: f64,
-    /// 成れる圏内への歩打ちのと金ポテンシャル加点
-    pub tokin_probe_w: f64,
     /// 2手読みで静的リスク項をサンプル実測に置き換える割合（0=従来、1=全面置換）
     pub depth2_replace: f64,
     /// 2手読みで応手に王手を掛けられた場合のペナルティ
@@ -1314,9 +1287,6 @@ impl Default for EvalParams {
             prior_weight: 4.9065,
             prior_weight_degen: 7.9515,
             threat_w: 0.4586,
-            // 新項（2026-07-19、人間レビュー指摘を受けて追加）。0 = 従来と同一挙動。
-            // 未調整のため控えめな初期値。次のSPSAラウンドの調整対象
-            knight_bait_w: 0.15,
             info_bonus: 0.64,
             big_home_penalty: 0.3156,
             hand_drop_w: 0.0757,
@@ -1325,7 +1295,6 @@ impl Default for EvalParams {
             soft_decay: 0.6753,
             king_probe_bonus: 0.2451,
             coverage_w: 0.0013,
-            tokin_probe_w: 0.2025,
             depth2_replace: 0.6205,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
@@ -1399,7 +1368,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 56] = [
+    pub const SPECS: [ParamSpec; 54] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -1516,11 +1485,6 @@ impl EvalParams {
             hi: 1.0,
         },
         ParamSpec {
-            name: "knight_bait_w",
-            lo: 0.0,
-            hi: 1.0,
-        },
-        ParamSpec {
             name: "info_bonus",
             lo: 0.0,
             hi: 2.0,
@@ -1559,11 +1523,6 @@ impl EvalParams {
             name: "coverage_w",
             lo: 0.0,
             hi: 0.1,
-        },
-        ParamSpec {
-            name: "tokin_probe_w",
-            lo: 0.0,
-            hi: 1.0,
         },
         ParamSpec {
             name: "depth2_replace",
@@ -1726,7 +1685,6 @@ impl EvalParams {
             self.prior_weight,
             self.prior_weight_degen,
             self.threat_w,
-            self.knight_bait_w,
             self.info_bonus,
             self.big_home_penalty,
             self.hand_drop_w,
@@ -1735,7 +1693,6 @@ impl EvalParams {
             self.soft_decay,
             self.king_probe_bonus,
             self.coverage_w,
-            self.tokin_probe_w,
             self.depth2_replace,
             self.depth2_check_pen,
             self.depth2_recap_discount,
@@ -1788,39 +1745,37 @@ impl EvalParams {
             prior_weight: v[20],
             prior_weight_degen: v[21],
             threat_w: v[22],
-            knight_bait_w: v[23],
-            info_bonus: v[24],
-            big_home_penalty: v[25],
-            hand_drop_w: v[26],
-            backtrack_penalty: v[27],
-            shuffle_penalty: v[28],
-            soft_decay: v[29],
-            king_probe_bonus: v[30],
-            coverage_w: v[31],
-            tokin_probe_w: v[32],
-            depth2_replace: v[33],
-            depth2_check_pen: v[34],
-            depth2_recap_discount: v[35],
-            foul_diff_pow: v[36],
-            check_limit_accel: v[37],
-            value_nn_w: v[38],
-            checker_removal_w: v[39],
-            capture_bet_var_w: v[40],
-            mate_threat_w: v[41],
-            mate_risk_w: v[42],
-            king_hole_w: v[43],
-            link_w: v[44],
-            effect_own_w: v[45],
-            effect_opp_w: v[46],
-            link_work_w: v[47],
-            link_work_ref: v[48],
-            repeat_penalty_w: v[49],
-            plan_w: v[50],
-            board_discount_w: v[51],
-            check_strength_w: v[52],
-            escape_cover_w: v[53],
-            defender_capture_w: v[54],
-            drop_hit_evac_w: v[55],
+            info_bonus: v[23],
+            big_home_penalty: v[24],
+            hand_drop_w: v[25],
+            backtrack_penalty: v[26],
+            shuffle_penalty: v[27],
+            soft_decay: v[28],
+            king_probe_bonus: v[29],
+            coverage_w: v[30],
+            depth2_replace: v[31],
+            depth2_check_pen: v[32],
+            depth2_recap_discount: v[33],
+            foul_diff_pow: v[34],
+            check_limit_accel: v[35],
+            value_nn_w: v[36],
+            checker_removal_w: v[37],
+            capture_bet_var_w: v[38],
+            mate_threat_w: v[39],
+            mate_risk_w: v[40],
+            king_hole_w: v[41],
+            link_w: v[42],
+            effect_own_w: v[43],
+            effect_opp_w: v[44],
+            link_work_w: v[45],
+            link_work_ref: v[46],
+            repeat_penalty_w: v[47],
+            plan_w: v[48],
+            board_discount_w: v[49],
+            check_strength_w: v[50],
+            escape_cover_w: v[51],
+            defender_capture_w: v[52],
+            drop_hit_evac_w: v[53],
         }
     }
 }
@@ -3635,8 +3590,6 @@ fn evaluate(
         // 自分が敵駒に当たりを付けている価値（露出リスクの鏡像）。
         // 1手読みでは見えない「次の駒得」を作る手（大駒の頭への歩打ち等）に価値を与える
         v += params.threat_w * threat_value(&next, me);
-        // 桂馬の高跳び歩の餌食: 歩が敵桂馬の攻撃マスへ近づくほど加点
-        v += params.knight_bait_w * knight_bait_value(&next, me, mv);
 
         // 王の安全度と攻撃圧力（利き走査が重いので少数の粒子でだけ測って平均する）
         if pressure_n < pressure_samples {
@@ -3829,11 +3782,9 @@ fn evaluate(
     // 動かす手だけペナルティが軽くなるので、展開への勾配になる
     let development = -params.big_home_penalty * big_home_after(view, mv);
 
-    // 利き被覆（広い索敵網）と、成れる圏内への歩打ち（と金ポテンシャル）。
-    // どちらも粒子に依存しない自明な情報だけで計算できる
+    // 利き被覆（広い索敵網）。粒子に依存しない自明な情報だけで計算できる
     let own_effects = own_effects_after(view, mv, opp_king_w, params);
     let coverage = params.coverage_w * own_effects.coverage;
-    let probe = params.tokin_probe_w * tokin_probe(view, mv);
     // 自玉8近傍の支えの無いマス（V4）。自駒だけで決まるので粒子に依らない
     let king_holes = params.king_hole_w * own_effects.king_holes;
     // V3（予防的な紐、やねうら王 Lv7 で +R25）: 紐のついた自駒の価値合計。
@@ -3950,7 +3901,7 @@ fn evaluate(
         (0.0, 0.0)
     };
 
-    let gain = expected + advance_bias + development + coverage + probe + mate_threat - mate_risk
+    let gain = expected + advance_bias + development + coverage + mate_threat - mate_risk
         - king_holes
         + link
         + drop_hit_evac
@@ -4238,51 +4189,6 @@ fn threat_value(pos: &Position, me: Color) -> f64 {
         let defended = pos.is_attacked(sq, opp);
         let gain = exchange_value(piece.role) * if defended { 0.45 } else { 1.0 };
         best = best.max(gain);
-    }
-    best
-}
-
-/// 桂馬の高跳び歩の餌食: 敵桂馬への攻撃マス（桂馬の直前1マス。歩がそこに
-/// いれば次に桂馬を取れる）へ、着手した歩がどれだけ近づいたかを評価する。
-/// 桂馬は後退できないので、安い歩で追い詰められれば駒得がほぼ確定する
-/// （人間レビューでの指摘: 序盤の桂馬狙いは大駒より歩を優先すべき）。
-/// BFS距離（deduce、多段ガイドと同じ空盤近似の下限）が縮むほど指数的に
-/// 加点し、攻撃マスに直接着地した手（距離0）が最大。
-/// `min_moves_empty_board(..., want_promoted=false)` は「成っても不成でも
-/// 良いなら最短」であり成り駒（金型移動）経由で筋を跨げてしまうため、
-/// ここでは `distance_empty_board` から不成状態の距離だけを直接引く
-/// （歩が本当に同じ筋を歩数だけ進む距離。筋違いの桂馬には自然に届かない）
-fn knight_bait_value(next: &Position, me: Color, mv: &ShogiMove) -> f64 {
-    let to = match *mv {
-        ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
-    };
-    // 着手後にそのマスにいる駒が歩でなければ関係ない（成った歩=と金も除外）
-    if !next.piece_at(to).is_some_and(|p| p.role == Role::Pawn) {
-        return 0.0;
-    }
-    let opp = me.other();
-    let mut best = 0.0f64;
-    for (sq, piece) in next.pieces() {
-        if piece.color != opp || piece.role != Role::Knight {
-            continue;
-        }
-        let attack_rank = match me {
-            Color::Sente => sq.rank + 1,
-            Color::Gote => sq.rank - 1,
-        };
-        if !(1..=9).contains(&attack_rank) {
-            continue;
-        }
-        let attack_sq = Coord {
-            file: sq.file,
-            rank: attack_rank,
-        };
-        let Some(dist) = crate::deduce::distance_empty_board(Role::Pawn, me, to, attack_sq, false)
-        else {
-            continue;
-        };
-        let decay = 0.6f64.powi(dist as i32);
-        best = best.max(exchange_value(Role::Knight) * decay);
     }
     best
 }
@@ -4658,79 +4564,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn knight_bait_rewards_pawn_on_attack_square_only() {
-        // 後手番。先手桂馬が3七（file3,rank7）にいる → 攻撃マスは3六（file3,rank6）
-        let knight_sq = Coord { file: 3, rank: 7 };
-        let attack_sq = Coord { file: 3, rank: 6 };
-        let mut next = Position::empty(Color::Sente);
-        next.set(
-            knight_sq,
-            Some(crate::shogi::Piece {
-                color: Color::Sente,
-                role: Role::Knight,
-            }),
-        );
-        next.set(
-            attack_sq,
-            Some(crate::shogi::Piece {
-                color: Color::Gote,
-                role: Role::Pawn,
-            }),
-        );
-        let mv = ShogiMove::Drop {
-            role: Role::Pawn,
-            to: attack_sq,
-        };
-        let v = knight_bait_value(&next, Color::Gote, &mv);
-        assert!((v - exchange_value(Role::Knight)).abs() < 1e-9, "v={v}");
-
-        // 違う筋への歩打ちは桂馬に届かないのでゼロ
-        let off_file = Coord { file: 7, rank: 6 };
-        let mut next2 = Position::empty(Color::Sente);
-        next2.set(
-            knight_sq,
-            Some(crate::shogi::Piece {
-                color: Color::Sente,
-                role: Role::Knight,
-            }),
-        );
-        next2.set(
-            off_file,
-            Some(crate::shogi::Piece {
-                color: Color::Gote,
-                role: Role::Pawn,
-            }),
-        );
-        let mv2 = ShogiMove::Drop {
-            role: Role::Pawn,
-            to: off_file,
-        };
-        assert_eq!(knight_bait_value(&next2, Color::Gote, &mv2), 0.0);
-
-        // 歩以外の駒（例: 香）を敵桂馬の攻撃マスへ打ってもゼロ（歩限定）
-        let mut next3 = Position::empty(Color::Sente);
-        next3.set(
-            knight_sq,
-            Some(crate::shogi::Piece {
-                color: Color::Sente,
-                role: Role::Knight,
-            }),
-        );
-        next3.set(
-            attack_sq,
-            Some(crate::shogi::Piece {
-                color: Color::Gote,
-                role: Role::Lance,
-            }),
-        );
-        let mv3 = ShogiMove::Drop {
-            role: Role::Lance,
-            to: attack_sq,
-        };
-        assert_eq!(knight_bait_value(&next3, Color::Gote, &mv3), 0.0);
-    }
-
-    #[test]
     fn combine_score_handles_gain_signs() {
         // 正のgain: p_legal で割り引かれる
         assert!((combine_score(2.0, 0.5, 0.0) - 1.0).abs() < 1e-9);
@@ -4804,7 +4637,6 @@ pub(crate) mod tests {
 
         assert_field_index!(check_bonus);
         assert_field_index!(foul_cost_base);
-        assert_field_index!(knight_bait_w);
         assert_field_index!(depth2_replace);
         assert_field_index!(check_limit_accel);
         assert_field_index!(check_strength_w);
@@ -5198,15 +5030,6 @@ pub(crate) mod tests {
         assert_eq!(holes, 8.0, "玉自身の利きは支えに数えない: {holes}");
     }
 
-    #[test]
-    fn tokin_probe_rewards_pawn_drops_near_promotion_zone() {
-        let view = minimal_view(vec![], HashMap::new());
-        // 成れる圏内（先手なら 4段目以浅）への歩打ちだけ加点
-        assert!(tokin_probe(&view, &parse_usi("P*3d").unwrap()) > 0.0);
-        assert_eq!(tokin_probe(&view, &parse_usi("P*3f").unwrap()), 0.0);
-        // 歩以外の打ちには付かない
-        assert_eq!(tokin_probe(&view, &parse_usi("G*3d").unwrap()), 0.0);
-    }
 
     /// 相手玉を kf筋・自陣に歩を1枚置いた盤（指紋がユニークになるよう pawn_sq を変える）
     fn synth_position(king_file: i8, pawn_rank: i8) -> Position {
