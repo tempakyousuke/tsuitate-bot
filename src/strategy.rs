@@ -2509,6 +2509,16 @@ impl Strategy for EstimatorStrategy {
         // 質量が乗っていたが、演繹上は 3d/4e/5a/5e/6a/6b/6c の7マスしかあり得ない）。
         // **棄却ではなく移動**なのは、玉位置の質量を潰す事故を避けるため（ansatsu 回帰の教訓）
         let opp_color = view.your_color.other();
+        // 玉位置ネットの分布（king_belief_nn）。ノブが両方0（既定）なら評価もしない。
+        // 使うのはブラインド決定だけ（belief_gain_w と同じ規約）
+        let net_king_dist: Vec<(Coord, f64)> =
+            if sample.is_empty() && (king_net_w() > 0.0 || king_net_proj()) {
+                let ctx = crate::belief_features::BeliefContext::from_log(view.your_color, log);
+                let cands = crate::deduce::opp_king_candidates(view.your_color, log);
+                crate::king_belief_nn::king_distribution(&ctx, &cands)
+            } else {
+                vec![]
+            };
         let taint_owned: Vec<(Position, f64)> = if sample.is_empty() {
             let mut pool = taint_particles(est);
             if pool.len() > TAINT_POOL_CAP {
@@ -2522,7 +2532,9 @@ impl Strategy for EstimatorStrategy {
                 pool.iter().map(|&(p, w)| (p.clone(), w)).collect()
             } else {
                 let cands = crate::deduce::opp_king_candidates(view.your_color, log);
-                project_taint_kings(&pool, &cands, opp_color)
+                let net = (king_net_proj() && !net_king_dist.is_empty())
+                    .then_some(net_king_dist.as_slice());
+                project_taint_kings(&pool, &cands, opp_color, net)
             }
         } else {
             vec![]
@@ -2606,10 +2618,18 @@ impl Strategy for EstimatorStrategy {
         // 特定しない「マスへの利き枚数密度」（ユーザーの実際の推論=
         // 「５七への相手利き≥2枚の確率が低い」に対応）は blind_hang_risk が
         // 受け（ハング回避）に使う
-        let blind_king_dist: Vec<(Coord, f64)> = if taint_pool.is_empty() {
-            vec![]
-        } else {
-            taint_king_distribution(&taint_pool, opp_color)
+        let blind_king_dist: Vec<(Coord, f64)> = {
+            let taint_dist = if taint_pool.is_empty() {
+                vec![]
+            } else {
+                taint_king_distribution(&taint_pool, opp_color)
+            };
+            // 玉位置ネットのブレンド（`king_net_w` 参照。既定 0 = 従来挙動）
+            if king_net_w() > 0.0 && !net_king_dist.is_empty() {
+                blend_king_dist(&taint_dist, &net_king_dist, king_net_w())
+            } else {
+                taint_dist
+            }
         };
         // 着地マスごとの被覆度をキャッシュ（成り/不成の同一着地マス等での
         // 重複走査を避ける）
@@ -3275,6 +3295,70 @@ fn belief_gain_w() -> f64 {
     })
 }
 
+/// 玉位置ネット（king_belief_nn = 候補集合内 softmax のカテゴリカル分布）を
+/// **厳密粒子ゼロの決定でだけ**ブラインド玉攻めの玉位置分布へブレンドする係数 λ。
+/// 既定 0 = ネットを評価すらしない（挙動不変）。`TSUITATE_KING_NET_W` で上書き
+/// （凍結版は知らない名前 = `-f env=` は候補側にだけ効く）。
+///
+/// 位置づけ: 段階②の pointwise 信念ネットは「マスごとの独立確率」なので
+/// 玉1枚の同時分布を表現できなかった（belief-net-stage2 の保留理由の一つ）。
+/// 玉位置は攻めの律速と特定済み（v2-bottleneck-is-king-belief）なので、
+/// 玉に特化したカテゴリカル分布として学習し直した。
+/// 供給先は `blind_king_dist`（taint 粒子の玉位置分布とのブレンド）:
+/// p = (1−λ)·p_taint + λ·p_net。taint が空でもネットだけで供給できる
+fn king_net_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_KING_NET_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 1.0))
+            .unwrap_or(0.0)
+    })
+}
+
+/// 玉位置ネットで taint 粒子の玉移設先を選ぶ（`project_taint_kings` の誘導）。
+/// **既定 on**（`TSUITATE_KING_NET_PROJ=0` で従来の最近傍移動へ切り戻し。
+/// TAINT_KING_FIX と同じ規約、凍結版は知らない名前）。有効時は移設が必要な
+/// 粒子を、ネット分布の CDF を等間隔の分位点で引いて割り当てる
+/// （決定的・分布比例。全部 argmax に集めると玉位置の多様性が潰れる）。
+///
+/// 実測（2026-07-31、ペア3シード 200局×3 vs v13、match_seed=20260801〜03）:
+/// 56.0/61.5/53.0 = **56.8% vs 対照（main）50.2%（+6.7pt、3シード全て対照以上）**。
+/// ガントレット（100局）v6 90.4 / v7 75.0 / v8 73.1 / v9 69.2 / v10 71.2 /
+/// v11 59.6 / v12 60.6 / v13 51.0%。反則/局・手数・思考時間は変質なし。
+/// ブレンド（king_net_w）は単独中立・投影との複合では投影の利得を打ち消す
+/// （50.8%）ため既定0のまま
+fn king_net_proj() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !std::env::var("TSUITATE_KING_NET_PROJ").is_ok_and(|v| v == "0"))
+}
+
+/// taint 玉位置分布とネット分布のブレンド: p = (1−λ)·p_taint + λ·p_net。
+/// どちらも正規化済みなので結果も正規化されている（taint が空なら実質ネットのみ）
+fn blend_king_dist(
+    taint: &[(Coord, f64)],
+    net: &[(Coord, f64)],
+    lambda: f64,
+) -> Vec<(Coord, f64)> {
+    let mut acc: std::collections::BTreeMap<(i8, i8), f64> = std::collections::BTreeMap::new();
+    let taint_total: f64 = taint.iter().map(|(_, p)| p).sum();
+    for (c, p) in taint {
+        *acc.entry((c.file, c.rank)).or_insert(0.0) += (1.0 - lambda) * p;
+    }
+    for (c, p) in net {
+        *acc.entry((c.file, c.rank)).or_insert(0.0) += lambda * p;
+    }
+    let z: f64 = if taint_total > 0.0 { 1.0 } else { lambda };
+    if z <= 0.0 {
+        return vec![];
+    }
+    acc.into_iter()
+        .map(|((file, rank), p)| (Coord { file, rank }, p / z))
+        .collect()
+}
+
 /// ブラインド時に使う「盤上に残っている相手駒の平均交換価値」。
 /// `blind_recapture_target` の駒種会計と同じもの（あちらはマスとセットで返す）
 fn blind_capture_estimate(view: &PlayerView, log: &ObservationLog) -> f64 {
@@ -3323,21 +3407,51 @@ const TAINT_POOL_CAP: usize = 256;
 ///
 /// 移動先は現在位置から最も近い候補（チェビシェフ距離、同点は決定的に file→rank 順）。
 /// その粒子で移動先に相手駒が居れば**入れ替える**（駒種の多重集合＝持ち駒会計を壊さない）。
+///
+/// `net` が Some（`TSUITATE_KING_NET_PROJ=1`）なら、移設先を最近傍でなく
+/// 玉位置ネットの分布から選ぶ: 移設が必要な粒子（重み降順で数えた通し番号 j）に
+/// CDF^{-1}((j+0.5)/m) の候補マスを割り当てる（決定的な分位点サンプル =
+/// 分布に比例した割り当てで、全部を argmax に集めて多様性を潰さない）
 fn project_taint_kings(
     pool: &[(&Position, f64)],
     cands: &std::collections::BTreeSet<Coord>,
     opp: Color,
+    net: Option<&[(Coord, f64)]>,
 ) -> Vec<(Position, f64)> {
+    // ネット誘導時は「移設が必要な粒子の数」を先に数えて分位点を等間隔に切る
+    let need_move = |pos: &Position| -> Option<Coord> {
+        let k = pos.king_square(opp)?;
+        (!cands.is_empty() && !cands.contains(&k)).then_some(k)
+    };
+    let movers = net.map(|_| pool.iter().filter(|(p, _)| need_move(p).is_some()).count());
+    let mut mover_idx = 0usize;
     pool.iter()
         .map(|&(pos, w)| {
-            let Some(k) = pos.king_square(opp) else {
+            let Some(k) = need_move(pos) else {
                 return (pos.clone(), w);
             };
-            if cands.is_empty() || cands.contains(&k) {
-                return (pos.clone(), w);
-            }
-            let dist = |a: Coord, b: Coord| (a.file - b.file).abs().max((a.rank - b.rank).abs());
-            let Some(&t) = cands.iter().min_by_key(|&&c| dist(c, k)) else {
+            let target = match (net, movers) {
+                (Some(dist), Some(m)) if m > 0 => {
+                    let u = (mover_idx as f64 + 0.5) / m as f64;
+                    mover_idx += 1;
+                    let mut acc = 0.0f64;
+                    let mut chosen = dist.last().map(|(c, _)| *c);
+                    for (c, p) in dist {
+                        acc += p;
+                        if acc >= u {
+                            chosen = Some(*c);
+                            break;
+                        }
+                    }
+                    chosen
+                }
+                _ => {
+                    let dist =
+                        |a: Coord, b: Coord| (a.file - b.file).abs().max((a.rank - b.rank).abs());
+                    cands.iter().min_by_key(|&&c| dist(c, k)).copied()
+                }
+            };
+            let Some(t) = target else {
                 return (pos.clone(), w);
             };
             let mut next = pos.clone();
@@ -5516,6 +5630,74 @@ pub(crate) mod tests {
             belief_gain_w(),
             0.0,
             "TSUITATE_BELIEF_GAIN_W の既定は0（挙動不変）でなければならない"
+        );
+    }
+
+    /// 玉位置ネットの既定: ブレンドは無効（単独中立・投影と複合すると
+    /// 投影の利得を打ち消す）、投影は有効（ペア3シード +6.7pt で採用）
+    #[test]
+    fn king_net_defaults() {
+        assert_eq!(
+            king_net_w(),
+            0.0,
+            "TSUITATE_KING_NET_W の既定は0（ブレンドは不採用）でなければならない"
+        );
+        assert!(
+            king_net_proj(),
+            "TSUITATE_KING_NET_PROJ の既定は on（2026-07-31 採用。=0 で切り戻し）"
+        );
+    }
+
+    /// blend_king_dist: λ=0.5 の混合が正規化を保ち、taint 空ならネットのみになる
+    #[test]
+    fn blend_king_dist_normalizes() {
+        let a = Coord { file: 5, rank: 1 };
+        let b = Coord { file: 5, rank: 2 };
+        let taint = vec![(a, 1.0)];
+        let net = vec![(a, 0.25), (b, 0.75)];
+        let mixed = blend_king_dist(&taint, &net, 0.5);
+        let total: f64 = mixed.iter().map(|(_, p)| p).sum();
+        assert!((total - 1.0).abs() < 1e-9, "正規化が壊れた: {total}");
+        let pa = mixed.iter().find(|(c, _)| *c == a).unwrap().1;
+        assert!((pa - (0.5 + 0.5 * 0.25)).abs() < 1e-9);
+        // taint 空: ネット分布そのもの
+        let only_net = blend_king_dist(&[], &net, 0.3);
+        let pb = only_net.iter().find(|(c, _)| *c == b).unwrap().1;
+        assert!((pb - 0.75).abs() < 1e-9);
+    }
+
+    /// ネット誘導の玉移設: 分位点割り当てが分布に比例し、候補内に収まる
+    #[test]
+    fn project_taint_kings_follows_net_distribution() {
+        // 敵玉だけ 9i に居る粒子を4つ用意し、候補 {5a,5b}・ネット {5a:0.75, 5b:0.25}
+        // へ移設する → 3粒子が 5a、1粒子が 5b に割り当たるはず
+        let mut pos = Position::empty(Color::Sente);
+        let k = Coord { file: 9, rank: 9 };
+        pos.set(
+            k,
+            Some(crate::shogi::Piece {
+                color: Color::Gote,
+                role: Role::King,
+            }),
+        );
+        let pool: Vec<(&Position, f64)> = vec![(&pos, 1.0); 4];
+        let a = Coord { file: 5, rank: 1 };
+        let b = Coord { file: 5, rank: 2 };
+        let cands: std::collections::BTreeSet<Coord> = [a, b].into_iter().collect();
+        let net = vec![(a, 0.75), (b, 0.25)];
+        let out = project_taint_kings(&pool, &cands, Color::Gote, Some(&net));
+        let kings: Vec<Coord> = out
+            .iter()
+            .filter_map(|(p, _)| p.king_square(Color::Gote))
+            .collect();
+        assert_eq!(kings.iter().filter(|&&c| c == a).count(), 3);
+        assert_eq!(kings.iter().filter(|&&c| c == b).count(), 1);
+        // ネット無しは従来どおり最近傍（9i から近いのは 5b = rank 差が小さい方…
+        // チェビシェフ距離は 5a が max(4,8)=8・5b が max(4,7)=7 なので 5b）
+        let out = project_taint_kings(&pool, &cands, Color::Gote, None);
+        assert!(
+            out.iter()
+                .all(|(p, _)| p.king_square(Color::Gote) == Some(b))
         );
     }
 

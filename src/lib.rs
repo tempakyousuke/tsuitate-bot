@@ -14,6 +14,7 @@ pub mod effect_profile;
 pub mod frozen;
 pub mod hits;
 pub mod kifu;
+pub mod king_belief_nn;
 pub mod likelihood;
 pub mod mate;
 pub mod model;

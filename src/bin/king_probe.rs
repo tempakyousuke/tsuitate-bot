@@ -14,6 +14,9 @@
 //!   cargo run --release --bin king_probe -- [--stride N] [--budget MS] [--seed S] \
 //!       [--max-games N] <records/*.jsonl...>
 
+use tsuitate_bot::belief_features::BeliefContext;
+use tsuitate_bot::deduce::opp_king_candidates;
+use tsuitate_bot::king_belief_nn::king_distribution;
 use tsuitate_bot::protocol::Color;
 use tsuitate_bot::scenario_core::{IncrementalEstimator, weighted_unique_particles};
 use tsuitate_bot::truth_replay::{for_each_decision, load_end};
@@ -74,6 +77,13 @@ fn main() {
     let mut all = Score::default();
     let mut strict_only = Score::default();
     let mut blind_all = Score::default();
+    // 玉位置ネット（king_belief_nn）。粒子と**同一の決定点**で測る（ゲート1）
+    let mut net_all = Score::default();
+    let mut net_blind = Score::default();
+    // ブレンド p=(1−λ)·p_taint+λ·p_net の λ 選定用（供給先 blind_king_dist と
+    // 同じ量になるのはブラインド決定点だけなので、そこだけ測る）
+    const LAMBDAS: [f64; 3] = [0.25, 0.5, 0.75];
+    let mut blend_blind: [Score; 3] = Default::default();
     let mut decisions = 0u64;
     let mut blind_decisions = 0u64;
     let mut games = 0u64;
@@ -136,9 +146,40 @@ fn main() {
             if strict_total > 0.0 {
                 strict_only.add(strict_true / strict_total, top1);
             }
+            // 玉位置ネット（同一決定点）
+            let ctx = BeliefContext::from_log(side, log);
+            let cands = opp_king_candidates(side, log);
+            let net = king_distribution(&ctx, &cands);
+            let p_net = net
+                .iter()
+                .find(|(c, _)| *c == true_king)
+                .map_or(0.0, |(_, p)| *p);
+            let net_top1 = net
+                .iter()
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .is_some_and(|(c, _)| *c == true_king);
+            net_all.add(p_net, net_top1);
             if n_strict == 0 {
                 blind_decisions += 1;
                 blind_all.add(p_all, top1);
+                net_blind.add(p_net, net_top1);
+                // ブレンド（粒子分布は per_sq を正規化して使う）
+                for (li, &lambda) in LAMBDAS.iter().enumerate() {
+                    let mut mix: std::collections::HashMap<tsuitate_bot::board::Coord, f64> =
+                        std::collections::HashMap::new();
+                    for (&sq, &m) in &per_sq {
+                        *mix.entry(sq).or_insert(0.0) += (1.0 - lambda) * m / mass_total;
+                    }
+                    for (sq, p) in &net {
+                        *mix.entry(*sq).or_insert(0.0) += lambda * p;
+                    }
+                    let p_mix = mix.get(&true_king).copied().unwrap_or(0.0);
+                    let mix_top1 = mix
+                        .iter()
+                        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
+                        .is_some_and(|(sq, _)| *sq == true_king);
+                    blend_blind[li].add(p_mix, mix_top1);
+                }
             }
         });
         if !ok {
@@ -156,4 +197,9 @@ fn main() {
     all.report("全粒子（taint込み）");
     strict_only.report("厳密のみ（厳密が生きている決定点だけ）");
     blind_all.report("全粒子／厳密ゼロの決定点だけ");
+    net_all.report("玉位置ネット（全決定点）");
+    net_blind.report("玉位置ネット／厳密ゼロの決定点だけ");
+    for (li, &lambda) in LAMBDAS.iter().enumerate() {
+        blend_blind[li].report(&format!("ブレンド λ={lambda}／厳密ゼロの決定点だけ"));
+    }
 }
