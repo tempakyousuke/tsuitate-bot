@@ -1564,7 +1564,7 @@ impl Default for EvalParams {
             threat_w: 0.4586,
             info_bonus: 0.64,
             big_home_penalty: 0.3156,
-            hand_drop_w: 0.0757,
+            hand_drop_w: 0.015,
             backtrack_penalty: 0.3685,
             shuffle_penalty: 0.2996,
             soft_decay: 0.6753,
@@ -1631,13 +1631,14 @@ impl Default for EvalParams {
             // 打ち当て露出（2026-07-30、dragon-evac）。未調整の新項なので
             // w スイープで決める
             drop_hit_evac_w: 0.0,
-            // 成りで増える利きのポテンシャル（2026-07-30 採用）。w スイープの実測で
-            // 0.2（0.5 は垂れ歩の常用化・成り済み駒のマス好み副作用で過剰）。
-            // シナリオ大幅改善・ペアアリーナ3シード中立で採用（CLAUDE.md 参照）
-            promo_potential_w: 0.2,
-            // 持ち駒のオプション価値（2026-07-30）。未調整の新項なので
-            // w スイープで決める
-            hand_option_w: 0.0,
+            // 成りで増える利きのポテンシャル（2026-07-30 採用、当初 0.2）。
+            // シナリオ目的SPSA第1ラン（tuning/tune-scn-drop-economy.jsonl）の
+            // 収束点で 0.33 へ（hand_option_w との同時調整。hand_drop_w の
+            // 打ち一般加点をほぼゼロにして hand_option_w の減点と役割分担）
+            promo_potential_w: 0.33,
+            // 持ち駒のオプション価値（2026-07-30 実装）。単体 w=1.0 はアリーナ微負で
+            // 既定0だったが、シナリオ目的SPSAの収束点 0.77（上記3ノブ同時）で再挑戦
+            hand_option_w: 0.77,
         }
     }
 }
