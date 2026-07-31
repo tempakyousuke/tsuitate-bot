@@ -3319,13 +3319,20 @@ fn king_net_w() -> f64 {
 }
 
 /// 玉位置ネットで taint 粒子の玉移設先を選ぶ（`project_taint_kings` の誘導）。
-/// 既定 off = 従来どおり最近傍の候補マスへ移動。`TSUITATE_KING_NET_PROJ=1` で有効
-/// （凍結版は知らない名前）。有効時は移設が必要な粒子を、ネット分布の CDF を
-/// 等間隔の分位点で引いて割り当てる（決定的・分布比例。全部 argmax に集めると
-/// 玉位置の多様性が潰れる）
+/// **既定 on**（`TSUITATE_KING_NET_PROJ=0` で従来の最近傍移動へ切り戻し。
+/// TAINT_KING_FIX と同じ規約、凍結版は知らない名前）。有効時は移設が必要な
+/// 粒子を、ネット分布の CDF を等間隔の分位点で引いて割り当てる
+/// （決定的・分布比例。全部 argmax に集めると玉位置の多様性が潰れる）。
+///
+/// 実測（2026-07-31、ペア3シード 200局×3 vs v13、match_seed=20260801〜03）:
+/// 56.0/61.5/53.0 = **56.8% vs 対照（main）50.2%（+6.7pt、3シード全て対照以上）**。
+/// ガントレット（100局）v6 90.4 / v7 75.0 / v8 73.1 / v9 69.2 / v10 71.2 /
+/// v11 59.6 / v12 60.6 / v13 51.0%。反則/局・手数・思考時間は変質なし。
+/// ブレンド（king_net_w）は単独中立・投影との複合では投影の利得を打ち消す
+/// （50.8%）ため既定0のまま
 fn king_net_proj() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_KING_NET_PROJ").is_ok_and(|v| v == "1"))
+    *V.get_or_init(|| !std::env::var("TSUITATE_KING_NET_PROJ").is_ok_and(|v| v == "0"))
 }
 
 /// taint 玉位置分布とネット分布のブレンド: p = (1−λ)·p_taint + λ·p_net。
@@ -5626,15 +5633,19 @@ pub(crate) mod tests {
         );
     }
 
-    /// 玉位置ネットの供給も既定では無効（挙動不変）
+    /// 玉位置ネットの既定: ブレンドは無効（単独中立・投影と複合すると
+    /// 投影の利得を打ち消す）、投影は有効（ペア3シード +6.7pt で採用）
     #[test]
-    fn king_net_is_disabled_by_default() {
+    fn king_net_defaults() {
         assert_eq!(
             king_net_w(),
             0.0,
-            "TSUITATE_KING_NET_W の既定は0（挙動不変）でなければならない"
+            "TSUITATE_KING_NET_W の既定は0（ブレンドは不採用）でなければならない"
         );
-        assert!(!king_net_proj(), "TSUITATE_KING_NET_PROJ の既定は off");
+        assert!(
+            king_net_proj(),
+            "TSUITATE_KING_NET_PROJ の既定は on（2026-07-31 採用。=0 で切り戻し）"
+        );
     }
 
     /// blend_king_dist: λ=0.5 の混合が正規化を保ち、taint 空ならネットのみになる

@@ -355,19 +355,29 @@
     `_GAIN_W` は厳密粒子ゼロの決定での gain 供給。**どれも単体では勝率中立**
     （実測は docs/nn-stage2-belief-net.md）。0 のときはネットを評価すらしない。
     凍結版はこれらの名前を知らないので `-f env=` は候補側にだけ効く
-  - `TSUITATE_KING_NET_W` / `TSUITATE_KING_NET_PROJ`（どちらも既定 0/off = 挙動不変）—
-    **玉位置ネット**（`king_belief_nn.rs`、2026-07-31）。段階②の pointwise ネットが
-    表現できない「玉1枚の同時分布」を、`deduce::opp_king_candidates`（健全な候補
-    集合）− 自駒マスの上の softmax として学習したカテゴリカル分布。教師は
-    アリーナ2400局（`bin/export_king_belief_data`、健全性違反0）、学習は
-    tsuitate-nn の train_king_belief.py（4シードで val NLL 1.73〜1.83 /
-    top1 44.6〜47.3%、一様対照 3.40 / 4.1%）。供給は**厳密粒子ゼロの決定のみ**:
-    `_W`（λ∈[0,1]）は `blind_king_dist`（ブラインド玉攻めの玉位置分布）への
-    ブレンド p=(1−λ)·p_taint+λ·p_net（taint 空でもネットだけで供給可）、
-    `_PROJ=1` は `project_taint_kings` の玉移設先を最近傍でなくネット分布の
-    分位点サンプルで選ぶ（決定的・分布比例、argmax 集中で多様性を潰さない）。
-    オフライン診断は `king_probe`（ネット列を常設。粒子と同一決定点で比較）。
-    凍結版はこの名前を知らない
+  - `TSUITATE_KING_NET_PROJ`（**既定 on**、0 で従来挙動へ切り戻し）/
+    `TSUITATE_KING_NET_W`（既定 0 = 無効）— **玉位置ネット**（`king_belief_nn.rs`、
+    2026-07-31 採用）。段階②の pointwise ネットが表現できない「玉1枚の同時分布」を、
+    `deduce::opp_king_candidates`（健全な候補集合）− 自駒マスの上の softmax として
+    学習したカテゴリカル分布。教師はアリーナ2400局（`bin/export_king_belief_data`、
+    健全性違反0 = deduce の実データ全量検証を兼ねた）、学習は tsuitate-nn の
+    train_king_belief.py（4シードで val NLL 1.73〜1.83 / top1 44.6〜47.3%、
+    一様対照 3.40 / 4.1%）。供給は**厳密粒子ゼロの決定のみ**:
+    - `_PROJ`（採用）= `project_taint_kings` の玉移設先を最近傍でなくネット分布の
+      分位点サンプルで選ぶ（決定的・分布比例、argmax 集中で多様性を潰さない）。
+      実測（ペア3シード 200局×3 vs v13、match_seed=20260801〜03）:
+      **56.0/61.5/53.0 = 56.8% vs 対照（main）50.2%（+6.7pt、3シード全て対照以上）**、
+      ガントレット v6 90.4 / v7 75.0 / v8 73.1 / v9 69.2 / v10 71.2 / v11 59.6 /
+      v12 60.6 / v13 51.0%（100局）。反則/局・手数・思考時間・シナリオ suite は変質なし
+    - `_W`（λ、不採用のまま）= `blind_king_dist`（ブラインド玉攻めの玉位置分布）への
+      ブレンド p=(1−λ)·p_taint+λ·p_net。オフラインではブラインドの対数損失を
+      3.85→2.01 に半減させるが、アリーナは単独中立（50.7%）で、**投影と複合すると
+      投影の利得まで打ち消す**（50.8%）ため既定0。較正の良い分布を gain 側の
+      攻め先重みに足すより、粒子盤面そのものを直す投影が深く効く
+      （mate_pool・CheckSolver 投票・被覆度へ波及する）
+    オフライン診断は `king_probe`（ネット列・ブレンド λ 列を常設。粒子と同一決定点で
+    比較。実測: ブラインド top1 は粒子 42.1% > ネット単独 28.1%、対数損失は
+    ネット 2.14 ≪ 粒子 3.85 = 役割分担）。凍結版はこの名前を知らない
   - `TSUITATE_STRATEGY`（既定 `estimator`。旧来の単純botは `heuristic`）
   - `TSUITATE_QUEUE_RETRY_MS`（既定 60000）: キュー参加拒否・受付終了後の再試行間隔
   - `TSUITATE_RECORD_DIR`（既定 `records`。空文字で無効）: 対局記録（JSONL）の出力先。
