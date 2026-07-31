@@ -127,13 +127,7 @@ fn print_tally(sc: &Scenario, stats: &ChoiceStats, trials: u64) {
         println!("  {usi}: {n}/{trials}{mark}");
     }
     if !sc.bad.is_empty() {
-        let bad_hits: u32 = stats
-            .tally
-            .iter()
-            .filter(|(usi, _)| sc.bad.iter().any(|b| b == usi))
-            .map(|(_, n)| *n)
-            .sum();
-        println!("不合格計: {bad_hits}/{trials}");
+        println!("不合格計: {}/{trials}", stats.bad_hits(&sc.bad));
     }
     println!("追加の反則の総数: {}", stats.total_fouls);
 }
@@ -669,13 +663,7 @@ fn run_suite(trials: u64, name: &str) {
         let bad_note = if sc.bad.is_empty() {
             String::new()
         } else {
-            let bad_hits: u32 = stats
-                .tally
-                .iter()
-                .filter(|(usi, _)| sc.bad.iter().any(|b| b == usi))
-                .map(|(_, n)| *n)
-                .sum();
-            format!(" 不合格計 {bad_hits}/{trials}")
+            format!(" 不合格計 {}/{trials}", stats.bad_hits(&sc.bad))
         };
         println!(
             "{:<12} {}手目 注目手 {:<6} {hits}/{trials}{bad_note} 反則{} 他: {}",

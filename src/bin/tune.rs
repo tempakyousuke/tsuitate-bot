@@ -15,6 +15,15 @@
 //! 使い方:
 //!   cargo run --release --bin tune -- [反復数=40] [評価あたり対局数=60] [基準...=estimator_v7]
 //!
+//! シナリオ目的モード（TUNE_OBJECTIVE=scenario）:
+//!   TUNE_OBJECTIVE=scenario cargo run --release --bin tune -- [反復数=40] [シナリオあたり試行数=10]
+//! 目的関数がアリーナのスコア率でなく **シナリオの不合格計**
+//! （score = 1 − 不合格計/(シナリオ数×試行数)）になる。対象は TUNE_SCENARIOS
+//! （既定は悪手8件）。基準戦略は不要（指定するとエラー）。シナリオ試行の
+//! シードは 0..trials の固定列なので f+/f− は自動的に共通乱数ペアになる。
+//! **過学習に注意**: 対象シナリオは少数の実戦局面なので、TUNE_PARAMS で
+//! 数次元に絞って使い、採用判定は従来どおり CI の200局ガントレットで行うこと
+//!
 //! - 進捗と各反復のパラメータは TUNE_LOG（既定 tune-log.jsonl）に追記する
 //! - **再開**: ログが存在すれば最後の反復のθから自動で続きを実行する。
 //!   再開時は start イベントの設定（基準・局数・定跡固定・思考予算・
@@ -26,8 +35,12 @@
 //! 環境変数:
 //! - TUNE_LOG: ログファイルのパス（既定 tune-log.jsonl。実験ごとに分ける）
 //! - TUNE_SEED: ランシード（既定はエントロピー。再開時は start から引き継ぐ）
+//! - TUNE_OBJECTIVE: arena（既定）| scenario（目的関数の切り替え。上記）
+//! - TUNE_SCENARIOS: scenario モードの対象シナリオ名（カンマ/空白区切り。
+//!   既定は悪手8件。bad= を持たないシナリオはエラー）
 //! - TUNE_CANDIDATE_LINE: 候補側の定跡をこのライン名に固定する
-//!   （例: 居飛車速攻。基準側を固定するには estimator_rush を基準に指定する）
+//!   （例: 居飛車速攻。基準側を固定するには estimator_rush を基準に指定する。
+//!   scenario モードでは無視される）
 //! - TUNE_FORCE_RESUME=1: 設定不一致でも再開を強行する
 
 use rand::Rng;
@@ -35,8 +48,12 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 
 use tsuitate_bot::opening::OpeningBook;
+use tsuitate_bot::protocol::Color;
+use tsuitate_bot::scenario_core::{
+    self, Replayed, Scenario, choice_trials_batch_with, load_scenario, replay,
+};
 use tsuitate_bot::selfplay::{MatchStats, mix, run_match_with_seeds};
-use tsuitate_bot::strategy::{self, EstimatorStrategy, EvalParams};
+use tsuitate_bot::strategy::{self, EstimatorStrategy, EvalParams, Strategy};
 
 /// ログファイルのパス（実験ごとに分けられる）
 fn log_path() -> String {
@@ -227,6 +244,263 @@ fn fitness(
     (total / baselines.len() as f64, details)
 }
 
+/// TUNE_OBJECTIVE=scenario の既定対象（悪手8件。同一147手棋譜由来で
+/// (棋譜,手番) 2グループに畳まれ、prewarm の継ぎ足し共有が最大限効く）
+const DEFAULT_SCENARIOS: &str = "focal-lance,lance-aimless,lance-tether,lance-for-pawn,\
+     pawn-hoard,pawn-tether,rook-selfdrop,lance-selfdrop";
+
+fn parse_scenario_names(list: &str) -> Vec<String> {
+    list.split([',', ' '])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// SPSA の目的関数。Arena は従来のスコア率、Scenario はシナリオ不合格計
+enum Objective {
+    Arena {
+        games_per_eval: u32,
+        baselines: Vec<String>,
+        candidate_line: Option<usize>,
+        candidate_line_name: Option<String>,
+    },
+    Scenario {
+        loaded: Vec<(Scenario, Replayed)>,
+        trials: u64,
+    },
+}
+
+impl Objective {
+    /// 返り値は fitness と同じ (score∈[0,1], 内訳JSON列)
+    fn eval(&self, params: &EvalParams, match_seeds: &[u64]) -> (f64, Vec<serde_json::Value>) {
+        match self {
+            Objective::Arena {
+                games_per_eval,
+                baselines,
+                candidate_line,
+                ..
+            } => fitness(params, *games_per_eval, baselines, *candidate_line, match_seeds),
+            Objective::Scenario { loaded, trials } => scenario_fitness(loaded, *trials, params),
+        }
+    }
+
+    /// 共通乱数シード列の本数。scenario はシードが 0..trials の固定列で
+    /// 自動ペアリングされるので match_seeds を使わない（0本）
+    fn seed_count(&self) -> usize {
+        match self {
+            Objective::Arena { baselines, .. } => baselines.len(),
+            Objective::Scenario { .. } => 0,
+        }
+    }
+
+    /// start イベントに記録する設定。arena は従来とバイト同一
+    /// （既存ログの再開互換を壊さないため objective キーも足さない）
+    fn config(&self, space: &TuneSpace) -> serde_json::Value {
+        match self {
+            Objective::Arena {
+                games_per_eval,
+                baselines,
+                candidate_line_name,
+                ..
+            } => config_json(*games_per_eval, baselines, candidate_line_name, space),
+            Objective::Scenario { loaded, trials } => serde_json::json!({
+                "objective": "scenario",
+                "trials": trials,
+                // ply/target/bad まで指紋に含める: .kif の bad= を育てただけでも
+                // 別の目的関数になるので再開を拒否する（強行は TUNE_FORCE_RESUME=1）
+                "scenarios": loaded.iter().map(|(sc, _)| serde_json::json!({
+                    "name": sc.name,
+                    "ply": sc.ply,
+                    "target": sc.target,
+                    "bad": sc.bad,
+                })).collect::<Vec<_>>(),
+                "think_budget_ms": std::env::var("TSUITATE_THINK_BUDGET_MS").ok(),
+                "span": space.span,
+                "specs": specs_json(space),
+            }),
+        }
+    }
+}
+
+/// 引数と env から目的関数を組み立てる（検証込み）
+fn build_objective(args: &[String]) -> Result<Objective, String> {
+    let kind = std::env::var("TUNE_OBJECTIVE").unwrap_or_else(|_| "arena".into());
+    match kind.as_str() {
+        "arena" => {
+            let games_per_eval: u32 = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(60);
+            let baselines: Vec<String> = if args.len() > 3 {
+                args[3..].to_vec()
+            } else {
+                vec!["estimator_v7".into()]
+            };
+            for name in &baselines {
+                if strategy::make(name).is_none() {
+                    return Err(format!("未知の戦略名です: {name}"));
+                }
+            }
+            // 候補側の定跡固定（定跡特化チューニング）
+            let candidate_line_name = std::env::var("TUNE_CANDIDATE_LINE").ok();
+            let candidate_line = match &candidate_line_name {
+                Some(name) => match OpeningBook::line_index(name) {
+                    Some(idx) => {
+                        println!("候補側の定跡を「{name}」に固定します");
+                        Some(idx)
+                    }
+                    None => {
+                        return Err(format!("定跡ライン「{name}」が joseki.json にありません"));
+                    }
+                },
+                None => None,
+            };
+            Ok(Objective::Arena {
+                games_per_eval,
+                baselines,
+                candidate_line,
+                candidate_line_name,
+            })
+        }
+        "scenario" => {
+            let trials: u64 = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(10);
+            if trials == 0 {
+                return Err("試行数は1以上を指定してください".into());
+            }
+            if args.len() > 3 {
+                return Err(
+                    "TUNE_OBJECTIVE=scenario では基準戦略は指定できません（候補のみで完結）"
+                        .into(),
+                );
+            }
+            if std::env::var("TUNE_CANDIDATE_LINE").is_ok() {
+                eprintln!(
+                    "警告: TUNE_CANDIDATE_LINE はシナリオ目的では無視されます（定跡は決定点に影響しない）"
+                );
+            }
+            let names = parse_scenario_names(
+                &std::env::var("TUNE_SCENARIOS").unwrap_or_else(|_| DEFAULT_SCENARIOS.into()),
+            );
+            if names.is_empty() {
+                return Err("TUNE_SCENARIOS が空です".into());
+            }
+            let mut loaded = vec![];
+            for name in &names {
+                let sc = load_scenario(name, None, None, None).map_err(|e| format!("{name}: {e}"))?;
+                if sc.bad.is_empty() {
+                    return Err(format!(
+                        "{name}: bad= がありません（不合格計が常に0で目的関数になりません）"
+                    ));
+                }
+                let rep = replay(&sc.kifu, sc.ply);
+                if let Some(outcome) = rep.pos.outcome() {
+                    return Err(format!(
+                        "{name}: ply={} の局面は終局しています（{outcome:?}）",
+                        sc.ply
+                    ));
+                }
+                loaded.push((sc, rep));
+            }
+            Ok(Objective::Scenario { loaded, trials })
+        }
+        other => Err(format!("TUNE_OBJECTIVE は arena か scenario です: {other}")),
+    }
+}
+
+/// score = 1 − 不合格計/(シナリオ数×試行数)。勝率と同じ [0,1] スケールに
+/// 揃えるので SPSA 係数（c0/a0）は arena と共通のままでよい
+fn scenario_score(bad_total: u32, scenarios: usize, trials: u64) -> f64 {
+    let n = (scenarios as u64 * trials).max(1) as f64;
+    1.0 - f64::from(bad_total) / n
+}
+
+/// シナリオ目的関数。(棋譜,手番) のパーティションごとにスレッドを立て
+/// （悪手8件は2グループ）、パーティション内は choice_trials_batch_with が
+/// prewarm を継ぎ足し共有する。シードは 0..trials の固定列なので
+/// f+/f− は何もしなくても共通乱数ペアになる
+fn scenario_fitness(
+    loaded: &[(Scenario, Replayed)],
+    trials: u64,
+    params: &EvalParams,
+) -> (f64, Vec<serde_json::Value>) {
+    let mut parts: Vec<((u64, Color), Vec<usize>)> = vec![];
+    for (i, (sc, rep)) in loaded.iter().enumerate() {
+        let key = (scenario_core::kifu_key(&sc.kifu), rep.pos.turn());
+        match parts.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, v)) => v.push(i),
+            None => parts.push((key, vec![i])),
+        }
+    }
+    let factory = |seed: u64| -> Box<dyn Strategy + Send> {
+        Box::new(EstimatorStrategy::with_params_line_seed(
+            params.clone(),
+            None,
+            Some(seed),
+        ))
+    };
+    let mut stats_by_idx: Vec<Option<scenario_core::ChoiceStats>> =
+        (0..loaded.len()).map(|_| None).collect();
+    std::thread::scope(|s| {
+        let handles: Vec<_> = parts
+            .iter()
+            .map(|(_, idxs)| {
+                let factory = &factory;
+                s.spawn(move || {
+                    let items: Vec<(&Scenario, &Replayed)> =
+                        idxs.iter().map(|&i| (&loaded[i].0, &loaded[i].1)).collect();
+                    choice_trials_batch_with(&items, trials, factory, |_, _, _, _| {})
+                })
+            })
+            .collect();
+        for ((_, idxs), handle) in parts.iter().zip(handles) {
+            let stats = handle.join().expect("シナリオ評価スレッドが異常終了");
+            for (&i, st) in idxs.iter().zip(stats) {
+                stats_by_idx[i] = Some(st);
+            }
+        }
+    });
+    let mut bad_total = 0u32;
+    let mut details = vec![];
+    for ((sc, _), stats) in loaded.iter().zip(stats_by_idx) {
+        let stats = stats.expect("全シナリオが評価されている");
+        let bad = stats.bad_hits(&sc.bad);
+        bad_total += bad;
+        details.push(serde_json::json!({
+            "scenario": sc.name,
+            "ply": sc.ply,
+            "bad_hits": bad,
+            "trials": trials,
+            "fouls": stats.total_fouls,
+            "target_hits": stats.target_hits(&sc.target),
+            "tally": stats.tally.iter().take(5)
+                .map(|(usi, n)| serde_json::json!([usi, n])).collect::<Vec<_>>(),
+        }));
+    }
+    (scenario_score(bad_total, loaded.len(), trials), details)
+}
+
+/// 調整対象の次元が TSUITATE_* env に上書きされて摂動が無効になっていないか。
+/// 次元 i にだけ lo/hi を入れた2つの probe を apply_env_param_overrides に通し、
+/// 両者が同一値になったら env に潰されている（probe 比較なので env 名の
+/// リスト保守は不要）。arena モードにも昔からある罠なので両モードで検査する
+fn env_crushed_dims(space: &TuneSpace) -> Vec<&'static str> {
+    let base = EvalParams::default().to_vec();
+    let mut out = vec![];
+    for (i, spec) in EvalParams::SPECS.iter().enumerate() {
+        if !space.active[i] || (spec.hi - spec.lo).abs() < 1e-12 {
+            continue;
+        }
+        let mut lo_v = base.clone();
+        lo_v[i] = spec.lo;
+        let mut hi_v = base.clone();
+        hi_v[i] = spec.hi;
+        let lo_p = strategy::apply_env_param_overrides(EvalParams::from_vec(&lo_v)).to_vec();
+        let hi_p = strategy::apply_env_param_overrides(EvalParams::from_vec(&hi_v)).to_vec();
+        if (lo_p[i] - hi_p[i]).abs() < 1e-12 {
+            out.push(spec.name);
+        }
+    }
+    out
+}
+
 /// ログ書き込み。失敗したら即座に落とす（Spot VM等で黙って進捗を失わないため）
 fn log_line(file: &mut std::fs::File, value: &serde_json::Value) {
     use std::io::Write;
@@ -365,33 +639,12 @@ fn unit_vec(v: &serde_json::Value) -> Option<Vec<f64>> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let iterations: u32 = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(40);
-    let games_per_eval: u32 = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(60);
-    let baselines: Vec<String> = if args.len() > 3 {
-        args[3..].to_vec()
-    } else {
-        vec!["estimator_v7".into()]
-    };
-    for name in &baselines {
-        if strategy::make(name).is_none() {
-            eprintln!("未知の戦略名です: {name}");
+    let objective = match build_objective(&args) {
+        Ok(objective) => objective,
+        Err(e) => {
+            eprintln!("{e}");
             std::process::exit(1);
         }
-    }
-
-    // 候補側の定跡固定（定跡特化チューニング）
-    let candidate_line_name = std::env::var("TUNE_CANDIDATE_LINE").ok();
-    let candidate_line = match &candidate_line_name {
-        Some(name) => match OpeningBook::line_index(name) {
-            Some(idx) => {
-                println!("候補側の定跡を「{name}」に固定します");
-                Some(idx)
-            }
-            None => {
-                eprintln!("定跡ライン「{name}」が joseki.json にありません");
-                std::process::exit(1);
-            }
-        },
-        None => None,
     };
 
     // SPSA係数（正規化座標）。c0: 摂動幅（範囲の8%）、a0/A/α/γ: 標準的な減衰
@@ -409,8 +662,20 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // 調整対象ノブが運用 env に上書きされていると摂動が効かないまま回ってしまう
+    let crushed = env_crushed_dims(&space);
+    if !crushed.is_empty() {
+        for name in &crushed {
+            eprintln!(
+                "エラー: 調整対象 {name} が環境変数（TSUITATE_{} ?）に上書きされ、SPSA の摂動が無効です",
+                name.to_uppercase()
+            );
+        }
+        eprintln!("該当の env を外してから実行してください");
+        std::process::exit(1);
+    }
     let active_count = space.active.iter().filter(|&&a| a).count();
-    let config = config_json(games_per_eval, &baselines, &candidate_line_name, &space);
+    let config = objective.config(&space);
     let mut u = to_unit(&EvalParams::default(), &space);
     let mut start_k = 1u32;
     let mut run_seed: u64 = std::env::var("TUNE_SEED")
@@ -460,13 +725,28 @@ fn main() {
         .open(log_path())
         .expect("チューニングログを開けない");
 
-    let per = games_per_baseline(games_per_eval, baselines.len());
-    println!(
-        "SPSA開始: 反復{start_k}〜{iterations} × 2評価 × {}局（{per}局×{}基準）, seed={run_seed}, {active_count}/{d}次元, span={}",
-        per * baselines.len() as u32,
-        baselines.len(),
-        space.span,
-    );
+    match &objective {
+        Objective::Arena {
+            games_per_eval,
+            baselines,
+            ..
+        } => {
+            let per = games_per_baseline(*games_per_eval, baselines.len());
+            println!(
+                "SPSA開始: 反復{start_k}〜{iterations} × 2評価 × {}局（{per}局×{}基準）, seed={run_seed}, {active_count}/{d}次元, span={}",
+                per * baselines.len() as u32,
+                baselines.len(),
+                space.span,
+            );
+        }
+        Objective::Scenario { loaded, trials } => {
+            println!(
+                "SPSA開始（シナリオ目的）: 反復{start_k}〜{iterations} × 2評価 × {}シナリオ×{trials}試行, seed={run_seed}, {active_count}/{d}次元, span={}",
+                loaded.len(),
+                space.span,
+            );
+        }
+    }
     if !resumed {
         log_line(
             &mut log,
@@ -502,19 +782,18 @@ fn main() {
             .map(|(ui, di)| (ui - ck * di).clamp(0.0, 1.0))
             .collect();
 
-        // 共通乱数法: f+ と f− に同じ対局シード列を使う。
+        // 共通乱数法: f+ と f− に同じ対局シード列を使う（scenario 目的は
+        // 試行シードが 0..trials の固定列なので match_seeds 自体が不要）。
         // 評価順も反復ごとに入れ替える（実行環境のドリフト対策）
         let iter_seed = mix(run_seed ^ u64::from(k));
-        let match_seeds: Vec<u64> = (0..baselines.len())
+        let match_seeds: Vec<u64> = (0..objective.seed_count())
             .map(|i| mix(iter_seed ^ (i as u64 + 1)))
             .collect();
         let plus_first = (iter_seed >> 7) & 1 == 0;
 
         let p_plus = to_params(&u_plus, &space);
         let p_minus = to_params(&u_minus, &space);
-        let eval = |params: &EvalParams| {
-            fitness(params, games_per_eval, &baselines, candidate_line, &match_seeds)
-        };
+        let eval = |params: &EvalParams| objective.eval(params, &match_seeds);
         let ((f_plus, det_plus), (f_minus, det_minus)) = if plus_first {
             let plus = eval(&p_plus);
             (plus, eval(&p_minus))
@@ -565,16 +844,10 @@ fn main() {
 
     // 最終中心点は勾配更新の結果であってまだ評価されていないので、ここで測る
     let final_params = to_params(&u, &space);
-    let final_seeds: Vec<u64> = (0..baselines.len())
+    let final_seeds: Vec<u64> = (0..objective.seed_count())
         .map(|i| mix(run_seed ^ 0x000F_17A1 ^ (i as u64 + 1)))
         .collect();
-    let (final_score, final_det) = fitness(
-        &final_params,
-        games_per_eval,
-        &baselines,
-        candidate_line,
-        &final_seeds,
-    );
+    let (final_score, final_det) = objective.eval(&final_params, &final_seeds);
     let best_params = to_params(&best_u, &space);
     println!("\n=== 最終パラメータ（SPSA収束点、score={final_score:.3}） ===");
     println!("{}", serde_json::to_string_pretty(&params_json(&final_params)).unwrap());
@@ -622,6 +895,24 @@ mod tests {
         // 符号: Δ=-1 の次元では分母が負になり勾配の向きが正しく反転する
         let g = spsa_gradient(0.6, 0.5, &[0.4], &[0.6]);
         assert!((g[0] + 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn scenario_names_parse_from_commas_and_spaces() {
+        assert_eq!(
+            parse_scenario_names("a,b c ,, d"),
+            vec!["a", "b", "c", "d"]
+        );
+        assert!(parse_scenario_names(" , ").is_empty());
+        // 既定リストは悪手8件
+        assert_eq!(parse_scenario_names(DEFAULT_SCENARIOS).len(), 8);
+    }
+
+    #[test]
+    fn scenario_score_maps_bad_total_to_unit_interval() {
+        assert_eq!(scenario_score(0, 8, 10), 1.0);
+        assert_eq!(scenario_score(80, 8, 10), 0.0);
+        assert!((scenario_score(39, 8, 20) - (1.0 - 39.0 / 160.0)).abs() < 1e-12);
     }
 
     #[test]

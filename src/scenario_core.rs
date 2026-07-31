@@ -261,14 +261,41 @@ impl ChoiceStats {
             .map(|(_, n)| *n)
             .unwrap_or(0)
     }
+
+    /// bad リストに載った手を選んだ回数の合計（suite の「不合格計」。
+    /// bin/scenario の表示と bin/tune のシナリオ目的関数が同じ数え方を共有する）
+    pub fn bad_hits(&self, bad: &[String]) -> u32 {
+        self.tally
+            .iter()
+            .filter(|(usi, _)| bad.iter().any(|b| b == usi))
+            .map(|(_, n)| *n)
+            .sum()
+    }
 }
+
+/// シードから戦略を作るファクトリ。`choice_trial_one_with` / `choice_trials_batch_with`
+/// が EvalParams を注入した戦略（bin/tune のシナリオ目的関数）で試行するための口。
+/// Sync はグループ並列（bin/tune がパーティションごとにスレッドを立てる）で
+/// 共有するため
+pub type SeededFactory<'a> = &'a (dyn Fn(u64) -> Box<dyn strategy::Strategy + Send> + Sync);
 
 /// 手番側の一手の選択を1シードぶん試行する。反則は観測として与えて指し直させる
 /// （実対局と同じ）。返り値は (受理された手, その前に試みた反則列)。
 /// 指せる手がなければ "resign"、反則累計10回で "foul_limit"
 pub fn choice_trial_one(rep: &Replayed, seed: u64, name: &str) -> (String, Vec<String>) {
+    choice_trial_one_with(rep, seed, &|s| {
+        strategy::make_seeded(name, s).expect("未知の戦略名")
+    })
+}
+
+/// choice_trial_one の戦略ファクトリ版（name 版はここへ委譲する）
+pub fn choice_trial_one_with(
+    rep: &Replayed,
+    seed: u64,
+    factory: SeededFactory,
+) -> (String, Vec<String>) {
     let side = rep.pos.turn();
-    let mut strat = strategy::make_seeded(name, seed).expect("未知の戦略名");
+    let mut strat = factory(seed);
     let log = clone_log(&rep.logs[side_idx(side)]);
     strategy::prewarm_strategy(&mut *strat, &make_view(&rep.pos, side, &rep.fouls), &log);
     choice_trial_body(&mut *strat, rep)
@@ -588,16 +615,28 @@ pub fn choice_trials_batch(
     items: &[(&Scenario, &Replayed)],
     trials: u64,
     name: &str,
+    on_trial: impl FnMut(usize, u64, &str, &[String]),
+) -> Vec<ChoiceStats> {
+    choice_trials_batch_with(
+        items,
+        trials,
+        &|s| strategy::make_seeded(name, s).expect("未知の戦略名"),
+        on_trial,
+    )
+}
+
+/// choice_trials_batch の戦略ファクトリ版（name 版はここへ委譲する）
+pub fn choice_trials_batch_with(
+    items: &[(&Scenario, &Replayed)],
+    trials: u64,
+    factory: SeededFactory,
     mut on_trial: impl FnMut(usize, u64, &str, &[String]),
 ) -> Vec<ChoiceStats> {
     let mut tallies: Vec<HashMap<String, u32>> = vec![HashMap::new(); items.len()];
     let mut fouls_total: Vec<u32> = vec![0; items.len()];
 
     // clone 対応か（戦略の構築だけなら安い。est は遅延構築なので空のまま）
-    let supports_clone = strategy::make_seeded(name, 0)
-        .expect("未知の戦略名")
-        .clone_boxed()
-        .is_some();
+    let supports_clone = factory(0).clone_boxed().is_some();
 
     // (棋譜キー, 手番側) でグループ化し、グループ内は ply 昇順
     let mut groups: Vec<((u64, Color), Vec<usize>)> = vec![];
@@ -621,14 +660,14 @@ pub fn choice_trials_batch(
             };
             if !supports_clone || idxs.len() == 1 {
                 for &i in idxs {
-                    let (accepted, foul_seq) = choice_trial_one(items[i].1, seed, name);
+                    let (accepted, foul_seq) = choice_trial_one_with(items[i].1, seed, factory);
                     record(i, accepted, foul_seq);
                 }
                 continue;
             }
             // 継ぎ足し共有: prewarm_strategy と同じ規約（自分手番イベントの直前で
             // prewarm、最後の update は choose に任せる）を consumed から再開する
-            let mut strat = strategy::make_seeded(name, seed).expect("未知の戦略名");
+            let mut strat = factory(seed);
             let mut running = ObservationLog::default();
             let mut consumed = 0usize;
             for &i in idxs {
@@ -885,6 +924,74 @@ mod tests {
             key(fresh_at2.estimator().unwrap()),
             "スナップショットが元の進行に引きずられている"
         );
+    }
+
+    #[test]
+    fn 不合格計はbadリストの手の回数だけ数える() {
+        let stats = ChoiceStats {
+            tally: vec![
+                ("7f7e".into(), 12),
+                ("P*9h".into(), 5),
+                ("2h5h".into(), 3),
+            ],
+            total_fouls: 4,
+        };
+        assert_eq!(stats.bad_hits(&["7f7e".into(), "P*9h".into()]), 17);
+        assert_eq!(stats.bad_hits(&["2h5h".into()]), 3);
+        assert_eq!(stats.bad_hits(&["9i9h".into()]), 0);
+        assert_eq!(stats.bad_hits(&[]), 0);
+    }
+
+    /// 決められた手を順に返すだけの戦略（ファクトリ版APIの配管テスト用）
+    struct Scripted {
+        moves: Vec<String>,
+        i: usize,
+    }
+
+    impl strategy::Strategy for Scripted {
+        fn choose(
+            &mut self,
+            _view: &PlayerView,
+            _log: &ObservationLog,
+            foul_tried: &HashSet<String>,
+        ) -> Option<String> {
+            while self.i < self.moves.len() {
+                let m = self.moves[self.i].clone();
+                self.i += 1;
+                if !foul_tried.contains(&m) {
+                    return Some(m);
+                }
+            }
+            None
+        }
+
+        fn name(&self) -> &'static str {
+            "scripted"
+        }
+    }
+
+    /// ファクトリ版APIが「反則→観測に足して指し直し→受理」の試行ループを
+    /// name 版と同じ規約で回すこと（bin/tune のシナリオ目的関数の配管の担保）
+    #[test]
+    fn ファクトリ版の試行は反則を経て受理手を返す() {
+        let sc = load("keima");
+        let rep = replay(&sc.kifu, 4); // 先手番。7f の歩が 7e へ進める
+        let factory: &(dyn Fn(u64) -> Box<dyn strategy::Strategy + Send> + Sync) = &|_seed| {
+            Box::new(Scripted {
+                moves: vec!["1g1e".into(), "7f7e".into()], // 1g1e は2マス動く反則
+                i: 0,
+            })
+        };
+        let (accepted, foul_seq) = choice_trial_one_with(&rep, 0, factory);
+        assert_eq!(accepted, "7f7e");
+        assert_eq!(foul_seq, vec!["1g1e".to_string()]);
+
+        let items = [(&sc, &rep)];
+        let stats = choice_trials_batch_with(&items, 2, factory, |_, _, _, _| {});
+        assert_eq!(stats.len(), 1);
+        assert_eq!(stats[0].tally, vec![("7f7e".to_string(), 2)]);
+        assert_eq!(stats[0].total_fouls, 2);
+        assert_eq!(stats[0].bad_hits(&["7f7e".into()]), 2);
     }
 
     /// リプレイの裁定検証（合法手は合法・反則試行は非合法）が全編通ること

@@ -244,6 +244,26 @@ JSON（DBの列をそのままJSON.parseして詰め直すだけでよい）。`
   2a2b / 2a3a（無目的な金のシャッフル）・P*1h / P*5f（価値の低い垂れ歩）・
   3e3f（3七歩に取られる突き捨て）・6h5h / 6i7i（無目的な玉・金の横移動）
 
+## SPSAチューニング（シナリオ目的）
+
+悪手8シナリオの**不合格計**を目的関数に SPSA を回せる（従来の手動 env スイープ
+= 「w を変えて不合格計の合計を比べる」の自動化）:
+
+```
+TUNE_OBJECTIVE=scenario TUNE_PARAMS=hand_option_w,promo_potential_w TUNE_SPAN=0.5 \
+  TUNE_LOG=tuning/tune-scn.jsonl cargo run --release --bin tune -- 30 10
+```
+
+- 位置引数2はシナリオあたりの**試行数**（既定10）。score = 1 − 不合格計/(件数×試行数)
+- 対象は `TUNE_SCENARIOS`（既定は悪手8件）。`bad=` を持たないシナリオはエラー
+- f+/f− の試行シードは 0..trials の固定列で自動的に共通乱数ペアになる。
+  残るノイズは壁時計予算の揺れ（上記の±3件/20試行）だけなので、
+  試行数の目安は探索中10・最終確認20
+- **過学習に注意**: 悪手8件は実質1局の8局面。TUNE_PARAMS で数次元に絞り、
+  採用判定は従来どおり CI の200局ガントレット（+シナリオ suite の回帰なし）で行う
+- 調整対象ノブに対応する `TSUITATE_*` env が立っていると起動時にエラーになる
+  （摂動が env に潰されて勾配が死ぬため。arena モードでも同じ検査が入る）
+
 ## archive/
 
 suite から外したシナリオ置き場（suite は `scenarios/` 直下の `.kif` だけを読む）。

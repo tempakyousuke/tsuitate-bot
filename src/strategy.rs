@@ -2133,233 +2133,7 @@ impl EstimatorStrategy {
         book_line: Option<usize>,
         seed: Option<u64>,
     ) -> Self {
-        // valueネット重みの運用ノブ（デプロイ時の切り戻し・アブレーション用）。
-        // SPSA（with_params 経由）でも env が設定されていればそちらを優先する
-        let params = match std::env::var("TSUITATE_VALUE_NN_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-        {
-            Some(w) => EvalParams {
-                value_nn_w: w,
-                ..params
-            },
-            None => params,
-        };
-        // 除去期待値項の運用ノブ（w スイープ・切り戻し用）
-        let params = match std::env::var("TSUITATE_CHECKER_REMOVAL_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-        {
-            Some(w) => EvalParams {
-                checker_removal_w: w,
-                ..params
-            },
-            None => params,
-        };
-        // 捕獲賭け分散ペナルティの運用ノブ（w スイープ・切り戻し用）
-        let params = match std::env::var("TSUITATE_CAPTURE_BET_VAR_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-        {
-            Some(w) => EvalParams {
-                capture_bet_var_w: w,
-                ..params
-            },
-            None => params,
-        };
-        // 詰めろ生成ボーナスの運用ノブ（w スイープ・切り戻し用）
-        let params = match std::env::var("TSUITATE_MATE_THREAT_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-        {
-            Some(w) => EvalParams {
-                mate_threat_w: w,
-                ..params
-            },
-            None => params,
-        };
-        // 被詰めろペナルティの運用ノブ（w スイープ・切り戻し用）
-        let params = match std::env::var("TSUITATE_MATE_RISK_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-        {
-            Some(w) => EvalParams {
-                mate_risk_w: w,
-                ..params
-            },
-            None => params,
-        };
-        // 自玉8近傍の穴の運用ノブ（w スイープ・切り戻し用）
-        let params = match std::env::var("TSUITATE_KING_HOLE_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-        {
-            Some(w) => EvalParams {
-                king_hole_w: w,
-                ..params
-            },
-            None => params,
-        };
-        // 予防的な紐（V3）の運用ノブ（w スイープ・切り戻し用。0 で従来挙動）
-        let params = match std::env::var("TSUITATE_LINK_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-        {
-            Some(w) => EvalParams { link_w: w, ..params },
-            None => params,
-        };
-        // 紐の働き重み付け（V3 の拡張）の運用ノブ（w スイープ・切り戻し用）
-        let params = match std::env::var("TSUITATE_LINK_WORK_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
-        {
-            Some(w) => EvalParams {
-                link_work_w: w,
-                ..params
-            },
-            None => params,
-        };
-        let params = match std::env::var("TSUITATE_LINK_WORK_REF")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0)
-        {
-            Some(r) => EvalParams {
-                link_work_ref: r,
-                ..params
-            },
-            None => params,
-        };
-        // 王手の強さ（解消手数Kによる値付け）の運用ノブ（w スイープ・切り戻し用）
-        let params = match std::env::var("TSUITATE_CHECK_STRENGTH_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-        {
-            Some(w) => EvalParams {
-                check_strength_w: w,
-                ..params
-            },
-            None => params,
-        };
-        // 構想の読み（自分の手 → 自分の次の手）の運用ノブ（0 で従来挙動）
-        let params = match std::env::var("TSUITATE_PLAN_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-        {
-            Some(w) => EvalParams { plan_w: w, ..params },
-            None => params,
-        };
-        // 同じ自陣形への往復の累積減点（0 で従来挙動）
-        let params = match std::env::var("TSUITATE_REPEAT_PENALTY_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-        {
-            Some(w) => EvalParams {
-                repeat_penalty_w: w,
-                ..params
-            },
-            None => params,
-        };
-        // 玉距離重み付き利き（V2）の運用ノブ（w スイープ用。0 で従来挙動）
-        let params = match std::env::var("TSUITATE_EFFECT_OWN_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-        {
-            Some(w) => EvalParams {
-                effect_own_w: w,
-                ..params
-            },
-            None => params,
-        };
-        let params = match std::env::var("TSUITATE_EFFECT_OPP_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-        {
-            Some(w) => EvalParams {
-                effect_opp_w: w,
-                ..params
-            },
-            None => params,
-        };
-        // 盤上駒の減価（V5）の運用ノブ（w スイープ用。0 で従来挙動。
-        // やねうら王の比率は 0.102。負の値も許す＝持ち駒より盤上を好む側）
-        let params = match std::env::var("TSUITATE_BOARD_DISCOUNT_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-        {
-            Some(w) => EvalParams {
-                board_discount_w: w,
-                ..params
-            },
-            None => params,
-        };
-        // 逃げマス被覆（凸）の運用ノブ（w スイープ用。0 で従来挙動）
-        let params = match std::env::var("TSUITATE_ESCAPE_COVER_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-        {
-            Some(w) => EvalParams {
-                escape_cover_w: w,
-                ..params
-            },
-            None => params,
-        };
-        // 守り駒捕獲ボーナスの運用ノブ（w スイープ用。0 で従来挙動）
-        let params = match std::env::var("TSUITATE_DEFENDER_CAPTURE_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-        {
-            Some(w) => EvalParams {
-                defender_capture_w: w,
-                ..params
-            },
-            None => params,
-        };
-        // 打ち当て露出の運用ノブ（w スイープ用。0 で従来挙動）
-        let params = match std::env::var("TSUITATE_DROP_HIT_EVAC_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-        {
-            Some(w) => EvalParams {
-                drop_hit_evac_w: w,
-                ..params
-            },
-            None => params,
-        };
-        // 成りポテンシャルの運用ノブ（w スイープ用。0 で従来挙動）
-        let params = match std::env::var("TSUITATE_PROMO_POTENTIAL_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-        {
-            Some(w) => EvalParams {
-                promo_potential_w: w,
-                ..params
-            },
-            None => params,
-        };
-        // 持ち駒オプション価値の運用ノブ（w スイープ用。0 で従来挙動）
-        let params = match std::env::var("TSUITATE_HAND_OPTION_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-        {
-            Some(w) => EvalParams {
-                hand_option_w: w,
-                ..params
-            },
-            None => params,
-        };
+        let params = apply_env_param_overrides(params);
         EstimatorStrategy {
             est: None,
             book: None,
@@ -2375,6 +2149,241 @@ impl EstimatorStrategy {
             last_ranking: None,
         }
     }
+}
+
+/// TSUITATE_*_W 系 env による EvalParams の上書き（運用ノブ。デプロイ時の
+/// 切り戻し・w スイープ用）。SPSA（with_params 経由）でも env が設定されて
+/// いればそちらを優先する。bin/tune はこの関数で「調整対象ノブが env に
+/// 潰されていないか」を起動時に検査する
+pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
+    // valueネット重みの運用ノブ（デプロイ時の切り戻し・アブレーション用）。
+    // SPSA（with_params 経由）でも env が設定されていればそちらを優先する
+    let params = match std::env::var("TSUITATE_VALUE_NN_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        Some(w) => EvalParams {
+            value_nn_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 除去期待値項の運用ノブ（w スイープ・切り戻し用）
+    let params = match std::env::var("TSUITATE_CHECKER_REMOVAL_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        Some(w) => EvalParams {
+            checker_removal_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 捕獲賭け分散ペナルティの運用ノブ（w スイープ・切り戻し用）
+    let params = match std::env::var("TSUITATE_CAPTURE_BET_VAR_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        Some(w) => EvalParams {
+            capture_bet_var_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 詰めろ生成ボーナスの運用ノブ（w スイープ・切り戻し用）
+    let params = match std::env::var("TSUITATE_MATE_THREAT_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        Some(w) => EvalParams {
+            mate_threat_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 被詰めろペナルティの運用ノブ（w スイープ・切り戻し用）
+    let params = match std::env::var("TSUITATE_MATE_RISK_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        Some(w) => EvalParams {
+            mate_risk_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 自玉8近傍の穴の運用ノブ（w スイープ・切り戻し用）
+    let params = match std::env::var("TSUITATE_KING_HOLE_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        Some(w) => EvalParams {
+            king_hole_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 予防的な紐（V3）の運用ノブ（w スイープ・切り戻し用。0 で従来挙動）
+    let params = match std::env::var("TSUITATE_LINK_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+    {
+        Some(w) => EvalParams { link_w: w, ..params },
+        None => params,
+    };
+    // 紐の働き重み付け（V3 の拡張）の運用ノブ（w スイープ・切り戻し用）
+    let params = match std::env::var("TSUITATE_LINK_WORK_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+    {
+        Some(w) => EvalParams {
+            link_work_w: w,
+            ..params
+        },
+        None => params,
+    };
+    let params = match std::env::var("TSUITATE_LINK_WORK_REF")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0)
+    {
+        Some(r) => EvalParams {
+            link_work_ref: r,
+            ..params
+        },
+        None => params,
+    };
+    // 王手の強さ（解消手数Kによる値付け）の運用ノブ（w スイープ・切り戻し用）
+    let params = match std::env::var("TSUITATE_CHECK_STRENGTH_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+    {
+        Some(w) => EvalParams {
+            check_strength_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 構想の読み（自分の手 → 自分の次の手）の運用ノブ（0 で従来挙動）
+    let params = match std::env::var("TSUITATE_PLAN_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams { plan_w: w, ..params },
+        None => params,
+    };
+    // 同じ自陣形への往復の累積減点（0 で従来挙動）
+    let params = match std::env::var("TSUITATE_REPEAT_PENALTY_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            repeat_penalty_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 玉距離重み付き利き（V2）の運用ノブ（w スイープ用。0 で従来挙動）
+    let params = match std::env::var("TSUITATE_EFFECT_OWN_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+    {
+        Some(w) => EvalParams {
+            effect_own_w: w,
+            ..params
+        },
+        None => params,
+    };
+    let params = match std::env::var("TSUITATE_EFFECT_OPP_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+    {
+        Some(w) => EvalParams {
+            effect_opp_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 盤上駒の減価（V5）の運用ノブ（w スイープ用。0 で従来挙動。
+    // やねうら王の比率は 0.102。負の値も許す＝持ち駒より盤上を好む側）
+    let params = match std::env::var("TSUITATE_BOARD_DISCOUNT_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+    {
+        Some(w) => EvalParams {
+            board_discount_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 逃げマス被覆（凸）の運用ノブ（w スイープ用。0 で従来挙動）
+    let params = match std::env::var("TSUITATE_ESCAPE_COVER_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            escape_cover_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 守り駒捕獲ボーナスの運用ノブ（w スイープ用。0 で従来挙動）
+    let params = match std::env::var("TSUITATE_DEFENDER_CAPTURE_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            defender_capture_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 打ち当て露出の運用ノブ（w スイープ用。0 で従来挙動）
+    let params = match std::env::var("TSUITATE_DROP_HIT_EVAC_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            drop_hit_evac_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 成りポテンシャルの運用ノブ（w スイープ用。0 で従来挙動）
+    let params = match std::env::var("TSUITATE_PROMO_POTENTIAL_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            promo_potential_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 持ち駒オプション価値の運用ノブ（w スイープ用。0 で従来挙動）
+    let params = match std::env::var("TSUITATE_HAND_OPTION_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            hand_option_w: w,
+            ..params
+        },
+        None => params,
+    };
+    params
 }
 
 impl Default for EstimatorStrategy {

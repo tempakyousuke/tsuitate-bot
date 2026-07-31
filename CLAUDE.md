@@ -78,7 +78,17 @@
   項目の片側クリップ対策）。完走時に最終中心点を追加評価して
   `done.final_score` に記録する。採用するときは `EvalParams::default` を書き換えて
   フルガントレットで確認する。
-  対局ループは `selfplay.rs`（arena と共用）。**長時間ランはローカルでなくGCEで回す**（下記）
+  対局ループは `selfplay.rs`（arena と共用）。**長時間ランはローカルでなくGCEで回す**（下記）。
+  **`TUNE_OBJECTIVE=scenario` でシナリオ不合格計を目的関数にできる**（2026-07-31 追加）:
+  位置引数2がシナリオあたり試行数（既定10）になり、score = 1 − 不合格計/(件数×試行数)。
+  対象は `TUNE_SCENARIOS`（既定は悪手8件。`bad=` 必須）。手動 env スイープ
+  （hand_option_w の 39→7 のような w 選定）の自動化で、試行シードは 0..trials の
+  固定列なので f+/f− は自動的に共通乱数ペアになる。(棋譜,手番) グループごとに
+  スレッド並列＋prewarm 継ぎ足し共有。**悪手8件は実質1局の8局面なので
+  TUNE_PARAMS で数次元に絞って使い、採用判定は従来どおり CI ガントレット**。
+  運用手順は `scenarios/README.md` の「SPSAチューニング（シナリオ目的）」。
+  両モード共通で、調整対象ノブの `TSUITATE_*` env が立っていると起動時にエラーになる
+  （env が摂動を潰して勾配が死ぬ罠の検査）
 - **粒子尤度のフィット**（`.github/workflows/fit.yml`、CIのみで実行する）:
   `gh workflow run fit.yml -f run_ids="<arena実行のrun ID...>" -f max_games=600`。
   過去アリーナの `arena-records`（観測列＋真実）を教師に、粒子群の中で真の局面を
