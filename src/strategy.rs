@@ -1172,11 +1172,14 @@ struct EvalOut {
     hand_option: f64,
     /// gain から引かれた盤上駒の減価（V5。正の値。内訳表示用）
     board_discount: f64,
+    /// 打ちプローブの反則情報価値（drop_probe_w）。反則の失敗枝の期待値なので
+    /// gain には含めず、combine_score の外側（(1−p_legal) 側）で加算する
+    foul_probe: f64,
 }
 
 impl EvalOut {
     fn score(&self) -> f64 {
-        combine_score(self.gain, self.p_legal, self.foul_cost)
+        combine_score(self.gain, self.p_legal, self.foul_cost) + self.foul_probe
     }
 }
 
@@ -1324,6 +1327,18 @@ pub struct EvalParams {
     /// に対し、寄与を 1000×q×(q/(q+q0)) と凸にゲートする: 裾の幻詰み（q≈0.1）は
     /// 材料スケールまで沈み、合意の詰み（q→1）はほぼ満額。0 = 従来と同一挙動
     pub mate_gate_q0: f64,
+    /// 打ちプローブの反則情報価値（quest31 レビュー 2026-08-03、m015 の
+    /// 2二歩打が発端。ユーザー指摘「2二とが高いだけでなく2二歩打が低いのも問題」）。
+    /// combine_score は「反則の価値 = 次善手の価値 − 反則コスト」と仮定するが、
+    /// **打ちの反則は占有の確定という情報を買う**: 打ちマスが相手駒に塞がれて
+    /// いて（反則枝）、かつ自分の利きが既にそのマスに当たっているなら、
+    /// 次の手で確定した駒を回収できる（実戦の人間: 角がいそうな2二へ歩を打ち、
+    /// 反則ならと金で角を取る。駒は失わず反則1回だけ消費）。
+    /// 反則枝の期待値 w × Σ(粒子重み × 占有駒の交換価値 × 自利きあり)/全質量 を
+    /// combine_score の**外側**（(1−p_legal) 側）へ加算する。攻め側の利きが
+    /// 無いマスへのプローブ（ただ情報だけ）は対象外 = 打ち得スパムにならない。
+    /// 王手中・taint 粒子では無効。0 = 従来と同一挙動
+    pub drop_probe_w: f64,
     /// 玉隣接への無支え進入ペナルティ（quest31 レビュー 2026-08-02、F1/F2 の
     /// 共通形への対応）。粒子上の相手玉の8近傍に、自分の利きの支えが無い駒で
     /// 入る手は、王手宣言・接触で即座に存在がバレて玉や近傍の守りに回収される
@@ -1628,6 +1643,13 @@ impl Default for EvalParams {
             mate_gate_q0: 4.0,
             // 玉隣接への無支え進入（2026-08-02、同上）。0 = 従来と同一挙動
             king_adj_entry_w: 0.0,
+            // 打ちプローブの反則情報価値（2026-08-03）。0 = 従来と同一挙動。
+            // 既定 1.6 はシナリオ実測で採用: quest31-m015 の 2二歩打（人間の
+            // 実戦手）が 0/20 → 20/20（不合格計 20→0）、tokin-bet の P*8h
+            // 20/20、m026/m028 の 4七歩成 20/20 維持（凸ゲート導入前の線形版は
+            // 占有 8% の 2六への探りが浮いて P*2f 18/20 に逆流した）。
+            // 打ち系8件・詰み/王手系の回帰なし
+            drop_probe_w: 1.6,
             // 自玉8近傍の穴（2026-07-26、docs/yaneuraou-lessons.md の V4）。
             // 0 = 従来と同一挙動。未調整の新項なので w スイープで決める
             king_hole_w: 0.0,
@@ -1676,7 +1698,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 58] = [
+    pub const SPECS: [ParamSpec; 59] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -1995,6 +2017,13 @@ impl EvalParams {
             lo: 0.0,
             hi: 1.5,
         },
+        ParamSpec {
+            // 占有駒の交換価値 × 占有質量に掛かる。w=1 で「確定した駒は
+            // 次手で満額回収できる」相当（回収時の取り返されを見るなら 1 未満）
+            name: "drop_probe_w",
+            lo: 0.0,
+            hi: 2.0,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -2057,6 +2086,7 @@ impl EvalParams {
             self.hand_option_w,
             self.mate_gate_q0,
             self.king_adj_entry_w,
+            self.drop_probe_w,
         ]
     }
 
@@ -2121,6 +2151,7 @@ impl EvalParams {
             hand_option_w: v[55],
             mate_gate_q0: v[56],
             king_adj_entry_w: v[57],
+            drop_probe_w: v[58],
         }
     }
 }
@@ -2322,6 +2353,18 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
     {
         Some(w) => EvalParams {
             mover_check_extra: w,
+            ..params
+        },
+        None => params,
+    };
+    // 打ちプローブの反則情報価値（w スイープ・切り戻し用。0 で従来挙動）
+    let params = match std::env::var("TSUITATE_DROP_PROBE_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            drop_probe_w: w,
             ..params
         },
         None => params,
@@ -3010,7 +3053,10 @@ impl Strategy for EstimatorStrategy {
                 // 内側へ統合した（`plan_w`）。応手を挟まない外付けの加点は
                 // 200局で -6pt と明確に負だったので廃止
                 let gain2 = out.gain + params.depth2_replace * (out.risk_mean + delta);
-                (gain2, combine_score(gain2, out.p_legal, out.foul_cost) + adjust)
+                (
+                    gain2,
+                    combine_score(gain2, out.p_legal, out.foul_cost) + out.foul_probe + adjust,
+                )
             } else {
                 (out.gain, score)
             };
@@ -4020,6 +4066,10 @@ fn evaluate(
     let mut check_hits = 0.0f64;
     // 詰みになった粒子の重み。加点はループ後に凸ゲート（mate_gate_q0）を通す
     let mut mate_hits = 0.0f64;
+    // 打ちプローブの反則情報価値の材料（drop_probe_w。反則枝の粒子だけが足す）
+    let mut probe_val_sum = 0.0f64;
+    // 「占有かつ自利きあり」の粒子質量（プローブ項の凸ゲート用）
+    let mut probe_mass = 0.0f64;
     // 王周辺の圧力は粒子間の分散が小さいわりに計算が重い（9マス×利き走査）ので
     // 少数の粒子でだけ測って平均する（数は思考予算に比例）
     let pressure_samples = budget.pressure_samples;
@@ -4039,6 +4089,19 @@ fn evaluate(
 
     for (pi, &(pos, w)) in particles.iter().enumerate() {
         if !pos.is_legal(mv) {
+            // 打ちプローブの反則情報価値の材料（drop_probe_w）: この粒子で
+            // 打ちマスが相手駒に塞がれていて、かつ自分の利きが既に当たって
+            // いるなら、反則の失敗枝が「占有の確定 → 次手で回収」に変換できる
+            if params.drop_probe_w != 0.0 && !view.you_in_check && !particles_are_taint {
+                if let ShogiMove::Drop { to, .. } = *mv {
+                    if let Some(p) = pos.piece_at(to) {
+                        if p.color == opp && pos.attack_count(to, me) > 0 {
+                            probe_val_sum += w * exchange_value(p.role);
+                            probe_mass += w;
+                        }
+                    }
+                }
+            }
             continue;
         }
         legal += w;
@@ -4516,6 +4579,17 @@ fn evaluate(
         + effect_value
         + blind_recapture
         + blind_belief_gain;
+    // 打ちプローブの反則情報価値: 反則枝（占有粒子）の期待回収値 × 占有確率の
+    // 凸ゲート（p_occ をもう一度掛ける = 実効 p_occ²）。線形だと占有質量 8% の
+    // マスへの探り（quest31-m026/m028 の P*2f、飛車 9.5 の期待値が僅差を逆転）
+    // まで浮いてしまう。人間の使い分けは「居そうなときだけ探る」
+    // （2二=65% は探る・2六=8% は探らない）で、凸形はこれを1本のwで表現する。
+    // 全粒子質量 n で正規化するので (1−p_legal) の重みを内包している
+    let foul_probe = if n > 0.0 {
+        params.drop_probe_w * (probe_val_sum / n) * (probe_mass / n)
+    } else {
+        0.0
+    };
     EvalOut {
         gain,
         risk_mean: if legal > 0.0 { risk_sum / legal } else { 0.0 },
@@ -4536,6 +4610,7 @@ fn evaluate(
         promo,
         hand_option: hand_option_pen,
         board_discount,
+        foul_probe,
     }
 }
 
