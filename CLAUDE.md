@@ -171,6 +171,14 @@
   N は平均79〜82手で N<10 はアリーナ800局で出現ゼロ（対人・終盤では効きうるので
   指標には残す）。王手の期待反則数は「手段クラス数 × 解消手の互いに素性 ÷ 解消手数」
   で決まる（詳細はメモリ strong-check-few-resolutions）
+- `cargo run --release --bin collision_probe -- <records/*.jsonl...>` — **当たりの
+  実現率の較正**（2026-08-03）。真実の棋譜を再生し、各決定点で相手側の全駒を
+  「当たっているか／敵歩の正面か／飛び駒の開き線上か」と `knownness_map` の
+  3分類（revealed / home / none）に割って、**その直後の着手で実際に取られた率**を
+  数える。粒子も思考も回さないので軽い（83局が数秒）。
+  `strategy::exposed_capture_risk` の `exposed_base` / `exposed_known` /
+  `exposed_pawn_head_w` の較正データ。実測値は CLAUDE.md の
+  `TSUITATE_EXPOSED_PAWN_HEAD_W` の節
 - `cargo run --release --bin belief_probe -- [--stride N] [--budget MS] [--seed S] <records/*.jsonl...>`
   — **粒子の信念の質を決定点ごとに測る**（NN段階②で作った診断。信念ネットとは
   独立に使える）。実戦と同じ順序で推定器を逐次 update し、マスごとの占有信念
@@ -425,6 +433,26 @@
     アリーナはペア3シードで 52.8% vs 対照 55.2%（誤差圏内・勝率の裏付けは無し）、
     シナリオは回帰なし（mate-net は 6→13/20 と改善）。**粒子の健全性は勝率と
     独立に守る**という判断で採用（2026-08-03 ユーザー判断）
+  - `TSUITATE_EXPOSED_PAWN_HEAD_W`（既定 0 = 従来挙動）/ `TSUITATE_EXPOSED_KNOWN`
+    （既定 0.1659 = EvalParams のまま。スイープ経路のみ）— **鉢合わせと
+    knownness の較正**（2026-08-03、ユーザー指摘「4七の位置の歩は相手から
+    取られやすい」が発端）。`bin/collision_probe` で実測した2件:
+    - **鉢合わせ**: 敵歩の正面に立つ駒は、相手が位置を知らなくても「歩を突く」
+      普通の手で取られる。相手が位置を知らない駒だけで比べて
+      **対人83局 8.01% vs 5.33% / アリーナ50局 5.36% vs 3.58% = どちらも1.50倍**。
+      `exposed_capture_risk` の重みを `1+w` 倍する（実測どおりなら w=0.5）。
+      SPSA対応（64個目）。凍結版はこの名前を知らない
+    - **knownness の過小評価**: 当たっている駒が次の1手で実際に取られた率は
+      revealed（そこで取ったので相手が知っている）**31.9〜39.6%** / home
+      6.0〜8.7% / none 4.1〜6.0% で、**revealed は none の 6.6〜7.9倍**。
+      モデルの重み `exposed_base 0.4576 + exposed_known 0.1659×knownness` は
+      未知0.4576〜既知0.6235 = **1.36倍**しか開かない。ただし revealed は
+      取り合いの最中のマスに偏る交絡があるうえ、SPSA は 0〜1.5 の範囲を
+      探索できたのに 0.1659 に収束している（較正の改善≠方策の改善。
+      メモリ check-solver-king-move-overconfidence）ので**既定は変えず**、
+      env スイープ経路だけ用意した
+    どちらも**対人・アリーナで比が一致する**ので、king_hole_w のような
+    「対人でしか効かない」型ではない
   - `TSUITATE_EXPOSED_MULTI_W`（既定 0 = 従来の max）— **当たっている自駒の
     複数枚計上**（2026-08-03、ユーザー指摘「4七の位置の歩は相手から取られやすい」
     が発端）。`exposed_capture_risk`（次の相手番で失いうる自駒）は

@@ -1423,6 +1423,11 @@ pub struct EvalParams {
     /// 割り引いて足す。実用域は 0.2〜0.4（4七歩成と安い探り打ちの差が ±0.3 の
     /// スケールなので、歩1枚ぶんの当たりが効くのはこのあたり）
     pub exposed_multi_w: f64,
+    /// **鉢合わせ**（`exposed_capture_risk` 内、2026-08-03）。敵歩の正面に
+    /// 立っている自駒の当たりを `1 + w` 倍する。相手がその駒の位置を知らなくても
+    /// 「歩を突く」という普通の手で取られるので、`knownness` では表現できない。
+    /// 実測は 1.50倍（= w=0.5）で対人・アリーナとも一致。0 = 従来挙動
+    pub exposed_pawn_head_w: f64,
     /// **taint 粒子の占有合意で打ちの反則確率を下げる**（2026-08-03、ユーザー指摘の
     /// 38手目 `S*4g` が発端）。厳密粒子が全滅した決定では `p_legal` が
     /// `prior_legal` だけで決まるが、その打ち側は**マスに依らない定数**
@@ -1725,6 +1730,7 @@ impl Default for EvalParams {
             // 大駒の成り道（2026-08-03）。0 = 従来と同一挙動
             major_promo_path_w: 0.0,
             exposed_multi_w: 0.0,
+            exposed_pawn_head_w: 0.0,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
             // 反則経済の新項（2026-07-16、オラクル測定で36ptの伸びしろを確認後に追加）。
@@ -1821,7 +1827,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 63] = [
+    pub const SPECS: [ParamSpec; 64] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -2175,6 +2181,12 @@ impl EvalParams {
             lo: 0.0,
             hi: 0.8,
         },
+        ParamSpec {
+            // 実測は 1.50倍 = w 0.5。倍率なので範囲は 0〜1.5（2.5倍まで）
+            name: "exposed_pawn_head_w",
+            lo: 0.0,
+            hi: 1.5,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -2242,6 +2254,7 @@ impl EvalParams {
             self.taint_occ_legal_w,
             self.major_promo_path_w,
             self.exposed_multi_w,
+            self.exposed_pawn_head_w,
         ]
     }
 
@@ -2311,6 +2324,7 @@ impl EvalParams {
             taint_occ_legal_w: v[60],
             major_promo_path_w: v[61],
             exposed_multi_w: v[62],
+            exposed_pawn_head_w: v[63],
         }
     }
 }
@@ -2524,6 +2538,32 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
     {
         Some(w) => EvalParams {
             major_promo_path_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 鉢合わせ（敵歩の正面。0 で従来挙動）
+    let params = match std::env::var("TSUITATE_EXPOSED_PAWN_HEAD_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            exposed_pawn_head_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 位置を知られている駒の当たり重み（既定 0.1659。較正の実測は
+    // 「知られている駒は知られていない駒の 6.6〜7.9倍取られる」= 大幅に不足。
+    // 既定は変えずスイープ経路だけ用意する。bin/collision_probe 参照）
+    let params = match std::env::var("TSUITATE_EXPOSED_KNOWN")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            exposed_known: w,
             ..params
         },
         None => params,
@@ -5219,6 +5259,19 @@ fn threat_value(pos: &Position, me: Color) -> f64 {
     best
 }
 
+/// マス `sq` の「`by` 側から見た正面手前」= `by` の歩がそこから `sq` へ進めるマス。
+/// `exposed_pawn_head_w`（鉢合わせ）の判定に使う
+fn pawn_front_of(sq: Coord, by: Color) -> Option<Coord> {
+    let rank = match by {
+        Color::Sente => sq.rank + 1,
+        Color::Gote => sq.rank - 1,
+    };
+    (1..=9).contains(&rank).then_some(Coord {
+        file: sq.file,
+        rank,
+    })
+}
+
 /// `threat_value` の守り判定を枚数で行うか（既定 off = 従来の二値）。
 /// `threat_value` の doc 参照
 fn threat_by_count() -> bool {
@@ -5295,7 +5348,21 @@ fn exposed_capture_risk(
             defenders > 0
         };
         let knownness = known.get(&sq).copied().unwrap_or(0.0);
-        let weight = params.exposed_base + params.exposed_known * knownness;
+        // **鉢合わせ**（`exposed_pawn_head_w`）: 敵歩の正面に立つ駒は、相手が
+        // 歩を突くという普通の手だけで取られる = 位置を知られている必要がない。
+        // 実測（bin/collision_probe、相手が位置を知らない駒だけで比較）:
+        // 対人83局 8.01% vs 5.33%、アリーナ50局 5.36% vs 3.58% = **どちらも1.50倍**
+        let head = params.exposed_pawn_head_w != 0.0
+            && pawn_front_of(sq, opp).is_some_and(|c| {
+                pos.piece_at(c)
+                    .is_some_and(|p| p.color == opp && p.role == Role::Pawn)
+            });
+        let weight = (params.exposed_base + params.exposed_known * knownness)
+            * if head {
+                1.0 + params.exposed_pawn_head_w
+            } else {
+                1.0
+            };
         let loss = exchange_value(piece.role)
             * if defended {
                 params.exposed_defended
@@ -5977,6 +6044,7 @@ pub(crate) mod tests {
         assert_field_index!(taint_occ_legal_w);
         assert_field_index!(major_promo_path_w);
         assert_field_index!(exposed_multi_w);
+        assert_field_index!(exposed_pawn_head_w);
 
         // 既定値は自分の SPECS 範囲内にあること（SPSA の中心点が
         // クランプで別の値へ化けるのを防ぐ。位置ズレの二重の網でもある）
@@ -6057,6 +6125,60 @@ pub(crate) mod tests {
         // 従来の max では同じ手でリスクが動かない（香が支配し続ける）
         let after_max = exposed_capture_risk(&moved, Color::Sente, None, &known, &base);
         assert!((after_max - max_only).abs() < 1e-9);
+    }
+
+    #[test]
+    fn exposed_pawn_head_w_scales_only_the_head_on_piece() {
+        use crate::shogi::Piece;
+        // 先手の歩 4f が後手の歩 4e の正面に立っている（鉢合わせ）
+        let mut pos = Position::empty(Color::Sente);
+        pos.set(
+            Coord { file: 4, rank: 6 },
+            Some(Piece {
+                color: Color::Sente,
+                role: Role::Pawn,
+            }),
+        );
+        pos.set(
+            Coord { file: 4, rank: 5 },
+            Some(Piece {
+                color: Color::Gote,
+                role: Role::Pawn,
+            }),
+        );
+        let known = HashMap::new();
+        let base = EvalParams::default();
+        assert_eq!(base.exposed_pawn_head_w, 0.0, "既定は従来挙動");
+        let plain = exposed_capture_risk(&pos, Color::Sente, None, &known, &base);
+        assert!(plain > 0.0);
+
+        let head = EvalParams {
+            exposed_pawn_head_w: 0.5,
+            ..base.clone()
+        };
+        let scaled = exposed_capture_risk(&pos, Color::Sente, None, &known, &head);
+        assert!((scaled - plain * 1.5).abs() < 1e-9, "正面の駒は 1+w 倍");
+
+        // 同じ当たりでも正面でなければ倍率は掛からない（後手の銀が斜めから）
+        let mut side = Position::empty(Color::Sente);
+        side.set(
+            Coord { file: 4, rank: 6 },
+            Some(Piece {
+                color: Color::Sente,
+                role: Role::Pawn,
+            }),
+        );
+        side.set(
+            Coord { file: 3, rank: 5 },
+            Some(Piece {
+                color: Color::Gote,
+                role: Role::Silver,
+            }),
+        );
+        let a = exposed_capture_risk(&side, Color::Sente, None, &known, &base);
+        let b = exposed_capture_risk(&side, Color::Sente, None, &known, &head);
+        assert!(a > 0.0);
+        assert!((a - b).abs() < 1e-9);
     }
 
     #[test]
