@@ -129,11 +129,13 @@ fn main() {
                         for c in ranking.iter().take(top_n) {
                             if show_scores {
                                 println!(
-                                    "{}({}) score={:.3} gain={:.3} p_legal={:.2} adjust={:+.3} depth2={}",
+                                    "{}({}) score={:.3} gain={:.3} static_gain={:.3} capture={:.3} p_legal={:.2} adjust={:+.3} depth2={}",
                                     jp_move(pos, &c.usi),
                                     c.usi,
                                     c.score,
                                     c.gain,
+                                    c.static_gain,
+                                    c.capture_value,
                                     c.p_legal,
                                     c.adjust,
                                     c.depth2
