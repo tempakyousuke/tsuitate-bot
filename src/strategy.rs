@@ -2134,6 +2134,15 @@ impl EvalParams {
             hi: 1.5,
         },
         ParamSpec {
+            // 占有駒の交換価値 × p_occ²(1−p_occ) × 予算² に掛かる。
+            // p_occ(1−p_occ) ゲートのピークは p=2/3 で ≈0.15 なので、
+            // 実効値は交換価値の w×0.15 程度。w=4.5 で 2二歩打（p=0.65・角8）が
+            // +5.3 = 2二と直行を上回る水準
+            name: "drop_probe_w",
+            lo: 0.0,
+            hi: 8.0,
+        },
+        ParamSpec {
             // 実効リスクが静的リスクの何割を下回れないか。1 で楽観禁止
             name: "depth2_optimism_cap",
             lo: 0.0,
@@ -2151,15 +2160,6 @@ impl EvalParams {
             name: "major_promo_path_w",
             lo: 0.0,
             hi: 3.0,
-        },
-        ParamSpec {
-            // 占有駒の交換価値 × p_occ²(1−p_occ) × 予算² に掛かる。
-            // p_occ(1−p_occ) ゲートのピークは p=2/3 で ≈0.15 なので、
-            // 実効値は交換価値の w×0.15 程度。w=4.5 で 2二歩打（p=0.65・角8）が
-            // +5.3 = 2二と直行を上回る水準
-            name: "drop_probe_w",
-            lo: 0.0,
-            hi: 8.0,
         },
     ];
 
@@ -5152,22 +5152,44 @@ fn big_home_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
 
 /// 自分が当たりを付けている敵駒の最大価値（露出リスクの鏡像）。
 /// 紐つき（相手が守っている）なら取ったときに取り返されるぶん割り引く。
-/// 玉への当たりは王手であり合法性・王手ボーナス側で扱うので除く
+/// 玉への当たりは王手であり合法性・王手ボーナス側で扱うので除く。
+///
+/// **枚数版**（`threat_by_count`、`TSUITATE_THREAT_BY_COUNT`）: 守りの判定を
+/// 「1枚でも守られていれば割り引く」から「守り枚数 ≥ 攻め枚数なら割り引く」へ
+/// 変える（`recapture_risk` の V1 の鏡像）。ユーザー指摘 2026-08-03:
+/// 「いると確信している駒を複数枚の利きで取りに行くことは実戦でもやること」—
+/// 従来形は当たりの有無が二値なので、**既に当たっている駒へ利きを足す手**
+/// （取りの準備）に一切の価値が付かず、単独駒での投機的な捕獲にしか勝ち目がない
+/// （quest31-m021: 4一の金（と信じている駒）へ3二とで利きを足す手が、
+/// 単騎の 4一と に 2.2 点負ける）
 fn threat_value(pos: &Position, me: Color) -> f64 {
     let opp = me.other();
+    let by_count = threat_by_count();
     let mut best = 0.0f64;
     for (sq, piece) in pos.pieces() {
         if piece.color != opp || piece.role == Role::King {
             continue;
         }
+        // 安いゲートを先に置く（attack_count は当たっている駒にだけ払う）
         if !pos.is_attacked(sq, me) {
             continue;
         }
-        let defended = pos.is_attacked(sq, opp);
+        let defended = if by_count {
+            pos.attack_count(sq, opp) >= pos.attack_count(sq, me)
+        } else {
+            pos.is_attacked(sq, opp)
+        };
         let gain = exchange_value(piece.role) * if defended { 0.45 } else { 1.0 };
         best = best.max(gain);
     }
     best
+}
+
+/// `threat_value` の守り判定を枚数で行うか（既定 off = 従来の二値）。
+/// `threat_value` の doc 参照
+fn threat_by_count() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TSUITATE_THREAT_BY_COUNT").is_ok_and(|v| v == "1"))
 }
 
 /// 着手駒（マス to にいる自駒）が次の相手番で取られるリスク。
@@ -5835,13 +5857,83 @@ pub(crate) mod tests {
             }};
         }
 
+        // 全項目を網羅する（一部だけ並べていた頃に drop_probe_w の
+        // SPECS 位置ズレを見逃した。SPECS の順序は to_vec の順序と一致が必須で、
+        // ズレると SPSA が別の項目の範囲・名前で調整してしまう）
         assert_field_index!(check_bonus);
+        assert_field_index!(check_foul_scale);
+        assert_field_index!(mover_w_captured);
+        assert_field_index!(mover_w_quiet);
+        assert_field_index!(mover_check_extra);
+        assert_field_index!(capture_reveal_risk);
+        assert_field_index!(camp_known_quiet);
+        assert_field_index!(camp_scale);
+        assert_field_index!(exposed_base);
+        assert_field_index!(exposed_known);
+        assert_field_index!(home_knownness);
+        assert_field_index!(recapture_defended);
+        assert_field_index!(exposed_defended);
+        assert_field_index!(attack_w);
+        assert_field_index!(pressure_w);
         assert_field_index!(foul_cost_base);
+        assert_field_index!(foul_cost_pow);
+        assert_field_index!(advance_w);
+        assert_field_index!(promote_bias);
+        assert_field_index!(drop_bias);
+        assert_field_index!(prior_weight);
+        assert_field_index!(prior_weight_degen);
+        assert_field_index!(threat_w);
+        assert_field_index!(info_bonus);
+        assert_field_index!(big_home_penalty);
+        assert_field_index!(hand_drop_w);
+        assert_field_index!(backtrack_penalty);
+        assert_field_index!(shuffle_penalty);
+        assert_field_index!(soft_decay);
+        assert_field_index!(king_probe_bonus);
+        assert_field_index!(coverage_w);
         assert_field_index!(depth2_replace);
+        assert_field_index!(depth2_check_pen);
+        assert_field_index!(depth2_recap_discount);
+        assert_field_index!(foul_diff_pow);
         assert_field_index!(check_limit_accel);
+        assert_field_index!(value_nn_w);
+        assert_field_index!(checker_removal_w);
+        assert_field_index!(capture_bet_var_w);
+        assert_field_index!(mate_threat_w);
+        assert_field_index!(mate_risk_w);
+        assert_field_index!(king_hole_w);
+        assert_field_index!(link_w);
+        assert_field_index!(effect_own_w);
+        assert_field_index!(effect_opp_w);
+        assert_field_index!(link_work_w);
+        assert_field_index!(link_work_ref);
+        assert_field_index!(repeat_penalty_w);
+        assert_field_index!(plan_w);
+        assert_field_index!(board_discount_w);
         assert_field_index!(check_strength_w);
         assert_field_index!(escape_cover_w);
         assert_field_index!(defender_capture_w);
+        assert_field_index!(drop_hit_evac_w);
+        assert_field_index!(promo_potential_w);
+        assert_field_index!(hand_option_w);
+        assert_field_index!(mate_gate_q0);
+        assert_field_index!(king_adj_entry_w);
+        assert_field_index!(drop_probe_w);
+        assert_field_index!(depth2_optimism_cap);
+        assert_field_index!(taint_occ_legal_w);
+        assert_field_index!(major_promo_path_w);
+
+        // 既定値は自分の SPECS 範囲内にあること（SPSA の中心点が
+        // クランプで別の値へ化けるのを防ぐ。位置ズレの二重の網でもある）
+        for (spec, v) in EvalParams::SPECS.iter().zip(&base_vec) {
+            assert!(
+                spec.lo <= *v && *v <= spec.hi,
+                "{} の既定 {v} が範囲 [{}, {}] の外",
+                spec.name,
+                spec.lo,
+                spec.hi
+            );
+        }
     }
 
     #[test]
