@@ -2259,6 +2259,8 @@ fn sample_opp_move(
     // (手, 素の重み w, ガイド後の提案重み g)
     let mut candidates: Vec<(ShogiMove, f64, f64)> = vec![];
     let mut total_mass = 0.0f64;
+    // 取る手の露見コスト（env は毎回読まずに手番ごとに1回だけ）
+    let reveal_w = capture_reveal_cost_w();
     for mv in pos.legal_moves() {
         // 取られたマスとの整合（取りがなかったなら自駒のあるマスへは来ていない）
         let to_capture = match mv {
@@ -2302,7 +2304,7 @@ fn sample_opp_move(
             foul_count_this_turn,
             my_foul_count_last_turn,
             moved_from_known_attacked(pos, &mv, opp, known_squares),
-        );
+        ) * capture_reveal_factor(pos, &mv, opp, reveal_w);
         total_mass += w;
         if consistent {
             let mut g = w * guide_boost_factor(pos, &next, &mv, guide, opp);
@@ -2384,6 +2386,64 @@ fn guide_boost_factor(pos: &Position, next: &Position, mv: &ShogiMove, guide: &G
 /// 事前分布のフィットでは駒取りは観測条件で絞られるため学習されていない。
 /// 対人実戦では露見駒の回収はほぼ必ず実行されるので予測では強く優先する
 const PREDICT_RECAPTURE_BOOST: f64 = 8.0;
+
+/// **取る手の露見コスト**（2026-08-03、ユーザー指摘）: 相手が自分の駒を取ると
+/// 「どのマスで取られたか」が通知されるので、**取った駒の位置は確実に露見する**。
+/// 強い相手ほど、その露見に見合わない大駒では取らない（同じ取りができるなら
+/// 安い駒で取る）。自分側の評価には既に同じ原理が入っている
+/// （`capture_reveal_risk`「等価な取りなら安い駒で取る」）が、**相手モデル側には
+/// 無かった**: opp_move NN の25特徴量に「取る手か」の表現が1つも無く、
+/// 駒種one-hotがあっても「取る×駒価値」の交互作用は表現できない。
+///
+/// 実測（quest31-m030、後手番の30手目。29手目に先手が3三の桂を取った）:
+/// 3三の駒種ビリーフは **龍 33.1% / 成桂 33.5% / 成銀 25.8% / と金 6.4%（真実）**
+/// で、期待捕獲価値 6.8（真実のと金は交換価値 3.5）。うち龍の寄与だけで 3.6 =
+/// 過大分の半分以上。ユーザーの指摘どおり「3三に桂がいるのは相手からも読めて
+/// いて、そこへ動く手は取ったことを観測されうる。強い相手ほど大駒は使わない」。
+///
+/// NN のロジットへ `−w × 取った駒の交換価値` を足す形で入れる（重み = exp(logit)
+/// なので exp(−w·V) 倍）。w=0.2 なら 龍(10.75)は 0.12倍・と金(3.5)は 0.50倍で
+/// 約4倍の差がつく。0 で従来挙動。
+///
+/// **粒子フィルタの標本化側（「相手は何を指したのか」）だけに掛ける**。
+/// 2手読みの応手予測（`predict_opp_reply`）には掛けない: そちらは
+/// PREDICT_RECAPTURE_BOOST で取り返しを強く優先している側で、F3
+/// （2手読みが取り返しを過小評価する）を悪化させるため
+fn capture_reveal_cost_w() -> f64 {
+    std::env::var("TSUITATE_OPP_CAPTURE_REVEAL_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(OPP_CAPTURE_REVEAL_W_DEFAULT)
+}
+
+/// 既定 0.2（2026-08-03 採用）。ペア3シード×200局 vs v13 で
+/// **50.0 / 55.5 / 60.0% = 合算 55.2%（対照 49.0%、+6.2pt、3シードすべて対照超え）**、
+/// 反則/局 6.41〜6.63（対照 6.79〜6.96）と減少。w=0.4 も単シード 57.5% と良好だが、
+/// 龍の信念を 1.8% まで潰して駒種分布が成桂に偏るので 0.2 を採る
+const OPP_CAPTURE_REVEAL_W_DEFAULT: f64 = 0.2;
+
+/// 取る手の露見コストの重み倍率（1.0 = 影響なし）。`mv` が相手（opp）の手で
+/// 自分（opp.other()）の駒を取るとき、取る駒の交換価値で指数的に割り引く
+fn capture_reveal_factor(pos: &Position, mv: &ShogiMove, opp: Color, w: f64) -> f64 {
+    if w == 0.0 {
+        return 1.0;
+    }
+    let ShogiMove::Board { from, to, .. } = *mv else {
+        return 1.0; // 打ちは駒を取れない
+    };
+    if !pos.piece_at(to).is_some_and(|p| p.color == opp.other()) {
+        return 1.0; // 取る手ではない
+    }
+    let Some(mover) = pos.piece_at(from) else {
+        return 1.0;
+    };
+    // 玉での取りは露見コストの問題ではない（玉は取られない）ので対象外
+    if mover.role == Role::King {
+        return 1.0;
+    }
+    (-w * crate::strategy::exchange_value(mover.role)).exp()
+}
 
 /// 相手の応手を事前分布モデルで1手サンプルする（2手読み用の予測）。
 /// sample_opp_move と同じ尤度モデルだが、これから指される手の予測なので

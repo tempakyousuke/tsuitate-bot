@@ -1277,6 +1277,21 @@ pub struct EvalParams {
     pub coverage_w: f64,
     /// 2手読みで静的リスク項をサンプル実測に置き換える割合（0=従来、1=全面置換）
     pub depth2_replace: f64,
+    /// 2手読みの**楽観方向の置き換え**の上限（0 = 従来と同一挙動、1 = 楽観禁止 =
+    /// 実効リスクが静的リスクを下回らない）。
+    ///
+    /// 置き換えは実効リスク `(1−w)·risk_mean + w·|delta|` の形になる
+    /// （w = depth2_replace）。相手の応手方策は取り返しを確率的にしか選ばないので
+    /// **|delta| < risk_mean になりやすく、静的リスクが大きいほど戻し額が大きい**
+    /// = 危険な捕獲ほど加点される、という逆転が起きる（quest31-m030f1 の実測:
+    /// 1二飛の反則で「3三は守られている」信念が 7.2%→57.7% に上がり静的評価は
+    /// 正しく 6.844→5.882 に下がったのに、2手読みの戻しが +0.70→+1.85 に増えて
+    /// 最終 gain は 7.547→7.734 と上がった。F3、
+    /// docs/improvement-plan-2026-08-02-quest31.md）。
+    ///
+    /// この項は緩和（relief）を `(1−cap)·risk_mean` で頭打ちにする。悲観方向
+    /// （delta が静的リスクより大きい損失を見つけた場合）は制限しない
+    pub depth2_optimism_cap: f64,
     /// 2手読みで応手に王手を掛けられた場合のペナルティ
     pub depth2_check_pen: f64,
     /// 2手読みの取り返し補償の割引（取り返し自体への反撃リスクの近似）
@@ -1327,6 +1342,23 @@ pub struct EvalParams {
     /// に対し、寄与を 1000×q×(q/(q+q0)) と凸にゲートする: 裾の幻詰み（q≈0.1）は
     /// 材料スケールまで沈み、合意の詰み（q→1）はほぼ満額。0 = 従来と同一挙動
     pub mate_gate_q0: f64,
+    /// **taint 粒子の占有合意で打ちの反則確率を下げる**（2026-08-03、ユーザー指摘の
+    /// 38手目 `S*4g` が発端）。厳密粒子が全滅した決定では `p_legal` が
+    /// `prior_legal` だけで決まるが、その打ち側は**マスに依らない定数**
+    /// （盤全体の平均空きマス率 q）なので、**確実に埋まっているマスへの打ちも
+    /// 空きマスと同じ 0.74 で生き残る**。
+    ///
+    /// 実測（quest31 の38手目、後手番）: 4七には先手の歩がいて、しかも
+    /// **taint 粒子は 100% それを当てている**（自分の4六歩が前進を塞いでいて、
+    /// 動けば取りが発生して観測されるので論理的にも確定する）。にもかかわらず
+    /// `S*4g` は p_legal=0.74 で候補上位に残り、反則を1回捨てることになる。
+    ///
+    /// 打ちは「占有マス = 反則」なので、taint の合意占有率をそのまま反則確率に
+    /// 使える（gain 側と違い**駒種の当て違いに鈍感** = taint を信用する範囲が狭い）。
+    /// **安全方向のみ**: `p_legal = min(prior, 1 − w×p_occ)` で、空きマスの
+    /// 打ちを押し上げることはしない（反則マス記憶系4種が全滅した領域なので
+    /// 楽観方向へは動かさない）。0 = 従来と同一挙動
+    pub taint_occ_legal_w: f64,
     /// 打ちプローブの反則情報価値（quest31 レビュー 2026-08-03、m015 の
     /// 2二歩打が発端。ユーザー指摘「2二とが高いだけでなく2二歩打が低いのも問題」）。
     /// combine_score は「反則の価値 = 次善手の価値 − 反則コスト」と仮定するが、
@@ -1603,6 +1635,12 @@ impl Default for EvalParams {
             king_probe_bonus: 0.2451,
             coverage_w: 0.0013,
             depth2_replace: 0.6205,
+            // 2手読みの楽観上限（2026-08-03、F3）。0 = 従来と同一挙動。
+            // アリーナがペア比較で中立〜負（cap=1.0 で −1.5pt、0.5 で −6.5pt）
+            // だったため 0 のまま
+            depth2_optimism_cap: 0.0,
+            // taint 占有合意による打ちの反則回避（2026-08-03）。0 = 従来と同一挙動
+            taint_occ_legal_w: 0.0,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
             // 反則経済の新項（2026-07-16、オラクル測定で36ptの伸びしろを確認後に追加）。
@@ -1699,7 +1737,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 59] = [
+    pub const SPECS: [ParamSpec; 61] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -2019,6 +2057,18 @@ impl EvalParams {
             hi: 1.5,
         },
         ParamSpec {
+            // 実効リスクが静的リスクの何割を下回れないか。1 で楽観禁止
+            name: "depth2_optimism_cap",
+            lo: 0.0,
+            hi: 1.0,
+        },
+        ParamSpec {
+            // 1 で taint の合意占有率をそのまま反則確率に使う（安全方向のみ）
+            name: "taint_occ_legal_w",
+            lo: 0.0,
+            hi: 1.0,
+        },
+        ParamSpec {
             // 占有駒の交換価値 × p_occ²(1−p_occ) × 予算² に掛かる。
             // p_occ(1−p_occ) ゲートのピークは p=2/3 で ≈0.15 なので、
             // 実効値は交換価値の w×0.15 程度。w=4.5 で 2二歩打（p=0.65・角8）が
@@ -2090,6 +2140,8 @@ impl EvalParams {
             self.mate_gate_q0,
             self.king_adj_entry_w,
             self.drop_probe_w,
+            self.depth2_optimism_cap,
+            self.taint_occ_legal_w,
         ]
     }
 
@@ -2155,6 +2207,8 @@ impl EvalParams {
             mate_gate_q0: v[56],
             king_adj_entry_w: v[57],
             drop_probe_w: v[58],
+            depth2_optimism_cap: v[59],
+            taint_occ_legal_w: v[60],
         }
     }
 }
@@ -2356,6 +2410,30 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
     {
         Some(w) => EvalParams {
             mover_check_extra: w,
+            ..params
+        },
+        None => params,
+    };
+    // taint 占有合意による打ちの反則回避（0 で従来挙動）
+    let params = match std::env::var("TSUITATE_TAINT_OCC_LEGAL_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            taint_occ_legal_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 2手読みの楽観置き換えの上限（F3。0 で従来挙動）
+    let params = match std::env::var("TSUITATE_DEPTH2_OPTIMISM_CAP")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            depth2_optimism_cap: w,
             ..params
         },
         None => params,
@@ -2825,6 +2903,30 @@ impl Strategy for EstimatorStrategy {
                 )
             });
         let blind_belief = blind_belief_board.as_ref().map(|(o, v)| (o, *v));
+        // ブラインド決定での taint 占有合意（打ちの反則回避。`taint_occ_legal_w`）。
+        // 打ちマスの占有は「駒種が当たっているか」に依らないので、gain 側より
+        // taint を信用する範囲が狭い。決定点ごとに1回作れば全候補で使える
+        let taint_occ_board: Option<[f64; 81]> = (params.taint_occ_legal_w != 0.0
+            && sample.is_empty()
+            && !taint_pool.is_empty())
+        .then(|| {
+            let mut occ = [0.0f64; 81];
+            let mut mass = 0.0f64;
+            for &(p, w) in &taint_pool {
+                mass += w;
+                for (sq, pc) in p.pieces() {
+                    if pc.color == opp_color {
+                        occ[crate::belief_features::sq_index(sq)] += w;
+                    }
+                }
+            }
+            if mass > 0.0 {
+                for v in occ.iter_mut() {
+                    *v /= mass;
+                }
+            }
+            occ
+        });
         // V2（玉距離重み付き利き）の相手玉側。玉位置の信念は評価に使う粒子から
         // 取る（厳密が生きていればそちら、全滅していれば taint = mate_pool と
         // 同じ規約）。重みが両方0（既定）なら 81マスぶんの表も作らない
@@ -2924,6 +3026,7 @@ impl Strategy for EstimatorStrategy {
                 &mut nn_state_cache,
                 blind_recapture,
                 blind_belief,
+                taint_occ_board.as_ref(),
                 opp_king_w.as_ref(),
                 drop_hit_expo_before,
                 promo_pot_before,
@@ -3055,7 +3158,15 @@ impl Strategy for EstimatorStrategy {
                 // 構想（自分の手 → 相手の応手 → 自分の手）は depth2_delta の
                 // 内側へ統合した（`plan_w`）。応手を挟まない外付けの加点は
                 // 200局で -6pt と明確に負だったので廃止
-                let gain2 = out.gain + params.depth2_replace * (out.risk_mean + delta);
+                //
+                // relief（正 = 静的リスクより楽観に置き換わる量）は
+                // `(1−depth2_optimism_cap)×risk_mean` で頭打ちにする。相手の応手
+                // 方策は取り返しを確率的にしか選ばないので |delta| < risk_mean に
+                // なりやすく、上限が無いと**静的リスクが大きいほど加点が増える**
+                // （F3。depth2_optimism_cap の doc 参照）。悲観方向は制限しない
+                let relief = params.depth2_replace * (out.risk_mean + delta);
+                let max_relief = (1.0 - params.depth2_optimism_cap) * out.risk_mean;
+                let gain2 = out.gain + relief.min(max_relief);
                 (
                     gain2,
                     combine_score(gain2, out.p_legal, out.foul_cost) + out.foul_probe + adjust,
@@ -4040,6 +4151,10 @@ fn evaluate(
     // 上と同じく**厳密粒子が全滅した決定でだけ**使う（`belief_gain_w`）。
     // 重みが 0 なら choose() が None を渡すので計算もしない
     blind_belief: Option<(&[f64; 81], f64)>,
+    // ブラインド決定での taint 占有合意（`taint_occ_legal_w`）。打ちの反則確率
+    // にだけ使う（Some のときだけ有効。choose() が w≠0・厳密粒子ゼロの
+    // ゲートを掛けて渡す）
+    taint_occ: Option<&[f64; 81]>,
     // V2: マスごとの「相手玉の信念位置からの距離重み」（`opp_king_effect_weights`）。
     // 決定点ごとに1度だけ作って全候補で使い回す
     opp_king_w: Option<&[f64; 81]>,
@@ -4280,11 +4395,19 @@ fn evaluate(
     let n: f64 = particles.iter().map(|(_, w)| w).sum();
     let degen = 1.0 - (n / budget.eval_particles as f64).min(1.0);
     let w = params.prior_weight + params.prior_weight_degen * degen;
-    let p_legal = if particles_are_taint {
+    let mut p_legal = if particles_are_taint {
         prior
     } else {
         (legal + prior * w) / (n + w)
     };
+    // taint 占有合意で打ちの反則確率を締める（`taint_occ_legal_w`）。
+    // 打ちマスが埋まっていれば必ず反則なので、合意占有率をそのまま反則確率に
+    // 使える。**安全方向のみ**（min）: 空きマスの打ちを押し上げはしない
+    if let (Some(occ), ShogiMove::Drop { to, .. }) = (taint_occ, *mv) {
+        let p_occ = occ[crate::belief_features::sq_index(to)];
+        p_legal = p_legal.min(1.0 - params.taint_occ_legal_w * p_occ).max(0.0);
+    }
+    let p_legal = p_legal;
     // 賭け分散ペナルティの内訳（ランキング表示用に expected の外へ持ち出す）
     let mut capture_bet_penalty = 0.0;
     // valueネット項の内訳（同上。発火率フック src/hits.rs が使う）
@@ -5439,6 +5562,26 @@ pub(crate) mod tests {
             to: Coord { file: 2, rank: 1 },
         };
         assert_eq!(own_effects_after(&view, &block, None, &params).drop_hit_exposure, 0.0);
+    }
+
+    /// F3: 2手読みの緩和（relief）の上限。cap=0 は従来と同一挙動でなければ
+    /// ならない（depth2_replace<1 なので relief は常に risk_mean 未満）
+    #[test]
+    fn depth2の楽観上限はcap0で挙動を変えない() {
+        let relief_of = |risk_mean: f64, delta: f64, cap: f64| {
+            let w = EvalParams::default().depth2_replace;
+            let relief = w * (risk_mean + delta);
+            relief.min((1.0 - cap) * risk_mean)
+        };
+        // cap=0: 従来どおり relief = w*(risk_mean+delta) がそのまま通る
+        let plain = EvalParams::default().depth2_replace * (4.0 + -1.0);
+        assert!((relief_of(4.0, -1.0, 0.0) - plain).abs() < 1e-9);
+        // cap=1: 楽観方向の置き換えを禁止（実効リスクは静的リスクのまま）
+        assert!(relief_of(4.0, -1.0, 1.0).abs() < 1e-9);
+        // 悲観方向（delta が静的リスクより大きい損失）は cap に関係なく通る
+        assert!(relief_of(4.0, -9.0, 1.0) < 0.0);
+        // リスクゼロの手（静かな手）は cap の影響を受けない
+        assert!(relief_of(0.0, 0.0, 1.0).abs() < 1e-9);
     }
 
     #[test]
