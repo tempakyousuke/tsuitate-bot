@@ -1417,6 +1417,12 @@ pub struct EvalParams {
     /// 飛・角・香の素材の成り得を成りマスまでの距離で減衰させた総和の差分。
     /// 自駒がどいて大駒の道が開くと跳ねる。0 = 従来と同一挙動
     pub major_promo_path_w: f64,
+    /// **当たっている自駒の複数枚計上**（`exposed_capture_risk` の doc 参照、
+    /// 2026-08-03）。上位3件を `t0 + w·t1 + w²·t2` で数える。0 = 従来の max。
+    /// 相手は1手に1枚しか取れないので主項は最大値のまま置き、2枚目以降を
+    /// 割り引いて足す。実用域は 0.2〜0.4（4七歩成と安い探り打ちの差が ±0.3 の
+    /// スケールなので、歩1枚ぶんの当たりが効くのはこのあたり）
+    pub exposed_multi_w: f64,
     /// **taint 粒子の占有合意で打ちの反則確率を下げる**（2026-08-03、ユーザー指摘の
     /// 38手目 `S*4g` が発端）。厳密粒子が全滅した決定では `p_legal` が
     /// `prior_legal` だけで決まるが、その打ち側は**マスに依らない定数**
@@ -1718,6 +1724,7 @@ impl Default for EvalParams {
             taint_occ_legal_w: 0.0,
             // 大駒の成り道（2026-08-03）。0 = 従来と同一挙動
             major_promo_path_w: 0.0,
+            exposed_multi_w: 0.0,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
             // 反則経済の新項（2026-07-16、オラクル測定で36ptの伸びしろを確認後に追加）。
@@ -1814,7 +1821,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 62] = [
+    pub const SPECS: [ParamSpec; 63] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -2161,6 +2168,13 @@ impl EvalParams {
             lo: 0.0,
             hi: 3.0,
         },
+        ParamSpec {
+            // 2枚目以降の当たりの割引率。1 だと3枚まで満額で数えて
+            // 「相手は1手に1枚しか取れない」に反するので上限は 0.8
+            name: "exposed_multi_w",
+            lo: 0.0,
+            hi: 0.8,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -2227,6 +2241,7 @@ impl EvalParams {
             self.depth2_optimism_cap,
             self.taint_occ_legal_w,
             self.major_promo_path_w,
+            self.exposed_multi_w,
         ]
     }
 
@@ -2295,6 +2310,7 @@ impl EvalParams {
             depth2_optimism_cap: v[59],
             taint_occ_legal_w: v[60],
             major_promo_path_w: v[61],
+            exposed_multi_w: v[62],
         }
     }
 }
@@ -2508,6 +2524,18 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
     {
         Some(w) => EvalParams {
             major_promo_path_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 当たっている自駒の複数枚計上（0 で従来の max）
+    let params = match std::env::var("TSUITATE_EXPOSED_MULTI_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            exposed_multi_w: w,
             ..params
         },
         None => params,
@@ -4480,6 +4508,12 @@ fn evaluate(
         let mover_risk =
             mover_w * recapture_risk(&next, me, to, params.recapture_defended).max(floor);
         let hidden_risk = exposed_capture_risk(&next, me, Some(to), known, params);
+        // ここの max は**外さない**（2026-08-03 実測）。着手駒の危険と
+        // 置き去りの危険を `top + w·min` で足す版は、着手駒側に
+        // `capture_reveal_risk` の床（取ったマスは相手に通知される）が
+        // 乗っているぶん**取る手を余計に罰する**: quest31-m026 で
+        // 4七歩成 と 2六歩打 の差が w=0/0.3/0.5 で 0.322/0.272/0.259 と
+        // 逆に縮んだ。複数枚計上は `exposed_capture_risk` の内側だけに留める
         let risk = mover_risk.max(hidden_risk);
         v -= risk;
         risk_sum += w * risk;
@@ -5222,7 +5256,16 @@ fn recapture_risk(pos: &Position, me: Color, to: Coord, defended_discount: f64) 
 /// 相手がその駒の位置を知っているほど（knownness_map）実際に取られやすいので
 /// 重みを引き上げる。位置が漏れていない駒は従来通り薄く見積もる。
 /// exclude（着手駒のマス）は recapture_risk 側で別の重みで数えるので除外する。
-/// 合法手の完全列挙（ピン考慮など）はコストに見合わないので利きベースの近似
+/// 合法手の完全列挙（ピン考慮など）はコストに見合わないので利きベースの近似。
+///
+/// **複数枚版**（`exposed_multi_w`、既定0 = 従来の max）: 上位3件を
+/// `t0 + w·t1 + w²·t2` で数える。相手は1手に1枚しか取れないので最大値を主項に
+/// 置く形は保つが、max だけだと**2枚目以降の当たりが完全に消える**。
+/// ユーザー指摘 2026-08-03（quest31-m026 の 4七歩成）: 当たっている自駒が
+/// 1一香（紐なし・龍に当たり・初期位置なので相手の既知度も高い）と
+/// 4六歩（2枚に当たられて紐なし）の2枚あるとき、max は必ず香を取るので
+/// **「取られやすい歩を逃がしつつ取って成る」手の緊急性が評価上ゼロになる**。
+/// 逃げの価値は「動かせばその駒が集合から抜ける」ことで自動的に差分になる
 fn exposed_capture_risk(
     pos: &Position,
     me: Color,
@@ -5231,7 +5274,8 @@ fn exposed_capture_risk(
     params: &EvalParams,
 ) -> f64 {
     let opp = me.other();
-    let mut worst = 0.0f64;
+    // 上位3件を降順に保つ（Vec を作らずホットパスの割り当てを避ける）
+    let mut top = [0.0f64; 3];
     for (sq, piece) in pos.pieces() {
         if piece.color != me || piece.role == Role::King {
             continue; // 玉が当たっているなら王手なので合法性の側で処理される
@@ -5259,9 +5303,19 @@ fn exposed_capture_risk(
                 1.0
             }
             * weight;
-        worst = worst.max(loss);
+        if loss > top[0] {
+            top[2] = top[1];
+            top[1] = top[0];
+            top[0] = loss;
+        } else if loss > top[1] {
+            top[2] = top[1];
+            top[1] = loss;
+        } else if loss > top[2] {
+            top[2] = loss;
+        }
     }
-    worst
+    let w = params.exposed_multi_w;
+    top[0] + w * top[1] + w * w * top[2]
 }
 
 /// 相手の持ち駒による「王手打ちの受け入れ面積」。
@@ -5922,6 +5976,7 @@ pub(crate) mod tests {
         assert_field_index!(depth2_optimism_cap);
         assert_field_index!(taint_occ_legal_w);
         assert_field_index!(major_promo_path_w);
+        assert_field_index!(exposed_multi_w);
 
         // 既定値は自分の SPECS 範囲内にあること（SPSA の中心点が
         // クランプで別の値へ化けるのを防ぐ。位置ズレの二重の網でもある）
@@ -5948,6 +6003,60 @@ pub(crate) mod tests {
         for k in 1..20 {
             assert!(g(k) > g(k + 1), "単調減少");
         }
+    }
+
+    #[test]
+    fn exposed_multi_w_counts_the_second_hanging_piece() {
+        use crate::shogi::Piece;
+        // 先手の香 1a と歩 4f が、どちらも紐なしで後手の駒に当たられている。
+        // max だけだと香が常に勝ち、歩の危険は評価上ゼロになる
+        // （quest31-m026 の 4七歩成 が本命なのに緊急性が見えなかった構図）
+        let mut pos = Position::empty(Color::Sente);
+        let put = |pos: &mut Position, file: i8, rank: i8, color, role| {
+            pos.set(Coord { file, rank }, Some(Piece { color, role }));
+        };
+        put(&mut pos, 1, 1, Color::Sente, Role::Lance);
+        put(&mut pos, 4, 6, Color::Sente, Role::Pawn);
+        // 後手の龍が 2a から 1a を、歩が 4e から 4f を狙う
+        put(&mut pos, 2, 1, Color::Gote, Role::Dragon);
+        put(&mut pos, 4, 5, Color::Gote, Role::Pawn);
+        let known = HashMap::new();
+
+        let base = EvalParams::default();
+        assert_eq!(base.exposed_multi_w, 0.0, "既定は従来の max");
+        let max_only = exposed_capture_risk(&pos, Color::Sente, None, &known, &base);
+
+        // 香だけを取り除くと max は歩に落ちる = 歩ぶんの寄与を単独で測れる
+        let mut without_lance = pos.clone();
+        without_lance.set(Coord { file: 1, rank: 1 }, None);
+        let pawn_only = exposed_capture_risk(&without_lance, Color::Sente, None, &known, &base);
+        assert!(pawn_only > 0.0);
+        assert!(
+            max_only > pawn_only,
+            "香のほうが高いので max は香を取る（歩の寄与は0）"
+        );
+
+        // 複数枚版では歩が w 倍で足される
+        let w = 0.3;
+        let multi = EvalParams {
+            exposed_multi_w: w,
+            ..base.clone()
+        };
+        let both = exposed_capture_risk(&pos, Color::Sente, None, &known, &multi);
+        assert!((both - (max_only + w * pawn_only)).abs() < 1e-9);
+
+        // 歩を動かして当たりを外せば、その差分だけリスクが下がる（＝逃げの価値）
+        let mut moved = pos.clone();
+        moved.set(Coord { file: 4, rank: 6 }, None);
+        put(&mut moved, 4, 5, Color::Sente, Role::Tokin);
+        let after = exposed_capture_risk(&moved, Color::Sente, None, &known, &multi);
+        assert!(
+            after < both,
+            "取られそうな歩を動かせば複数枚版ではリスクが下がる"
+        );
+        // 従来の max では同じ手でリスクが動かない（香が支配し続ける）
+        let after_max = exposed_capture_risk(&moved, Color::Sente, None, &known, &base);
+        assert!((after_max - max_only).abs() < 1e-9);
     }
 
     #[test]
