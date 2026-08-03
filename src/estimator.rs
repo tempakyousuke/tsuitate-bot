@@ -2709,7 +2709,31 @@ fn opp_move_weight(
     // 反則中の王手駒探索（kakutori.kif）の粒子再生成コストが2〜3倍以上に
     // 悪化する事例を確認したため、外挿時の暴走を防ぐ安全弁として導入
     let s = crate::opp_move_nn::opp_move_nn_forward(&features).clamp(-15.0, 15.0);
-    s.exp()
+    (s / opp_move_temp()).exp()
+}
+
+/// **相手手事前分布の温度**（既定 1.0 = 従来どおり）。T>1 で分布を平滑化し、
+/// 「相手はモデルほど型どおりには指さない」を表す。
+///
+/// 動機（2026-08-03、quest31-m021）: 21手目の 4一と（幻の金を取りに行く手）は
+/// **4一に金がいる信念 88.4%**（真実は空）に支えられている。後手の金は20手目に
+/// 初期マス4一から5一へ寄っただけなのに、粒子はその手をほとんど採らない。
+/// 相手モデルの `from_home`（初期配置マスからの移動）は「未観測の駒は初期配置の
+/// まま」を表す特徴量で、**bot 自己対局で較正**されているため、人間が普通に指す
+/// 金寄り・玉の囲い替えのような静かな組み替えを系統的に過小評価する
+/// （[[enprise-belief-ceiling]] と同じ構図: 教師の挙動が信念の上限になる）。
+/// 温度は特定の特徴量を狙い撃ちせずに過信そのものを緩めるので、
+/// この系統の誤りに一括で効くかを1つのスカラーで測れる。
+/// 凍結版はこの名前を知らないので `-f env=` は候補側にだけ効く
+fn opp_move_temp() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_OPP_MOVE_TEMP")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(1.0)
+    })
 }
 
 fn weighted_choice<R: Rng>(candidates: &[(ShogiMove, f64)], rng: &mut R) -> Option<ShogiMove> {
