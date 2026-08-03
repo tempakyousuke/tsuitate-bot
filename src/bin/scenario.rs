@@ -28,7 +28,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
-use tsuitate_bot::board::{make_usi_square, parse_usi_square};
+use tsuitate_bot::board::{Coord, make_usi_square, parse_usi_square};
 use tsuitate_bot::estimator::Estimator;
 use tsuitate_bot::observation::Observation;
 use tsuitate_bot::protocol::{Color, Role};
@@ -179,6 +179,95 @@ fn run_batch(specs: &[String], trials: u64, name: &str) {
         println!();
         println!("===== {}（{}手目） =====", sc.name, sc.ply + 1);
         print_tally(sc, st, trials);
+    }
+}
+
+/// シナリオ局面の**真実の盤面**を表示する（レビュー中に「その駒は本当に
+/// 当たっているのか」を確かめるため。審判視点なので bot には見えない情報）。
+/// 手番側の各駒について、相手の利き枚数と自分の紐の枚数も併記する
+fn print_truth_board(sc: &Scenario, rep: &Replayed) {
+    let side = rep.pos.turn();
+    println!("局面: {}", sc.desc);
+    println!(
+        "手番: {side:?}（{}手目）/ ここまでの反則 先手{} 後手{}",
+        sc.ply + 1,
+        rep.fouls[0],
+        rep.fouls[1]
+    );
+    println!();
+    println!("    9   8   7   6   5   4   3   2   1");
+    for rank in 1..=9 {
+        let mut row = String::new();
+        for file in (1..=9).rev() {
+            let c = Coord { file, rank };
+            row.push_str(&match rep.pos.piece_at(c) {
+                Some(p) => {
+                    let s = role_char(p.role);
+                    format!("{:>4}", if p.color == Color::Gote { format!("v{s}") } else { s.into() })
+                }
+                None => "   .".to_string(),
+            });
+        }
+        println!("{rank}: {row}");
+    }
+    for color in [Color::Sente, Color::Gote] {
+        let mut items: Vec<_> = rep
+            .pos
+            .hand_map(color)
+            .into_iter()
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        items.sort_by_key(|(r, _)| format!("{r:?}"));
+        println!(
+            "{color:?} 持ち駒: {}",
+            items
+                .iter()
+                .map(|(r, n)| format!("{}x{n}", role_char(*r)))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+    println!();
+    println!("手番側（{side:?}）の駒の当たり（相手の利き枚数 > 0 のものだけ）:");
+    let mut any = false;
+    for (sq, p) in rep.pos.pieces() {
+        if p.color != side {
+            continue;
+        }
+        let att = rep.pos.attack_count(sq, side.other());
+        if att == 0 {
+            continue;
+        }
+        any = true;
+        println!(
+            "  {} {:?}: 相手の利き{}枚 / 自分の紐{}枚",
+            make_usi_square(sq),
+            p.role,
+            att,
+            rep.pos.attack_count(sq, side)
+        );
+    }
+    if !any {
+        println!("  （当たっている駒は無い）");
+    }
+}
+
+fn role_char(role: Role) -> &'static str {
+    match role {
+        Role::Pawn => "P",
+        Role::Lance => "L",
+        Role::Knight => "N",
+        Role::Silver => "S",
+        Role::Gold => "G",
+        Role::Bishop => "B",
+        Role::Rook => "R",
+        Role::King => "K",
+        Role::Tokin => "+P",
+        Role::Promotedlance => "+L",
+        Role::Promotedknight => "+N",
+        Role::Promotedsilver => "+S",
+        Role::Horse => "+B",
+        Role::Dragon => "+R",
     }
 }
 
@@ -824,6 +913,7 @@ fn main() {
     }
 
     match args.get(1).map(String::as_str) {
+        Some("board") => print_truth_board(&sc, &rep),
         Some("diag") => {
             let n = args
                 .get(2)
