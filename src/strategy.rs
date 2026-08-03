@@ -751,15 +751,22 @@ fn own_effects_after(
     }
 }
 
-/// 打ち当て露出（`drop_hit_evac_w` の素材）。敵陣（自分から見て最奥3段）に
-/// いる自分の大駒（飛角竜馬）のうち、**頭**（自分の前進方向に1マス先 =
-/// 相手の歩がそこへ打たれると次の相手の手でこの駒を取れるマス）が盤内かつ
-/// 自駒で塞がれていないものの交換価値の合計。
+/// 打ち当て露出（`drop_hit_evac_w` の素材）。自分の大駒（飛角竜馬）のうち、
+/// **頭**（自分の前進方向に1マス先 = 相手の歩がそこへ打たれると次の相手の手で
+/// この駒を取れるマス）が盤内かつ自駒で塞がれていないものの交換価値の合計。
 ///
 /// 頭のマスに**敵駒**がいる可能性（打てない）は見えないので無視する =
 /// 露出は上界。逆に相手の二歩制約も相手の歩の配置が見えないので無視する。
 /// 紐（自分の利き）は軽減に数えない: 歩打ちは観測されないため取られてから
-/// 取り返しても「大駒 ↔ 歩」の交換にしかならない
+/// 取り返しても「大駒 ↔ 歩」の交換にしかならない。
+///
+/// **2026-08-03 に自陣側へ拡張**（ユーザー指摘）: 初版は敵陣（最奥3段）の大駒
+/// だけを数えていたが、「相手が歩を入手した瞬間に飛車の頭へ歩を打たれる」危険は
+/// **自陣に居る飛車にも同じように生じる**（quest31-m021 の先手飛車2八は
+/// 2七へ打たれうるのに露出0と数えられていた）。`TSUITATE_DROP_HIT_ALL_RANKS=0`
+/// で旧挙動（敵陣のみ）へ戻せる。
+/// この拡張は `major_promo_path_w` の動機とも繋がる: 先に成って敵陣へ入って
+/// しまえば、自陣で歩打ちに晒され続ける状態から抜けられる
 fn drop_hit_exposure(pieces: &[VisiblePiece], me: Color) -> f64 {
     let occupied: HashSet<Coord> = pieces
         .iter()
@@ -774,10 +781,13 @@ fn drop_hit_exposure(pieces: &[VisiblePiece], me: Color) -> f64 {
             )
         })
         .filter_map(|p| parse_usi_square(&p.square).map(|c| (c, p.role)))
-        .filter(|&(c, _)| match me {
+        .filter(|&(c, _)| {
             // 段の向き: 先手は rank 減少方向へ前進（advance_bias と同じ規約）
-            Color::Sente => c.rank <= 3,
-            Color::Gote => c.rank >= 7,
+            drop_hit_all_ranks()
+                || match me {
+                    Color::Sente => c.rank <= 3,
+                    Color::Gote => c.rank >= 7,
+                }
         })
         .filter(|&(c, _)| {
             let head = Coord {
@@ -791,6 +801,13 @@ fn drop_hit_exposure(pieces: &[VisiblePiece], me: Color) -> f64 {
         })
         .map(|(_, role)| exchange_value(role))
         .sum()
+}
+
+/// 打ち当て露出を**全段**で数えるか（既定 on、`TSUITATE_DROP_HIT_ALL_RANKS=0` で
+/// 旧挙動 = 敵陣の大駒のみ）。`drop_hit_exposure` の doc 参照
+fn drop_hit_all_ranks() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !std::env::var("TSUITATE_DROP_HIT_ALL_RANKS").is_ok_and(|v| v == "0"))
 }
 
 /// 成りポテンシャルの手数減衰（1手遠いごとに半減）
@@ -5467,8 +5484,19 @@ pub(crate) mod tests {
         // 最奥段は頭が盤外 → 露出ゼロ
         let pieces = vec![vp(5, 1, Role::Dragon)];
         assert_eq!(drop_hit_exposure(&pieces, Color::Sente), 0.0);
-        // 敵陣外（4段目）は数えない
+        // 敵陣外も数える（2026-08-03 の拡張。相手が歩を持てば自陣の飛車の頭にも
+        // 打たれるので、露出は段に依らない）。旧挙動は TSUITATE_DROP_HIT_ALL_RANKS=0
         let pieces = vec![vp(5, 4, Role::Dragon)];
+        assert!(
+            (drop_hit_exposure(&pieces, Color::Sente) - exchange_value(Role::Dragon)).abs() < 1e-9
+        );
+        // 自陣の飛車（8段目）も対象: 頭の7段目が空いていれば露出する
+        let pieces = vec![vp(2, 8, Role::Rook)];
+        assert!(
+            (drop_hit_exposure(&pieces, Color::Sente) - exchange_value(Role::Rook)).abs() < 1e-9
+        );
+        // 自陣の飛車でも頭が自駒（歩）で塞がっていれば露出ゼロ
+        let pieces = vec![vp(2, 8, Role::Rook), vp(2, 7, Role::Pawn)];
         assert_eq!(drop_hit_exposure(&pieces, Color::Sente), 0.0);
         // 大駒以外は数えない
         let pieces = vec![vp(5, 2, Role::Gold)];
@@ -5669,15 +5697,32 @@ pub(crate) mod tests {
         // 先手の竜が2二（敵陣）・頭2一空き、金を1枚持っている想定
         let mut hand = HashMap::new();
         hand.insert(Role::Gold, 1);
-        let view = minimal_view(vec![vp(2, 2, Role::Dragon), vp(5, 9, Role::King)], hand);
+        // 2七に自分の歩を置いておく（頭を塞げる退避先を作るため）
+        let view = minimal_view(
+            vec![vp(2, 2, Role::Dragon), vp(2, 7, Role::Pawn), vp(5, 9, Role::King)],
+            hand,
+        );
         let params = EvalParams::default();
-        // 退避（2二→2六 = 敵陣外）で露出が消える
+        // 退避 = **頭が自駒で塞がるマスへ動く**こと（2二→2八、頭2七は自分の歩）。
+        // 2026-08-03 の拡張で「敵陣から出れば安全」ではなくなった
         let evac = ShogiMove::Board {
+            from: Coord { file: 2, rank: 2 },
+            to: Coord { file: 2, rank: 8 },
+            promote: false,
+        };
+        assert_eq!(own_effects_after(&view, &evac, None, &params).drop_hit_exposure, 0.0);
+        // 敵陣を出るだけ（2二→2六、頭2五は空き）では露出は消えない
+        let shallow = ShogiMove::Board {
             from: Coord { file: 2, rank: 2 },
             to: Coord { file: 2, rank: 6 },
             promote: false,
         };
-        assert_eq!(own_effects_after(&view, &evac, None, &params).drop_hit_exposure, 0.0);
+        assert!(
+            (own_effects_after(&view, &shallow, None, &params).drop_hit_exposure
+                - exchange_value(Role::Dragon))
+            .abs()
+                < 1e-9
+        );
         // 無関係の手（玉を動かす）では露出が残る
         let idle = ShogiMove::Board {
             from: Coord { file: 5, rank: 9 },
