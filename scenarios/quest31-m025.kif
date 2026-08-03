@@ -1,4 +1,4 @@
-*scenario ply=24 target=3a3b bad=S*3h,S*5h,S*8h,S*4h desc=25手目（先手番）。3二と（実戦の手）が自然。4一と・3二龍も可。自陣への銀打ち4種は悪手（持ち駒温存の欠落）
+*scenario ply=24 target=3a3b bad=S*3h,S*5h,S*8h,S*4h,S*7f,S*1h desc=25手目（先手番）。3二と（実戦の手）が自然。4一と・3二龍も可。自陣への銀打ち4種は悪手（持ち駒温存の欠落）
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

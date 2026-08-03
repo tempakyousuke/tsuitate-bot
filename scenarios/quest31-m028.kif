@@ -1,4 +1,4 @@
-*scenario ply=27 target=4f4g+ bad=5b4b,P*2f,7a7b,9c9d desc=28手目（後手番）。4七歩成が本命（4五桂・2八歩打も可）。4二飛は大悪手。2六歩打・7二銀・9四歩は悪手
+*scenario ply=27 target=4f4g+ bad=5b4b,P*2f,7a7b,9c9d,7c7d,P*2e desc=28手目（後手番）。4七歩成が本命（4五桂・2八歩打も可）。4二飛は大悪手。2六歩打・7二銀・9四歩は悪手
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
