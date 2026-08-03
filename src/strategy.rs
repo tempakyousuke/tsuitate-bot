@@ -1172,11 +1172,14 @@ struct EvalOut {
     hand_option: f64,
     /// gain から引かれた盤上駒の減価（V5。正の値。内訳表示用）
     board_discount: f64,
+    /// 打ちプローブの反則情報価値（drop_probe_w）。反則の失敗枝の期待値なので
+    /// gain には含めず、combine_score の外側（(1−p_legal) 側）で加算する
+    foul_probe: f64,
 }
 
 impl EvalOut {
     fn score(&self) -> f64 {
-        combine_score(self.gain, self.p_legal, self.foul_cost)
+        combine_score(self.gain, self.p_legal, self.foul_cost) + self.foul_probe
     }
 }
 
@@ -1316,6 +1319,35 @@ pub struct EvalParams {
     /// 支え駒が見えなくても評価できる（玉で取る以外に受けがない
     /// `MateThreat::IfSupported` を MATE_RISK_IF_SUPPORTED 倍で数える）。0 = 無効
     pub mate_risk_w: f64,
+    /// 幻の詰みゲート（quest31 レビュー 2026-08-02、m027/m029 の 4一龍が発端）。
+    /// 粒子上の詰み（+1000）は「真の局面がこの粒子なら勝ち」として正しいが、
+    /// 較正の悪い信念の裾が詰みを主張すると全候補を乗っ取る（実測: 玉が初期配置
+    /// 近辺に残る粒子質量 8〜9% だけで gain 77〜91。真の玉は既に移動済みで、
+    /// 外れ枝は敵陣密集地帯で龍がタダ死にする）。詰み質量 q = 詰み粒子重み/合法重み
+    /// に対し、寄与を 1000×q×(q/(q+q0)) と凸にゲートする: 裾の幻詰み（q≈0.1）は
+    /// 材料スケールまで沈み、合意の詰み（q→1）はほぼ満額。0 = 従来と同一挙動
+    pub mate_gate_q0: f64,
+    /// 打ちプローブの反則情報価値（quest31 レビュー 2026-08-03、m015 の
+    /// 2二歩打が発端。ユーザー指摘「2二とが高いだけでなく2二歩打が低いのも問題」）。
+    /// combine_score は「反則の価値 = 次善手の価値 − 反則コスト」と仮定するが、
+    /// **打ちの反則は占有の確定という情報を買う**: 打ちマスが相手駒に塞がれて
+    /// いて（反則枝）、かつ自分の利きが既にそのマスに当たっているなら、
+    /// 次の手で確定した駒を回収できる（実戦の人間: 角がいそうな2二へ歩を打ち、
+    /// 反則ならと金で角を取る。駒は失わず反則1回だけ消費）。
+    /// 反則枝の期待値 w × Σ(粒子重み × 占有駒の交換価値 × 自利きあり)/全質量 を
+    /// combine_score の**外側**（(1−p_legal) 側）へ加算する。攻め側の利きが
+    /// 無いマスへのプローブ（ただ情報だけ）は対象外 = 打ち得スパムにならない。
+    /// 王手中・taint 粒子では無効。0 = 従来と同一挙動
+    pub drop_probe_w: f64,
+    /// 玉隣接への無支え進入ペナルティ（quest31 レビュー 2026-08-02、F1/F2 の
+    /// 共通形への対応）。粒子上の相手玉の8近傍に、自分の利きの支えが無い駒で
+    /// 入る手は、王手宣言・接触で即座に存在がバレて玉や近傍の守りに回収される
+    /// （実測: 直接王手の53〜56%が即取られ、大半が取り返しなし）。
+    /// 該当粒子で w × 着手駒の交換価値 を引く。駒価値スケールなので
+    /// 龍の突進（12）は大きく沈み、と金の進入（3.5）は軽い。
+    /// mover_check_extra（全王手対象）より狭く、4七歩成のような
+    /// 「安い駒の前進」への巻き添えが小さい。王手中は無効。0 = 従来と同一挙動
+    pub king_adj_entry_w: f64,
     /// 自玉8近傍の「玉以外の自駒の利きが無いマス」1個あたりの減点
     /// （docs/yaneuraou-lessons.md の V4。やねうら王 Lv8 で +R35）。
     ///
@@ -1602,6 +1634,23 @@ impl Default for EvalParams {
             // 0 = 従来と同一挙動。未調整の新項なので w スイープで決める
             mate_threat_w: 0.0,
             mate_risk_w: 0.0,
+            // 幻の詰みゲート（2026-08-02、quest31 レビュー）。0 = 従来と同一挙動。
+            // 既定 4.0 はシナリオ実測で採用（2026-08-03、シナリオ重視のユーザー方針）:
+            // quest31-m027 の幻詰み 4一龍 20/20→2/20・m029 の龍 19/20→6/20、
+            // 回帰なし（m026/m028 ベースライン同等・ansatsu 19〜20/20・keima 20/20・
+            // dragon-check-drop / king-evade / mate-net-attack / tokin-bet 維持）。
+            // q=0.3 の詰みは 26 残り材料項より優位、q=0.1 の幻詰みは 7 で材料スケール
+            mate_gate_q0: 4.0,
+            // 玉隣接への無支え進入（2026-08-02、同上）。0 = 従来と同一挙動
+            king_adj_entry_w: 0.0,
+            // 打ちプローブの反則情報価値（2026-08-03）。0 = 従来と同一挙動。
+            // 形は p_occ²(1−p_occ)×予算² ゲート（evaluate の foul_probe 参照。
+            // 変遷: p_occ² 版 w=1.6 はシナリオ全緑だがアリーナ 36.8%・反則/局
+            // 6.4→8.2 でレース負け。占有確定マスの再プローブループと中終盤の
+    // 乱発が原因で、(1−p_occ)・予算² の2ゲートを追加して w を再較正）。
+            // quest31-m015 の 2二歩打（人間の実戦手）0/20→20/20 と
+            // m026/m028 の 4七歩成 20/20 維持を両立する値
+            drop_probe_w: 4.5,
             // 自玉8近傍の穴（2026-07-26、docs/yaneuraou-lessons.md の V4）。
             // 0 = 従来と同一挙動。未調整の新項なので w スイープで決める
             king_hole_w: 0.0,
@@ -1650,7 +1699,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 56] = [
+    pub const SPECS: [ParamSpec; 59] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -1954,6 +2003,30 @@ impl EvalParams {
             lo: 0.0,
             hi: 2.0,
         },
+        ParamSpec {
+            // 幻の詰みゲートの半飽和点。q0=4 で q=0.1 の幻詰みが
+            // 材料スケール（〜7）まで沈み、q=0.3 の詰みは 26 残る。
+            // 既定 4.0 が中心に来るよう範囲は 0〜8
+            name: "mate_gate_q0",
+            lo: 0.0,
+            hi: 8.0,
+        },
+        ParamSpec {
+            // 着手駒の交換価値（3.5〜12）× 玉隣接粒子質量に掛かる。
+            // w=1 で「隣接粒子では確実に取られる」相当なので実用域は 0.3〜0.8
+            name: "king_adj_entry_w",
+            lo: 0.0,
+            hi: 1.5,
+        },
+        ParamSpec {
+            // 占有駒の交換価値 × p_occ²(1−p_occ) × 予算² に掛かる。
+            // p_occ(1−p_occ) ゲートのピークは p=2/3 で ≈0.15 なので、
+            // 実効値は交換価値の w×0.15 程度。w=4.5 で 2二歩打（p=0.65・角8）が
+            // +5.3 = 2二と直行を上回る水準
+            name: "drop_probe_w",
+            lo: 0.0,
+            hi: 8.0,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -2014,6 +2087,9 @@ impl EvalParams {
             self.drop_hit_evac_w,
             self.promo_potential_w,
             self.hand_option_w,
+            self.mate_gate_q0,
+            self.king_adj_entry_w,
+            self.drop_probe_w,
         ]
     }
 
@@ -2076,6 +2152,9 @@ impl EvalParams {
             drop_hit_evac_w: v[53],
             promo_potential_w: v[54],
             hand_option_w: v[55],
+            mate_gate_q0: v[56],
+            king_adj_entry_w: v[57],
+            drop_probe_w: v[58],
         }
     }
 }
@@ -2262,6 +2341,57 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
     {
         Some(w) => EvalParams {
             check_strength_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 王手の自己露見リスク（王手宣言で位置がバレて着手駒が取られる）の
+    // 運用ノブ。既定 0.0622 は実測（直接王手の53〜56%が即取られ）に対して
+    // 過小の疑いがあり、quest31-m021 の 4一と（幻の金への王手込み突進）の
+    // スイープ用に env を開ける
+    let params = match std::env::var("TSUITATE_MOVER_CHECK_EXTRA")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            mover_check_extra: w,
+            ..params
+        },
+        None => params,
+    };
+    // 打ちプローブの反則情報価値（w スイープ・切り戻し用。0 で従来挙動）
+    let params = match std::env::var("TSUITATE_DROP_PROBE_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            drop_probe_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 玉隣接への無支え進入ペナルティ（w スイープ・切り戻し用。0 で従来挙動）
+    let params = match std::env::var("TSUITATE_KING_ADJ_ENTRY_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            king_adj_entry_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 幻の詰みゲート（w スイープ・切り戻し用。0 で従来挙動）
+    let params = match std::env::var("TSUITATE_MATE_GATE_Q0")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            mate_gate_q0: w,
             ..params
         },
         None => params,
@@ -2926,7 +3056,10 @@ impl Strategy for EstimatorStrategy {
                 // 内側へ統合した（`plan_w`）。応手を挟まない外付けの加点は
                 // 200局で -6pt と明確に負だったので廃止
                 let gain2 = out.gain + params.depth2_replace * (out.risk_mean + delta);
-                (gain2, combine_score(gain2, out.p_legal, out.foul_cost) + adjust)
+                (
+                    gain2,
+                    combine_score(gain2, out.p_legal, out.foul_cost) + out.foul_probe + adjust,
+                )
             } else {
                 (out.gain, score)
             };
@@ -3934,6 +4067,12 @@ fn evaluate(
     let mut capture_value_sum = 0.0f64;
     // 王手になった粒子の重み。王探しの情報利得（判定が割れるほど価値）に使う
     let mut check_hits = 0.0f64;
+    // 詰みになった粒子の重み。加点はループ後に凸ゲート（mate_gate_q0）を通す
+    let mut mate_hits = 0.0f64;
+    // 打ちプローブの反則情報価値の材料（drop_probe_w。反則枝の粒子だけが足す）
+    let mut probe_val_sum = 0.0f64;
+    // 「占有かつ自利きあり」の粒子質量（プローブ項の凸ゲート用）
+    let mut probe_mass = 0.0f64;
     // 王周辺の圧力は粒子間の分散が小さいわりに計算が重い（9マス×利き走査）ので
     // 少数の粒子でだけ測って平均する（数は思考予算に比例）
     let pressure_samples = budget.pressure_samples;
@@ -3953,6 +4092,19 @@ fn evaluate(
 
     for (pi, &(pos, w)) in particles.iter().enumerate() {
         if !pos.is_legal(mv) {
+            // 打ちプローブの反則情報価値の材料（drop_probe_w）: この粒子で
+            // 打ちマスが相手駒に塞がれていて、かつ自分の利きが既に当たって
+            // いるなら、反則の失敗枝が「占有の確定 → 次手で回収」に変換できる
+            if params.drop_probe_w != 0.0 && !view.you_in_check && !particles_are_taint {
+                if let ShogiMove::Drop { to, .. } = *mv {
+                    if let Some(p) = pos.piece_at(to) {
+                        if p.color == opp && pos.attack_count(to, me) > 0 {
+                            probe_val_sum += w * exchange_value(p.role);
+                            probe_mass += w;
+                        }
+                    }
+                }
+            }
             continue;
         }
         legal += w;
@@ -3994,7 +4146,11 @@ fn evaluate(
             // 正解を引くまで反則を積む — tuyoi_oote / rei2 のユーザー指導）
             let resolutions = next.legal_moves().len();
             if resolutions == 0 {
-                v += 1000.0; // 詰み（真の局面がこの粒子なら勝ち）
+                // 詰み（真の局面がこの粒子なら勝ち）。ここでは質量だけ数え、
+                // 加点はループ後に詰み質量 q の凸ゲート（mate_gate_q0）を通す:
+                // 較正の悪い信念の裾（q≈0.1 の幻詰み）が +1000 で全候補を
+                // 乗っ取るのを防ぐ（quest31-m027/m029 の 4一龍、gain 77〜91）
+                mate_hits += w;
             } else if params.check_strength_w != 0.0 {
                 v += params.check_strength_w
                     * (CHECK_STRENGTH_CURVE / (1.0 + resolutions as f64)
@@ -4040,6 +4196,18 @@ fn evaluate(
             .piece_at(to)
             .map(|p| exchange_value(p.role))
             .unwrap_or(0.0);
+        // 玉隣接への無支え進入（king_adj_entry_w）: この粒子で着地マスが相手玉の
+        // 8近傍にあり自分の利きの支えが無いなら、王手宣言・接触で存在がバレて
+        // 玉や近傍の守りに回収される前提の回収リスクを駒価値スケールで敷く
+        // （実測: 直接王手の53〜56%が即取られ。quest31 の 4一龍/4一と が発端）。
+        // 王手中は無効（回避手の序列は CheckSolver の領分）
+        if params.king_adj_entry_w != 0.0 && !view.you_in_check {
+            if let Some(ok) = next.king_square(opp) {
+                if cheb(to, ok) <= 1 && next.attack_count(to, me) == 0 {
+                    v -= params.king_adj_entry_w * own_after;
+                }
+            }
+        }
         let known_factor = if captured_value > 0.0 {
             1.0
         } else {
@@ -4213,7 +4381,16 @@ fn evaluate(
             capture_bet_penalty =
                 params.capture_bet_var_w * p_hit * (1.0 - p_hit) * (capture_value_sum / capture_hits);
         }
-        value_sum / legal - capture_bet_penalty
+        // 粒子上の詰みの加点。q = 詰みを主張する質量の割合に対し
+        // 1000×q×(q/(q+q0)) の凸ゲート: q0=0 は従来（1000×q）と同一挙動、
+        // q0>0 では裾の幻詰みが材料スケールへ沈み、合意の詰みはほぼ満額残る
+        let mate_term = if mate_hits > 0.0 {
+            let q = mate_hits / legal;
+            1000.0 * q * (q / (q + params.mate_gate_q0))
+        } else {
+            0.0
+        };
+        value_sum / legal + mate_term - capture_bet_penalty
             + params.info_bonus * p_hit * (1.0 - p_hit)
             + params.king_probe_bonus * p_chk * (1.0 - p_chk)
             + value_nn_term
@@ -4405,6 +4582,33 @@ fn evaluate(
         + effect_value
         + blind_recapture
         + blind_belief_gain;
+    // 打ちプローブの反則情報価値: 反則枝（占有粒子）の期待回収値 ×
+    // p_occ(1−p_occ) の情報ゲート × 残り反則予算の2乗。形の根拠:
+    // - p_occ を掛ける（実効 p_occ²·(1−p_occ)）: 線形だと占有質量 8% のマスへの
+    //   探り（quest31-m026/m028 の P*2f、飛車 9.5 の期待値が僅差を逆転）まで
+    //   浮く。人間の使い分けは「居そうなときだけ探る」（2二=65% は探る・
+    //   2六=8% は探らない）
+    // - (1−p_occ) を掛ける: 占有が**確定**したマスの再プローブは情報価値ゼロ
+    //   （正解は既存の利きで取る手）。selfplay/実対局の foul_tried は受理後に
+    //   クリアされるので、この因子が無いと「反則で確定 → 次手も同じマスへ
+    //   打つ」の反則ループが最大ブーストになる
+    // - 残り反則予算 (fouls_left/10)² : 勝敗は反則レース（アリーナの78%が
+    //   反則負け決着）なので対価は残budget比例。人間のプローブも
+    //   「序盤の反則が安いうちに」が定石（15手目の2二歩打 = 反則0の局面）。
+    //   ゲート無しの初版はアリーナで反則/局 6.4→8.2・36.8%（−13.7pt）
+    // 全粒子質量 n で正規化するので (1−p_legal) の重みを内包している
+    let foul_probe = if n > 0.0 && probe_mass > 0.0 {
+        let p_occ = probe_mass / n;
+        let budget_frac = f64::from(10u32.saturating_sub(view.fouls.you)) / 10.0;
+        params.drop_probe_w
+            * (probe_val_sum / n)
+            * p_occ
+            * (1.0 - p_occ)
+            * budget_frac
+            * budget_frac
+    } else {
+        0.0
+    };
     EvalOut {
         gain,
         risk_mean: if legal > 0.0 { risk_sum / legal } else { 0.0 },
@@ -4425,6 +4629,7 @@ fn evaluate(
         promo,
         hand_option: hand_option_pen,
         board_discount,
+        foul_probe,
     }
 }
 

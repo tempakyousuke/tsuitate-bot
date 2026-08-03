@@ -27,6 +27,11 @@ pub struct Scenario {
     pub bad: Vec<String>,
     /// 何手目まで再生するか（ply+1 手目を考えさせる）
     pub ply: usize,
+    /// 決定の前に注入する反則列（`fouls=<USI,...>`）。実戦で反則を挟んだ
+    /// 決定点の「反則後」の状態を再現する（例: quest_20260731 の30手目 =
+    /// 1二飛・2一歩打の反則後に4二金を指した）。choice_trial_body と同じ規約で
+    /// MyFoul 観測・反則カウント・foul_tried に反映される
+    pub fouls: Vec<String>,
     /// diag で相手駒の利き枚数分布を測るマス
     pub diag_squares: Vec<String>,
     /// continue の足切り手数（**通算**の手数。必勝局面の遂行実験で、これを
@@ -66,6 +71,17 @@ pub fn load_scenario(
     let target = target_flag
         .or_else(|| kifu.directives.get("target").cloned())
         .or_else(|| kifu.plies.get(ply).map(|p| p.mv.to_usi()))
+        .unwrap_or_default();
+    let fouls: Vec<String> = kifu
+        .directives
+        .get("fouls")
+        .map(|s| {
+            s.split(',')
+                .map(|x| x.trim())
+                .filter(|x| !x.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
         .unwrap_or_default();
     let bad: Vec<String> = kifu
         .directives
@@ -113,6 +129,7 @@ pub fn load_scenario(
         target,
         bad,
         ply,
+        fouls,
         diag_squares,
         limit,
         kifu,
@@ -125,6 +142,11 @@ pub struct Replayed {
     pub logs: [ObservationLog; 2],
     pub fouls: [u32; 2],
     pub plies: u32,
+    /// 決定の前に注入された反則列（`fouls=` ディレクティブ、apply_scenario_fouls が
+    /// 設定）。choice_trial_body が foul_tried の初期値に使い、バッチの
+    /// チェーン共有はこれが異なるシナリオを別グループにする（ログが
+    /// プレフィックス拡張でなくなるため）
+    pub injected_fouls: Vec<String>,
 }
 
 pub fn side_idx(c: Color) -> usize {
@@ -212,6 +234,31 @@ pub fn replay(kifu: &Kifu, upto: usize) -> Replayed {
         logs,
         fouls,
         plies: upto as u32,
+        injected_fouls: vec![],
+    }
+}
+
+/// `fouls=` ディレクティブの反則列を注入した状態にする（実戦で反則を挟んだ
+/// 決定点の再現）。`replay` の後に呼ぶ。規約は choice_trial_body と同じ:
+/// 手番側の MyFoul 観測・反則カウント・相手側への OpponentFoul 通知。
+/// 反則のはずの手が合法なら panic（棋譜由来の真実データの検証を兼ねる）
+pub fn apply_scenario_fouls(rep: &mut Replayed, fouls: &[String]) {
+    let side = rep.pos.turn();
+    for usi in fouls {
+        let mv = parse_usi(usi).unwrap_or_else(|| panic!("fouls のUSIを読めません: {usi}"));
+        assert!(
+            !rep.pos.is_legal(&mv),
+            "fouls に指定した手が合法です（反則になりません）: {usi}"
+        );
+        rep.fouls[side_idx(side)] += 1;
+        rep.logs[side_idx(side)].record(Observation::MyFoul {
+            move_number: rep.pos.move_number(),
+            usi: usi.clone(),
+        });
+        rep.logs[side_idx(side.other())].record(Observation::OpponentFoul {
+            count: rep.fouls[side_idx(side)],
+        });
+        rep.injected_fouls.push(usi.clone());
     }
 }
 
@@ -306,7 +353,9 @@ pub fn choice_trial_one_with(
 fn choice_trial_body(strat: &mut dyn strategy::Strategy, rep: &Replayed) -> (String, Vec<String>) {
     let side = rep.pos.turn();
     let mut log = clone_log(&rep.logs[side_idx(side)]);
-    let mut foul_tried: HashSet<String> = HashSet::new();
+    // 注入済みの反則（fouls= ディレクティブ）は「もう試した手」なので
+    // 実対局と同じく再提示しない
+    let mut foul_tried: HashSet<String> = rep.injected_fouls.iter().cloned().collect();
     let mut fouls = rep.fouls;
     let mut foul_seq: Vec<String> = vec![];
     let accepted = loop {
@@ -638,10 +687,21 @@ pub fn choice_trials_batch_with(
     // clone 対応か（戦略の構築だけなら安い。est は遅延構築なので空のまま）
     let supports_clone = factory(0).clone_boxed().is_some();
 
-    // (棋譜キー, 手番側) でグループ化し、グループ内は ply 昇順
+    // (棋譜キー, 手番側) でグループ化し、グループ内は ply 昇順。
+    // **反則注入シナリオ（fouls=）は共有しない**: 注入した MyFoul 観測が
+    // ログ末尾に付くので、次の ply のログがプレフィックス拡張にならない。
+    // キーに一意値を混ぜて singleton グループ = 毎回作り直しへ落とす
     let mut groups: Vec<((u64, Color), Vec<usize>)> = vec![];
     for (i, (sc, rep)) in items.iter().enumerate() {
-        let key = (kifu_key(&sc.kifu), rep.pos.turn());
+        let base = kifu_key(&sc.kifu);
+        let key = (
+            if rep.injected_fouls.is_empty() {
+                base
+            } else {
+                base ^ (0x9e37_79b9_7f4a_7c15u64.wrapping_mul(i as u64 + 1))
+            },
+            rep.pos.turn(),
+        );
         match groups.iter_mut().find(|(k, _)| *k == key) {
             Some((_, v)) => v.push(i),
             None => groups.push((key, vec![i])),
@@ -719,6 +779,38 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    /// `fouls=` の反則注入が実対局と同じ状態を作ること（quest31-m030f2 =
+    /// 実戦で 1二飛・2一歩打 を反則してから 4二金 を指した決定点）
+    #[test]
+    fn fouls指定は反則観測と反則カウントを注入する() {
+        let sc = load("quest31-m030f2");
+        assert_eq!(sc.fouls, vec!["5b1b".to_string(), "P*2a".to_string()]);
+        let mut rep = replay(&sc.kifu, sc.ply);
+        let side = rep.pos.turn();
+        let before = rep.logs[side_idx(side)].events().len();
+        apply_scenario_fouls(&mut rep, &sc.fouls);
+        // 手番側は MyFoul、相手側は OpponentFoul を反則の数だけ受け取る
+        assert_eq!(rep.fouls[side_idx(side)], 2);
+        assert_eq!(rep.fouls[side_idx(side.other())], 0);
+        assert_eq!(rep.logs[side_idx(side)].events().len(), before + 2);
+        assert!(matches!(
+            rep.logs[side_idx(side)].events().last(),
+            Some(Observation::MyFoul { usi, .. }) if usi == "P*2a"
+        ));
+        // 局面は進まない（反則は手番を失わない）
+        assert_eq!(rep.pos.turn(), side);
+        assert_eq!(rep.injected_fouls, sc.fouls);
+    }
+
+    /// 反則にならない手を fouls= に書いたら気づけること（棋譜の写し間違い検出）
+    #[test]
+    #[should_panic(expected = "合法です")]
+    fn fouls指定が合法手ならpanicする() {
+        let sc = load("quest31-m030f2");
+        let mut rep = replay(&sc.kifu, sc.ply);
+        apply_scenario_fouls(&mut rep, &["4f4g+".to_string()]);
     }
 
     /// 手動翻訳で検証済みだった USI 列とパーサーの出力が一致すること

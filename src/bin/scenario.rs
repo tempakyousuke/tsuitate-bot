@@ -33,8 +33,8 @@ use tsuitate_bot::estimator::Estimator;
 use tsuitate_bot::observation::Observation;
 use tsuitate_bot::protocol::{Color, Role};
 use tsuitate_bot::scenario_core::{
-    ChoiceStats, Replayed, Scenario, build_estimator, choice_trials, choice_trials_batch,
-    clone_log, load_scenario,
+    ChoiceStats, Replayed, Scenario, apply_scenario_fouls, build_estimator, choice_trials,
+    choice_trials_batch, clone_log, load_scenario,
     make_view, replay, scenarios_dir, side_idx, weighted_unique_particles,
 };
 use tsuitate_bot::shogi::{Outcome, Position, ShogiMove, parse_usi, unpromote_role};
@@ -144,7 +144,8 @@ fn run_batch(specs: &[String], trials: u64, name: &str) {
                 std::process::exit(1);
             }
         };
-        let rep = replay(&sc.kifu, sc.ply);
+        let mut rep = replay(&sc.kifu, sc.ply);
+        apply_scenario_fouls(&mut rep, &sc.fouls);
         if let Some(outcome) = rep.pos.outcome() {
             eprintln!("{spec}: ply={} の局面は終局しています（{outcome:?}）", sc.ply);
             std::process::exit(1);
@@ -640,7 +641,8 @@ fn run_suite(trials: u64, name: &str) {
                 continue;
             }
         };
-        let rep = replay(&sc.kifu, sc.ply);
+        let mut rep = replay(&sc.kifu, sc.ply);
+        apply_scenario_fouls(&mut rep, &sc.fouls);
         loaded.push((sc, rep));
     }
     let items: Vec<(&Scenario, &Replayed)> = loaded.iter().map(|(sc, rep)| (sc, rep)).collect();
@@ -761,7 +763,8 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let rep = replay(&sc.kifu, sc.ply);
+    let mut rep = replay(&sc.kifu, sc.ply);
+    apply_scenario_fouls(&mut rep, &sc.fouls);
     if let Some(outcome) = rep.pos.outcome() {
         eprintln!(
             "ply={} の局面は終局しています（{outcome:?}）。--ply を見直してください",
