@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use tsuitate_bot::kifu::parse_kif;
 use tsuitate_bot::observation::{Observation, ObservationLog};
 use tsuitate_bot::protocol::Role;
-use tsuitate_bot::scenario_core::{make_view, replay, side_idx};
+use tsuitate_bot::scenario_core::{clone_log, make_view, replay, resolve_foul, side_idx};
 use tsuitate_bot::shogi::{Position, ShogiMove, parse_usi};
 use tsuitate_bot::strategy::{self, Strategy};
 
@@ -110,37 +110,82 @@ fn main() {
             chain.running.record(e.clone());
             chain.consumed += 1;
         }
-        let mut snap = chain
-            .strat
-            .clone_boxed()
-            .expect("estimator は clone_boxed 対応のはず");
-        let chosen = snap.choose(&view, log, &HashSet::new());
-        println!();
-        println!("## {m}手目");
         let show_scores = std::env::var("RANK_DUMP_SCORES").is_ok_and(|v| v == "1");
-        match snap.last_ranking() {
-            Some(ranking) => {
-                for c in ranking.iter().take(top_n) {
-                    if show_scores {
-                        println!(
-                            "{}({}) score={:.3} gain={:.3} p_legal={:.2} adjust={:+.3} depth2={}",
-                            jp_move(&rep.pos, &c.usi),
-                            c.usi,
-                            c.score,
-                            c.gain,
-                            c.p_legal,
-                            c.adjust,
-                            c.depth2
-                        );
-                    } else {
-                        println!("{}({})", jp_move(&rep.pos, &c.usi), c.usi);
+        // 実戦でこの手の前に試みられた反則（*illegal 行）。棋譜の最終決定
+        // （反則負けなど、plies に手が無い決定点）は trailing_fouls を使う
+        let real_fouls = if ply < kifu.plies.len() {
+            kifu.plies[ply].fouls.clone()
+        } else {
+            kifu.trailing_fouls.clone()
+        };
+        // RANK_DUMP_FOULS_ONLY=1: 反則を挟む決定点の「反則後」サブ状態だけを
+        // 出力する（反則前のリストは既に doc にある前提。チェーンは全手で進める）
+        let fouls_only = std::env::var("RANK_DUMP_FOULS_ONLY").is_ok_and(|v| v == "1");
+
+        let print_ranking =
+            |snap: &dyn Strategy, chosen: &Option<String>, pos: &Position, top_n: usize| {
+                match snap.last_ranking() {
+                    Some(ranking) => {
+                        for c in ranking.iter().take(top_n) {
+                            if show_scores {
+                                println!(
+                                    "{}({}) score={:.3} gain={:.3} p_legal={:.2} adjust={:+.3} depth2={}",
+                                    jp_move(pos, &c.usi),
+                                    c.usi,
+                                    c.score,
+                                    c.gain,
+                                    c.p_legal,
+                                    c.adjust,
+                                    c.depth2
+                                );
+                            } else {
+                                println!("{}({})", jp_move(pos, &c.usi), c.usi);
+                            }
+                        }
                     }
+                    None => println!(
+                        "（ランキングなし: 定跡または候補ゼロ。choose={}）",
+                        chosen.as_deref().unwrap_or("投了")
+                    ),
                 }
+            };
+
+        if !fouls_only {
+            let mut snap = chain
+                .strat
+                .clone_boxed()
+                .expect("estimator は clone_boxed 対応のはず");
+            let chosen = snap.choose(&view, log, &HashSet::new());
+            println!();
+            println!("## {m}手目");
+            print_ranking(&*snap, &chosen, &rep.pos, top_n);
+        }
+
+        // 反則を挟む決定点: 反則観測を1つずつ足した「反則後」の状態を、
+        // choice_trial_body と同じ規約（MyFoul 記録・反則カウント・foul_tried）で
+        // 再現してランキングを出す
+        if !real_fouls.is_empty() {
+            let mut log2 = clone_log(log);
+            let mut fouls_arr = rep.fouls;
+            let mut foul_tried: HashSet<String> = HashSet::new();
+            for raw in &real_fouls {
+                let usi = resolve_foul(&rep.pos, side, raw);
+                fouls_arr[idx] += 1;
+                log2.record(Observation::MyFoul {
+                    move_number: rep.pos.move_number(),
+                    usi: usi.clone(),
+                });
+                foul_tried.insert(usi.clone());
+                let view2 = make_view(&rep.pos, side, &fouls_arr);
+                let mut snap = chain
+                    .strat
+                    .clone_boxed()
+                    .expect("estimator は clone_boxed 対応のはず");
+                let chosen = snap.choose(&view2, &log2, &foul_tried);
+                println!();
+                println!("### {m}手目（{}({})の反則後）", jp_move(&rep.pos, &usi), usi);
+                print_ranking(&*snap, &chosen, &rep.pos, top_n);
             }
-            None => println!(
-                "（ランキングなし: 定跡または候補ゼロ。choose={}）",
-                chosen.as_deref().unwrap_or("投了")
-            ),
         }
         eprintln!("[{m}/{last}] 完了");
     }
