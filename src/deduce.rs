@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::board::{Coord, on_board, orient, steps};
 use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{Color, Role};
-use crate::shogi::{Position, promote_role};
+use crate::shogi::{Position, ShogiMove, promote_role};
 
 /// **相手玉の位置候補**を観測履歴から健全に絞る（上の演繹の鏡像: あちらは
 /// 「自玉の王手履歴で相手駒の経路を刈る」、こちらは「自分が掛けた王手宣言で
@@ -143,6 +143,20 @@ pub fn opp_king_candidates(my_color: Color, log: &ObservationLog) -> std::collec
                 checking_board = None;
             }
             _ => {}
+        }
+    }
+    // **相手の歩が居ると確定しているマスに玉は居ない**（2026-08-03）。
+    // 玉候補は `strategy::project_taint_kings` が taint 粒子の玉を移設する先に
+    // なるが、その移設は移設先の駒と**入れ替え**るので、確定した歩のマスを
+    // 候補に残すと歩が弾き出されて「自分の観測だけで否定できる粒子」が生まれる
+    // （ユーザー指摘の 4七歩）。ここで落としておけば全ての利用箇所が守られる
+    let locked = immobile_opponent_pawns(my_color, log);
+    if !locked.is_empty() {
+        let pruned: std::collections::BTreeSet<Coord> =
+            cands.difference(&locked).copied().collect();
+        // 空になったら演繹のどこかが不健全なので制約を捨てる（既存の安全弁と同じ）
+        if !pruned.is_empty() {
+            cands = pruned;
         }
     }
     cands
@@ -292,6 +306,185 @@ mod king_tests {
         let cands = opp_king_candidates(Color::Sente, &rep.logs[side_idx(Color::Sente)]);
         assert_eq!(cands.len(), 1, "79手目は1マスに確定するはず: {cands:?}");
     }
+
+    /// **健全性**: 動けないと断言した相手の歩は、必ず真実でもそこに居る。
+    /// 2局分の全局面・両者視点で検証する（真実を1つでも落としたら演繹が壊れている）
+    #[test]
+    fn 不動の歩の演繹は真実を落とさない() {
+        for name in ["archive/king-deduction.kif", "archive/quest_20260731.kif"] {
+            let path = scenarios_dir().join(name);
+            let kifu = load_scenario(&path.to_string_lossy(), Some(0), None, None)
+                .unwrap()
+                .kifu;
+            for ply in 0..=kifu.plies.len() {
+                let rep = replay(&kifu, ply);
+                for me in [Color::Sente, Color::Gote] {
+                    let opp = me.other();
+                    for sq in immobile_opponent_pawns(me, &rep.logs[side_idx(me)]) {
+                        let truth = rep.pos.piece_at(sq);
+                        assert!(
+                            truth.is_some_and(|p| p.color == opp && p.role == Role::Pawn),
+                            "{name} ply={ply} {me:?}視点: {} に相手の歩が居ると断言したが真実は {truth:?}",
+                            make_usi_square(sq)
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// **鋭さ**: ユーザー指摘の局面（quest_20260731 の38手目、後手番）で
+    /// 4七が「動けない先手の歩」として確定する
+    #[test]
+    fn 塞がれた歩は不動と確定できる() {
+        let path = scenarios_dir().join("archive/quest_20260731.kif");
+        let kifu = load_scenario(&path.to_string_lossy(), Some(0), None, None)
+            .unwrap()
+            .kifu;
+        let rep = replay(&kifu, 37);
+        let locked = immobile_opponent_pawns(Color::Gote, &rep.logs[side_idx(Color::Gote)]);
+        let got: Vec<String> = locked.iter().map(|c| make_usi_square(*c)).collect();
+        assert!(
+            got.contains(&"4g".to_string()),
+            "38手目に 4g（先手の歩）が確定するはず: {got:?}"
+        );
+    }
+}
+
+/// **動けないことが確定している相手の歩**のマス（＝そこに相手の歩がいると
+/// 断言できる集合）。
+///
+/// ユーザー指摘（2026-08-03、quest_20260731 の38手目 `S*4g`）の一般化:
+/// 「先手の4七歩は前進先の4六に自分の歩がいるので動けない。動けば必ず取りが
+/// 発生して観測されるはずで、観測が無い以上そこに居続けている」。
+///
+/// 使う事実は**全て自分側の完全既知情報**だけなので健全（真実を絶対に落とさない）:
+/// - 初期局面の相手の歩の位置は分かっている（各筋の3段目/7段目）
+/// - 歩の動きは前方1マスだけ
+/// - 自分の駒の配置は常に厳密に分かる（自分の手と「取られたマス」の観測）
+/// - 相手が指せるのは自分の手番のときだけ
+///
+/// 判定: **相手の手番が来るたびに前進先が自駒で塞がっていた**なら、その歩は
+/// 一度も動く機会が無かった＝初期マスにいる。途中で前進先が空いた瞬間があれば
+/// （そこで動いたかは分からないので）以後その筋は諦める。自分がその歩を
+/// 取った観測があればもちろん除外する。
+///
+/// 用途は2つ: 粒子フィルタが**この事実に反する粒子を作らないようにする**
+/// （変異救済の移設元から除く）ことと、打ちマスの反則を確実に避けること。
+pub fn immobile_opponent_pawns(
+    my_color: Color,
+    log: &ObservationLog,
+) -> std::collections::BTreeSet<Coord> {
+    use std::collections::BTreeSet;
+    let opp = my_color.other();
+    // 相手の歩の初期段と、その前進先の段（相手から見た前方 = 自分に近づく向き）
+    let (pawn_rank, front_rank) = match opp {
+        Color::Sente => (7, 6),
+        Color::Gote => (3, 4),
+    };
+    // 前進の向き（相手の歩が進む段の増分）と成り込み段
+    let step: i8 = if opp == Color::Sente { -1 } else { 1 };
+    let promo_zone = |r: i8| if opp == Color::Sente { r <= 3 } else { r >= 7 };
+    // 自分の盤面を再構成する（自駒だけ。GameModel と同じ材料）
+    let init = Position::initial();
+    let mut mine: HashMap<Coord, Role> = init
+        .pieces()
+        .filter(|(_, p)| p.color == my_color)
+        .map(|(sq, p)| (sq, p.role))
+        .collect();
+    // 筋ごとの「その筋の相手の歩がいられる段」の**上界集合**（1件に絞れたら確定）。
+    // 歩は前進しかしないので段だけで表せる。give_up[f] は追跡を諦めた筋
+    let mut possible: HashMap<i8, BTreeSet<i8>> =
+        (1..=9).map(|f| (f, BTreeSet::from([pawn_rank]))).collect();
+    let mut give_up: HashSet<i8> = HashSet::new();
+    let _ = front_rank;
+
+    // 自駒が居るマスに相手の歩は居ない（自駒の配置は常に厳密に分かる）
+    let prune_by_mine = |possible: &mut HashMap<i8, BTreeSet<i8>>, mine: &HashMap<Coord, Role>| {
+        for (&f, ranks) in possible.iter_mut() {
+            ranks.retain(|&r| !mine.contains_key(&Coord { file: f, rank: r }));
+        }
+    };
+
+    for e in log.events() {
+        match e {
+            Observation::MyMove { usi, captured, .. } => match crate::shogi::parse_usi(usi) {
+                Some(ShogiMove::Board { from, to, promote }) => {
+                    // その筋の歩がいられる段で駒を取ったなら、取ったのがその歩
+                    // だった可能性がある（`captured` は成る前の駒種に潰されて
+                    // 届くので と金 と歩を区別できない）→ その筋は諦める
+                    if captured.is_some()
+                        && possible.get(&to.file).is_some_and(|s| s.contains(&to.rank))
+                    {
+                        give_up.insert(to.file);
+                    }
+                    if let Some(role) = mine.remove(&from) {
+                        let r = if promote {
+                            promote_role(role).unwrap_or(role)
+                        } else {
+                            role
+                        };
+                        mine.insert(to, r);
+                    }
+                    prune_by_mine(&mut possible, &mine);
+                }
+                Some(ShogiMove::Drop { role, to }) => {
+                    // 打てた = そのマスは空だった
+                    mine.insert(to, role);
+                    prune_by_mine(&mut possible, &mine);
+                }
+                None => {}
+            },
+            Observation::OpponentMoved {
+                captured_my_piece_at,
+                ..
+            } => {
+                let captured_sq = captured_my_piece_at
+                    .as_deref()
+                    .and_then(crate::board::parse_usi_square);
+                // この手番で歩が1つ前進できた可能性を足す（上界なので広げる側）。
+                // 前が自駒で塞がっていれば、前進 = その自駒を取る手なので
+                // 「取られたマス」の観測と一致するときだけ可能
+                for (&f, ranks) in possible.iter_mut() {
+                    let mut next = ranks.clone();
+                    for &r in ranks.iter() {
+                        let front = Coord { file: f, rank: r + step };
+                        if !on_board(front) {
+                            continue;
+                        }
+                        let blocked = mine.contains_key(&front);
+                        if !blocked || captured_sq == Some(front) {
+                            next.insert(front.rank);
+                        }
+                    }
+                    *ranks = next;
+                }
+                // 成り込みうる段に届いたら、以後は と金 として盤上を自由に動ける
+                // ＝ 段だけでは追えないので、その筋は諦める
+                for (&f, ranks) in possible.iter() {
+                    if ranks.iter().any(|&r| promo_zone(r)) {
+                        give_up.insert(f);
+                    }
+                }
+                if let Some(c) = captured_sq {
+                    mine.remove(&c);
+                }
+                prune_by_mine(&mut possible, &mine);
+            }
+            // 反則は盤面を動かさない。王手宣言も自駒の配置には影響しない
+            Observation::MyFoul { .. }
+            | Observation::OpponentFoul { .. }
+            | Observation::Check { .. } => {}
+        }
+    }
+    possible
+        .into_iter()
+        .filter(|(f, ranks)| !give_up.contains(f) && ranks.len() == 1)
+        .map(|(f, ranks)| Coord {
+            file: f,
+            rank: *ranks.iter().next().expect("1件"),
+        })
+        .collect::<BTreeSet<_>>()
 }
 
 /// 相手の各着手（OpponentMoved）の直前時点での「自玉の位置」と、

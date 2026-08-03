@@ -387,6 +387,9 @@ pub struct Estimator {
     king_cands: Option<std::collections::BTreeSet<Coord>>,
     /// king_cands を計算した時点の観測イベント数
     king_cands_at: usize,
+    /// **動けないことが確定している相手の歩**のマス（`deduce::immobile_opponent_pawns`）。
+    /// 変異救済がこの歩を移設すると、観測と論理的に矛盾する粒子が生まれる
+    locked_pawns: std::collections::BTreeSet<Coord>,
     /// 思考予算に応じた粒子の目標数（スケール1.0で TARGET_PARTICLES）
     target: usize,
     /// リプレイ試行回数の上限（スケール比例）
@@ -498,6 +501,7 @@ impl Estimator {
             mut_rescued: 0,
             king_cands: None,
             king_cands_at: usize::MAX,
+            locked_pawns: std::collections::BTreeSet::new(),
             target,
             regen_attempts: (REGEN_ATTEMPTS as f64 * scale) as usize,
             regen_deadline_ms: (500.0 * scale) as u64,
@@ -644,6 +648,11 @@ impl Estimator {
         // 生成時に使えば、変異粒子の玉は最初から候補集合の中に立つ）
         if self.mut_attempts > 0 && self.king_cands_at != log.events().len() {
             self.king_cands = Some(crate::deduce::opp_king_candidates(self.my_color, log));
+            // 「動けないことが確定している相手の歩」も同じタイミングで更新する。
+            // 変異救済がこの歩を動かすと、自分の観測だけで否定できる粒子が
+            // 生まれてしまう（ユーザー指摘の 4七歩。移設は歴史との整合を
+            // 検証しない嘘なので、こういう不変量は外から与えるしかない）
+            self.locked_pawns = crate::deduce::immobile_opponent_pawns(self.my_color, log);
             self.king_cands_at = log.events().len();
         }
         let events = log.events();
@@ -1106,6 +1115,7 @@ impl Estimator {
                     my_color,
                     *captured_at,
                     *gives_check,
+                    &self.locked_pawns,
                     &mut self.rng,
                 ),
             };
@@ -1777,10 +1787,18 @@ enum MutSource {
 /// 移設に使える相手駒の一覧（シャッフル済み・MUT_SOURCE_TRIES 件まで）。
 /// 盤上駒を先に並べる（持ち駒からの配置は「過去に打っていた」という
 /// より強い嘘なので後回し）
-fn mut_sources(pos: &Position, opp: Color, rng: &mut StdRng) -> Vec<(MutSource, Piece)> {
+fn mut_sources(
+    pos: &Position,
+    opp: Color,
+    locked: &std::collections::BTreeSet<Coord>,
+    rng: &mut StdRng,
+) -> Vec<(MutSource, Piece)> {
     let mut board: Vec<(MutSource, Piece)> = pos
         .pieces()
-        .filter(|(_, p)| p.color == opp && p.role != Role::King)
+        // 玉は移設しない。**動けないと確定している歩も動かさない**
+        // （移設は歴史との整合を検証しないので、この不変量を守らないと
+        // 自分の観測だけで否定できる粒子が生まれる）
+        .filter(|(sq, p)| p.color == opp && p.role != Role::King && !locked.contains(sq))
         .map(|(sq, p)| (MutSource::Board(sq), p))
         .collect();
     board.shuffle(rng);
@@ -2102,6 +2120,7 @@ fn mutate_for_opp_move(
     my_color: Color,
     captured_at: Option<Coord>,
     gives_check: bool,
+    locked: &std::collections::BTreeSet<Coord>,
     rng: &mut StdRng,
 ) -> Option<u32> {
     let opp = my_color.other();
@@ -2112,7 +2131,7 @@ fn mutate_for_opp_move(
         pos.piece_at(x).filter(|p| p.color == my_color)?;
         // 「x で取ったとき自玉へ利くか」で移設候補を宣言と整合しやすい順に並べる
         let mut ranked: Vec<(bool, MutSource, Piece)> = vec![];
-        for (src, piece) in mut_sources(pos, opp, rng) {
+        for (src, piece) in mut_sources(pos, opp, locked, rng) {
             let saved = pos.piece_at(x);
             pos.set(x, Some(piece));
             let checks_from_x = pos.attacks(x, my_king);
@@ -2146,7 +2165,7 @@ fn mutate_for_opp_move(
     }
     if gives_check {
         // 打ちで王手できるなら粒子は生きていたはずなので、盤上駒の移設だけ試す
-        let sources: Vec<(MutSource, Piece)> = mut_sources(pos, opp, rng)
+        let sources: Vec<(MutSource, Piece)> = mut_sources(pos, opp, locked, rng)
             .into_iter()
             .filter(|(src, _)| matches!(src, MutSource::Board(_)))
             .collect();
@@ -2184,7 +2203,7 @@ fn mutate_for_opp_move(
         return None;
     }
     // 取りも王手も無い手が1つも指せない（手詰まりに近い粒子）: 密集を解く
-    for (src, _) in mut_sources(pos, opp, rng) {
+    for (src, _) in mut_sources(pos, opp, locked, rng) {
         if let MutSource::Board(sq) = src {
             if relocate_away(pos, sq, &[], rng) {
                 return Some(1);

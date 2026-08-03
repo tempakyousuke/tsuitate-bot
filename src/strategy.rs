@@ -3683,25 +3683,57 @@ fn project_taint_kings(
             let Some(k) = need_move(pos) else {
                 return (pos.clone(), w);
             };
+            // **移設先は空きマスを優先する**: 下の移設は移設先の駒と入れ替えるので、
+            // 埋まっているマスを選ぶと「その駒が別のマスへ瞬間移動した」という
+            // 余計な嘘が1つ増える（玉の位置を直すために別の駒の位置を壊す）。
+            // 候補の中に空きが1つも無いときだけ従来どおり入れ替える
+            let empty_here = |c: &Coord| pos.piece_at(*c).is_none();
             let target = match (net, movers) {
                 (Some(dist), Some(m)) if m > 0 => {
                     let u = (mover_idx as f64 + 0.5) / m as f64;
                     mover_idx += 1;
-                    let mut acc = 0.0f64;
-                    let mut chosen = dist.last().map(|(c, _)| *c);
-                    for (c, p) in dist {
-                        acc += p;
-                        if acc >= u {
-                            chosen = Some(*c);
-                            break;
+                    // 空きマスだけで分位点を切り直す（全滅なら元の分布へ戻す）
+                    let open: Vec<&(Coord, f64)> =
+                        dist.iter().filter(|(c, _)| empty_here(c)).collect();
+                    let (slice, total): (&[&(Coord, f64)], f64) = if open.is_empty() {
+                        (&[], 0.0)
+                    } else {
+                        let t: f64 = open.iter().map(|(_, p)| p).sum();
+                        (&open, t)
+                    };
+                    if slice.is_empty() || total <= 0.0 {
+                        let mut acc = 0.0f64;
+                        let mut chosen = dist.last().map(|(c, _)| *c);
+                        for (c, p) in dist {
+                            acc += p;
+                            if acc >= u {
+                                chosen = Some(*c);
+                                break;
+                            }
                         }
+                        chosen
+                    } else {
+                        let mut acc = 0.0f64;
+                        let mut chosen = slice.last().map(|(c, _)| *c);
+                        for (c, p) in slice {
+                            acc += p / total;
+                            if acc >= u {
+                                chosen = Some(*c);
+                                break;
+                            }
+                        }
+                        chosen
                     }
-                    chosen
                 }
                 _ => {
                     let dist =
                         |a: Coord, b: Coord| (a.file - b.file).abs().max((a.rank - b.rank).abs());
-                    cands.iter().min_by_key(|&&c| dist(c, k)).copied()
+                    cands
+                        .iter()
+                        .filter(|c| empty_here(c))
+                        .min_by_key(|&&c| dist(c, k))
+                        .or_else(|| cands.iter().min_by_key(|&&c| dist(c, k)))
+                        .copied()
                 }
             };
             let Some(t) = target else {
@@ -3709,6 +3741,11 @@ fn project_taint_kings(
             };
             let mut next = pos.clone();
             let displaced = next.piece_at(t);
+            // 「玉を直すために他の駒を根拠なく飛ばした」割合。空きマス優先の
+            // 効果はここで測る（TSUITATE_DBG_HITS=1）
+            if crate::hits::enabled() {
+                crate::hits::flag("taint_king_displaces_piece", displaced.is_some());
+            }
             next.set(t, pos.piece_at(k));
             next.set(k, displaced);
             (next, w)
