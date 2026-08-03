@@ -1277,6 +1277,21 @@ pub struct EvalParams {
     pub coverage_w: f64,
     /// 2手読みで静的リスク項をサンプル実測に置き換える割合（0=従来、1=全面置換）
     pub depth2_replace: f64,
+    /// 2手読みの**楽観方向の置き換え**の上限（0 = 従来と同一挙動、1 = 楽観禁止 =
+    /// 実効リスクが静的リスクを下回らない）。
+    ///
+    /// 置き換えは実効リスク `(1−w)·risk_mean + w·|delta|` の形になる
+    /// （w = depth2_replace）。相手の応手方策は取り返しを確率的にしか選ばないので
+    /// **|delta| < risk_mean になりやすく、静的リスクが大きいほど戻し額が大きい**
+    /// = 危険な捕獲ほど加点される、という逆転が起きる（quest31-m030f1 の実測:
+    /// 1二飛の反則で「3三は守られている」信念が 7.2%→57.7% に上がり静的評価は
+    /// 正しく 6.844→5.882 に下がったのに、2手読みの戻しが +0.70→+1.85 に増えて
+    /// 最終 gain は 7.547→7.734 と上がった。F3、
+    /// docs/improvement-plan-2026-08-02-quest31.md）。
+    ///
+    /// この項は緩和（relief）を `(1−cap)·risk_mean` で頭打ちにする。悲観方向
+    /// （delta が静的リスクより大きい損失を見つけた場合）は制限しない
+    pub depth2_optimism_cap: f64,
     /// 2手読みで応手に王手を掛けられた場合のペナルティ
     pub depth2_check_pen: f64,
     /// 2手読みの取り返し補償の割引（取り返し自体への反撃リスクの近似）
@@ -1603,6 +1618,9 @@ impl Default for EvalParams {
             king_probe_bonus: 0.2451,
             coverage_w: 0.0013,
             depth2_replace: 0.6205,
+            // 2手読みの楽観上限（2026-08-03、F3）。0 = 従来と同一挙動。
+            // 既定値はシナリオ実測とアリーナで決める
+            depth2_optimism_cap: 0.0,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
             // 反則経済の新項（2026-07-16、オラクル測定で36ptの伸びしろを確認後に追加）。
@@ -1699,7 +1717,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 59] = [
+    pub const SPECS: [ParamSpec; 60] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -2019,6 +2037,12 @@ impl EvalParams {
             hi: 1.5,
         },
         ParamSpec {
+            // 実効リスクが静的リスクの何割を下回れないか。1 で楽観禁止
+            name: "depth2_optimism_cap",
+            lo: 0.0,
+            hi: 1.0,
+        },
+        ParamSpec {
             // 占有駒の交換価値 × p_occ²(1−p_occ) × 予算² に掛かる。
             // p_occ(1−p_occ) ゲートのピークは p=2/3 で ≈0.15 なので、
             // 実効値は交換価値の w×0.15 程度。w=4.5 で 2二歩打（p=0.65・角8）が
@@ -2090,6 +2114,7 @@ impl EvalParams {
             self.mate_gate_q0,
             self.king_adj_entry_w,
             self.drop_probe_w,
+            self.depth2_optimism_cap,
         ]
     }
 
@@ -2155,6 +2180,7 @@ impl EvalParams {
             mate_gate_q0: v[56],
             king_adj_entry_w: v[57],
             drop_probe_w: v[58],
+            depth2_optimism_cap: v[59],
         }
     }
 }
@@ -2356,6 +2382,18 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
     {
         Some(w) => EvalParams {
             mover_check_extra: w,
+            ..params
+        },
+        None => params,
+    };
+    // 2手読みの楽観置き換えの上限（F3。0 で従来挙動）
+    let params = match std::env::var("TSUITATE_DEPTH2_OPTIMISM_CAP")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            depth2_optimism_cap: w,
             ..params
         },
         None => params,
@@ -3055,7 +3093,15 @@ impl Strategy for EstimatorStrategy {
                 // 構想（自分の手 → 相手の応手 → 自分の手）は depth2_delta の
                 // 内側へ統合した（`plan_w`）。応手を挟まない外付けの加点は
                 // 200局で -6pt と明確に負だったので廃止
-                let gain2 = out.gain + params.depth2_replace * (out.risk_mean + delta);
+                //
+                // relief（正 = 静的リスクより楽観に置き換わる量）は
+                // `(1−depth2_optimism_cap)×risk_mean` で頭打ちにする。相手の応手
+                // 方策は取り返しを確率的にしか選ばないので |delta| < risk_mean に
+                // なりやすく、上限が無いと**静的リスクが大きいほど加点が増える**
+                // （F3。depth2_optimism_cap の doc 参照）。悲観方向は制限しない
+                let relief = params.depth2_replace * (out.risk_mean + delta);
+                let max_relief = (1.0 - params.depth2_optimism_cap) * out.risk_mean;
+                let gain2 = out.gain + relief.min(max_relief);
                 (
                     gain2,
                     combine_score(gain2, out.p_legal, out.foul_cost) + out.foul_probe + adjust,
@@ -5439,6 +5485,26 @@ pub(crate) mod tests {
             to: Coord { file: 2, rank: 1 },
         };
         assert_eq!(own_effects_after(&view, &block, None, &params).drop_hit_exposure, 0.0);
+    }
+
+    /// F3: 2手読みの緩和（relief）の上限。cap=0 は従来と同一挙動でなければ
+    /// ならない（depth2_replace<1 なので relief は常に risk_mean 未満）
+    #[test]
+    fn depth2の楽観上限はcap0で挙動を変えない() {
+        let relief_of = |risk_mean: f64, delta: f64, cap: f64| {
+            let w = EvalParams::default().depth2_replace;
+            let relief = w * (risk_mean + delta);
+            relief.min((1.0 - cap) * risk_mean)
+        };
+        // cap=0: 従来どおり relief = w*(risk_mean+delta) がそのまま通る
+        let plain = EvalParams::default().depth2_replace * (4.0 + -1.0);
+        assert!((relief_of(4.0, -1.0, 0.0) - plain).abs() < 1e-9);
+        // cap=1: 楽観方向の置き換えを禁止（実効リスクは静的リスクのまま）
+        assert!(relief_of(4.0, -1.0, 1.0).abs() < 1e-9);
+        // 悲観方向（delta が静的リスクより大きい損失）は cap に関係なく通る
+        assert!(relief_of(4.0, -9.0, 1.0) < 0.0);
+        // リスクゼロの手（静かな手）は cap の影響を受けない
+        assert!(relief_of(0.0, 0.0, 1.0).abs() < 1e-9);
     }
 
     #[test]
