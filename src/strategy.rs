@@ -555,6 +555,9 @@ struct OwnEffects {
     /// `promo_potential()` の doc 参照。`promo_potential_w == 0` か王手中は
     /// 計算しない（0 のまま）
     promo_potential: f64,
+    /// **大駒の成り道**（`major_promo_path_w`）: 飛・角・香の素材の成り得を
+    /// 成りマスまでの距離で減衰させた総和。`major_promo_path()` の doc 参照
+    major_promo_path: f64,
     /// **この手で盤上に増える自駒の価値**（V5。`board_discount_w`）。
     /// 打ち = 打った駒の価値、成り = 増えた価値、それ以外 = 0。
     ///
@@ -739,6 +742,11 @@ fn own_effects_after(
         } else {
             0.0
         },
+        major_promo_path: if params.major_promo_path_w != 0.0 && !view.you_in_check {
+            major_promo_path(&pieces, view.your_color)
+        } else {
+            0.0
+        },
         board_material_added,
     }
 }
@@ -824,6 +832,44 @@ fn promo_potential(pieces: &[VisiblePiece], me: Color) -> f64 {
             total += promo_effect_gain(&occupied, origin, unpromote_role(p.role), origin, me);
         } else {
             total += piece_promo_potential(&occupied, origin, p.role, me);
+        }
+    }
+    total
+}
+
+/// **大駒（飛・角・香）の成り道**の価値（`major_promo_path_w`、2026-08-03）。
+///
+/// `promo_potential` は成りの価値を **Δ利き**（成り駒種と現駒種の利きマス数の差）で
+/// 測るので、飛→龍が +4 利きにしかならず**歩→と金の +5 より小さく**なる。
+/// ところが実戦的には「自分の飛車の前を自駒がどいて次手で成れる」は決定的な差で、
+/// ユーザーが quest31-m021 の 3二と（2三のと金をどけて先手飛車2八の前を開ける手）を
+/// 本命とした理由がまさにこれ。実測でも `promo_potential` の寄与は +0.300 しかなく、
+/// **飛車の道を開けない 3一と（+0.400）のほうが高い**＝この概念は表現されていない。
+///
+/// そこで大駒だけを対象に、**素材の成り得**（龍−飛 = 2.5、馬−角 = 2.0、成香−香 = 3.0）を
+/// 成りマスまでの手数で減衰させて足す。距離は `promo_distance`（自駒ブロッカーのみ
+/// 考慮の BFS）を共用するので、**自駒がどけば距離が縮んで値が跳ねる**。
+/// 歩・桂・銀は対象外（`promo_potential` の領分。ここで足すと垂れ歩が支配的になる）。
+/// 差分形（着手後−現局面）で gain 内・王手中は無効・粒子不要（自駒だけで決まる）
+fn major_promo_path(pieces: &[VisiblePiece], me: Color) -> f64 {
+    let occupied: HashSet<Coord> = pieces
+        .iter()
+        .filter_map(|p| parse_usi_square(&p.square))
+        .collect();
+    let mut total = 0.0f64;
+    for p in pieces {
+        if !matches!(p.role, Role::Rook | Role::Bishop | Role::Lance) {
+            continue; // 成り済み・小駒は対象外
+        }
+        let Some(at) = parse_usi_square(&p.square) else {
+            continue;
+        };
+        let Some(promoted) = promote_role(p.role) else {
+            continue;
+        };
+        let gain = exchange_value(promoted) - exchange_value(p.role);
+        if let Some((d, _)) = promo_distance(&occupied, at, p.role, me) {
+            total += gain * PROMO_POTENTIAL_DECAY.powi(d as i32);
         }
     }
     total
@@ -1350,6 +1396,10 @@ pub struct EvalParams {
     /// に対し、寄与を 1000×q×(q/(q+q0)) と凸にゲートする: 裾の幻詰み（q≈0.1）は
     /// 材料スケールまで沈み、合意の詰み（q→1）はほぼ満額。0 = 従来と同一挙動
     pub mate_gate_q0: f64,
+    /// **大駒の成り道**（`major_promo_path` の doc 参照、2026-08-03）。
+    /// 飛・角・香の素材の成り得を成りマスまでの距離で減衰させた総和の差分。
+    /// 自駒がどいて大駒の道が開くと跳ねる。0 = 従来と同一挙動
+    pub major_promo_path_w: f64,
     /// **taint 粒子の占有合意で打ちの反則確率を下げる**（2026-08-03、ユーザー指摘の
     /// 38手目 `S*4g` が発端）。厳密粒子が全滅した決定では `p_legal` が
     /// `prior_legal` だけで決まるが、その打ち側は**マスに依らない定数**
@@ -1649,6 +1699,8 @@ impl Default for EvalParams {
             depth2_optimism_cap: 0.0,
             // taint 占有合意による打ちの反則回避（2026-08-03）。0 = 従来と同一挙動
             taint_occ_legal_w: 0.0,
+            // 大駒の成り道（2026-08-03）。0 = 従来と同一挙動
+            major_promo_path_w: 0.0,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
             // 反則経済の新項（2026-07-16、オラクル測定で36ptの伸びしろを確認後に追加）。
@@ -1745,7 +1797,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 61] = [
+    pub const SPECS: [ParamSpec; 62] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -2077,6 +2129,13 @@ impl EvalParams {
             hi: 1.0,
         },
         ParamSpec {
+            // 差分の振れ幅は龍−飛=2.5 × 減衰の変化（最大 0.5 程度）。
+            // w=1 で「次手で成れる形を作る手」が約1歩強
+            name: "major_promo_path_w",
+            lo: 0.0,
+            hi: 3.0,
+        },
+        ParamSpec {
             // 占有駒の交換価値 × p_occ²(1−p_occ) × 予算² に掛かる。
             // p_occ(1−p_occ) ゲートのピークは p=2/3 で ≈0.15 なので、
             // 実効値は交換価値の w×0.15 程度。w=4.5 で 2二歩打（p=0.65・角8）が
@@ -2150,6 +2209,7 @@ impl EvalParams {
             self.drop_probe_w,
             self.depth2_optimism_cap,
             self.taint_occ_legal_w,
+            self.major_promo_path_w,
         ]
     }
 
@@ -2217,6 +2277,7 @@ impl EvalParams {
             drop_probe_w: v[58],
             depth2_optimism_cap: v[59],
             taint_occ_legal_w: v[60],
+            major_promo_path_w: v[61],
         }
     }
 }
@@ -2418,6 +2479,18 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
     {
         Some(w) => EvalParams {
             mover_check_extra: w,
+            ..params
+        },
+        None => params,
+    };
+    // 大駒の成り道（0 で従来挙動）
+    let params = match std::env::var("TSUITATE_MAJOR_PROMO_PATH_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            major_promo_path_w: w,
             ..params
         },
         None => params,
@@ -2982,6 +3055,10 @@ impl Strategy for EstimatorStrategy {
         let promo_pot_before: Option<f64> = (params.promo_potential_w != 0.0
             && !view.you_in_check)
             .then(|| promo_potential(&view.your_pieces, view.your_color));
+        // 大駒の成り道（`major_promo_path_w`）の現局面の値。同じく差分で使う
+        let major_path_before: Option<f64> = (params.major_promo_path_w != 0.0
+            && !view.you_in_check)
+            .then(|| major_promo_path(&view.your_pieces, view.your_color));
 
         // 持ち駒オプション価値（`hand_option_w`）の決定点コンテキスト。
         // 王手中は無効（合駒は CheckSolver の領分）
@@ -3038,6 +3115,7 @@ impl Strategy for EstimatorStrategy {
                 opp_king_w.as_ref(),
                 drop_hit_expo_before,
                 promo_pot_before,
+                major_path_before,
                 hand_option.as_ref(),
             );
             // 王手中: 仮説条件付きの「王手駒の除去期待値」（check.rs::removal_term）。
@@ -4212,6 +4290,8 @@ fn evaluate(
     // 項が有効（choose() が「w≠0・王手中でない」のゲートを掛けて渡す）。
     // 着手後との差分を gain へ加点する
     promo_pot_before: Option<f64>,
+    // 大駒の成り道（`major_promo_path_w`）の**現局面**の値。同じく差分で使う
+    major_path_before: Option<f64>,
     // 持ち駒オプション価値（`hand_option_w`）の決定点コンテキスト。Some のとき
     // だけ項が有効（choose() が「w≠0・王手中でない」のゲートを掛けて渡す）。
     // 打つ手に「最良打ちポテンシャルとの不足分」の減点を掛ける
@@ -4644,6 +4724,13 @@ fn evaluate(
         .map(|before| params.promo_potential_w * (own_effects.promo_potential - before))
         .unwrap_or(0.0);
 
+    // 大駒の成り道の差分（`major_promo_path` の doc 参照）。自駒がどいて
+    // 飛・角・香の成り道が開く手が正、自分で塞ぐ手が負。promo と同じく
+    // 大半の候補は 0 なので gain のゼロ点は動かない
+    let major_path = major_path_before
+        .map(|before| params.major_promo_path_w * (own_effects.major_promo_path - before))
+        .unwrap_or(0.0);
+
     // 持ち駒オプションの不足分（`hand_option_w` の doc 参照）。打つ手にだけ
     // 「その駒種の最良打ちポテンシャル − この打ちマスでの実現値」を引く。
     // 最良マスへの打ち（垂れ歩）は 0、ポテンシャルを捨てる打ちほど満額。
@@ -4746,6 +4833,7 @@ fn evaluate(
         + link
         + drop_hit_evac
         + promo
+        + major_path
         - hand_option_pen
         - board_discount
         + effect_value
