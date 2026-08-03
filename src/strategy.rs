@@ -1342,6 +1342,23 @@ pub struct EvalParams {
     /// に対し、寄与を 1000×q×(q/(q+q0)) と凸にゲートする: 裾の幻詰み（q≈0.1）は
     /// 材料スケールまで沈み、合意の詰み（q→1）はほぼ満額。0 = 従来と同一挙動
     pub mate_gate_q0: f64,
+    /// **taint 粒子の占有合意で打ちの反則確率を下げる**（2026-08-03、ユーザー指摘の
+    /// 38手目 `S*4g` が発端）。厳密粒子が全滅した決定では `p_legal` が
+    /// `prior_legal` だけで決まるが、その打ち側は**マスに依らない定数**
+    /// （盤全体の平均空きマス率 q）なので、**確実に埋まっているマスへの打ちも
+    /// 空きマスと同じ 0.74 で生き残る**。
+    ///
+    /// 実測（quest31 の38手目、後手番）: 4七には先手の歩がいて、しかも
+    /// **taint 粒子は 100% それを当てている**（自分の4六歩が前進を塞いでいて、
+    /// 動けば取りが発生して観測されるので論理的にも確定する）。にもかかわらず
+    /// `S*4g` は p_legal=0.74 で候補上位に残り、反則を1回捨てることになる。
+    ///
+    /// 打ちは「占有マス = 反則」なので、taint の合意占有率をそのまま反則確率に
+    /// 使える（gain 側と違い**駒種の当て違いに鈍感** = taint を信用する範囲が狭い）。
+    /// **安全方向のみ**: `p_legal = min(prior, 1 − w×p_occ)` で、空きマスの
+    /// 打ちを押し上げることはしない（反則マス記憶系4種が全滅した領域なので
+    /// 楽観方向へは動かさない）。0 = 従来と同一挙動
+    pub taint_occ_legal_w: f64,
     /// 打ちプローブの反則情報価値（quest31 レビュー 2026-08-03、m015 の
     /// 2二歩打が発端。ユーザー指摘「2二とが高いだけでなく2二歩打が低いのも問題」）。
     /// combine_score は「反則の価値 = 次善手の価値 − 反則コスト」と仮定するが、
@@ -1619,8 +1636,11 @@ impl Default for EvalParams {
             coverage_w: 0.0013,
             depth2_replace: 0.6205,
             // 2手読みの楽観上限（2026-08-03、F3）。0 = 従来と同一挙動。
-            // 既定値はシナリオ実測とアリーナで決める
+            // アリーナがペア比較で中立〜負（cap=1.0 で −1.5pt、0.5 で −6.5pt）
+            // だったため 0 のまま
             depth2_optimism_cap: 0.0,
+            // taint 占有合意による打ちの反則回避（2026-08-03）。0 = 従来と同一挙動
+            taint_occ_legal_w: 0.0,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
             // 反則経済の新項（2026-07-16、オラクル測定で36ptの伸びしろを確認後に追加）。
@@ -1717,7 +1737,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 60] = [
+    pub const SPECS: [ParamSpec; 61] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -2043,6 +2063,12 @@ impl EvalParams {
             hi: 1.0,
         },
         ParamSpec {
+            // 1 で taint の合意占有率をそのまま反則確率に使う（安全方向のみ）
+            name: "taint_occ_legal_w",
+            lo: 0.0,
+            hi: 1.0,
+        },
+        ParamSpec {
             // 占有駒の交換価値 × p_occ²(1−p_occ) × 予算² に掛かる。
             // p_occ(1−p_occ) ゲートのピークは p=2/3 で ≈0.15 なので、
             // 実効値は交換価値の w×0.15 程度。w=4.5 で 2二歩打（p=0.65・角8）が
@@ -2115,6 +2141,7 @@ impl EvalParams {
             self.king_adj_entry_w,
             self.drop_probe_w,
             self.depth2_optimism_cap,
+            self.taint_occ_legal_w,
         ]
     }
 
@@ -2181,6 +2208,7 @@ impl EvalParams {
             king_adj_entry_w: v[57],
             drop_probe_w: v[58],
             depth2_optimism_cap: v[59],
+            taint_occ_legal_w: v[60],
         }
     }
 }
@@ -2382,6 +2410,18 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
     {
         Some(w) => EvalParams {
             mover_check_extra: w,
+            ..params
+        },
+        None => params,
+    };
+    // taint 占有合意による打ちの反則回避（0 で従来挙動）
+    let params = match std::env::var("TSUITATE_TAINT_OCC_LEGAL_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            taint_occ_legal_w: w,
             ..params
         },
         None => params,
@@ -2863,6 +2903,30 @@ impl Strategy for EstimatorStrategy {
                 )
             });
         let blind_belief = blind_belief_board.as_ref().map(|(o, v)| (o, *v));
+        // ブラインド決定での taint 占有合意（打ちの反則回避。`taint_occ_legal_w`）。
+        // 打ちマスの占有は「駒種が当たっているか」に依らないので、gain 側より
+        // taint を信用する範囲が狭い。決定点ごとに1回作れば全候補で使える
+        let taint_occ_board: Option<[f64; 81]> = (params.taint_occ_legal_w != 0.0
+            && sample.is_empty()
+            && !taint_pool.is_empty())
+        .then(|| {
+            let mut occ = [0.0f64; 81];
+            let mut mass = 0.0f64;
+            for &(p, w) in &taint_pool {
+                mass += w;
+                for (sq, pc) in p.pieces() {
+                    if pc.color == opp_color {
+                        occ[crate::belief_features::sq_index(sq)] += w;
+                    }
+                }
+            }
+            if mass > 0.0 {
+                for v in occ.iter_mut() {
+                    *v /= mass;
+                }
+            }
+            occ
+        });
         // V2（玉距離重み付き利き）の相手玉側。玉位置の信念は評価に使う粒子から
         // 取る（厳密が生きていればそちら、全滅していれば taint = mate_pool と
         // 同じ規約）。重みが両方0（既定）なら 81マスぶんの表も作らない
@@ -2962,6 +3026,7 @@ impl Strategy for EstimatorStrategy {
                 &mut nn_state_cache,
                 blind_recapture,
                 blind_belief,
+                taint_occ_board.as_ref(),
                 opp_king_w.as_ref(),
                 drop_hit_expo_before,
                 promo_pot_before,
@@ -4086,6 +4151,10 @@ fn evaluate(
     // 上と同じく**厳密粒子が全滅した決定でだけ**使う（`belief_gain_w`）。
     // 重みが 0 なら choose() が None を渡すので計算もしない
     blind_belief: Option<(&[f64; 81], f64)>,
+    // ブラインド決定での taint 占有合意（`taint_occ_legal_w`）。打ちの反則確率
+    // にだけ使う（Some のときだけ有効。choose() が w≠0・厳密粒子ゼロの
+    // ゲートを掛けて渡す）
+    taint_occ: Option<&[f64; 81]>,
     // V2: マスごとの「相手玉の信念位置からの距離重み」（`opp_king_effect_weights`）。
     // 決定点ごとに1度だけ作って全候補で使い回す
     opp_king_w: Option<&[f64; 81]>,
@@ -4326,11 +4395,19 @@ fn evaluate(
     let n: f64 = particles.iter().map(|(_, w)| w).sum();
     let degen = 1.0 - (n / budget.eval_particles as f64).min(1.0);
     let w = params.prior_weight + params.prior_weight_degen * degen;
-    let p_legal = if particles_are_taint {
+    let mut p_legal = if particles_are_taint {
         prior
     } else {
         (legal + prior * w) / (n + w)
     };
+    // taint 占有合意で打ちの反則確率を締める（`taint_occ_legal_w`）。
+    // 打ちマスが埋まっていれば必ず反則なので、合意占有率をそのまま反則確率に
+    // 使える。**安全方向のみ**（min）: 空きマスの打ちを押し上げはしない
+    if let (Some(occ), ShogiMove::Drop { to, .. }) = (taint_occ, *mv) {
+        let p_occ = occ[crate::belief_features::sq_index(to)];
+        p_legal = p_legal.min(1.0 - params.taint_occ_legal_w * p_occ).max(0.0);
+    }
+    let p_legal = p_legal;
     // 賭け分散ペナルティの内訳（ランキング表示用に expected の外へ持ち出す）
     let mut capture_bet_penalty = 0.0;
     // valueネット項の内訳（同上。発火率フック src/hits.rs が使う）
