@@ -215,6 +215,8 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
     let mut all_king_mass = 0.0f64;
     // マスごとの相手利き枚数（0,1,2,3+）の重み質量
     let mut cover_tally: Vec<[f64; 4]> = vec![[0.0; 4]; diag_sqs.len()];
+    // マスごとの「そこにいる相手駒の駒種」の重み質量（捕獲期待値の内訳）
+    let mut occ_tally: Vec<HashMap<String, f64>> = vec![HashMap::new(); diag_sqs.len()];
     // taint 粒子だけでの同集計（strategy.rs の taint_particles/taint_square_coverage
     // と同じ重み規約 = 0.5^(taint-1) 減衰・taint<=6・taint内max_lwで正規化）。
     // 「局所被覆度ビリーフ」が真実とどれだけ一致するかの直接測定
@@ -310,6 +312,14 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
                     })
                     .count();
                 cover_tally[i][n.min(3)] += w;
+                // そのマスに何の駒がいると思っているか（捕獲期待値の内訳）。
+                // 「取られたマス」は占有が確定するので駒種の分布だけが問題になる
+                let key = match pp.piece_at(*sq) {
+                    Some(pc) if pc.color == side.other() => format!("{:?}", pc.role),
+                    Some(_) => "自駒".to_string(),
+                    None => "空".to_string(),
+                };
+                *occ_tally[i].entry(key).or_insert(0.0) += w;
             }
         }
         // taint 粒子だけの被覆度集計（strategy.rs の taint_particles/
@@ -431,6 +441,26 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
             .filter(|(from, pc)| pc.color == side.other() && rep.pos.attacks(*from, *sq))
             .count();
         println!();
+        // そのマスの駒種ビリーフ（真実と並べる）。「取られたマス」のように占有が
+        // 確定しているマスでは、捕獲期待値の誤差は丸ごと駒種の誤りになる
+        if strict_unique > 0 {
+            let truth_occ = match rep.pos.piece_at(*sq) {
+                Some(pc) if pc.color == side.other() => format!("{:?}", pc.role),
+                Some(_) => "自駒".to_string(),
+                None => "空".to_string(),
+            };
+            let mut occ: Vec<(String, f64)> = occ_tally[i].clone().into_iter().collect();
+            occ.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            let shown: Vec<String> = occ
+                .iter()
+                .take(6)
+                .map(|(k, v)| {
+                    let mark = if *k == truth_occ { "←真実" } else { "" };
+                    format!("{k} {:.1}%{mark}", 100.0 * v / strict_mass.max(1e-12))
+                })
+                .collect();
+            println!("{name} の駒種ビリーフ（厳密粒子。真実={truth_occ}）: {}", shown.join(" / "));
+        }
         println!("{name} への相手利き枚数:");
         if strict_unique > 0 {
             let t = &cover_tally[i];
