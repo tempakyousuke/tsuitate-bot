@@ -1,4 +1,4 @@
-*scenario ply=19 target=4f4g+ bad=4a5a,6a7b,4a5b,3d3e desc=20手目（後手番）。4七歩成が本命（4五桂より評価が上であるべき）。実戦の5一金と7二金は悪手
+*scenario ply=19 target=4f4g+ bad=6a7b,4a5b,3d3e,4a5a desc=20手目（後手番）。4七歩成が本命（4五桂より評価が上であるべき）。実戦の5一金と7二金は悪手
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

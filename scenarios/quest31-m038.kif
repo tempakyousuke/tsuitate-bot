@@ -1,4 +1,4 @@
-*scenario ply=23 target=3b4b bad=5a4b,4f4g+,5a4a,P*2f,3c4e,P*2g,P*2h desc=24手目（後手番）。飛車が3一のとに当たられており逃げる一手（4二飛が自然、実戦の5二飛は消極的だが可）。4二金・4一金は飛車を見捨てる悪手。ここでは4七歩成も悪手（飛車不動がバレて3二とで駒を取られる）
+*scenario ply=37 target=4c4d bad=S*5h,S*6h,S*4h,6c5d,S*4b,S*3g,S*4g,S*5g,S*5i,S*5d,S*5b,6c5b desc=38手目（後手番）。4四飛が当然の一手（4七歩成もセーフ）。S*4g は論外＝4七に先手の歩がいることは自分の観測だけで確定できる（deduce::immobile_opponent_pawns の実例）
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
