@@ -324,6 +324,14 @@ fn think_budget_ms() -> u64 {
     DEFAULT_THINK_BUDGET_MS
 }
 
+/// taint 粒子の玉を移設するとき、移設先に空きマスを優先するか（既定 on、
+/// `TSUITATE_TAINT_KING_EMPTY=0` で従来挙動）。従来は候補マスの駒と無条件に
+/// 入れ替えていたため、玉位置を直すたびに別の駒が根拠なく飛んでいた
+fn taint_king_prefer_empty() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| !std::env::var("TSUITATE_TAINT_KING_EMPTY").is_ok_and(|v| v == "0"))
+}
+
 /// 厳密粒子が全滅した決定で、評価本体（`expected`）を taint 粒子へ落とすか。
 /// 既定は無効（従来挙動）。`TSUITATE_EVAL_TAINT_FALLBACK=1` で有効。
 /// 凍結版はこの名前を知らないので候補側にだけ効く
@@ -3686,8 +3694,9 @@ fn project_taint_kings(
             // **移設先は空きマスを優先する**: 下の移設は移設先の駒と入れ替えるので、
             // 埋まっているマスを選ぶと「その駒が別のマスへ瞬間移動した」という
             // 余計な嘘が1つ増える（玉の位置を直すために別の駒の位置を壊す）。
-            // 候補の中に空きが1つも無いときだけ従来どおり入れ替える
-            let empty_here = |c: &Coord| pos.piece_at(*c).is_none();
+            // 候補の中に空きが1つも無いときだけ従来どおり入れ替える。
+            // `TSUITATE_TAINT_KING_EMPTY=0` で従来挙動（アブレーション用）
+            let empty_here = |c: &Coord| taint_king_prefer_empty() && pos.piece_at(*c).is_none();
             let target = match (net, movers) {
                 (Some(dist), Some(m)) if m > 0 => {
                     let u = (mover_idx as f64 + 0.5) / m as f64;
