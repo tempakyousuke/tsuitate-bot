@@ -3007,6 +3007,10 @@ impl Strategy for EstimatorStrategy {
         // 自分が打ちの反則をしたマス（局を通じて累積。`foul_tride` と違い
         // 受理でクリアされない）。`drop_probe_repeat_gate` 参照
         let mut my_drop_foul_squares = [false; 81];
+        // 争点マス（`anchor_move_w`）: 自分が取ったマスと、自駒を取られたマス。
+        // どちらも観測だけで正確に決まる（相手も取られたマスを通知されるので
+        // 双方が注目しているマス = 争点）
+        let mut contested_squares = [false; 81];
         for e in log.events() {
             match e {
                 Observation::MyMove { usi, captured, .. } => {
@@ -3017,11 +3021,20 @@ impl Strategy for EstimatorStrategy {
                         };
                         if captured.is_some() {
                             my_capture_squares.push(to);
+                            contested_squares[crate::belief_features::sq_index(to)] = true;
                         }
                         if let ShogiMove::Board { from, .. } = mv {
                             my_touched_squares.push(from);
                         }
                         my_touched_squares.push(to);
+                    }
+                }
+                Observation::OpponentMoved {
+                    captured_my_piece_at: Some(sq),
+                    ..
+                } => {
+                    if let Some(c) = parse_usi_square(sq) {
+                        contested_squares[crate::belief_features::sq_index(c)] = true;
                     }
                 }
                 Observation::MyFoul { usi, .. } => {
@@ -3272,6 +3285,7 @@ impl Strategy for EstimatorStrategy {
                 hand_option.as_ref(),
                 &my_drop_foul_squares,
                 &own_attack,
+                &contested_squares,
             );
             // 王手中: 仮説条件付きの「王手駒の除去期待値」（check.rs::removal_term）。
             // 王手駒のマスを取る手は受理された未来で脅威ごと駒を排除し、玉逃げ等の
@@ -4506,6 +4520,8 @@ fn evaluate(
     drop_foul_squares: &[bool; 81],
     // 着手前の自駒の利き枚数（`anchor_move_w` の錨の判定）
     own_attack_before: &[u8; 81],
+    // 争点マス = そこで駒が取られた/取ったマス（`anchor_move_w` の争点ゲート）
+    contested_squares: &[bool; 81],
 ) -> EvalOut {
     let me = view.your_color;
     let opp = me.other();
@@ -5061,19 +5077,32 @@ fn evaluate(
     let anchor_move_pen = if params.anchor_move_w != 0.0 && !view.you_in_check {
         match *mv {
             ShogiMove::Board { from, to, .. } => {
+                let idx = crate::belief_features::sq_index(to);
+                // **争点ゲート**（第1版に無くて −20.6pt を出した因子。
+                // codex の `contested(to)`）。争点は観測だけで正確に分かる:
+                // **そこで駒が取られた/取ったマス**（相手は取られたマスを
+                // 通知されるので双方が注目している）。61手目の4七はまさに
+                // 58手目に自分の歩が取られたマス。全マスに当たらないので
+                // 発火率が低い（`anchor_move_fires` フックで実測する）
+                let contested = contested_squares[idx];
+                // 着手後に `to` を守る自駒の枚数（着手駒自身を除く）
+                let after = own_attack_before[idx]
+                    .saturating_sub(u8::from(own_defends_from(view, from, to)));
                 let mover = view
                     .your_pieces
                     .iter()
-                    .find(|p| p.square == make_usi_square(from));
-                match mover.filter(|p| p.role != Role::King) {
-                    Some(p) if own_defends_from(view, from, to) => {
-                        // 着手後に `to` を守る自駒の枚数（着手駒自身を除く）
-                        let after = f64::from(
-                            own_attack_before[crate::belief_features::sq_index(to)]
-                                .saturating_sub(1),
-                        );
-                        params.anchor_move_w * exchange_value(p.role) / (1.0 + after)
-                    }
+                    .find(|p| p.square == make_usi_square(from))
+                    .filter(|p| p.role != Role::King);
+                // 争点へ乗ったあと**自分の支えが一枚も残らない**ときだけ罰する
+                // （残っていれば取り返せるので形は壊れていない）
+                let fires = matches!(mover, Some(_)) && contested && after == 0;
+                // `hits::flag` は内部でグローバル Mutex を取るので、
+                // 既存の呼び出しと同じく enabled() でガードすること
+                if crate::hits::enabled() {
+                    crate::hits::flag("anchor_move_fires", fires);
+                }
+                match mover {
+                    Some(p) if fires => params.anchor_move_w * exchange_value(p.role),
                     _ => 0.0,
                 }
             }
