@@ -1428,6 +1428,11 @@ pub struct EvalParams {
     /// 「歩を突く」という普通の手で取られるので、`knownness` では表現できない。
     /// 実測は 1.50倍（= w=0.5）で対人・アリーナとも一致。0 = 従来挙動
     pub exposed_pawn_head_w: f64,
+    /// **ブラインド玉攻め加点を攻め駒の生存で割り引く**（2026-08-03）。
+    /// 係数 = `1/(1 + w×max(0, 着地マスの期待被覆枚数 − 自分の守り枚数))`。
+    /// 0 = 従来挙動（無防備な駒を信念上の玉の隣へ置くほど加点が最大になる）。
+    /// 実用域は 0.5〜1.5（w=1 で「相手が2枚利かせて自分の紐なし」の打ちが 1/3 に）
+    pub blind_attack_survive_w: f64,
     /// **taint 粒子の占有合意で打ちの反則確率を下げる**（2026-08-03、ユーザー指摘の
     /// 38手目 `S*4g` が発端）。厳密粒子が全滅した決定では `p_legal` が
     /// `prior_legal` だけで決まるが、その打ち側は**マスに依らない定数**
@@ -1731,6 +1736,7 @@ impl Default for EvalParams {
             major_promo_path_w: 0.0,
             exposed_multi_w: 0.0,
             exposed_pawn_head_w: 0.0,
+            blind_attack_survive_w: 0.0,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
             // 反則経済の新項（2026-07-16、オラクル測定で36ptの伸びしろを確認後に追加）。
@@ -1827,7 +1833,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 64] = [
+    pub const SPECS: [ParamSpec; 65] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -2187,6 +2193,12 @@ impl EvalParams {
             lo: 0.0,
             hi: 1.5,
         },
+        ParamSpec {
+            // 1/(1+w×不足枚数) の形。w=1 で2枚不足なら 1/3、w=3 で 1/7
+            name: "blind_attack_survive_w",
+            lo: 0.0,
+            hi: 3.0,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -2255,6 +2267,7 @@ impl EvalParams {
             self.major_promo_path_w,
             self.exposed_multi_w,
             self.exposed_pawn_head_w,
+            self.blind_attack_survive_w,
         ]
     }
 
@@ -2325,6 +2338,7 @@ impl EvalParams {
             major_promo_path_w: v[61],
             exposed_multi_w: v[62],
             exposed_pawn_head_w: v[63],
+            blind_attack_survive_w: v[64],
         }
     }
 }
@@ -2538,6 +2552,18 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
     {
         Some(w) => EvalParams {
             major_promo_path_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // ブラインド玉攻め加点の生存割引（0 で従来挙動）
+    let params = match std::env::var("TSUITATE_BLIND_ATTACK_SURVIVE_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            blind_attack_survive_w: w,
             ..params
         },
         None => params,
@@ -3069,6 +3095,9 @@ impl Strategy for EstimatorStrategy {
                 )
             });
         let blind_belief = blind_belief_board.as_ref().map(|(o, v)| (o, *v));
+        // 自駒の利き枚数（`blind_attack_survive_w` の守り枚数と
+        // `adds_focal_attacker` の争点判定で共用。決定点ごとに1回）
+        let own_attack = own_attack_counts(view);
         // ブラインド決定での taint 占有合意（打ちの反則回避。`taint_occ_legal_w`）。
         // 打ちマスの占有は「駒種が当たっているか」に依らないので、gain 側より
         // taint を信用する範囲が狭い。決定点ごとに1回作れば全候補で使える
@@ -3239,9 +3268,44 @@ impl Strategy for EstimatorStrategy {
                 // G*5h が信念上の敵玉 5i/4h への利きで +1.7 を得て正解の玉逃げ
                 // 5c4d を逆転）だが、平時のブラインドでも taint 粒子は反則の説明
                 // （打ちマス占有など）を緩和しているため同じ穴が開く
-                adjust += out.p_legal
-                    * BLIND_KING_ATTACK_W
-                    * blind_king_attack(view, &mv, &blind_king_dist);
+                let attack = blind_king_attack(view, &mv, &blind_king_dist);
+                // **攻め駒の生存で割り引く**（`blind_attack_survive_w`、2026-08-03、
+                // ユーザー指摘「初期位置の玉に王手をかけてしまうのを危惧した」）。
+                // 厳密粒子ゼロでは `expected`（駒得・取られリスク）が丸ごと消えるので、
+                // この加点だけが残って対抗する項が無い ＝ **無防備な駒を信念上の玉の
+                // 隣へ置くほど加点が最大になる**。quest31-m040 の実測: 5九へ利く
+                // 銀打ち（5七/5九/7七/5八/6八/4八）が adjust +0.59〜0.90 を得て
+                // 上位を占め、4七の争点を支える 3八銀打（5九に利かないので +0.002）が
+                // 78位に沈む。ユーザー判定は前者が悪手・後者が本命。
+                //
+                // 解消手が「王手駒を取る」しかない王手は駒の献上でしかない
+                // （メモリ strong-check-few-resolutions）。着地マスの taint 由来の
+                // 期待被覆枚数から自分の守り枚数を引いた分だけ加点を減衰させる。
+                // 加点側だけを絞る形なので、`blind_hang_risk`（着地マス全般への
+                // 一律減点、既定 off）と違い普通の前進手には影響しない
+                let survive = if params.blind_attack_survive_w > 0.0
+                    && attack > 0.0
+                    && !taint_pool.is_empty()
+                {
+                    let to = match mv {
+                        ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+                    };
+                    let cov = *coverage_cache
+                        .entry(to)
+                        .or_insert_with(|| taint_square_coverage(&taint_pool, to, opp_color));
+                    // 着地マスを守る自駒の枚数（着手駒自身は自分のマスを守れないので
+                    // 移動元から to へ利いていたぶんだけ引く）
+                    let mut def = f64::from(own_attack[crate::belief_features::sq_index(to)]);
+                    if let ShogiMove::Board { from, .. } = mv {
+                        if own_defends_from(view, from, to) {
+                            def -= 1.0;
+                        }
+                    }
+                    1.0 / (1.0 + params.blind_attack_survive_w * (cov - def).max(0.0))
+                } else {
+                    1.0
+                };
+                adjust += out.p_legal * BLIND_KING_ATTACK_W * attack * survive;
             }
             if hang_risk_enabled && !taint_pool.is_empty() {
                 adjust -= BLIND_HANG_RISK_W
@@ -3310,7 +3374,6 @@ impl Strategy for EstimatorStrategy {
         // 王手中は CheckSolver の領分なので予約しない
         let focal_k = depth2_focal_k();
         let focal_reserved: HashSet<usize> = if focal_k > 0 && !view.you_in_check {
-            let own_attack = own_attack_counts(view);
             scored
                 .iter()
                 .enumerate()
@@ -5329,6 +5392,16 @@ fn adds_focal_attacker(view: &PlayerView, mv: &ShogiMove, own_attack_before: &[u
         })
 }
 
+/// マス `from` にいる自駒が `to` へ利いているか（`blind_attack_survive_w` の
+/// 守り枚数から着手駒自身を除くため）
+fn own_defends_from(view: &PlayerView, from: Coord, to: Coord) -> bool {
+    let from_usi = make_usi_square(from);
+    view.your_pieces
+        .iter()
+        .find(|p| p.square == from_usi)
+        .is_some_and(|p| defend_targets(&view.your_pieces, p, view.your_color).contains(&to))
+}
+
 /// 自駒が今どのマスへ何枚利かせているか（`adds_focal_attacker` の前提）
 fn own_attack_counts(view: &PlayerView) -> [u8; 81] {
     let mut n = [0u8; 81];
@@ -6139,6 +6212,7 @@ pub(crate) mod tests {
         assert_field_index!(major_promo_path_w);
         assert_field_index!(exposed_multi_w);
         assert_field_index!(exposed_pawn_head_w);
+        assert_field_index!(blind_attack_survive_w);
 
         // 既定値は自分の SPECS 範囲内にあること（SPSA の中心点が
         // クランプで別の値へ化けるのを防ぐ。位置ズレの二重の網でもある）
