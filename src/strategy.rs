@@ -3305,13 +3305,30 @@ impl Strategy for EstimatorStrategy {
         // gain 内の静的リスク項の depth2_replace 分を実測の期待損失で
         // 置き換えて（一致するなら無変化）、最終式を適用し直す
         scored.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+        // **争点への利き足し**の予約枠（`adds_focal_attacker` の doc 参照）。
+        // 静的スコアでは必ず沈むので、上位N本の足切りとは別枠で読む機会を作る。
+        // 王手中は CheckSolver の領分なので予約しない
+        let focal_k = depth2_focal_k();
+        let focal_reserved: HashSet<usize> = if focal_k > 0 && !view.you_in_check {
+            let own_attack = own_attack_counts(view);
+            scored
+                .iter()
+                .enumerate()
+                .skip(budget.depth2_top_k)
+                .filter(|(_, s)| adds_focal_attacker(view, &s.1, &own_attack))
+                .map(|(i, _)| i)
+                .take(focal_k)
+                .collect()
+        } else {
+            HashSet::new()
+        };
         // (usi, 選択手の p_legal, スコア)
         let mut best: Option<(String, f64, f64)> = None;
         let mut ranking: Vec<CandidateScore> = vec![];
         for (i, (usi, mv, out, adjust, score)) in scored.into_iter().enumerate() {
             // 平均化した玉の手は2手読みで gain を再構成しない（応手サンプルも
             // 同じ幻の粒子が源で、揃えた序列が壊れるだけ）
-            let depth2 = i < budget.depth2_top_k
+            let depth2 = (i < budget.depth2_top_k || focal_reserved.contains(&i))
                 && !(view.you_in_check && check_king_gain_mean() && equalized_king_move(&mv));
             let (final_gain, final_score) = if depth2 {
                 let delta = depth2_delta(
@@ -5259,6 +5276,83 @@ fn threat_value(pos: &Position, me: Color) -> f64 {
     best
 }
 
+/// **争点への利き足し**か（2手読みの予約枠、`depth2_focal_k`）。
+///
+/// 着手した駒が「**自分が既に利かせていて、自駒が乗っていないマス**」へ
+/// 新たに利きを足すなら真。＝これから取り合いになるマスへ味方を足す手
+/// （ユーザーの言う「焦点への利き集中」。quest31-m040 の 3八銀打が典型で、
+/// 4六歩が既に利かせている4七へ銀の利きを足す）。
+///
+/// **静的評価では必ず負になる類型**なのが要点: 持ち駒を晒して、その手自体では
+/// 何も得ない。価値は「4七歩成 → 同X → 同銀」の3手先にしかないので、
+/// 静的スコアの上位N本だけを2手読みに回す従来の足切りでは**読まれることすら
+/// ない**（実測: 3八銀打は 67〜98位で depth2=false）。良い利き足しと悪い利き足し
+/// （5八銀打 = 玉の隣で即取られ）を静的に区別しようとすると、マージンの薄い
+/// 他の手を巻き込んで壊れる（king_adj_entry_w / hand_option_w の失敗）ので、
+/// **区別は読みに任せて、読む機会だけを与える**。
+///
+/// 自駒の配置だけで決まるので粒子不要・ノイズゼロ
+fn adds_focal_attacker(view: &PlayerView, mv: &ShogiMove, own_attack_before: &[u8; 81]) -> bool {
+    let (to, role) = match *mv {
+        ShogiMove::Board { from, to, promote } => {
+            let from_usi = make_usi_square(from);
+            let Some(p) = view.your_pieces.iter().find(|p| p.square == from_usi) else {
+                return false;
+            };
+            let role = if promote {
+                promote_role(p.role).unwrap_or(p.role)
+            } else {
+                p.role
+            };
+            (to, role)
+        }
+        ShogiMove::Drop { role, to } => (to, role),
+    };
+    // 着手後の盤で、その駒がどこへ利くか
+    let mut pieces: Vec<VisiblePiece> = view.your_pieces.clone();
+    if let ShogiMove::Board { from, .. } = *mv {
+        let from_usi = make_usi_square(from);
+        pieces.retain(|p| p.square != from_usi);
+    }
+    let moved = VisiblePiece {
+        square: make_usi_square(to),
+        role,
+    };
+    let own_occupied: HashSet<String> = pieces.iter().map(|p| p.square.clone()).collect();
+    pieces.push(moved.clone());
+    defend_targets(&pieces, &moved, view.your_color)
+        .into_iter()
+        .any(|s| {
+            s != to
+                && own_attack_before[crate::belief_features::sq_index(s)] >= 1
+                && !own_occupied.contains(&make_usi_square(s))
+        })
+}
+
+/// 自駒が今どのマスへ何枚利かせているか（`adds_focal_attacker` の前提）
+fn own_attack_counts(view: &PlayerView) -> [u8; 81] {
+    let mut n = [0u8; 81];
+    for p in &view.your_pieces {
+        for s in defend_targets(&view.your_pieces, p, view.your_color) {
+            let i = crate::belief_features::sq_index(s);
+            n[i] = n[i].saturating_add(1);
+        }
+    }
+    n
+}
+
+/// 2手読みへ予約する「争点への利き足し」の本数（`TSUITATE_DEPTH2_FOCAL_K`、
+/// 既定 0 = 従来挙動）。`adds_focal_attacker` の doc 参照
+fn depth2_focal_k() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_DEPTH2_FOCAL_K")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// マス `sq` の「`by` 側から見た正面手前」= `by` の歩がそこから `sq` へ進めるマス。
 /// `exposed_pawn_head_w`（鉢合わせ）の判定に使う
 fn pawn_front_of(sq: Coord, by: Color) -> Option<Coord> {
@@ -6125,6 +6219,51 @@ pub(crate) mod tests {
         // 従来の max では同じ手でリスクが動かない（香が支配し続ける）
         let after_max = exposed_capture_risk(&moved, Color::Sente, None, &known, &base);
         assert!((after_max - max_only).abs() < 1e-9);
+    }
+
+    #[test]
+    fn adds_focal_attacker_picks_support_of_a_contested_square() {
+        // 後手番。4六に自分の歩がいて4七へ利いている（=争点）
+        let mut view = minimal_view(
+            vec![
+                VisiblePiece {
+                    square: "4f".into(),
+                    role: Role::Pawn,
+                },
+                VisiblePiece {
+                    square: "6c".into(),
+                    role: Role::King,
+                },
+            ],
+            HashMap::new(),
+        );
+        view.your_color = Color::Gote;
+        view.turn = Color::Gote;
+        let own = own_attack_counts(&view);
+        assert_eq!(own[crate::belief_features::sq_index(Coord { file: 4, rank: 7 })], 1);
+
+        // 3八銀打: 銀が4七へ利きを足す → 予約対象
+        let s3h = ShogiMove::Drop {
+            role: Role::Silver,
+            to: Coord { file: 3, rank: 8 },
+        };
+        assert!(adds_focal_attacker(&view, &s3h, &own));
+
+        // 9八銀打: 何の争点にも絡まない → 対象外
+        let s9h = ShogiMove::Drop {
+            role: Role::Silver,
+            to: Coord { file: 9, rank: 8 },
+        };
+        assert!(!adds_focal_attacker(&view, &s9h, &own));
+
+        // 歩を1マス進めるだけの手も対象外（自分が既に利かせているマスへ
+        // 足すわけではない）
+        let push = ShogiMove::Board {
+            from: Coord { file: 4, rank: 6 },
+            to: Coord { file: 4, rank: 7 },
+            promote: false,
+        };
+        assert!(!adds_focal_attacker(&view, &push, &own));
     }
 
     #[test]
