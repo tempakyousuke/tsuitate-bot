@@ -28,7 +28,13 @@ SUB_RE = re.compile(r"^### (\d+)手目（(.+?)の反則後）")
 USI_RE = re.compile(r"\((\d[a-i]\d[a-i]\+?|[PLNSGBR]\*\d[a-i])\)")
 
 # 反則後ブロックの見出しキー → シナリオ名
-FOUL_MAP = {(30, "1二飛(5b1b)"): "quest31-m030f1", (30, "2一歩打(P*2a)"): "quest31-m030f2"}
+FOUL_MAP = {
+    (30, "1二飛(5b1b)"): "quest31-m030f1",
+    (30, "2一歩打(P*2a)"): "quest31-m030f2",
+    (40, "5六銀打(S*5f)"): "quest31-m040f1",
+    (41, "2一龍(2d2a)"): "quest31-m041f1",
+    (50, "3五玉(4e3e)"): "quest31-m050f1",
+}
 
 
 def is_bad(text: str) -> bool:
