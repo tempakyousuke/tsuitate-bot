@@ -1433,6 +1433,11 @@ pub struct EvalParams {
     /// 0 = 従来挙動（無防備な駒を信念上の玉の隣へ置くほど加点が最大になる）。
     /// 実用域は 0.5〜1.5（w=1 で「相手が2枚利かせて自分の紐なし」の打ちが 1/3 に）
     pub blind_attack_survive_w: f64,
+    /// **錨外し**（`evaluate` の anchor_move_pen 参照、2026-08-04）。
+    /// 争点マスを支えている自駒自身をそこへ動かす手へ
+    /// `w × 交換価値 ÷ (1 + 着手後の残り守り枚数)` の減点。0 = 従来挙動。
+    /// 実用域は 0.2〜0.6（w=0.4 で金の単独錨外しが約2歩ぶん）
+    pub anchor_move_w: f64,
     /// **taint 粒子の占有合意で打ちの反則確率を下げる**（2026-08-03、ユーザー指摘の
     /// 38手目 `S*4g` が発端）。厳密粒子が全滅した決定では `p_legal` が
     /// `prior_legal` だけで決まるが、その打ち側は**マスに依らない定数**
@@ -1737,6 +1742,7 @@ impl Default for EvalParams {
             exposed_multi_w: 0.0,
             exposed_pawn_head_w: 0.0,
             blind_attack_survive_w: 0.0,
+            anchor_move_w: 0.0,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
             // 反則経済の新項（2026-07-16、オラクル測定で36ptの伸びしろを確認後に追加）。
@@ -1833,7 +1839,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 65] = [
+    pub const SPECS: [ParamSpec; 66] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -2199,6 +2205,13 @@ impl EvalParams {
             lo: 0.0,
             hi: 3.0,
         },
+        ParamSpec {
+            // 交換価値（3.5〜12）に掛かる。w=1 で「単独の錨を外す手」が
+            // 駒価値まるごとの減点になるので実用域は 1 未満
+            name: "anchor_move_w",
+            lo: 0.0,
+            hi: 1.5,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -2268,6 +2281,7 @@ impl EvalParams {
             self.exposed_multi_w,
             self.exposed_pawn_head_w,
             self.blind_attack_survive_w,
+            self.anchor_move_w,
         ]
     }
 
@@ -2339,6 +2353,7 @@ impl EvalParams {
             exposed_multi_w: v[62],
             exposed_pawn_head_w: v[63],
             blind_attack_survive_w: v[64],
+            anchor_move_w: v[65],
         }
     }
 }
@@ -2552,6 +2567,18 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
     {
         Some(w) => EvalParams {
             major_promo_path_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 錨外し（0 で従来挙動）
+    let params = match std::env::var("TSUITATE_ANCHOR_MOVE_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            anchor_move_w: w,
             ..params
         },
         None => params,
@@ -3244,6 +3271,7 @@ impl Strategy for EstimatorStrategy {
                 major_path_before,
                 hand_option.as_ref(),
                 &my_drop_foul_squares,
+                &own_attack,
             );
             // 王手中: 仮説条件付きの「王手駒の除去期待値」（check.rs::removal_term）。
             // 王手駒のマスを取る手は受理された未来で脅威ごと駒を排除し、玉逃げ等の
@@ -4476,6 +4504,8 @@ fn evaluate(
     hand_option: Option<&HandOption>,
     // 自分が打ちの反則をしたマス（`drop_probe_repeat_gate` の再プローブ判定）
     drop_foul_squares: &[bool; 81],
+    // 着手前の自駒の利き枚数（`anchor_move_w` の錨の判定）
+    own_attack_before: &[u8; 81],
 ) -> EvalOut {
     let me = view.your_color;
     let opp = me.other();
@@ -5014,8 +5044,48 @@ fn evaluate(
         (0.0, 0.0)
     };
 
+    // **錨外し**（`anchor_move_w`、2026-08-04、ユーザー指摘の61手目が発端。
+    // codex 相談で「anchor removal penalty」として一般化）。
+    // 争点マス `to` を支えている自駒**自身**をそこへ動かすと、占拠と守りを
+    // 同じ駒に背負わせることになり、読みが外れて空だった／取り返された
+    // ときに取り返す駒が残らない。実例: 61手目の 4七金 — 4七を守っているのは
+    // 5七金だけで、その金を4七へ動かすと外部の支えがゼロになる（人間の判定は
+    // 悪手で、正着は支えを残したまま安い歩を打つ P*4g）。
+    //
+    // **`gain` の内側**に置くこと（= p_legal 割引を受ける）。同じ着想を
+    // `foul_probe`（combine_score の外側）へ載せた版は反則コストを迂回して
+    // 反則/局 6.4→8.1・−12.8pt だった（`drop_probe_repeat_gate` の doc）。
+    //
+    // 自駒の配置だけで決まるので粒子不要・ノイズゼロ。王手中は CheckSolver の
+    // 領分なので無効。玉の手は recapture_risk が元々ゼロ扱いなので対象外
+    let anchor_move_pen = if params.anchor_move_w != 0.0 && !view.you_in_check {
+        match *mv {
+            ShogiMove::Board { from, to, .. } => {
+                let mover = view
+                    .your_pieces
+                    .iter()
+                    .find(|p| p.square == make_usi_square(from));
+                match mover.filter(|p| p.role != Role::King) {
+                    Some(p) if own_defends_from(view, from, to) => {
+                        // 着手後に `to` を守る自駒の枚数（着手駒自身を除く）
+                        let after = f64::from(
+                            own_attack_before[crate::belief_features::sq_index(to)]
+                                .saturating_sub(1),
+                        );
+                        params.anchor_move_w * exchange_value(p.role) / (1.0 + after)
+                    }
+                    _ => 0.0,
+                }
+            }
+            ShogiMove::Drop { .. } => 0.0,
+        }
+    } else {
+        0.0
+    };
+
     let gain = expected + advance_bias + development + coverage + mate_threat - mate_risk
         - king_holes
+        - anchor_move_pen
         + link
         + drop_hit_evac
         + promo
@@ -6261,6 +6331,7 @@ pub(crate) mod tests {
         assert_field_index!(exposed_multi_w);
         assert_field_index!(exposed_pawn_head_w);
         assert_field_index!(blind_attack_survive_w);
+        assert_field_index!(anchor_move_w);
 
         // 既定値は自分の SPECS 範囲内にあること（SPSA の中心点が
         // クランプで別の値へ化けるのを防ぐ。位置ズレの二重の網でもある）
