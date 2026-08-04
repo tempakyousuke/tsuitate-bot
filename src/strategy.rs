@@ -2977,6 +2977,9 @@ impl Strategy for EstimatorStrategy {
         let mut my_capture_squares: Vec<Coord> = vec![];
         let mut my_touched_squares: Vec<Coord> = vec![];
         let mut my_fouls_this_turn: u32 = 0;
+        // 自分が打ちの反則をしたマス（局を通じて累積。`foul_tride` と違い
+        // 受理でクリアされない）。`drop_probe_repeat_gate` 参照
+        let mut my_drop_foul_squares = [false; 81];
         for e in log.events() {
             match e {
                 Observation::MyMove { usi, captured, .. } => {
@@ -2994,7 +2997,16 @@ impl Strategy for EstimatorStrategy {
                         my_touched_squares.push(to);
                     }
                 }
-                Observation::MyFoul { .. } => my_fouls_this_turn += 1,
+                Observation::MyFoul { usi, .. } => {
+                    my_fouls_this_turn += 1;
+                    // 自分が「打ちの反則」をしたマス = そこに相手駒がいることが
+                    // 確定した（かつ以後も自分が取るまで動かないとは限らないが、
+                    // **もう一度打っても新しい情報は買えない**）。
+                    // `drop_probe_repeat_gate` のループ対策に使う
+                    if let Some(ShogiMove::Drop { to, .. }) = parse_usi(usi) {
+                        my_drop_foul_squares[crate::belief_features::sq_index(to)] = true;
+                    }
+                }
                 _ => {}
             }
         }
@@ -3231,6 +3243,7 @@ impl Strategy for EstimatorStrategy {
                 promo_pot_before,
                 major_path_before,
                 hand_option.as_ref(),
+                &my_drop_foul_squares,
             );
             // 王手中: 仮説条件付きの「王手駒の除去期待値」（check.rs::removal_term）。
             // 王手駒のマスを取る手は受理された未来で脅威ごと駒を排除し、玉逃げ等の
@@ -4461,6 +4474,8 @@ fn evaluate(
     // だけ項が有効（choose() が「w≠0・王手中でない」のゲートを掛けて渡す）。
     // 打つ手に「最良打ちポテンシャルとの不足分」の減点を掛ける
     hand_option: Option<&HandOption>,
+    // 自分が打ちの反則をしたマス（`drop_probe_repeat_gate` の再プローブ判定）
+    drop_foul_squares: &[bool; 81],
 ) -> EvalOut {
     let me = view.your_color;
     let opp = me.other();
@@ -5028,12 +5043,35 @@ fn evaluate(
     let foul_probe = if n > 0.0 && probe_mass > 0.0 {
         let p_occ = probe_mass / n;
         let budget_frac = f64::from(10u32.saturating_sub(view.fouls.you)) / 10.0;
-        params.drop_probe_w
-            * (probe_val_sum / n)
-            * p_occ
-            * (1.0 - p_occ)
-            * budget_frac
-            * budget_frac
+        // **再プローブのゲート**（`drop_probe_repeat_gate`、2026-08-03、
+        // ユーザー指摘の61手目 4七歩打が発端）。`(1−p_occ)` はループ対策
+        // としては効くが、**確信が高いほど価値が上がる**という人間の使い方を
+        // 巻き添えで消す: quest31 の61手目は 4七の占有 p_occ≈0.89・5七金の
+        // 支えつきで、人間は「反則なら占有が確定して金で取れる、空なら
+        // 支え付きで争点を占拠できる」と読んで歩を打った。bot は
+        // (1−p_occ)=0.11 でこの手を78位に沈め、代わりに**支えていた金自身**を
+        // 4七へ動かす手（ユーザー判定=悪手）を5位に置いていた。
+        //
+        // ループ対策は占有確率でなく「**そのマスへ既に打って反則したか**」で
+        // 判定するのが正しい（観測ログの MyFoul から正確に取れる。foul_tried と
+        // 違い受理でクリアされない）。既に確定したマスは価値ゼロ、まだ試して
+        // いないマスは p_occ² で単調増加させる（m026/m028 の「占有8%への
+        // 安い探り」を抑える p_occ² は保つ）
+        let repeat = if drop_probe_repeat_gate() {
+            match *mv {
+                ShogiMove::Drop { to, .. } => {
+                    if drop_foul_squares[crate::belief_features::sq_index(to)] {
+                        0.0
+                    } else {
+                        1.0
+                    }
+                }
+                ShogiMove::Board { .. } => 1.0,
+            }
+        } else {
+            1.0 - p_occ
+        };
+        params.drop_probe_w * (probe_val_sum / n) * p_occ * repeat * budget_frac * budget_frac
     } else {
         0.0
     };
@@ -5412,6 +5450,16 @@ fn own_attack_counts(view: &PlayerView) -> [u8; 81] {
         }
     }
     n
+}
+
+/// 打ちプローブの再プローブ判定を「既に打って反則したマスか」で行うか
+/// （`TSUITATE_DROP_PROBE_REPEAT_GATE=1`、既定 off = 従来の `(1−p_occ)`）。
+/// `foul_probe` の doc 参照
+fn drop_probe_repeat_gate() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_DROP_PROBE_REPEAT_GATE").is_ok_and(|v| v == "1")
+    })
 }
 
 /// 2手読みへ予約する「争点への利き足し」の本数（`TSUITATE_DEPTH2_FOCAL_K`、
