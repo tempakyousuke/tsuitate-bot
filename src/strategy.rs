@@ -4733,8 +4733,13 @@ fn evaluate(
             // 取り返しの残留リスクを敷く（= 等価な取りは安い駒で取る）。
             // 玉は exchange_value=0 でこの床を素通りしていた（quest31-m076:
             // 銀で取れる駒を玉で取る手が首位）ので、露見するのが玉のときは
-            // 実効価値 king_capture_reveal に置き換える（既定0 = 従来挙動）
-            let reveal_after = if next.piece_at(to).is_some_and(|p| p.role == Role::King) {
+            // 実効価値 king_capture_reveal に置き換える（既定0 = 従来挙動）。
+            // **王手中は適用しない**: 王手宣言で自玉の位置は既に漏れており、
+            // 王手駒の玉捕獲は CheckSolver / check_king_prior の領分
+            // （観測確実な取り返しベイト recap-dragon が 16→14 に沈む実測）
+            let reveal_after = if !view.you_in_check
+                && next.piece_at(to).is_some_and(|p| p.role == Role::King)
+            {
                 params.king_capture_reveal.max(own_after)
             } else {
                 own_after
@@ -4840,8 +4845,9 @@ fn evaluate(
                         matches!(*mv, ShogiMove::Board { from, .. } if p.square == make_usi_square(from))
                     })
                     .map(|p| {
-                        // 玉の露見コスト免除の穴を塞ぐ（上の床と同じ規約）
-                        if p.role == Role::King {
+                        // 玉の露見コスト免除の穴を塞ぐ（上の床と同じ規約。
+                        // 王手中は適用しない = recap-dragon の取り返しベイト保護）
+                        if p.role == Role::King && !view.you_in_check {
                             params.king_capture_reveal
                         } else {
                             exchange_value(p.role)
