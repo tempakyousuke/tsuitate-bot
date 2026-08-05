@@ -474,7 +474,7 @@ pub(crate) fn exchange_value(role: Role) -> f64 {
 /// 着手後の自駒の利き被覆マス数（自分に見える盤面だけの近似）。
 /// 相手の駒は見えないため飛び駒は自駒にだけ遮られる楽観値
 fn coverage_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
-    own_effects_after(view, mv, None, &EvalParams::default()).coverage
+    own_effects_after(view, mv, None, None, &EvalParams::default()).coverage
 }
 
 /// 玉からの距離による利きの価値の減衰（V2。docs/yaneuraou-lessons.md 1-2）。
@@ -582,6 +582,7 @@ fn own_effects_after(
     view: &PlayerView,
     mv: &ShogiMove,
     opp_king_w: Option<&[f64; 81]>,
+    promo_prox: Option<&[f64; 81]>,
     params: &EvalParams,
 ) -> OwnEffects {
     let mut pieces: Vec<VisiblePiece> = view.your_pieces.clone();
@@ -738,7 +739,7 @@ fn own_effects_after(
         effect_opp,
         drop_hit_exposure: drop_hit_exposure(&pieces, view.your_color),
         promo_potential: if params.promo_potential_w != 0.0 && !view.you_in_check {
-            promo_potential(&pieces, view.your_color)
+            promo_potential(&pieces, view.your_color, promo_prox)
         } else {
             0.0
         },
@@ -833,8 +834,16 @@ const PROMO_BFS_MAX_DEPTH: u32 = 8;
 ///
 /// 呼び出し側は `drop_hit_evac_w` と同じ**差分形**（着手後 − 現局面）で gain へ
 /// 加算するので、無関係な候補は 0 でゼロ点が動かない（threat_value 差分化の罠を
-/// 回避）。自駒だけで決まるので粒子不要・ノイズゼロ
-fn promo_potential(pieces: &[VisiblePiece], me: Color) -> f64 {
+/// 回避）。自駒だけで決まるので粒子不要・ノイズゼロ。
+///
+/// `king_prox` は**敵玉候補集合への近接重み**（`promo_king_prox_map`、既定 None =
+/// 従来挙動）。quest31-m083 が発端: 実現ボーナスが方向を見ないため、敵玉
+/// （王手履歴からほぼ確定）から遠ざかる 3二角成 が、正解の 7六歩 を
+/// promo 差 +0.36 で上回っていた。ユーザーの原則「4三のと金は相手玉から
+/// 遠すぎる。突くなら7・8筋」を、演繹（deduce::opp_king_candidates =
+/// 観測のみ由来でノイズゼロ）への近さで実装する。差分の両側が同じマップを
+/// 使うので差分形の性質は保たれる
+fn promo_potential(pieces: &[VisiblePiece], me: Color, king_prox: Option<&[f64; 81]>) -> f64 {
     let occupied: HashSet<Coord> = pieces
         .iter()
         .filter_map(|p| parse_usi_square(&p.square))
@@ -844,14 +853,36 @@ fn promo_potential(pieces: &[VisiblePiece], me: Color) -> f64 {
         let Some(origin) = parse_usi_square(&p.square) else {
             continue;
         };
+        let prox = king_prox.map_or(1.0, |m| m[crate::belief_features::sq_index(origin)]);
         if unpromote_role(p.role) != p.role {
             // 成り済み: 実現した利き増加（成る手の差分を正にするための対）
-            total += promo_effect_gain(&occupied, origin, unpromote_role(p.role), origin, me);
+            total +=
+                prox * promo_effect_gain(&occupied, origin, unpromote_role(p.role), origin, me);
         } else {
-            total += piece_promo_potential(&occupied, origin, p.role, me);
+            total += prox * piece_promo_potential(&occupied, origin, p.role, me);
         }
     }
     total
+}
+
+/// `promo_king_prox` の近接マップ。マスごとに `(1-w) + w × 1/(1+d_min)`
+/// （d_min = 敵玉候補集合への最小チェビシェフ距離）。候補集合が空なら None
+/// （= 重みなし）。deduce 由来なので粒子不要・ノイズゼロ
+fn promo_king_prox_map(w: f64, cands: &std::collections::BTreeSet<Coord>) -> Option<[f64; 81]> {
+    if cands.is_empty() {
+        return None;
+    }
+    let mut map = [1.0f64; 81];
+    for (i, slot) in map.iter_mut().enumerate() {
+        // belief_features::sq_index の逆写像（(file-1)*9 + (rank-1)）
+        let sq = Coord {
+            file: (i / 9) as i8 + 1,
+            rank: (i % 9) as i8 + 1,
+        };
+        let d = cands.iter().map(|&k| cheb(sq, k)).min().unwrap_or(8);
+        *slot = (1.0 - w) + w / (1.0 + d as f64);
+    }
+    Some(map)
 }
 
 /// **大駒（飛・角・香）の成り道**の価値（`major_promo_path_w`、2026-08-03）。
@@ -1084,7 +1115,7 @@ fn promo_distance(
 /// あるなら加点」の区別はできない。**自駒が乗っているマスは穴に数えない**
 /// （壁として機能するため）という近似にする
 fn king_holes_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
-    own_effects_after(view, mv, None, &EvalParams::default()).king_holes
+    own_effects_after(view, mv, None, None, &EvalParams::default()).king_holes
 }
 
 /// アンチドロー（終盤の寄せ）: 増幅を始める手数（plies）
@@ -1448,6 +1479,15 @@ pub struct EvalParams {
     /// 使う（0 = 従来挙動）。玉の位置露見は材料でなく詰みリスクなので
     /// 実用域は大駒級の 5〜12
     pub king_capture_reveal: f64,
+    /// **成りポテンシャルの敵玉近接重み**（2026-08-05、quest31-m083 の
+    /// 3二角成が発端）。`promo_potential` の各駒寄与に
+    /// `(1-w) + w × 1/(1+d_min)`（d_min = `deduce::opp_king_candidates` への
+    /// 最小チェビシェフ距離）を掛ける。促成の実現ボーナスが方向を見ないため、
+    /// 敵玉から遠ざかる成り（3二角成）が正解の玉方向の手（7六歩）を上回っていた。
+    /// ユーザー原則「と金は相手玉の近くに作る。突くなら7・8筋」の実装。
+    /// deduce 由来なので粒子不要・ノイズゼロ（promo_potential の設計を保つ）。
+    /// 0 = 従来挙動。w=1 で「玉候補の隣 1/2 vs 8マス先 1/9」
+    pub promo_king_prox: f64,
     /// **taint 粒子の占有合意で打ちの反則確率を下げる**（2026-08-03、ユーザー指摘の
     /// 38手目 `S*4g` が発端）。厳密粒子が全滅した決定では `p_legal` が
     /// `prior_legal` だけで決まるが、その打ち側は**マスに依らない定数**
@@ -1759,6 +1799,8 @@ impl Default for EvalParams {
             // 0 で従来挙動へ切り戻し。w=10 × capture_reveal_risk ≒ 1.3点の
             // リスク床で、玉でしか取れない駒の捕獲は gain が勝って生き残る
             king_capture_reveal: 10.0,
+            // 成りポテンシャルの敵玉近接重み（2026-08-05）。0 = 従来と同一挙動
+            promo_king_prox: 0.0,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
             // 反則経済の新項（2026-07-16、オラクル測定で36ptの伸びしろを確認後に追加）。
@@ -1855,7 +1897,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 67] = [
+    pub const SPECS: [ParamSpec; 68] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -2234,6 +2276,12 @@ impl EvalParams {
             lo: 0.0,
             hi: 12.0,
         },
+        ParamSpec {
+            // (1-w) + w/(1+d) のブレンド比なので 0〜1
+            name: "promo_king_prox",
+            lo: 0.0,
+            hi: 1.0,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -2305,6 +2353,7 @@ impl EvalParams {
             self.blind_attack_survive_w,
             self.anchor_move_w,
             self.king_capture_reveal,
+            self.promo_king_prox,
         ]
     }
 
@@ -2378,6 +2427,7 @@ impl EvalParams {
             blind_attack_survive_w: v[64],
             anchor_move_w: v[65],
             king_capture_reveal: v[66],
+            promo_king_prox: v[67],
         }
     }
 }
@@ -2680,6 +2730,18 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
     {
         Some(w) => EvalParams {
             shuffle_penalty: w,
+            ..params
+        },
+        None => params,
+    };
+    // 成りポテンシャルの敵玉近接重み（0 で従来挙動）
+    let params = match std::env::var("TSUITATE_PROMO_KING_PROX")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+    {
+        Some(w) => EvalParams {
+            promo_king_prox: w,
             ..params
         },
         None => params,
@@ -3267,11 +3329,21 @@ impl Strategy for EstimatorStrategy {
             })
             .flatten();
 
+        // 成りポテンシャルの敵玉近接マップ（`promo_king_prox`）。deduce の
+        // 玉候補集合から決定点ごとに1度だけ作る（粒子不要・ノイズゼロ）
+        let promo_prox: Option<[f64; 81]> = (params.promo_king_prox != 0.0
+            && params.promo_potential_w != 0.0
+            && !view.you_in_check)
+            .then(|| {
+                let cands = crate::deduce::opp_king_candidates(view.your_color, log);
+                promo_king_prox_map(params.promo_king_prox, &cands)
+            })
+            .flatten();
         // 成りポテンシャル（`promo_potential_w`）の現局面の値。着手後との差分を
         // gain へ加算する。王手中は無効（CheckSolver の領分）
         let promo_pot_before: Option<f64> = (params.promo_potential_w != 0.0
             && !view.you_in_check)
-            .then(|| promo_potential(&view.your_pieces, view.your_color));
+            .then(|| promo_potential(&view.your_pieces, view.your_color, promo_prox.as_ref()));
         // 大駒の成り道（`major_promo_path_w`）の現局面の値。同じく差分で使う
         let major_path_before: Option<f64> = (params.major_promo_path_w != 0.0
             && !view.you_in_check)
@@ -3333,6 +3405,7 @@ impl Strategy for EstimatorStrategy {
                 drop_hit_expo_before,
                 promo_pot_before,
                 major_path_before,
+                promo_prox.as_ref(),
                 hand_option.as_ref(),
                 &my_drop_foul_squares,
                 &own_attack,
@@ -4563,6 +4636,10 @@ fn evaluate(
     promo_pot_before: Option<f64>,
     // 大駒の成り道（`major_promo_path_w`）の**現局面**の値。同じく差分で使う
     major_path_before: Option<f64>,
+    // 成りポテンシャルの敵玉近接マップ（`promo_king_prox`。deduce 由来）。
+    // None なら重みなし = 従来挙動。promo_pot_before と着手後の両方が
+    // 同じマップを使う（差分形の整合）
+    promo_prox: Option<&[f64; 81]>,
     // 持ち駒オプション価値（`hand_option_w`）の決定点コンテキスト。Some のとき
     // だけ項が有効（choose() が「w≠0・王手中でない」のゲートを掛けて渡す）。
     // 打つ手に「最良打ちポテンシャルとの不足分」の減点を掛ける
@@ -4984,7 +5061,7 @@ fn evaluate(
     let development = -params.big_home_penalty * big_home_after(view, mv);
 
     // 利き被覆（広い索敵網）。粒子に依存しない自明な情報だけで計算できる
-    let own_effects = own_effects_after(view, mv, opp_king_w, params);
+    let own_effects = own_effects_after(view, mv, opp_king_w, promo_prox, params);
     let coverage = params.coverage_w * own_effects.coverage;
     // 自玉8近傍の支えの無いマス（V4）。自駒だけで決まるので粒子に依らない
     let king_holes = params.king_hole_w * own_effects.king_holes;
@@ -6049,19 +6126,19 @@ pub(crate) mod tests {
             role,
         };
         // 先手の歩: 4段目（成りマスまで1手）は 7段目（4手）より大きい
-        let near = promo_potential(&[vp(5, 4, Role::Pawn)], Color::Sente);
-        let far = promo_potential(&[vp(5, 7, Role::Pawn)], Color::Sente);
+        let near = promo_potential(&[vp(5, 4, Role::Pawn)], Color::Sente, None);
+        let far = promo_potential(&[vp(5, 7, Role::Pawn)], Color::Sente, None);
         assert!(near > far, "near={near} far={far}");
         assert!(far > 0.0);
         // 歩→と金は Δ利き5（中央）× 0.5^1
         assert!((near - 5.0 * 0.5).abs() < 1e-9, "near={near}");
         // 前に自分の歩がいる歩は成れない（道を塞がれた駒はポテンシャル 0）
         let blocked =
-            promo_potential(&[vp(5, 4, Role::Pawn), vp(5, 3, Role::Pawn)], Color::Sente);
-        let solo_5c = promo_potential(&[vp(5, 3, Role::Pawn)], Color::Sente);
+            promo_potential(&[vp(5, 4, Role::Pawn), vp(5, 3, Role::Pawn)], Color::Sente, None);
+        let solo_5c = promo_potential(&[vp(5, 3, Role::Pawn)], Color::Sente, None);
         assert!((blocked - solo_5c).abs() < 1e-9, "5四の歩の寄与が 0 になるはず");
         // 後手向き: 6段目の歩（成りマス7段目まで1手）も同じ値
-        let gote = promo_potential(&[vp(5, 6, Role::Pawn)], Color::Gote);
+        let gote = promo_potential(&[vp(5, 6, Role::Pawn)], Color::Gote, None);
         assert!((gote - 5.0 * 0.5).abs() < 1e-9, "gote={gote}");
     }
 
@@ -6075,8 +6152,9 @@ pub(crate) mod tests {
         let with_lance = promo_potential(
             &[vp(1, 1, Role::Tokin), vp(1, 2, Role::Lance)],
             Color::Sente,
+            None,
         );
-        let without = promo_potential(&[vp(1, 1, Role::Tokin)], Color::Sente);
+        let without = promo_potential(&[vp(1, 1, Role::Tokin)], Color::Sente, None);
         assert!((with_lance - without).abs() < 1e-9, "塞がれた香の寄与は 0");
     }
 
@@ -6163,8 +6241,8 @@ pub(crate) mod tests {
             square: crate::board::make_usi_square(Coord { file, rank }),
             role,
         };
-        let before = promo_potential(&[vp(9, 3, Role::Lance)], Color::Sente);
-        let after = promo_potential(&[vp(9, 3, Role::Promotedlance)], Color::Sente);
+        let before = promo_potential(&[vp(9, 3, Role::Lance)], Color::Sente, None);
+        let after = promo_potential(&[vp(9, 3, Role::Promotedlance)], Color::Sente, None);
         assert!(before > 0.0);
         assert!(after > before, "after={after} before={before}");
     }
@@ -6193,8 +6271,8 @@ pub(crate) mod tests {
             to: Coord { file: 5, rank: 8 },
             promote: false,
         };
-        let adv_pot = own_effects_after(&view, &advance, None, &params).promo_potential;
-        let idle_pot = own_effects_after(&view, &idle, None, &params).promo_potential;
+        let adv_pot = own_effects_after(&view, &advance, None, None, &params).promo_potential;
+        let idle_pot = own_effects_after(&view, &idle, None, None, &params).promo_potential;
         assert!(adv_pot > idle_pot, "adv={adv_pot} idle={idle_pot}");
         // 垂れ歩（4段目打ち）> 自陣打ち（8段目）
         let deep = ShogiMove::Drop {
@@ -6205,15 +6283,15 @@ pub(crate) mod tests {
             role: Role::Pawn,
             to: Coord { file: 7, rank: 8 },
         };
-        let deep_pot = own_effects_after(&view, &deep, None, &params).promo_potential;
-        let shallow_pot = own_effects_after(&view, &shallow, None, &params).promo_potential;
+        let deep_pot = own_effects_after(&view, &deep, None, None, &params).promo_potential;
+        let shallow_pot = own_effects_after(&view, &shallow, None, None, &params).promo_potential;
         assert!(deep_pot > shallow_pot, "deep={deep_pot} shallow={shallow_pot}");
         // w=0 なら計算ごとスキップ（切り戻しノブの担保）
         let params_off = EvalParams {
             promo_potential_w: 0.0,
             ..EvalParams::default()
         };
-        let off = own_effects_after(&view, &advance, None, &params_off);
+        let off = own_effects_after(&view, &advance, None, None, &params_off);
         assert_eq!(off.promo_potential, 0.0);
     }
 
@@ -6239,7 +6317,7 @@ pub(crate) mod tests {
             to: Coord { file: 2, rank: 8 },
             promote: false,
         };
-        assert_eq!(own_effects_after(&view, &evac, None, &params).drop_hit_exposure, 0.0);
+        assert_eq!(own_effects_after(&view, &evac, None, None, &params).drop_hit_exposure, 0.0);
         // 敵陣を出るだけ（2二→2六、頭2五は空き）では露出は消えない
         let shallow = ShogiMove::Board {
             from: Coord { file: 2, rank: 2 },
@@ -6247,7 +6325,7 @@ pub(crate) mod tests {
             promote: false,
         };
         assert!(
-            (own_effects_after(&view, &shallow, None, &params).drop_hit_exposure
+            (own_effects_after(&view, &shallow, None, None, &params).drop_hit_exposure
                 - exchange_value(Role::Dragon))
             .abs()
                 < 1e-9
@@ -6259,7 +6337,7 @@ pub(crate) mod tests {
             promote: false,
         };
         assert!(
-            (own_effects_after(&view, &idle, None, &params).drop_hit_exposure
+            (own_effects_after(&view, &idle, None, None, &params).drop_hit_exposure
                 - exchange_value(Role::Dragon))
             .abs()
                 < 1e-9
@@ -6269,7 +6347,7 @@ pub(crate) mod tests {
             role: Role::Gold,
             to: Coord { file: 2, rank: 1 },
         };
-        assert_eq!(own_effects_after(&view, &block, None, &params).drop_hit_exposure, 0.0);
+        assert_eq!(own_effects_after(&view, &block, None, None, &params).drop_hit_exposure, 0.0);
     }
 
     /// F3: 2手読みの緩和（relief）の上限。cap=0 は従来と同一挙動でなければ
@@ -6434,6 +6512,7 @@ pub(crate) mod tests {
         assert_field_index!(blind_attack_survive_w);
         assert_field_index!(anchor_move_w);
         assert_field_index!(king_capture_reveal);
+        assert_field_index!(promo_king_prox);
 
         // 既定値は自分の SPECS 範囲内にあること（SPSA の中心点が
         // クランプで別の値へ化けるのを防ぐ。位置ズレの二重の網でもある）
@@ -6859,8 +6938,8 @@ pub(crate) mod tests {
         );
         // 玉を 5九→4九 に動かす（どちらも同じ手）ことで、駒の配置だけが違う
         // 2局面の effect_own を比べる
-        let a = own_effects_after(&bottom_pawn, &parse_usi("5i4i").unwrap(), None, &EvalParams::default());
-        let b = own_effects_after(&corner_tokin, &parse_usi("5i4i").unwrap(), None, &EvalParams::default());
+        let a = own_effects_after(&bottom_pawn, &parse_usi("5i4i").unwrap(), None, None, &EvalParams::default());
+        let b = own_effects_after(&corner_tokin, &parse_usi("5i4i").unwrap(), None, None, &EvalParams::default());
         assert!(
             a.effect_own > b.effect_own,
             "底歩（可動性ゼロだが玉の近く）が隅のと金（可動性はあるが遠い）より \
@@ -6897,13 +6976,13 @@ pub(crate) mod tests {
             HashMap::from([(Role::Lance, 1)]),
         );
         // 打ち: 打った駒の価値そのもの
-        let drop = own_effects_after(&view, &parse_usi("L*1b").unwrap(), None, &EvalParams::default());
+        let drop = own_effects_after(&view, &parse_usi("L*1b").unwrap(), None, None, &EvalParams::default());
         assert_eq!(drop.board_material_added, piece_value(Role::Lance));
         // 静かな盤上の手: 増分ゼロ
-        let quiet = own_effects_after(&view, &parse_usi("2d2c").unwrap(), None, &EvalParams::default());
+        let quiet = own_effects_after(&view, &parse_usi("2d2c").unwrap(), None, None, &EvalParams::default());
         assert_eq!(quiet.board_material_added, 0.0);
         // 成り: 増えたぶんだけ（歩1 → と6）
-        let promo = own_effects_after(&view, &parse_usi("2d2c+").unwrap(), None, &EvalParams::default());
+        let promo = own_effects_after(&view, &parse_usi("2d2c+").unwrap(), None, None, &EvalParams::default());
         assert_eq!(
             promo.board_material_added,
             piece_value(Role::Tokin) - piece_value(Role::Pawn)
@@ -7008,9 +7087,9 @@ pub(crate) mod tests {
         };
         // 玉(5i)だけが金(5h)を守っている形。玉の利きも紐に数える
         let view = minimal_view(vec![gold.clone(), king.clone()], HashMap::new());
-        let alone = own_effects_after(&view, &parse_usi("5h5g").unwrap(), None, &EvalParams::default());
+        let alone = own_effects_after(&view, &parse_usi("5h5g").unwrap(), None, None, &EvalParams::default());
         assert_eq!(alone.linked_value, 0.0, "5g へ出れば玉から離れて紐が切れる");
-        let stay = own_effects_after(&view, &parse_usi("5i4i").unwrap(), None, &EvalParams::default());
+        let stay = own_effects_after(&view, &parse_usi("5i4i").unwrap(), None, None, &EvalParams::default());
         assert!(
             stay.linked_value > 0.0,
             "玉が 4i へ寄っても金 5h は玉の利きに入ったまま"
@@ -7023,7 +7102,7 @@ pub(crate) mod tests {
             role: Role::Silver,
         });
         let view2 = minimal_view(pieces, HashMap::new());
-        let two = own_effects_after(&view2, &parse_usi("5i4i").unwrap(), None, &EvalParams::default());
+        let two = own_effects_after(&view2, &parse_usi("5i4i").unwrap(), None, None, &EvalParams::default());
         assert!(two.linked_value > stay.linked_value);
     }
 
