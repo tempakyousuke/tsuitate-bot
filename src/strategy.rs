@@ -2665,6 +2665,21 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         },
         None => params,
     };
+    // 同一駒の連続移動減点（既定 0.2996 = SPSA 収束値）。撤去スイープ用:
+    // 固有の守備範囲が「正当な継続手」（quest31-m073 の 4二成桂→5二成桂）と
+    // 重なっている疑いがあり、膠着側は backtrack_penalty / repeat_penalty_w が
+    // 上位互換でカバーする
+    let params = match std::env::var("TSUITATE_SHUFFLE_PENALTY")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            shuffle_penalty: w,
+            ..params
+        },
+        None => params,
+    };
     // 玉で取る手の露見実効価値（0 で従来挙動）
     let params = match std::env::var("TSUITATE_KING_CAPTURE_REVEAL")
         .ok()
