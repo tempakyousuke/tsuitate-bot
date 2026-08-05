@@ -1751,7 +1751,9 @@ impl Default for EvalParams {
             major_promo_path_w: 0.0,
             exposed_multi_w: 0.0,
             exposed_pawn_head_w: 0.0,
-            blind_attack_survive_w: 0.0,
+            // ブラインド玉攻めの生存割引（2026-08-03 実装、2026-08-05 採用）。
+            // 0 で従来挙動へ切り戻し
+            blind_attack_survive_w: 1.0,
             anchor_move_w: 0.0,
             // 玉で取る手の露見実効価値（2026-08-04 実装、2026-08-05 採用）。
             // 0 で従来挙動へ切り戻し。w=10 × capture_reveal_risk ≒ 1.3点の
