@@ -1438,6 +1438,16 @@ pub struct EvalParams {
     /// `w × 交換価値 ÷ (1 + 着手後の残り守り枚数)` の減点。0 = 従来挙動。
     /// 実用域は 0.2〜0.6（w=0.4 で金の単独錨外しが約2歩ぶん）
     pub anchor_move_w: f64,
+    /// **玉で取る手の露見実効価値**（2026-08-04、quest31-m076 が発端）。
+    /// 取ったマスは相手に通知されるので取り手の位置は露見するが、玉は
+    /// `exchange_value=0` のため `capture_reveal_risk` の床と `blind_recapture` の
+    /// 露見コストが**完全に免除**され、ブラインド決定（粒子全滅で expected が
+    /// 消えた状態）では玉が「最も安全な取り手」に化ける（実測: 銀でも取れる
+    /// 6二の駒を玉で取る手が 12/20 で首位。ユーザー判定は「普通は銀で取った
+    /// 方が良い」）。露見するのが玉自身のときは交換価値の代わりにこの実効価値を
+    /// 使う（0 = 従来挙動）。玉の位置露見は材料でなく詰みリスクなので
+    /// 実用域は大駒級の 5〜12
+    pub king_capture_reveal: f64,
     /// **taint 粒子の占有合意で打ちの反則確率を下げる**（2026-08-03、ユーザー指摘の
     /// 38手目 `S*4g` が発端）。厳密粒子が全滅した決定では `p_legal` が
     /// `prior_legal` だけで決まるが、その打ち側は**マスに依らない定数**
@@ -1743,6 +1753,8 @@ impl Default for EvalParams {
             exposed_pawn_head_w: 0.0,
             blind_attack_survive_w: 0.0,
             anchor_move_w: 0.0,
+            // 玉で取る手の露見実効価値（2026-08-04）。0 = 従来と同一挙動
+            king_capture_reveal: 0.0,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
             // 反則経済の新項（2026-07-16、オラクル測定で36ptの伸びしろを確認後に追加）。
@@ -1839,7 +1851,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 66] = [
+    pub const SPECS: [ParamSpec; 67] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -2212,6 +2224,12 @@ impl EvalParams {
             lo: 0.0,
             hi: 1.5,
         },
+        ParamSpec {
+            // 駒価値スケール（capture_reveal_risk の床に乗る）。龍=12 が上限
+            name: "king_capture_reveal",
+            lo: 0.0,
+            hi: 12.0,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -2282,6 +2300,7 @@ impl EvalParams {
             self.exposed_pawn_head_w,
             self.blind_attack_survive_w,
             self.anchor_move_w,
+            self.king_capture_reveal,
         ]
     }
 
@@ -2354,6 +2373,7 @@ impl EvalParams {
             exposed_pawn_head_w: v[63],
             blind_attack_survive_w: v[64],
             anchor_move_w: v[65],
+            king_capture_reveal: v[66],
         }
     }
 }
@@ -2641,6 +2661,18 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
     {
         Some(w) => EvalParams {
             taint_occ_legal_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 玉で取る手の露見実効価値（0 で従来挙動）
+    let params = match std::env::var("TSUITATE_KING_CAPTURE_REVEAL")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            king_capture_reveal: w,
             ..params
         },
         None => params,
@@ -4683,8 +4715,16 @@ fn evaluate(
         let mut floor = own_after * camp_defended_prior(to, me, params.camp_scale) * known_factor;
         if captured_value > 0.0 {
             // 取ったマスは相手に通知される。粒子に守りが見えなくても
-            // 取り返しの残留リスクを敷く（= 等価な取りは安い駒で取る）
-            floor = floor.max(own_after * params.capture_reveal_risk);
+            // 取り返しの残留リスクを敷く（= 等価な取りは安い駒で取る）。
+            // 玉は exchange_value=0 でこの床を素通りしていた（quest31-m076:
+            // 銀で取れる駒を玉で取る手が首位）ので、露見するのが玉のときは
+            // 実効価値 king_capture_reveal に置き換える（既定0 = 従来挙動）
+            let reveal_after = if next.piece_at(to).is_some_and(|p| p.role == Role::King) {
+                params.king_capture_reveal.max(own_after)
+            } else {
+                own_after
+            };
+            floor = floor.max(reveal_after * params.capture_reveal_risk);
         }
         let mover_risk =
             mover_w * recapture_risk(&next, me, to, params.recapture_defended).max(floor);
@@ -4784,7 +4824,14 @@ fn evaluate(
                     .find(|p| {
                         matches!(*mv, ShogiMove::Board { from, .. } if p.square == make_usi_square(from))
                     })
-                    .map(|p| exchange_value(p.role))
+                    .map(|p| {
+                        // 玉の露見コスト免除の穴を塞ぐ（上の床と同じ規約）
+                        if p.role == Role::King {
+                            params.king_capture_reveal
+                        } else {
+                            exchange_value(p.role)
+                        }
+                    })
                     .unwrap_or(0.0);
                 let _ = sq;
                 blind_recapture_w()
@@ -6361,6 +6408,7 @@ pub(crate) mod tests {
         assert_field_index!(exposed_pawn_head_w);
         assert_field_index!(blind_attack_survive_w);
         assert_field_index!(anchor_move_w);
+        assert_field_index!(king_capture_reveal);
 
         // 既定値は自分の SPECS 範囲内にあること（SPSA の中心点が
         // クランプで別の値へ化けるのを防ぐ。位置ズレの二重の網でもある）
