@@ -811,7 +811,22 @@ fn drop_hit_all_ranks() -> bool {
     *V.get_or_init(|| !std::env::var("TSUITATE_DROP_HIT_ALL_RANKS").is_ok_and(|v| v == "0"))
 }
 
-/// 成りポテンシャルの手数減衰（1手遠いごとに半減）
+/// 成りポテンシャルの手数減衰（既定: 1手遠いごとに半減）。
+/// `TSUITATE_PROMO_DECAY` で上書き可（スイープ経路。0.5〜0.9 が実用域）。
+/// ついたて将棋では静かな前進は相手から観測されず妨害されにくいので、
+/// 通常将棋の感覚より高い生存率（緩い減衰）が正当化されうる
+/// （「静かな準備の手の複数手先の価値」2026-08-06）
+fn promo_decay() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_PROMO_DECAY")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| (0.1..=1.0).contains(v))
+            .unwrap_or(PROMO_POTENTIAL_DECAY)
+    })
+}
+/// 成りポテンシャルの手数減衰の既定値
 const PROMO_POTENTIAL_DECAY: f64 = 0.5;
 /// 成りマス探索（BFS）の手数上限。0.5^8 ≈ 0.004 で寄与が消えるので打ち切る
 const PROMO_BFS_MAX_DEPTH: u32 = 8;
@@ -853,13 +868,16 @@ fn promo_potential(pieces: &[VisiblePiece], me: Color, king_prox: Option<&[f64; 
         let Some(origin) = parse_usi_square(&p.square) else {
             continue;
         };
-        let prox = king_prox.map_or(1.0, |m| m[crate::belief_features::sq_index(origin)]);
         if unpromote_role(p.role) != p.role {
-            // 成り済み: 実現した利き増加（成る手の差分を正にするための対）
+            // 成り済み: 実現した利き増加（成る手の差分を正にするための対）。
+            // 近接重みは**今いるマス**で掛ける（実現した働きの場所）
+            let prox = king_prox.map_or(1.0, |m| m[crate::belief_features::sq_index(origin)]);
             total +=
                 prox * promo_effect_gain(&occupied, origin, unpromote_role(p.role), origin, me);
         } else {
-            total += prox * piece_promo_potential(&occupied, origin, p.role, me);
+            // 未成: 近接重みは**成りマス**で掛ける（piece_promo_potential 内）。
+            // 行進中の歩は現在地が玉から遠くても成り先が玉の隣なら満額に近い
+            total += piece_promo_potential(&occupied, origin, p.role, me, king_prox);
         }
     }
     total
@@ -924,15 +942,23 @@ fn major_promo_path(pieces: &[VisiblePiece], me: Color) -> f64 {
 }
 
 /// 未成駒 `role` がマス `at` にいる（または打たれる）ときの成りポテンシャル
-/// 「Δ利き × 減衰^(成りマスまでの手数)」。`promo_potential()` の1駒ぶんと、
-/// 持ち駒オプション（`hand_option_w`）の打ちマス実現値の共通部品
-fn piece_promo_potential(occupied: &HashSet<Coord>, at: Coord, role: Role, me: Color) -> f64 {
+/// 「Δ利き × 減衰^(成りマスまでの手数) × 成りマスの敵玉近接重み」。
+/// `promo_potential()` の1駒ぶんと、持ち駒オプション（`hand_option_w`）の
+/// 打ちマス実現値の共通部品。`king_prox` は None なら重みなし
+fn piece_promo_potential(
+    occupied: &HashSet<Coord>,
+    at: Coord,
+    role: Role,
+    me: Color,
+    king_prox: Option<&[f64; 81]>,
+) -> f64 {
     if promote_role(role).is_none() {
         return 0.0;
     }
     match promo_distance(occupied, at, role, me) {
         Some((d, sq)) => {
-            promo_effect_gain(occupied, at, role, sq, me) * PROMO_POTENTIAL_DECAY.powi(d as i32)
+            let prox = king_prox.map_or(1.0, |m| m[crate::belief_features::sq_index(sq)]);
+            prox * promo_effect_gain(occupied, at, role, sq, me) * promo_decay().powi(d as i32)
         }
         None => 0.0,
     }
@@ -965,7 +991,7 @@ fn hand_option_context(view: &PlayerView) -> HandOption {
         }
         let h = crate::board::drop_targets(&view.your_pieces, role, me)
             .into_iter()
-            .map(|s| piece_promo_potential(&occupied, s, role, me))
+            .map(|s| piece_promo_potential(&occupied, s, role, me, None))
             .fold(0.0f64, f64::max);
         if h > 0.0 {
             best.insert(role, h);
@@ -5122,7 +5148,7 @@ fn evaluate(
             .get(&role)
             .map(|&h| {
                 params.hand_option_w
-                    * (h - piece_promo_potential(&ctx.occupied, to, role, me)).max(0.0)
+                    * (h - piece_promo_potential(&ctx.occupied, to, role, me, None)).max(0.0)
             })
             .unwrap_or(0.0),
         _ => 0.0,
@@ -6177,12 +6203,14 @@ pub(crate) mod tests {
             Coord { file: 5, rank: 3 },
             Role::Pawn,
             Color::Sente,
+            None,
         );
         let deep = piece_promo_potential(
             &ctx.occupied,
             Coord { file: 5, rank: 8 },
             Role::Pawn,
             Color::Sente,
+            None,
         );
         assert!((h - near).abs() < 1e-9, "敵陣近くの打ちは不足分 0");
         assert!(h - deep > 1.0, "自陣深くの打ちは不足分が大きい: h={h} deep={deep}");
@@ -6210,6 +6238,7 @@ pub(crate) mod tests {
             Coord { file: 1, rank: 2 },
             Role::Lance,
             Color::Sente,
+            None,
         );
         assert_eq!(blocked, 0.0, "と金の裏の香は成りへの道が無い");
     }
