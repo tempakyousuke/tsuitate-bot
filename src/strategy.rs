@@ -1753,8 +1753,10 @@ impl Default for EvalParams {
             exposed_pawn_head_w: 0.0,
             blind_attack_survive_w: 0.0,
             anchor_move_w: 0.0,
-            // 玉で取る手の露見実効価値（2026-08-04）。0 = 従来と同一挙動
-            king_capture_reveal: 0.0,
+            // 玉で取る手の露見実効価値（2026-08-04 実装、2026-08-05 採用）。
+            // 0 で従来挙動へ切り戻し。w=10 × capture_reveal_risk ≒ 1.3点の
+            // リスク床で、玉でしか取れない駒の捕獲は gain が勝って生き残る
+            king_capture_reveal: 10.0,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
             // 反則経済の新項（2026-07-16、オラクル測定で36ptの伸びしろを確認後に追加）。
