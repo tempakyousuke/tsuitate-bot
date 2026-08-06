@@ -1,4 +1,4 @@
-*scenario ply=62 target=5g4g bad=3c4c,3c2b,3b2b,B*1h,B*3f,B*7f,B*9f,9g9f,1g1f,3g3f,B*3e,B*3d,5f5e,B*4c,B*1f,3b4b,B*8f,B*2g,B*5e,B*3a desc=63手目（先手番）。実戦は同金。4七金以外は全て悪手（他の手だと4七の成銀をタダで取る機会を失う）
+*scenario ply=62 target=5g4g bad=3c4c,3c2b,3b2b,B*1h,B*3f,B*7f,B*9f,9g9f,1g1f,3g3f,B*3e,B*3d,5f5e,B*4c,B*1f,3b4b,B*8f,B*2g,B*5e,B*3a,2d3e desc=63手目（先手番）。実戦は同金。4七金以外は全て悪手（他の手だと4七の成銀をタダで取る機会を失う）
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

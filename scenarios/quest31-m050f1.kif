@@ -1,4 +1,4 @@
-*scenario ply=49 fouls=4e3e target=3d3e bad=4g4h,4g5h,3h4i+,3h2i+,7c7d,9c9d,P*2b,4e5f,6b7b,P*2g desc=50手目・3五玉(4e3e)の反則後（後手番）。3五歩・5四歩があり。3五が塞がっていると分かったので3六玉を試す価値がある
+*scenario ply=49 fouls=4e3e target=3d3e bad=4g4h,4g5h,3h4i+,3h2i+,7c7d,9c9d,P*2b,4e5f,6b7b,P*2g,3h3i+ desc=50手目・3五玉(4e3e)の反則後（後手番）。3五歩・5四歩があり。3五が塞がっていると分かったので3六玉を試す価値がある
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

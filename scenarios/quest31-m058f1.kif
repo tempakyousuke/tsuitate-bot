@@ -1,4 +1,4 @@
-*scenario ply=57 fouls=P*4g target=4f4g+ bad=G*5h,G*6i,S*5h,S*6h,S*4h,G*6h,G*4h,G*1b,S*1b,S*1d,S*2b,G*2d,G*3c,G*2b,6d6e desc=58手目・4七歩打(P*4g)の反則後（後手番）。4七は先手の歩で埋まっていることが確定した
+*scenario ply=57 fouls=P*4g target=4f4g+ bad=G*5h,G*6i,S*5h,S*6h,S*4h,G*6h,G*4h,G*1b,S*1b,S*1d,S*2b,G*2d,G*3c,G*2b,6d6e,P*2h desc=58手目・4七歩打(P*4g)の反則後（後手番）。4七は先手の歩で埋まっていることが確定した
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

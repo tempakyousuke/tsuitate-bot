@@ -1,4 +1,4 @@
-*scenario ply=54 target=P*4h bad=G*5e,3c4c,3b2b,B*1h,B*7f,B*9f,B*2e,B*5h,G*4c,B*4c,B*1f,3c2b desc=55手目（先手番）。実戦は4八歩打
+*scenario ply=54 target=P*4h bad=G*5e,3c4c,3b2b,B*1h,B*7f,B*9f,B*2e,B*5h,G*4c,B*4c,B*1f,3c2b,3c2c desc=55手目（先手番）。実戦は4八歩打
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

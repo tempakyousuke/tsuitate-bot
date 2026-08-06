@@ -1,4 +1,4 @@
-*scenario ply=81 target=7e7f bad=N*6g,N*4g,N*5f,P*6g,N*7f,8a7c,3d3e,9c9d,5c5d,6b7c,7b7c,6b6c,N*5d,N*5b,7b6c,N*3a,P*2b,N*6f desc=82手目（後手番）。実戦の5四歩は悪手判定。ありは7六歩のみ（6三歩打は「ありだが反則確率は高い」）。桂打ち各種は悪手
+*scenario ply=81 target=7e7f bad=N*6g,N*4g,N*5f,P*6g,N*7f,8a7c,9c9d,5c5d,6b7c,7b7c,6b6c,N*5d,N*5b,7b6c,N*3a,P*2b,N*6f desc=82手目（後手番）。実戦の5四歩は悪手判定。ありは7六歩のみ（6三歩打は「ありだが反則確率は高い」）。桂打ち各種は悪手
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
