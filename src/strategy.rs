@@ -731,6 +731,11 @@ fn own_effects_after(
         }
     }
 
+    // 打つ手なら打ったマス（promo_potential の旧価格付け対象）
+    let dropped_at = match *mv {
+        ShogiMove::Drop { to, .. } => Some(to),
+        _ => None,
+    };
     OwnEffects {
         coverage: covered.len() as f64,
         king_holes,
@@ -739,7 +744,7 @@ fn own_effects_after(
         effect_opp,
         drop_hit_exposure: drop_hit_exposure(&pieces, view.your_color),
         promo_potential: if params.promo_potential_w != 0.0 && !view.you_in_check {
-            promo_potential(&pieces, view.your_color, promo_prox)
+            promo_potential(&pieces, view.your_color, promo_prox, dropped_at)
         } else {
             0.0
         },
@@ -858,7 +863,17 @@ const PROMO_BFS_MAX_DEPTH: u32 = 8;
 /// 遠すぎる。突くなら7・8筋」を、演繹（deduce::opp_king_candidates =
 /// 観測のみ由来でノイズゼロ）への近さで実装する。差分の両側が同じマップを
 /// 使うので差分形の性質は保たれる
-fn promo_potential(pieces: &[VisiblePiece], me: Color, king_prox: Option<&[f64; 81]>) -> f64 {
+fn promo_potential(
+    pieces: &[VisiblePiece],
+    me: Color,
+    king_prox: Option<&[f64; 81]>,
+    // 直前の手で打たれたマス（Drop の差分評価時のみ Some）。そこにいる駒は
+    // **旧価格**（既定 decay 0.5・prox なし）で値付けする: 打つ手は持ち駒を
+    // 消費するので、行進の価格改定（decay 緩和×prox）で釣り上げると
+    // 垂れ歩が常用化する（実測: decay0.8/w0.5 で P*2f が 19/20。
+    // occasional-probe「たまに」方針の保護）
+    dropped_at: Option<Coord>,
+) -> f64 {
     let occupied: HashSet<Coord> = pieces
         .iter()
         .filter_map(|p| parse_usi_square(&p.square))
@@ -868,10 +883,29 @@ fn promo_potential(pieces: &[VisiblePiece], me: Color, king_prox: Option<&[f64; 
         let Some(origin) = parse_usi_square(&p.square) else {
             continue;
         };
+        if dropped_at == Some(origin) {
+            // 旧 decay（緩和なし）＋ prox は適用。prox まで免除すると
+            // 盤上の駒だけが方向割引されて打ちが相対的に浮く
+            // （実測: P*2f が 16〜20/20 に再浮上）
+            total += piece_promo_potential_with(
+                &occupied,
+                origin,
+                p.role,
+                me,
+                king_prox,
+                PROMO_POTENTIAL_DECAY,
+            );
+            continue;
+        }
         if unpromote_role(p.role) != p.role {
             // 成り済み: 実現した利き増加（成る手の差分を正にするための対）。
-            // 近接重みは**今いるマス**で掛ける（実現した働きの場所）
-            let prox = king_prox.map_or(1.0, |m| m[crate::belief_features::sq_index(origin)]);
+            // 近接重みは**今いるマス**で掛けるが、実現分は現物なので
+            // 床 `promo_realized_floor()` より下へは割り引かない
+            // （床なしだと「今できる成り捕獲」まで方向割引で沈み、
+            // 無意味な歩突きに負ける。実測: m016 の 7三歩 20/20）
+            let prox = king_prox
+                .map_or(1.0, |m| m[crate::belief_features::sq_index(origin)])
+                .max(promo_realized_floor());
             total +=
                 prox * promo_effect_gain(&occupied, origin, unpromote_role(p.role), origin, me);
         } else {
@@ -881,6 +915,18 @@ fn promo_potential(pieces: &[VisiblePiece], me: Color, king_prox: Option<&[f64; 
         }
     }
     total
+}
+
+/// 実現済みの成りの prox 床（`TSUITATE_PROMO_REALIZED_FLOOR`、既定 0 = 床なし）
+fn promo_realized_floor() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_PROMO_REALIZED_FLOOR")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| (0.0..=1.0).contains(v))
+            .unwrap_or(0.0)
+    })
 }
 
 /// `promo_king_prox` の近接マップ。マスごとに `(1-w) + w × 1/(1+d_min)`
@@ -952,13 +998,34 @@ fn piece_promo_potential(
     me: Color,
     king_prox: Option<&[f64; 81]>,
 ) -> f64 {
+    // 減衰の緩和（TSUITATE_PROMO_DECAY）は**歩だけ**に適用する。歩の行進は
+    // 正面の駒にしか止められない低リスクの前進だが、桂銀香の進出は被捕獲
+    // リスクが高く緩い減衰の根拠が無い（実測: decay0.8 で 8一桂の跳び道を
+    // 玉が開ける手に candy が乗り、m076 の玉捕獲が 0→20 に再発した）
+    let decay = if role == Role::Pawn {
+        promo_decay()
+    } else {
+        PROMO_POTENTIAL_DECAY
+    };
+    piece_promo_potential_with(occupied, at, role, me, king_prox, decay)
+}
+
+/// 減衰を明示指定する版（打たれた駒の旧価格付け用。`promo_potential` の doc 参照）
+fn piece_promo_potential_with(
+    occupied: &HashSet<Coord>,
+    at: Coord,
+    role: Role,
+    me: Color,
+    king_prox: Option<&[f64; 81]>,
+    decay: f64,
+) -> f64 {
     if promote_role(role).is_none() {
         return 0.0;
     }
     match promo_distance(occupied, at, role, me) {
         Some((d, sq)) => {
             let prox = king_prox.map_or(1.0, |m| m[crate::belief_features::sq_index(sq)]);
-            prox * promo_effect_gain(occupied, at, role, sq, me) * promo_decay().powi(d as i32)
+            prox * promo_effect_gain(occupied, at, role, sq, me) * decay.powi(d as i32)
         }
         None => 0.0,
     }
@@ -3369,7 +3436,7 @@ impl Strategy for EstimatorStrategy {
         // gain へ加算する。王手中は無効（CheckSolver の領分）
         let promo_pot_before: Option<f64> = (params.promo_potential_w != 0.0
             && !view.you_in_check)
-            .then(|| promo_potential(&view.your_pieces, view.your_color, promo_prox.as_ref()));
+            .then(|| promo_potential(&view.your_pieces, view.your_color, promo_prox.as_ref(), None));
         // 大駒の成り道（`major_promo_path_w`）の現局面の値。同じく差分で使う
         let major_path_before: Option<f64> = (params.major_promo_path_w != 0.0
             && !view.you_in_check)
@@ -6152,19 +6219,19 @@ pub(crate) mod tests {
             role,
         };
         // 先手の歩: 4段目（成りマスまで1手）は 7段目（4手）より大きい
-        let near = promo_potential(&[vp(5, 4, Role::Pawn)], Color::Sente, None);
-        let far = promo_potential(&[vp(5, 7, Role::Pawn)], Color::Sente, None);
+        let near = promo_potential(&[vp(5, 4, Role::Pawn)], Color::Sente, None, None);
+        let far = promo_potential(&[vp(5, 7, Role::Pawn)], Color::Sente, None, None);
         assert!(near > far, "near={near} far={far}");
         assert!(far > 0.0);
         // 歩→と金は Δ利き5（中央）× 0.5^1
         assert!((near - 5.0 * 0.5).abs() < 1e-9, "near={near}");
         // 前に自分の歩がいる歩は成れない（道を塞がれた駒はポテンシャル 0）
         let blocked =
-            promo_potential(&[vp(5, 4, Role::Pawn), vp(5, 3, Role::Pawn)], Color::Sente, None);
-        let solo_5c = promo_potential(&[vp(5, 3, Role::Pawn)], Color::Sente, None);
+            promo_potential(&[vp(5, 4, Role::Pawn), vp(5, 3, Role::Pawn)], Color::Sente, None, None);
+        let solo_5c = promo_potential(&[vp(5, 3, Role::Pawn)], Color::Sente, None, None);
         assert!((blocked - solo_5c).abs() < 1e-9, "5四の歩の寄与が 0 になるはず");
         // 後手向き: 6段目の歩（成りマス7段目まで1手）も同じ値
-        let gote = promo_potential(&[vp(5, 6, Role::Pawn)], Color::Gote, None);
+        let gote = promo_potential(&[vp(5, 6, Role::Pawn)], Color::Gote, None, None);
         assert!((gote - 5.0 * 0.5).abs() < 1e-9, "gote={gote}");
     }
 
@@ -6179,8 +6246,9 @@ pub(crate) mod tests {
             &[vp(1, 1, Role::Tokin), vp(1, 2, Role::Lance)],
             Color::Sente,
             None,
+            None,
         );
-        let without = promo_potential(&[vp(1, 1, Role::Tokin)], Color::Sente, None);
+        let without = promo_potential(&[vp(1, 1, Role::Tokin)], Color::Sente, None, None);
         assert!((with_lance - without).abs() < 1e-9, "塞がれた香の寄与は 0");
     }
 
@@ -6270,8 +6338,8 @@ pub(crate) mod tests {
             square: crate::board::make_usi_square(Coord { file, rank }),
             role,
         };
-        let before = promo_potential(&[vp(9, 3, Role::Lance)], Color::Sente, None);
-        let after = promo_potential(&[vp(9, 3, Role::Promotedlance)], Color::Sente, None);
+        let before = promo_potential(&[vp(9, 3, Role::Lance)], Color::Sente, None, None);
+        let after = promo_potential(&[vp(9, 3, Role::Promotedlance)], Color::Sente, None, None);
         assert!(before > 0.0);
         assert!(after > before, "after={after} before={before}");
     }
