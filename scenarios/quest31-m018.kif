@@ -1,4 +1,4 @@
-*scenario ply=17 target=4f4g+ bad=6a7b,1c1d,6a5b desc=18手目（後手番）。4七歩成が自然。7二金（玉の逃げ道を塞ぐ。先に7四歩/6四歩が必要）と1四歩は悪手。実戦の3二銀は悪くない
+*scenario ply=17 target=4f4g+ scores=4f4g+:7,7a7b:6,9c9d:6,3c4e:6,3d3e:5,6a7b:2,8c8d:8,1c1d:2,7c7d:6,6a5b:2 bad=6a7b,1c1d,6a5b desc=18手目（後手番）。4七歩成が自然。7二金（玉の逃げ道を塞ぐ。先に7四歩/6四歩が必要）と1四歩は悪手。実戦の3二銀は悪くない
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

@@ -1,4 +1,4 @@
-*scenario ply=65 fouls=4e4f target=4e5d bad=4e4d,4e3e,4e5e,3d3e,5c5d,6b7b,7a7b desc=66手目・4六玉(4e4f)の反則後（後手番・王手中）。4六は先手の金で確定＝5四玉のみあり
+*scenario ply=65 fouls=4e4f target=4e5d scores=4e5d:8,4e4d:2,4e3e:2,4e5e:2,3d3e:0,5c5d:0,6b7b:0,7a7b:0 bad=4e4d,4e3e,4e5e,3d3e,5c5d,6b7b,7a7b desc=66手目・4六玉(4e4f)の反則後（後手番・王手中）。4六は先手の金で確定＝5四玉のみあり
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

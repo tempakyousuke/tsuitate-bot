@@ -268,6 +268,9 @@ enum Objective {
     Scenario {
         loaded: Vec<(Scenario, Replayed)>,
         trials: u64,
+        /// true なら採点表（scores=）の平均得点を目的関数にする
+        /// （TUNE_OBJECTIVE=scenario_score）。false は従来の不合格計
+        use_scores: bool,
     },
 }
 
@@ -281,7 +284,11 @@ impl Objective {
                 candidate_line,
                 ..
             } => fitness(params, *games_per_eval, baselines, *candidate_line, match_seeds),
-            Objective::Scenario { loaded, trials } => scenario_fitness(loaded, *trials, params),
+            Objective::Scenario {
+                loaded,
+                trials,
+                use_scores,
+            } => scenario_fitness(loaded, *trials, params, *use_scores),
         }
     }
 
@@ -304,16 +311,27 @@ impl Objective {
                 candidate_line_name,
                 ..
             } => config_json(*games_per_eval, baselines, candidate_line_name, space),
-            Objective::Scenario { loaded, trials } => serde_json::json!({
-                "objective": "scenario",
+            Objective::Scenario {
+                loaded,
+                trials,
+                use_scores,
+            } => serde_json::json!({
+                "objective": if *use_scores { "scenario_score" } else { "scenario" },
                 "trials": trials,
-                // ply/target/bad まで指紋に含める: .kif の bad= を育てただけでも
-                // 別の目的関数になるので再開を拒否する（強行は TUNE_FORCE_RESUME=1）
+                // ply/target/bad/scores まで指紋に含める: .kif の採点を育てた
+                // だけでも別の目的関数になるので再開を拒否する
+                // （強行は TUNE_FORCE_RESUME=1）
                 "scenarios": loaded.iter().map(|(sc, _)| serde_json::json!({
                     "name": sc.name,
                     "ply": sc.ply,
                     "target": sc.target,
                     "bad": sc.bad,
+                    "scores": if *use_scores {
+                        serde_json::json!(sc.scores.iter()
+                            .map(|(u, p)| format!("{u}:{p}")).collect::<Vec<_>>())
+                    } else {
+                        serde_json::Value::Null
+                    },
                 })).collect::<Vec<_>>(),
                 "think_budget_ms": std::env::var("TSUITATE_THINK_BUDGET_MS").ok(),
                 "span": space.span,
@@ -360,7 +378,8 @@ fn build_objective(args: &[String]) -> Result<Objective, String> {
                 candidate_line_name,
             })
         }
-        "scenario" => {
+        "scenario" | "scenario_score" => {
+            let use_scores = kind == "scenario_score";
             let trials: u64 = args.get(2).and_then(|v| v.parse().ok()).unwrap_or(10);
             if trials == 0 {
                 return Err("試行数は1以上を指定してください".into());
@@ -385,7 +404,13 @@ fn build_objective(args: &[String]) -> Result<Objective, String> {
             let mut loaded = vec![];
             for name in &names {
                 let sc = load_scenario(name, None, None, None).map_err(|e| format!("{name}: {e}"))?;
-                if sc.bad.is_empty() {
+                if use_scores {
+                    if sc.scores.is_empty() {
+                        return Err(format!(
+                            "{name}: scores= がありません（evals から sync_eval.py で同期してください）"
+                        ));
+                    }
+                } else if sc.bad.is_empty() {
                     return Err(format!(
                         "{name}: bad= がありません（不合格計が常に0で目的関数になりません）"
                     ));
@@ -399,9 +424,15 @@ fn build_objective(args: &[String]) -> Result<Objective, String> {
                 }
                 loaded.push((sc, rep));
             }
-            Ok(Objective::Scenario { loaded, trials })
+            Ok(Objective::Scenario {
+                loaded,
+                trials,
+                use_scores,
+            })
         }
-        other => Err(format!("TUNE_OBJECTIVE は arena か scenario です: {other}")),
+        other => Err(format!(
+            "TUNE_OBJECTIVE は arena / scenario / scenario_score です: {other}"
+        )),
     }
 }
 
@@ -420,6 +451,7 @@ fn scenario_fitness(
     loaded: &[(Scenario, Replayed)],
     trials: u64,
     params: &EvalParams,
+    use_scores: bool,
 ) -> (f64, Vec<serde_json::Value>) {
     let mut parts: Vec<((u64, Color), Vec<usize>)> = vec![];
     for (i, (sc, rep)) in loaded.iter().enumerate() {
@@ -458,15 +490,20 @@ fn scenario_fitness(
         }
     });
     let mut bad_total = 0u32;
+    let mut score_sum = 0.0f64;
     let mut details = vec![];
     for ((sc, _), stats) in loaded.iter().zip(stats_by_idx) {
         let stats = stats.expect("全シナリオが評価されている");
         let bad = stats.bad_hits(&sc.bad);
         bad_total += bad;
+        let (mean, unscored) = stats.mean_score(&sc.scores);
+        score_sum += mean / 10.0;
         details.push(serde_json::json!({
             "scenario": sc.name,
             "ply": sc.ply,
             "bad_hits": bad,
+            "mean_score": mean,
+            "unscored": unscored,
             "trials": trials,
             "fouls": stats.total_fouls,
             "target_hits": stats.target_hits(&sc.target),
@@ -474,7 +511,13 @@ fn scenario_fitness(
                 .map(|(usi, n)| serde_json::json!([usi, n])).collect::<Vec<_>>(),
         }));
     }
-    (scenario_score(bad_total, loaded.len(), trials), details)
+    let score = if use_scores {
+        // 平均得点/10 のシナリオ平均 ∈ [0,1]（SPSA 係数を arena と共通に保つ）
+        score_sum / loaded.len().max(1) as f64
+    } else {
+        scenario_score(bad_total, loaded.len(), trials)
+    };
+    (score, details)
 }
 
 /// 調整対象の次元が TSUITATE_* env に上書きされて摂動が無効になっていないか。
@@ -739,9 +782,14 @@ fn main() {
                 space.span,
             );
         }
-        Objective::Scenario { loaded, trials } => {
+        Objective::Scenario {
+            loaded,
+            trials,
+            use_scores,
+        } => {
             println!(
-                "SPSA開始（シナリオ目的）: 反復{start_k}〜{iterations} × 2評価 × {}シナリオ×{trials}試行, seed={run_seed}, {active_count}/{d}次元, span={}",
+                "SPSA開始（シナリオ{}目的）: 反復{start_k}〜{iterations} × 2評価 × {}シナリオ×{trials}試行, seed={run_seed}, {active_count}/{d}次元, span={}",
+                if *use_scores { "得点" } else { "不合格" },
                 loaded.len(),
                 space.span,
             );

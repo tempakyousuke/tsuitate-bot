@@ -1,4 +1,4 @@
-*scenario ply=74 target=S*6a bad=3c4c,1g1f,9g9f,3g3f,7g7f,8g8f,9i9h,S*8c,S*7c,S*6c,S*8a,5b6b,4a3b+,P*4c,S*4c,S*1d,S*3e,5e6e,S*6d,S*8f,S*7f,S*6f,S*8d desc=75手目（先手番）。6一銀打（5一金打の筋で駒がいる可能性を調べ、外れても6二へ利きを作る）・6一成桂・4四歩打・4四銀打・6六歩があり。実戦は6二銀打の反則後に6二成桂
+*scenario ply=74 target=S*6a scores=3c4c:2,1g1f:2,9g9f:2,3g3f:2,7g7f:2,8g8f:2,9i9h:2,S*8c:2,S*7c:2,S*6c:2,S*6a:8,S*8a:2,5b6b:2,4a3b+:2,P*4c:2,S*4c:2,S*1d:2,S*3e:2,5e6e:2,S*6d:2,S*8f:2,S*7f:2,S*6f:2,S*8d:2,5b6a:8,P*4d:8,S*4d:8,6g6f:8 bad=3c4c,1g1f,9g9f,3g3f,7g7f,8g8f,9i9h,S*8c,S*7c,S*6c,S*8a,5b6b,4a3b+,P*4c,S*4c,S*1d,S*3e,5e6e,S*6d,S*8f,S*7f,S*6f,S*8d desc=75手目（先手番）。6一銀打（5一金打の筋で駒がいる可能性を調べ、外れても6二へ利きを作る）・6一成桂・4四歩打・4四銀打・6六歩があり。実戦は6二銀打の反則後に6二成桂
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

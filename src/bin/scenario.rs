@@ -129,6 +129,10 @@ fn print_tally(sc: &Scenario, stats: &ChoiceStats, trials: u64) {
     if !sc.bad.is_empty() {
         println!("不合格計: {}/{trials}", stats.bad_hits(&sc.bad));
     }
+    if !sc.scores.is_empty() {
+        let (mean, unscored) = stats.mean_score(&sc.scores);
+        println!("平均得点: {mean:.2}/10（未採点の選択 {unscored}/{trials}）");
+    }
     println!("追加の反則の総数: {}", stats.total_fouls);
 }
 
@@ -806,8 +810,14 @@ fn run_suite(trials: u64, name: &str) {
         } else {
             format!(" 不合格計 {}/{trials}", stats.bad_hits(&sc.bad))
         };
+        let score_note = if sc.scores.is_empty() {
+            String::new()
+        } else {
+            let (mean, unscored) = stats.mean_score(&sc.scores);
+            format!(" 得点 {mean:.2}/10(未採点{unscored})")
+        };
         println!(
-            "{:<12} {}手目 注目手 {:<6} {hits}/{trials}{bad_note} 反則{} 他: {}",
+            "{:<12} {}手目 注目手 {:<6} {hits}/{trials}{bad_note}{score_note} 反則{} 他: {}",
             sc.name,
             sc.ply + 1,
             sc.target,

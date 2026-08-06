@@ -1,4 +1,4 @@
-*scenario ply=30 target=3c4b bad=2a1a,3c3b,N*2e,N*5h,N*3f,N*4h,N*4e,N*6f,N*8f,2a2c,3c2c,N*5e,N*2c desc=31手目（先手番）。4二と（実戦の手）が当然の手。他の候補（龍の移動・桂打ち各種・2三と）は全て悪手
+*scenario ply=30 target=3c4b scores=3c4b:8,2a1a:2,3c3b:2,N*2e:2,N*5h:2,N*3f:2,N*4h:2,N*4e:2,N*6f:2,N*8f:2,2a2c:2,3c2c:2,N*5e:2,N*2c:2 bad=2a1a,3c3b,N*2e,N*5h,N*3f,N*4h,N*4e,N*6f,N*8f,2a2c,3c2c,N*5e,N*2c desc=31手目（先手番）。4二と（実戦の手）が当然の手。他の候補（龍の移動・桂打ち各種・2三と）は全て悪手
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

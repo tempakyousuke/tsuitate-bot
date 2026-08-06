@@ -1,4 +1,4 @@
-*scenario ply=90 target=6h7g bad=4a3b+,5b5a+,P*4d,P*2b,4a2c+,P*4c,P*2c,6d6c,6d7c,G*6c,5b6c+,G*8c,G*7c,G*8b,G*6b,6d5c,3c5c desc=91手目（先手番）。実戦は同玉（7七玉）＝相手の反則から7八歩打を推理して玉で取る手で「悪くない」。攻めるなら7四歩。リスト上の候補は全て悪手
+*scenario ply=90 target=6h7g scores=4a3b+:2,5b5a+:2,P*4d:2,P*2b:2,4a2c+:2,P*4c:2,P*2c:2,6d6c:2,6d7c:2,G*6c:2,5b6c+:4,G*8c:2,G*7c:2,G*8b:2,G*6b:2,6d5c:2,3c5c:2 bad=4a3b+,5b5a+,P*4d,P*2b,4a2c+,P*4c,P*2c,6d6c,6d7c,G*6c,G*8c,G*7c,G*8b,G*6b,6d5c,3c5c desc=91手目（先手番）。実戦は同玉（7七玉）＝相手の反則から7八歩打を推理して玉で取る手で「悪くない」。攻めるなら7四歩。リスト上の候補は全て悪手
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

@@ -1,4 +1,4 @@
-*scenario ply=82 target=7g7f bad=4a3b+,5b5a+,4a2c+,5f5e,9g9f,1g1f,6c7c,6d7c,6c7b,6c6b,2d3e,P*4c,6d5c,P*4d,5b4c+,3c4c,3c2b,6d7d,P*2b,3c3e desc=83手目（先手番）。実戦の9六歩は悪手判定（81手目ではありだった9六歩も、ここでは7六歩のみあり）。角成・銀成の清算系と4筋のと金作りは全て悪手
+*scenario ply=82 target=7g7f scores=4a3b+:2,5b5a+:2,4a2c+:2,7g7f:8,5f5e:2,9g9f:2,1g1f:2,6c7c:2,6d7c:2,6c7b:2,5b6a+:8,6c6b:2,2d3e:2,P*4c:2,6d5c:2,P*4d:2,5b4c+:2,3c4c:2,3c2b:2,6d7d:2,P*2b:2,3c3e:2 bad=4a3b+,5b5a+,4a2c+,5f5e,9g9f,1g1f,6c7c,6d7c,6c7b,6c6b,2d3e,P*4c,6d5c,P*4d,5b4c+,3c4c,3c2b,6d7d,P*2b,3c3e desc=83手目（先手番）。実戦の9六歩は悪手判定（81手目ではありだった9六歩も、ここでは7六歩のみあり）。角成・銀成の清算系と4筋のと金作りは全て悪手
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

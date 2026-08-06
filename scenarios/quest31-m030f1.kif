@@ -1,4 +1,4 @@
-*scenario ply=29 fouls=5b1b target=4f4g+ bad=4d3c,P*2f,7a7b,3d3e,7c7d,9c9d,P*2g,7a8b desc=30手目・1二飛(5b1b)の反則後（先手番=後手の手番）。反則で1二への経路が塞がれている＝取り返される確率が高いと分かったので3三角は悪手に転じる。4七歩成が本命
+*scenario ply=29 fouls=5b1b target=4f4g+ scores=4d3c:2,4f4g+:7,P*2f:2,7a7b:2,3d3e:2,7c7d:2,9c9d:2,P*2g:2,P*2h:6,7a8b:2 bad=4d3c,P*2f,7a7b,3d3e,7c7d,9c9d,P*2g,7a8b desc=30手目・1二飛(5b1b)の反則後（先手番=後手の手番）。反則で1二への経路が塞がれている＝取り返される確率が高いと分かったので3三角は悪手に転じる。4七歩成が本命
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

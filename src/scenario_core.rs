@@ -25,6 +25,10 @@ pub struct Scenario {
     /// ためのもので、target が悪手ならこのリストにも重複して入れる（自己完結。
     /// suite の「不合格計」はこのリストだけで数える）。空なら従来どおり
     pub bad: Vec<String>,
+    /// 採点表（`scores=<USI:点,...>`、0〜10）。evals/*.eval.md から
+    /// `sync_eval.py` が同期する。SPSA の `TUNE_OBJECTIVE=scenario_score` と
+    /// suite の「平均得点」が使う。空なら得点は出さない
+    pub scores: Vec<(String, u8)>,
     /// 何手目まで再生するか（ply+1 手目を考えさせる）
     pub ply: usize,
     /// 決定の前に注入する反則列（`fouls=<USI,...>`）。実戦で反則を挟んだ
@@ -94,6 +98,18 @@ pub fn load_scenario(
                 .collect()
         })
         .unwrap_or_default();
+    let scores: Vec<(String, u8)> = kifu
+        .directives
+        .get("scores")
+        .map(|s| {
+            s.split(',')
+                .filter_map(|x| {
+                    let (usi, pt) = x.trim().split_once(':')?;
+                    Some((usi.to_string(), pt.parse().ok()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let diag_squares: Vec<String> = diag_flag
         .or_else(|| kifu.directives.get("diag").cloned())
         .map(|s| {
@@ -128,6 +144,7 @@ pub fn load_scenario(
         desc,
         target,
         bad,
+        scores,
         ply,
         fouls,
         diag_squares,
@@ -318,7 +335,43 @@ impl ChoiceStats {
             .map(|(_, n)| *n)
             .sum()
     }
+
+    /// 採点表による平均得点（0〜10）と未採点の選択回数。
+    /// 採点表に無い手（未採点）は `UNSCORED_DEFAULT` で数えて件数を別途返す
+    /// （方策が評価済み候補の外へ出ると計測不能になる抜け穴 2026-08-06 への
+    /// 対応: 未採点の選択は数として見える化し、evals へ追記して判定を受ける）。
+    /// "resign" / "foul_limit" は 0 点
+    pub fn mean_score(&self, scores: &[(String, u8)]) -> (f64, u32) {
+        let mut sum = 0.0f64;
+        let mut n = 0u32;
+        let mut unscored = 0u32;
+        for (usi, count) in &self.tally {
+            let pt = if usi == "resign" || usi == "foul_limit" {
+                Some(0.0)
+            } else {
+                scores
+                    .iter()
+                    .find(|(s, _)| s == usi)
+                    .map(|(_, p)| f64::from(*p))
+            };
+            let pt = pt.unwrap_or_else(|| {
+                unscored += count;
+                UNSCORED_DEFAULT
+            });
+            sum += pt * f64::from(*count);
+            n += count;
+        }
+        if n == 0 {
+            (0.0, 0)
+        } else {
+            (sum / f64::from(n), unscored)
+        }
+    }
 }
+
+/// 未採点の手を選んだときの仮の点数（0〜10）。promo 価格改定の実測では
+/// 新出手の約半分が「あり」判定だったので中間よりやや下の 4 とする
+pub const UNSCORED_DEFAULT: f64 = 4.0;
 
 /// シードから戦略を作るファクトリ。`choice_trial_one_with` / `choice_trials_batch_with`
 /// が EvalParams を注入した戦略（bin/tune のシナリオ目的関数）で試行するための口。

@@ -1,4 +1,4 @@
-*scenario ply=64 target=4g4f bad=B*3f,B*1h,B*5h,B*7f,3b2b,B*9f,B*2e,2d4f,6i5h,4g3f,4g5g,6h5h,3c4b,B*4d,2d3e,B*7c,B*3e,B*5c,S*6c,B*1f,B*5g,3b4b,3c2b,B*4c,B*4f desc=65手目（先手番）。本命は同金（4六金＝実戦）。後手の4六歩〜4七歩成が辛いのでケアが必要
+*scenario ply=64 target=4g4f scores=B*3f:2,B*1h:2,B*5h:2,B*7f:2,3b2b:2,B*9f:2,B*2e:2,4g4f:10,2d4f:2,6i5h:2,4g3f:2,4g5g:2,6h5h:2,3c4b:2,B*4d:2,2d3e:2,B*7c:2,B*3e:2,B*5c:2,S*6c:2,B*1f:2,B*5g:2,3b4b:2,3c2b:2,B*4c:2,B*4f:2 bad=B*3f,B*1h,B*5h,B*7f,3b2b,B*9f,B*2e,2d4f,6i5h,4g3f,4g5g,6h5h,3c4b,B*4d,2d3e,B*7c,B*3e,B*5c,S*6c,B*1f,B*5g,3b4b,3c2b,B*4c,B*4f desc=65手目（先手番）。本命は同金（4六金＝実戦）。後手の4六歩〜4七歩成が辛いのでケアが必要
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

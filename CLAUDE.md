@@ -97,6 +97,17 @@
   判別する条件付きMLE（`bin/fit_particles`）を回し、係数を `src/likelihood.rs` の
   `FITTED_THETA` へ手で反映する。評価側は `stratified_sample` が exp(θ·φ) を
   粒子重みに乗じる（fit_opp の局面版。2026-07-16 のフィットで実効候補数 59→33）
+- **採点式レビュー（evals/）**: 実戦棋譜の決定点ごとに候補手を 0〜10 点で
+  採点し、SPSA の目的関数にする仕組み（2026-08-07。二値の bad= の一般化。
+  形式とワークフローは `evals/README.md`）。
+  `cargo run --release --bin make_eval -- <kif>` で全決定点のスケルトンを
+  自動生成（冪等追記・反則後サブ状態対応）→ 採点 →
+  `python3 scripts/quest_review/sync_eval.py` でシナリオの `scores=` / `bad=`
+  （2点以下）へ同期 → suite に「平均得点」が出る。SPSA は
+  `TUNE_OBJECTIVE=scenario_score`（score = 平均得点/10 のシナリオ平均 ∈ [0,1]）。
+  未採点の手が選ばれたら仮4点＋件数表示（評価済み候補の外へ逃げる
+  指標の抜け穴への対応。目立ったら make_eval 再実行→採点）。
+  quest_20260731 は md から移行済みで **eval が一次資料**
 - `cargo run --release --bin scenario -- <名前|suite|batch <名前...>>` — 実戦棋譜の
   局面再現実験。
   `scenarios/*.kif`（Shogi Quest エクスポート + `*scenario ply=N` 行）を再生して

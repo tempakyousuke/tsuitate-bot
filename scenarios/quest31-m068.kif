@@ -1,4 +1,4 @@
-*scenario ply=67 target=5d6c bad=5d4c,5d4d,5d6e,6d6e,6b6c,2c4c desc=68手目（後手番・王手中）。5五金の王手に6三玉が自然な受け。他は全て悪手
+*scenario ply=67 target=5d6c scores=5d6c:8,5d4c:2,5d4d:2,5d6e:2,6d6e:2,6b6c:2,2c4c:2 bad=5d4c,5d4d,5d6e,6d6e,6b6c,2c4c desc=68手目（後手番・王手中）。5五金の王手に6三玉が自然な受け。他は全て悪手
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

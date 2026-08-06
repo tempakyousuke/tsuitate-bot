@@ -1,4 +1,4 @@
-*scenario ply=29 target=4d3c bad=P*2f,7a7b,7c7d,9c9d,7a8b desc=30手目（後手番）。3三角（と金の取り返し。取り返されるが致し方なし）か4七歩成が普通。2六歩打・7二銀・7四歩・9四歩・8二銀は悪手
+*scenario ply=29 target=4d3c scores=4d3c:7,4f4g+:7,P*2f:2,7a7b:2,7c7d:2,9c9d:2,7a8b:2 bad=P*2f,7a7b,7c7d,9c9d,7a8b desc=30手目（後手番）。3三角（と金の取り返し。取り返されるが致し方なし）か4七歩成が普通。2六歩打・7二銀・7四歩・9四歩・8二銀は悪手
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

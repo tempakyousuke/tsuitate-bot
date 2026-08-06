@@ -1,4 +1,4 @@
-*scenario ply=15 target=4f4g+ bad=3d3e,7c7d,7a7b,9c9d,1c1d,6a7b desc=16手目（後手番）。4七歩成と3三桂（実戦の手）以外は全て悪手とみなす（候補外の3二銀もあり）。badは候補に出た悪手5件
+*scenario ply=15 target=4f4g+ scores=4f4g+:7,2a3c:7,3d3e:2,7c7d:2,7a7b:2,9c9d:2,1c1d:2,6a7b:2 bad=3d3e,7c7d,7a7b,9c9d,1c1d,6a7b desc=16手目（後手番）。4七歩成と3三桂（実戦の手）以外は全て悪手とみなす（候補外の3二銀もあり）。badは候補に出た悪手5件
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

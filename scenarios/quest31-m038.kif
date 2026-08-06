@@ -1,4 +1,4 @@
-*scenario ply=37 target=4c4d bad=S*5h,S*6h,S*4h,6c5d,S*4b,S*3g,S*4g,S*5g,S*5i,S*5d,S*5b,6c5b desc=38手目（後手番）。4四飛が当然の一手（4七歩成もセーフ）。S*4g は論外＝4七に先手の歩がいることは自分の観測だけで確定できる（deduce::immobile_opponent_pawns の実例）
+*scenario ply=37 target=4c4d scores=4c4d:8,S*5h:2,S*6h:2,S*4h:2,4f4g+:6,6c5d:2,S*4b:2,S*3g:2,S*4g:0,S*5g:2,S*5i:2,S*5d:2,S*5b:2,6c5b:2 bad=S*5h,S*6h,S*4h,6c5d,S*4b,S*3g,S*4g,S*5g,S*5i,S*5d,S*5b,6c5b desc=38手目（後手番）。4四飛が当然の一手（4七歩成もセーフ）。S*4g は論外＝4七に先手の歩がいることは自分の観測だけで確定できる（deduce::immobile_opponent_pawns の実例）
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

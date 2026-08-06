@@ -1,4 +1,4 @@
-*scenario ply=76 target=G*5b bad=4a3b+,4a5b+,3c4d,4a2c+,4a6c+,7g7f,S*4b,G*7c,S*7c,G*6c,S*4c,G*4c,S*4d,1g1f,3c4c,3c2b,5e6d,G*7d,G*8e,5e6e,G*6e,S*8d,S*8f,S*7f,G*8f,G*7f,G*4d desc=77手目（先手番）。4二龍・3二龍・5二金打・4三歩打・4四歩打があり（6三銀打はややリスキー）。実戦は5二銀打（リスト外）
+*scenario ply=76 target=G*5b scores=4a3b+:2,4a5b+:2,3c4d:2,4a2c+:2,4a6c+:2,7g7f:2,S*4b:2,3c4b:8,3c3b:8,G*7c:2,S*6c:6,S*7c:2,G*6c:2,G*5b:8,P*4c:8,S*4c:2,G*4c:2,P*4d:8,S*4d:2,1g1f:2,3c4c:2,3c2b:2,5e6d:2,G*7d:2,G*8e:2,5e6e:2,G*6e:2,S*8d:2,S*8f:2,S*7f:2,G*8f:2,G*7f:2,G*4d:2 bad=4a3b+,4a5b+,3c4d,4a2c+,4a6c+,7g7f,S*4b,G*7c,S*7c,G*6c,S*4c,G*4c,S*4d,1g1f,3c4c,3c2b,5e6d,G*7d,G*8e,5e6e,G*6e,S*8d,S*8f,S*7f,G*8f,G*7f,G*4d desc=77手目（先手番）。4二龍・3二龍・5二金打・4三歩打・4四歩打があり（6三銀打はややリスキー）。実戦は5二銀打（リスト外）
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

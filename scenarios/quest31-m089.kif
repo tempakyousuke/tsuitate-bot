@@ -1,4 +1,4 @@
-*scenario ply=88 target=5b6c+ bad=4a3b+,5b5a+,P*4d,P*2b,4a2c+,P*4c,6d7c,6d6c,G*8c,G*7c,G*8b,6d5c,3c5c desc=89手目（先手番）。6三銀成・6三金打・6二金打があり。実戦は7五歩（候補外）
+*scenario ply=88 target=5b6c+ scores=4a3b+:2,5b5a+:2,P*4d:2,P*2b:2,4a2c+:2,P*4c:2,5b6c+:8,6d7c:2,6d6c:2,G*6c:8,G*8c:2,G*7c:2,G*8b:2,G*6b:8,6d5c:2,3c5c:2 bad=4a3b+,5b5a+,P*4d,P*2b,4a2c+,P*4c,6d7c,6d6c,G*8c,G*7c,G*8b,6d5c,3c5c desc=89手目（先手番）。6三銀成・6三金打・6二金打があり。実戦は7五歩（候補外）
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
