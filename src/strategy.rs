@@ -929,6 +929,33 @@ fn promo_realized_floor() -> f64 {
     })
 }
 
+/// 残存する相手駒（玉除く）の平均交換価値（`foul_occ_attack_w` の素材）。
+/// 観測のみで決まる: 初期の19枚から自分が取った駒種を引く
+fn mean_remaining_opp_value(log: &ObservationLog) -> f64 {
+    use Role::*;
+    let mut remaining: Vec<Role> = vec![
+        Pawn, Pawn, Pawn, Pawn, Pawn, Pawn, Pawn, Pawn, Pawn, Lance, Lance, Knight, Knight,
+        Silver, Silver, Gold, Gold, Bishop, Rook,
+    ];
+    for e in log.events() {
+        if let Observation::MyMove {
+            captured: Some(role),
+            ..
+        } = e
+        {
+            let base = unpromote_role(*role);
+            if let Some(pos) = remaining.iter().position(|&r| r == base) {
+                remaining.swap_remove(pos);
+            }
+        }
+    }
+    if remaining.is_empty() {
+        0.0
+    } else {
+        remaining.iter().map(|&r| exchange_value(r)).sum::<f64>() / remaining.len() as f64
+    }
+}
+
 /// `promo_king_prox` の近接マップ。マスごとに `(1-w) + w × 1/(1+d_min)`
 /// （d_min = 敵玉候補集合への最小チェビシェフ距離）。候補集合が空なら None
 /// （= 重みなし）。deduce 由来なので粒子不要・ノイズゼロ
@@ -1581,6 +1608,16 @@ pub struct EvalParams {
     /// deduce 由来なので粒子不要・ノイズゼロ（promo_potential の設計を保つ）。
     /// 0 = 従来挙動。w=1 で「玉候補の隣 1/2 vs 8マス先 1/9」
     pub promo_king_prox: f64,
+    /// **この手番の打ち反則で確定した駒への当たり**（2026-08-07、quest31-m090f1
+    /// が発端）。自分の打ちが反則になったマスには相手駒がいることが100%確定し、
+    /// しかも反則では手番が変わらないので**情報は今この瞬間まで新鮮**。
+    /// なのに従来はそのマスへ利きを付ける手（実戦の人間: 7八歩打の反則 →
+    /// 7七歩打で確定駒に当てる）に何の価値も付かず、73〜81位に沈んでいた。
+    /// drop_probe_w（プローブ = 情報を買う）の**回収側**。
+    /// 着手駒（玉以外）が着手後にそのマスへ利きを持つ手へ
+    /// `w × 残存敵駒の平均交換価値` を gain 内（p_legal 割引の内側）へ加点。
+    /// 観測のみ由来・粒子不要。王手中は無効。0 = 従来挙動
+    pub foul_occ_attack_w: f64,
     /// **taint 粒子の占有合意で打ちの反則確率を下げる**（2026-08-03、ユーザー指摘の
     /// 38手目 `S*4g` が発端）。厳密粒子が全滅した決定では `p_legal` が
     /// `prior_legal` だけで決まるが、その打ち側は**マスに依らない定数**
@@ -1894,6 +1931,8 @@ impl Default for EvalParams {
             king_capture_reveal: 10.0,
             // 成りポテンシャルの敵玉近接重み（2026-08-05）。0 = 従来と同一挙動
             promo_king_prox: 0.0,
+            // 打ち反則で確定した駒への当たり（2026-08-07）。0 = 従来と同一挙動
+            foul_occ_attack_w: 0.0,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
             // 反則経済の新項（2026-07-16、オラクル測定で36ptの伸びしろを確認後に追加）。
@@ -1990,7 +2029,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 68] = [
+    pub const SPECS: [ParamSpec; 69] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -2375,6 +2414,12 @@ impl EvalParams {
             lo: 0.0,
             hi: 1.0,
         },
+        ParamSpec {
+            // 残存敵駒の平均交換価値（約3）に掛かる。w=1.5 で銀1枚ぶん相当
+            name: "foul_occ_attack_w",
+            lo: 0.0,
+            hi: 3.0,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -2447,6 +2492,7 @@ impl EvalParams {
             self.anchor_move_w,
             self.king_capture_reveal,
             self.promo_king_prox,
+            self.foul_occ_attack_w,
         ]
     }
 
@@ -2521,6 +2567,7 @@ impl EvalParams {
             anchor_move_w: v[65],
             king_capture_reveal: v[66],
             promo_king_prox: v[67],
+            foul_occ_attack_w: v[68],
         }
     }
 }
@@ -2823,6 +2870,18 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
     {
         Some(w) => EvalParams {
             shuffle_penalty: w,
+            ..params
+        },
+        None => params,
+    };
+    // 打ち反則で確定した駒への当たり（0 で従来挙動）
+    let params = match std::env::var("TSUITATE_FOUL_OCC_ATTACK_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            foul_occ_attack_w: w,
             ..params
         },
         None => params,
@@ -3448,6 +3507,24 @@ impl Strategy for EstimatorStrategy {
             && !view.you_in_check)
             .then(|| hand_option_context(view));
 
+        // この手番の打ち反則で占有が確定したマスと、残存敵駒の平均交換価値
+        // （`foul_occ_attack_w`）。反則では手番が変わらないので情報は完全に新鮮。
+        // 平均価値は観測のみで決まる: 相手の初期19枚（玉除く）− 自分が取った駒
+        let turn_foul_occ: Option<([bool; 81], f64)> = (params.foul_occ_attack_w != 0.0
+            && !view.you_in_check)
+            .then(|| {
+                let mut arr = [false; 81];
+                let mut any = false;
+                for u in foul_tried {
+                    if let Some(ShogiMove::Drop { to, .. }) = parse_usi(u) {
+                        arr[crate::belief_features::sq_index(to)] = true;
+                        any = true;
+                    }
+                }
+                any.then(|| (arr, mean_remaining_opp_value(log)))
+            })
+            .flatten();
+
         let rng = &mut self.rng;
         // 王手中の玉の手の gain 平均化判定用（check_king_gain_mean の doc 参照）
         let my_king = king_square(view);
@@ -3499,6 +3576,7 @@ impl Strategy for EstimatorStrategy {
                 promo_pot_before,
                 major_path_before,
                 promo_prox.as_ref(),
+                turn_foul_occ.as_ref(),
                 hand_option.as_ref(),
                 &my_drop_foul_squares,
                 &own_attack,
@@ -4733,6 +4811,10 @@ fn evaluate(
     // None なら重みなし = 従来挙動。promo_pot_before と着手後の両方が
     // 同じマップを使う（差分形の整合）
     promo_prox: Option<&[f64; 81]>,
+    // この手番の打ち反則で占有が確定したマスと残存敵駒の平均交換価値
+    // （`foul_occ_attack_w`。choose() が「w≠0・王手中でない・今手番に
+    // 打ち反則あり」のゲートを掛けて渡す）
+    turn_foul_occ: Option<&([bool; 81], f64)>,
     // 持ち駒オプション価値（`hand_option_w`）の決定点コンテキスト。Some のとき
     // だけ項が有効（choose() が「w≠0・王手中でない」のゲートを掛けて渡す）。
     // 打つ手に「最良打ちポテンシャルとの不足分」の減点を掛ける
@@ -5354,6 +5436,60 @@ fn evaluate(
         0.0
     };
 
+    // この手番の打ち反則で占有が確定したマスへ、着手駒（玉以外）が着手後に
+    // 利きを付ける手への加点（`foul_occ_attack_w`。EvalParams の doc 参照）。
+    // 反則直後は手番が保たれるので確定情報は完全に新鮮 = 次の相手の1手より
+    // 前にこの当たりが立つ。玉は露見リスク側（king_capture_reveal）の領分
+    let foul_occ_attack = match turn_foul_occ {
+        Some((occ, mean_val)) if !view.you_in_check => {
+            let mut pieces = view.your_pieces.clone();
+            let moved: Option<usize> = match *mv {
+                ShogiMove::Board { from, to, promote } => {
+                    let from_usi = make_usi_square(from);
+                    pieces
+                        .iter()
+                        .position(|p| p.square == from_usi)
+                        .filter(|&i| pieces[i].role != Role::King)
+                        .inspect(|&i| {
+                            if promote {
+                                if let Some(r) = promote_role(pieces[i].role) {
+                                    pieces[i].role = r;
+                                }
+                            }
+                            pieces[i].square = make_usi_square(to);
+                        })
+                }
+                ShogiMove::Drop { role, to } => {
+                    pieces.push(VisiblePiece {
+                        square: make_usi_square(to),
+                        role,
+                    });
+                    Some(pieces.len() - 1)
+                }
+            };
+            match moved {
+                Some(i) => {
+                    let p = pieces[i].clone();
+                    let hits_confirmed = crate::board::defend_targets(&pieces, &p, me)
+                        .iter()
+                        .any(|&s| occ[crate::belief_features::sq_index(s)]);
+                    if hits_confirmed {
+                        // 「同じ仕事なら最安の駒で」: 当てる駒が高いほど、
+                        // 取り返された/かわされたときの損が大きい。
+                        // 素の実測では 6六桂打（悪手・桂3.5）が 7七歩打
+                        // （正解・歩1.0）と同点で上に来た
+                        params.foul_occ_attack_w * mean_val
+                            / (1.0 + exchange_value(p.role))
+                    } else {
+                        0.0
+                    }
+                }
+                None => 0.0,
+            }
+        }
+        _ => 0.0,
+    };
+
     let gain = expected + advance_bias + development + coverage + mate_threat - mate_risk
         - king_holes
         - anchor_move_pen
@@ -5364,6 +5500,7 @@ fn evaluate(
         - hand_option_pen
         - board_discount
         + effect_value
+        + foul_occ_attack
         + blind_recapture
         + blind_belief_gain;
     // 打ちプローブの反則情報価値: 反則枝（占有粒子）の期待回収値 ×
@@ -6610,6 +6747,7 @@ pub(crate) mod tests {
         assert_field_index!(anchor_move_w);
         assert_field_index!(king_capture_reveal);
         assert_field_index!(promo_king_prox);
+        assert_field_index!(foul_occ_attack_w);
 
         // 既定値は自分の SPECS 範囲内にあること（SPSA の中心点が
         // クランプで別の値へ化けるのを防ぐ。位置ズレの二重の網でもある）
