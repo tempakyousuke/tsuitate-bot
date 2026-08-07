@@ -85,9 +85,12 @@ jobs:
             hits="0/${{ inputs.trials }}"
           fi
           fouls=$(grep -oE '追加の反則の総数: [0-9]+' result.txt | grep -oE '[0-9]+$' || echo 0)
+          # 平均得点（scores= 付きシナリオのみ出る。無ければ "-"）
+          score=$(grep -oE '平均得点: [0-9.]+/10（未採点の選択 [0-9]+' result.txt \
+            | sed -E 's/平均得点: ([0-9.]+)\/10（未採点の選択 ([0-9]+)/\1(未採点\2)/' || true)
           others=$(awk '/受理された手の内訳/{f=1;next} /追加の反則の総数/{f=0} f && !/← 注目手/ {gsub(/^ +/,""); print}' result.txt | head -3 | paste -sd' ' -)
-          printf '%s\t%s\t%s\t%s\t%s\n' \
-            "${{ matrix.scenario }}" "${target:--}" "$hits" "$fouls" "${others:--}" > line.tsv
+          printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+            "${{ matrix.scenario }}" "${target:--}" "$hits" "${score:--}" "$fouls" "${others:--}" > line.tsv
           cat line.tsv
 
       - name: Write job summary
@@ -123,9 +126,11 @@ jobs:
           {
             echo "## Scenario Suite（各 ${{ inputs.trials }} 試行 / 戦略 ${{ inputs.strategy }} / env '${{ inputs.env }}'）"
             echo ""
-            echo '| シナリオ | 注目手 | 選択 | 反則 | 他の選択 |'
-            echo '|---|---|---|---|---|'
-            cat results/*/line.tsv | sort | awk -F'\t' '{printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5}'
+            echo '| シナリオ | 注目手 | 選択 | 得点/10 | 反則 | 他の選択 |'
+            echo '|---|---|---|---|---|---|'
+            cat results/*/line.tsv | sort | awk -F'\t' '{printf "| %s | %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5, $6}'
+            # 得点の全体平均（scores= 付きシナリオのみ対象）
+            cat results/*/line.tsv | awk -F'\t' '$4 != "-" {sum += $4; n++} END {if (n) printf "\n**平均得点の全体平均: %.2f/10（%d件）**\n", sum/n, n}'
           } >> "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY"
 

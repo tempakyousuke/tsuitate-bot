@@ -1,4 +1,4 @@
-*scenario ply=39 fouls=S*5f target=S*3h scores=S*5h:2,S*4h:2,S*6h:2,4f4g+:8,7a7b:2,S*2b:2,S*1d:2,S*3e:2,S*4c:2,S*3c:2,S*1b:2,S*8b:2,P*2h:8 bad=S*5h,S*4h,S*6h,7a7b,S*2b,S*1d,S*3e,S*4c,S*3c,S*1b,S*8b desc=40手目・5六銀打(S*5f)の反則後（後手番）。狙いは同じで3八銀打が本命、4七歩成もあり
+*scenario ply=39 fouls=S*5f target=S*3h scores=S*5h:2,S*4h:2,S*6h:2,4f4g+:8,7a7b:2,S*2b:1,S*1d:1,S*3e:2,S*4c:1,S*3c:1,S*1b:1,S*8b:1,P*2h:7 bad=S*5h,S*4h,S*6h,7a7b,S*2b,S*1d,S*3e,S*4c,S*3c,S*1b,S*8b desc=40手目・5六銀打(S*5f)の反則後（後手番）。狙いは同じで3八銀打が本命、4七歩成もあり
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

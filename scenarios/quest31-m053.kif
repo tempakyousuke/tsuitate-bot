@@ -1,4 +1,4 @@
-*scenario ply=52 target=5h4g scores=G*5e:2,5h4g:8,B*1h:2,B*7f:2,B*2g:2,B*9f:2,B*3f:2,P*4b:2,B*4b:2,3g3f:2,B*3e:2,B*3a:2,B*3d:2,3b4b:2,3c4b:2,3b2b:2,B*1f:2,B*4c:2,B*8f:2 bad=G*5e,B*1h,B*7f,B*2g,B*9f,B*3f,P*4b,B*4b,3g3f,B*3e,B*3a,B*3d,3b4b,3c4b,3b2b,B*1f,B*4c,B*8f desc=53手目（先手番）。実戦は同金（4七の取り合い）
+*scenario ply=52 target=5h4g scores=G*5e:2,5h4g:7,B*1h:2,B*7f:2,B*2g:1,B*9f:2,B*3f:3,P*4b:2,B*4b:2,3g3f:2,B*3e:2,B*3a:2,B*3d:1,3b4b:3,3c4b:3,3b2b:1,B*1f:2,B*4c:2,B*8f:2 bad=G*5e,B*1h,B*7f,B*2g,B*9f,P*4b,B*4b,3g3f,B*3e,B*3a,B*3d,3b2b,B*1f,B*4c,B*8f desc=53手目（先手番）。実戦は同金（4七の取り合い）
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

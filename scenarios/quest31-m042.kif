@@ -1,4 +1,4 @@
-*scenario ply=41 target=4f4g+ scores=3h4i+:2,4f4g+:8,3h2i+:2,7a7b:2,6c7b:2,3h3i+:2,6b7b:2,3h4g+:2,2c2g+:8,2c2i+:8,P*2b:2 bad=3h4i+,3h2i+,7a7b,6c7b,3h3i+,6b7b,3h4g+,P*2b desc=42手目（後手番）。4七歩成が本命。2七飛成・2九飛成もあり
+*scenario ply=41 target=4f4g+ scores=3h4i+:2,4f4g+:10,3h2i+:2,7a7b:2,6c7b:2,3h3i+:2,6b7b:2,3h4g+:2,2c2g+:7,2c2i+:7,P*2b:1 bad=3h4i+,3h2i+,7a7b,6c7b,3h3i+,6b7b,3h4g+,P*2b desc=42手目（後手番）。4七歩成が本命。2七飛成・2九飛成もあり
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
