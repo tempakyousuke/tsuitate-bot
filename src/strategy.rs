@@ -392,6 +392,23 @@ fn gen_nonpromote() -> bool {
     *V.get_or_init(|| std::env::var("TSUITATE_GEN_NONPROMOTE").is_ok_and(|v| v == "1"))
 }
 
+/// 成る手の取られリスクを**成る前の駒価値**で数えるか（既定は無効 = 従来の
+/// 成った後の駒種で数える）。`TSUITATE_PROMO_RISK_PREROLE=1` で有効。
+/// 凍結版はこの名前を知らない。
+///
+/// GEN_NONPROMOTE の初回計測（2026-08-08）で露呈した歪みへの対応:
+/// 4七歩成（quest31-m016/018/020/024/026/028 の本命・従来20/20）が不成の
+/// 4七歩へ 20/20 で流れた。原因は `recapture_risk` と床が着手後の駒種
+/// （と金 ≈3）でリスクを数えるため、成ると取り返し損の見積もりが歩(1)の
+/// 3倍になり、promo_potential の実現加点（0.2×Δ利き5 ≈ 1.0）では覆せない。
+/// **取り返される分岐で相手が得るのは元駒相当**（と金→持ち駒の歩）なので、
+/// 成/不成のリスク差は本来ほぼゼロ: リスクは「持ち込んだ駒」の価値で数え、
+/// 成りの付加価値は生き残った分岐（threat / promo 実現）でだけ実現させる
+fn promo_risk_prerole() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TSUITATE_PROMO_RISK_PREROLE").is_ok_and(|v| v == "1"))
+}
+
 /// V1（利き数）のノブ。**既定は両方 無効**（＝従来の二値の利き判定）。
 ///
 /// やねうら王 Lv4 の「利き数」（+R30）をついたてへ持ち込む実験だったが、
@@ -4993,6 +5010,19 @@ fn evaluate(
             .piece_at(to)
             .map(|p| exchange_value(p.role))
             .unwrap_or(0.0);
+        // 成る手のリスクは成る前の駒価値で数える（promo_risk_prerole の doc 参照。
+        // 既定は従来どおり own_after = 成った後の駒種）
+        let own_risk = match *mv {
+            ShogiMove::Board {
+                from,
+                promote: true,
+                ..
+            } if promo_risk_prerole() => pos
+                .piece_at(from)
+                .map(|p| exchange_value(p.role))
+                .unwrap_or(own_after),
+            _ => own_after,
+        };
         // 玉隣接への無支え進入（king_adj_entry_w）: この粒子で着地マスが相手玉の
         // 8近傍にあり自分の利きの支えが無いなら、王手宣言・接触で存在がバレて
         // 玉や近傍の守りに回収される前提の回収リスクを駒価値スケールで敷く
@@ -5001,7 +5031,7 @@ fn evaluate(
         if params.king_adj_entry_w != 0.0 && !view.you_in_check {
             if let Some(ok) = next.king_square(opp) {
                 if cheb(to, ok) <= 1 && next.attack_count(to, me) == 0 {
-                    v -= params.king_adj_entry_w * own_after;
+                    v -= params.king_adj_entry_w * own_risk;
                 }
             }
         }
@@ -5010,7 +5040,7 @@ fn evaluate(
         } else {
             params.camp_known_quiet
         };
-        let mut floor = own_after * camp_defended_prior(to, me, params.camp_scale) * known_factor;
+        let mut floor = own_risk * camp_defended_prior(to, me, params.camp_scale) * known_factor;
         if captured_value > 0.0 {
             // 取ったマスは相手に通知される。粒子に守りが見えなくても
             // 取り返しの残留リスクを敷く（= 等価な取りは安い駒で取る）。
@@ -5023,14 +5053,18 @@ fn evaluate(
             let reveal_after = if !view.you_in_check
                 && next.piece_at(to).is_some_and(|p| p.role == Role::King)
             {
-                params.king_capture_reveal.max(own_after)
+                params.king_capture_reveal.max(own_risk)
             } else {
-                own_after
+                own_risk
             };
             floor = floor.max(reveal_after * params.capture_reveal_risk);
         }
-        let mover_risk =
-            mover_w * recapture_risk(&next, me, to, params.recapture_defended).max(floor);
+        let mut recap = recapture_risk(&next, me, to, params.recapture_defended);
+        if own_risk != own_after && own_after > 0.0 {
+            // recapture_risk は着手後の駒種で価値を数えるので成る前の価値へ換算
+            recap *= own_risk / own_after;
+        }
+        let mover_risk = mover_w * recap.max(floor);
         let hidden_risk = exposed_capture_risk(&next, me, Some(to), known, params);
         // ここの max は**外さない**（2026-08-03 実測）。着手駒の危険と
         // 置き去りの危険を `top + w·min` で足す版は、着手駒側に
@@ -5674,15 +5708,30 @@ fn depth2_delta(
         // 静かな応手（駒損なし）: 重みを溜めて王手ペナルティだけ後でサンプル近似
         let mut quiet: Vec<(ShogiMove, f64)> = vec![];
         let mut quiet_w = 0.0;
+        // 成る手のリスクは成る前の駒価値で数える（promo_risk_prerole。
+        // stage1 の own_risk と同じ規約を、応手で着手駒が取られる分岐にも適用）
+        let mover_prerole = match *mv {
+            ShogiMove::Board {
+                from,
+                promote: true,
+                ..
+            } if promo_risk_prerole() => pos.piece_at(from).map(|p| exchange_value(p.role)),
+            _ => None,
+        };
         for (reply, rw) in &replies {
             let reply_to = match *reply {
                 ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
             };
-            let lost = next
+            let mut lost = next
                 .piece_at(reply_to)
                 .filter(|p| p.color == me)
                 .map(|p| exchange_value(p.role))
                 .unwrap_or(0.0);
+            if reply_to == to && lost > 0.0 {
+                if let Some(pre) = mover_prerole {
+                    lost = pre;
+                }
+            }
             if lost <= 0.0 {
                 quiet_w += rw;
                 quiet.push((*reply, *rw));
