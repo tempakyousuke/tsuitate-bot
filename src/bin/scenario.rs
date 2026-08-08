@@ -34,7 +34,7 @@ use tsuitate_bot::observation::Observation;
 use tsuitate_bot::protocol::{Color, Role};
 use tsuitate_bot::scenario_core::{
     ChoiceStats, Replayed, Scenario, apply_scenario_fouls, build_estimator, choice_trials,
-    choice_trials_batch, clone_log, load_scenario,
+    choice_trials_batch, choice_trials_batch_range_with, clone_log, kifu_key, load_scenario,
     make_view, replay, scenarios_dir, side_idx, weighted_unique_particles,
 };
 use tsuitate_bot::shogi::{Outcome, Position, ShogiMove, parse_usi, unpromote_role};
@@ -46,7 +46,9 @@ fn usage() -> &'static str {
   cargo run --release --bin scenario -- <名前> diag [推定器数=10]
   cargo run --release --bin scenario -- <名前> continue [対局数=10] [手番側戦略] [相手戦略]
   cargo run --release --bin scenario -- suite [試行数=10] [戦略=estimator]
-  共通フラグ: --ply N / --target USI / --diag 5g,4h"
+  cargo run --release --bin scenario -- merge <TRIAL行入りファイル...>
+  共通フラグ: --ply N / --target USI / --diag 5g,4h
+  suite用フラグ: --seed-base N / --tsv / --only 名前,..."
 }
 
 fn exit_usage(msg: &str) -> ! {
@@ -761,17 +763,32 @@ fn continue_games(sc: &Scenario, rep: &Replayed, games: u64, name_me: &str, name
     }
 }
 
-/// scenarios/*.kif を全部回して注目手一致率を表にする（回帰テスト用）
-fn run_suite(trials: u64, name: &str) {
+/// scenarios/*.kif を全部回して注目手一致率を表にする（回帰テスト用）。
+///
+/// `seed_base` でシード列を `seed_base..seed_base+trials` にずらせる
+/// （CI のシードシャード実行: 各ランナーが trials=1 で別シードを担当し、
+/// merge モードで合算する）。`tsv` なら試行ごとの機械可読行
+/// `TRIAL\t名前\tシード\t受理手\t反則数` も出力する。
+/// `only` はシナリオ名（ファイル名から .kif を除いたもの）のフィルタ。
+///
+/// (棋譜, 手番側) のグループごとにワーカースレッドへ分配して並列実行する
+/// （bin/tune のシナリオ目的関数と同じ分割。ワーカー数は物理コア数まで =
+/// choose の壁時計予算を奪い合わない範囲。`SCENARIO_WORKERS` で上書き可）
+fn run_suite(trials: u64, name: &str, seed_base: u64, tsv: bool, only: &[String]) {
     let dir = scenarios_dir();
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("{} を読めません: {e}", dir.display()))
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|x| x == "kif"))
+        .filter(|p| {
+            only.is_empty()
+                || p.file_stem()
+                    .is_some_and(|s| only.iter().any(|o| o == &s.to_string_lossy()))
+        })
         .collect();
     paths.sort();
     println!(
-        "スイート: {} 件 / 戦略 {name} / 各 {trials} 試行（同一棋譜×同一手番は構築を共有）",
+        "スイート: {} 件 / 戦略 {name} / 各 {trials} 試行 seed {seed_base}〜（同一棋譜×同一手番は構築を共有）",
         paths.len()
     );
     println!();
@@ -788,15 +805,81 @@ fn run_suite(trials: u64, name: &str) {
         apply_scenario_fouls(&mut rep, &sc.fouls);
         loaded.push((sc, rep));
     }
-    let items: Vec<(&Scenario, &Replayed)> = loaded.iter().map(|(sc, rep)| (sc, rep)).collect();
-    let total = items.len() as u64 * trials;
-    let mut done = 0u64;
-    let all_stats = choice_trials_batch(&items, trials, name, |_, _, _, _| {
-        done += 1;
-        eprint!("\r{done}/{total} 試行");
+
+    // (棋譜, 手番側) のパーティション（choice_trials_batch の内部グループと同じ）。
+    // 重いグループ（Σply 大）から着手してワーカーの負荷を均す
+    let mut parts: Vec<((u64, tsuitate_bot::protocol::Color), Vec<usize>)> = vec![];
+    for (i, (sc, rep)) in loaded.iter().enumerate() {
+        let key = (kifu_key(&sc.kifu), rep.pos.turn());
+        match parts.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, v)) => v.push(i),
+            None => parts.push((key, vec![i])),
+        }
+    }
+    parts.sort_by_key(|(_, idxs)| {
+        std::cmp::Reverse(idxs.iter().map(|&i| loaded[i].0.ply).max().unwrap_or(0))
+    });
+
+    let workers = std::env::var("SCENARIO_WORKERS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(4)
+        })
+        .clamp(1, parts.len().max(1));
+
+    let total = loaded.len() as u64 * trials;
+    let done = std::sync::atomic::AtomicU64::new(0);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    // パーティションごとの結果: (統計, TSV行 = (グローバルindex, シード, 受理手, 反則数))
+    type Rows = Vec<(usize, u64, String, u32)>;
+    let results: Vec<std::sync::Mutex<Option<(Vec<ChoiceStats>, Rows)>>> =
+        parts.iter().map(|_| std::sync::Mutex::new(None)).collect();
+    let factory: &(dyn Fn(u64) -> Box<dyn strategy::Strategy + Send> + Sync) =
+        &|s| strategy::make_seeded(name, s).expect("未知の戦略名");
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| {
+                loop {
+                    let k = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if k >= parts.len() {
+                        break;
+                    }
+                    let idxs = &parts[k].1;
+                    let items: Vec<(&Scenario, &Replayed)> =
+                        idxs.iter().map(|&i| (&loaded[i].0, &loaded[i].1)).collect();
+                    let mut rows: Rows = vec![];
+                    let stats = choice_trials_batch_range_with(
+                        &items,
+                        seed_base..seed_base + trials,
+                        factory,
+                        |il, seed, accepted, foul_seq| {
+                            rows.push((idxs[il], seed, accepted.to_string(), foul_seq.len() as u32));
+                            let d = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                            eprint!("\r{d}/{total} 試行");
+                        },
+                    );
+                    *results[k].lock().unwrap() = Some((stats, rows));
+                }
+            });
+        }
     });
     eprintln!();
-    for ((sc, _), stats) in loaded.iter().zip(&all_stats) {
+
+    let mut stats_by_idx: Vec<Option<ChoiceStats>> = (0..loaded.len()).map(|_| None).collect();
+    let mut all_rows: Rows = vec![];
+    for ((_, idxs), cell) in parts.iter().zip(results) {
+        let (stats, rows) = cell.into_inner().unwrap().expect("パーティション未評価");
+        for (&i, st) in idxs.iter().zip(stats) {
+            stats_by_idx[i] = Some(st);
+        }
+        all_rows.extend(rows);
+    }
+
+    for ((sc, _), stats) in loaded.iter().zip(&stats_by_idx) {
+        let stats = stats.as_ref().expect("全シナリオが評価されている");
         let hits = stats.target_hits(&sc.target);
         let others: Vec<String> = stats
             .tally
@@ -825,13 +908,125 @@ fn run_suite(trials: u64, name: &str) {
             others.join(" ")
         );
     }
+    if tsv {
+        println!();
+        all_rows.sort();
+        for (i, seed, accepted, fouls) in &all_rows {
+            println!("TRIAL\t{}\t{seed}\t{accepted}\t{fouls}", loaded[*i].0.name);
+        }
+    }
+}
+
+/// シードシャード実行の TSV（`suite --tsv` の `TRIAL` 行）を合算して
+/// suite と同じ集計の markdown 表を出す（scenario.yml の aggregate ジョブ用）。
+/// 集計の意味論（target_hits / bad_hits / mean_score）は ChoiceStats を
+/// そのまま使うので suite と完全に一致する
+fn run_merge(files: &[String]) {
+    // シナリオ名 → (受理手カウント, 反則合計, 試行数)
+    let mut agg: std::collections::BTreeMap<String, (HashMap<String, u32>, u32, u32)> =
+        std::collections::BTreeMap::new();
+    for f in files {
+        let text = std::fs::read_to_string(f)
+            .unwrap_or_else(|e| exit_usage(&format!("{f} を読めません: {e}")));
+        for line in text.lines() {
+            let mut cols = line.split('\t');
+            if cols.next() != Some("TRIAL") {
+                continue;
+            }
+            let (Some(name), Some(_seed), Some(accepted), Some(fouls)) =
+                (cols.next(), cols.next(), cols.next(), cols.next())
+            else {
+                exit_usage(&format!("TRIAL 行を読めません: {line}"));
+            };
+            let fouls: u32 = fouls
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| exit_usage(&format!("TRIAL 行の反則数を読めません: {line}")));
+            let e = agg.entry(name.to_string()).or_default();
+            *e.0.entry(accepted.to_string()).or_insert(0) += 1;
+            e.1 += fouls;
+            e.2 += 1;
+        }
+    }
+    if agg.is_empty() {
+        exit_usage("TRIAL 行が見つかりません（suite --tsv の出力を渡してください）");
+    }
+    let mut bad_total = 0u32;
+    let mut bad_n = 0u32;
+    let mut score_sum = 0.0f64;
+    let mut score_n = 0u32;
+    let mut unscored_total = 0u32;
+    println!("| シナリオ | 手目 | 注目手 | 選択 | 不合格 | 得点/10 | 反則 | 他の選択 |");
+    println!("|---|---|---|---|---|---|---|---|");
+    for (sc_name, (tally, fouls, trials)) in &agg {
+        let sc = match load_scenario(sc_name, None, None, None) {
+            Ok(sc) => sc,
+            Err(e) => {
+                println!("| {sc_name} | - | 読み込み失敗: {e} | - | - | - | - | - |");
+                continue;
+            }
+        };
+        let mut tally: Vec<(String, u32)> = tally.clone().into_iter().collect();
+        tally.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let stats = ChoiceStats {
+            tally,
+            total_fouls: *fouls,
+        };
+        let hits = stats.target_hits(&sc.target);
+        let bad_cell = if sc.bad.is_empty() {
+            "-".to_string()
+        } else {
+            let b = stats.bad_hits(&sc.bad);
+            bad_total += b;
+            bad_n += 1;
+            format!("{b}/{trials}")
+        };
+        let score_cell = if sc.scores.is_empty() {
+            "-".to_string()
+        } else {
+            let (mean, unscored) = stats.mean_score(&sc.scores);
+            score_sum += mean;
+            score_n += 1;
+            unscored_total += unscored;
+            format!("{mean:.2}(未採点{unscored})")
+        };
+        let others: Vec<String> = stats
+            .tally
+            .iter()
+            .filter(|(usi, _)| *usi != sc.target)
+            .take(3)
+            .map(|(usi, n)| format!("{usi}×{n}"))
+            .collect();
+        println!(
+            "| {} | {} | {} | {hits}/{trials} | {bad_cell} | {score_cell} | {} | {} |",
+            sc.name,
+            sc.ply + 1,
+            sc.target,
+            stats.total_fouls,
+            others.join(" ")
+        );
+    }
+    println!();
+    if bad_n > 0 {
+        println!("**不合格計の合計: {bad_total}（{bad_n}件）**");
+    }
+    if score_n > 0 {
+        println!(
+            "**平均得点の全体平均: {:.3}/10（{score_n}件、未採点合計{unscored_total}）**",
+            score_sum / f64::from(score_n)
+        );
+    }
 }
 
 fn main() {
-    // フラグ（--ply N / --target USI / --diag 5g,4h）を先に抜き取る
+    // フラグ（--ply N / --target USI / --diag 5g,4h / suite用 --seed-base N /
+    // --tsv / --only 名前,...）を先に抜き取る
     let mut ply_flag: Option<usize> = None;
     let mut target_flag: Option<String> = None;
     let mut diag_flag: Option<String> = None;
+    let mut seed_base: u64 = 0;
+    let mut tsv = false;
+    let mut only: Vec<String> = vec![];
     let mut args: Vec<String> = vec![];
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -864,6 +1059,29 @@ fn main() {
                 diag_flag = Some(value.clone());
                 i += 2;
             }
+            "--seed-base" => {
+                let Some(value) = raw.get(i + 1) else {
+                    exit_usage("--seed-base には値が必要です");
+                };
+                seed_base = parse_u64_arg("--seed-base", value);
+                i += 2;
+            }
+            "--tsv" => {
+                tsv = true;
+                i += 1;
+            }
+            "--only" => {
+                let Some(value) = raw.get(i + 1) else {
+                    exit_usage("--only には値が必要です");
+                };
+                only = value
+                    .split([',', ' '])
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                i += 2;
+            }
             _ => {
                 args.push(raw[i].clone());
                 i += 1;
@@ -876,7 +1094,14 @@ fn main() {
         let trials = args.get(1).map(|s| parse_u64_arg("試行数", s)).unwrap_or(10);
         let name = args.get(2).map(String::as_str).unwrap_or("estimator");
         validate_strategy_name(name);
-        run_suite(trials, name);
+        run_suite(trials, name, seed_base, tsv, &only);
+        return;
+    }
+    if spec == "merge" {
+        if args.len() < 2 {
+            exit_usage("merge には TRIAL 行入りのファイルを1つ以上指定してください");
+        }
+        run_merge(&args[1..]);
         return;
     }
     if spec == "batch" {

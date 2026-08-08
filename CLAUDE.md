@@ -120,14 +120,25 @@
   共有し、各決定点は `Strategy::clone_boxed` のスナップショットに試行させる
   （GUI の IncrementalEstimator の Strategy 版。等価性はテストで担保。
   凍結版は clone_boxed 非対応なので従来どおり毎回作り直し）。
-  **suite はローカル直列だと30分超かかるので CI で並列実行できる**
+  `fouls=` 注入シナリオも 2026-08-08 からチェーン共有する（共有チェーンは
+  素のリプレイのプレフィックスまで進め、注入反則の尾はスナップショット側だけに
+  食わせる。等価性テストあり）。
+  suite は (棋譜,手番) グループ単位でコア数までスレッド並列
+  （`SCENARIO_WORKERS` で上書き可）。
+  **全件 suite は CI のシードシャードで回す**
   （`.github/workflows/scenario.yml`、手動起動のみ）:
   `gh workflow run scenario.yml --ref <ブランチ> -f trials=20`。
-  1シナリオ=1ランナーの matrix で壁時計は最遅1件分。
+  **1シード=1ランナー**の matrix（trials=N でシード 0..N-1 の N ランナー。
+  各ランナーは `suite 1 --seed-base <シード> --tsv` で全シナリオ1試行）で、
+  ランナー内はチェーン共有＋グループ並列が効く。総合表は aggregate ジョブが
+  `scenario merge`（TRIAL 行の合算。集計は ChoiceStats 共有で suite と完全一致）
+  で出す markdown 表（サマリーと artifact `scenario-combined` の merged.md）。
+  旧方式（1シナリオ=1ランナー、〜2026-08-08）は全件で計30時間・壁時計4時間
+  かかっていた（prewarm の重複が9割。143件×20シードでゼロから再生）。
+  シード・試行数は同一なので統計は旧方式と等価。
   `-f scenarios="kakutori keima"` で対象を絞れる。
   `-f env="TSUITATE_XXX=値"` で評価ノブを渡せる（arena.yml と同じ規約。
-  既定0で入れた項の回帰確認に要る）。総合表は aggregate ジョブの
-  サマリー（suite と同形式）。注意: 試行はシード同一でも壁時計ベースの
+  既定0で入れた項の回帰確認に要る）。注意: 試行はシード同一でも壁時計ベースの
   予算スケールで揺れるため、10試行の±2〜3件差はノイズ。版比較は20試行×両版で
 - `cd scenario-gui` → `npm run tauri dev` — シナリオデバッグ GUI（Tauri）。
   `.kif` の取り込み・任意 ply までの再生・先後視点切り替え・候補手分析

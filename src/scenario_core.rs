@@ -732,6 +732,19 @@ pub fn choice_trials_batch_with(
     items: &[(&Scenario, &Replayed)],
     trials: u64,
     factory: SeededFactory,
+    on_trial: impl FnMut(usize, u64, &str, &[String]),
+) -> Vec<ChoiceStats> {
+    choice_trials_batch_range_with(items, 0..trials, factory, on_trial)
+}
+
+/// choice_trials_batch のシード範囲版。CI のシードシャード実行
+/// （scenario.yml が seed ごとに1ランナーへ分割し、各ランナーは
+/// `seed_base..seed_base+1` で全シナリオを1試行ずつ回す）用の口。
+/// `0..trials` を渡せば従来の choice_trials_batch と同一
+pub fn choice_trials_batch_range_with(
+    items: &[(&Scenario, &Replayed)],
+    seeds: std::ops::Range<u64>,
+    factory: SeededFactory,
     mut on_trial: impl FnMut(usize, u64, &str, &[String]),
 ) -> Vec<ChoiceStats> {
     let mut tallies: Vec<HashMap<String, u32>> = vec![HashMap::new(); items.len()];
@@ -741,20 +754,13 @@ pub fn choice_trials_batch_with(
     let supports_clone = factory(0).clone_boxed().is_some();
 
     // (棋譜キー, 手番側) でグループ化し、グループ内は ply 昇順。
-    // **反則注入シナリオ（fouls=）は共有しない**: 注入した MyFoul 観測が
-    // ログ末尾に付くので、次の ply のログがプレフィックス拡張にならない。
-    // キーに一意値を混ぜて singleton グループ = 毎回作り直しへ落とす
+    // 反則注入シナリオ（fouls=）も同じグループで共有する: 注入した MyFoul は
+    // ログ末尾の既知個数（injected_fouls.len()）なので、共有チェーンは
+    // その手前（= 素のリプレイのプレフィックス）まで進め、注入の尾は
+    // スナップショット側だけに食わせる（下記）
     let mut groups: Vec<((u64, Color), Vec<usize>)> = vec![];
     for (i, (sc, rep)) in items.iter().enumerate() {
-        let base = kifu_key(&sc.kifu);
-        let key = (
-            if rep.injected_fouls.is_empty() {
-                base
-            } else {
-                base ^ (0x9e37_79b9_7f4a_7c15u64.wrapping_mul(i as u64 + 1))
-            },
-            rep.pos.turn(),
-        );
+        let key = (kifu_key(&sc.kifu), rep.pos.turn());
         match groups.iter_mut().find(|(k, _)| *k == key) {
             Some((_, v)) => v.push(i),
             None => groups.push((key, vec![i])),
@@ -765,7 +771,7 @@ pub fn choice_trials_batch_with(
     }
 
     for ((_, _side), idxs) in &groups {
-        for seed in 0..trials {
+        for seed in seeds.clone() {
             let mut record = |i: usize, accepted: String, foul_seq: Vec<String>| {
                 on_trial(i, seed, &accepted, &foul_seq);
                 *tallies[i].entry(accepted).or_insert(0) += 1;
@@ -789,7 +795,11 @@ pub fn choice_trials_batch_with(
                 let view = make_view(&rep.pos, side, &rep.fouls);
                 let log = &rep.logs[side_idx(side)];
                 let events = log.events();
-                while consumed < events.len() {
+                // 注入反則（fouls=）はログ末尾に付くので、共有チェーンは
+                // その手前 = 素のリプレイと同じプレフィックスまでしか進めない
+                // （進めてしまうと後続シナリオのログが拡張にならない）
+                let base_len = events.len() - rep.injected_fouls.len();
+                while consumed < base_len {
                     let e = &events[consumed];
                     if matches!(e, Observation::MyMove { .. } | Observation::MyFoul { .. }) {
                         strat.prewarm(&view, &running);
@@ -800,6 +810,17 @@ pub fn choice_trials_batch_with(
                 let mut snap = strat
                     .clone_boxed()
                     .expect("clone_boxed 対応確認済みの戦略で clone に失敗");
+                if base_len < events.len() {
+                    // 注入反則の尾はスナップショット側だけに食わせる
+                    // （prewarm_strategy と同じ規約で、共有チェーンは汚さない）
+                    let mut tail_running = clone_log(&running);
+                    for e in &events[base_len..] {
+                        if matches!(e, Observation::MyMove { .. } | Observation::MyFoul { .. }) {
+                            snap.prewarm(&view, &tail_running);
+                        }
+                        tail_running.record(e.clone());
+                    }
+                }
                 let (accepted, foul_seq) = choice_trial_body(&mut *snap, rep);
                 record(i, accepted, foul_seq);
             }
@@ -1068,6 +1089,68 @@ mod tests {
             key(snap.estimator().unwrap()),
             key(fresh_at2.estimator().unwrap()),
             "スナップショットが元の進行に引きずられている"
+        );
+    }
+
+    /// 反則注入シナリオ（fouls=）のチェーン共有の担保: 「素のログまで prewarm →
+    /// スナップショットに注入反則の尾だけ食わせる」（choice_trials_batch_range_with
+    /// の方式）が、注入込みの全ログをゼロから prewarm した戦略と一致する
+    #[test]
+    fn 反則注入の尾をスナップショットへ食わせる継ぎ足しは作り直しと一致する() {
+        use crate::observation::Observation;
+        let sc = load("keima");
+        let mut rep4f = replay(&sc.kifu, 4);
+        let side = rep4f.pos.turn();
+        apply_scenario_fouls(&mut rep4f, &["1g1e".to_string()]); // 2マス動く反則
+        let rep4 = replay(&sc.kifu, 4); // 素のリプレイ（共有チェーン相当）
+
+        let key = |est: &Estimator| -> Vec<(u64, u64)> {
+            let mut v: Vec<(u64, u64)> = weighted_unique_particles(est)
+                .iter()
+                .map(|(p, w, _)| (p.fingerprint(), (w * 1e9) as u64))
+                .collect();
+            v.sort_unstable();
+            v
+        };
+
+        // 作り直し: 注入込みの全ログをゼロから prewarm（fresh 経路と同じ）
+        let mut fresh = strategy::EstimatorStrategy::with_params_line_seed(
+            strategy::EvalParams::default(),
+            None,
+            Some(0),
+        );
+        let view_f = make_view(&rep4f.pos, side, &rep4f.fouls);
+        strategy::prewarm_strategy(&mut fresh, &view_f, &rep4f.logs[side_idx(side)]);
+
+        // 継ぎ足し: 素のログまで prewarm → clone → 注入の尾だけを食わせる
+        let mut chain = strategy::EstimatorStrategy::with_params_line_seed(
+            strategy::EvalParams::default(),
+            None,
+            Some(0),
+        );
+        strategy::prewarm_strategy(
+            &mut chain,
+            &view_f,
+            &rep4.logs[side_idx(side)],
+        );
+        let mut snap = chain.clone();
+        let mut tail_running = clone_log(&rep4.logs[side_idx(side)]);
+        let events_f = rep4f.logs[side_idx(side)].events();
+        let base_len = events_f.len() - rep4f.injected_fouls.len();
+        assert!(base_len < events_f.len(), "注入反則がログに載っていない");
+        for e in &events_f[base_len..] {
+            if matches!(e, Observation::MyMove { .. } | Observation::MyFoul { .. }) {
+                crate::strategy::Strategy::prewarm(&mut snap, &view_f, &tail_running);
+            }
+            tail_running.record(e.clone());
+        }
+        // choose 相当の最終 update を両者へ同じだけ与えてから比較
+        crate::strategy::Strategy::prewarm(&mut fresh, &view_f, &rep4f.logs[side_idx(side)]);
+        crate::strategy::Strategy::prewarm(&mut snap, &view_f, &tail_running);
+        assert_eq!(
+            key(fresh.estimator().unwrap()),
+            key(snap.estimator().unwrap()),
+            "反則注入の尾の継ぎ足しと作り直しで粒子集合が違う"
         );
     }
 

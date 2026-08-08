@@ -1,13 +1,25 @@
 name: Scenario Suite
 
-# scenario suite をシナリオごとに並列実行する（ローカルの直列実行だと30分超）。
-# 手動起動のみ。1シナリオ=1ランナーで、壁時計は最遅シナリオ1件分になる。
-# 各ジョブが suite と同形式の1行サマリーを出し、aggregate ジョブが表に合算する。
+# scenario suite をシードシャードで並列実行する（2026-08-08 に方式変更）。
+#
+# 旧方式（1シナリオ=1ランナー）は、同一棋譜のシナリオ群でも各ランナーが
+# ゼロから prewarm するため、全件 suite で計30時間・壁時計4時間かかっていた
+# （支配コストは思考でなく prewarm = 棋譜の再生。127件が同じ棋譜なのに
+# 20シード×Σply≒18万局面更新の9割が重複）。
+# 新方式は 1シード=1ランナー: 各ランナーが `suite 1 --seed-base <シード>` で
+# 全シナリオを1試行ずつ回し、ランナー内では batch のチェーン共有
+# （同一棋譜×同一手番は prewarm を ply 昇順で継ぎ足し、fouls= 注入の尾は
+# スナップショット側だけに食わせる）とグループ並列（コア数まで）が効く。
+# aggregate は `scenario merge` で TRIAL 行を合算する（集計の意味論は
+# ChoiceStats を共有するので suite と完全一致）。
+# シード・試行数は旧方式と同一なので統計的には等価。
+#
+# 手動起動のみ。
 on:
   workflow_dispatch:
     inputs:
       trials:
-        description: "シナリオごとの試行数"
+        description: "シナリオごとの試行数（= シードシャード数。シード 0..N-1）"
         required: false
         default: "20"
       strategy:
@@ -27,24 +39,19 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
-      scenarios: ${{ steps.list.outputs.scenarios }}
+      seeds: ${{ steps.list.outputs.seeds }}
     steps:
-      - uses: actions/checkout@v4
       - id: list
         run: |
-          filter='${{ inputs.scenarios }}'
-          if [ -n "$filter" ]; then
-            echo "scenarios=$(echo "$filter" | jq -R -c 'split(" ") | map(select(length > 0))')" >> "$GITHUB_OUTPUT"
-          else
-            echo "scenarios=$(ls scenarios/*.kif | xargs -n1 basename | sed 's/\.kif$//' | jq -R . | jq -s -c .)" >> "$GITHUB_OUTPUT"
-          fi
+          trials='${{ inputs.trials }}'
+          echo "seeds=$(jq -c -n --argjson n "${trials:-20}" '[range(0; $n)]')" >> "$GITHUB_OUTPUT"
 
-  scenario:
+  shard:
     needs: plan
     strategy:
       fail-fast: false
       matrix:
-        scenario: ${{ fromJSON(needs.plan.outputs.scenarios) }}
+        seed: ${{ fromJSON(needs.plan.outputs.seeds) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -53,9 +60,10 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Run scenario
+      - name: Run suite shard
         env:
           SCENARIO_EXTRA_ENV: ${{ inputs.env }}
+          SCENARIO_ONLY: ${{ inputs.scenarios }}
         run: |
           # 評価ノブ（TSUITATE_* のみ許可）。arena.yml と同じ規約
           for kv in $SCENARIO_EXTRA_ENV; do
@@ -64,41 +72,21 @@ jobs:
               *) echo "無視（TSUITATE_XXX=値 のみ許可）: ${kv}" ;;
             esac
           done
-          cargo run --release --bin scenario -- \
-            "${{ matrix.scenario }}" \
-            "${{ inputs.trials }}" \
-            "${{ inputs.strategy }}" \
-            | tee result.txt
-
-      - name: Extract summary line
-        if: always()
-        run: |
-          # suite の1行サマリー相当を standalone 出力から復元する。
-          # 「  1d1e: 15/20 ← 注目手」→ 注目手と選択率。0回選択だと行が無いので
-          # kif の target= ディレクティブへフォールバックする
-          hit_line=$(grep '← 注目手' result.txt || true)
-          if [ -n "$hit_line" ]; then
-            target=$(echo "$hit_line" | awk -F: '{gsub(/^ +/,"",$1); print $1}')
-            hits=$(echo "$hit_line" | grep -oE '[0-9]+/[0-9]+' | head -1)
-          else
-            target=$(grep -oE 'target=[^ ]+' "scenarios/${{ matrix.scenario }}.kif" | head -1 | cut -d= -f2)
-            hits="0/${{ inputs.trials }}"
+          only_args=()
+          if [ -n "$SCENARIO_ONLY" ]; then
+            only_args=(--only "$SCENARIO_ONLY")
           fi
-          fouls=$(grep -oE '追加の反則の総数: [0-9]+' result.txt | grep -oE '[0-9]+$' || echo 0)
-          # 平均得点（scores= 付きシナリオのみ出る。無ければ "-"）
-          score=$(grep -oE '平均得点: [0-9.]+/10（未採点の選択 [0-9]+' result.txt \
-            | sed -E 's/平均得点: ([0-9.]+)\/10（未採点の選択 ([0-9]+)/\1(未採点\2)/' || true)
-          others=$(awk '/受理された手の内訳/{f=1;next} /追加の反則の総数/{f=0} f && !/← 注目手/ {gsub(/^ +/,""); print}' result.txt | head -3 | paste -sd' ' -)
-          printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "${{ matrix.scenario }}" "${target:--}" "$hits" "${score:--}" "$fouls" "${others:--}" > line.tsv
-          cat line.tsv
+          cargo run --release --bin scenario -- \
+            suite 1 "${{ inputs.strategy }}" \
+            --seed-base "${{ matrix.seed }}" --tsv "${only_args[@]}" \
+            | tee result.txt
 
       - name: Write job summary
         if: always()
         run: |
           {
             echo '```'
-            cat result.txt
+            grep -v '^TRIAL' result.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -106,36 +94,38 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: scenario-result-${{ matrix.scenario }}
-          path: |
-            result.txt
-            line.tsv
+          name: scenario-shard-s${{ matrix.seed }}
+          path: result.txt
 
   aggregate:
-    needs: scenario
+    needs: shard
     if: always()
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
       - uses: actions/download-artifact@v4
         with:
-          pattern: scenario-result-*
+          pattern: scenario-shard-*
           path: results
 
       - name: Aggregate
         run: |
+          cargo run --release --bin scenario -- merge results/*/result.txt | tee merged.md
           {
             echo "## Scenario Suite（各 ${{ inputs.trials }} 試行 / 戦略 ${{ inputs.strategy }} / env '${{ inputs.env }}'）"
             echo ""
-            echo '| シナリオ | 注目手 | 選択 | 得点/10 | 反則 | 他の選択 |'
-            echo '|---|---|---|---|---|---|'
-            cat results/*/line.tsv | sort | awk -F'\t' '{printf "| %s | %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5, $6}'
-            # 得点の全体平均（scores= 付きシナリオのみ対象）
-            cat results/*/line.tsv | awk -F'\t' '$4 != "-" {sum += $4; n++} END {if (n) printf "\n**平均得点の全体平均: %.2f/10（%d件）**\n", sum/n, n}'
+            cat merged.md
           } >> "$GITHUB_STEP_SUMMARY"
-          cat "$GITHUB_STEP_SUMMARY"
 
       - name: Upload combined result
         uses: actions/upload-artifact@v4
         with:
           name: scenario-combined
-          path: results/*/line.tsv
+          path: |
+            merged.md
+            results/*/result.txt
