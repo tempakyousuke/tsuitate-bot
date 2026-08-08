@@ -371,6 +371,22 @@ fn check_king_gain_mean() -> bool {
     })
 }
 
+/// 成りが任意の移動で**不成も候補に生成する**か（既定は無効 = 従来の
+/// 「成れるなら成る」）。`TSUITATE_GEN_NONPROMOTE=1` で有効。
+/// 凍結版は自前の candidate_moves を持つのでこの名前を知らない。
+///
+/// 発端は quest_20260731 の95手目（人間の ７三歩**成らず**）: ついたて将棋では
+/// 成ると信念上の玉へ王手が掛かる手筋があり、王手は**宣言で露見**して駒を
+/// 失いやすい（blind_attack_survive_w と同じ経済）。不成なら静かに次の成りを
+/// 狙える。成りの利き集合は不成の上位集合なので「余計な王手＝余計な露見」も
+/// 単調に増える = 不成の価値はついたて固有。従来は生成段階で不成を刈っていた
+/// ため、評価側（mover_check_extra / promo_potential）に判断させる機会すら
+/// 無かった（実戦の 7d7c が make_eval のスケルトンにも載らない）
+fn gen_nonpromote() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TSUITATE_GEN_NONPROMOTE").is_ok_and(|v| v == "1"))
+}
+
 /// V1（利き数）のノブ。**既定は両方 無効**（＝従来の二値の利き判定）。
 ///
 /// やねうら王 Lv4 の「利き数」（+R30）をついたてへ持ち込む実験だったが、
@@ -4581,8 +4597,13 @@ pub fn candidate_moves(
                 Promotion::None => push(make_usi_move(from, to, false), &mut out),
                 Promotion::Forced => push(make_usi_move(from, to, true), &mut out),
                 Promotion::Optional => {
-                    // 成れるなら成る（不成が有利な局面はまれなので候補を絞る）
+                    // 成れるなら成る（不成が有利な局面はまれなので候補を絞る）。
+                    // TSUITATE_GEN_NONPROMOTE=1 なら不成も生成して評価側に
+                    // 判断させる（gen_nonpromote の doc 参照）
                     push(make_usi_move(from, to, true), &mut out);
+                    if gen_nonpromote() {
+                        push(make_usi_move(from, to, false), &mut out);
+                    }
                 }
             }
         }
