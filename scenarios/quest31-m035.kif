@@ -1,4 +1,4 @@
-*scenario ply=34 target=N*3f scores=G*3e:2,G*4f:2,G*3c:5,N*3f:6,N*2c:2,5f5e:7,G*2a:1,2d1c:0,N*5d:2,N*3d:2,2d3c:2,7i3e:2,G*2c:2,G*5h:2,G*4h:2,G*3h:2,N*5h:2,G*2b:2,N*9e:3,N*7e:5,2d2a:2,2d3d:2,G*5e:2,N*1e:0,N*5e:2,N*6f:2 bad=G*3e,G*4f,N*2c,G*2a,2d1c,N*5d,N*3d,2d3c,7i3e,G*2c,G*5h,G*4h,G*3h,N*5h,G*2b,2d2a,2d3d,G*5e,N*1e,N*5e,N*6f desc=35手目（先手番）。実戦の3六桂打（2四龍に紐）を注目手にする。3三金打・5五歩・7五桂打もセーフ。2一龍は人間的には悪手
+*scenario ply=34 target=N*3f scores=G*3e:2,G*4f:2,G*3c:5,N*3f:6,N*2c:2,5f5e:7,G*2a:1,2d1c:0,N*5d:2,N*3d:2,2d3c:2,7i3e:2,G*2c:2,G*5h:2,G*4h:2,G*3h:2,N*5h:2,G*2b:2,N*9e:3,N*7e:5,2d2a:2,2d3d:2,G*5e:2,N*1e:0,N*5e:2,N*6f:2,N*7d:5 bad=G*3e,G*4f,N*2c,G*2a,2d1c,N*5d,N*3d,2d3c,7i3e,G*2c,G*5h,G*4h,G*3h,N*5h,G*2b,2d2a,2d3d,G*5e,N*1e,N*5e,N*6f desc=35手目（先手番）。実戦の3六桂打（2四龍に紐）を注目手にする。3三金打・5五歩・7五桂打もセーフ。2一龍は人間的には悪手
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
