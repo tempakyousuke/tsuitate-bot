@@ -1,4 +1,4 @@
-*scenario ply=56 target=4h4g scores=4h4g:8,3c4c:2,B*1h:2,B*7f:2,B*9f:2,3c2b:2,B*1f:2,B*8f:2,B*3a:2,B*6f:2,3g3f:2,B*3e:2,B*3d:2,3b4b:6,3b2b:2,B*2g:1,B*7i:0,G*5e:2 bad=3c4c,B*1h,B*7f,B*9f,3c2b,B*1f,B*8f,B*3a,B*6f,3g3f,B*3e,B*3d,3b2b,B*2g,B*7i,G*5e desc=57手目（先手番）。実戦は4七歩（このときは支えが無く、58手目に同成銀で取られた）
+*scenario ply=56 target=4h4g scores=4h4g:8,3c4c:2,B*1h:2,B*7f:2,B*9f:2,3c2b:2,B*1f:2,B*8f:2,B*3a:2,B*6f:2,3g3f:2,B*3e:2,B*3d:2,3b4b:6,3b2b:2,B*2g:1,B*7i:0,G*5e:2,2d3e:2,3c4b:4,3c5c:0,B*4b:2 bad=3c4c,B*1h,B*7f,B*9f,3c2b,B*1f,B*8f,B*3a,B*6f,3g3f,B*3e,B*3d,3b2b,B*2g,B*7i,G*5e,2d3e,3c5c,B*4b desc=57手目（先手番）。実戦は4七歩（このときは支えが無く、58手目に同成銀で取られた）
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
