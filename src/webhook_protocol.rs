@@ -38,7 +38,10 @@ pub fn parse_bw_color(s: &str) -> Option<Color> {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BotTurnRequest {
-    #[serde(rename = "type")]
+    /// 旧仕様（全履歴送信）では必須で "your_turn" が来ていた。差分化後の
+    /// 型定義（README 2026-08 改訂）のトップレベルには載っていないため、
+    /// 欠落時は "your_turn" とみなす
+    #[serde(rename = "type", default = "default_request_kind")]
     pub kind: String,
     #[allow(dead_code)]
     pub request_id: String,
@@ -48,10 +51,22 @@ pub struct BotTurnRequest {
     #[allow(dead_code)]
     pub number: u32,
     pub ply: u32,
+    /// 差分化後の2回目以降のリクエストにのみ含まれる「botが保持済みと
+    /// 想定される最終手数」。positions には basePly+1..=ply だけが入る
+    #[serde(default)]
+    pub base_ply: Option<u32>,
+    /// 旧仕様のフィールド。差分化後の型定義には載っていないため任意にする
     #[allow(dead_code)]
+    #[serde(default)]
     pub deadline_ms: u64,
     pub positions: HashMap<String, PositionEntry>,
-    pub game: GameInfo,
+    /// 初回リクエストにのみ含まれる（差分化後の2回目以降は省略される）
+    #[serde(default)]
+    pub game: Option<GameInfo>,
+}
+
+fn default_request_kind() -> String {
+    "your_turn".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -126,12 +141,39 @@ mod tests {
         let req: BotTurnRequest = serde_json::from_str(json).unwrap();
         assert_eq!(req.kind, "your_turn");
         assert_eq!(req.ply, 0);
-        assert_eq!(req.game.kind, "ついたて");
-        assert_eq!(req.game.required_players.b, 1);
+        assert!(req.base_ply.is_none());
+        let game = req.game.as_ref().unwrap();
+        assert_eq!(game.kind, "ついたて");
+        assert_eq!(game.required_players.b, 1);
         assert_eq!(parse_bw_color(&req.color), Some(Color::Sente));
         let p0 = &req.positions["0"];
         assert_eq!(p0.fouls.unwrap().b, 9);
         assert!(p0.last_move.is_none());
+    }
+
+    /// 差分化後の2回目以降のリクエスト: `type`/`deadlineMs`/`game` が無く、
+    /// `basePly` と差分の positions だけが来る
+    #[test]
+    fn parses_subsequent_diff_payload() {
+        let json = r#"{
+            "requestId": "r2",
+            "gameId": "g1",
+            "color": "b",
+            "number": 1,
+            "ply": 2,
+            "basePly": 0,
+            "positions": {
+                "1": { "sfen": "masked", "lastMove": "+7776FU", "lastInfo": 0 },
+                "2": { "sfen": "masked", "lastMove": "-0000ZZ", "lastInfo": 0 }
+            }
+        }"#;
+        let req: BotTurnRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.kind, "your_turn");
+        assert_eq!(req.ply, 2);
+        assert_eq!(req.base_ply, Some(0));
+        assert!(req.game.is_none());
+        assert!(!req.positions.contains_key("0"));
+        assert_eq!(req.positions["2"].last_move.as_deref(), Some("-0000ZZ"));
     }
 
     #[test]

@@ -1,11 +1,17 @@
 //! webhookペイロード（`webhook_protocol::BotTurnRequest`）から観測ログ・
 //! PlayerViewを組み立て、ゲームごとの戦略インスタンスをキャッシュする。
 //!
-//! ソケット接続常駐の client.rs と違い、webhookは「今回のリクエストに至るまでの
-//! 全ply履歴」を毎回受け取るステートレスなHTTP呼び出し。ここでは gameId ごとに
-//! Strategy + 観測ログをメモリ上にキャッシュし、継続対局では新しいplyぶんだけ
-//! 増分で読み進める。キャッシュを失った場合（プロセス再起動・老朽化した
-//! セッションの掃除後など）は0手目から全件を読み直す。
+//! ソケット接続常駐の client.rs と違い、webhookはHTTP呼び出しの繰り返し。
+//! 2026-08 のプロトコル改訂（従量課金対策の差分化）で、初回リクエストだけが
+//! 0手目からの全履歴＋`game` を含み、2回目以降は `basePly+1..=ply` の差分
+//! （`game` なし）だけが届く。ここでは gameId ごとに Strategy + 観測ログを
+//! メモリ上にキャッシュし、新しいplyぶんだけ増分で読み進める。
+//!
+//! 差分化により「キャッシュを失ったらリクエスト内の全履歴で0手目から作り直す」
+//! 復旧は初回リクエスト以外では不可能になったため、`TSUITATE_WEBHOOK_SESSION_DIR`
+//! を設定すると観測イベント列をディスクへ追記し、プロセス再起動・TTL掃除の後も
+//! そこから復元する（戦略は復元ログからprewarmで作り直す）。復元も効かない
+//! 履歴ギャップ（`basePly` > 保持済みply）は409で拒否する。
 //!
 //! sfen は使わない: 各plyの `lastMove`(CSA)/`lastInfo`/`lastCapture`/
 //! `wasPromotion` から直接 `Observation` イベントを組み立てられるため、
@@ -14,8 +20,11 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
+use std::fs;
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::board::{make_usi_drop, make_usi_move, make_usi_square};
 use crate::model::GameModel;
@@ -37,6 +46,17 @@ const SESSION_TTL: Duration = Duration::from_secs(2 * 60 * 60);
 /// 通常updateへ渡し、HTTP deadlineを無制限の復元処理で消費しない。
 const DEFAULT_COLD_START_PREWARM_MS: u64 = 2_500;
 
+/// セッション永続化ファイル（`<dir>/<gameId>.jsonl`）の1行。advance が
+/// 観測を積むたびに、新規イベントだけをまとめて追記する
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PersistedChunk {
+    /// "b" | "w"（自分の色。ゲームID再利用の検出に使う）
+    color: String,
+    /// このチャンク適用後の処理済みply
+    processed_ply: u32,
+    events: Vec<Observation>,
+}
+
 #[derive(Debug)]
 pub enum SessionError {
     UnsupportedRequestType(String),
@@ -50,6 +70,10 @@ pub enum SessionError {
     UnsupportedGameParameters,
     InconsistentHistory,
     StaleRequest,
+    /// 差分リクエストの `basePly` が保持済みのplyより先を指している
+    /// （前回リクエストの取りこぼし・復元不能なキャッシュ喪失）。
+    /// 手元の状態では差分を適用できず、リトライでも治らない
+    HistoryGap { have: u32, base: u32 },
     NoLegalMove,
     ResponseEncodingFailed,
 }
@@ -63,6 +87,9 @@ impl fmt::Display for SessionError {
             SessionError::UnsupportedGameParameters => write!(f, "unsupported_game_parameters"),
             SessionError::InconsistentHistory => write!(f, "inconsistent_history"),
             SessionError::StaleRequest => write!(f, "stale_request"),
+            SessionError::HistoryGap { have, base } => {
+                write!(f, "history_gap: have={have} base={base}")
+            }
             SessionError::UnknownStrategy(name) => write!(f, "unknown_strategy: {name}"),
             SessionError::InvalidColor(c) => write!(f, "invalid_color: {c}"),
             SessionError::MissingPosition(ply) => write!(f, "missing_position: {ply}"),
@@ -88,7 +115,7 @@ impl SessionError {
             | SessionError::MissingPosition(_)
             | SessionError::MissingLastMove(_)
             | SessionError::InvalidLastMove { .. } => 400,
-            SessionError::StaleRequest => 409,
+            SessionError::StaleRequest | SessionError::HistoryGap { .. } => 409,
             SessionError::UnknownStrategy(_) | SessionError::ResponseEncodingFailed => 500,
             SessionError::NoLegalMove => 422,
         }
@@ -108,6 +135,9 @@ struct GameSession {
     check_holder: Option<Color>,
     /// このセッションが処理済みの ply（次に処理すべきは +1 から）
     processed_ply: u32,
+    /// セッション永続化（`SessionStore::session_dir`）で書き出し済みの
+    /// 観測イベント数（`log.events()` の先頭からの個数）
+    persisted_events: usize,
     /// dispatcherの再送に対して同じ応答を返すためのrequestIdキャッシュ。
     /// 古い再送でセッションを過去へ巻き戻さないことも目的とする。
     request_cache: HashMap<String, String>,
@@ -124,9 +154,28 @@ impl GameSession {
             next_move_number: 1,
             check_holder: None,
             processed_ply: 0,
+            persisted_events: 0,
             request_cache: HashMap::new(),
             request_cache_order: VecDeque::new(),
         })
+    }
+
+    /// 永続化ファイルから復元した観測イベントを1件適用する。
+    /// `advance` が観測を記録するときの副作用（move_number・check_holder の
+    /// 更新規約）と一致させること
+    fn replay_event(&mut self, event: Observation) {
+        match &event {
+            Observation::MyMove { .. } | Observation::OpponentMoved { .. } => {
+                self.next_move_number += 1;
+                self.check_holder = None;
+            }
+            Observation::Check { in_check } => {
+                self.check_holder = Some(*in_check);
+            }
+            Observation::MyFoul { .. } | Observation::OpponentFoul { .. } => {}
+        }
+        self.log.record(event.clone());
+        self.model.apply(&event);
     }
 }
 
@@ -135,6 +184,10 @@ type SessionEntry = (Instant, Arc<Mutex<GameSession>>);
 pub struct SessionStore {
     strategy_name: String,
     games: Mutex<HashMap<String, SessionEntry>>,
+    /// Some なら観測イベント列を `<dir>/<gameId>.jsonl` へ追記し、キャッシュ喪失時
+    /// （プロセス再起動・TTL掃除）にそこから復元する。差分プロトコルでは
+    /// リクエストから全履歴を再構成できないため、これが唯一の復旧経路
+    session_dir: Option<PathBuf>,
 }
 
 impl SessionStore {
@@ -142,17 +195,44 @@ impl SessionStore {
         SessionStore {
             strategy_name,
             games: Mutex::new(HashMap::new()),
+            session_dir: None,
         }
     }
 
+    pub fn with_session_dir(mut self, dir: Option<PathBuf>) -> Self {
+        self.session_dir = dir;
+        self
+    }
+
+    fn session_file(&self, game_id: &str) -> Option<PathBuf> {
+        let dir = self.session_dir.as_ref()?;
+        let sanitized: String = game_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        Some(dir.join(format!("{sanitized}.jsonl")))
+    }
+
+    /// `has_full_history` は positions が0手目を含む（＝初回リクエスト相当で、
+    /// セッションをゼロから作り直せる）かどうか。差分リクエストのときだけ
+    /// ディスク復元を試みる（全履歴があるならリクエスト自体が真実で、古い
+    /// 永続化ファイルはゲームID再利用の残骸かもしれないため使わない）
     fn session_for(
         &self,
         game_id: &str,
         my_color: Color,
+        has_full_history: bool,
     ) -> Result<(Arc<Mutex<GameSession>>, bool), SessionError> {
         let mut games = self.games.lock().expect("games mutex poisoned");
         let now = Instant::now();
         games.retain(|_, (last_seen, _)| now.duration_since(*last_seen) < SESSION_TTL);
+        self.prune_stale_session_files();
 
         if let Some((last_seen, session)) = games.get_mut(game_id) {
             let same_color = session.lock().expect("session mutex poisoned").my_color == my_color;
@@ -161,11 +241,110 @@ impl SessionStore {
                 return Ok((session.clone(), false));
             }
         }
-        let fresh = GameSession::new(&self.strategy_name, my_color)
-            .ok_or_else(|| SessionError::UnknownStrategy(self.strategy_name.clone()))?;
+
+        let session = if has_full_history {
+            // 全履歴つき＝作り直せるので、古い永続化ファイルは破棄して新規
+            if let Some(path) = self.session_file(game_id) {
+                let _ = fs::remove_file(path);
+            }
+            None
+        } else {
+            self.restore_session(game_id, my_color)
+        };
+        let fresh = match session {
+            Some(s) => s,
+            None => GameSession::new(&self.strategy_name, my_color)
+                .ok_or_else(|| SessionError::UnknownStrategy(self.strategy_name.clone()))?,
+        };
         let arc = Arc::new(Mutex::new(fresh));
         games.insert(game_id.to_string(), (now, arc.clone()));
         Ok((arc, true))
+    }
+
+    /// 永続化ファイルから観測イベント列を再生してセッションを復元する。
+    /// 色不一致・破損・矛盾は None（呼び出し側が新規セッションで続行し、
+    /// 差分しか無ければ advance が HistoryGap / MissingPosition で拒否する）
+    fn restore_session(&self, game_id: &str, my_color: Color) -> Option<GameSession> {
+        let path = self.session_file(game_id)?;
+        let data = fs::read_to_string(&path).ok()?;
+        let mut session = GameSession::new(&self.strategy_name, my_color)?;
+        for line in data.lines().filter(|l| !l.trim().is_empty()) {
+            let parsed: PersistedChunk = serde_json::from_str(line).ok()?;
+            if parse_bw_color(&parsed.color) != Some(my_color) {
+                return None;
+            }
+            for event in parsed.events {
+                session.replay_event(event);
+            }
+            session.processed_ply = parsed.processed_ply;
+        }
+        if session.processed_ply == 0 || !session.model.consistent() {
+            return None;
+        }
+        session.persisted_events = session.log.events().len();
+        Some(session)
+    }
+
+    /// advance で新しく積まれた観測イベントを追記する。失敗しても対局は
+    /// 続行する（永続化はベストエフォート。次回また末尾から追記を試みる）
+    fn persist_session(&self, game_id: &str, session: &mut GameSession) {
+        let Some(path) = self.session_file(game_id) else {
+            return;
+        };
+        let events = session.log.events();
+        if events.len() <= session.persisted_events {
+            return;
+        }
+        let chunk = PersistedChunk {
+            color: match session.my_color {
+                Color::Sente => "b".to_string(),
+                Color::Gote => "w".to_string(),
+            },
+            processed_ply: session.processed_ply,
+            events: events[session.persisted_events..].to_vec(),
+        };
+        let Ok(line) = serde_json::to_string(&chunk) else {
+            return;
+        };
+        let result = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .and_then(|mut f| writeln!(f, "{line}"));
+        match result {
+            Ok(()) => session.persisted_events = events.len(),
+            Err(e) => eprintln!(
+                "セッション永続化の書き込みに失敗しました ({}): {e}",
+                path.display()
+            ),
+        }
+    }
+
+    /// TTLを過ぎた永続化ファイルを掃除する（終局通知が無いプロトコルなので、
+    /// メモリ側のセッションTTLと同じ経過時間で消す）
+    fn prune_stale_session_files(&self) {
+        let Some(dir) = self.session_dir.as_ref() else {
+            return;
+        };
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        let now = SystemTime::now();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+                continue;
+            }
+            let stale = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|mtime| now.duration_since(mtime).ok())
+                .is_some_and(|age| age >= SESSION_TTL);
+            if stale {
+                let _ = fs::remove_file(path);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -180,17 +359,23 @@ pub fn choose_move(store: &SessionStore, req: &BotTurnRequest) -> Result<String,
     if req.kind != "your_turn" {
         return Err(SessionError::UnsupportedRequestType(req.kind.clone()));
     }
-    if req.game.kind != SUPPORTED_GAME_TYPE {
-        return Err(SessionError::UnsupportedGameType(req.game.kind.clone()));
+    // 差分化後、`game` は初回リクエストにしか含まれない。検証も初回のみで、
+    // 非対応のゲームは初回で拒否されてセッションが作られないため、以後の
+    // 差分リクエストも（履歴が無いことにより）先へ進まない
+    if let Some(game) = &req.game {
+        if game.kind != SUPPORTED_GAME_TYPE {
+            return Err(SessionError::UnsupportedGameType(game.kind.clone()));
+        }
+        if game.required_players.b != 1 || game.required_players.w != 1 {
+            return Err(SessionError::UnsupportedPlayers);
+        }
+        validate_game_parameters(game)?;
     }
-    if req.game.required_players.b != 1 || req.game.required_players.w != 1 {
-        return Err(SessionError::UnsupportedPlayers);
-    }
-    validate_game_parameters(&req.game)?;
     let my_color =
         parse_bw_color(&req.color).ok_or_else(|| SessionError::InvalidColor(req.color.clone()))?;
 
-    let (arc, new_session) = store.session_for(&req.game_id, my_color)?;
+    let has_full_history = req.positions.contains_key("0");
+    let (arc, new_session) = store.session_for(&req.game_id, my_color, has_full_history)?;
     let mut session = arc.lock().expect("session mutex poisoned");
 
     if !req.request_id.is_empty() {
@@ -205,12 +390,32 @@ pub fn choose_move(store: &SessionStore, req: &BotTurnRequest) -> Result<String,
         return Err(SessionError::StaleRequest);
     }
 
+    // 差分リクエストは basePly+1 からしか含まないので、保持済みply（復元込み）が
+    // basePly に届いていなければ適用できない。advance を汚す前に検知して
+    // 区別できるエラーで返す（保持済みが先行しているぶんには差分が重複する
+    // だけで、advance が処理済みplyを読み飛ばすので問題ない）
+    if let Some(base) = req.base_ply {
+        if session.processed_ply < base && !has_full_history {
+            return Err(SessionError::HistoryGap {
+                have: session.processed_ply,
+                base,
+            });
+        }
+    }
+
     let mut cold_start = new_session;
-    if advance(&mut session, &req.positions, req.ply).is_err() {
+    if let Err(e) = advance(&mut session, &req.positions, req.ply) {
+        if !has_full_history {
+            // 差分だけでは0手目から作り直せない。セッションを壊さずそのまま返す
+            return Err(e);
+        }
         // 想定外の食い違い（プロセス再起動直後でキャッシュが空、ply欠落等）は
         // セッションを作り直して0手目からやり直す
         *session = GameSession::new(&store.strategy_name, my_color)
             .ok_or_else(|| SessionError::UnknownStrategy(store.strategy_name.clone()))?;
+        if let Some(path) = store.session_file(&req.game_id) {
+            let _ = fs::remove_file(path);
+        }
         advance(&mut session, &req.positions, req.ply)?;
         cold_start = true;
     }
@@ -218,6 +423,7 @@ pub fn choose_move(store: &SessionStore, req: &BotTurnRequest) -> Result<String,
     if !session.model.consistent() {
         return Err(SessionError::InconsistentHistory);
     }
+    store.persist_session(&req.game_id, &mut session);
     let view = build_player_view(&session, req)?;
     let mut foul_tried = collect_foul_tried(&session.log, session.next_move_number);
     let mut deduced_illegal = HashSet::new();
@@ -458,21 +664,18 @@ fn build_player_view(
     session: &GameSession,
     req: &BotTurnRequest,
 ) -> Result<PlayerView, SessionError> {
-    let fouls_present = req
+    let current_fouls = req
         .positions
-        .get("0")
-        .and_then(|entry| entry.fouls)
-        .is_some()
-        && req
-            .positions
-            .get(&req.ply.to_string())
-            .and_then(|entry| entry.fouls)
-            .is_some();
-    let (you_fouls, opponent_fouls) = if fouls_present {
-        let current_fouls = fouls_at(&req.positions, req.ply)?;
-        let start_fouls = fouls_at(&req.positions, 0)?;
+        .get(&req.ply.to_string())
+        .and_then(|entry| entry.fouls);
+    let (you_fouls, opponent_fouls) = if let Some(current) = current_fouls {
+        // 差分リクエストには0手目が含まれないので、開始残数は標準の初期値
+        // （9,9。非標準の foul_limits は初回の validate_game_parameters で
+        // 拒否済み）で補完する
+        let start_fouls = start_fouls(&req.positions);
         let (you_start, opp_start) = split_by_color(session.my_color, start_fouls);
-        let (you_remaining, opp_remaining) = split_by_color(session.my_color, current_fouls);
+        let (you_remaining, opp_remaining) =
+            split_by_color(session.my_color, (current.b, current.w));
         (
             you_start.saturating_sub(you_remaining),
             opp_start.saturating_sub(opp_remaining),
@@ -506,16 +709,15 @@ fn build_player_view(
     })
 }
 
-fn fouls_at(
-    positions: &HashMap<String, PositionEntry>,
-    ply: u32,
-) -> Result<(u32, u32), SessionError> {
-    let entry = positions
-        .get(&ply.to_string())
-        .ok_or(SessionError::MissingPosition(ply))?;
-    // 標準ついたての既定値。dispatcher契約上 fouls は任意フィールドなので、
-    // 欠落していても標準ルールでは初期残数9として扱う。
-    Ok(entry.fouls.map(|f| (f.b, f.w)).unwrap_or((9, 9)))
+/// 開始時の反則残数。差分リクエストには0手目が含まれないため、無ければ
+/// 標準ついたての初期残数（9,9）として扱う（非標準の foul_limits は初回の
+/// validate_game_parameters で拒否済み。fouls 自体も契約上任意フィールド）
+fn start_fouls(positions: &HashMap<String, PositionEntry>) -> (u32, u32) {
+    positions
+        .get("0")
+        .and_then(|entry| entry.fouls)
+        .map(|f| (f.b, f.w))
+        .unwrap_or((9, 9))
 }
 
 fn split_by_color(color: Color, (b, w): (u32, u32)) -> (u32, u32) {
@@ -643,26 +845,18 @@ fn advance(
 }
 
 /// 相手の残り反則数（`fouls`）から累計反則回数を逆算する。開始値は0手目
-/// （初期局面）の残り数から読む
+/// （初期局面）の残り数から読み、差分リクエストで0手目が無ければ標準の
+/// 初期残数（9,9）とみなす
 fn opponent_foul_count(
     session: &GameSession,
     positions: &HashMap<String, PositionEntry>,
     ply: u32,
     mover: Color,
 ) -> Result<u32, SessionError> {
-    let start = positions.get("0").and_then(|entry| entry.fouls);
+    let (start_b, start_w) = start_fouls(positions);
     let current = positions
         .get(&ply.to_string())
         .and_then(|entry| entry.fouls);
-    let Some((start_b, start_w)) = start.map(|f| (f.b, f.w)) else {
-        return Ok(session
-            .log
-            .events()
-            .iter()
-            .filter(|event| matches!(event, Observation::OpponentFoul { .. }))
-            .count() as u32
-            + 1);
-    };
     let Some((cur_b, cur_w)) = current.map(|f| (f.b, f.w)) else {
         return Ok(session
             .log
@@ -721,9 +915,34 @@ mod tests {
             color: color.into(),
             number: 0,
             ply,
+            base_ply: None,
             deadline_ms: 5000,
             positions,
-            game: game_info(SUPPORTED_GAME_TYPE),
+            game: Some(game_info(SUPPORTED_GAME_TYPE)),
+        }
+    }
+
+    /// 差分化後の2回目以降のリクエスト（`game` なし・`basePly` あり・
+    /// positions は base_ply+1..=ply の差分だけ）
+    fn subsequent_request(
+        game_id: &str,
+        color: &str,
+        base_ply: u32,
+        ply: u32,
+        positions: HashMap<String, PositionEntry>,
+        request_id: &str,
+    ) -> BotTurnRequest {
+        BotTurnRequest {
+            kind: "your_turn".into(),
+            request_id: request_id.into(),
+            game_id: game_id.into(),
+            color: color.into(),
+            number: 0,
+            ply,
+            base_ply: Some(base_ply),
+            deadline_ms: 0,
+            positions,
+            game: None,
         }
     }
 
@@ -733,7 +952,7 @@ mod tests {
         let mut positions = HashMap::new();
         positions.insert("0".to_string(), initial_entry());
         let mut req = request("g1", "b", 0, positions);
-        req.game = game_info("カスタム");
+        req.game = Some(game_info("カスタム"));
         let err = choose_move(&store, &req).unwrap_err();
         assert!(matches!(err, SessionError::UnsupportedGameType(_)));
         assert_eq!(err.status_code(), 400);
@@ -745,7 +964,7 @@ mod tests {
         let mut positions = HashMap::new();
         positions.insert("0".to_string(), initial_entry());
         let mut req = request("g1", "b", 0, positions);
-        req.game.required_players = RequiredPlayers { b: 2, w: 1 };
+        req.game.as_mut().unwrap().required_players = RequiredPlayers { b: 2, w: 1 };
         let err = choose_move(&store, &req).unwrap_err();
         assert!(matches!(err, SessionError::UnsupportedPlayers));
     }
@@ -815,6 +1034,110 @@ mod tests {
         assert!(mv.starts_with('+'));
         // 同じ gameId なのでセッションは1件のまま（作り直されていない）
         assert_eq!(store.session_count(), 1);
+    }
+
+    fn move_entry(last_move: &str, last_info: u8) -> PositionEntry {
+        PositionEntry {
+            sfen: "masked".into(),
+            fouls: None,
+            last_move: Some(last_move.into()),
+            last_info: Some(last_info),
+            last_capture: None,
+            was_promotion: Some(false),
+        }
+    }
+
+    /// 差分化後の2回目以降（`game` なし・0手目なし・basePly+1..=ply だけ）でも
+    /// キャッシュ済みセッションが増分適用できる
+    #[test]
+    fn subsequent_diff_request_advances_cached_session() {
+        let store = SessionStore::new("heuristic".into());
+        let mut positions = HashMap::new();
+        positions.insert("0".to_string(), initial_entry());
+        let mv0 = choose_move(&store, &request("g-diff", "b", 0, positions)).unwrap();
+
+        let mut diff = HashMap::new();
+        diff.insert("1".to_string(), move_entry(&mv0, INFO_NONE));
+        diff.insert("2".to_string(), move_entry("-0000ZZ", INFO_NONE));
+        let req = subsequent_request("g-diff", "b", 0, 2, diff, "r2");
+        let mv = choose_move(&store, &req).unwrap();
+        assert_eq!(mv.len(), 7);
+        assert!(mv.starts_with('+'));
+        assert_eq!(store.session_count(), 1);
+    }
+
+    /// basePly が保持済みplyより先の差分は409で拒否し、セッションを壊さない
+    /// （正しい差分が後から来ればそのまま続行できる）
+    #[test]
+    fn history_gap_is_rejected_without_wrecking_session() {
+        let store = SessionStore::new("heuristic".into());
+        let mut positions = HashMap::new();
+        positions.insert("0".to_string(), initial_entry());
+        let mv0 = choose_move(&store, &request("g-gap", "b", 0, positions)).unwrap();
+
+        // 保持済みは ply0 なのに basePly=2 の差分が届いた（前回リクエストの取りこぼし）
+        let mut skipped = HashMap::new();
+        skipped.insert("3".to_string(), move_entry("+7776FU", INFO_NONE));
+        let err =
+            choose_move(&store, &subsequent_request("g-gap", "b", 2, 3, skipped, "r2")).unwrap_err();
+        assert!(matches!(err, SessionError::HistoryGap { have: 0, base: 2 }));
+        assert_eq!(err.status_code(), 409);
+
+        // セッションは無傷なので、正しい差分（basePly=0）は適用できる
+        let mut diff = HashMap::new();
+        diff.insert("1".to_string(), move_entry(&mv0, INFO_NONE));
+        diff.insert("2".to_string(), move_entry("-0000ZZ", INFO_NONE));
+        let mv = choose_move(&store, &subsequent_request("g-gap", "b", 0, 2, diff, "r3")).unwrap();
+        assert_eq!(mv.len(), 7);
+    }
+
+    /// キャッシュ喪失（再起動相当）後の差分リクエストは、永続化なしでは
+    /// HistoryGap で拒否される
+    #[test]
+    fn cache_loss_without_session_dir_rejects_diff() {
+        let store = SessionStore::new("heuristic".into());
+        let mut diff = HashMap::new();
+        diff.insert("3".to_string(), move_entry("+7776FU", INFO_NONE));
+        diff.insert("4".to_string(), move_entry("-0000ZZ", INFO_NONE));
+        let err = choose_move(&store, &subsequent_request("g-lost", "b", 2, 4, diff, "r1"))
+            .unwrap_err();
+        assert!(matches!(err, SessionError::HistoryGap { have: 0, base: 2 }));
+    }
+
+    /// TSUITATE_WEBHOOK_SESSION_DIR 相当の永続化があれば、キャッシュ喪失後も
+    /// ディスクの観測イベント列から復元して差分を継続できる
+    #[test]
+    fn session_dir_restores_after_cache_loss() {
+        let dir = std::env::temp_dir().join(format!(
+            "tsuitate-webhook-session-test-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let store = SessionStore::new("heuristic".into()).with_session_dir(Some(dir.clone()));
+        let mut positions = HashMap::new();
+        positions.insert("0".to_string(), initial_entry());
+        let mv0 = choose_move(&store, &request("g-persist", "b", 0, positions)).unwrap();
+
+        let mut diff = HashMap::new();
+        diff.insert("1".to_string(), move_entry(&mv0, INFO_NONE));
+        diff.insert("2".to_string(), move_entry("-0000ZZ", INFO_NONE));
+        let mv1 =
+            choose_move(&store, &subsequent_request("g-persist", "b", 0, 2, diff, "r2")).unwrap();
+        assert!(dir.join("g-persist.jsonl").exists());
+
+        // プロセス再起動相当: 新しいストアに ply3..4 の差分だけが届く
+        let store2 = SessionStore::new("heuristic".into()).with_session_dir(Some(dir.clone()));
+        let mut diff2 = HashMap::new();
+        diff2.insert("3".to_string(), move_entry(&mv1, INFO_NONE));
+        diff2.insert("4".to_string(), move_entry("-0000ZZ", INFO_NONE));
+        let mv2 =
+            choose_move(&store2, &subsequent_request("g-persist", "b", 2, 4, diff2, "r3")).unwrap();
+        assert_eq!(mv2.len(), 7);
+        assert!(mv2.starts_with('+'));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1131,7 +1454,7 @@ mod tests {
         let mut positions = HashMap::new();
         positions.insert("0".to_string(), initial_entry());
         let mut req = request("g-custom-param", "b", 0, positions);
-        req.game.param = Some("promotion_rank=4".into());
+        req.game.as_mut().unwrap().param = Some("promotion_rank=4".into());
         let err = choose_move(&store, &req).unwrap_err();
         assert!(matches!(err, SessionError::UnsupportedGameParameters));
         assert_eq!(err.status_code(), 400);
@@ -1143,7 +1466,7 @@ mod tests {
         let mut positions = HashMap::new();
         positions.insert("0".to_string(), initial_entry());
         let mut req = request("g-standard-param", "b", 0, positions);
-        req.game.param = Some("initial_board=lnsgkgsnl%2F1r5b1%2Fppppppppp%2F9%2F9%2F9%2FPPPPPPPPP%2F1B5R1%2FLNSGKGSNL&promotion_rank=3&draw_move_count=150&enable_try_rule=false&foul_limits=9.9".into());
+        req.game.as_mut().unwrap().param = Some("initial_board=lnsgkgsnl%2F1r5b1%2Fppppppppp%2F9%2F9%2F9%2FPPPPPPPPP%2F1B5R1%2FLNSGKGSNL&promotion_rank=3&draw_move_count=150&enable_try_rule=false&foul_limits=9.9".into());
         assert!(choose_move(&store, &req).is_ok());
     }
 

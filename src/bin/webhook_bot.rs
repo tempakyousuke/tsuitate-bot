@@ -12,6 +12,10 @@
 //! - TSUITATE_THINK_BUDGET_MS: strategy.rs 側の思考予算（既定2000ms）。
 //!   登録する「レスポンス時間」より十分小さい値に絞ること
 //! - TSUITATE_COLD_START_PREWARM_MS（既定2500）: 再起動後の履歴prewarm上限ms。
+//! - TSUITATE_WEBHOOK_SESSION_DIR（既定 未設定＝無効）: 設定すると、対局ごとの
+//!   観測イベント列を `<dir>/<gameId>.jsonl` へ追記し、プロセス再起動後も
+//!   そこからセッションを復元する。差分プロトコル（2026-08 改訂）では
+//!   リクエストから全履歴を再構成できないため、本番運用では設定を強く推奨
 //! - TSUITATE_WEBHOOK_LOG_DIR（既定 未設定＝無効）: 設定すると、検証済みリクエストの
 //!   生payload・応答・所要時間を `<dir>/<gameId>.jsonl` に1行1リクエストで追記する
 //!   （本体の TSUITATE_RECORD_DIR と同じ「対局ごとに1ファイル」の思想。
@@ -51,6 +55,16 @@ fn main() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(300);
+    let session_dir = match std::env::var("TSUITATE_WEBHOOK_SESSION_DIR") {
+        Ok(v) if !v.is_empty() => match fs::create_dir_all(&v) {
+            Ok(()) => Some(std::path::PathBuf::from(v)),
+            Err(e) => {
+                eprintln!("TSUITATE_WEBHOOK_SESSION_DIR ({v}) の作成に失敗しました: {e}");
+                exit(1);
+            }
+        },
+        _ => None,
+    };
     let log_dir = match std::env::var("TSUITATE_WEBHOOK_LOG_DIR") {
         Ok(v) if !v.is_empty() => match fs::create_dir_all(&v) {
             Ok(()) => Some(v),
@@ -71,7 +85,7 @@ fn main() {
     };
     println!("webhook_bot listening on http://{bind}{path} (strategy={strategy_name})");
 
-    let store = Arc::new(SessionStore::new(strategy_name));
+    let store = Arc::new(SessionStore::new(strategy_name).with_session_dir(session_dir));
     let secret = Arc::new(secret);
     let path = Arc::new(path);
     let log_dir = Arc::new(log_dir);

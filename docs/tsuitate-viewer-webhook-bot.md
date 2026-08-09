@@ -12,12 +12,19 @@ strategy.rs/NN特徴量にモジュール横断でハードコードされてお
 
 ## プロトコル概要
 
-サイトのdispatcherが `your_turn` を毎手POSTしてくるHTTP webhook。リクエスト自体は
-ステートレスだが、botプロセス内では `gameId` ごとのセッションをTTL付きで保持し、
-前回までの履歴を再利用する。
+サイトのdispatcherが `your_turn` を毎手POSTしてくるHTTP webhook。botプロセス内では
+`gameId` ごとのセッションをTTL付きで保持し、前回までの履歴を再利用する。
 真実は運営者提供のサンプル
 （<https://github.com/tsuboshun/tsuitate-sample-bot>）のREADME。
 
+- **差分プロトコル（2026-08 改訂、従量課金対策）**: 初回リクエストだけが
+  手数0から現在までの全 `positions` と `game` を含み、2回目以降は
+  `basePly`（botが保持済みと想定される最終手数）と `basePly+1..=ply` の差分
+  `positions` だけが届く（`game` は来ない。README の型定義ではトップレベルの
+  `type`/`deadlineMs` も2回目以降の型から消えているため、こちらの実装では
+  どちらも任意フィールドとして扱う）。かつては毎回全履歴が届いており
+  「キャッシュを失ったら受信履歴で0手目から作り直す」復旧ができたが、
+  差分化で不可能になった（下記 `TSUITATE_WEBHOOK_SESSION_DIR` と「既知の制約」）
 - 盤面は SFEN、指し手は CSA 形式（7文字固定: 符号1 + 移動元2桁 + 移動先2桁 + 駒種2文字）。
   マスは USI と違い筋・段とも数字（例 `"76"`）
 - 相手の手は常にマスクされる: 捕獲時のみ `+00<to>ZZ` で移動先が開示され、
@@ -25,9 +32,10 @@ strategy.rs/NN特徴量にモジュール横断でハードコードされてお
 - `lastCapture` は実戦dispatcherでは **2文字のCSA駒コード**（FU/KY/KE/GI/KI/KA/HI）。
   エンジン直結のサンプルでは1文字のUSI駒コード（P/L/N/S/G/B/R/K）が使われることも
   あるため、実装は両形式を受理する。
-- `positions` はply（反則試行含む）をキーにした完全な履歴。SFENは使わず、
-  各plyの `lastMove`/`lastInfo`/`lastCapture`/`wasPromotion` だけから
-  `Observation` イベント列を組み立てる（詳細は `webhook_session.rs` 冒頭コメント）
+- `positions` はply（反則試行含む）をキーにした履歴（初回=全量、以降=差分）。
+  SFENは使わず、各plyの `lastMove`/`lastInfo`/`lastCapture`/`wasPromotion` だけから
+  `Observation` イベント列を組み立てる（詳細は `webhook_session.rs` 冒頭コメント）。
+  差分に0手目が含まれない場合、開始時の反則残数は標準の初期値（9,9）として扱う
 - 直前の相手正規手が自駒を取った場合、その捕獲升には相手の着手駒が確実にいる。
   駒打ちは捕獲できないため、その升への全ての駒打ちを候補から除外する。
   さらに、その升を飛び越える飛車・角・香などの長距離移動も除外する。
@@ -37,9 +45,14 @@ strategy.rs/NN特徴量にモジュール横断でハードコードされてお
 - 同じ `requestId` を再送した場合は、セッションを進めず前回と同じCSA応答を返す
   （セッションごとに直近128件を保持）
 - キャッシュから外れた古い `ply` のリクエストは、履歴を巻き戻さず409で拒否する
-- 実戦payload（`TSUITATE_WEBHOOK_LOG_DIR`で取得、2026-07-23確認）で判明した点:
-  - `positions` は長い対局（実測82ply）でも常に0手目から現在plyまで欠番なく全量で届く
-    （スライディングウィンドウ化はされていない）
+- `basePly` が保持済み（ディスク復元込み）のplyより先を指す差分（前回リクエストの
+  取りこぼし・復元不能なキャッシュ喪失）は、セッションを壊さず 409
+  `history_gap` で拒否する。保持済みが `basePly` より先行しているぶんには
+  差分が重複するだけなので、処理済みplyを読み飛ばして正常に続行する
+- 実戦payload（`TSUITATE_WEBHOOK_LOG_DIR`で取得、2026-07-23確認。**差分化前の
+  旧仕様時点の観測**）で判明した点:
+  - （旧仕様）`positions` は長い対局（実測82ply）でも常に0手目から現在plyまで
+    欠番なく全量で届いていた（2026-08 の差分化でこの前提は廃止）
   - `deadlineMs` は相対時間ではなく**絶対epoch msタイムスタンプ**（リクエスト受信の
     約9〜11秒後を指す値を観測）。現状コードはこの値を参照していない
     （`webhook_protocol.rs` の `deadline_ms` は `#[allow(dead_code)]`）
@@ -59,11 +72,15 @@ strategy.rs/NN特徴量にモジュール横断でハードコードされてお
   （盤上移動の駒種は「移動前の自駒配置」から解決する）
 - `webhook_session.rs` — ply履歴から `ObservationLog`/`GameModel`/`PlayerView`
   を組み立て、gameIdごとに `Box<dyn Strategy>` をメモリ上にキャッシュする。
-  標準の `game.param`（初期盤面・昇格段・反則上限・千日手手数・try rule）以外は400で拒否し、
+  標準の `game.param`（初期盤面・昇格段・反則上限・千日手手数・try rule）以外は
+  初回リクエストで400拒否し（`game` は初回にしか来ない）、
   履歴から再構成した自駒局面に矛盾があれば着手せず400を返す。
-  キャッシュ済みなら新しいplyぶんだけ増分で読み進め、キャッシュを失った
-  （プロセス再起動直後・老朽化したセッションの掃除後）場合は0手目から
-  作り直す。老朽化したセッションはリクエストのたびに掃除する（TTL 2時間）
+  キャッシュ済みなら新しいplyぶんだけ増分で読み進める。キャッシュを失った
+  （プロセス再起動直後・老朽化したセッションの掃除後）場合、
+  `TSUITATE_WEBHOOK_SESSION_DIR` が設定されていればディスクの観測イベント列から
+  復元し、無ければ以後の差分リクエストは 409 `history_gap` になる
+  （リクエストに0手目からの全履歴が含まれる場合のみ従来どおり作り直す）。
+  老朽化したセッションはリクエストのたびに掃除する（TTL 2時間、永続化ファイルも同じ）
 - `src/bin/webhook_bot.rs` — エントリポイント。`tiny_http` の同期HTTPサーバーで
   リクエストごとにスレッドを立てる（本体は非同期ランタイム未使用のため、
   tokio/axum一式ではなくこちらに合わせた）
@@ -79,6 +96,7 @@ strategy.rs/NN特徴量にモジュール横断でハードコードされてお
 | `WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS` | `300` | HMAC timestampの許容秒数 |
 | `TSUITATE_THINK_BUDGET_MS` | `2000`（strategy.rs既定） | 登録する「レスポンス時間」より十分小さい値に絞ること |
 | `TSUITATE_COLD_START_PREWARM_MS` | `2500` | 再起動後の履歴prewarmに使う上限。残りの履歴は通常updateで処理する |
+| `TSUITATE_WEBHOOK_SESSION_DIR` | 未設定（無効） | 対局ごとの観測イベント列を `<dir>/<gameId>.jsonl` へ追記し、プロセス再起動・セッションTTL掃除の後もそこから復元する。**差分プロトコルではリクエストから全履歴を再構成できないため、本番運用では設定を強く推奨**（未設定だと再起動後、進行中の対局は 409 で継続不能になる） |
 | `TSUITATE_WEBHOOK_LOG_DIR` | 未設定（無効） | 設定すると検証済みリクエストの生payload・応答・所要時間を `<dir>/<gameId>.jsonl` に1行1リクエストで追記する（本体の `TSUITATE_RECORD_DIR` と同じ思想。実戦での「弱く感じる」挙動を後から再現・分析するための診断用） |
 
 ## デプロイ手順（既存VPS、`tsuitate/scripts/server/setup/07-bot.sh` と同じ思想）
@@ -113,6 +131,7 @@ tsuitate-bot本体の運営bot（`tsuitate-bot.service`）とは別サービス�
    TSUITATE_WEBHOOK_STRATEGY=estimator_v10
    TSUITATE_THINK_BUDGET_MS=2000
    TSUITATE_COLD_START_PREWARM_MS=2500
+   TSUITATE_WEBHOOK_SESSION_DIR=/home/tsuitate/webhook-sessions
    TSUITATE_WEBHOOK_LOG_DIR=/home/tsuitate/webhook-logs
    EOF
    sudo chmod 600 /home/tsuitate/tsuitate-webhook-bot.env
@@ -193,7 +212,11 @@ v10・v20は別プロセス・別ポート・別Secretで完全に独立する�
 
 ## 既知の制約
 
-- **プロセス再起動直後、進行中対局への初回応答は0手目からのフルreplayになる**。
+- **プロセス再起動後の進行中対局は `TSUITATE_WEBHOOK_SESSION_DIR` が無いと
+  継続できない**（差分プロトコルではリクエストに過去の履歴が含まれないため、
+  409 `history_gap` を返し続けることになる。dispatcher側に全履歴の再送
+  フォールバックは無い）。設定してあれば、ディスクの観測イベント列から
+  復元して0手目からのフルreplayを行う。
   当初は一括updateで粒子が完全枯渇するリスクがあったため、`bin/scenario.rs`と
   同じ「自分の手番ごとに逐次prewarmする」パターン（`strategy::prewarm_strategy_with_budget`）
   をコールドスタート経路に追加済み。HTTPではprewarmに既定2.5秒の上限を設け、
@@ -205,9 +228,8 @@ v10・v20は別プロセス・別ポート・別Secretで完全に独立する�
   この時間は伸びる。登録する「レスポンス時間」はデフォルトの5000msではなく
   10000ms程度に余裕を持たせることを推奨（`TSUITATE_THINK_BUDGET_MS`を下げれば
   さらに縮められる）。`deadlineMs`（リクエストで渡ってくる値）は現状コード側で
-  参照していない（`#[allow(dead_code)]`）ため、内部で早期打ち切りはしない。
-  systemd `Restart=always` により再起動自体は稀想定だが、頻発するようなら
-  セッションの永続化（ply/カーソルの簡易ディスク保存）を検討する
+  参照していない（差分化後の型定義からは消えており、欠落も許容する）ため、
+  内部で早期打ち切りはしない
 - `sfen` フィールドを使った `GameModel::diff_view` 相当の整合性チェックは
   実装していない（観測ログ経路のみで自己完結）。ただし履歴モデル自身の矛盾は
   400で拒否する。SFENとの照合が必要なズレの実例が出たら追加検討する
@@ -252,4 +274,19 @@ curl -s -X POST "http://127.0.0.1:8799/webhook" \
   -H "X-Tsuitate-Signature: sha256=$SIG" \
   --data "$BODY"
 # => {"move":"+2726FU"}
+```
+
+2回目以降の差分リクエスト（`type`/`deadlineMs`/`game` なし・`basePly` あり・
+positions は差分のみ）の形。ply 1 の `lastMove` には直前の応答で返した手を入れる:
+
+```sh
+BODY='{"requestId":"r2","gameId":"g1","color":"b","number":1,"ply":2,"basePly":0,"positions":{"1":{"sfen":"masked","lastMove":"+2726FU","lastInfo":0},"2":{"sfen":"masked","lastMove":"-0000ZZ","lastInfo":0}}}'
+TS=$(date +%s)
+SIG=$(printf '%s.%s' "$TS" "$BODY" | openssl dgst -sha256 -hmac testsecret | sed 's/^.* //')
+curl -s -X POST "http://127.0.0.1:8799/webhook" \
+  -H "Content-Type: application/json" \
+  -H "X-Tsuitate-Timestamp: $TS" \
+  -H "X-Tsuitate-Signature: sha256=$SIG" \
+  --data "$BODY"
+# => {"move":"+..."}（セッションが増分適用されて2手目を返す）
 ```
