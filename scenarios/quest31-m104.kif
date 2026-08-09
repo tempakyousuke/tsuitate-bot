@@ -1,4 +1,4 @@
-*scenario ply=103 target=7b7c scores=7b7c:8,2c7c:2,8b7c:2,8b9b:2,8b8a:2,8b8c:2,7b8c:2 bad=2c7c,8b7c,8b9b,8b8a,8b8c,7b8c desc=104手目（後手番）。最高点は7三銀（8点）。採点はevals/quest_20260731.eval.md参照
+*scenario ply=103 target=7b7c scores=7b7c:8,2c7c:2,8b7c:2,8b9b:2,8b8a:2,8b8c:0,7b8c:2 bad=2c7c,8b7c,8b9b,8b8a,8b8c,7b8c desc=104手目（後手番）。最高点は7三銀（8点）。採点はevals/quest_20260731.eval.md参照
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

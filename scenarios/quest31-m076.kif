@@ -1,4 +1,4 @@
-*scenario ply=75 target=7a6b scores=7c6b:2,7a6b:8,7b6b:6,S*6h:2,S*5h:2,S*4h:2,7c8b:2,S*1b:2,S*2b:2,S*1d:2,P*2b:2 bad=7c6b,S*6h,S*5h,S*4h,7c8b,S*1b,S*2b,S*1d,P*2b desc=76手目（後手番）。6二の成桂を取る以外は悪手。銀で取る同銀（実戦）が自然、金で取るのもありだが普通は銀
+*scenario ply=75 target=7a6b scores=7c6b:2,7a6b:8,7b6b:5,S*6h:0,S*5h:0,S*4h:0,7c8b:0,S*1b:0,S*2b:0,S*1d:0,P*2b:0 bad=7c6b,S*6h,S*5h,S*4h,7c8b,S*1b,S*2b,S*1d,P*2b desc=76手目（後手番）。6二の成桂を取る以外は悪手。銀で取る同銀（実戦）が自然、金で取るのもありだが普通は銀
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

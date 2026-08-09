@@ -1,4 +1,4 @@
-*scenario ply=106 fouls=P*7c target=P*7d scores=4a3b+:2,4a5b+:2,4a2c+:2,P*5c:2,P*7d:8,P*5d:2,P*5b:2,P*4d:2,P*7b:2,P*2b:2,S*7c:2,3c4b:2,6d7c:2,3c3b:2,S*9a:2,S*7a:2,S*9c:2 bad=4a3b+,4a5b+,4a2c+,P*5c,P*5d,P*5b,P*4d,P*7b,P*2b,S*7c,3c4b,6d7c,3c3b,S*9a,S*7a,S*9c desc=107手目・7三歩打(P*7c)の反則後（先手番）。最高点は7四歩打（8点）。採点はevals/quest_20260731.eval.md参照
+*scenario ply=106 fouls=P*7c target=P*7d scores=4a3b+:0,4a5b+:0,4a2c+:0,P*5c:0,P*7d:10,P*5d:0,P*5b:0,P*4d:0,P*7b:2,P*2b:0,S*7c:0,3c4b:6,6d7c:3,3c3b:3,S*9a:0,S*7a:6,S*9c:0 bad=4a3b+,4a5b+,4a2c+,P*5c,P*5d,P*5b,P*4d,P*7b,P*2b,S*7c,S*9a,S*9c desc=107手目・7三歩打(P*7c)の反則後（先手番）。最高点は7四歩打（8点）。採点はevals/quest_20260731.eval.md参照
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

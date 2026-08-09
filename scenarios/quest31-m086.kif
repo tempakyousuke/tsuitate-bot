@@ -1,4 +1,4 @@
-*scenario ply=85 target=7a7b scores=7a7b:8,8b7b:8,8b9b:2,8a7c:2,6b7c:2,9a9b:2,2c7c:2 bad=8b9b,8a7c,6b7c,9a9b,2c7c desc=86手目（後手番・王手中）。7二金の王手への受け。同銀（実戦）と7二玉があり（7二銀は6二の銀の紐が外れる点に注意）。桂・香・飛の合駒系は解消確率0で悪手
+*scenario ply=85 target=7a7b scores=7a7b:8,8b7b:8,8b9b:2,8a7c:0,6b7c:0,9a9b:0,2c7c:0 bad=8b9b,8a7c,6b7c,9a9b,2c7c desc=86手目（後手番・王手中）。7二金の王手への受け。同銀（実戦）と7二玉があり（7二銀は6二の銀の紐が外れる点に注意）。桂・香・飛の合駒系は解消確率0で悪手
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

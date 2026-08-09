@@ -1,4 +1,4 @@
-*scenario ply=120 scores=2d3c+:2 bad=2d3c+ desc=121手目（先手番）。採点はevals/quest_20260731.eval.md参照
+*scenario ply=120 scores=2d3c+:0,7c7b+:10,S*1c:0,S*1e:0,S*2e:0,P*5d:0,P*4d:0,S*8c:5,S*7a:5,S*9a:0,S*9c:0,7d9b:5,P*5b:0,4b5b:1 bad=2d3c+,S*1c,S*1e,S*2e,P*5d,P*4d,S*9a,S*9c,P*5b,4b5b desc=121手目（先手番）。採点はevals/quest_20260731.eval.md参照
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

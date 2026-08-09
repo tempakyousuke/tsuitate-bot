@@ -1,4 +1,4 @@
-*scenario ply=98 target=7g8h scores=7g8h:8,7g6h:2,6g6f:2,7g8f:6,8g8f:2,7g7f:8,6i6h:2,2d6h:2 bad=7g6h,6g6f,8g8f,6i6h,2d6h desc=99手目（先手番）。最高点は8八玉（8点）。採点はevals/quest_20260731.eval.md参照
+*scenario ply=98 target=7g8h scores=7g8h:8,7g6h:2,6g6f:1,7g8f:6,8g8f:1,7g7f:7,6i6h:2,2d6h:0 bad=7g6h,6g6f,8g8f,6i6h,2d6h desc=99手目（先手番）。最高点は8八玉（8点）。採点はevals/quest_20260731.eval.md参照
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
