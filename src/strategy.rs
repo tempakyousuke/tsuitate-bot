@@ -3439,9 +3439,11 @@ impl Strategy for EstimatorStrategy {
         // ブラインド時の取り返し（観測だけで決まるので粒子の有無に依らず作れる。
         // 実際に使うのは厳密粒子ゼロの決定だけ = evaluate 側で判定する）
         let blind_recapture = blind_recapture_target(view, log);
-        // ブラインド進入リスクの擬似粒子（`blind_home_risk_w`。観測のみ由来。
-        // 使うのは厳密粒子ゼロの決定だけ = evaluate 側で判定する）
-        let blind_home = (blind_home_risk_w() != 0.0 && !view.you_in_check)
+        // ブラインド進入リスク／home占有割引の擬似粒子（`blind_home_risk_w` /
+        // `blind_home_drop_occ_w`。観測のみ由来。使うのは厳密粒子ゼロの
+        // 決定だけ = evaluate 側で判定する）
+        let blind_home = ((blind_home_risk_w() != 0.0 || blind_home_drop_occ_w() > 0.0)
+            && !view.you_in_check)
             .then(|| blind_home_position(view, log));
         // ブラインド時の信念ネット供給（NN段階②、`belief_gain_w`）。
         // 81マスぶんの forward pass は決定点ごとに1回で足りる（粒子に依存しない）。
@@ -4140,13 +4142,104 @@ fn blind_home_risk_w() -> f64 {
     })
 }
 
-/// ブラインド決定の擬似粒子: 自駒（完全既知）＋**相手駒を初期配置に置いた**盤面。
-/// 自分が取った駒種はその枚数だけ初期マスから除き（成駒は生駒へ戻して数える。
-/// 同駒種のどちらを除くかは初期配置の走査順で決める近似）、自駒が居るマスの
-/// 相手駒も置かない。相手の「動いた駒」は表現しない = home 事前分布そのもの。
-/// 用途はブラインド決定での mover リスク（露見・取り返し）の課金だけで、
+/// ブラインドの home 占有による**打ちの p_legal 割引**の重み
+/// （`TSUITATE_BLIND_HOME_DROP_OCC_W`、既定 0 = 無効）。
+/// ブラインド決定では打ちの p_legal が事前確率のみ（マスに依らずほぼ定数）に
+/// なり、初期配置マスへの打ち（S*1c = 敵歩の上）がほぼ無割引で反則を連発する
+/// （m121/m123 で追加反則 15〜35回/20試行）。擬似粒子の占有 × 鮮度を
+/// 安全方向のみ（min）で反則確率に使う。taint_occ_legal_w と同じ形。
+/// codex 相談（2026-08-09）で「占有反則と受理後リスクの二重課税を避けつつ
+/// まず (b) 占有割引から」と助言された実装順
+fn blind_home_drop_occ_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_BLIND_HOME_DROP_OCC_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+            .unwrap_or(0.0)
+    })
+}
+
+/// home 残存の**鮮度減衰**のパラメータ（codex 相談 2026-08-09 の推奨形:
+/// `freshness(T) = floor + (1−floor)·exp(−λ·T)`、T = 相手の消化手数）。
+/// 相手が動くほど初期配置の情報は古くなるので、home 由来の課金・割引を
+/// 一様に減衰させる。歩・香・桂は動きにくいので減衰を半分にする
+/// （1三角成の香の取り返しのような隅の物理を保つ）。
+/// `TSUITATE_BLIND_HOME_FLOOR` / `TSUITATE_BLIND_HOME_LAMBDA` でスイープ可
+fn blind_home_floor() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_BLIND_HOME_FLOOR")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+            .unwrap_or(0.2)
+    })
+}
+
+fn blind_home_lambda() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_BLIND_HOME_LAMBDA")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.045)
+    })
+}
+
+/// マス上の home 駒の鮮度（そこにまだ居る確率の近似）。role は擬似粒子で
+/// そのマスに置いた駒種（None なら速い側の減衰 = 保守的）
+fn blind_home_freshness(role: Option<Role>, view: &PlayerView) -> f64 {
+    let t = f64::from(view.move_number.saturating_sub(1)) / 2.0;
+    let lambda = match role {
+        Some(Role::Pawn | Role::Lance | Role::Knight) => blind_home_lambda() * 0.5,
+        _ => blind_home_lambda(),
+    };
+    let floor = blind_home_floor();
+    floor + (1.0 - floor) * (-lambda * t).exp()
+}
+
+/// ブラインド決定の home 事前モデル: 相手駒を初期配置に**全部**置いた盤面と、
+/// 駒種ごとの生存率（残枚数/初期枚数。自分が取った駒は成駒を生駒へ戻して数える）。
+///
+/// 取った駒を盤面から個別に除かないのが要点（codex 相談 2026-08-09）:
+/// どの1枚を取ったかは観測から分からないので、走査順で除くと「実在する
+/// 1三の歩」まで消える（初版のバグ。多くの歩を取った終盤で S*1c の占有割引が
+/// 発火しなかった）。代わりに占有・リスクの重みへ survival(role) を掛けて
+/// 確率質量として扱う。自駒が居るマスの相手駒だけは確実に居ないので置かない。
+/// 用途はブラインド決定での mover リスク・打ちの p_legal 割引だけで、
 /// 駒得側の供給には使わない（反則マス記憶系が全滅した領域なので安全方向のみ）
-fn blind_home_position(view: &PlayerView, log: &ObservationLog) -> Position {
+struct BlindHome {
+    pos: Position,
+    /// 自分がそのマスで駒を取ったことがあるか（観測で確定。そのマスの
+    /// home 駒は確実にもう居ない）
+    captured_at: [bool; 81],
+    /// 単一駒（角・飛）の生存率。1枚しか無いので「その駒種を取った」＝
+    /// home 駒が消えた、が枚数証拠だけで確定する。複数駒（歩香桂銀金）は
+    /// 「どの1枚を取ったか」が分からず、取られやすいのは動いた駒に偏る
+    /// （隅の home 残留駒ではない）ので枚数証拠は使わない —
+    /// 初版の駒数プール方式は打ち直し→再捕獲の二重計上で歩の生存率が
+    /// 0 になり、実在する1三の歩の占有割引が発火しなかった
+    bishop_survival: f64,
+    rook_survival: f64,
+}
+
+impl BlindHome {
+    fn survival_at(&self, sq: Coord, role: Role) -> f64 {
+        if self.captured_at[crate::belief_features::sq_index(sq)] {
+            return 0.0;
+        }
+        match unpromote_role(role) {
+            Role::Bishop => self.bishop_survival,
+            Role::Rook => self.rook_survival,
+            _ => 1.0,
+        }
+    }
+}
+
+fn blind_home_position(view: &PlayerView, log: &ObservationLog) -> BlindHome {
     let me = view.your_color;
     let opp = me.other();
     let mut pos = Position::empty(me);
@@ -4161,39 +4254,43 @@ fn blind_home_position(view: &PlayerView, log: &ObservationLog) -> Position {
             );
         }
     }
-    let mut remaining: HashMap<Role, i32> = HashMap::new();
-    for (_, p) in Position::initial().pieces() {
-        if p.color == opp {
-            *remaining.entry(p.role).or_insert(0) += 1;
+    for (sq, p) in Position::initial().pieces() {
+        if p.color == opp && pos.piece_at(sq).is_none() {
+            pos.set(
+                sq,
+                Some(crate::shogi::Piece {
+                    color: opp,
+                    role: p.role,
+                }),
+            );
         }
     }
+    let mut captured_at = [false; 81];
+    let mut bishop_survival = 1.0f64;
+    let mut rook_survival = 1.0f64;
     for e in log.events() {
         if let Observation::MyMove {
             captured: Some(role),
+            usi,
             ..
         } = e
         {
-            *remaining.entry(unpromote_role(*role)).or_insert(0) -= 1;
+            if let Some(ShogiMove::Board { to, .. }) = parse_usi(usi) {
+                captured_at[crate::belief_features::sq_index(to)] = true;
+            }
+            match unpromote_role(*role) {
+                Role::Bishop => bishop_survival = 0.0,
+                Role::Rook => rook_survival = 0.0,
+                _ => {}
+            }
         }
     }
-    for (sq, p) in Position::initial().pieces() {
-        if p.color != opp || pos.piece_at(sq).is_some() {
-            continue;
-        }
-        let c = remaining.entry(p.role).or_insert(0);
-        if *c <= 0 {
-            continue;
-        }
-        *c -= 1;
-        pos.set(
-            sq,
-            Some(crate::shogi::Piece {
-                color: opp,
-                role: p.role,
-            }),
-        );
+    BlindHome {
+        pos,
+        captured_at,
+        bishop_survival,
+        rook_survival,
     }
-    pos
 }
 
 /// 「直前の相手手が自駒を取ったマス」と、そこにいる相手駒の期待交換価値。
@@ -4908,10 +5005,11 @@ fn evaluate(
     // 直前に自駒を取られたマスと、そこにいる敵駒の期待交換価値（観測のみで決まる）。
     // 厳密粒子が全滅した決定でだけ使う（`blind_recapture_target`）
     blind_recapture_target: Option<(Coord, f64)>,
-    // ブラインド進入リスクの擬似粒子（相手駒を初期配置に置いた盤面。
-    // `blind_home_risk_w`。choose() が「w≠0・王手中でない」のゲートを掛けて
-    // 渡し、厳密粒子が全滅した決定でだけ使う）
-    blind_home: Option<&Position>,
+    // ブラインドの home 事前モデル（相手駒を初期配置に置いた盤面＋駒種生存率。
+    // `blind_home_risk_w` / `blind_home_drop_occ_w`。choose() が
+    // 「w≠0・王手中でない」のゲートを掛けて渡し、厳密粒子が全滅した決定で
+    // だけ使う）
+    blind_home: Option<&BlindHome>,
     // 信念ネットのマスごと占有確率と、盤上に残る相手駒の平均交換価値。
     // 上と同じく**厳密粒子が全滅した決定でだけ**使う（`belief_gain_w`）。
     // 重みが 0 なら choose() が None を渡すので計算もしない
@@ -5255,6 +5353,19 @@ fn evaluate(
         let p_occ = occ[crate::belief_features::sq_index(to)];
         p_legal = p_legal.min(1.0 - params.taint_occ_legal_w * p_occ).max(0.0);
     }
+    // ブラインドの home 占有による打ちの p_legal 割引（`blind_home_drop_occ_w`、
+    // 安全方向のみ = min）。初期配置マスへの打ちは擬似粒子の占有 × 生存率 ×
+    // 鮮度の確率で反則になる。空きマスの打ちは押し上げない
+    if blind_home_drop_occ_w() > 0.0 && particles.is_empty() {
+        if let (Some(bh), ShogiMove::Drop { to, .. }) = (blind_home, *mv) {
+            if let Some(p) = bh.pos.piece_at(to).filter(|p| p.color == opp) {
+                let p_occ = bh.survival_at(to, p.role) * blind_home_freshness(Some(p.role), view);
+                p_legal = p_legal
+                    .min(1.0 - blind_home_drop_occ_w() * p_occ)
+                    .max(0.0);
+            }
+        }
+    }
     let p_legal = p_legal;
     // 賭け分散ペナルティの内訳（ランキング表示用に expected の外へ持ち出す）
     let mut capture_bet_penalty = 0.0;
@@ -5336,17 +5447,14 @@ fn evaluate(
     // 課金する。駒得側は供給しない（安全方向のみ）。blind_recapture のマスは
     // あちらが同じ式でリスクを引くので二重計上しない。王手中は無効
     let blind_home_risk = match (particles.is_empty(), blind_home, *mv) {
-        (true, Some(ph), ShogiMove::Board { from, to, .. })
+        (true, Some(bh), ShogiMove::Board { from, to, .. })
             if !view.you_in_check
                 && blind_recapture_target.is_none_or(|(sq, _)| sq != to)
-                && ph.is_legal(mv) =>
+                && bh.pos.is_legal(mv) =>
         {
-            let captured_value = ph
-                .piece_at(to)
-                .filter(|p| p.color == opp)
-                .map(|p| exchange_value(p.role))
-                .unwrap_or(0.0);
-            let mut next_p = ph.clone();
+            let occ_piece = bh.pos.piece_at(to).filter(|p| p.color == opp);
+            let captured_value = occ_piece.map(|p| exchange_value(p.role)).unwrap_or(0.0);
+            let mut next_p = bh.pos.clone();
             next_p.play_unchecked(mv);
             let own_after = next_p
                 .piece_at(to)
@@ -5358,7 +5466,8 @@ fn evaluate(
                     from: f2,
                     promote: true,
                     ..
-                } if promo_risk_prerole() => ph
+                } if promo_risk_prerole() => bh
+                    .pos
                     .piece_at(f2)
                     .map(|p| exchange_value(p.role))
                     .unwrap_or(own_after),
@@ -5384,7 +5493,16 @@ fn evaluate(
             if own_risk != own_after && own_after > 0.0 {
                 recap *= own_risk / own_after;
             }
-            blind_home_risk_w() * mover_w * recap.max(floor)
+            // 鮮度減衰 × 生存率（codex 相談 2026-08-09）: 相手が動くほど home
+            // 事前は古くなり、取った駒種ほど残っていない。着地マスの占有駒の
+            // 鮮度×生存率で全体を割り引く（捕獲でなければ保守的に速い側の減衰）。
+            // home 事前が古い局面で正しい侵入まで課税していた過課金
+            // （m119/m044/m034）への対策
+            let fresh = match occ_piece {
+                Some(p) => bh.survival_at(to, p.role) * blind_home_freshness(Some(p.role), view),
+                None => blind_home_freshness(None, view),
+            };
+            blind_home_risk_w() * fresh * mover_w * recap.max(floor)
         }
         _ => 0.0,
     };
