@@ -4142,6 +4142,22 @@ fn blind_home_risk_w() -> f64 {
     })
 }
 
+/// 残り反則1回（次の反則で即負け）のときの反則コストの床
+/// （`TSUITATE_LAST_FOUL_GUARD`、既定 0 = 従来挙動）。
+/// 推奨値 50〜100: 材料スケールの gain（〜10）では反則リスクを正当化
+/// できないが、粒子合意の詰み（〜1000×q）は通る水準。
+/// 凍結版はこの名前を知らない
+fn last_foul_guard() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_LAST_FOUL_GUARD")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
 /// ブラインドの home 占有による**打ちの p_legal 割引**の重み
 /// （`TSUITATE_BLIND_HOME_DROP_OCC_W`、既定 0 = 無効）。
 /// ブラインド決定では打ちの p_legal が事前確率のみ（マスに依らずほぼ定数）に
@@ -5567,9 +5583,20 @@ fn evaluate(
     // 0 = 従来どおり自分の残数のみ。tune-round3 の分析でスコアと反則差の相関0.75）
     let fouls_left = (10u32.saturating_sub(view.fouls.you)).max(1) as f64;
     let opp_fouls_left = (10u32.saturating_sub(view.fouls.opponent)).max(1) as f64;
-    let foul_cost = params.foul_cost_base
+    let mut foul_cost = params.foul_cost_base
         * (10.0 / fouls_left).powf(params.foul_cost_pow)
         * (opp_fouls_left / 10.0).powf(params.foul_diff_pow);
+    // 残り反則1回（次の反則で即負け）のガード（`TSUITATE_LAST_FOUL_GUARD`、
+    // 既定 0 = 従来挙動）。既定の急峻化は残り1回でも約4.8点にしかならず、
+    // gain 5〜8 の手が「10%反則でも指す」計算を通して反則負けまで打ち尽くす
+    // （quest31-m138/m140 で foul_limit 12/20）。ユーザー方針（2026-08-10）:
+    // 反則プローブは生産的だが**残り0のときだけは反則に気をつける**。
+    // 床は材料スケールの gain では正当化できない水準に敷く。粒子合意の詰み
+    // （〜1000×q）だけは通る = 「ほぼ確実な詰みなら残り1回でも賭けてよい」
+    if fouls_left <= 1.0 {
+        foul_cost = foul_cost.max(last_foul_guard());
+    }
+    let foul_cost = foul_cost;
 
     // 前進の弱い事前バイアス（推定が薄い序盤に駒をぶつけに行くため）
     let advance_bias = match *mv {
