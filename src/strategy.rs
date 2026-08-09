@@ -4143,10 +4143,12 @@ fn blind_home_risk_w() -> f64 {
 }
 
 /// 残り反則1回（次の反則で即負け）のときの反則コストの床
-/// （`TSUITATE_LAST_FOUL_GUARD`、既定 0 = 従来挙動）。
-/// 推奨値 50〜100: 材料スケールの gain（〜10）では反則リスクを正当化
-/// できないが、粒子合意の詰み（〜1000×q）は通る水準。
-/// 凍結版はこの名前を知らない
+/// （`TSUITATE_LAST_FOUL_GUARD`、**既定 60**、0 で従来挙動 = 切り戻しノブ）。
+/// 材料スケールの gain（〜10）では反則リスクを正当化できないが、
+/// 粒子合意の詰み（〜1000×q）は通る水準。凍結版はこの名前を知らない。
+/// 実測（2026-08-10 採用）: suite 1263→1230・アリーナ ペア3シード
+/// 57.1% vs 対照 51.8%（+5.3pt、3シード全勝）・反則/局は対照水準
+/// （= 残り2回以上のプローブ経済は不変）
 fn last_foul_guard() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -4154,9 +4156,12 @@ fn last_foul_guard() -> f64 {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.0)
+            .unwrap_or(LAST_FOUL_GUARD)
     })
 }
+
+/// `last_foul_guard` の既定値（2026-08-10 採用）。0 で従来挙動へ切り戻し
+const LAST_FOUL_GUARD: f64 = 60.0;
 
 /// ブラインドの home 占有による**打ちの p_legal 割引**の重み
 /// （`TSUITATE_BLIND_HOME_DROP_OCC_W`、既定 0 = 無効）。
