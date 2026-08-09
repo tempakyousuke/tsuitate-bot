@@ -5110,7 +5110,38 @@ fn evaluate(
         if params.value_nn_w != 0.0 && !view.you_in_check && nn_n < budget.nn_samples {
             let state = nn_state_cache[pi]
                 .get_or_insert_with(|| crate::value_features::value_features(pos, me));
-            let trans = crate::value_features::transition_features(pos, mv, &next, me);
+            // 不成候補（gen_nonpromote 時のみ存在）の NN は**成り側の双子**で
+            // 評価する: NN の学習データは「成れるなら成る」の自動成りのみで、
+            // 成/不成の差分は分布外ノイズ（実測 2026-08-09: ΔNN が seed により
+            // ±0.8 振れ、リスク・静的gainが同額なのに確定捕獲の 4七歩不成が
+            // 成りの上へ浮く = ユーザー指摘の悪手）。成/不成の差は手作り項
+            // （露見・利き・promo）だけに担わせる
+            let promoted_twin = match *mv {
+                ShogiMove::Board {
+                    from,
+                    to,
+                    promote: false,
+                } if pos.piece_at(from).is_some_and(|p| {
+                    promotion_choice(p.role, from, to, me) == Promotion::Optional
+                }) =>
+                {
+                    let mv2 = ShogiMove::Board {
+                        from,
+                        to,
+                        promote: true,
+                    };
+                    let mut next2 = pos.clone();
+                    next2.play_unchecked(&mv2);
+                    Some((mv2, next2))
+                }
+                _ => None,
+            };
+            let trans = match &promoted_twin {
+                Some((mv2, next2)) => {
+                    crate::value_features::transition_features(pos, mv2, next2, me)
+                }
+                None => crate::value_features::transition_features(pos, mv, &next, me),
+            };
             let mut f = [0.0f64;
                 crate::value_features::VALUE_FEATURES + crate::value_features::TRANSITION_FEATURES];
             f[..crate::value_features::VALUE_FEATURES].copy_from_slice(state);
