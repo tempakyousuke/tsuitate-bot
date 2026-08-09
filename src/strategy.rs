@@ -3439,6 +3439,10 @@ impl Strategy for EstimatorStrategy {
         // ブラインド時の取り返し（観測だけで決まるので粒子の有無に依らず作れる。
         // 実際に使うのは厳密粒子ゼロの決定だけ = evaluate 側で判定する）
         let blind_recapture = blind_recapture_target(view, log);
+        // ブラインド進入リスクの擬似粒子（`blind_home_risk_w`。観測のみ由来。
+        // 使うのは厳密粒子ゼロの決定だけ = evaluate 側で判定する）
+        let blind_home = (blind_home_risk_w() != 0.0 && !view.you_in_check)
+            .then(|| blind_home_position(view, log));
         // ブラインド時の信念ネット供給（NN段階②、`belief_gain_w`）。
         // 81マスぶんの forward pass は決定点ごとに1回で足りる（粒子に依存しない）。
         // 重み0（既定）なら計算もしない = 挙動不変
@@ -3608,6 +3612,7 @@ impl Strategy for EstimatorStrategy {
                 budget,
                 &mut nn_state_cache,
                 blind_recapture,
+                blind_home.as_ref(),
                 blind_belief,
                 taint_occ_board.as_ref(),
                 opp_king_w.as_ref(),
@@ -4116,6 +4121,79 @@ fn blind_recapture_w() -> f64 {
             .and_then(|v| v.parse().ok())
             .unwrap_or(BLIND_RECAPTURE_W)
     })
+}
+
+/// ブラインド進入リスク（`TSUITATE_BLIND_HOME_RISK_W`、既定 0 = 無効）の重み。
+/// 厳密粒子ゼロの決定では `expected` ごと mover リスクが消え、敵陣の
+/// 初期配置マスへの成り込みが無コストで浮く（quest31 の 1三角成 = 初期位置の
+/// 歩を取り、1一の香に取り返される歩角交換。粒子が生きた seed では
+/// リスク −3.2〜−6.4 で沈むのにブラインド seed ではリスク 0 で 16 位。
+/// 2026-08-09 ユーザー指摘が発端）
+fn blind_home_risk_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_BLIND_HOME_RISK_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
+/// ブラインド決定の擬似粒子: 自駒（完全既知）＋**相手駒を初期配置に置いた**盤面。
+/// 自分が取った駒種はその枚数だけ初期マスから除き（成駒は生駒へ戻して数える。
+/// 同駒種のどちらを除くかは初期配置の走査順で決める近似）、自駒が居るマスの
+/// 相手駒も置かない。相手の「動いた駒」は表現しない = home 事前分布そのもの。
+/// 用途はブラインド決定での mover リスク（露見・取り返し）の課金だけで、
+/// 駒得側の供給には使わない（反則マス記憶系が全滅した領域なので安全方向のみ）
+fn blind_home_position(view: &PlayerView, log: &ObservationLog) -> Position {
+    let me = view.your_color;
+    let opp = me.other();
+    let mut pos = Position::empty(me);
+    for p in &view.your_pieces {
+        if let Some(sq) = parse_usi_square(&p.square) {
+            pos.set(
+                sq,
+                Some(crate::shogi::Piece {
+                    color: me,
+                    role: p.role,
+                }),
+            );
+        }
+    }
+    let mut remaining: HashMap<Role, i32> = HashMap::new();
+    for (_, p) in Position::initial().pieces() {
+        if p.color == opp {
+            *remaining.entry(p.role).or_insert(0) += 1;
+        }
+    }
+    for e in log.events() {
+        if let Observation::MyMove {
+            captured: Some(role),
+            ..
+        } = e
+        {
+            *remaining.entry(unpromote_role(*role)).or_insert(0) -= 1;
+        }
+    }
+    for (sq, p) in Position::initial().pieces() {
+        if p.color != opp || pos.piece_at(sq).is_some() {
+            continue;
+        }
+        let c = remaining.entry(p.role).or_insert(0);
+        if *c <= 0 {
+            continue;
+        }
+        *c -= 1;
+        pos.set(
+            sq,
+            Some(crate::shogi::Piece {
+                color: opp,
+                role: p.role,
+            }),
+        );
+    }
+    pos
 }
 
 /// 「直前の相手手が自駒を取ったマス」と、そこにいる相手駒の期待交換価値。
@@ -4830,6 +4908,10 @@ fn evaluate(
     // 直前に自駒を取られたマスと、そこにいる敵駒の期待交換価値（観測のみで決まる）。
     // 厳密粒子が全滅した決定でだけ使う（`blind_recapture_target`）
     blind_recapture_target: Option<(Coord, f64)>,
+    // ブラインド進入リスクの擬似粒子（相手駒を初期配置に置いた盤面。
+    // `blind_home_risk_w`。choose() が「w≠0・王手中でない」のゲートを掛けて
+    // 渡し、厳密粒子が全滅した決定でだけ使う）
+    blind_home: Option<&Position>,
     // 信念ネットのマスごと占有確率と、盤上に残る相手駒の平均交換価値。
     // 上と同じく**厳密粒子が全滅した決定でだけ**使う（`belief_gain_w`）。
     // 重みが 0 なら choose() が None を渡すので計算もしない
@@ -5246,6 +5328,66 @@ fn evaluate(
         }
         _ => 0.0,
     };
+    // ブラインド進入リスク（`blind_home_risk_w`、既定 0）: 厳密粒子ゼロの
+    // 決定では expected ごと mover リスクが消え、敵陣の初期配置マスへの
+    // 成り込み（1三角成 = 初期位置の歩を取り 1一の香に取り返される歩角交換）が
+    // 無コストで浮く。相手駒を初期配置に置いた擬似粒子1個に対して
+    // **mover リスクだけ**を通常経路と同じ式（露見床・取り返し・prerole 換算）で
+    // 課金する。駒得側は供給しない（安全方向のみ）。blind_recapture のマスは
+    // あちらが同じ式でリスクを引くので二重計上しない。王手中は無効
+    let blind_home_risk = match (particles.is_empty(), blind_home, *mv) {
+        (true, Some(ph), ShogiMove::Board { from, to, .. })
+            if !view.you_in_check
+                && blind_recapture_target.is_none_or(|(sq, _)| sq != to)
+                && ph.is_legal(mv) =>
+        {
+            let captured_value = ph
+                .piece_at(to)
+                .filter(|p| p.color == opp)
+                .map(|p| exchange_value(p.role))
+                .unwrap_or(0.0);
+            let mut next_p = ph.clone();
+            next_p.play_unchecked(mv);
+            let own_after = next_p
+                .piece_at(to)
+                .map(|p| exchange_value(p.role))
+                .unwrap_or(0.0);
+            // 成る手のリスク価格は通常経路と同じ規約（promo_risk_prerole）
+            let own_risk = match *mv {
+                ShogiMove::Board {
+                    from: f2,
+                    promote: true,
+                    ..
+                } if promo_risk_prerole() => ph
+                    .piece_at(f2)
+                    .map(|p| exchange_value(p.role))
+                    .unwrap_or(own_after),
+                _ => own_after,
+            };
+            let _ = from;
+            let mover_w = if captured_value > 0.0 {
+                params.mover_w_captured
+            } else {
+                params.mover_w_quiet
+            };
+            let known_factor = if captured_value > 0.0 {
+                1.0
+            } else {
+                params.camp_known_quiet
+            };
+            let mut floor =
+                own_risk * camp_defended_prior(to, me, params.camp_scale) * known_factor;
+            if captured_value > 0.0 {
+                floor = floor.max(own_risk * params.capture_reveal_risk);
+            }
+            let mut recap = recapture_risk(&next_p, me, to, params.recapture_defended);
+            if own_risk != own_after && own_after > 0.0 {
+                recap *= own_risk / own_after;
+            }
+            blind_home_risk_w() * mover_w * recap.max(floor)
+        }
+        _ => 0.0,
+    };
     // 攻め圧力は粒子の健全度でゲートする。退化した粒子は間違った玉位置に
     // 固まりやすく、「誰もいない場所への攻め」が加点され続ける
     // （対人実戦: 終盤の成桂の徘徊）。健全度が低いときは確実な項だけ残す
@@ -5594,7 +5736,8 @@ fn evaluate(
         + effect_value
         + foul_occ_attack
         + blind_recapture
-        + blind_belief_gain;
+        + blind_belief_gain
+        - blind_home_risk;
     // 打ちプローブの反則情報価値: 反則枝（占有粒子）の期待回収値 ×
     // p_occ(1−p_occ) の情報ゲート × 残り反則予算の2乗。形の根拠:
     // - p_occ を掛ける（実効 p_occ²·(1−p_occ)）: 線形だと占有質量 8% のマスへの
