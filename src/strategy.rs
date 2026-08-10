@@ -1963,7 +1963,7 @@ impl Default for EvalParams {
             foul_cost_base: 0.637,
             foul_cost_pow: 1.3331,
             advance_w: 0.0699,
-            promote_bias: 0.5,
+            promote_bias: 0.4,
             drop_bias: 0.2616,
             prior_weight: 4.9065,
             prior_weight_degen: 7.9515,
