@@ -452,8 +452,16 @@ fn king_known_approach_amount(
     amount
 }
 
-/// 打ちの「仕事」があるか（`hand_asset_w`）。裏付け占有への当たり、または
-/// 玉候補への近接（チェビシェフ距離 ≤ 2）
+/// 打ちの「仕事」があるか（`hand_asset_w`）。
+///
+/// - **安い駒**（歩香桂）: 裏付け占有への当たり、または鋭い玉候補への近接
+/// - **高い駒**（金銀飛角とその成駒）: 鋭い玉候補への近接、または
+///   「鋭い玉候補の近くの裏付けマス」への当たり
+///
+/// 発端は quest31-m062 の `G*1b`。玉候補が41マスに拡散している局面で
+/// 「昔取られた 2c に当たる」だけで金打ちが免税され、端への無目的な
+/// 金打ちが link 加点ごと生き残っていた。玉近接・寄せ方向の当たりは
+/// `king_cands.len() ≤ 8` のときだけ数える。
 fn drop_has_hand_asset_work(
     view: &PlayerView,
     role: Role,
@@ -468,15 +476,28 @@ fn drop_has_hand_asset_work(
         role,
     });
     let p = pieces.last().expect("just pushed");
-    if crate::board::defend_targets(&pieces, p, me)
-        .iter()
-        .any(|&s| backed[crate::belief_features::sq_index(s)])
-    {
+    let attack_backed: Vec<Coord> = crate::board::defend_targets(&pieces, p, me)
+        .into_iter()
+        .filter(|&s| backed[crate::belief_features::sq_index(s)])
+        .collect();
+    let cheap = matches!(role, Role::Pawn | Role::Lance | Role::Knight);
+    if cheap && !attack_backed.is_empty() {
         return true;
     }
-    king_cands.iter().any(|k| {
-        (k.file - to.file).abs() <= 2 && (k.rank - to.rank).abs() <= 2
-    })
+    const SHARP_KING_CANDS: usize = 8;
+    if king_cands.len() > SHARP_KING_CANDS {
+        return false;
+    }
+    let near_king = |c: Coord| {
+        king_cands
+            .iter()
+            .any(|k| (k.file - c.file).abs() <= 2 && (k.rank - c.rank).abs() <= 2)
+    };
+    if near_king(to) {
+        return true;
+    }
+    // 高い駒: 玉の近くの裏付けを取る／当てる打ちだけ仕事
+    !cheap && attack_backed.iter().any(|&s| near_king(s))
 }
 
 /// 王手中の玉の手の gain を「玉の手全体の平均」に揃えるか（既定 on、
@@ -7992,7 +8013,7 @@ pub(crate) mod tests {
         assert!(threats2[crate::belief_features::sq_index(Coord { file: 7, rank: 7 })]);
     }
 
-    /// 持ち駒資産損の「仕事」判定: 裏付けマスへの当たり／玉候補近接なら work
+    /// 持ち駒資産損の「仕事」判定（安い駒の裏付け当たり／鋭い玉近接）
     #[test]
     fn drop_hand_asset_work_backed_or_near_king() {
         let view = minimal_view(
@@ -8000,7 +8021,11 @@ pub(crate) mod tests {
                 square: "5i".into(),
                 role: Role::King,
             }],
-            HashMap::from([(Role::Gold, 1), (Role::Silver, 1)]),
+            HashMap::from([
+                (Role::Gold, 1),
+                (Role::Silver, 1),
+                (Role::Pawn, 1),
+            ]),
         );
         let mut backed = [false; 81];
         // 7g に裏付け占有
@@ -8008,8 +8033,16 @@ pub(crate) mod tests {
         let mut kings = std::collections::BTreeSet::new();
         kings.insert(Coord { file: 5, rank: 1 });
 
-        // 金を 7f に打つと裏付け 7g へ縦に当たる → work
+        // 安い駒（歩）は裏付けへの当たりだけで work（先手歩は 7h→7g）
         assert!(drop_has_hand_asset_work(
+            &view,
+            Role::Pawn,
+            Coord { file: 7, rank: 8 },
+            &backed,
+            &kings,
+        ));
+        // 高い駒（金）は玉から遠い裏付けへの当たりだけでは免税しない
+        assert!(!drop_has_hand_asset_work(
             &view,
             Role::Gold,
             Coord { file: 7, rank: 6 },
@@ -8024,7 +8057,7 @@ pub(crate) mod tests {
             &backed,
             &kings,
         ));
-        // 銀を 5c に打つ: 玉 5a へチェビシェフ2 → work
+        // 銀を 5c に打つ: 玉 5a へチェビシェフ2 → work（候補1個で鋭い）
         assert!(drop_has_hand_asset_work(
             &view,
             Role::Silver,
@@ -8032,6 +8065,66 @@ pub(crate) mod tests {
             &backed,
             &kings,
         ));
+        // 高い駒でも、鋭い玉候補の近くの裏付けへ当たれば work
+        let mut kings_near = std::collections::BTreeSet::new();
+        kings_near.insert(Coord { file: 7, rank: 5 });
+        assert!(drop_has_hand_asset_work(
+            &view,
+            Role::Gold,
+            Coord { file: 7, rank: 6 },
+            &backed,
+            &kings_near,
+        ));
+        // 候補が9個以上に拡散していると玉近接は数えない
+        for f in 1..=9i8 {
+            kings.insert(Coord { file: f, rank: 1 });
+        }
+        assert!(
+            !drop_has_hand_asset_work(
+                &view,
+                Role::Silver,
+                Coord { file: 5, rank: 3 },
+                &backed,
+                &kings,
+            ),
+            "diffuse king belief must not exempt near-king drops"
+        );
+        // 安い駒の裏付け当たりは拡散していても work
+        assert!(drop_has_hand_asset_work(
+            &view,
+            Role::Pawn,
+            Coord { file: 7, rank: 8 },
+            &backed,
+            &kings,
+        ));
+        // 高い駒は拡散時に裏付け当たりでも免税しない（m062 の G*1b 型）
+        assert!(!drop_has_hand_asset_work(
+            &view,
+            Role::Gold,
+            Coord { file: 7, rank: 6 },
+            &backed,
+            &kings,
+        ));
+    }
+
+    /// m062 の G*1b が広い玉候補近接で work 免除されていないか
+    #[test]
+    fn hand_asset_g1b_quest31_m062_should_be_taxed() {
+        let text = std::fs::read_to_string("scenarios/quest31-m062.kif").expect("kif");
+        let kifu = crate::kifu::parse_kif(&text).expect("parse");
+        let rep = crate::scenario_core::replay(&kifu, 61);
+        let side = rep.pos.turn();
+        let view = crate::scenario_core::make_view(&rep.pos, side, &rep.fouls);
+        let log = &rep.logs[crate::scenario_core::side_idx(side)];
+        let kings = crate::deduce::opp_king_candidates(side, log);
+        let backed = opp_occupancy_evidence(&view, log);
+        let to = Coord { file: 1, rank: 2 };
+        let work = drop_has_hand_asset_work(&view, Role::Gold, to, &backed, &kings);
+        assert!(
+            !work,
+            "G*1b should NOT have hand-asset work at m062 (king_cands={})",
+            kings.len()
+        );
     }
 
     /// ブラインド取り返し: 対象マスは**直前の相手手**で取られたマスに限る
