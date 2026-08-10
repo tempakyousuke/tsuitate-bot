@@ -1969,7 +1969,7 @@ impl Default for EvalParams {
             foul_cost_base: 0.637,
             foul_cost_pow: 1.3331,
             advance_w: 0.0699,
-            promote_bias: 0.1466,
+            promote_bias: 0.5,
             drop_bias: 0.2616,
             prior_weight: 4.9065,
             prior_weight_degen: 7.9515,
@@ -2009,7 +2009,7 @@ impl Default for EvalParams {
             // 材料の退化ゲート（2026-08-10）。0 = 従来と同一挙動
             material_degen_q0: 0.0,
             // home マスへの未確認捕獲成り（2026-08-10）。検証候補
-            unconfirmed_promo_capture_w: 0.05,
+            unconfirmed_promo_capture_w: 0.2,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
             // 反則経済の新項（2026-07-16、オラクル測定で36ptの伸びしろを確認後に追加）。
@@ -2741,6 +2741,18 @@ impl EstimatorStrategy {
 /// いればそちらを優先する。bin/tune はこの関数で「調整対象ノブが env に
 /// 潰されていないか」を起動時に検査する
 pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
+    // 実現成りの固定バイアス（既存SPSA項のスイープ・切り戻し用）
+    let params = match std::env::var("TSUITATE_PROMOTE_BIAS")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+    {
+        Some(w) => EvalParams {
+            promote_bias: w,
+            ..params
+        },
+        None => params,
+    };
     // valueネット重みの運用ノブ（デプロイ時の切り戻し・アブレーション用）。
     // SPSA（with_params 経由）でも env が設定されていればそちらを優先する
     let params = match std::env::var("TSUITATE_VALUE_NN_W")
