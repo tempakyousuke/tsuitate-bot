@@ -5839,13 +5839,35 @@ fn evaluate(
     let foul_cost = foul_cost;
 
     // 前進の弱い事前バイアス（推定が薄い序盤に駒をぶつけに行くため）
+    // 成りの固定ボーナス（`promote_bias`）の駒種分け（2026-08-10）:
+    // - 歩・角・飛: 成ると利きが増え／ついたてでは王手露見回避の不成もあるが、
+    //   成り側へ `promote_bias` を付ける（従来どおり）
+    // - 桂・銀・香: 成ると元の利き（跳び・斜め後ろ・縦走り）を失うので、
+    //   **不成側**へ同額を付ける（成り側は 0）。`TSUITATE_GEN_NONPROMOTE` で
+    //   不成が候補に載る前提。載らない従来生成では成り一択のまま挙動不変。
+    //   発端は quest31 の 4九銀成（3h4i+、不成=10 / 成=2）
     let advance_bias = match *mv {
         ShogiMove::Board { from, to, promote } => {
             let adv = match me {
                 Color::Sente => (from.rank - to.rank) as f64,
                 Color::Gote => (to.rank - from.rank) as f64,
             };
-            params.advance_w * adv + if promote { params.promote_bias } else { 0.0 }
+            let role = view
+                .your_pieces
+                .iter()
+                .find(|p| p.square == make_usi_square(from))
+                .map(|p| p.role);
+            let promo_bonus = match (promote, role) {
+                (true, Some(Role::Silver | Role::Knight | Role::Lance)) => 0.0,
+                (false, Some(r @ (Role::Silver | Role::Knight | Role::Lance)))
+                    if promotion_choice(r, from, to, me) != Promotion::None =>
+                {
+                    params.promote_bias
+                }
+                (true, _) => params.promote_bias,
+                (false, _) => 0.0,
+            };
+            params.advance_w * adv + promo_bonus
         }
         ShogiMove::Drop { .. } => params.drop_bias,
     };
