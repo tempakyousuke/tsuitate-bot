@@ -1678,6 +1678,12 @@ pub struct EvalParams {
     /// `w × 残存敵駒の平均交換価値` を gain 内（p_legal 割引の内側）へ加点。
     /// 観測のみ由来・粒子不要。王手中は無効。0 = 従来挙動
     pub foul_occ_attack_w: f64,
+    /// **材料の退化ゲート**（既定 0 = 従来と同一挙動）。駒得の期待値を粒子質量の
+    /// 薄さで縮める: g = c(1+q0)/(c+q0)（c = confidence）。少数の生存粒子は
+    /// 「自信を持って間違う」ため（実測 2026-08-10: 厳密粒子9個の決定点で
+    /// 真実が空きマスの4一に飛車85.9%の信念、そこへの4一成桂が浮く）。
+    /// `TSUITATE_MATERIAL_DEGEN_Q0` で上書き可・SPSA対応。凍結版は知らない
+    pub material_degen_q0: f64,
     /// **taint 粒子の占有合意で打ちの反則確率を下げる**（2026-08-03、ユーザー指摘の
     /// 38手目 `S*4g` が発端）。厳密粒子が全滅した決定では `p_legal` が
     /// `prior_legal` だけで決まるが、その打ち側は**マスに依らない定数**
@@ -1994,6 +2000,8 @@ impl Default for EvalParams {
             // 打ち反則で確定した駒への当たり（2026-08-07 実装、2026-08-08 採用）。
             // 0 で従来挙動へ切り戻し。drop_probe_w（情報を買う）の回収側
             foul_occ_attack_w: 2.0,
+            // 材料の退化ゲート（2026-08-10）。0 = 従来と同一挙動
+            material_degen_q0: 0.0,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
             // 反則経済の新項（2026-07-16、オラクル測定で36ptの伸びしろを確認後に追加）。
@@ -2090,7 +2098,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 69] = [
+    pub const SPECS: [ParamSpec; 70] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -2481,6 +2489,12 @@ impl EvalParams {
             lo: 0.0,
             hi: 3.0,
         },
+        ParamSpec {
+            // 材料の退化ゲートの半減点（confidence のスケール）。0 = 無効
+            name: "material_degen_q0",
+            lo: 0.0,
+            hi: 1.0,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -2554,6 +2568,7 @@ impl EvalParams {
             self.king_capture_reveal,
             self.promo_king_prox,
             self.foul_occ_attack_w,
+            self.material_degen_q0,
         ]
     }
 
@@ -2629,6 +2644,7 @@ impl EvalParams {
             king_capture_reveal: v[66],
             promo_king_prox: v[67],
             foul_occ_attack_w: v[68],
+            material_degen_q0: v[69],
         }
     }
 }
@@ -2943,6 +2959,18 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
     {
         Some(w) => EvalParams {
             foul_occ_attack_w: w,
+            ..params
+        },
+        None => params,
+    };
+    // 材料の退化ゲート（0 で従来挙動）
+    let params = match std::env::var("TSUITATE_MATERIAL_DEGEN_Q0")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            material_degen_q0: w,
             ..params
         },
         None => params,
@@ -5592,6 +5620,27 @@ fn evaluate(
             capture_bet_penalty =
                 params.capture_bet_var_w * p_hit * (1.0 - p_hit) * (capture_value_sum / capture_hits);
         }
+        // **材料の退化ゲート**（`material_degen_q0`、既定 0 = 従来と同一挙動）:
+        // 駒得の期待値は退化した粒子集合でも満額で効く（confidence ゲートは
+        // 攻め項にしか掛かっていなかった）。実測（2026-08-10、m067 の
+        // `scenario diag`）: 生存した厳密粒子が9個しかない決定点で、真実は
+        // 空きマスの 4一 に **飛車 85.9%** の信念が立ち、そこへの成桂
+        // （4一成桂）が浮いていた（ユーザー指摘の手）。同型の 8e7g+ も
+        // 駒得 +3.575 が駆動源。少数粒子の合意は「自信を持って間違う」ので、
+        // 質量が薄いほど駒得期待値を縮める（観測に裏付けられた駒得は
+        // `blind_recapture` が別経路で供給する）。
+        // g = c(1+q0)/(c+q0): q0=0 で g=1（従来）、q0>0 で c 小さいほど強く縮む
+        let degen_gate = if params.material_degen_q0 > 0.0 {
+            confidence * (1.0 + params.material_degen_q0)
+                / (confidence + params.material_degen_q0)
+        } else {
+            1.0
+        };
+        let material_shrink = if degen_gate < 1.0 && capture_hits > 0.0 {
+            (1.0 - degen_gate) * (capture_value_sum / legal)
+        } else {
+            0.0
+        };
         // 粒子上の詰みの加点。q = 詰みを主張する質量の割合に対し
         // 1000×q×(q/(q+q0)) の凸ゲート: q0=0 は従来（1000×q）と同一挙動、
         // q0>0 では裾の幻詰みが材料スケールへ沈み、合意の詰みはほぼ満額残る
@@ -5604,7 +5653,7 @@ fn evaluate(
         // 攻め側の項（王探し・玉周りの圧力・逃げマス被覆）は taint
         // フォールバック中は attack_scale で絞る。守り側（自玉への圧力・
         // 相手の打ち王手の危険）は絞らない = 安全方向は残す
-        value_sum / legal + mate_term - capture_bet_penalty
+        value_sum / legal + mate_term - capture_bet_penalty - material_shrink
             + params.info_bonus * p_hit * (1.0 - p_hit)
             + attack_scale * params.king_probe_bonus * p_chk * (1.0 - p_chk)
             + value_nn_term
@@ -7184,6 +7233,7 @@ pub(crate) mod tests {
         assert_field_index!(king_capture_reveal);
         assert_field_index!(promo_king_prox);
         assert_field_index!(foul_occ_attack_w);
+        assert_field_index!(material_degen_q0);
 
         // 既定値は自分の SPECS 範囲内にあること（SPSA の中心点が
         // クランプで別の値へ化けるのを防ぐ。位置ズレの二重の網でもある）

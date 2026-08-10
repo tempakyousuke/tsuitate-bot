@@ -1719,6 +1719,55 @@ fn foul_consistent(pos: &Position, my_color: Color, mv: &ShogiMove) -> bool {
 /// 自分側の状態（自駒配置・持ち駒・手番）は真実と同期させ、相手側は
 /// 分かる範囲（取られた自駒 → 相手の持ち駒）だけ反映する。結果の盤面は
 /// 観測と厳密整合しない近似なので、評価側は玉位置系の用途に限定すること
+/// 多重集合修復（`TSUITATE_TAINT_MULTISET_REPAIR`、既定 off）。
+///
+/// `force_apply` は「観測された捕獲駒種を自分の持ち駒へ加える」一方で、粒子上の
+/// 着手先には別の駒（または何も）居たので、**その駒種が1枚湧く**（従来の嘘。
+/// テスト mutation_rescue_preserves_multiset が 19枚を明記）。湧いた1枚は
+/// 「初期マスに残ったまま」の古い信念として生き続け、taint 評価に幻の駒得を
+/// 与える（発端: 2026-08-10 ユーザー指摘「序盤で4二で相手の金を取ったのに
+/// 4一に金がいる信念で 4一成桂 が出る」。m067 は決定点で 1137粒子すべて taint）。
+///
+/// 湧いた枚数を相手側の盤上から1枚除いて枚数を合わせる。除く候補は
+/// **居る根拠が最も薄い1枚**: ①初期配置マスに残っている駒（動いた証拠がない）
+/// を優先し、②同条件なら着手先から遠い駒。**除くだけ**（足さない）ので
+/// 幻の駒得は減る方向にしか動かない
+fn taint_multiset_repair() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_TAINT_MULTISET_REPAIR").is_ok_and(|v| v == "1")
+    })
+}
+
+/// 相手側の盤上から駒種 role（生駒基準）の1枚を「居る根拠が薄い順」に除く
+fn repair_spawned_role(pos: &mut Position, opp: Color, role: Role, near: Coord) {
+    let initial = Position::initial();
+    let mut best: Option<(bool, i32, Coord)> = None;
+    for (sq, p) in pos.pieces() {
+        if p.color != opp || p.role == Role::King || unpromote_role(p.role) != role {
+            continue;
+        }
+        // 初期マスに居る = 動いた証拠がない（古い信念の典型）
+        let at_home = initial
+            .piece_at(sq)
+            .is_some_and(|q| q.color == opp && q.role == p.role);
+        let dist = i32::from(
+            (sq.file - near.file)
+                .abs()
+                .max((sq.rank - near.rank).abs()),
+        );
+        let key = (at_home, dist, sq);
+        if best.is_none_or(|b| (b.0, b.1) < (key.0, key.1)) {
+            best = Some(key);
+        }
+    }
+    let fired = best.is_some();
+    if let Some((_, _, sq)) = best {
+        pos.set(sq, None);
+    }
+    crate::hits::flag("taint_multiset_repair", fired);
+}
+
 fn force_apply(pos: &mut Position, my_color: Color, constraint: &Constraint) {
     match constraint {
         Constraint::MyMove { mv, captured, .. } => {
@@ -1727,8 +1776,19 @@ fn force_apply(pos: &mut Position, my_color: Color, constraint: &Constraint) {
             // 嘘の駒種で自分の持ち駒を汚さない（codex P3 レビュー指摘）。
             // 合法時の play_unchecked も同じ理由で使わない（粒子上の to の駒種が
             // 真実と違うと持ち駒がズレる）
+            // 多重集合修復の判定材料: 着手先に粒子が置いていた駒（観測された
+            // 捕獲駒種と一致しなければ、持ち駒への計上でその駒種が1枚湧く）
+            let mut spawn_at: Option<Coord> = None;
             match *mv {
                 ShogiMove::Board { from, to, promote } => {
+                    let old = pos.piece_at(to);
+                    if captured.is_some_and(|r| {
+                        !old.is_some_and(|q| {
+                            q.color == my_color.other() && unpromote_role(q.role) == r
+                        })
+                    }) {
+                        spawn_at = Some(to);
+                    }
                     if let Some(mut p) =
                         pos.piece_at(from).filter(|p| p.color == my_color)
                     {
@@ -1756,6 +1816,11 @@ fn force_apply(pos: &mut Position, my_color: Color, constraint: &Constraint) {
             }
             if let Some(r) = captured {
                 pos.set_hand(my_color, *r, pos.hand_count(my_color, *r) + 1);
+                // 湧いた1枚を相手側の盤上から除いて枚数を合わせる
+                // （`taint_multiset_repair` の doc 参照）
+                if let Some(to) = spawn_at.filter(|_| taint_multiset_repair()) {
+                    repair_spawned_role(pos, my_color.other(), *r, to);
+                }
             }
             pos.set_turn(my_color.other());
         }
