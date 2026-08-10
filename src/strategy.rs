@@ -402,6 +402,54 @@ fn hand_asset_w() -> f64 {
     })
 }
 
+/// 玉の既知脅威への接近減点（`TSUITATE_KING_KNOWN_APPROACH_W`、既定 0）。
+/// 観測で位置が確定している敵駒マスへ近づく玉の手へ `w × Δcloseness` を
+/// gain から引く。quest31-m099 の 6八玉（取られた直後の 5六へ近づく）が発端。
+/// 粒子不要。そのマス自体を取る手は対象外。凍結版はこの名前を知らない。
+fn king_known_approach_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_KING_KNOWN_APPROACH_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
+fn chebyshev(a: Coord, b: Coord) -> i32 {
+    (a.file - b.file).abs().max((a.rank - b.rank).abs())
+}
+
+/// 玉の既知脅威への接近量（`king_known_approach_w` の材料）。
+/// チェビシェフが縮むときはその差分、同じ危険圏（≤2）で筋/段だけ寄るとき
+/// は 0.5（quest31-m099: 7g→6h は 5f へ dist=2 のまま筋だけ寄る）。
+/// 脅威マス自体を取る手は 0。
+fn king_known_approach_amount(
+    from: Coord,
+    to: Coord,
+    backed: &[bool; 81],
+) -> f64 {
+    let mut amount = 0.0f64;
+    for t in crate::belief_features::all_squares() {
+        if !backed[crate::belief_features::sq_index(t)] || to == t {
+            continue;
+        }
+        let d0 = chebyshev(from, t);
+        let d1 = chebyshev(to, t);
+        if d1 < d0 {
+            amount += (d0 - d1) as f64;
+        } else if d1 <= 2 {
+            let file_closer = (to.file - t.file).abs() < (from.file - t.file).abs();
+            let rank_closer = (to.rank - t.rank).abs() < (from.rank - t.rank).abs();
+            if file_closer || rank_closer {
+                amount += 0.5;
+            }
+        }
+    }
+    amount
+}
+
 /// 打ちの「仕事」があるか（`hand_asset_w`）。裏付け占有への当たり、または
 /// 玉候補への近接（チェビシェフ距離 ≤ 2）
 fn drop_has_hand_asset_work(
@@ -3694,9 +3742,11 @@ impl Strategy for EstimatorStrategy {
             .then(|| hand_option_context(view));
 
         // 相手駒の占有が観測で裏付けられたマス（`material_degen_q0` の
-        // 「裏付け無し捕獲だけ縮める」ゲート／`hand_asset_w` の仕事判定用。
-        // 決定点ごとに1回）
-        let opp_occ_backed = (params.material_degen_q0 > 0.0 || hand_asset_w() > 0.0)
+        // 「裏付け無し捕獲だけ縮める」ゲート／`hand_asset_w` の仕事判定／
+        // `king_known_approach_w` の脅威マス。決定点ごとに1回）
+        let opp_occ_backed = (params.material_degen_q0 > 0.0
+            || hand_asset_w() > 0.0
+            || king_known_approach_w() > 0.0)
             .then(|| opp_occupancy_evidence(view, log));
         // 持ち駒資産損の玉候補（`hand_asset_w`）。王手中は無効
         let hand_asset_kings: Option<std::collections::BTreeSet<Coord>> =
@@ -5310,7 +5360,8 @@ fn evaluate(
     // 争点マス = そこで駒が取られた/取ったマス（`anchor_move_w` の争点ゲート）
     contested_squares: &[bool; 81],
     // 相手駒の占有が観測で裏付けられたマス（`material_degen_q0` /
-    // `hand_asset_w`）。None なら両ノブ無効時（choose が渡さない）
+    // `hand_asset_w` / `king_known_approach_w`）。None ならノブ無効時
+    // （choose が渡さない）
     opp_occ_backed: Option<&[bool; 81]>,
     // 持ち駒資産損（`hand_asset_w`）の玉候補。Some のときだけ項が有効
     // （choose が「w≠0・王手中でない」のゲートを掛けて渡す）
@@ -6013,6 +6064,22 @@ fn evaluate(
         _ => 0.0,
     };
 
+    // 玉の既知脅威への接近（`king_known_approach_w` の doc 参照）。
+    // 王手中は CheckSolver の領分なので無効。脅威マスを取る手は amount=0
+    let king_approach_pen = match (opp_occ_backed, mv) {
+        (Some(backed), &ShogiMove::Board { from, to, .. })
+            if !view.you_in_check && king_square(view) == Some(from) =>
+        {
+            let w = king_known_approach_w();
+            if w <= 0.0 {
+                0.0
+            } else {
+                w * king_known_approach_amount(from, to, backed)
+            }
+        }
+        _ => 0.0,
+    };
+
     // V5（盤上駒の減価、やねうら王 Lv2 で +R50）: 「同じ駒なら持ち駒のほうが
     // 価値が高い」。この手で**盤上に増えた自駒の価値**にだけ比例して引く
     // （打ち＝打った駒、成り＝増えたぶん。盤上の合計は定数なので持たない
@@ -6209,6 +6276,7 @@ fn evaluate(
         + major_path
         - hand_option_pen
         - hand_asset_pen
+        - king_approach_pen
         - board_discount
         + effect_value
         + foul_occ_attack
@@ -7780,6 +7848,24 @@ pub(crate) mod tests {
         assert!(!backed[crate::belief_features::sq_index(Coord { file: 2, rank: 1 })]);
         assert!(!backed[crate::belief_features::sq_index(Coord { file: 5, rank: 5 })]);
         assert!(!backed[crate::belief_features::sq_index(Coord { file: 3, rank: 3 })]);
+    }
+
+    /// 玉の既知脅威接近: m099 型（7g→6h は 5f へ dist=2 のまま筋だけ寄る → 0.5、
+    /// 7g→8h は遠ざかる → 0）。脅威マスへの捕獲は 0
+    #[test]
+    fn king_known_approach_partial_file_close() {
+        let mut backed = [false; 81];
+        backed[crate::belief_features::sq_index(Coord { file: 5, rank: 6 })] = true;
+        let from = Coord { file: 7, rank: 7 };
+        let toward = Coord { file: 6, rank: 8 };
+        let away = Coord { file: 8, rank: 8 };
+        let capture = Coord { file: 5, rank: 6 };
+        assert!((king_known_approach_amount(from, toward, &backed) - 0.5).abs() < 1e-9);
+        assert_eq!(king_known_approach_amount(from, away, &backed), 0.0);
+        assert_eq!(king_known_approach_amount(from, capture, &backed), 0.0);
+        // チェビシェフが縮むときは整数差分
+        let closer = Coord { file: 6, rank: 6 };
+        assert!((king_known_approach_amount(from, closer, &backed) - 1.0).abs() < 1e-9);
     }
 
     /// 持ち駒資産損の「仕事」判定: 裏付けマスへの当たり／玉候補近接なら work
