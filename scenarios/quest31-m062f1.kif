@@ -1,4 +1,4 @@
-*scenario ply=61 fouls=P*4g target=4f4g scores=G*5h:1,G*6i:1,S*5h:2,S*4h:2,S*6h:1,G*6h:1,G*4h:1,G*1b:0,S*1b:0,S*2b:0,G*2b:0,S*1d:0,G*2d:0,P*2b:0,G*4i:1,6d6e:2,G*3c:1,P*2h:2,4f3f:8,4f5f:6,4f5g:2 bad=G*5h,G*6i,S*5h,S*4h,S*6h,G*6h,G*4h,G*1b,S*1b,S*2b,G*2b,S*1d,G*2d,P*2b,G*4i,6d6e,G*3c,P*2h,4f5g desc=62手目・4七歩打(P*4g)の反則後（後手番）。4七は先手の歩で確定＝同成銀で取るのが自然
+*scenario ply=61 fouls=P*4g target=4f4g scores=G*5h:1,G*6i:1,S*5h:2,S*4h:2,S*6h:1,G*6h:1,G*4h:1,G*1b:0,S*1b:0,S*2b:0,G*2b:0,S*1d:0,G*2d:0,P*2b:0,G*4i:1,6d6e:2,G*3c:1,P*2h:2,4f3f:8,4f5f:6,4f5g:2,4f3g:0,4f4g:5 bad=G*5h,G*6i,S*5h,S*4h,S*6h,G*6h,G*4h,G*1b,S*1b,S*2b,G*2b,S*1d,G*2d,P*2b,G*4i,6d6e,G*3c,P*2h,4f5g,4f3g desc=62手目・4七歩打(P*4g)の反則後（後手番）。4七は先手の歩で確定＝同成銀で取るのが自然
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

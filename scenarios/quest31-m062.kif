@@ -1,4 +1,4 @@
-*scenario ply=61 target=4f4g scores=G*5h:2,G*6i:1,S*5h:1,S*4h:1,S*6h:1,G*4h:1,G*6h:1,G*1b:0,S*1b:0,S*2b:0,G*2b:0,G*2d:0,S*1d:0,P*2b:0,G*4i:1,6d6e:2,G*3c:1,P*2h:4,P*4h:2,2c3c:0,4f5f:5,4f5g:0 bad=G*5h,G*6i,S*5h,S*4h,S*6h,G*4h,G*6h,G*1b,S*1b,S*2b,G*2b,G*2d,S*1d,P*2b,G*4i,6d6e,G*3c,P*4h,2c3c,4f5g desc=62手目（後手番）。実戦は同成銀（4七の歩を取りつつ成銀を4六から逃がす）。候補の金銀打ちは全て悪手＝4六の成銀をケアする手を指したい局面
+*scenario ply=61 target=4f4g scores=G*5h:2,G*6i:1,S*5h:1,S*4h:1,S*6h:1,G*4h:1,G*6h:1,G*1b:0,S*1b:0,S*2b:0,G*2b:0,G*2d:0,S*1d:0,P*2b:0,G*4i:1,6d6e:2,G*3c:1,P*2h:4,P*4h:2,2c3c:0,4f5f:5,4f5g:0,4f3f:8,8a7c:2 bad=G*5h,G*6i,S*5h,S*4h,S*6h,G*4h,G*6h,G*1b,S*1b,S*2b,G*2b,G*2d,S*1d,P*2b,G*4i,6d6e,G*3c,P*4h,2c3c,4f5g,8a7c desc=62手目（後手番）。実戦は同成銀（4七の歩を取りつつ成銀を4六から逃がす）。候補の金銀打ちは全て悪手＝4六の成銀をケアする手を指したい局面
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

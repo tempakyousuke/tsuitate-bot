@@ -1,4 +1,4 @@
-*scenario ply=91 target=5e5f scores=N*4g:0,N*6g:0,5e5f:8,8a7c:2,3d3e:0,9c9d:3,8c8d:2,7a6a:1,7b6a:1,8b9b:2,1a1b:0,N*3a:0,P*2b:0,1c1d:0,2c3c:1,P*6f:6,P*7d:2 bad=N*4g,N*6g,8a7c,3d3e,8c8d,7a6a,7b6a,8b9b,1a1b,N*3a,P*2b,1c1d,2c3c,P*7d desc=92手目（後手番）。ありは5六歩のみ。実戦の7三歩打は「あまり推奨しない」
+*scenario ply=91 target=5e5f scores=N*4g:0,N*6g:0,5e5f:8,8a7c:2,3d3e:0,9c9d:3,8c8d:2,7a6a:1,7b6a:1,8b9b:2,1a1b:0,N*3a:0,P*2b:0,1c1d:0,2c3c:1,P*6f:6,P*7d:2,6b6c:0 bad=N*4g,N*6g,8a7c,3d3e,8c8d,7a6a,7b6a,8b9b,1a1b,N*3a,P*2b,1c1d,2c3c,P*7d,6b6c desc=92手目（後手番）。ありは5六歩のみ。実戦の7三歩打は「あまり推奨しない」
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

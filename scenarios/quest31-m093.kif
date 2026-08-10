@@ -1,4 +1,4 @@
-*scenario ply=92 target=7e7d scores=4a3b+:0,5b5a+:0,G*6e:1,P*4d:2,P*4c:1,P*2b:0,4a2c+:0,6d6c:2,G*6c:4,6d7c:1,5b6c+:3,G*8c:1,G*8b:1,G*6b:3,G*7c:0,6d5c:2,3c3d:2,3c2c:0,5b4c+:0 bad=4a3b+,5b5a+,G*6e,P*4d,P*4c,P*2b,4a2c+,6d6c,6d7c,G*8c,G*8b,G*7c,6d5c,3c3d,3c2c,5b4c+ desc=93手目（先手番）。実戦は7四歩。ユーザー注=botの候補に7四歩が推奨されないのは問題。リスト上の候補は全て悪手
+*scenario ply=92 target=7e7d scores=4a3b+:0,5b5a+:0,G*6e:1,P*4d:2,P*4c:1,P*2b:0,4a2c+:0,6d6c:2,G*6c:4,6d7c:1,5b6c+:3,G*8c:1,G*8b:1,G*6b:3,G*7c:0,6d5c:2,3c3d:2,3c2c:0,5b4c+:0,2d1c+:0,3c2b:1 bad=4a3b+,5b5a+,G*6e,P*4d,P*4c,P*2b,4a2c+,6d6c,6d7c,G*8c,G*8b,G*7c,6d5c,3c3d,3c2c,5b4c+,2d1c+,3c2b desc=93手目（先手番）。実戦は7四歩。ユーザー注=botの候補に7四歩が推奨されないのは問題。リスト上の候補は全て悪手
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

@@ -1,4 +1,4 @@
-*scenario ply=78 target=G*6a scores=4a3b+:0,5b5a+:0,7g7f:8,9g9f:7,1g1f:0,3g3f:1,5e4d:2,G*7c:2,5b6c+:1,G*6c:4,G*8b:2,3c2c:0,G*8c:0,5b6a+:2,G*6a:6,G*5c:0,2d3e:2,P*4c:2,G*4c:2,5b4c+:2,P*4d:7,3c4c:1,3c2b:0,5e6d:2,5e6e:2,G*6e:6,G*8e:2,G*7f:0,G*8f:0,G*6f:0,3c6c:0,G*4d:2,6g6f:5,3c4d:4,5b6c:2 bad=4a3b+,5b5a+,1g1f,3g3f,5e4d,G*7c,5b6c+,G*8b,3c2c,G*8c,5b6a+,G*5c,2d3e,P*4c,G*4c,5b4c+,3c4c,3c2b,5e6d,5e6e,G*8e,G*7f,G*8f,G*6f,3c6c,G*4d,5b6c desc=79手目（先手番）。7六歩・9六歩・6一金打・4四歩打・6五金打・6六歩があり。実戦の6三金打はここで清算すると負けたのであまり良くなかったかも。7三金打はほぼ確実に7三に相手玉がいるので悪手
+*scenario ply=78 target=G*6a scores=4a3b+:0,5b5a+:0,7g7f:8,9g9f:7,1g1f:0,3g3f:1,5e4d:2,G*7c:2,5b6c+:1,G*6c:4,G*8b:2,3c2c:0,G*8c:0,5b6a+:2,G*6a:6,G*5c:0,2d3e:2,P*4c:2,G*4c:2,5b4c+:2,P*4d:7,3c4c:1,3c2b:0,5e6d:2,5e6e:2,G*6e:6,G*8e:2,G*7f:0,G*8f:0,G*6f:0,3c6c:0,G*4d:2,6g6f:5,3c4d:4,5b6c:2,2d1c+:0 bad=4a3b+,5b5a+,1g1f,3g3f,5e4d,G*7c,5b6c+,G*8b,3c2c,G*8c,5b6a+,G*5c,2d3e,P*4c,G*4c,5b4c+,3c4c,3c2b,5e6d,5e6e,G*8e,G*7f,G*8f,G*6f,3c6c,G*4d,5b6c,2d1c+ desc=79手目（先手番）。7六歩・9六歩・6一金打・4四歩打・6五金打・6六歩があり。実戦の6三金打はここで清算すると負けたのであまり良くなかったかも。7三金打はほぼ確実に7三に相手玉がいるので悪手
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

@@ -1,4 +1,4 @@
-*scenario ply=71 target=G*7b scores=G*5h:1,G*6i:1,S*5h:1,G*6h:1,S*6h:1,S*4h:2,G*4h:2,G*4i:1,G*1b:0,S*1b:0,S*2b:0,G*2b:0,S*1d:0,G*2d:1,P*2b:0,6d6e:4,P*4g:4,P*2h:6,7a7b:2,P*4h:2,7c8b:2,7c8d:2,3d3e:0 bad=G*5h,G*6i,S*5h,G*6h,S*6h,S*4h,G*4h,G*4i,G*1b,S*1b,S*2b,G*2b,S*1d,G*2d,P*2b,7a7b,P*4h,7c8b,7c8d,3d3e desc=72手目（後手番）。実戦は7二金打（受けの金打ち）だがbotの候補に無い（ユーザー「7二金打ちのような手がないのが残念」）。候補は全て悪手
+*scenario ply=71 target=G*7b scores=G*5h:1,G*6i:1,S*5h:1,G*6h:1,S*6h:1,S*4h:2,G*4h:2,G*4i:1,G*1b:0,S*1b:0,S*2b:0,G*2b:0,S*1d:0,G*2d:1,P*2b:0,6d6e:4,P*4g:4,P*2h:6,7a7b:2,P*4h:2,7c8b:2,7c8d:2,3d3e:0,2c2d:0,6b6a:0 bad=G*5h,G*6i,S*5h,G*6h,S*6h,S*4h,G*4h,G*4i,G*1b,S*1b,S*2b,G*2b,S*1d,G*2d,P*2b,7a7b,P*4h,7c8b,7c8d,3d3e,2c2d,6b6a desc=72手目（後手番）。実戦は7二金打（受けの金打ち）だがbotの候補に無い（ユーザー「7二金打ちのような手がないのが残念」）。候補は全て悪手
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

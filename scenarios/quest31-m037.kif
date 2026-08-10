@@ -1,4 +1,4 @@
-*scenario ply=36 target=3f4d scores=G*4f:1,G*3c:2,G*2a:0,G*5h:2,G*4h:2,G*3h:2,G*8h:1,7i3e:2,G*2c:2,G*7f:2,G*6f:2,3f4d:8,2d4d:3,G*9h:1,G*2b:1,2d2a:2,9g9f:3,2d1c:0,5f5e:8,G*1e:1,G*5e:4 bad=G*4f,G*3c,G*2a,G*5h,G*4h,G*3h,G*8h,7i3e,G*2c,G*7f,G*6f,G*9h,G*2b,2d2a,2d1c,G*1e desc=37手目（先手番）。4四桂（3六桂の活用）だけが「あり」。金打ち群・角出・4四龍・2一龍は全て悪手
+*scenario ply=36 target=3f4d scores=G*4f:1,G*3c:2,G*2a:0,G*5h:2,G*4h:2,G*3h:2,G*8h:1,7i3e:2,G*2c:2,G*7f:2,G*6f:2,3f4d:8,2d4d:3,G*9h:1,G*2b:1,2d2a:2,9g9f:3,2d1c:0,5f5e:8,G*1e:1,G*5e:4,3i2h:1 bad=G*4f,G*3c,G*2a,G*5h,G*4h,G*3h,G*8h,7i3e,G*2c,G*7f,G*6f,G*9h,G*2b,2d2a,2d1c,G*1e,3i2h desc=37手目（先手番）。4四桂（3六桂の活用）だけが「あり」。金打ち群・角出・4四龍・2一龍は全て悪手
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
