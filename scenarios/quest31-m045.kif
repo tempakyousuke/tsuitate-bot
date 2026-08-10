@@ -1,4 +1,4 @@
-*scenario ply=44 target=3i4h scores=G*4f:2,G*5e:2,B*1h:1,B*3f:2,B*7f:2,B*2g:2,B*9f:2,3b4b:3,3b2b:2,B*1f:2,B*8f:2,3g3f:2,3c4b:3,B*3e:2,3c2b:1,B*4d:2,3c5c:0,B*4b:2,G*4b:1 bad=G*4f,G*5e,B*1h,B*3f,B*7f,B*2g,B*9f,3b2b,B*1f,B*8f,3g3f,B*3e,3c2b,B*4d,3c5c,B*4b,G*4b desc=45手目（先手番）。4八歩から4九歩成の筋をケアする手が要る。実戦は4八銀。3八銀・3八金・5八金も候補。bot 候補の上位は全て悪手
+*scenario ply=44 target=3i4h scores=G*4f:2,G*5e:2,B*1h:1,B*3f:2,B*7f:2,B*2g:2,B*9f:2,3b4b:3,3b2b:2,B*1f:2,B*8f:2,3g3f:2,3c4b:3,B*3e:2,3c2b:1,B*4d:2,3c5c:0,B*4b:2,G*4b:1,3c2c:2 bad=G*4f,G*5e,B*1h,B*3f,B*7f,B*2g,B*9f,3b2b,B*1f,B*8f,3g3f,B*3e,3c2b,B*4d,3c5c,B*4b,G*4b,3c2c desc=45手目（先手番）。4八歩から4九歩成の筋をケアする手が要る。実戦は4八銀。3八銀・3八金・5八金も候補。bot 候補の上位は全て悪手
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
