@@ -418,7 +418,7 @@ fn king_known_approach_w() -> f64 {
 }
 
 fn chebyshev(a: Coord, b: Coord) -> i32 {
-    (a.file - b.file).abs().max((a.rank - b.rank).abs())
+    i32::from((a.file - b.file).abs().max((a.rank - b.rank).abs()))
 }
 
 /// 玉の既知脅威への接近量（`king_known_approach_w` の材料）。
