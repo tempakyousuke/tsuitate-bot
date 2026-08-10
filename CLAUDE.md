@@ -106,8 +106,18 @@
   （2点以下）へ同期 → suite に「平均得点」が出る。SPSA は
   `TUNE_OBJECTIVE=scenario_score`（score = 平均得点/10 のシナリオ平均 ∈ [0,1]）。
   未採点の手が選ばれたら仮4点＋件数表示（評価済み候補の外へ逃げる
-  指標の抜け穴への対応。目立ったら make_eval 再実行→採点）。
-  quest_20260731 は md から移行済みで **eval が一次資料**
+  指標の抜け穴への対応）。
+  quest_20260731 は md から移行済みで **eval が一次資料**。
+  **ノブ検証の標準ループ**（2026-08-09〜10 に確立。指標穴で3度騙された結果）:
+  ①候補ノブで suite → ②`python3 scripts/quest_review/append_unscored.py
+  evals/<名前>.eval.md "<実験名>" <scenario-combined 展開先...>` で
+  **選ばれたのに未収載の手**を `?` 追記（既定は計2回以上。1回だけの
+  ロングテールは仮4点の有界ノイズなので追わない）→ ③ユーザーが採点 →
+  ④`sync_eval.py` → ⑤**同一コミットで対照と候補の suite を取り直して確定判定**。
+  **採点前の suite 差は信じない**（promo価格改定 C1・不成 combo・
+  ブラインドhome の3件で「見かけの改善が未採点手への逃避だった」を実証。
+  極端な例: taint フォールバックの −116 は全ブロックで 0〜2点の既知悪手
+  7七桂成への逃避が主因だった）
 - `cargo run --release --bin scenario -- <名前|suite|batch <名前...>>` — 実戦棋譜の
   局面再現実験。
   `scenarios/*.kif`（Shogi Quest エクスポート + `*scenario ply=N` 行）を再生して
