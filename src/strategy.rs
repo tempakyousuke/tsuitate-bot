@@ -4128,6 +4128,36 @@ fn stratified_sample<'a>(
         }
     }
 
+    // **指紋シェアの上限**（`eval_weight_cap`、既定 1.0 = 無効）: 崩壊した
+    // 粒子集合では、生き残った少数の指紋の**複製数**がそのまま重みになるので
+    // 「1個の粒子が信念の85%」という点質量ができる（実測 2026-08-10、
+    // m067 の 4一: 厳密粒子9個で飛車85.9%、真実は空きマス。ユーザー指摘
+    // 「厳密粒子の信念が偏りすぎている」）。複製数は崩壊前のリサンプリングの
+    // 遺物で独立な証拠ではないので、1指紋の取り分に上限を敷いて残りへ配り直す。
+    // 健全な集合（どの指紋も上限未満）では何も変わらない
+    let cap_share = eval_weight_cap();
+    if cap_share < 1.0 && sample.len() > 1 {
+        let total: f64 = sample.iter().map(|(_, w)| w).sum();
+        if total > 0.0 {
+            let mut per_fp: HashMap<u64, f64> = HashMap::new();
+            for (p, w) in sample.iter() {
+                *per_fp.entry(p.fingerprint()).or_insert(0.0) += w;
+            }
+            let cap = cap_share * total;
+            let over = per_fp.values().any(|&m| m > cap);
+            if over {
+                // 超過した指紋だけ縮める。残りへの配り直しは直後の
+                // legacy_mass への再正規化が比例配分でやってくれる
+                for (p, w) in sample.iter_mut() {
+                    let m = per_fp[&p.fingerprint()];
+                    if m > cap {
+                        *w *= cap / m;
+                    }
+                }
+            }
+            crate::hits::flag("eval_weight_cap_fired", over);
+        }
+    }
     // 旧方式の重み和へ正規化（較正の維持）
     let sample_mass: f64 = sample.iter().map(|(_, w)| w).sum();
     if sample_mass > 0.0 {
@@ -4189,6 +4219,24 @@ fn blind_home_risk_w() -> f64 {
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
             .unwrap_or(0.0)
+    })
+}
+
+/// 評価サンプルで**1指紋が持てる重みの上限シェア**
+/// （`TSUITATE_EVAL_WEIGHT_CAP`、既定 1.0 = 無効）。
+/// 崩壊した粒子集合では複製数がそのまま重みになり「1個の粒子が信念の85%」
+/// という点質量ができる（実測 2026-08-10: m067 の 4一 で厳密粒子9個・
+/// 飛車85.9%・真実は空きマス。ユーザー指摘「厳密粒子の信念が偏りすぎている」）。
+/// 複製数は崩壊前のリサンプリングの遺物で独立な証拠ではない。
+/// 推奨 0.4〜0.6。凍結版はこの名前を知らない
+fn eval_weight_cap() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_EVAL_WEIGHT_CAP")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+            .unwrap_or(1.0)
     })
 }
 
