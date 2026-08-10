@@ -383,6 +383,52 @@ fn link_endgame_dampen() -> f64 {
     })
 }
 
+/// 持ち駒の資産損（`TSUITATE_HAND_ASSET_W`、既定 0 = 無効）。
+/// 打つ手に `w × exchange_value(role) × (1−work)` を gain から引く。
+///
+/// `hand_option_w` は成りのポテンシャル不足だけを見るので、金の投げ捨てや
+/// 「最良の成り道」でも無目的な角打（B*1h）を止められない。こちらは
+/// **仕事があるか**で判定する: 観測裏付けの相手駒へ当たる／玉候補の
+/// 2マス以内、のいずれかなら work=1（減点0）。それ以外は駒価値ぶん課税。
+/// 打つ手だけ・王手中無効・粒子不要。凍結版はこの名前を知らない。
+fn hand_asset_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_HAND_ASSET_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
+/// 打ちの「仕事」があるか（`hand_asset_w`）。裏付け占有への当たり、または
+/// 玉候補への近接（チェビシェフ距離 ≤ 2）
+fn drop_has_hand_asset_work(
+    view: &PlayerView,
+    role: Role,
+    to: Coord,
+    backed: &[bool; 81],
+    king_cands: &std::collections::BTreeSet<Coord>,
+) -> bool {
+    let me = view.your_color;
+    let mut pieces = view.your_pieces.clone();
+    pieces.push(VisiblePiece {
+        square: make_usi_square(to),
+        role,
+    });
+    let p = pieces.last().expect("just pushed");
+    if crate::board::defend_targets(&pieces, p, me)
+        .iter()
+        .any(|&s| backed[crate::belief_features::sq_index(s)])
+    {
+        return true;
+    }
+    king_cands.iter().any(|k| {
+        (k.file - to.file).abs() <= 2 && (k.rank - to.rank).abs() <= 2
+    })
+}
+
 /// 王手中の玉の手の gain を「玉の手全体の平均」に揃えるか（既定 on、
 /// `TSUITATE_CHECK_KING_GAIN_MEAN=0` で従来挙動。凍結版はこの名前を知らない）。
 /// = 玉の手**どうし**の序列は p_legal（CheckSolver の解消確率）と反則コストだけで
@@ -3648,9 +3694,14 @@ impl Strategy for EstimatorStrategy {
             .then(|| hand_option_context(view));
 
         // 相手駒の占有が観測で裏付けられたマス（`material_degen_q0` の
-        // 「裏付け無し捕獲だけ縮める」ゲート用。決定点ごとに1回）
-        let opp_occ_backed = (params.material_degen_q0 > 0.0)
+        // 「裏付け無し捕獲だけ縮める」ゲート／`hand_asset_w` の仕事判定用。
+        // 決定点ごとに1回）
+        let opp_occ_backed = (params.material_degen_q0 > 0.0 || hand_asset_w() > 0.0)
             .then(|| opp_occupancy_evidence(view, log));
+        // 持ち駒資産損の玉候補（`hand_asset_w`）。王手中は無効
+        let hand_asset_kings: Option<std::collections::BTreeSet<Coord>> =
+            (hand_asset_w() > 0.0 && !view.you_in_check)
+                .then(|| crate::deduce::opp_king_candidates(view.your_color, log));
 
         // この手番の打ち反則で占有が確定したマスと、残存敵駒の平均交換価値
         // （`foul_occ_attack_w`）。反則では手番が変わらないので情報は完全に新鮮。
@@ -3728,6 +3779,7 @@ impl Strategy for EstimatorStrategy {
                 &own_attack,
                 &contested_squares,
                 opp_occ_backed.as_ref(),
+                hand_asset_kings.as_ref(),
             );
             // 王手中: 仮説条件付きの「王手駒の除去期待値」（check.rs::removal_term）。
             // 王手駒のマスを取る手は受理された未来で脅威ごと駒を排除し、玉逃げ等の
@@ -5257,9 +5309,12 @@ fn evaluate(
     own_attack_before: &[u8; 81],
     // 争点マス = そこで駒が取られた/取ったマス（`anchor_move_w` の争点ゲート）
     contested_squares: &[bool; 81],
-    // 相手駒の占有が観測で裏付けられたマス（`material_degen_q0`）。
-    // None なら退化ゲート無効時（choose が q0=0 のとき渡さない）
+    // 相手駒の占有が観測で裏付けられたマス（`material_degen_q0` /
+    // `hand_asset_w`）。None なら両ノブ無効時（choose が渡さない）
     opp_occ_backed: Option<&[bool; 81]>,
+    // 持ち駒資産損（`hand_asset_w`）の玉候補。Some のときだけ項が有効
+    // （choose が「w≠0・王手中でない」のゲートを掛けて渡す）
+    hand_asset_kings: Option<&std::collections::BTreeSet<Coord>>,
 ) -> EvalOut {
     let me = view.your_color;
     let opp = me.other();
@@ -5944,6 +5999,20 @@ fn evaluate(
         _ => 0.0,
     };
 
+    // 持ち駒の資産損（`hand_asset_w` の doc 参照）。仕事の無い打ちだけを
+    // 駒価値で課税。移動の手は 0 なのでゼロ点は動かない
+    let hand_asset_pen = match (hand_asset_kings, opp_occ_backed, mv) {
+        (Some(cands), Some(backed), &ShogiMove::Drop { role, to }) => {
+            let w = hand_asset_w();
+            if w <= 0.0 || drop_has_hand_asset_work(view, role, to, backed, cands) {
+                0.0
+            } else {
+                w * exchange_value(role)
+            }
+        }
+        _ => 0.0,
+    };
+
     // V5（盤上駒の減価、やねうら王 Lv2 で +R50）: 「同じ駒なら持ち駒のほうが
     // 価値が高い」。この手で**盤上に増えた自駒の価値**にだけ比例して引く
     // （打ち＝打った駒、成り＝増えたぶん。盤上の合計は定数なので持たない
@@ -6139,6 +6208,7 @@ fn evaluate(
         + promo
         + major_path
         - hand_option_pen
+        - hand_asset_pen
         - board_discount
         + effect_value
         + foul_occ_attack
@@ -7710,6 +7780,48 @@ pub(crate) mod tests {
         assert!(!backed[crate::belief_features::sq_index(Coord { file: 2, rank: 1 })]);
         assert!(!backed[crate::belief_features::sq_index(Coord { file: 5, rank: 5 })]);
         assert!(!backed[crate::belief_features::sq_index(Coord { file: 3, rank: 3 })]);
+    }
+
+    /// 持ち駒資産損の「仕事」判定: 裏付けマスへの当たり／玉候補近接なら work
+    #[test]
+    fn drop_hand_asset_work_backed_or_near_king() {
+        let view = minimal_view(
+            vec![VisiblePiece {
+                square: "5i".into(),
+                role: Role::King,
+            }],
+            HashMap::from([(Role::Gold, 1), (Role::Silver, 1)]),
+        );
+        let mut backed = [false; 81];
+        // 7g に裏付け占有
+        backed[crate::belief_features::sq_index(Coord { file: 7, rank: 7 })] = true;
+        let mut kings = std::collections::BTreeSet::new();
+        kings.insert(Coord { file: 5, rank: 1 });
+
+        // 金を 7f に打つと裏付け 7g へ縦に当たる → work
+        assert!(drop_has_hand_asset_work(
+            &view,
+            Role::Gold,
+            Coord { file: 7, rank: 6 },
+            &backed,
+            &kings,
+        ));
+        // 金を 1b に打つ: 裏付けにも玉（5a）にも遠い → 仕事なし
+        assert!(!drop_has_hand_asset_work(
+            &view,
+            Role::Gold,
+            Coord { file: 1, rank: 2 },
+            &backed,
+            &kings,
+        ));
+        // 銀を 5c に打つ: 玉 5a へチェビシェフ2 → work
+        assert!(drop_has_hand_asset_work(
+            &view,
+            Role::Silver,
+            Coord { file: 5, rank: 3 },
+            &backed,
+            &kings,
+        ));
     }
 
     /// ブラインド取り返し: 対象マスは**直前の相手手**で取られたマスに限る
