@@ -1684,12 +1684,6 @@ pub struct EvalParams {
     /// 真実が空きマスの4一に飛車85.9%の信念、そこへの4一成桂が浮く）。
     /// `TSUITATE_MATERIAL_DEGEN_Q0` で上書き可・SPSA対応。凍結版は知らない
     pub material_degen_q0: f64,
-    /// **home マスへの未確認捕獲成りの賭け金**。相手の初期配置マスに駒がいると
-    /// 粒子が主張しても、直前の相手捕獲・同一手番の打ち反則で在駒が確認されて
-    /// いなければ、歩より高価な駒の捕獲成りを
-    /// `w × p_hit × (着手前の交換価値 − 歩)` だけ割り引く。
-    /// `TSUITATE_UNCONFIRMED_PROMO_CAPTURE_W` で上書き可・SPSA対応
-    pub unconfirmed_promo_capture_w: f64,
     /// **taint 粒子の占有合意で打ちの反則確率を下げる**（2026-08-03、ユーザー指摘の
     /// 38手目 `S*4g` が発端）。厳密粒子が全滅した決定では `p_legal` が
     /// `prior_legal` だけで決まるが、その打ち側は**マスに依らない定数**
@@ -2008,8 +2002,6 @@ impl Default for EvalParams {
             foul_occ_attack_w: 2.0,
             // 材料の退化ゲート（2026-08-10）。0 = 従来と同一挙動
             material_degen_q0: 0.0,
-            // home マスへの未確認捕獲成り（2026-08-10）。検証候補
-            unconfirmed_promo_capture_w: 0.2,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
             // 反則経済の新項（2026-07-16、オラクル測定で36ptの伸びしろを確認後に追加）。
@@ -2106,7 +2098,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 71] = [
+    pub const SPECS: [ParamSpec; 70] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -2503,12 +2495,6 @@ impl EvalParams {
             lo: 0.0,
             hi: 1.0,
         },
-        ParamSpec {
-            // 歩を超える着手駒の交換価値（桂2.5〜角8.5）に掛かる
-            name: "unconfirmed_promo_capture_w",
-            lo: 0.0,
-            hi: 1.0,
-        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -2583,7 +2569,6 @@ impl EvalParams {
             self.promo_king_prox,
             self.foul_occ_attack_w,
             self.material_degen_q0,
-            self.unconfirmed_promo_capture_w,
         ]
     }
 
@@ -2660,7 +2645,6 @@ impl EvalParams {
             promo_king_prox: v[67],
             foul_occ_attack_w: v[68],
             material_degen_q0: v[69],
-            unconfirmed_promo_capture_w: v[70],
         }
     }
 }
@@ -2999,18 +2983,6 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
     {
         Some(w) => EvalParams {
             material_degen_q0: w,
-            ..params
-        },
-        None => params,
-    };
-    // home マスへの未確認捕獲成りの賭け金（0 で従来挙動）
-    let params = match std::env::var("TSUITATE_UNCONFIRMED_PROMO_CAPTURE_W")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v >= 0.0)
-    {
-        Some(w) => EvalParams {
-            unconfirmed_promo_capture_w: w,
             ..params
         },
         None => params,
@@ -5141,33 +5113,6 @@ fn camp_defended_prior(to: Coord, me: Color, camp_scale: f64) -> f64 {
 
 /// 候補手をユニーク粒子の加重平均で評価する（重み = ソフト救済の減衰）
 #[allow(clippy::too_many_arguments)]
-fn unconfirmed_home_promo_stake(view: &PlayerView, mv: &ShogiMove, opp: Color) -> f64 {
-    let ShogiMove::Board {
-        from,
-        to,
-        promote: true,
-    } = *mv
-    else {
-        return 0.0;
-    };
-    let is_home = match opp {
-        Color::Sente => {
-            to.rank == 7 || to.rank == 9 || (to.rank == 8 && matches!(to.file, 2 | 8))
-        }
-        Color::Gote => {
-            to.rank == 3 || to.rank == 1 || (to.rank == 2 && matches!(to.file, 2 | 8))
-        }
-    };
-    if !is_home {
-        return 0.0;
-    }
-    view.your_pieces
-        .iter()
-        .find(|p| p.square == make_usi_square(from))
-        .map(|p| (exchange_value(p.role) - exchange_value(Role::Pawn)).max(0.0))
-        .unwrap_or(0.0)
-}
-
 fn evaluate(
     view: &PlayerView,
     mv: &ShogiMove,
@@ -5756,30 +5701,6 @@ fn evaluate(
         } else {
             0.0
         };
-        // home マスへの未確認捕獲成りの賭け金。quest31 で繰り返す
-        // 2d3c+ / 4a3b+ / 8e7g+ / 3h4i+ は、古い初期配置像の幻の駒得へ
-        // 歩より高価な駒を投入する同型。一律の home 事前は正しい侵入も殺すため、
-        // 粒子が実際に捕獲を主張し、かつ新鮮な観測で在駒を確認できない場合だけ
-        // 着手前の駒価値を stake にする。歩成 4f4g+ は stake=0 で不変。
-        let capture_confirmed = match *mv {
-            ShogiMove::Board { to, .. } => {
-                blind_recapture_target.is_some_and(|(sq, _)| sq == to)
-                    || turn_foul_occ.is_some_and(|(occ, _)| {
-                        occ[crate::belief_features::sq_index(to)]
-                    })
-            }
-            _ => false,
-        };
-        let unconfirmed_promo_capture_penalty = if !view.you_in_check
-            && !capture_confirmed
-            && capture_hits > 0.0
-        {
-            params.unconfirmed_promo_capture_w
-                * p_hit
-                * unconfirmed_home_promo_stake(view, mv, opp)
-        } else {
-            0.0
-        };
         // 粒子上の詰みの加点。q = 詰みを主張する質量の割合に対し
         // 1000×q×(q/(q+q0)) の凸ゲート: q0=0 は従来（1000×q）と同一挙動、
         // q0>0 では裾の幻詰みが材料スケールへ沈み、合意の詰みはほぼ満額残る
@@ -5793,7 +5714,6 @@ fn evaluate(
         // フォールバック中は attack_scale で絞る。守り側（自玉への圧力・
         // 相手の打ち王手の危険）は絞らない = 安全方向は残す
         value_sum / legal + mate_term - capture_bet_penalty - material_shrink
-            - unconfirmed_promo_capture_penalty
             + params.info_bonus * p_hit * (1.0 - p_hit)
             + attack_scale * params.king_probe_bonus * p_chk * (1.0 - p_chk)
             + value_nn_term
@@ -7246,35 +7166,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn home_promo_stake_targets_expensive_pieces_but_not_pawns() {
-        let view = minimal_view(
-            vec![
-                VisiblePiece { square: "2d".into(), role: Role::Bishop },
-                VisiblePiece { square: "4d".into(), role: Role::Pawn },
-            ],
-            HashMap::new(),
-        );
-        let bishop_home = ShogiMove::Board {
-            from: Coord { file: 2, rank: 4 },
-            to: Coord { file: 3, rank: 3 },
-            promote: true,
-        };
-        assert!(unconfirmed_home_promo_stake(&view, &bishop_home, Color::Gote) > 0.0);
-        let pawn_home = ShogiMove::Board {
-            from: Coord { file: 4, rank: 4 },
-            to: Coord { file: 4, rank: 3 },
-            promote: true,
-        };
-        assert_eq!(unconfirmed_home_promo_stake(&view, &pawn_home, Color::Gote), 0.0);
-        let bishop_not_home = ShogiMove::Board {
-            from: Coord { file: 2, rank: 4 },
-            to: Coord { file: 3, rank: 4 },
-            promote: true,
-        };
-        assert_eq!(unconfirmed_home_promo_stake(&view, &bishop_not_home, Color::Gote), 0.0);
-    }
-
-    #[test]
     fn search_budget_scales_with_think_time() {
         let base = SearchBudget::from_ms(900);
         assert_eq!(base.eval_particles, EVAL_PARTICLES);
@@ -7403,7 +7294,6 @@ pub(crate) mod tests {
         assert_field_index!(promo_king_prox);
         assert_field_index!(foul_occ_attack_w);
         assert_field_index!(material_degen_q0);
-        assert_field_index!(unconfirmed_promo_capture_w);
 
         // 既定値は自分の SPECS 範囲内にあること（SPSA の中心点が
         // クランプで別の値へ化けるのを防ぐ。位置ズレの二重の網でもある）
