@@ -1,4 +1,4 @@
-*scenario ply=42 target=7i2d scores=3c4b:7,B*3d:2,3b4b:7,3c2b:2,B*1h:2,B*1f:2,B*9f:2,3b2b:2,B*7f:2,B*3f:2,B*3a:2,B*5e:2,G*4b:2,B*8f:2,G*5e:2,B*2g:2,B*4b:2,3i2h:2,6g6f:2,B*4d:2,B*9e:2,G*2b:0,3i4h:4 bad=B*3d,3c2b,B*1h,B*1f,B*9f,3b2b,B*7f,B*3f,B*3a,B*5e,G*4b,B*8f,G*5e,B*2g,B*4b,3i2h,6g6f,B*4d,B*9e,G*2b desc=43手目（先手番）。実戦は2四角（遊んでいる自陣の角の活用＋玉の逃げ道作り）。4二龍・4二成桂もあり
+*scenario ply=42 target=7i2d scores=3c4b:7,B*3d:2,3b4b:7,3c2b:2,B*1h:2,B*1f:2,B*9f:2,3b2b:2,B*7f:2,B*3f:2,B*3a:2,B*5e:2,G*4b:2,B*8f:2,G*5e:2,B*2g:2,B*4b:2,3i2h:2,6g6f:2,B*4d:2,B*9e:2,G*2b:0,3i4h:4,5f5e:5 bad=B*3d,3c2b,B*1h,B*1f,B*9f,3b2b,B*7f,B*3f,B*3a,B*5e,G*4b,B*8f,G*5e,B*2g,B*4b,3i2h,6g6f,B*4d,B*9e,G*2b desc=43手目（先手番）。実戦は2四角（遊んでいる自陣の角の活用＋玉の逃げ道作り）。4二龍・4二成桂もあり
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
