@@ -364,6 +364,25 @@ fn eval_taint_attack_w() -> f64 {
     })
 }
 
+/// 終盤の紐減衰（`TSUITATE_LINK_ENDGAME_DAMPEN`、既定 0 = 無効）。
+/// ブラインド決定でのみ `link_w /= 1 + w × endgame_push`。
+///
+/// quest31 終盤の 3三角成（2d3c+）固執が発端: 駒得ゼロなのに
+/// `link≈2.4` + `promo` で玉筋の打ち（P*7c / G*7c）を押し下げる。
+/// `link_w=0` なら G*7c（採点8）が首位に来るが、序中盤の予防的な紐
+/// （v12）まで消すのは困る。厳密粒子が生きている決定では紐を触らず、
+/// taint の玉位置に紐の働きが引っ張られるブラインド終盤だけ減衰する。
+fn link_endgame_dampen() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_LINK_ENDGAME_DAMPEN")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
 /// 王手中の玉の手の gain を「玉の手全体の平均」に揃えるか（既定 on、
 /// `TSUITATE_CHECK_KING_GAIN_MEAN=0` で従来挙動。凍結版はこの名前を知らない）。
 /// = 玉の手**どうし**の序列は p_legal（CheckSolver の解消確率）と反則コストだけで
@@ -3442,6 +3461,14 @@ impl Strategy for EstimatorStrategy {
                 p.advance_w *= 1.0 + 0.5 * push;
                 p.backtrack_penalty *= 1.0 + push;
                 p.shuffle_penalty *= 1.0 + push;
+                // 終盤の紐減衰（`link_endgame_dampen`）。攻め増幅の対で、
+                // 遠方の相互守りが玉攻めを潰さないようにする。
+                // **ブラインド決定に限定**: 厳密粒子がある局面では紐の働き重みが
+                // まだ使え、序中盤の予防的な紐（v12）を壊したくない
+                let damp = link_endgame_dampen();
+                if damp > 0.0 && sample.is_empty() {
+                    p.link_w /= 1.0 + damp * push;
+                }
             }
             p
         };
