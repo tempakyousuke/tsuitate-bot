@@ -404,7 +404,9 @@ fn hand_asset_w() -> f64 {
 
 /// 玉の既知脅威への接近減点（`TSUITATE_KING_KNOWN_APPROACH_W`、既定 0）。
 /// 観測で位置が確定している敵駒マスへ近づく玉の手へ `w × Δcloseness` を
-/// gain から引く。quest31-m099 の 6八玉（取られた直後の 5六へ近づく）が発端。
+/// gain から引く。quest31-m099 の 6八玉（既知の 5六へ筋だけ寄る）が発端。
+/// 脅威マスは `king_threat_evidence`（捕獲マス＋歴代の非歩打ち反則）。
+/// **王手中も有効**（m099 は王手逃げの序列問題。CheckSolver は解消確率だけ）。
 /// 粒子不要。そのマス自体を取る手は対象外。凍結版はこの名前を知らない。
 fn king_known_approach_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -3742,12 +3744,13 @@ impl Strategy for EstimatorStrategy {
             .then(|| hand_option_context(view));
 
         // 相手駒の占有が観測で裏付けられたマス（`material_degen_q0` の
-        // 「裏付け無し捕獲だけ縮める」ゲート／`hand_asset_w` の仕事判定／
-        // `king_known_approach_w` の脅威マス。決定点ごとに1回）
-        let opp_occ_backed = (params.material_degen_q0 > 0.0
-            || hand_asset_w() > 0.0
-            || king_known_approach_w() > 0.0)
+        // 「裏付け無し捕獲だけ縮める」ゲート／`hand_asset_w` の仕事判定。
+        // 決定点ごとに1回）
+        let opp_occ_backed = (params.material_degen_q0 > 0.0 || hand_asset_w() > 0.0)
             .then(|| opp_occupancy_evidence(view, log));
+        // 玉接近減点の脅威マス（歴代の非歩打ち反則を含む。上記より広い）
+        let king_threats =
+            (king_known_approach_w() > 0.0).then(|| king_threat_evidence(log));
         // 持ち駒資産損の玉候補（`hand_asset_w`）。王手中は無効
         let hand_asset_kings: Option<std::collections::BTreeSet<Coord>> =
             (hand_asset_w() > 0.0 && !view.you_in_check)
@@ -3830,6 +3833,7 @@ impl Strategy for EstimatorStrategy {
                 &contested_squares,
                 opp_occ_backed.as_ref(),
                 hand_asset_kings.as_ref(),
+                king_threats.as_ref(),
             );
             // 王手中: 仮説条件付きの「王手駒の除去期待値」（check.rs::removal_term）。
             // 王手駒のマスを取る手は受理された未来で脅威ごと駒を排除し、玉逃げ等の
@@ -3955,10 +3959,29 @@ impl Strategy for EstimatorStrategy {
                 .map(|(i, _)| i)
                 .collect();
             if king_idx.len() > 1 {
+                // 玉接近減点は幻の分散ではないので平均化の外に出す
+                // （m099: 王手逃げ 6八 vs 8八。平均化が −w·Δcloseness まで消す）
+                let approach_pens: Vec<f64> = king_idx
+                    .iter()
+                    .map(|&i| match (king_threats.as_ref(), &scored[i].1) {
+                        (Some(th), ShogiMove::Board { from, to, .. }) => {
+                            let w = king_known_approach_w();
+                            if w <= 0.0 {
+                                0.0
+                            } else {
+                                w * king_known_approach_amount(*from, *to, th)
+                            }
+                        }
+                        _ => 0.0,
+                    })
+                    .collect();
+                for (j, &i) in king_idx.iter().enumerate() {
+                    scored[i].2.gain += approach_pens[j];
+                }
                 let mean =
                     king_idx.iter().map(|&i| scored[i].2.gain).sum::<f64>() / king_idx.len() as f64;
-                for &i in &king_idx {
-                    scored[i].2.gain = mean;
+                for (j, &i) in king_idx.iter().enumerate() {
+                    scored[i].2.gain = mean - approach_pens[j];
                     scored[i].4 = scored[i].2.score() + scored[i].3;
                 }
             }
@@ -4604,6 +4627,47 @@ fn opp_occupancy_evidence(view: &PlayerView, log: &ObservationLog) -> [bool; 81]
                     if role != Role::Pawn {
                         backed[crate::belief_features::sq_index(to)] = true;
                     }
+                }
+            }
+            _ => {}
+        }
+    }
+    backed
+}
+
+/// 玉接近減点用の脅威マス（`king_known_approach_w`）。
+///
+/// `opp_occupancy_evidence` より広い: **手番を問わず**非歩の打ち反則マスを残す。
+/// 発端の m099 では 41 手目の `S*5f` 反則で 5六が確定しており、99 手目でも
+/// そこに歩が居る（現行の「今手番の打ち反則だけ」では消えてしまう）。
+/// 歩打ち反則は二歩の可能性があるので除外。自分がそのマスで取ったら消す
+/// （駒はもう居ない）。
+fn king_threat_evidence(log: &ObservationLog) -> [bool; 81] {
+    let mut backed = [false; 81];
+    for e in log.events() {
+        match e {
+            Observation::OpponentMoved {
+                captured_my_piece_at: Some(sq),
+                ..
+            } => {
+                if let Some(c) = parse_usi_square(sq) {
+                    backed[crate::belief_features::sq_index(c)] = true;
+                }
+            }
+            Observation::MyFoul { usi, .. } => {
+                if let Some(ShogiMove::Drop { role, to }) = parse_usi(usi) {
+                    if role != Role::Pawn {
+                        backed[crate::belief_features::sq_index(to)] = true;
+                    }
+                }
+            }
+            Observation::MyMove {
+                usi,
+                captured: Some(_),
+                ..
+            } => {
+                if let Some(ShogiMove::Board { to, .. }) = parse_usi(usi) {
+                    backed[crate::belief_features::sq_index(to)] = false;
                 }
             }
             _ => {}
@@ -5360,12 +5424,13 @@ fn evaluate(
     // 争点マス = そこで駒が取られた/取ったマス（`anchor_move_w` の争点ゲート）
     contested_squares: &[bool; 81],
     // 相手駒の占有が観測で裏付けられたマス（`material_degen_q0` /
-    // `hand_asset_w` / `king_known_approach_w`）。None ならノブ無効時
-    // （choose が渡さない）
+    // `hand_asset_w`）。None ならノブ無効時（choose が渡さない）
     opp_occ_backed: Option<&[bool; 81]>,
     // 持ち駒資産損（`hand_asset_w`）の玉候補。Some のときだけ項が有効
     // （choose が「w≠0・王手中でない」のゲートを掛けて渡す）
     hand_asset_kings: Option<&std::collections::BTreeSet<Coord>>,
+    // 玉接近減点の脅威マス（`king_known_approach_w`）。歴代非歩打ち反則込み
+    king_threats: Option<&[bool; 81]>,
 ) -> EvalOut {
     let me = view.your_color;
     let opp = me.other();
@@ -6065,16 +6130,17 @@ fn evaluate(
     };
 
     // 玉の既知脅威への接近（`king_known_approach_w` の doc 参照）。
-    // 王手中は CheckSolver の領分なので無効。脅威マスを取る手は amount=0
-    let king_approach_pen = match (opp_occ_backed, mv) {
-        (Some(backed), &ShogiMove::Board { from, to, .. })
-            if !view.you_in_check && king_square(view) == Some(from) =>
+    // 王手中も有効: m099 は 8五桂の王手で、逃げ先の序列（8八 vs 6八）が
+    // CheckSolver の解消確率だけでは決まらない。脅威マスを取る手は amount=0。
+    let king_approach_pen = match (king_threats, mv) {
+        (Some(threats), &ShogiMove::Board { from, to, .. })
+            if king_square(view) == Some(from) =>
         {
             let w = king_known_approach_w();
             if w <= 0.0 {
                 0.0
             } else {
-                w * king_known_approach_amount(from, to, backed)
+                w * king_known_approach_amount(from, to, threats)
             }
         }
         _ => 0.0,
@@ -7866,6 +7932,64 @@ pub(crate) mod tests {
         // チェビシェフが縮むときは整数差分
         let closer = Coord { file: 6, rank: 6 };
         assert!((king_known_approach_amount(from, closer, &backed) - 1.0).abs() < 1e-9);
+    }
+
+    /// m099 決定点で歴代 S*5f が脅威に残っていること
+    #[test]
+    fn king_threat_evidence_quest31_m099_has_5f() {
+        let text = std::fs::read_to_string("scenarios/quest31-m099.kif").expect("kif");
+        let kifu = crate::kifu::parse_kif(&text).expect("parse");
+        let rep = crate::scenario_core::replay(&kifu, 98);
+        let side = rep.pos.turn();
+        let log = &rep.logs[crate::scenario_core::side_idx(side)];
+        let threats = king_threat_evidence(log);
+        let sq5f = crate::belief_features::sq_index(Coord { file: 5, rank: 6 });
+        assert!(
+            threats[sq5f],
+            "5f should be a king threat from historical S*5f foul"
+        );
+        let from = Coord { file: 7, rank: 7 };
+        let toward = Coord { file: 6, rank: 8 };
+        let away = Coord { file: 8, rank: 8 };
+        let a6 = king_known_approach_amount(from, toward, &threats);
+        let a8 = king_known_approach_amount(from, away, &threats);
+        assert!(
+            a6 > a8,
+            "7g6h should approach threats more than 7g8h: 6h={a6} 8h={a8}"
+        );
+    }
+
+    /// 玉脅威: 過去手番の非歩打ち反則も残し、そこで取ったら消える
+    #[test]
+    fn king_threat_evidence_keeps_historical_nonpawn_foul() {
+        let mut log = ObservationLog::default();
+        log.record(Observation::MyFoul {
+            move_number: 41,
+            usi: "S*5f".into(),
+        });
+        log.record(Observation::OpponentMoved {
+            move_number: 42,
+            captured_my_piece_at: Some("7g".into()),
+        });
+        // 歩打ち反則は載せない
+        log.record(Observation::MyFoul {
+            move_number: 50,
+            usi: "P*3c".into(),
+        });
+        let threats = king_threat_evidence(&log);
+        assert!(threats[crate::belief_features::sq_index(Coord { file: 5, rank: 6 })]);
+        assert!(threats[crate::belief_features::sq_index(Coord { file: 7, rank: 7 })]);
+        assert!(!threats[crate::belief_features::sq_index(Coord { file: 3, rank: 3 })]);
+
+        // 5f で取ったら消える
+        log.record(Observation::MyMove {
+            move_number: 51,
+            usi: "4f5f".into(),
+            captured: Some(Role::Silver),
+        });
+        let threats2 = king_threat_evidence(&log);
+        assert!(!threats2[crate::belief_features::sq_index(Coord { file: 5, rank: 6 })]);
+        assert!(threats2[crate::belief_features::sq_index(Coord { file: 7, rank: 7 })]);
     }
 
     /// 持ち駒資産損の「仕事」判定: 裏付けマスへの当たり／玉候補近接なら work
