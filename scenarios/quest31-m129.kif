@@ -1,4 +1,4 @@
-*scenario ply=128 target=4b7b scores=4b7b:8,2d3c+:0,N*3f:0,N*4d:0,S*1c:0,N*5d:0,N*1d:0,N*6d:8,G*7c:2,S*8c:0,S*7c:0,G*8c:2,N*9d:4,G*7b:0,7d7c:1,7d8c:1 bad=2d3c+,N*3f,N*4d,S*1c,N*5d,N*1d,G*7c,S*8c,S*7c,G*8c,G*7b,7d7c,7d8c desc=129手目（先手番）。最高点は7二龍（8点）。採点はevals/quest_20260731.eval.md参照
+*scenario ply=128 target=4b7b scores=4b7b:8,2d3c+:0,N*3f:0,N*4d:0,S*1c:0,N*5d:0,N*1d:0,N*6d:8,G*7c:2,S*8c:0,S*7c:0,G*8c:2,N*9d:4,G*7b:0,7d7c:1,7d8c:1,2d1c+:0 bad=2d3c+,N*3f,N*4d,S*1c,N*5d,N*1d,G*7c,S*8c,S*7c,G*8c,G*7b,7d7c,7d8c,2d1c+ desc=129手目（先手番）。最高点は7二龍（8点）。採点はevals/quest_20260731.eval.md参照
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
