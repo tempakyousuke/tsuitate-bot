@@ -342,6 +342,28 @@ fn eval_taint_fallback() -> bool {
     })
 }
 
+/// taint フォールバック中の**攻め項の倍率**（`TSUITATE_EVAL_TAINT_ATTACK`、
+/// 既定 0 = 攻め項は供給しない）。
+///
+/// 発端は 2026-08-10 の実測: 素の taint フォールバックは材料・リスクの供給で
+/// m067 を 3.10→7.65 点に改善する一方、**王手ボーナスが玉の信念位置への
+/// 駒捨て王手**（7七桂成 8e7g+ = 支え付きマスへの桂捨て。ユーザー採点は
+/// 全ブロックで 0〜2点）を 9〜10/20 まで押し上げ、採点済みシナリオでは
+/// m100 7.70→3.10・m106/m110/m114/m116/m138 と一様に得点を落とした。
+/// taint 粒子の玉位置ビリーフは攻め先の決定には足りない（メモリ
+/// v2-bottleneck-is-king-belief、blind_attack_survive_w と同じ構図）ので、
+/// 供給チャネルを材料・リスク側に限定する。1.0 で従来のフォールバック相当
+fn eval_taint_attack_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_EVAL_TAINT_ATTACK")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+            .unwrap_or(0.0)
+    })
+}
+
 /// 王手中の玉の手の gain を「玉の手全体の平均」に揃えるか（既定 on、
 /// `TSUITATE_CHECK_KING_GAIN_MEAN=0` で従来挙動。凍結版はこの名前を知らない）。
 /// = 玉の手**どうし**の序列は p_legal（CheckSolver の解消確率）と反則コストだけで
@@ -5104,6 +5126,13 @@ fn evaluate(
     let mut nn_sum = 0.0f64;
     let mut nn_w_sum = 0.0f64;
     let mut nn_n = 0usize;
+    // taint フォールバック中の攻め項の倍率（既定 0 = 材料・リスクだけ供給）。
+    // 厳密粒子で評価している通常の決定では 1.0 = 従来どおり
+    let attack_scale = if particles_are_taint {
+        eval_taint_attack_w()
+    } else {
+        1.0
+    };
 
     for (pi, &(pos, w)) in particles.iter().enumerate() {
         if !pos.is_legal(mv) {
@@ -5152,8 +5181,11 @@ fn evaluate(
         if gives_check {
             let opp_fouls_left = f64::from(10u32.saturating_sub(view.fouls.opponent).max(1));
             let accel = (10.0 / opp_fouls_left).powf(params.check_limit_accel);
-            v += params.check_bonus
-                + params.check_foul_scale * f64::from(view.fouls.opponent) * accel;
+            // taint フォールバック中は攻め項を絞る（`eval_taint_attack_w`。
+            // 玉位置ビリーフが攻め先の決定に足りない = 駒捨て王手の濫発）
+            v += attack_scale
+                * (params.check_bonus
+                    + params.check_foul_scale * f64::from(view.fouls.opponent) * accel);
             check_hits += w;
             // K = この粒子での相手の合法解消手数（王手中の合法手 = 解消手）。
             // 0 なら詰み。それ以外は「王手の強さ」で再配分する（check_strength_w
@@ -5167,7 +5199,8 @@ fn evaluate(
                 // 乗っ取るのを防ぐ（quest31-m027/m029 の 4一龍、gain 77〜91）
                 mate_hits += w;
             } else if params.check_strength_w != 0.0 {
-                v += params.check_strength_w
+                v += attack_scale
+                    * params.check_strength_w
                     * (CHECK_STRENGTH_CURVE / (1.0 + resolutions as f64)
                         - CHECK_STRENGTH_CENTER);
             }
@@ -5568,12 +5601,15 @@ fn evaluate(
         } else {
             0.0
         };
+        // 攻め側の項（王探し・玉周りの圧力・逃げマス被覆）は taint
+        // フォールバック中は attack_scale で絞る。守り側（自玉への圧力・
+        // 相手の打ち王手の危険）は絞らない = 安全方向は残す
         value_sum / legal + mate_term - capture_bet_penalty
             + params.info_bonus * p_hit * (1.0 - p_hit)
-            + params.king_probe_bonus * p_chk * (1.0 - p_chk)
+            + attack_scale * params.king_probe_bonus * p_chk * (1.0 - p_chk)
             + value_nn_term
-            + (params.attack_w * confidence * attack_sum
-                + params.escape_cover_w * confidence * escape_sum
+            + (attack_scale * params.attack_w * confidence * attack_sum
+                + attack_scale * params.escape_cover_w * confidence * escape_sum
                 - params.pressure_w * pressure_sum
                 - params.hand_drop_w * danger_sum)
                 / pressure_w_sum.max(1e-9)
