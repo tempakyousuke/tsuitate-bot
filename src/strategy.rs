@@ -1682,6 +1682,12 @@ pub struct EvalParams {
     /// 薄さで縮める: g = c(1+q0)/(c+q0)（c = confidence）。少数の生存粒子は
     /// 「自信を持って間違う」ため（実測 2026-08-10: 厳密粒子9個の決定点で
     /// 真実が空きマスの4一に飛車85.9%の信念、そこへの4一成桂が浮く）。
+    ///
+    /// **縮めるのは観測裏付けの無い捕獲だけ**（2026-08-10 の全捕獲版は
+    /// m032/m063 など正しい捕獲まで殺し不採用。次に試すなら「裏付け無し」に
+    /// 絞れ、という教訓どおり）。裏付け = 相手が自駒を取ったマス（居場所が
+    /// 通知される）＋この手番の非歩打ち反則マス。幻の 3三角成 / 3二角成 /
+    /// 7七桂成クラスを沈める一方、観測確実な取り返しは満額残す。
     /// `TSUITATE_MATERIAL_DEGEN_Q0` で上書き可・SPSA対応。凍結版は知らない
     pub material_degen_q0: f64,
     /// **taint 粒子の占有合意で打ちの反則確率を下げる**（2026-08-03、ユーザー指摘の
@@ -3614,6 +3620,11 @@ impl Strategy for EstimatorStrategy {
             && !view.you_in_check)
             .then(|| hand_option_context(view));
 
+        // 相手駒の占有が観測で裏付けられたマス（`material_degen_q0` の
+        // 「裏付け無し捕獲だけ縮める」ゲート用。決定点ごとに1回）
+        let opp_occ_backed = (params.material_degen_q0 > 0.0)
+            .then(|| opp_occupancy_evidence(view, log));
+
         // この手番の打ち反則で占有が確定したマスと、残存敵駒の平均交換価値
         // （`foul_occ_attack_w`）。反則では手番が変わらないので情報は完全に新鮮。
         // 平均価値は観測のみで決まる: 相手の初期19枚（玉除く）− 自分が取った駒
@@ -3689,6 +3700,7 @@ impl Strategy for EstimatorStrategy {
                 &my_drop_foul_squares,
                 &own_attack,
                 &contested_squares,
+                opp_occ_backed.as_ref(),
             );
             // 王手中: 仮説条件付きの「王手駒の除去期待値」（check.rs::removal_term）。
             // 王手駒のマスを取る手は受理された未来で脅威ごと駒を排除し、玉逃げ等の
@@ -4433,6 +4445,44 @@ fn blind_home_position(view: &PlayerView, log: &ObservationLog) -> BlindHome {
 ///   初期配置 − 自分が取った駒（`MyMove{captured}`）＋ 相手が自分から取った駒
 ///   （打ち直されて盤に戻りうる）。その平均交換価値を見積もりに使う。
 ///   玉は除く（玉で取り返しに来る形は稀で、平均を押し上げるだけ）
+/// 相手駒の占有が観測で裏付けられたマス。
+///
+/// `material_degen_q0` が「幻の駒得」だけを縮めるための証拠集合:
+/// - 相手が自駒を取ったマス（`OpponentMoved.captured_my_piece_at`）=
+///   取った駒の位置が通知されるので占有は確定
+/// - この手番の非歩打ち反則マス = 候補生成が二歩・行き所を既に除外しているので
+///   着地点に相手駒がいる（`exclude_moves_on_known_opponent` と同じ規約）
+///
+/// 自分が取ったマスは対象外（取った時点で相手駒は消えており、再占有の証拠に
+/// ならない）。歩打ち反則も対象外（二歩の可能性がある）。
+fn opp_occupancy_evidence(view: &PlayerView, log: &ObservationLog) -> [bool; 81] {
+    let mut backed = [false; 81];
+    for e in log.events() {
+        match e {
+            Observation::OpponentMoved {
+                captured_my_piece_at: Some(sq),
+                ..
+            } => {
+                if let Some(c) = parse_usi_square(sq) {
+                    backed[crate::belief_features::sq_index(c)] = true;
+                }
+            }
+            Observation::MyFoul { move_number, usi } if *move_number == view.move_number => {
+                if view.you_in_check {
+                    continue;
+                }
+                if let Some(ShogiMove::Drop { role, to }) = parse_usi(usi) {
+                    if role != Role::Pawn {
+                        backed[crate::belief_features::sq_index(to)] = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    backed
+}
+
 fn blind_recapture_target(view: &PlayerView, log: &ObservationLog) -> Option<(Coord, f64)> {
     let square = log.events().iter().rev().find_map(|e| match e {
         Observation::OpponentMoved {
@@ -5180,6 +5230,9 @@ fn evaluate(
     own_attack_before: &[u8; 81],
     // 争点マス = そこで駒が取られた/取ったマス（`anchor_move_w` の争点ゲート）
     contested_squares: &[bool; 81],
+    // 相手駒の占有が観測で裏付けられたマス（`material_degen_q0`）。
+    // None なら退化ゲート無効時（choose が q0=0 のとき渡さない）
+    opp_occ_backed: Option<&[bool; 81]>,
 ) -> EvalOut {
     let me = view.your_color;
     let opp = me.other();
@@ -5687,8 +5740,12 @@ fn evaluate(
         // 空きマスの 4一 に **飛車 85.9%** の信念が立ち、そこへの成桂
         // （4一成桂）が浮いていた（ユーザー指摘の手）。同型の 8e7g+ も
         // 駒得 +3.575 が駆動源。少数粒子の合意は「自信を持って間違う」ので、
-        // 質量が薄いほど駒得期待値を縮める（観測に裏付けられた駒得は
-        // `blind_recapture` が別経路で供給する）。
+        // 質量が薄いほど駒得期待値を縮める。
+        //
+        // **縮めるのは観測裏付けの無い捕獲だけ**: 2026-08-10 の全捕獲版は
+        // m032/m063 の正しい捕獲まで殺し不採用。裏付けマス（相手が自駒を
+        // 取った／この手番の非歩打ち反則）への捕獲は満額残し、幻の
+        // 3三角成クラスだけを沈める。
         // g = c(1+q0)/(c+q0): q0=0 で g=1（従来）、q0>0 で c 小さいほど強く縮む
         let degen_gate = if params.material_degen_q0 > 0.0 {
             confidence * (1.0 + params.material_degen_q0)
@@ -5696,7 +5753,13 @@ fn evaluate(
         } else {
             1.0
         };
-        let material_shrink = if degen_gate < 1.0 && capture_hits > 0.0 {
+        let capture_to_backed = match (*mv, opp_occ_backed) {
+            (ShogiMove::Board { to, .. }, Some(backed)) => {
+                backed[crate::belief_features::sq_index(to)]
+            }
+            _ => false,
+        };
+        let material_shrink = if degen_gate < 1.0 && capture_hits > 0.0 && !capture_to_backed {
             (1.0 - degen_gate) * (capture_value_sum / legal)
         } else {
             0.0
@@ -7551,6 +7614,53 @@ pub(crate) mod tests {
         let promo = coverage_after(&view, &parse_usi("3d3c+").unwrap());
         assert_eq!(quiet, 1.0);
         assert_eq!(promo, 6.0, "と金は金の利き（6マス）");
+    }
+
+    /// 相手駒の占有証拠: 相手が取ったマスは常に、この手番の非歩打ち反則も。
+    /// 歩打ち反則と自分が取ったマスは対象外（material_degen の裏付けゲート）
+    #[test]
+    fn opp_occupancy_evidence_marks_capture_and_nonpawn_foul_only() {
+        let mut view = minimal_view(
+            vec![VisiblePiece {
+                square: "5i".into(),
+                role: Role::King,
+            }],
+            HashMap::from([(Role::Silver, 1), (Role::Pawn, 1)]),
+        );
+        view.move_number = 10;
+        let mut log = ObservationLog::default();
+        log.record(Observation::OpponentMoved {
+            move_number: 2,
+            captured_my_piece_at: Some("7g".into()),
+        });
+        // 自分が取ったマスは裏付けにならない
+        log.record(Observation::MyMove {
+            move_number: 5,
+            usi: "2b2a+".into(),
+            captured: Some(Role::Silver),
+        });
+        // この手番の銀打ち反則 → 裏付け
+        log.record(Observation::MyFoul {
+            move_number: 10,
+            usi: "S*4g".into(),
+        });
+        // 歩打ち反則は二歩の可能性があるので対象外
+        log.record(Observation::MyFoul {
+            move_number: 10,
+            usi: "P*5e".into(),
+        });
+        // 前の手番の打ち反則は対象外（盤が動いている）
+        log.record(Observation::MyFoul {
+            move_number: 8,
+            usi: "S*3c".into(),
+        });
+
+        let backed = opp_occupancy_evidence(&view, &log);
+        assert!(backed[crate::belief_features::sq_index(Coord { file: 7, rank: 7 })]);
+        assert!(backed[crate::belief_features::sq_index(Coord { file: 4, rank: 7 })]);
+        assert!(!backed[crate::belief_features::sq_index(Coord { file: 2, rank: 1 })]);
+        assert!(!backed[crate::belief_features::sq_index(Coord { file: 5, rank: 5 })]);
+        assert!(!backed[crate::belief_features::sq_index(Coord { file: 3, rank: 3 })]);
     }
 
     /// ブラインド取り返し: 対象マスは**直前の相手手**で取られたマスに限る
