@@ -421,14 +421,16 @@ fn king_known_approach_w() -> f64 {
 
 /// 大駒成りの遠方ペナルティ（`TSUITATE_PROMOTE_FAR_W`、既定 0 = 無効）。
 /// 角・飛の**実現する成り**で、着地が `deduce::opp_king_candidates` から
-/// 遠いとき `w × max(0, d_min−2)` を gain から引く。
+/// 遠いとき `w × max(0, d_min−1)` を gain から引く。
 ///
 /// quest31 終盤の 3三角成（2d3c+）／3二角成（4a3b+）固執が発端: 採点 0 なのに
 /// `promote_bias` + `promo_potential` で玉筋の打ち（P*7c / G*7c）を押し下げる。
 /// `promo_king_prox` は将来の成りポテンシャル側で、**今成る手**の固定ボーナスを
-/// 削らない。こちらは成る手そのものへの課税。玉候補 2 マス以内は免税
-/// （寄せの成りを壊さない）。観測裏付けのある捕獲成は対象外。
-/// 王手中無効・粒子不要。凍結版はこの名前を知らない。
+/// 削らない。こちらは成る手そのものへの課税。玉候補 1 マス以内（隣接）だけ免税
+/// （寄せの成りを壊さない）。免税を 2 にすると 4a3b+/4a6c+ が
+/// d_min=2 で逃げ残る（combo_far_v1 実測で 4a3b+ が20残）。
+/// 観測裏付けのある捕獲成は対象外。王手中無効・粒子不要。
+/// 凍結版はこの名前を知らない。
 fn promote_far_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -441,12 +443,12 @@ fn promote_far_w() -> f64 {
 }
 
 /// 大駒成りの遠方量（`promote_far_w` の材料）。玉候補への最小チェビシェフ
-/// が 2 を超えたぶん。候補が空なら 0（減点しない = 安全方向）。
+/// が 1 を超えたぶん。候補が空なら 0（減点しない = 安全方向）。
 fn promote_far_amount(to: Coord, cands: &std::collections::BTreeSet<Coord>) -> f64 {
     let Some(d_min) = cands.iter().map(|&k| chebyshev(to, k)).min() else {
         return 0.0;
     };
-    f64::from(d_min.saturating_sub(2))
+    f64::from(d_min.saturating_sub(1))
 }
 
 fn chebyshev(a: Coord, b: Coord) -> i32 {
@@ -8183,15 +8185,17 @@ pub(crate) mod tests {
         );
     }
 
-    /// 大駒成り遠方: 玉候補 2 マス以内は 0、それ以遠は超過分
+    /// 大駒成り遠方: 玉候補 1 マス以内（隣接）は 0、それ以遠は超過分
     #[test]
-    fn promote_far_amount_free_within_two() {
+    fn promote_far_amount_free_within_one() {
         let mut cands = std::collections::BTreeSet::new();
         cands.insert(Coord { file: 7, rank: 1 });
-        // 3c → 7a は chebyshev 4 → max(0,4-2)=2
-        assert!((promote_far_amount(Coord { file: 3, rank: 3 }, &cands) - 2.0).abs() < 1e-9);
-        // 7c → 7a は chebyshev 2 → 0
-        assert_eq!(promote_far_amount(Coord { file: 7, rank: 3 }, &cands), 0.0);
+        // 3c → 7a は chebyshev 4 → max(0,4-1)=3
+        assert!((promote_far_amount(Coord { file: 3, rank: 3 }, &cands) - 3.0).abs() < 1e-9);
+        // 7c → 7a は chebyshev 2 → 1
+        assert!((promote_far_amount(Coord { file: 7, rank: 3 }, &cands) - 1.0).abs() < 1e-9);
+        // 7b → 7a は chebyshev 1 → 0
+        assert_eq!(promote_far_amount(Coord { file: 7, rank: 2 }, &cands), 0.0);
         // 空集合は 0
         assert_eq!(
             promote_far_amount(Coord { file: 3, rank: 3 }, &std::collections::BTreeSet::new()),
