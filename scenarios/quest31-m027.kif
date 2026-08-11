@@ -1,4 +1,4 @@
-*scenario ply=26 target=S*4b scores=2a4a:4,2a3a:3,S*3h:1,S*5h:2,S*8h:1,S*4h:1,S*1h:1,S*4b:8,2a1a:2,S*7f:1,3b3c:7,5i4h:6,1g1f:1,3i3h:6,4g4f:8 bad=S*3h,S*5h,S*8h,S*4h,S*1h,2a1a,S*7f,1g1f desc=27手目（先手番）。bot候補上位7個が全て悪手（龍の無目的移動2種＋自陣銀打ち5種）。実戦の人間の手4二銀打の価値が上がるべき。他の非悪手は3三となど
+*scenario ply=26 target=S*4b scores=2a4a:4,2a3a:3,S*3h:1,S*5h:2,S*8h:1,S*4h:1,S*1h:1,S*4b:8,2a1a:2,S*7f:1,3b3c:7,5i4h:6,1g1f:1 bad=S*3h,S*5h,S*8h,S*4h,S*1h,2a1a,S*7f,1g1f desc=27手目（先手番）。bot候補上位7個が全て悪手（龍の無目的移動2種＋自陣銀打ち5種）。実戦の人間の手4二銀打の価値が上がるべき。他の非悪手は3三となど
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

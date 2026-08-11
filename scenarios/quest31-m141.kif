@@ -1,4 +1,4 @@
-*scenario ply=140 target=7a8b+ scores=7a8b+:8,2d3c+:0,G*1e:0,P*7c:0,P*5c:0,P*2b:0,P*5d:0,G*9b:1,G*9a:0,G*7b:2,G*8b:0,G*3e:0,7a8b:8 bad=2d3c+,G*1e,P*7c,P*5c,P*2b,P*5d,G*9b,G*9a,G*7b,G*8b,G*3e desc=141手目（先手番）。最高点は8二銀成（8点）。採点はevals/quest_20260731.eval.md参照
+*scenario ply=140 target=7a8b+ scores=7a8b+:8,2d3c+:0,G*1e:0,P*7c:0,P*5c:0,P*2b:0,P*5d:0,G*9b:1,G*9a:0,G*7b:2,G*8b:0,G*3e:0 bad=2d3c+,G*1e,P*7c,P*5c,P*2b,P*5d,G*9b,G*9a,G*7b,G*8b,G*3e desc=141手目（先手番）。最高点は8二銀成（8点）。採点はevals/quest_20260731.eval.md参照
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
