@@ -1,4 +1,4 @@
-*scenario ply=43 target=P*4f scores=3h4i+:6,4g4h:2,4g5h:2,7a7b:2,6c7b:2,6b7b:2,7c7d:2,P*2b:2,5c5d:2,P*2h:6,3h2i+:3,3h3i+:3,3h4i:6,2c2f:6,P*4f:9 bad=4g4h,4g5h,7a7b,6c7b,6b7b,7c7d,P*2b,5c5d desc=44手目（後手番）。実戦の4六歩打（または4八歩打）が候補に上がるべきだが出てこない。bot 候補では4九銀成があり
+*scenario ply=43 target=P*4f scores=3h4i+:6,4g4h:2,4g5h:2,7a7b:2,6c7b:2,6b7b:2,7c7d:2,P*2b:2,5c5d:2,P*2h:6,3h2i+:3,3h3i+:3,3h4i:6,2c2f:6,P*4f:9,4g4f:4 bad=4g4h,4g5h,7a7b,6c7b,6b7b,7c7d,P*2b,5c5d desc=44手目（後手番）。実戦の4六歩打（または4八歩打）が候補に上がるべきだが出てこない。bot 候補では4九銀成があり
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
