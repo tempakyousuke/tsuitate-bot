@@ -738,6 +738,27 @@ fn promo_risk_prerole() -> bool {
     *V.get_or_init(|| std::env::var("TSUITATE_PROMO_RISK_PREROLE").is_ok_and(|v| v == "1"))
 }
 
+/// 捕獲直後の手戻り免除・退避加点（`TSUITATE_CAPTURE_RETREAT_W`、既定 0 = 無効）。
+///
+/// 直前に受理された手が**駒を取った移動**で、今手がその厳密な逆（from/to 入替）
+/// なら「取って逃げる」なので `backtrack_penalty` を免除し、
+/// `w × exchange_value(着手駒)` を adjust へ加点する。
+///
+/// 発端は quest31-m024: 同飛で 3二のとを取った直後の退避 `3b4b` が、gain では
+/// 4七歩成に近いのに backtrack −0.37 で沈み、GEN+PREROLE 下では 4七歩成に
+/// 0/5 で負けていた。粒子の当たり判定はブラインド／誤信念で発火しないので
+/// **観測（captured の有無）だけ**を使う。凍結版はこの名前を知らない。
+fn capture_retreat_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_CAPTURE_RETREAT_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
 /// V1（利き数）のノブ。**既定は両方 無効**（＝従来の二値の利き判定）。
 ///
 /// やねうら王 Lv4 の「利き数」（+R30）をついたてへ持ち込む実験だったが、
@@ -3602,9 +3623,11 @@ impl Strategy for EstimatorStrategy {
             .count();
         let opp_board_n = (20 - my_captures.min(19)) as f64;
 
-        // 直前に受理された自分の手（手戻りシャッフルの抑制に使う）
+        // 直前に受理された自分の手（手戻りシャッフルの抑制／捕獲直後の退避判定）
         let last_my_move = log.events().iter().rev().find_map(|e| match e {
-            Observation::MyMove { usi, .. } => parse_usi(usi),
+            Observation::MyMove { usi, captured, .. } => {
+                parse_usi(usi).map(|mv| (mv, captured.is_some()))
+            }
             _ => None,
         });
 
@@ -4156,18 +4179,37 @@ impl Strategy for EstimatorStrategy {
                     * blind_hang_risk(view, &mv, &taint_pool, opp_color, &mut coverage_cache);
             }
             // 手戻り（直前の手をそのまま逆に戻す）は膠着の典型なので減点。
-            // 直前に動かした駒をまた動かすだけの手も雑なシャッフルとして軽く減点
+            // 直前に動かした駒をまた動かすだけの手も雑なシャッフルとして軽く減点。
+            // ただし直前が**捕獲**で今手がその厳密な逆なら「取って逃げる」
+            // （`capture_retreat_w` / quest31-m024: 同飛→3b4b）。観測のみ。
             if let (
-                Some(ShogiMove::Board {
-                    from: pf, to: pt, ..
-                }),
+                Some((
+                    ShogiMove::Board {
+                        from: pf, to: pt, ..
+                    },
+                    last_captured,
+                )),
                 ShogiMove::Board { from, to, .. },
             ) = (last_my_move, mv)
             {
+                let retreat_w = capture_retreat_w();
+                let capture_retreat =
+                    retreat_w > 0.0 && last_captured && from == pt && to == pf;
                 if from == pt && to == pf {
-                    adjust -= params.backtrack_penalty;
+                    if !capture_retreat {
+                        adjust -= params.backtrack_penalty;
+                    }
                 } else if from == pt {
                     adjust -= params.shuffle_penalty;
+                }
+                if capture_retreat {
+                    let val = view
+                        .your_pieces
+                        .iter()
+                        .find(|p| p.square == make_usi_square(from))
+                        .map(|p| exchange_value(p.role))
+                        .unwrap_or(0.0);
+                    adjust += retreat_w * val;
                 }
             }
             // 同じ自陣形へ戻る手の累積減点。上の2つは直前の1手しか見ず固定額
@@ -8416,6 +8458,18 @@ pub(crate) mod tests {
             Coord { file: 6, rank: 4 }, // 6d
             &own
         ));
+    }
+
+    /// 捕獲直後の手戻り免除ノブは既定 0（挙動不変）。正の値で有効化。
+    #[test]
+    fn capture_retreat_w_default_off() {
+        // OnceLock はプロセス内で一度だけ読むので、このテストは「未設定なら 0」
+        // の契約だけを固定する（他テストが先に env を立てると壊れるので
+        // 環境変数は触らない）
+        let w = std::env::var("TSUITATE_CAPTURE_RETREAT_W").ok();
+        if w.is_none() {
+            assert_eq!(capture_retreat_w(), 0.0);
+        }
     }
 
     /// m133 の 2d3c+ は玉候補から遠く、寄せ筋の接近成りより重い
