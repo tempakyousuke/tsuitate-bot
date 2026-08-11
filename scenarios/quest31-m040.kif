@@ -1,4 +1,4 @@
-*scenario ply=39 target=S*3h scores=S*5h:2,S*4h:2,S*6h:2,4f4g+:8,S*2b:2,7a7b:2,S*1d:2,S*3g:1,S*4g:0,S*5g:2,S*3i:1,S*5i:2,S*4c:2,S*3e:2,S*1b:1,P*2b:1,S*3c:1,P*2h:7,4f4g:2,P*2f:2,P*2e:1,6c7b:4,6d6e:2,2c2f:6 bad=S*5h,S*4h,S*6h,S*2b,7a7b,S*1d,S*3g,S*4g,S*5g,S*3i,S*5i,S*4c,S*3e,S*1b,P*2b,S*3c,4f4g,P*2f,P*2e,6d6e desc=40手目（後手番）。実戦の3八銀打（4七地点に利きを足す手）が本命だが bot の候補に上がらない。4七歩成もあり。5八/4八/6八銀打は王手を食って銀を回収される
+*scenario ply=39 target=S*3h scores=S*5h:2,S*4h:2,S*6h:2,4f4g+:8,S*2b:2,7a7b:2,S*1d:2,S*3g:1,S*4g:0,S*5g:2,S*3i:1,S*5i:2,S*4c:2,S*3e:2,S*1b:1,P*2b:1,S*3c:1,P*2h:7,4f4g:2,P*2f:2,P*2e:1,6c7b:1,6d6e:2,2c2f:6 bad=S*5h,S*4h,S*6h,S*2b,7a7b,S*1d,S*3g,S*4g,S*5g,S*3i,S*5i,S*4c,S*3e,S*1b,P*2b,S*3c,4f4g,P*2f,P*2e,6c7b,6d6e desc=40手目（後手番）。実戦の3八銀打（4七地点に利きを足す手）が本命だが bot の候補に上がらない。4七歩成もあり。5八/4八/6八銀打は王手を食って銀を回収される
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
