@@ -741,13 +741,13 @@ fn promo_risk_prerole() -> bool {
 /// 捕獲直後の手戻り免除・退避加点（`TSUITATE_CAPTURE_RETREAT_W`、既定 0 = 無効）。
 ///
 /// 直前に受理された手が**駒を取った移動**で、今手がその厳密な逆（from/to 入替）
-/// なら「取って逃げる」なので `backtrack_penalty` を免除し、
+/// かつ**不成**なら「取って逃げる」なので `backtrack_penalty` を免除し、
 /// `w × exchange_value(着手駒)` を adjust へ加点する。
 ///
-/// 発端は quest31-m024: 同飛で 3二のとを取った直後の退避 `3b4b` が、gain では
-/// 4七歩成に近いのに backtrack −0.37 で沈み、GEN+PREROLE 下では 4七歩成に
-/// 0/5 で負けていた。粒子の当たり判定はブラインド／誤信念で発火しないので
-/// **観測（captured の有無）だけ**を使う。凍結版はこの名前を知らない。
+/// 成りを除外する理由: 捕獲→成り返り（例: 3二角成）は退避でなく再突入で、
+/// 加点すると quest31-m087/m089 の 4a3b+（0点）が銀不成を押しのける
+/// （実測: w=0.08 で両シナリオ 5.6→0）。発端 m024 の 3b4b は不成。
+/// 粒子不要（観測の captured のみ）。凍結版はこの名前を知らない。
 fn capture_retreat_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -4180,8 +4180,9 @@ impl Strategy for EstimatorStrategy {
             }
             // 手戻り（直前の手をそのまま逆に戻す）は膠着の典型なので減点。
             // 直前に動かした駒をまた動かすだけの手も雑なシャッフルとして軽く減点。
-            // ただし直前が**捕獲**で今手がその厳密な逆なら「取って逃げる」
+            // ただし直前が**捕獲**で今手がその厳密な逆かつ不成なら「取って逃げる」
             // （`capture_retreat_w` / quest31-m024: 同飛→3b4b）。観測のみ。
+            // 成り逆（4a3b+ 型）は再突入なので対象外（m087/m089 回帰の教訓）。
             if let (
                 Some((
                     ShogiMove::Board {
@@ -4189,12 +4190,20 @@ impl Strategy for EstimatorStrategy {
                     },
                     last_captured,
                 )),
-                ShogiMove::Board { from, to, .. },
+                ShogiMove::Board {
+                    from,
+                    to,
+                    promote,
+                    ..
+                },
             ) = (last_my_move, mv)
             {
                 let retreat_w = capture_retreat_w();
-                let capture_retreat =
-                    retreat_w > 0.0 && last_captured && from == pt && to == pf;
+                let capture_retreat = retreat_w > 0.0
+                    && last_captured
+                    && !promote
+                    && from == pt
+                    && to == pf;
                 if from == pt && to == pf {
                     if !capture_retreat {
                         adjust -= params.backtrack_penalty;
