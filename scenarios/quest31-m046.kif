@@ -1,4 +1,4 @@
-*scenario ply=45 target=7c7d scores=4g4h:2,4g5h:2,3h4i+:2,7a7b:2,6c7b:2,6b7b:2,7c7d:6,P*2b:2,4g3g:2,3h2i+:2,3h3i+:2,3h4i:10,4g5g:2,2c2f:7 bad=4g4h,4g5h,3h4i+,7a7b,6c7b,6b7b,P*2b,4g3g,3h2i+,3h3i+,4g5g desc=46手目（後手番）。4六歩を突いた関係で4七の取り合いには強いので手待ちでよい。4九銀成は金を取れなかったとき王手を食って銀を失う（4九銀不成のほうがよい）
+*scenario ply=45 target=7c7d scores=4g4h:2,4g5h:2,3h4i+:2,7a7b:2,6c7b:2,6b7b:2,7c7d:6,P*2b:2,4g3g:2,3h2i+:2,3h3i+:2,3h4i:10,4g5g:2,2c2f:7,P*2d:1 bad=4g4h,4g5h,3h4i+,7a7b,6c7b,6b7b,P*2b,4g3g,3h2i+,3h3i+,4g5g,P*2d desc=46手目（後手番）。4六歩を突いた関係で4七の取り合いには強いので手待ちでよい。4九銀成は金を取れなかったとき王手を食って銀を失う（4九銀不成のほうがよい）
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

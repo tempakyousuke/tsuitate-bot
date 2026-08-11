@@ -1,4 +1,4 @@
-*scenario ply=31 target=5b4b scores=5b4b:8,4f4g+:3,6c5d:2,4d3e:2,S*3e:1,6c7b:1,S*3c:2,S*5e:1,4d5e:2,7a7b:2 bad=6c5d,4d3e,S*3e,6c7b,S*3c,S*5e,4d5e,7a7b desc=32手目（後手番）。4二飛（実戦の手）が当然の手（と金で飛車が取られる寸前）。他は全て悪手
+*scenario ply=31 target=5b4b scores=5b4b:8,4f4g+:3,6c5d:2,4d3e:2,S*3e:1,6c7b:1,S*3c:2,S*5e:1,4d5e:2,7a7b:2,7a6b:1 bad=6c5d,4d3e,S*3e,6c7b,S*3c,S*5e,4d5e,7a7b,7a6b desc=32手目（後手番）。4二飛（実戦の手）が当然の手（と金で飛車が取られる寸前）。他は全て悪手
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
