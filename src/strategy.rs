@@ -442,6 +442,28 @@ fn promote_far_w() -> f64 {
     })
 }
 
+/// 成って王手する手の露見ペナルティ（`TSUITATE_PROMOTE_CHECK_REVEAL_W`、
+/// 既定 0 = 無効）。歩・角・飛の**成る王手**は宣言で位置が露見し、
+/// 安い駒でも回収されやすい（quest31-m095 の 7三歩成 vs 不成が発端。
+/// ユーザー指導: 歩・飛・角の不成価値は「成ると王手が増え宣言で露見する
+/// のを避ける」ついたて固有）。
+///
+/// `mover_check_extra`（既定 0.0622）はリスク床の係数で歩スケールでは
+/// `promote_bias`（0.4）に負ける。こちらは gain から直接 `w` を引く。
+/// 詰み（解消手0）は対象外。王手中の回避は CheckSolver の領分なので
+/// 呼び出し側で `you_in_check` のときは評価ループに入らない想定だが、
+/// 成る王手の減点自体は自玉王手中でも害は小さい。凍結版は知らない。
+fn promote_check_reveal_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_PROMOTE_CHECK_REVEAL_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
 /// 大駒成りの遠方量（`promote_far_w` の材料）。
 /// - 着地の最小チェビシェフが 1 を超えたぶん
 /// - **玉へ近づかない**成り（`d_to ≥ d_from`）は最低 1
@@ -5638,6 +5660,24 @@ fn evaluate(
                     * params.check_strength_w
                     * (CHECK_STRENGTH_CURVE / (1.0 + resolutions as f64)
                         - CHECK_STRENGTH_CENTER);
+            }
+            // 歩・角・飛の成る王手: 宣言露見のコスト（`promote_check_reveal_w`）。
+            // 詰みは上で除外。桂銀香は promote_bias の不成側付け替えで別経路。
+            if resolutions > 0 {
+                if let ShogiMove::Board {
+                    from,
+                    promote: true,
+                    ..
+                } = *mv
+                {
+                    let reveal = promote_check_reveal_w();
+                    if reveal > 0.0 {
+                        let role = pos.piece_at(from).map(|p| p.role);
+                        if matches!(role, Some(Role::Pawn | Role::Bishop | Role::Rook)) {
+                            v -= reveal;
+                        }
+                    }
+                }
             }
         }
 
