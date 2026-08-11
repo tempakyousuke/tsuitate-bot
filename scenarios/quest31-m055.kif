@@ -1,4 +1,4 @@
-*scenario ply=54 target=P*4h scores=G*5e:3,3c4c:2,3b2b:2,B*1h:2,B*7f:1,B*3f:7,B*9f:1,B*2e:3,G*5g:9,G*5h:8,6i5h:7,B*5h:3,P*4h:7,G*4f:6,3c4b:6,P*4c:7,G*4c:4,B*4c:2,B*1f:2,3b4b:7,3c2b:2,3c2c:2,2d3e:0,3c5c:0,B*4b:2,P*4b:2,3b4a:1 bad=3c4c,3b2b,B*1h,B*7f,B*9f,B*4c,B*1f,3c2b,3c2c,2d3e,3c5c,B*4b,P*4b,3b4a desc=55手目（先手番）。実戦は4八歩打
+*scenario ply=54 target=P*4h scores=G*5e:3,3c4c:2,3b2b:2,B*1h:2,B*7f:1,B*3f:7,B*9f:1,B*2e:3,G*5g:9,G*5h:8,6i5h:7,B*5h:3,P*4h:7,G*4f:6,3c4b:6,P*4c:7,G*4c:4,B*4c:2,B*1f:2,3b4b:7,3c2b:2,3c2c:2,2d3e:0,3c5c:0,B*4b:2,P*4b:2,3b4a:1,B*2b:1,2d1c+:0,6h5g:0,P*4f:7 bad=3c4c,3b2b,B*1h,B*7f,B*9f,B*4c,B*1f,3c2b,3c2c,2d3e,3c5c,B*4b,P*4b,3b4a,B*2b,2d1c+,6h5g desc=55手目（先手番）。実戦は4八歩打
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

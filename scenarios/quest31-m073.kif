@@ -1,4 +1,4 @@
-*scenario ply=72 target=4b5b scores=4a5b+:2,4b5b:10,3c6c:1,3c4c:2,S*5a:6,4b4c:2,4a3b+:1,S*5c:1,S*7c:1,S*6c:2,4a6c+:1,3c2c:1,5e6d:2,5e5d:2,S*5d:5,S*6d:2,S*5b:2,S*4c:2,P*4c:2,9g9f:3,3c2b:1,3c4d:3,5e6e:2,S*8c:2,S*8e:3,S*8f:2,S*7f:2,6g6f:2,P*4d:2,2d3e:4,2d1c+:0,7g7f:6,S*1d:0 bad=4a5b+,3c6c,3c4c,4b4c,4a3b+,S*5c,S*7c,S*6c,4a6c+,3c2c,5e6d,5e5d,S*6d,S*5b,S*4c,P*4c,3c2b,5e6e,S*8c,S*8f,S*7f,6g6f,P*4d,2d1c+,S*1d desc=73手目（先手番）。本命は5二成桂（実戦）。5一銀打（駒がいる可能性を調べ、外れても6二へ利きを作る）と5四銀打もあり
+*scenario ply=72 target=4b5b scores=4a5b+:2,4b5b:10,3c6c:1,3c4c:2,S*5a:6,4b4c:2,4a3b+:1,S*5c:1,S*7c:1,S*6c:2,4a6c+:1,3c2c:1,5e6d:2,5e5d:2,S*5d:5,S*6d:2,S*5b:2,S*4c:2,P*4c:2,9g9f:3,3c2b:1,3c4d:3,5e6e:2,S*8c:2,S*8e:3,S*8f:2,S*7f:2,6g6f:2,P*4d:2,2d3e:4,2d1c+:0,7g7f:6,S*1d:0,6i5h:0,3c3b:4 bad=4a5b+,3c6c,3c4c,4b4c,4a3b+,S*5c,S*7c,S*6c,4a6c+,3c2c,5e6d,5e5d,S*6d,S*5b,S*4c,P*4c,3c2b,5e6e,S*8c,S*8f,S*7f,6g6f,P*4d,2d1c+,S*1d,6i5h desc=73手目（先手番）。本命は5二成桂（実戦）。5一銀打（駒がいる可能性を調べ、外れても6二へ利きを作る）と5四銀打もあり
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

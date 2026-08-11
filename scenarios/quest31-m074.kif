@@ -1,4 +1,4 @@
-*scenario ply=73 target=7d7e scores=S*5h:2,S*6h:2,S*4h:3,7c8b:1,9c9d:6,3d3e:2,6d6e:8,7d7e:8,S*1b:0,S*1d:0,S*2b:0,P*2b:0,S*9b:2,7a8b:1,5c5d:6,P*4g:6,7c8d:2,S*5i:2,2c2d:1 bad=S*5h,S*6h,7c8b,3d3e,S*1b,S*1d,S*2b,P*2b,S*9b,7a8b,7c8d,S*5i,2c2d desc=74手目（後手番）。攻めに失敗して後手が苦しい局面。9四歩・6五歩・7五歩（実戦）・5四歩があり。ユーザー推奨は4六歩から4七歩成のと金作り（候補外）
+*scenario ply=73 target=7d7e scores=S*5h:2,S*6h:2,S*4h:3,7c8b:1,9c9d:6,3d3e:2,6d6e:8,7d7e:8,S*1b:0,S*1d:0,S*2b:0,P*2b:0,S*9b:2,7a8b:1,5c5d:6,P*4g:6,7c8d:2,S*5i:2,2c2d:1,P*4f:10 bad=S*5h,S*6h,7c8b,3d3e,S*1b,S*1d,S*2b,P*2b,S*9b,7a8b,7c8d,S*5i,2c2d desc=74手目（後手番）。攻めに失敗して後手が苦しい局面。9四歩・6五歩・7五歩（実戦）・5四歩があり。ユーザー推奨は4六歩から4七歩成のと金作り（候補外）
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

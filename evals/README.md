@@ -50,10 +50,36 @@
 2. **採点**: `?` を 0〜10 に書き換える（コメント任意）
 3. **同期**: `python3 scripts/quest_review/sync_eval.py [evalパス]`
    シナリオの `scores=`（採点全量）と `bad=`（**2点以下**）を更新する。
-   反則後ブロックとシナリオの対応はスクリプト内 FOUL_MAP に登録する
+   反則後ブロックとシナリオの対応は `scripts/quest_review/foul_blocks.py` の
+   FOUL_MAP に登録する（sync_eval / append_unscored / rerank_eval の共有表）
 4. **計測**: `bin/scenario` が不合格計と並べて「平均得点 x.xx/10」を表示。
    SPSA は `TUNE_OBJECTIVE=scenario_score`（score = 平均得点/10 の
    シナリオ平均。試行シードは 0..trials の固定列で f+/f− は共通乱数ペア）
+
+## 未収載候補の探索（rerank_eval.py）
+
+`scripts/quest_review/rerank_eval.py` は「同じ USI の他の決定点での平均点」を
+事前値として `prior + alpha × エンジンscore` で rank_dump を並べ替え、
+現行方策とは違う手が上位に来る決定点を洗い出す**オフライン診断**。
+出力は `scenario suite --tsv` と同じ TRIAL TSV なので、ファイルへ落として
+そのまま `append_unscored.py` に食わせられる。
+
+```
+RANK_DUMP_SCORES=1 target/release/rank_dump <kif> <開始> <終了> > /tmp/rank.txt
+mkdir -p /tmp/rerank
+python3 scripts/quest_review/rerank_eval.py evals/quest_20260731.eval.md \
+  /tmp/rank.txt --stop-unscored 10 > /tmp/rerank/result.txt
+python3 scripts/quest_review/append_unscored.py \
+  evals/quest_20260731.eval.md usi-prior-rerank /tmp/rerank --min 1
+```
+
+- 事前値は局面を見ないので、**高得点の USI がどの手目でも上位に来る**。
+  発見される候補は少数の USI に集中する（網羅的な探索の道具ではない）
+- stderr の「平均 x.xxx/10」は **suite の平均得点とは比較できない**
+  （候補集合が違う。`--exclude-ply` や `--stop-unscored` を使えばなおさら）
+- 反則後ブロックは親の手目と別の決定点として扱う。ここを混ぜると
+  「反則後にしか存在しない候補」が反則前のシナリオ名で出てきて採点が
+  ずれる（2026-08-11 に PR #3 で実際に起きた。`cargo test 採点表` が関門）
 
 ## quest_20260731 の移行について
 

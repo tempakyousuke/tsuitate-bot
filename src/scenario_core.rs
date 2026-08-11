@@ -878,6 +878,81 @@ mod tests {
         assert_eq!(rep.injected_fouls, sc.fouls);
     }
 
+    /// `scores=` / `bad=` に「手番側が指せない手」が混ざっていないこと。
+    ///
+    /// eval の採点をブロックごと取り違えると（例: 26手目=後手番のブロックへ
+    /// 27手目=先手番の手を書く）、相手の駒を動かす USI が採点表に入る。
+    /// 到達しえない手なので平均得点には出てこず、`bad=` に入っても不合格計が
+    /// 増えないため、**suite の数字を見ているかぎり永久に気づけない**。
+    /// 2026-08-11 に PR #3 で実際に3件混入したので常設の関門にする。
+    ///
+    /// 合法性そのものは見ない（見えない相手駒に依存するし、`3三銀不成` のように
+    /// `TSUITATE_GEN_NONPROMOTE=1` でしか生成されない手も採点対象にしてよい）。
+    /// 「移動元に手番側の駒があるか」「打つ駒を持っているか」だけを見る。
+    #[test]
+    fn 採点表の手はすべて手番側の駒の手である() {
+        let mut violations: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+        let mut dir: Vec<PathBuf> = std::fs::read_dir(scenarios_dir())
+            .expect("scenarios/ を読めません")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "kif"))
+            .collect();
+        dir.sort();
+        for path in dir {
+            let sc = match load_scenario(&path.to_string_lossy(), None, None, None) {
+                Ok(sc) => sc,
+                // ply= を持たない棋譜（アーカイブ等）はシナリオではない
+                Err(_) => continue,
+            };
+            if sc.scores.is_empty() && sc.bad.is_empty() {
+                continue;
+            }
+            let rep = replay(&sc.kifu, sc.ply);
+            let side = rep.pos.turn();
+            // bad= は scores= の部分集合なので同じ手を二重に数えない
+            let listed: HashSet<&String> =
+                sc.scores.iter().map(|(u, _)| u).chain(sc.bad.iter()).collect();
+            let mut listed: Vec<&String> = listed.into_iter().collect();
+            listed.sort();
+            for usi in listed {
+                checked += 1;
+                let Some(mv) = parse_usi(usi) else {
+                    violations.push(format!("{}: {usi} を USI として解析できない", sc.name));
+                    continue;
+                };
+                match mv {
+                    ShogiMove::Board { from, .. } => match rep.pos.piece_at(from) {
+                        None => violations.push(format!(
+                            "{}（{side:?}番）: {usi} の移動元が空きマス",
+                            sc.name
+                        )),
+                        Some(p) if p.color != side => violations.push(format!(
+                            "{}（{side:?}番）: {usi} の移動元は相手の {:?}",
+                            sc.name, p.role
+                        )),
+                        Some(_) => {}
+                    },
+                    ShogiMove::Drop { role, .. } => {
+                        if rep.pos.hand_count(side, role) == 0 {
+                            violations.push(format!(
+                                "{}（{side:?}番）: {usi} の {role:?} を持っていない",
+                                sc.name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(checked > 1000, "採点表がほとんど読めていない（{checked} 件）");
+        assert!(
+            violations.is_empty(),
+            "手番側の手でない採点が {} 件:\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
+    }
+
     /// 反則にならない手を fouls= に書いたら気づけること（棋譜の写し間違い検出）
     #[test]
     #[should_panic(expected = "合法です")]

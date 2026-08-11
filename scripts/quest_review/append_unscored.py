@@ -14,8 +14,7 @@
   対照と候補の suite を取り直して確定判定
   （**採点前の suite 差は信じない**。指標穴の実証3例あり）
 
-反則後サブブロック（`### N手目（…の反則後）`）は FOUL_MAP で対応づける。
-sync_eval.py と同じ表を持つので、シナリオを増やしたら両方に足すこと。
+反則後サブブロック（`### N手目（…の反則後）`）は foul_blocks.FOUL_MAP で対応づける。
 """
 
 import argparse
@@ -24,28 +23,13 @@ import pathlib
 import re
 import subprocess
 
+from foul_blocks import block_key
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
 SEC = re.compile(r"^## (\d+)手目")
 SUB = re.compile(r"^### (\d+)手目（(.+?)の反則後）")
 MOVE = re.compile(r"^(\S+?)\((\d[a-i]\d[a-i]\+?|[PLNSGBR]\*\d[a-i])\)\s+(\d+|\?)")
-
-# sync_eval.py の FOUL_MAP と同一に保つこと（シナリオ名 → (手目, 見出しキー)）
-FOUL_MAP = {
-    "quest31-m030f1": (30, "1二飛(5b1b)"),
-    "quest31-m030f2": (30, "2一歩打(P*2a)"),
-    "quest31-m040f1": (40, "5六銀打(S*5f)"),
-    "quest31-m041f1": (41, "2一龍(2d2a)"),
-    "quest31-m050f1": (50, "3五玉(4e3e)"),
-    "quest31-m058f1": (58, "4七歩打(P*4g)"),
-    "quest31-m062f1": (62, "4七歩打(P*4g)"),
-    "quest31-m066f1": (66, "4六玉(4e4f)"),
-    "quest31-m075f1": (75, "6二銀打(S*6b)"),
-    "quest31-m090f1": (90, "7八歩打(P*7h)"),
-    "quest31-m099f1": (99, "6五金(6d6e)"),
-    "quest31-m107f1": (107, "7三歩打(P*7c)"),
-    "quest31-m120f1": (120, "7四桂打(N*7d)"),
-}
 
 KANJI = "一二三四五六七八九"
 ROLE_JP = {
@@ -72,13 +56,6 @@ def parse_blocks(eval_path):
         if m and key:
             blocks[key].add(m.group(2))
     return blocks
-
-
-def block_key(scenario):
-    if scenario in FOUL_MAP:
-        return FOUL_MAP[scenario]
-    m = re.match(r"quest31-m(\d+)$", scenario)
-    return (int(m.group(1)), None) if m else None
 
 
 _board_cache = {}

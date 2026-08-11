@@ -7,3 +7,4 @@
 /scenario-gui/src-tauri/target/
 /scenario-gui/src-tauri/gen/
 /scenario-gui/public/fixtures/
+__pycache__/
