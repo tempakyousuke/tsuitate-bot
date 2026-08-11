@@ -442,13 +442,30 @@ fn promote_far_w() -> f64 {
     })
 }
 
-/// 大駒成りの遠方量（`promote_far_w` の材料）。玉候補への最小チェビシェフ
-/// が 1 を超えたぶん。候補が空なら 0（減点しない = 安全方向）。
-fn promote_far_amount(to: Coord, cands: &std::collections::BTreeSet<Coord>) -> f64 {
-    let Some(d_min) = cands.iter().map(|&k| chebyshev(to, k)).min() else {
+/// 大駒成りの遠方量（`promote_far_w` の材料）。
+/// - 着地の最小チェビシェフが 1 を超えたぶん
+/// - **玉へ近づかない**成り（`d_to ≥ d_from`）は最低 1
+///   （玉候補の裾が 3b 近傍に残っているとき 4a3b+ が免税で残る対策。
+///   combo_far_v2 実測で 4a3b+ がなお 18）
+/// 候補が空なら 0（減点しない = 安全方向）。
+fn promote_far_amount(
+    from: Coord,
+    to: Coord,
+    cands: &std::collections::BTreeSet<Coord>,
+) -> f64 {
+    let Some(d_to) = cands.iter().map(|&k| chebyshev(to, k)).min() else {
         return 0.0;
     };
-    f64::from(d_min.saturating_sub(1))
+    let d_from = cands
+        .iter()
+        .map(|&k| chebyshev(from, k))
+        .min()
+        .unwrap_or(d_to);
+    let mut amount = f64::from(d_to.saturating_sub(1));
+    if d_to >= d_from {
+        amount = amount.max(1.0);
+    }
+    amount
 }
 
 fn chebyshev(a: Coord, b: Coord) -> i32 {
@@ -3926,7 +3943,7 @@ impl Strategy for EstimatorStrategy {
                         .as_ref()
                         .is_some_and(|b| b[crate::belief_features::sq_index(to)]);
                     if !backed_hit {
-                        out.gain -= w * promote_far_amount(to, cands);
+                        out.gain -= w * promote_far_amount(from, to, cands);
                     }
                 }
             }
@@ -8185,25 +8202,49 @@ pub(crate) mod tests {
         );
     }
 
-    /// 大駒成り遠方: 玉候補 1 マス以内（隣接）は 0、それ以遠は超過分
+    /// 大駒成り遠方: 隣接着地かつ接近なら 0。非接近は最低 1。以遠は超過分
     #[test]
-    fn promote_far_amount_free_within_one() {
+    fn promote_far_amount_free_within_one_if_approaching() {
         let mut cands = std::collections::BTreeSet::new();
         cands.insert(Coord { file: 7, rank: 1 });
-        // 3c → 7a は chebyshev 4 → max(0,4-1)=3
-        assert!((promote_far_amount(Coord { file: 3, rank: 3 }, &cands) - 3.0).abs() < 1e-9);
-        // 7c → 7a は chebyshev 2 → 1
-        assert!((promote_far_amount(Coord { file: 7, rank: 3 }, &cands) - 1.0).abs() < 1e-9);
-        // 7b → 7a は chebyshev 1 → 0
-        assert_eq!(promote_far_amount(Coord { file: 7, rank: 2 }, &cands), 0.0);
+        let from_far = Coord { file: 2, rank: 4 };
+        // 2d→3c: 着地 d=4 → 3、かつ非接近でも max で 3
+        assert!(
+            (promote_far_amount(from_far, Coord { file: 3, rank: 3 }, &cands) - 3.0).abs() < 1e-9
+        );
+        // 7c→7b: 着地隣接 d=1 → 0、かつ接近（2→1）なので免税
+        assert_eq!(
+            promote_far_amount(
+                Coord { file: 7, rank: 3 },
+                Coord { file: 7, rank: 2 },
+                &cands
+            ),
+            0.0
+        );
+        // 4a→3b: 玉 7a からは遠ざかる。裾に 3a がいても非接近なら最低 1
+        let mut cands2 = cands.clone();
+        cands2.insert(Coord { file: 3, rank: 1 });
+        let amt = promote_far_amount(
+            Coord { file: 4, rank: 1 },
+            Coord { file: 3, rank: 2 },
+            &cands2,
+        );
+        assert!(
+            amt >= 1.0,
+            "non-approaching promote near a fringe cand should still be taxed: {amt}"
+        );
         // 空集合は 0
         assert_eq!(
-            promote_far_amount(Coord { file: 3, rank: 3 }, &std::collections::BTreeSet::new()),
+            promote_far_amount(
+                Coord { file: 2, rank: 4 },
+                Coord { file: 3, rank: 3 },
+                &std::collections::BTreeSet::new()
+            ),
             0.0
         );
     }
 
-    /// m133 の 2d3c+ は玉候補から遠く、寄せ筋の 7c 近傍は免税距離に入る
+    /// m133 の 2d3c+ は玉候補から遠く、寄せ筋の接近成りより重い
     #[test]
     fn promote_far_quest31_m133_2d3c_is_far() {
         let text = std::fs::read_to_string("scenarios/quest31-m133.kif").expect("kif");
@@ -8212,8 +8253,8 @@ pub(crate) mod tests {
         let side = rep.pos.turn();
         let log = &rep.logs[crate::scenario_core::side_idx(side)];
         let kings = crate::deduce::opp_king_candidates(side, log);
-        let far = promote_far_amount(Coord { file: 3, rank: 3 }, &kings);
-        let near = promote_far_amount(Coord { file: 7, rank: 3 }, &kings);
+        let far = promote_far_amount(Coord { file: 2, rank: 4 }, Coord { file: 3, rank: 3 }, &kings);
+        let near = promote_far_amount(Coord { file: 7, rank: 4 }, Coord { file: 7, rank: 3 }, &kings);
         assert!(
             far > near && far >= 1.0,
             "2d3c+ landing should be farther than 7c: far={far} near={near} kings={kings:?}"
