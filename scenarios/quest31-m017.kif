@@ -1,4 +1,4 @@
-*scenario ply=16 target=2b2a+ scores=2b2a+:9,2c1c:1,1g1f:2,9g9f:2,1i1h:2,4i3h:6,5i4h:6,7g7f:2,9i9h:2,3g3f:6 bad=2c1c,1g1f,9g9f,1i1h,7g7f,9i9h desc=17手目（先手番）。実戦の2一歩成が自然。1三と（歩と交換になり1八歩打の反撃も許す）・1六歩・1八香・9八香は悪手
+*scenario ply=16 target=2b2a+ scores=2b2a+:9,2c1c:1,1g1f:2,9g9f:2,1i1h:2,4i3h:6,5i4h:6,7g7f:2,9i9h:2,3g3f:6,4g4f:4 bad=2c1c,1g1f,9g9f,1i1h,7g7f,9i9h desc=17手目（先手番）。実戦の2一歩成が自然。1三と（歩と交換になり1八歩打の反撃も許す）・1六歩・1八香・9八香は悪手
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
