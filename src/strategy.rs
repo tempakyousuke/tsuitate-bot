@@ -364,7 +364,7 @@ fn eval_taint_attack_w() -> f64 {
     })
 }
 
-/// 終盤の紐減衰（`TSUITATE_LINK_ENDGAME_DAMPEN`、既定 0 = 無効）。
+/// 終盤の紐減衰（`TSUITATE_LINK_ENDGAME_DAMPEN`、既定 **40**、0 で無効）。
 /// ブラインド決定でのみ `link_w /= 1 + w × endgame_push`。
 ///
 /// quest31 終盤の 3三角成（2d3c+）固執が発端: 駒得ゼロなのに
@@ -379,11 +379,11 @@ fn link_endgame_dampen() -> f64 {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.0)
+            .unwrap_or(40.0)
     })
 }
 
-/// 持ち駒の資産損（`TSUITATE_HAND_ASSET_W`、既定 0 = 無効）。
+/// 持ち駒の資産損（`TSUITATE_HAND_ASSET_W`、既定 **0.5**、0 で無効）。
 /// 打つ手に `w × exchange_value(role) × (1−work)` を gain から引く。
 ///
 /// `hand_option_w` は成りのポテンシャル不足だけを見るので、金の投げ捨てや
@@ -398,11 +398,11 @@ fn hand_asset_w() -> f64 {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.0)
+            .unwrap_or(0.5)
     })
 }
 
-/// 玉の既知脅威への接近減点（`TSUITATE_KING_KNOWN_APPROACH_W`、既定 0）。
+/// 玉の既知脅威への接近減点（`TSUITATE_KING_KNOWN_APPROACH_W`、既定 **2**、0 で無効）。
 /// 観測で位置が確定している敵駒マスへ近づく玉の手へ `w × Δcloseness` を
 /// gain から引く。quest31-m099 の 6八玉（既知の 5六へ筋だけ寄る）が発端。
 /// 脅威マスは `king_threat_evidence`（捕獲マス＋歴代の非歩打ち反則）。
@@ -415,11 +415,11 @@ fn king_known_approach_w() -> f64 {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.0)
+            .unwrap_or(2.0)
     })
 }
 
-/// 大駒成りの遠方ペナルティ（`TSUITATE_PROMOTE_FAR_W`、既定 0 = 無効）。
+/// 大駒成りの遠方ペナルティ（`TSUITATE_PROMOTE_FAR_W`、既定 **1.0**、0 で無効）。
 /// 角・飛の**実現する成り**で、着地が `deduce::opp_king_candidates` から
 /// 遠いとき `w × max(0, d_min−1)` を gain から引く。
 ///
@@ -438,7 +438,7 @@ fn promote_far_w() -> f64 {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.0)
+            .unwrap_or(1.0)
     })
 }
 
@@ -700,8 +700,8 @@ fn check_king_gain_mean() -> bool {
     })
 }
 
-/// 成りが任意の移動で**不成も候補に生成する**か（既定は無効 = 従来の
-/// 「成れるなら成る」）。`TSUITATE_GEN_NONPROMOTE=1` で有効。
+/// 成りが任意の移動で**不成も候補に生成する**か（既定 **on**、
+/// `TSUITATE_GEN_NONPROMOTE=0` で従来の「成れるなら成る」へ切り戻し）。
 /// 凍結版は自前の candidate_moves を持つのでこの名前を知らない。
 ///
 /// 発端は quest_20260731 の95手目（人間の ７三歩**成らず**）。不成の価値は
@@ -718,11 +718,13 @@ fn check_king_gain_mean() -> bool {
 /// スケルトンにも載らない）。駒種フィルタは置かない（駒種特化を足さない方針）
 fn gen_nonpromote() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_GEN_NONPROMOTE").is_ok_and(|v| v == "1"))
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_GEN_NONPROMOTE").map_or(true, |v| v != "0")
+    })
 }
 
-/// 成る手の取られリスクを**成る前の駒価値**で数えるか（既定は無効 = 従来の
-/// 成った後の駒種で数える）。`TSUITATE_PROMO_RISK_PREROLE=1` で有効。
+/// 成る手の取られリスクを**成る前の駒価値**で数えるか（既定 **on**、
+/// `TSUITATE_PROMO_RISK_PREROLE=0` で従来の成った後の駒種へ切り戻し）。
 /// 凍結版はこの名前を知らない。
 ///
 /// GEN_NONPROMOTE の初回計測（2026-08-08）で露呈した歪みへの対応:
@@ -735,10 +737,13 @@ fn gen_nonpromote() -> bool {
 /// 成りの付加価値は生き残った分岐（threat / promo 実現）でだけ実現させる
 fn promo_risk_prerole() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_PROMO_RISK_PREROLE").is_ok_and(|v| v == "1"))
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_PROMO_RISK_PREROLE").map_or(true, |v| v != "0")
+    })
 }
 
-/// 捕獲直後の手戻り免除・退避加点（`TSUITATE_CAPTURE_RETREAT_W`、既定 0 = 無効）。
+/// 捕獲直後の手戻り免除・退避加点（`TSUITATE_CAPTURE_RETREAT_W`、既定 **0.08**、
+/// 0 で無効）。
 ///
 /// 直前に受理された手が**駒を取った移動**で、今手がその厳密な逆（from/to 入替）
 /// かつ**不成**なら「取って逃げる」なので `backtrack_penalty` を免除し、
@@ -755,7 +760,7 @@ fn capture_retreat_w() -> f64 {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.0)
+            .unwrap_or(0.08)
     })
 }
 
@@ -2006,7 +2011,7 @@ pub struct EvalParams {
     /// `w × 残存敵駒の平均交換価値` を gain 内（p_legal 割引の内側）へ加点。
     /// 観測のみ由来・粒子不要。王手中は無効。0 = 従来挙動
     pub foul_occ_attack_w: f64,
-    /// **材料の退化ゲート**（既定 0 = 従来と同一挙動）。駒得の期待値を粒子質量の
+    /// **材料の退化ゲート**（既定 **0.3**、0 で従来挙動）。駒得の期待値を粒子質量の
     /// 薄さで縮める: g = c(1+q0)/(c+q0)（c = confidence）。少数の生存粒子は
     /// 「自信を持って間違う」ため（実測 2026-08-10: 厳密粒子9個の決定点で
     /// 真実が空きマスの4一に飛車85.9%の信念、そこへの4一成桂が浮く）。
@@ -2335,7 +2340,7 @@ impl Default for EvalParams {
             // 0 で従来挙動へ切り戻し。drop_probe_w（情報を買う）の回収側
             foul_occ_attack_w: 2.0,
             // 材料の退化ゲート（2026-08-10）。0 = 従来と同一挙動
-            material_degen_q0: 0.0,
+            material_degen_q0: 0.3,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
             // 反則経済の新項（2026-07-16、オラクル測定で36ptの伸びしろを確認後に追加）。
@@ -6223,7 +6228,7 @@ fn evaluate(
             capture_bet_penalty =
                 params.capture_bet_var_w * p_hit * (1.0 - p_hit) * (capture_value_sum / capture_hits);
         }
-        // **材料の退化ゲート**（`material_degen_q0`、既定 0 = 従来と同一挙動）:
+        // **材料の退化ゲート**（`material_degen_q0`、既定 0.3、0 で従来挙動）:
         // 駒得の期待値は退化した粒子集合でも満額で効く（confidence ゲートは
         // 攻め項にしか掛かっていなかった）。実測（2026-08-10、m067 の
         // `scenario diag`）: 生存した厳密粒子が9個しかない決定点で、真実は
@@ -8469,15 +8474,15 @@ pub(crate) mod tests {
         ));
     }
 
-    /// 捕獲直後の手戻り免除ノブは既定 0（挙動不変）。正の値で有効化。
+    /// 捕獲直後の手戻り免除ノブは既定 0.08（quest31 採用値）。0 で無効。
     #[test]
-    fn capture_retreat_w_default_off() {
-        // OnceLock はプロセス内で一度だけ読むので、このテストは「未設定なら 0」
+    fn capture_retreat_w_default_on() {
+        // OnceLock はプロセス内で一度だけ読むので、このテストは「未設定なら 0.08」
         // の契約だけを固定する（他テストが先に env を立てると壊れるので
         // 環境変数は触らない）
         let w = std::env::var("TSUITATE_CAPTURE_RETREAT_W").ok();
         if w.is_none() {
-            assert_eq!(capture_retreat_w(), 0.0);
+            assert!((capture_retreat_w() - 0.08).abs() < 1e-12);
         }
     }
 
