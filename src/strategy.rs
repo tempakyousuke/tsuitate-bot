@@ -419,6 +419,36 @@ fn king_known_approach_w() -> f64 {
     })
 }
 
+/// 大駒成りの遠方ペナルティ（`TSUITATE_PROMOTE_FAR_W`、既定 0 = 無効）。
+/// 角・飛の**実現する成り**で、着地が `deduce::opp_king_candidates` から
+/// 遠いとき `w × max(0, d_min−2)` を gain から引く。
+///
+/// quest31 終盤の 3三角成（2d3c+）／3二角成（4a3b+）固執が発端: 採点 0 なのに
+/// `promote_bias` + `promo_potential` で玉筋の打ち（P*7c / G*7c）を押し下げる。
+/// `promo_king_prox` は将来の成りポテンシャル側で、**今成る手**の固定ボーナスを
+/// 削らない。こちらは成る手そのものへの課税。玉候補 2 マス以内は免税
+/// （寄せの成りを壊さない）。観測裏付けのある捕獲成は対象外。
+/// 王手中無効・粒子不要。凍結版はこの名前を知らない。
+fn promote_far_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_PROMOTE_FAR_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
+/// 大駒成りの遠方量（`promote_far_w` の材料）。玉候補への最小チェビシェフ
+/// が 2 を超えたぶん。候補が空なら 0（減点しない = 安全方向）。
+fn promote_far_amount(to: Coord, cands: &std::collections::BTreeSet<Coord>) -> f64 {
+    let Some(d_min) = cands.iter().map(|&k| chebyshev(to, k)).min() else {
+        return 0.0;
+    };
+    f64::from(d_min.saturating_sub(2))
+}
+
 fn chebyshev(a: Coord, b: Coord) -> i32 {
     i32::from((a.file - b.file).abs().max((a.rank - b.rank).abs()))
 }
@@ -3767,14 +3797,19 @@ impl Strategy for EstimatorStrategy {
         // 相手駒の占有が観測で裏付けられたマス（`material_degen_q0` の
         // 「裏付け無し捕獲だけ縮める」ゲート／`hand_asset_w` の仕事判定。
         // 決定点ごとに1回）
-        let opp_occ_backed = (params.material_degen_q0 > 0.0 || hand_asset_w() > 0.0)
-            .then(|| opp_occupancy_evidence(view, log));
+        let opp_occ_backed =
+            (params.material_degen_q0 > 0.0 || hand_asset_w() > 0.0 || promote_far_w() > 0.0)
+                .then(|| opp_occupancy_evidence(view, log));
         // 玉接近減点の脅威マス（歴代の非歩打ち反則を含む。上記より広い）
         let king_threats =
             (king_known_approach_w() > 0.0).then(|| king_threat_evidence(log));
         // 持ち駒資産損の玉候補（`hand_asset_w`）。王手中は無効
         let hand_asset_kings: Option<std::collections::BTreeSet<Coord>> =
             (hand_asset_w() > 0.0 && !view.you_in_check)
+                .then(|| crate::deduce::opp_king_candidates(view.your_color, log));
+        // 大駒成り遠方ペナルティの玉候補（`promote_far_w`）。王手中は無効
+        let promote_far_kings: Option<std::collections::BTreeSet<Coord>> =
+            (promote_far_w() > 0.0 && !view.you_in_check)
                 .then(|| crate::deduce::opp_king_candidates(view.your_color, log));
 
         // この手番の打ち反則で占有が確定したマスと、残存敵駒の平均交換価値
@@ -3870,6 +3905,27 @@ impl Strategy for EstimatorStrategy {
                 {
                     out.checker_removal = params.checker_removal_w * term;
                     out.gain += out.checker_removal;
+                }
+            }
+            // 大駒成りの遠方ペナルティ（`promote_far_w` の doc 参照）。
+            // gain の内側: 成りの固定ボーナスと同レイヤで綱引きさせる。
+            if let (Some(cands), ShogiMove::Board { from, to, promote: true }) =
+                (promote_far_kings.as_ref(), mv)
+            {
+                let w = promote_far_w();
+                let role = view
+                    .your_pieces
+                    .iter()
+                    .find(|p| p.square == make_usi_square(from))
+                    .map(|p| p.role);
+                if w > 0.0 && matches!(role, Some(Role::Bishop | Role::Rook)) {
+                    // 観測裏付けの占有マスへの成り捕獲は「材料」なので免税
+                    let backed_hit = opp_occ_backed
+                        .as_ref()
+                        .is_some_and(|b| b[crate::belief_features::sq_index(to)]);
+                    if !backed_hit {
+                        out.gain -= w * promote_far_amount(to, cands);
+                    }
                 }
             }
             if debug_check_enabled && view.you_in_check {
@@ -8124,6 +8180,39 @@ pub(crate) mod tests {
             !work,
             "G*1b should NOT have hand-asset work at m062 (king_cands={})",
             kings.len()
+        );
+    }
+
+    /// 大駒成り遠方: 玉候補 2 マス以内は 0、それ以遠は超過分
+    #[test]
+    fn promote_far_amount_free_within_two() {
+        let mut cands = std::collections::BTreeSet::new();
+        cands.insert(Coord { file: 7, rank: 1 });
+        // 3c → 7a は chebyshev 4 → max(0,4-2)=2
+        assert!((promote_far_amount(Coord { file: 3, rank: 3 }, &cands) - 2.0).abs() < 1e-9);
+        // 7c → 7a は chebyshev 2 → 0
+        assert_eq!(promote_far_amount(Coord { file: 7, rank: 3 }, &cands), 0.0);
+        // 空集合は 0
+        assert_eq!(
+            promote_far_amount(Coord { file: 3, rank: 3 }, &std::collections::BTreeSet::new()),
+            0.0
+        );
+    }
+
+    /// m133 の 2d3c+ は玉候補から遠く、寄せ筋の 7c 近傍は免税距離に入る
+    #[test]
+    fn promote_far_quest31_m133_2d3c_is_far() {
+        let text = std::fs::read_to_string("scenarios/quest31-m133.kif").expect("kif");
+        let kifu = crate::kifu::parse_kif(&text).expect("parse");
+        let rep = crate::scenario_core::replay(&kifu, 132);
+        let side = rep.pos.turn();
+        let log = &rep.logs[crate::scenario_core::side_idx(side)];
+        let kings = crate::deduce::opp_king_candidates(side, log);
+        let far = promote_far_amount(Coord { file: 3, rank: 3 }, &kings);
+        let near = promote_far_amount(Coord { file: 7, rank: 3 }, &kings);
+        assert!(
+            far > near && far >= 1.0,
+            "2d3c+ landing should be farther than 7c: far={far} near={near} kings={kings:?}"
         );
     }
 
