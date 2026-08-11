@@ -1,4 +1,4 @@
-*scenario ply=70 target=3b4b scores=3c4c:2,3c2b:1,9g9f:7,1g1f:2,7g7f:7,3b2b:1,8g8f:7,4a5b+:2,2d3e:2,3c4b:2,4a6c+:1,S*7c:1,S*6c:3,S*5c:1,5e6d:2,5e5d:2,S*5d:5,S*6d:2,S*7d:2,3c2c:1,P*4c:4,S*4c:2,S*5b:3,S*4b:2,3b4b:10,P*4b:2,3c4d:4,5e6e:2,6g6f:5,P*4d:7,6h7i:4,S*8f:2,S*7f:3,5e4d:2,2d1c+:0,3c5c:0,3c3d:2 bad=3c4c,3c2b,1g1f,3b2b,4a5b+,2d3e,3c4b,4a6c+,S*7c,S*5c,5e6d,5e5d,S*6d,S*7d,3c2c,S*4c,S*4b,P*4b,5e6e,S*8f,5e4d,2d1c+,3c5c,3c3d desc=71手目（先手番）。本命は4二成桂（実戦）。5二金とされていると角の位置が露見して取られる筋があるので、5二地点を攻めて相手の応手を調べる情報価値の手
+*scenario ply=70 target=3b4b scores=3c4c:2,3c2b:1,9g9f:7,1g1f:2,7g7f:7,3b2b:1,8g8f:7,4a5b+:2,2d3e:2,3c4b:2,4a6c+:1,S*7c:1,S*6c:3,S*5c:1,5e6d:2,5e5d:2,S*5d:5,S*6d:2,S*7d:2,3c2c:1,P*4c:4,S*4c:2,S*5b:3,S*4b:2,3b4b:10,P*4b:2,3c4d:4,5e6e:2,6g6f:5,P*4d:7,6h7i:4,S*8f:2,S*7f:3,5e4d:2,2d1c+:0,3c5c:0,3c3d:2,3c1c:0 bad=3c4c,3c2b,1g1f,3b2b,4a5b+,2d3e,3c4b,4a6c+,S*7c,S*5c,5e6d,5e5d,S*6d,S*7d,3c2c,S*4c,S*4b,P*4b,5e6e,S*8f,5e4d,2d1c+,3c5c,3c3d,3c1c desc=71手目（先手番）。本命は4二成桂（実戦）。5二金とされていると角の位置が露見して取られる筋があるので、5二地点を攻めて相手の応手を調べる情報価値の手
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

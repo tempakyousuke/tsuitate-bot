@@ -117,7 +117,19 @@
   **採点前の suite 差は信じない**（promo価格改定 C1・不成 combo・
   ブラインドhome の3件で「見かけの改善が未採点手への逃避だった」を実証。
   極端な例: taint フォールバックの −116 は全ブロックで 0〜2点の既知悪手
-  7七桂成への逃避が主因だった）
+  7七桂成への逃避が主因だった）。
+  **未収載候補の別経路**: `scripts/quest_review/rerank_eval.py` は
+  「同じ USI の他の決定点での平均点」を事前値にして rank_dump を並べ替える
+  オフライン診断（`prior + alpha×score`）。出力は TRIAL TSV なので
+  ファイルへ落として append_unscored へ渡せる。局面を見ない事前値なので
+  発見は少数の USI に集中し、stderr の平均は suite の平均得点とは
+  比較できない（詳細は evals/README.md）。
+  **ブロック取り違えの関門**: eval の採点を別の手目・別の反則後サブ状態へ
+  書くと、相手の駒を動かす USI が `scores=` に入る。到達しえないので
+  平均得点にも不合格計にも出ず suite では永久に気づけないため、
+  `cargo test 採点表` （`scenario_core` のテスト）で常時検査する。
+  反則後ブロックとシナリオの対応表は
+  `scripts/quest_review/foul_blocks.py` に一本化してある
 - `cargo run --release --bin scenario -- <名前|suite|batch <名前...>>` — 実戦棋譜の
   局面再現実験。
   `scenarios/*.kif`（Shogi Quest エクスポート + `*scenario ply=N` 行）を再生して
@@ -709,8 +721,10 @@
     v11 65.4 / v12 60.6 / **v13 51.9%±9.6** — 非推移性なし・全凍結版に
     勝ち越しだが、**v13 との差が凍結相場（+7〜11pt）に届かないので
     v14 凍結は見送り**（玉位置ネット +6.7pt のときと同じ判断）。
-    以後の suite 対照は **1230 / 4.544**（run 31321863290 = guard=60 env、
-    採用後の既定と挙動同一）
+    採用時点の suite 対照は 1230 / 4.544（run 31321863290 = guard=60 env、
+    採用後の既定と挙動同一）。**以後の対照は 2026-08-11 の同期漏れ解消後の
+    1218 / 4.538**（run 31470988916。エンジン無変更で main HEAD 対照
+    1229 / 4.539 と横ばい。詳細は scenarios/README.md）
   - `TSUITATE_BLIND_HOME_DROP_OCC_W`（既定 0）/ `TSUITATE_BLIND_HOME_FLOOR`
     （既定 0.2）/ `TSUITATE_BLIND_HOME_LAMBDA`（既定 0.045）—
     **codex 相談（2026-08-09）による home 事前の再設計**: 打ちの p_legal を

@@ -1,4 +1,4 @@
-*scenario ply=87 target=G*7a scores=G*5h:2,N*4g:0,N*6g:0,G*6i:2,G*6h:0,G*4h:2,G*4i:0,7b6a:3,5e5f:6,G*6c:3,6b6c:3,6b7c:1,G*7a:8,G*1b:0,G*3c:0,G*2b:0,G*5a:4,P*2b:0,3d3e:2,6b5c:0,7e7f:6,G*6f:0,N*8d:2,P*6f:6,2c2d:0,2c3c:0 bad=G*5h,N*4g,N*6g,G*6i,G*6h,G*4h,G*4i,6b7c,G*1b,G*3c,G*2b,P*2b,3d3e,6b5c,G*6f,N*8d,2c2d,2c3c desc=88手目（後手番）。実戦は7一金打（あり）。6三金打・5一金打は「悪手だが比較的マシ」
+*scenario ply=87 target=G*7a scores=G*5h:2,N*4g:0,N*6g:0,G*6i:2,G*6h:0,G*4h:2,G*4i:0,7b6a:3,5e5f:6,G*6c:3,6b6c:3,6b7c:1,G*7a:8,G*1b:0,G*3c:0,G*2b:0,G*5a:4,P*2b:0,3d3e:2,6b5c:0,7e7f:6,G*6f:0,N*8d:2,P*6f:6,2c2d:0,2c3c:0,2c2b:0,6b7a:6,P*6h:6 bad=G*5h,N*4g,N*6g,G*6i,G*6h,G*4h,G*4i,6b7c,G*1b,G*3c,G*2b,P*2b,3d3e,6b5c,G*6f,N*8d,2c2d,2c3c,2c2b desc=88手目（後手番）。実戦は7一金打（あり）。6三金打・5一金打は「悪手だが比較的マシ」
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

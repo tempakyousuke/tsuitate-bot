@@ -5,7 +5,7 @@
 
 - `scores=` は採点済み（? 以外）の全候補 `USI:点` を列挙
 - `bad=` は score <= BAD_THRESHOLD の手（従来の不合格計との互換表示用）
-- 反則後ブロック（`### N手目（…の反則後）`）は FOUL_MAP のシナリオへ対応
+- 反則後ブロック（`### N手目（…の反則後）`）は foul_blocks.FOUL_MAP のシナリオへ対応
 - **冪等**。eval に点を書き足すたびに回せばよい
 """
 
@@ -13,6 +13,8 @@ import os
 import pathlib
 import re
 import sys
+
+from foul_blocks import scenario_for
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCN = ROOT / "scenarios"
@@ -23,25 +25,6 @@ SUB = re.compile(r"^### (\d+)手目（(.+?)の反則後）")
 MOVE = re.compile(
     r"^(\S+?)\((\d[a-i]\d[a-i]\+?|[PLNSGBR]\*\d[a-i])\)\s+(\d+|\?)(?:\s+(.*))?$"
 )
-
-# 反則後ブロックの見出しキー → シナリオ名（sync_bad_lists.py と同一に保つこと）
-FOUL_MAP = {
-    (30, "1二飛(5b1b)"): "quest31-m030f1",
-    (30, "2一歩打(P*2a)"): "quest31-m030f2",
-    (40, "5六銀打(S*5f)"): "quest31-m040f1",
-    (41, "2一龍(2d2a)"): "quest31-m041f1",
-    (50, "3五玉(4e3e)"): "quest31-m050f1",
-    (58, "4七歩打(P*4g)"): "quest31-m058f1",
-    (62, "4七歩打(P*4g)"): "quest31-m062f1",
-    (66, "4六玉(4e4f)"): "quest31-m066f1",
-    (75, "6二銀打(S*6b)"): "quest31-m075f1",
-    (90, "7八歩打(P*7h)"): "quest31-m090f1",
-    (99, "6五金(6d6e)"): "quest31-m099f1",
-    (107, "7三歩打(P*7c)"): "quest31-m107f1",
-    (120, "7四桂打(N*7d)"): "quest31-m120f1",
-    # 148手目の反則後（S*7a）は後手の反則10回目 = 終局後の状態なので
-    # シナリオ化しない（eval のブロックは未採点のまま残してよい）
-}
 
 
 def parse_eval(path: pathlib.Path):
@@ -88,7 +71,7 @@ def main() -> None:
     blocks = parse_eval(eval_path)
     changed = 0
     for (num, sub), entries in sorted(blocks.items(), key=lambda kv: (kv[0][0], kv[0][1] or "")):
-        name = FOUL_MAP.get((num, sub)) if sub else f"{prefix}{num:03d}"
+        name = scenario_for((num, sub), prefix)
         if name is None:
             continue
         path = SCN / f"{name}.kif"

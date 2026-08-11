@@ -1,4 +1,4 @@
-*scenario ply=137 scores=8e7g+:4,5e7g+:0,2c2h+:0,5e2h+:0,5f5g+:0,5e8h+:0,8e9g+:1,5e6f:2,2c3c:0,2c5c:0,2c4c:0,5e3g+:0,5e4d:0,2c2i+:0,P*6f:0,2c2e:0,5e4f:0,8c7d:1 bad=5e7g+,2c2h+,5e2h+,5f5g+,5e8h+,8e9g+,5e6f,2c3c,2c5c,2c4c,5e3g+,5e4d,2c2i+,P*6f,2c2e,5e4f,8c7d desc=138手目（後手番）。採点はevals/quest_20260731.eval.md参照
+*scenario ply=137 scores=8e7g+:4,5e7g+:0,2c2h+:0,5e2h+:0,5f5g+:0,5e8h+:0,8e9g+:1,5e6f:2,2c3c:0,2c5c:0,2c4c:0,5e3g+:0,5e4d:0,2c2i+:0,P*6f:0,2c2e:0,5e4f:0,8c7d:1,2c2b:1 bad=5e7g+,2c2h+,5e2h+,5f5g+,5e8h+,8e9g+,5e6f,2c3c,2c5c,2c4c,5e3g+,5e4d,2c2i+,P*6f,2c2e,5e4f,8c7d,2c2b desc=138手目（後手番）。採点はevals/quest_20260731.eval.md参照
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
