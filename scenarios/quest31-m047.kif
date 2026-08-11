@@ -1,4 +1,4 @@
-*scenario ply=46 target=5i6h scores=G*4f:2,G*5e:2,B*1h:2,B*7f:2,B*9f:2,B*3f:2,B*8f:2,B*1f:2,B*7i:0,3g3f:2,B*3e:2,B*3a:2,B*5e:2,3c2b:1,3b2b:1,3b4b:3,3c4b:3,B*2g:2,2d1c+:0,3c5c:0,5f5e:2,6g6f:2,7g7f:2,B*4d:2,B*9e:2,G*4b:1,3c2c:0,4h4g:5 bad=G*4f,G*5e,B*1h,B*7f,B*9f,B*3f,B*8f,B*1f,B*7i,3g3f,B*3e,B*3a,B*5e,3c2b,3b2b,B*2g,2d1c+,3c5c,5f5e,6g6f,7g7f,B*4d,B*9e,G*4b,3c2c desc=47手目（先手番）。実戦は6八玉（5九のままだと玉頭を抑えられるリスク）。5八金もあり。bot 候補の上位は全て悪手
+*scenario ply=46 target=5i6h scores=G*4f:2,G*5e:2,B*1h:2,B*7f:2,B*9f:2,B*3f:2,B*8f:2,B*1f:2,B*7i:0,3g3f:2,B*3e:2,B*3a:2,B*5e:2,3c2b:1,3b2b:1,3b4b:3,3c4b:3,B*2g:2,2d1c+:0,3c5c:0,5f5e:2,6g6f:2,7g7f:2,B*4d:2,B*9e:2,G*4b:1,3c2c:0,4h4g:5,G*4a:0 bad=G*4f,G*5e,B*1h,B*7f,B*9f,B*3f,B*8f,B*1f,B*7i,3g3f,B*3e,B*3a,B*5e,3c2b,3b2b,B*2g,2d1c+,3c5c,5f5e,6g6f,7g7f,B*4d,B*9e,G*4b,3c2c,G*4a desc=47手目（先手番）。実戦は6八玉（5九のままだと玉頭を抑えられるリスク）。5八金もあり。bot 候補の上位は全て悪手
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
