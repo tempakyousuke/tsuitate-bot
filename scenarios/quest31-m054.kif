@@ -1,4 +1,4 @@
-*scenario ply=53 target=3h4g+ scores=3h4g+:9,3h4i+:1,S*5h:1,S*6h:1,S*4h:1,S*2b:1,3h2i+:1,S*1b:1,S*1d:1,2c2g+:1,P*2b:1,6d6e:1,2c2b:1,3h2g+:0,3h4i:0 bad=3h4i+,S*5h,S*6h,S*4h,S*2b,3h2i+,S*1b,S*1d,2c2g+,P*2b,6d6e,2c2b,3h2g+,3h4i desc=54手目（後手番）。実戦は同銀成
+*scenario ply=53 target=3h4g+ scores=3h4g+:9,3h4i+:1,S*5h:1,S*6h:1,S*4h:1,S*2b:1,3h2i+:1,S*1b:1,S*1d:1,2c2g+:1,P*2b:1,6d6e:1,2c2b:1,3h2g+:0,3h4i:0,4e5d:0 bad=3h4i+,S*5h,S*6h,S*4h,S*2b,3h2i+,S*1b,S*1d,2c2g+,P*2b,6d6e,2c2b,3h2g+,3h4i,4e5d desc=54手目（後手番）。実戦は同銀成
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
