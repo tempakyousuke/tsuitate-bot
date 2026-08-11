@@ -1,4 +1,4 @@
-*scenario ply=77 target=7e7f scores=N*4g:0,N*6g:0,S*6h:0,S*4h:1,S*5h:1,N*5f:0,N*7f:2,7e7f:8,S*2b:0,S*1b:0,7c8b:1,P*2b:0,7b8b:0,N*6e:8,N*7d:2,S*1d:0,6d6e:7,N*3a:0,2c2d:2,2c3c:2,S*5g:1,S*7f:1,3d3e:1 bad=N*4g,N*6g,S*6h,S*4h,S*5h,N*5f,N*7f,S*2b,S*1b,7c8b,P*2b,7b8b,N*7d,S*1d,N*3a,2c2d,2c3c,S*5g,S*7f,3d3e desc=78手目（後手番）。7六歩・6五桂打・6五歩があり。7六桂打は悪手だが7九玉なら8八銀の詰みを狙う一か八かの価値はある。実戦は7一銀打（リスト外）
+*scenario ply=77 target=7e7f scores=N*4g:0,N*6g:0,S*6h:0,S*4h:1,S*5h:1,N*5f:0,N*7f:2,7e7f:8,S*2b:0,S*1b:0,7c8b:1,P*2b:0,7b8b:0,N*6e:8,N*7d:2,S*1d:0,6d6e:7,N*3a:0,2c2d:2,2c3c:2,S*5g:1,S*7f:1,3d3e:1,N*7g:3 bad=N*4g,N*6g,S*6h,S*4h,S*5h,N*5f,N*7f,S*2b,S*1b,7c8b,P*2b,7b8b,N*7d,S*1d,N*3a,2c2d,2c3c,S*5g,S*7f,3d3e desc=78手目（後手番）。7六歩・6五桂打・6五歩があり。7六桂打は悪手だが7九玉なら8八銀の詰みを狙う一か八かの価値はある。実戦は7一銀打（リスト外）
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
