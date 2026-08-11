@@ -448,11 +448,11 @@ fn promote_far_w() -> f64 {
 /// ユーザー指導: 歩・飛・角の不成価値は「成ると王手が増え宣言で露見する
 /// のを避ける」ついたて固有）。
 ///
-/// `mover_check_extra`（既定 0.0622）はリスク床の係数で歩スケールでは
-/// `promote_bias`（0.4）に負ける。こちらは gain から直接 `w` を引く。
-/// 詰み（解消手0）は対象外。王手中の回避は CheckSolver の領分なので
-/// 呼び出し側で `you_in_check` のときは評価ループに入らない想定だが、
-/// 成る王手の減点自体は自玉王手中でも害は小さい。凍結版は知らない。
+/// **粒子不要**（`deduce::opp_king_candidates` 上の幾何）。m095 は厳密粒子
+/// ゼロのブラインド決定で、粒子ループ内の減点は `expected=0` に消える。
+/// 歩→と金は着地の8近傍に玉候補がいれば発火。角・飛は自駒ブロッカー
+/// だけを見た利きで判定する。詰み級の寄せは候補が着地そのもののとき
+/// （取って詰み）は対象外。凍結版はこの名前を知らない。
 fn promote_check_reveal_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -462,6 +462,106 @@ fn promote_check_reveal_w() -> f64 {
             .filter(|v| v.is_finite() && *v >= 0.0)
             .unwrap_or(0.0)
     })
+}
+
+/// 成る手が `deduce` 玉候補のいずれかに王手を掛けるか（観測のみ）。
+fn promote_checks_king_cand(
+    view: &PlayerView,
+    from: Coord,
+    to: Coord,
+    role: Role,
+    cands: &std::collections::BTreeSet<Coord>,
+) -> bool {
+    let me = view.your_color;
+    // 着地に自駒は無い（合法候補の前提）。玉候補が着地そのもの＝取る王手は
+    // 「寄せ」なので露見ペナルティの対象外
+    let mut own = [false; 81];
+    for p in &view.your_pieces {
+        let Some(c) = parse_usi_square(&p.square) else {
+            continue;
+        };
+        if c == from {
+            continue; // 動かす駒は vacate
+        }
+        own[crate::belief_features::sq_index(c)] = true;
+    }
+    let promo_role = match role {
+        Role::Pawn => Role::Tokin,
+        Role::Bishop => Role::Horse,
+        Role::Rook => Role::Dragon,
+        _ => return false,
+    };
+    for &k in cands {
+        if k == to {
+            continue;
+        }
+        if own[crate::belief_features::sq_index(k)] {
+            continue; // 自駒マスに玉は居ない
+        }
+        if piece_attacks_sq(promo_role, me, to, k, &own) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 自駒ブロッカーのみを考慮した利き（ついたての「自分側だけ見える」利き）。
+fn piece_attacks_sq(
+    role: Role,
+    me: Color,
+    from: Coord,
+    target: Coord,
+    own: &[bool; 81],
+) -> bool {
+    let df = i32::from(target.file - from.file);
+    let dr = i32::from(target.rank - from.rank);
+    let adf = df.abs();
+    let adr = dr.abs();
+    let clear_ray = || -> bool {
+        let steps = adf.max(adr);
+        if steps <= 1 {
+            return true;
+        }
+        let step_f = df.signum();
+        let step_r = dr.signum();
+        for s in 1..steps {
+            let sq = Coord {
+                file: from.file + (step_f * s) as i8,
+                rank: from.rank + (step_r * s) as i8,
+            };
+            if own[crate::belief_features::sq_index(sq)] {
+                return false;
+            }
+        }
+        true
+    };
+    match role {
+        Role::Tokin
+        | Role::Gold
+        | Role::Promotedlance
+        | Role::Promotedknight
+        | Role::Promotedsilver => {
+            // 金相当: 前3・左右・直後（斜め後ろ以外の隣接）
+            let forward = match me {
+                Color::Sente => -1,
+                Color::Gote => 1,
+            };
+            adf <= 1 && adr <= 1 && !(adf == 0 && adr == 0) && !(adf == 1 && dr == -forward)
+        }
+        Role::Horse => {
+            if adf <= 1 && adr <= 1 && !(adf == 0 && adr == 0) {
+                return true;
+            }
+            adf == adr && adf > 0 && clear_ray()
+        }
+        Role::Dragon => {
+            if adf <= 1 && adr <= 1 && !(adf == 0 && adr == 0) {
+                return true;
+            }
+            ((adf == 0 && adr > 0) || (adr == 0 && adf > 0)) && clear_ray()
+        }
+        _ => false,
+    }
 }
 
 /// 大駒成りの遠方量（`promote_far_w` の材料）。
@@ -3852,6 +3952,11 @@ impl Strategy for EstimatorStrategy {
         let promote_far_kings: Option<std::collections::BTreeSet<Coord>> =
             (promote_far_w() > 0.0 && !view.you_in_check)
                 .then(|| crate::deduce::opp_king_candidates(view.your_color, log));
+        // 成る王手の露見ペナルティ用玉候補（`promote_check_reveal_w`）。
+        // ブラインド決定でも効かせるため粒子不要。王手中は無効
+        let promote_check_kings: Option<std::collections::BTreeSet<Coord>> =
+            (promote_check_reveal_w() > 0.0 && !view.you_in_check)
+                .then(|| crate::deduce::opp_king_candidates(view.your_color, log));
 
         // この手番の打ち反則で占有が確定したマスと、残存敵駒の平均交換価値
         // （`foul_occ_attack_w`）。反則では手番が変わらないので情報は完全に新鮮。
@@ -3967,6 +4072,24 @@ impl Strategy for EstimatorStrategy {
                     if !backed_hit {
                         out.gain -= w * promote_far_amount(from, to, cands);
                     }
+                }
+            }
+            // 歩・角・飛の成る王手の露見ペナルティ（`promote_check_reveal_w`）。
+            // ブラインド決定でも効くよう粒子不要（deduce 玉候補の幾何）。
+            if let (Some(cands), ShogiMove::Board { from, to, promote: true }) =
+                (promote_check_kings.as_ref(), mv)
+            {
+                let w = promote_check_reveal_w();
+                let role = view
+                    .your_pieces
+                    .iter()
+                    .find(|p| p.square == make_usi_square(from))
+                    .map(|p| p.role);
+                if w > 0.0
+                    && matches!(role, Some(Role::Pawn | Role::Bishop | Role::Rook))
+                    && promote_checks_king_cand(view, from, to, role.unwrap(), cands)
+                {
+                    out.gain -= w;
                 }
             }
             if debug_check_enabled && view.you_in_check {
@@ -5660,24 +5783,6 @@ fn evaluate(
                     * params.check_strength_w
                     * (CHECK_STRENGTH_CURVE / (1.0 + resolutions as f64)
                         - CHECK_STRENGTH_CENTER);
-            }
-            // 歩・角・飛の成る王手: 宣言露見のコスト（`promote_check_reveal_w`）。
-            // 詰みは上で除外。桂銀香は promote_bias の不成側付け替えで別経路。
-            if resolutions > 0 {
-                if let ShogiMove::Board {
-                    from,
-                    promote: true,
-                    ..
-                } = *mv
-                {
-                    let reveal = promote_check_reveal_w();
-                    if reveal > 0.0 {
-                        let role = pos.piece_at(from).map(|p| p.role);
-                        if matches!(role, Some(Role::Pawn | Role::Bishop | Role::Rook)) {
-                            v -= reveal;
-                        }
-                    }
-                }
             }
         }
 
@@ -8282,6 +8387,35 @@ pub(crate) mod tests {
             ),
             0.0
         );
+    }
+
+    /// と金の8近傍王手（m095: 7c のと金 → 7b の玉）と、遠い玉への非発火
+    #[test]
+    fn promote_check_reveal_tokin_adjacent() {
+        let own = [false; 81];
+        let to = Coord { file: 7, rank: 3 }; // 7c
+        assert!(piece_attacks_sq(
+            Role::Tokin,
+            Color::Sente,
+            to,
+            Coord { file: 7, rank: 2 }, // 7b
+            &own
+        ));
+        assert!(!piece_attacks_sq(
+            Role::Tokin,
+            Color::Sente,
+            to,
+            Coord { file: 5, rank: 1 }, // 5a（遠い）
+            &own
+        ));
+        // 斜め後ろは金相当なので不可（先手なら rank+1 斜め）
+        assert!(!piece_attacks_sq(
+            Role::Tokin,
+            Color::Sente,
+            to,
+            Coord { file: 6, rank: 4 }, // 6d
+            &own
+        ));
     }
 
     /// m133 の 2d3c+ は玉候補から遠く、寄せ筋の接近成りより重い
