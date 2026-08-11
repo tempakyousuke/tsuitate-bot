@@ -1,4 +1,4 @@
-*scenario ply=47 target=5d4e scores=4g4h:2,4g5h:2,3h4i+:2,3h2i+:2,7c7d:6,9c9d:5,6b7b:2,6d6e:6,4g5g:2,P*2b:1,P*2g:2,3h3i+:2,3h4i:10 bad=4g4h,4g5h,3h4i+,3h2i+,6b7b,4g5g,P*2b,P*2g,3h3i+ desc=48手目（後手番）。7四歩・9四歩・6五歩があり。実戦は4五玉
+*scenario ply=47 target=5d4e scores=4g4h:2,4g5h:2,3h4i+:2,3h2i+:2,7c7d:6,9c9d:5,6b7b:2,6d6e:6,4g5g:2,P*2b:1,P*2g:2,3h3i+:2,3h4i:10,2c2f:6 bad=4g4h,4g5h,3h4i+,3h2i+,6b7b,4g5g,P*2b,P*2g,3h3i+ desc=48手目（後手番）。7四歩・9四歩・6五歩があり。実戦は4五玉
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
