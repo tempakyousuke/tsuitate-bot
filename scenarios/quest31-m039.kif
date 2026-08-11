@@ -1,4 +1,4 @@
-*scenario ply=38 target=4d3b+ scores=G*4f:2,G*5b:7,B*3c:6,G*3b:2,B*3a:3,G*3c:2,B*1h:2,B*7f:2,B*7e:2,B*9f:2,B*4h:1,B*4f:2,2d1c:0,B*1f:2,B*2b:2,B*2e:3,B*6f:1,B*8f:1,B*5e:2,2d3d:2,G*5e:2 bad=G*4f,G*3b,G*3c,B*1h,B*7f,B*7e,B*9f,B*4h,B*4f,2d1c,B*1f,B*2b,B*6f,B*8f,B*5e,2d3d,G*5e desc=39手目（先手番）。実戦は3二桂成。5二金打もあり・3三角打はセーフ
+*scenario ply=38 target=4d3b+ scores=G*4f:2,G*5b:7,B*3c:6,G*3b:2,B*3a:3,G*3c:2,B*1h:2,B*7f:2,B*7e:2,B*9f:2,B*4h:1,B*4f:2,2d1c:0,B*1f:2,B*2b:2,B*2e:3,B*6f:1,B*8f:1,B*5e:2,2d3d:2,G*5e:2,3i2h:3,B*4e:4,2d3c:7,9g9f:5,1g1f:1,7i4f:2 bad=G*4f,G*3b,G*3c,B*1h,B*7f,B*7e,B*9f,B*4h,B*4f,2d1c,B*1f,B*2b,B*6f,B*8f,B*5e,2d3d,G*5e,1g1f,7i4f desc=39手目（先手番）。実戦は3二桂成。5二金打もあり・3三角打はセーフ
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

@@ -1,4 +1,4 @@
-*scenario ply=89 target=5e5f scores=N*4g:0,N*6g:0,N*7f:2,P*6g:0,N*5f:0,5e5f:8,8a7c:2,N*4f:2,N*6f:2,3d3e:2,P*6h:8,N*7g:8,7a6a:2,7b6a:2,P*2b:0,N*6c:0,6b6c:1,N*3a:0,P*7d:2,2c3c:1,6b5c:1,7b6c:1,N*4d:0,N*8f:2,P*6f:8,1c1d:0 bad=N*4g,N*6g,N*7f,P*6g,N*5f,8a7c,N*4f,N*6f,3d3e,7a6a,7b6a,P*2b,N*6c,6b6c,N*3a,P*7d,2c3c,6b5c,7b6c,N*4d,N*8f,1c1d desc=90手目（後手番）。5六歩・6八歩打・7七桂打があり。実戦は7八歩打の反則後に7七歩打
+*scenario ply=89 target=5e5f scores=N*4g:0,N*6g:0,N*7f:2,P*6g:0,N*5f:0,5e5f:8,8a7c:2,N*4f:2,N*6f:2,3d3e:2,P*6h:8,N*7g:8,7a6a:2,7b6a:2,P*2b:0,N*6c:0,6b6c:1,N*3a:0,P*7d:2,2c3c:1,6b5c:1,7b6c:1,N*4d:0,N*8f:2,P*6f:8,1c1d:0,2c2b:0 bad=N*4g,N*6g,N*7f,P*6g,N*5f,8a7c,N*4f,N*6f,3d3e,7a6a,7b6a,P*2b,N*6c,6b6c,N*3a,P*7d,2c3c,6b5c,7b6c,N*4d,N*8f,1c1d,2c2b desc=90手目（後手番）。5六歩・6八歩打・7七桂打があり。実戦は7八歩打の反則後に7七歩打
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
