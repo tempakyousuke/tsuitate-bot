@@ -1,4 +1,4 @@
-*scenario ply=33 target=4b2b scores=S*5h:2,S*4h:2,S*6h:2,4f4g+:3,6c5b:1,6a5b:3,7a7b:2,S*5a:1,6a7b:2,S*4a:1,4d2f:4,4f4g:1,P*2f:1,P*2g:2,P*2h:4,S*2g:1,S*1d:0,S*6f:0,7a6b:1 bad=S*5h,S*4h,S*6h,6c5b,7a7b,S*5a,6a7b,S*4a,4f4g,P*2f,P*2g,S*2g,S*1d,S*6f,7a6b desc=34手目（後手番）。ユーザー推奨は2二飛（次に2一飛で龍を狙う）。銀打ち3種・4七歩成（飛車を動かす方が先）・5二玉・5二金・7二銀は悪手。実戦の4三飛は評価対象外
+*scenario ply=33 target=4b2b scores=S*5h:2,S*4h:2,S*6h:2,4f4g+:3,6c5b:1,6a5b:3,7a7b:2,S*5a:1,6a7b:2,S*4a:1,4d2f:4,4f4g:1,P*2f:1,P*2g:2,P*2h:4,S*2g:1,S*1d:0,S*6f:0,7a6b:1,4b5b:2 bad=S*5h,S*4h,S*6h,6c5b,7a7b,S*5a,6a7b,S*4a,4f4g,P*2f,P*2g,S*2g,S*1d,S*6f,7a6b,4b5b desc=34手目（後手番）。ユーザー推奨は2二飛（次に2一飛で龍を狙う）。銀打ち3種・4七歩成（飛車を動かす方が先）・5二玉・5二金・7二銀は悪手。実戦の4三飛は評価対象外
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
