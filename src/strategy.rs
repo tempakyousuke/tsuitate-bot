@@ -446,6 +446,78 @@ fn promote_far_w() -> f64 {
     })
 }
 
+/// 玉候補への接近ボーナス（`TSUITATE_KING_CAND_ATTACK_W`、既定 0 = 無効）。
+///
+/// `deduce::opp_king_candidates`（**健全**＝真の玉を絶対に落とさない候補集合）が
+/// 鋭いとき、着地マスの近接度 `Σ_k 0.5^cheb(to,k)`（盤の最大で正規化）を
+/// `w × 近接度 × 安さ係数` で gain へ加点する（近接度は `king_cand_prox_map`、
+/// 安さ係数は歩を 1.0 に正規化した `2/(1+交換価値)`）。
+///
+/// 発端は quest31 終盤（plies 67〜148）の実測: 王手宣言のおかげで **先手側の
+/// 玉候補は 6〜17 マス**まで絞れていて真の玉（8二/8一）を必ず含むのに、
+/// この情報を使う項は `promote_far_w`（成りへの課税）しか無い。評価は
+/// 終盤ブラインドで `link`（紐）が支配し（実測: gain 3.7 のうち link 2.8）、
+/// 玉から一番遠い 3二角成／3三角成が首位を占め続けていた。採点済み eval の
+/// 高得点手は P*7c / G*7c / 7c7b+ / 7d7c+ と**玉の隣接圏に集中**する。
+///
+/// 粒子不要・ノイズゼロ（自分の観測だけで決まる）。**候補集合が鋭いときだけ**
+/// 発火するので中盤（|cands| が 30〜50）では素通りする。王手中は無効。
+/// 凍結版はこの名前を知らない。
+fn king_cand_attack_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_KING_CAND_ATTACK_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
+/// 玉候補マスへ利く手への追加加点（`TSUITATE_KING_CAND_CHECK_W`、既定 0 = 無効）。
+/// `king_cand_attack_w`（着地マスの近接度）と同じゲート・同じ安さ係数で、
+/// 「その駒が実際に玉候補へ利くか」を `blind_king_attack` で測って加点する
+/// （分布は候補集合上の一様分布 = 粒子不要）
+fn king_cand_check_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_KING_CAND_CHECK_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
+/// `king_cand_attack_w` が発火する玉候補集合の上限（`TSUITATE_KING_CAND_ATTACK_GATE`、
+/// 既定 20）。これを超えると候補が盤の半分に散っていて近接度が
+/// 「敵陣へ前進」以上の情報を持たない
+fn king_cand_attack_gate() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_KING_CAND_ATTACK_GATE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(20)
+    })
+}
+
+/// `promote_far_w` の課税を**全駒種**へ広げるか（`TSUITATE_PROMOTE_FAR_ALL=1`、
+/// 既定 0 = 角・飛だけ）。課税額は着手駒の交換価値で頭打ちにする
+fn promote_far_all() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TSUITATE_PROMOTE_FAR_ALL").is_ok_and(|v| v == "1"))
+}
+
+/// `king_cand_attack_w` を**厳密粒子ゼロの決定だけ**に限るか
+/// （`TSUITATE_KING_CAND_ATTACK_BLIND=1`、既定 0 = 常に発火）。
+/// 厳密粒子が生きている決定では駒得・攻め圧力が情報を持つので、
+/// 玉候補の幾何だけで引っ張る必要は薄い、という仮説の検証用
+fn king_cand_attack_blind_only() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TSUITATE_KING_CAND_ATTACK_BLIND").is_ok_and(|v| v == "1"))
+}
+
 /// 成って王手する手の露見ペナルティ（`TSUITATE_PROMOTE_CHECK_REVEAL_W`、
 /// 既定 0 = 無効）。歩・角・飛の**成る王手**は宣言で位置が露見し、
 /// 安い駒でも回収されやすい（quest31-m095 の 7三歩成 vs 不成が発端。
@@ -1367,6 +1439,36 @@ fn promo_king_prox_map(w: f64, cands: &std::collections::BTreeSet<Coord>) -> Opt
         *slot = (1.0 - w) + w / (1.0 + d as f64);
     }
     Some(map)
+}
+
+/// `king_cand_attack_w` の近接マップ。マスごとに `Σ_k 0.5^cheb(sq,k) / |cands|`。
+///
+/// 候補集合全体の平均なので、候補が1点に絞れているときは隣接で 0.5・
+/// 2マス離れで 0.25 と急峻に落ち、候補が広いほど全マスで平坦になる
+/// （＝情報が無いときは自然に効かなくなる）
+fn king_cand_prox_map(cands: &std::collections::BTreeSet<Coord>) -> [f64; 81] {
+    let mut map = [0.0f64; 81];
+    for (i, slot) in map.iter_mut().enumerate() {
+        let sq = Coord {
+            file: (i / 9) as i8 + 1,
+            rank: (i % 9) as i8 + 1,
+        };
+        *slot = cands
+            .iter()
+            .map(|&k| 0.5f64.powi(i32::from(cheb(sq, k))))
+            .sum::<f64>();
+    }
+    // 最大が 1 になるよう正規化する（候補が散っているほど生の値は小さいので、
+    // 正規化しないと w の意味が候補集合の広さで変わる）。**最短距離でなく
+    // 候補全体の和**を使うのは、候補が固まっている側（玉が居そうな一帯）を
+    // 素直に重くしたいから
+    let max = map.iter().cloned().fold(0.0f64, f64::max);
+    if max > 0.0 {
+        for slot in map.iter_mut() {
+            *slot /= max;
+        }
+    }
+    map
 }
 
 /// **大駒（飛・角・香）の成り道**の価値（`major_promo_path_w`、2026-08-03）。
@@ -3981,6 +4083,19 @@ impl Strategy for EstimatorStrategy {
         let promote_far_kings: Option<std::collections::BTreeSet<Coord>> =
             (promote_far_w() > 0.0 && !view.you_in_check)
                 .then(|| crate::deduce::opp_king_candidates(view.your_color, log));
+        // 玉候補への接近ボーナスの近接マップ（`king_cand_attack_w`）。
+        // 候補集合が**鋭いときだけ**（`king_cand_attack_gate` 以下）作る:
+        // 40〜55マスに散らばった候補への近接は「敵陣へ前進」以上の意味を
+        // 持たない。王手中は無効（CheckSolver の領分）
+        let king_cand_set: Option<std::collections::BTreeSet<Coord>> =
+            ((king_cand_attack_w() > 0.0 || king_cand_check_w() > 0.0) && !view.you_in_check)
+                .then(|| {
+                    let cands = crate::deduce::opp_king_candidates(view.your_color, log);
+                    (!cands.is_empty() && cands.len() <= king_cand_attack_gate()).then_some(cands)
+                })
+                .flatten();
+        let king_cand_prox: Option<[f64; 81]> =
+            king_cand_set.as_ref().map(|c| king_cand_prox_map(c));
         // 成る王手の露見ペナルティ用玉候補（`promote_check_reveal_w`）。
         // ブラインド決定でも効かせるため粒子不要。王手中は無効
         let promote_check_kings: Option<std::collections::BTreeSet<Coord>> =
@@ -4093,14 +4208,78 @@ impl Strategy for EstimatorStrategy {
                     .iter()
                     .find(|p| p.square == make_usi_square(from))
                     .map(|p| p.role);
-                if w > 0.0 && matches!(role, Some(Role::Bishop | Role::Rook)) {
+                let target_role = if promote_far_all() {
+                    // 全駒種へ拡張（`TSUITATE_PROMOTE_FAR_ALL=1`）。
+                    // 玉から遠い「意味のない成り」は歩・桂・銀でも同じ理屈で
+                    // 課税されるべき（実測の失点上位は 4a3b+/5f5g+/7d7c+/4a6c+ と
+                    // ほぼ全部が成る手）。ただし課税額は駒の交換価値で頭打ちに
+                    // する（歩の成りに角と同じ 5 点を課すのは過剰）
+                    role.is_some()
+                } else {
+                    matches!(role, Some(Role::Bishop | Role::Rook))
+                };
+                if w > 0.0 && target_role {
                     // 観測裏付けの占有マスへの成り捕獲は「材料」なので免税
                     let backed_hit = opp_occ_backed
                         .as_ref()
                         .is_some_and(|b| b[crate::belief_features::sq_index(to)]);
                     if !backed_hit {
-                        out.gain -= w * promote_far_amount(from, to, cands);
+                        let mut pen = w * promote_far_amount(from, to, cands);
+                        if promote_far_all() {
+                            if let Some(r) = role {
+                                pen = pen.min(exchange_value(r));
+                            }
+                        }
+                        out.gain -= pen;
                     }
+                }
+            }
+            // 玉候補への接近ボーナス（`king_cand_attack_w` の doc 参照）。
+            // gain の内側（攻め加点は p_legal 割引の内側に置く。
+            // dragon-check-drop の教訓）。着地マスの近接度を「着地する駒の
+            // 安さ」で割る（同じ仕事なら最安の駒で）
+            if let Some(map) = king_cand_prox
+                .as_ref()
+                .filter(|_| !king_cand_attack_blind_only() || sample.is_empty())
+            {
+                let (to, role) = match mv {
+                    ShogiMove::Drop { role, to } => (to, role),
+                    ShogiMove::Board { from, to, promote } => {
+                        let r = view
+                            .your_pieces
+                            .iter()
+                            .find(|p| p.square == make_usi_square(from))
+                            .map(|p| p.role);
+                        match r {
+                            Some(r) if promote => (to, promote_role(r).unwrap_or(r)),
+                            Some(r) => (to, r),
+                            None => (to, Role::King),
+                        }
+                    }
+                };
+                if role != Role::King {
+                    let prox = map[crate::belief_features::sq_index(to)];
+                    // 玉候補マスへ**実際に利く**手への追加加点
+                    // （`king_cand_check_w`）。採点済み eval の局面内回帰では
+                    // 距離を制御してもなお +0.78 点ぶんの説明力がある
+                    if king_cand_check_w() > 0.0 {
+                        if let Some(cands) = king_cand_set.as_ref() {
+                            let dist: Vec<(Coord, f64)> = cands
+                                .iter()
+                                .map(|&k| (k, 1.0 / cands.len() as f64))
+                                .collect();
+                            let frac = blind_king_attack(view, &mv, &dist);
+                            out.gain += king_cand_check_w() * frac * 2.0
+                                / (1.0 + exchange_value(role));
+                        }
+                    }
+                    // 「同じ仕事なら最安の駒で」（`foul_occ_attack_w` と同じ規約）。
+                    // 歩を 1.0 に正規化した安さ係数を掛ける: 裸の銀・金を信念上の
+                    // 玉の隣へ投げる手（m040 の教訓）は歩の垂らしより小さい加点に
+                    // なる。採点済み eval の局面内回帰でも歩 +0.53 / 角 −0.53 と
+                    // 「安い駒の手ほど良い」が出ている
+                    let cheapness = 2.0 / (1.0 + exchange_value(role));
+                    out.gain += king_cand_attack_w() * prox * cheapness;
                 }
             }
             // 歩・角・飛の成る王手の露見ペナルティ（`promote_check_reveal_w`）。
