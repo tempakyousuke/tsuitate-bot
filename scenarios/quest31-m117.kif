@@ -1,4 +1,4 @@
-*scenario ply=116 target=P*7c scores=P*5d:0,P*7c:10,P*4c:0,P*4d:0,P*2c:0,P*5c:0,P*7b:0,S*7c:0,S*8c:4,6d7c:2,3c4b:8,S*6c:4,3c2b:2,P*2b:0,P*5b:0,S*9c:1,S*9a:0,S*7a:6,P*4b:0,S*4c:0,7d9b:2,9f9e:3,2d1c+:0 bad=P*5d,P*4c,P*4d,P*2c,P*5c,P*7b,S*7c,6d7c,3c2b,P*2b,P*5b,S*9c,S*9a,P*4b,S*4c,7d9b,2d1c+ desc=117手目（先手番）。最高点は7三歩打（8点）。採点はevals/quest_20260731.eval.md参照
+*scenario ply=116 target=P*7c scores=P*5d:0,P*7c:10,P*4c:0,P*4d:0,P*2c:0,P*5c:0,P*7b:0,S*7c:0,S*8c:4,6d7c:2,3c4b:8,S*6c:4,3c2b:2,P*2b:0,P*5b:0,S*9c:1,S*9a:0,S*7a:6,P*4b:0,S*4c:0,7d9b:2,9f9e:3,2d1c+:0,7d4a:0 bad=P*5d,P*4c,P*4d,P*2c,P*5c,P*7b,S*7c,6d7c,3c2b,P*2b,P*5b,S*9c,S*9a,P*4b,S*4c,7d9b,2d1c+,7d4a desc=117手目（先手番）。最高点は7三歩打（8点）。採点はevals/quest_20260731.eval.md参照
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

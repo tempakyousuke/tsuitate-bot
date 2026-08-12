@@ -1,4 +1,4 @@
-*scenario ply=49 target=3d3e scores=4g4h:2,4g5h:3,3h4i+:3,3h2i+:2,7c7d:3,9c9d:2,3d3e:6,6d6e:4,4g5g:2,P*2b:1,4e5f:3,P*2g:3,6b7b:2,5c5d:6,3h3i+:3,3h4i:6,2c2f:6,4e5d:2 bad=4g4h,3h2i+,9c9d,4g5g,P*2b,6b7b,4e5d desc=50手目（後手番）。3五歩・5四歩があり。実戦の7四歩は悪手（ユーザー判定）
+*scenario ply=49 target=3d3e scores=4g4h:2,4g5h:3,3h4i+:3,3h2i+:2,7c7d:3,9c9d:2,3d3e:6,6d6e:4,4g5g:2,P*2b:1,4e5f:3,P*2g:3,6b7b:2,5c5d:6,3h3i+:3,3h4i:6,2c2f:6,4e5d:2,3h2i:3 bad=4g4h,3h2i+,9c9d,4g5g,P*2b,6b7b,4e5d desc=50手目（後手番）。3五歩・5四歩があり。実戦の7四歩は悪手（ユーザー判定）
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)

@@ -1,4 +1,4 @@
-*scenario ply=89 fouls=P*7h target=P*7g scores=5e5f:3,N*6f:3,N*8f:3,P*7g:10,8a7c:2,3d3e:0,9c9d:2,N*6g:0,N*4g:0,8c8d:2,7a6a:2,7b6a:2,6b6c:2,8b9b:2,1a1b:0,N*3a:0,P*2b:0,7b7c:0 bad=8a7c,3d3e,9c9d,N*6g,N*4g,8c8d,7a6a,7b6a,6b6c,8b9b,1a1b,N*3a,P*2b,7b7c desc=90手目・7八歩打(P*7h)の反則後（後手番）。7八は先手の駒で確定＝7七歩打（実戦）があり
+*scenario ply=89 fouls=P*7h target=P*7g scores=5e5f:3,N*6f:3,N*8f:3,P*7g:10,8a7c:2,3d3e:0,9c9d:2,N*6g:0,N*4g:0,8c8d:2,7a6a:2,7b6a:2,6b6c:2,8b9b:2,1a1b:0,N*3a:0,P*2b:0,7b7c:0,N*6c:2 bad=8a7c,3d3e,9c9d,N*6g,N*4g,8c8d,7a6a,7b6a,6b6c,8b9b,1a1b,N*3a,P*2b,7b7c,N*6c desc=90手目・7八歩打(P*7h)の反則後（後手番）。7八は先手の駒で確定＝7七歩打（実戦）があり
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
