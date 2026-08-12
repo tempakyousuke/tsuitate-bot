@@ -1,4 +1,4 @@
-*scenario ply=147 scores=8e7g+:2,S*2b:0,S*1b:0,S*1d:0,S*3b:0,P*2b:0,8e9g+:0,S*4h:0,S*6h:0,P*5h:0,S*5h:0,5g5h:0,5g6h:0,5g4h:0,S*6c:0,S*4c:0,S*5c:0,2c5c:0,S*4e:0,S*6e:0,P*5c:0,2c2i+:0,2c2g+:0,2c2e:0,S*4g:0,2c7c:0,S*5f:1 bad=8e7g+,S*2b,S*1b,S*1d,S*3b,P*2b,8e9g+,S*4h,S*6h,P*5h,S*5h,5g5h,5g6h,5g4h,S*6c,S*4c,S*5c,2c5c,S*4e,S*6e,P*5c,2c2i+,2c2g+,2c2e,S*4g,2c7c,S*5f desc=148手目（後手番）。採点はevals/quest_20260731.eval.md参照
+*scenario ply=147 scores=8e7g+:2,S*2b:0,S*1b:0,S*1d:0,S*3b:0,P*2b:0,8e9g+:0,S*4h:0,S*6h:0,P*5h:0,S*5h:0,5g5h:0,5g6h:0,5g4h:0,S*6c:0,S*4c:0,S*5c:0,2c5c:0,S*4e:0,S*6e:0,P*5c:0,2c2i+:0,2c2g+:0,2c2e:0,S*4g:0,2c7c:0,S*5f:1,3d3e:0,8e7g:0 bad=8e7g+,S*2b,S*1b,S*1d,S*3b,P*2b,8e9g+,S*4h,S*6h,P*5h,S*5h,5g5h,5g6h,5g4h,S*6c,S*4c,S*5c,2c5c,S*4e,S*6e,P*5c,2c2i+,2c2g+,2c2e,S*4g,2c7c,S*5f,3d3e,8e7g desc=148手目（後手番）。採点はevals/quest_20260731.eval.md参照
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
