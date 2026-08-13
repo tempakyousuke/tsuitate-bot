@@ -461,9 +461,10 @@ fn promote_far_w() -> f64 {
     })
 }
 
-/// 大駒成りの遠方ペナルティの既定（2026-08-13。4.0 でも m081 の 4a3b+ が
-/// 7六歩より上に残ったため 5.5。0 で切り戻し）
-const PROMOTE_FAR_W: f64 = 2.5;
+/// 大駒成りの遠方ペナルティの既定（2026-08-13。歩成りは対象外なので
+/// 7d7c+ クラスは巻き込まない。4a3b+ を 7六歩の下へ沈める作業点）。
+/// 0 で切り戻し
+const PROMOTE_FAR_W: f64 = 3.5;
 
 /// 玉筋の歩前進（`TSUITATE_KING_FILE_PAWN_W`、既定 `KING_FILE_PAWN_W`）。
 /// **敵陣**の歩（前進・成り・打ち）が、玉候補筋の中央値から距離 ≤2 のとき
@@ -563,6 +564,73 @@ fn unbacked_camp_w() -> f64 {
 }
 
 const UNBACKED_CAMP_W: f64 = 0.8;
+
+/// 金銀の裏付け無し捕獲を gain から削る係数（`TSUITATE_UNBACKED_GS_CAPTURE_W`、
+/// 既定 `UNBACKED_GS_CAPTURE_W`。0 で切り戻し）。
+///
+/// `material_degen_q0` は粒子質量が厚いと縮まない。金銀が観測裏付けの無い
+/// マスで「駒が居る」と信じた捕獲（quest31-m081 の 6c6b、幻の金）は
+/// p_hit≈1 で `capture_bet_var` も消える。こちらは**金銀の盤上移動だけ**
+/// 期待駒得を `w` 倍だけ引く（w=1 で幻の駒得を全額キャンセル）。
+/// 打ちは捕獲にならない。王手中無効（kakutori）。裏付けマスは満額残す
+/// （recap-dragon）。と金・大駒は対象外（2c3b の銀取り・4七歩成を守る）。
+/// 凍結版はこの名前を知らない。
+fn unbacked_gs_capture_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_UNBACKED_GS_CAPTURE_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(UNBACKED_GS_CAPTURE_W)
+    })
+}
+
+/// 金銀の裏付け無し捕獲をキャンセルする既定（2026-08-13。m081 の 6c6b）。
+const UNBACKED_GS_CAPTURE_W: f64 = 1.0;
+
+/// 相手の初期金位置への金銀の当たり（`TSUITATE_HOME_GOLD_ATTACK_W`、既定
+/// `HOME_GOLD_ATTACK_W`。0 で切り戻し）。
+///
+/// 発端は quest31-m046 の 3h4i 不成（10点）。4i の金は相手の初期位置に
+/// 居る実在の駒だが、観測裏付けも粒子の捕獲信念も無いので capture=0。
+/// unbacked_camp が敵陣進入として銀を課税すると 4g4h / 7a7b に流出する。
+/// こちらは**相手の金の初期マス**（先手なら 4a/6a、後手なら 4i/6i）へ
+/// 金銀が盤上から入る手へ `w` を足す事前。と金は対象外（m021 の 3a4a）。
+/// 裏付けマスは capture が既に数えるので加点しない。王手中無効・粒子不要。
+fn home_gold_attack_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_HOME_GOLD_ATTACK_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(HOME_GOLD_ATTACK_W)
+    })
+}
+
+const HOME_GOLD_ATTACK_W: f64 = 2.5;
+
+/// と金が玉筋へ寄る手の加点（`TSUITATE_TOKIN_APPROACH_W`、既定
+/// `TOKIN_APPROACH_W`。0 で切り戻し）。敵陣のと金が、玉候補筋の中央値への
+/// 筋距離を縮める手へ `w / (1+d_to)` を足す。
+///
+/// 発端は quest31-m021 の 2c3b（10点）。3a4a を king_adj で沈めても
+/// 7六歩・9六歩が繰り上がる。2c3b は銀取りだが粒子が銀を置かないと
+/// capture=0 で、ただのと金移動に見える。玉筋へ寄る勾配だけを足す。
+/// 3a4a も寄るが king_adj の税（3.5×1.5）の方が大きい。王手中無効。
+fn tokin_approach_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_TOKIN_APPROACH_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(TOKIN_APPROACH_W)
+    })
+}
+
+const TOKIN_APPROACH_W: f64 = 1.8;
 
 /// 玉隣接への高い駒の無支え進入（`TSUITATE_KING_ADJ_HEAVY_W`、既定
 /// `KING_ADJ_HEAVY_W`。0 で切り戻し）。
@@ -909,6 +977,70 @@ fn unbacked_camp_amount(
         Role::Gold | Role::Silver if !is_drop => exchange_value(role),
         _ => 0.0,
     }
+}
+
+/// 金銀の敵陣進入税は、粒子が「そこに駒が居る」と信じているときだけ掛ける。
+/// capture≈0 の 3h4i（実在の金が見えていない）を 4g4h へ流出させない。
+fn unbacked_camp_needs_capture(role: Role, capture_value: f64) -> bool {
+    match role {
+        Role::Gold | Role::Silver => capture_value >= 0.5,
+        _ => true,
+    }
+}
+
+/// 相手の金の初期マス（先手が攻めるなら 4a/6a、後手なら 4i/6i）。
+fn opp_gold_homes(me: Color) -> [Coord; 2] {
+    match me {
+        Color::Sente => [
+            Coord { file: 4, rank: 1 },
+            Coord { file: 6, rank: 1 },
+        ],
+        Color::Gote => [
+            Coord { file: 4, rank: 9 },
+            Coord { file: 6, rank: 9 },
+        ],
+    }
+}
+
+/// 相手の初期金位置への金銀の当たり量（`home_gold_attack_w`）。
+fn home_gold_attack_amount(
+    role: Role,
+    to: Coord,
+    me: Color,
+    backed: &[bool; 81],
+) -> f64 {
+    if !matches!(role, Role::Gold | Role::Silver) {
+        return 0.0;
+    }
+    if backed[crate::belief_features::sq_index(to)] {
+        return 0.0;
+    }
+    if opp_gold_homes(me).iter().any(|&h| h == to) {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// と金が玉筋へ寄る量（`tokin_approach_w`）。
+fn tokin_file_approach_amount(
+    from: Coord,
+    to: Coord,
+    me: Color,
+    cands: &std::collections::BTreeSet<Coord>,
+) -> f64 {
+    if !in_enemy_camp(to, me) {
+        return 0.0;
+    }
+    let Some(median) = king_file_median(cands) else {
+        return 0.0;
+    };
+    let d0 = (from.file - median).abs();
+    let d1 = (to.file - median).abs();
+    if d1 >= d0 {
+        return 0.0;
+    }
+    1.0 / (1.0 + f64::from(d1))
 }
 
 /// 自陣の金銀桂の空きマス移動量（`own_camp_idle_w`）。
@@ -4400,6 +4532,8 @@ impl Strategy for EstimatorStrategy {
                 || hand_asset_w() > 0.0
                 || promote_far_w() > 0.0
                 || unbacked_camp_w() > 0.0
+                || unbacked_gs_capture_w() > 0.0
+                || home_gold_attack_w() > 0.0
                 || king_adj_heavy_w() > 0.0
                 || tokin_file_drift_w() > 0.0
                 || own_camp_idle_w() > 0.0)
@@ -4416,6 +4550,7 @@ impl Strategy for EstimatorStrategy {
             ((promote_far_w() > 0.0
                 || king_file_pawn_w() > 0.0
                 || king_file_gold_w() > 0.0
+                || tokin_approach_w() > 0.0
                 || unbacked_camp_w() > 0.0
                 || king_adj_heavy_w() > 0.0
                 || tokin_file_drift_w() > 0.0)
@@ -4578,6 +4713,7 @@ impl Strategy for EstimatorStrategy {
                 }
             }
             // 裏付け無しの敵陣進入（`unbacked_camp_w`）。gain の内側。
+            // 金銀は粒子が捕獲を信じているときだけ（3h4i の capture=0 を守る）。
             if !view.you_in_check {
                 let uw = unbacked_camp_w();
                 if uw > 0.0 {
@@ -4591,13 +4727,58 @@ impl Strategy for EstimatorStrategy {
                             ShogiMove::Drop { role, to } => Some((role, to, true)),
                         };
                         if let Some((role, to, is_drop)) = landing {
-                            out.gain -= uw
-                                * unbacked_camp_amount(
-                                    role,
+                            if unbacked_camp_needs_capture(role, out.capture_value) {
+                                out.gain -= uw
+                                    * unbacked_camp_amount(
+                                        role,
+                                        to,
+                                        view.your_color,
+                                        backed,
+                                        is_drop,
+                                    );
+                            }
+                        }
+                    }
+                }
+            }
+            // 相手の初期金位置への金銀当たり（`home_gold_attack_w`）。
+            if !view.you_in_check {
+                let hw = home_gold_attack_w();
+                if hw > 0.0 {
+                    if let (Some(backed), ShogiMove::Board { from, to, .. }) =
+                        (opp_occ_backed.as_ref(), mv)
+                    {
+                        let role = view
+                            .your_pieces
+                            .iter()
+                            .find(|p| p.square == make_usi_square(from))
+                            .map(|p| p.role);
+                        if let Some(role) = role {
+                            out.gain += hw
+                                * home_gold_attack_amount(role, to, view.your_color, backed);
+                        }
+                    }
+                }
+            }
+            // と金の玉筋接近（`tokin_approach_w`）。
+            if !view.you_in_check {
+                let tw = tokin_approach_w();
+                if tw > 0.0 {
+                    if let (Some(cands), ShogiMove::Board { from, to, .. }) =
+                        (promote_far_kings.as_ref(), mv)
+                    {
+                        let is_tokin = view
+                            .your_pieces
+                            .iter()
+                            .find(|p| p.square == make_usi_square(from))
+                            .is_some_and(|p| p.role == Role::Tokin);
+                        if is_tokin {
+                            out.gain += tw
+                                * tokin_file_approach_amount(
+                                    from,
                                     to,
                                     view.your_color,
-                                    backed,
-                                    is_drop,
+                                    cands,
                                 );
                         }
                     }
@@ -6848,6 +7029,30 @@ fn evaluate(
         } else {
             0.0
         };
+        // 金銀の裏付け無し捕獲をキャンセル（`unbacked_gs_capture_w`）。
+        // 質量ゲートでは自信を持って間違う 6c6b が残るので、金銀に限り
+        // 期待駒得を w 倍だけ引く。王手中・裏付けマスは対象外。
+        let gs_unbacked_capture = if unbacked_gs_capture_w() > 0.0
+            && !view.you_in_check
+            && capture_hits > 0.0
+            && !capture_to_backed
+        {
+            let mover_gs = matches!(
+                *mv,
+                ShogiMove::Board { from, .. } if view
+                    .your_pieces
+                    .iter()
+                    .find(|p| p.square == make_usi_square(from))
+                    .is_some_and(|p| matches!(p.role, Role::Gold | Role::Silver))
+            );
+            if mover_gs {
+                unbacked_gs_capture_w() * (capture_value_sum / legal)
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
         // 粒子上の詰みの加点。q = 詰みを主張する質量の割合に対し
         // 1000×q×(q/(q+q0)) の凸ゲート: q0=0 は従来（1000×q）と同一挙動、
         // q0>0 では裾の幻詰みが材料スケールへ沈み、合意の詰みはほぼ満額残る
@@ -6860,7 +7065,7 @@ fn evaluate(
         // 攻め側の項（王探し・玉周りの圧力・逃げマス被覆）は taint
         // フォールバック中は attack_scale で絞る。守り側（自玉への圧力・
         // 相手の打ち王手の危険）は絞らない = 安全方向は残す
-        value_sum / legal + mate_term - capture_bet_penalty - material_shrink
+        value_sum / legal + mate_term - capture_bet_penalty - material_shrink - gs_unbacked_capture
             + params.info_bonus * p_hit * (1.0 - p_hit)
             + attack_scale * params.king_probe_bonus * p_chk * (1.0 - p_chk)
             + value_nn_term
@@ -9354,6 +9559,117 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn unbacked_camp_gold_needs_believed_capture() {
+        assert!(
+            unbacked_camp_needs_capture(Role::Gold, 5.3),
+            "6c6b believed gold capture is taxed"
+        );
+        assert!(
+            !unbacked_camp_needs_capture(Role::Silver, 0.0),
+            "3h4i with capture=0 must not be taxed"
+        );
+        assert!(
+            unbacked_camp_needs_capture(Role::Bishop, 0.0),
+            "majors are taxed even without capture (2d3c+)"
+        );
+    }
+
+    #[test]
+    fn home_gold_attack_hits_opp_gold_home_not_tokin() {
+        let backed = [false; 81];
+        let gote_4i = home_gold_attack_amount(
+            Role::Silver,
+            Coord { file: 4, rank: 9 },
+            Color::Gote,
+            &backed,
+        );
+        assert_eq!(gote_4i, 1.0, "3h4i is sente's gold home");
+        let sente_4a = home_gold_attack_amount(
+            Role::Gold,
+            Coord { file: 4, rank: 1 },
+            Color::Sente,
+            &backed,
+        );
+        assert_eq!(sente_4a, 1.0, "gold to 4a is gote's gold home");
+        let tokin = home_gold_attack_amount(
+            Role::Tokin,
+            Coord { file: 4, rank: 1 },
+            Color::Sente,
+            &backed,
+        );
+        assert_eq!(tokin, 0.0, "tokin 3a4a must not get the gold-home bonus");
+        let miss = home_gold_attack_amount(
+            Role::Silver,
+            Coord { file: 3, rank: 9 },
+            Color::Gote,
+            &backed,
+        );
+        assert_eq!(miss, 0.0, "3i is silver home, not gold");
+        let mut hit = [false; 81];
+        hit[crate::belief_features::sq_index(Coord { file: 4, rank: 9 })] = true;
+        assert_eq!(
+            home_gold_attack_amount(
+                Role::Silver,
+                Coord { file: 4, rank: 9 },
+                Color::Gote,
+                &hit
+            ),
+            0.0,
+            "backed recapture is already counted as capture"
+        );
+    }
+
+    #[test]
+    fn tokin_approach_rewards_closing_king_file() {
+        let mut cands = std::collections::BTreeSet::new();
+        cands.insert(Coord { file: 5, rank: 1 });
+        let close = tokin_file_approach_amount(
+            Coord { file: 2, rank: 3 },
+            Coord { file: 3, rank: 2 },
+            Color::Sente,
+            &cands,
+        );
+        assert!(
+            (close - 1.0 / 3.0).abs() < 1e-9,
+            "2c3b d 3→2 → 1/3, got {close}"
+        );
+        let recede = tokin_file_approach_amount(
+            Coord { file: 2, rank: 3 },
+            Coord { file: 1, rank: 3 },
+            Color::Sente,
+            &cands,
+        );
+        assert_eq!(recede, 0.0, "2c1c recedes from file 5");
+        let adj = tokin_file_approach_amount(
+            Coord { file: 3, rank: 1 },
+            Coord { file: 4, rank: 1 },
+            Color::Sente,
+            &cands,
+        );
+        assert!(
+            (adj - 0.5).abs() < 1e-9,
+            "3a4a also approaches (king_adj tax is larger)"
+        );
+    }
+
+    #[test]
+    fn unbacked_gs_capture_and_home_gold_defaults() {
+        if std::env::var("TSUITATE_UNBACKED_GS_CAPTURE_W").is_err() {
+            assert!((unbacked_gs_capture_w() - UNBACKED_GS_CAPTURE_W).abs() < 1e-12);
+            assert!((UNBACKED_GS_CAPTURE_W - 1.0).abs() < 1e-12);
+        }
+        if std::env::var("TSUITATE_HOME_GOLD_ATTACK_W").is_err() {
+            assert!((home_gold_attack_w() - HOME_GOLD_ATTACK_W).abs() < 1e-12);
+        }
+        if std::env::var("TSUITATE_TOKIN_APPROACH_W").is_err() {
+            assert!((tokin_approach_w() - TOKIN_APPROACH_W).abs() < 1e-12);
+        }
+        if std::env::var("TSUITATE_PROMOTE_FAR_W").is_err() {
+            assert!((promote_far_w() - 3.5).abs() < 1e-12);
+        }
+    }
+
+    #[test]
     fn king_adj_heavy_taxes_tokin_next_to_king_not_two_away() {
         let mut cands = std::collections::BTreeSet::new();
         cands.insert(Coord { file: 5, rank: 1 });
@@ -9527,7 +9843,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_PROMOTE_FAR_W").is_err() {
             assert!((promote_far_w() - PROMOTE_FAR_W).abs() < 1e-12);
-            assert!((PROMOTE_FAR_W - 2.5).abs() < 1e-12);
+            assert!((PROMOTE_FAR_W - 3.5).abs() < 1e-12);
         }
         if std::env::var("TSUITATE_KING_ADJ_HEAVY_W").is_err() {
             assert!((KING_ADJ_HEAVY_W - 1.5).abs() < 1e-12);
