@@ -4291,7 +4291,16 @@ impl Strategy for EstimatorStrategy {
                         }
                     }
                 };
-                if role != Role::King {
+                // 大駒の**成り込み**は接近ボーナスの対象外にする。採点済み eval は
+                // 玉の近くへの角成りを一貫して悪手としており（m071 の 4a6c+=1 を
+                // 7/10 シード・m077 も 7/10、m087/m089 の 4a3b+=0）、`promote_far_w`
+                // は玉候補の隣接を免税にするのでここを止められない。安さ係数
+                // （馬で 0.17）だけでは押し出しに足りなかった実測への対応
+                let major_promotion = matches!(
+                    mv,
+                    ShogiMove::Board { promote: true, .. }
+                ) && matches!(role, Role::Horse | Role::Dragon);
+                if role != Role::King && !major_promotion {
                     let prox = map[crate::belief_features::sq_index(to)];
                     // 玉候補マスへ**実際に利く**手への追加加点
                     // （`king_cand_check_w`）。採点済み eval の局面内回帰では
