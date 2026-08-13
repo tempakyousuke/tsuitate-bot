@@ -409,9 +409,9 @@ fn hand_asset_w() -> f64 {
     })
 }
 
-/// 金銀の無目的打ち課税の既定（2026-08-13。PR#1 の 0.5 を金銀限定のまま 1.0 へ。
-/// G*5e が 0.5 では link 加点に負けた）
-const HAND_ASSET_W: f64 = 1.0;
+/// 金銀の無目的打ち課税の既定（2026-08-13。PR#1 作業点 0.5 を金銀限定で採用。
+/// 1.0 は 4a3b+ クラスタを回帰させた）
+const HAND_ASSET_W: f64 = 0.5;
 
 /// 玉の既知脅威への接近減点（`TSUITATE_KING_KNOWN_APPROACH_W`、既定
 /// `KING_KNOWN_APPROACH_W`。0 で切り戻し）。
@@ -459,9 +459,9 @@ fn promote_far_w() -> f64 {
     })
 }
 
-/// 大駒成りの遠方ペナルティの既定（2026-08-13。コンボ作業点 1.0 から 1.5 へ
-/// 引き上げ = 4a3b+ が w=1 でも残ったため）。0 で切り戻し
-const PROMOTE_FAR_W: f64 = 1.5;
+/// 大駒成りの遠方ペナルティの既定（2026-08-13。1.5 でも 4a3b+ が
+/// 玉筋歩ゲート後に復活したため 2.5。0 で切り戻し）
+const PROMOTE_FAR_W: f64 = 2.5;
 
 /// 玉筋の歩前進（`TSUITATE_KING_FILE_PAWN_W`、既定 `KING_FILE_PAWN_W`）。
 /// 未成の歩が、玉候補筋の**中央値**から距離 ≤2 の筋へ前進する手へ
@@ -483,7 +483,7 @@ fn king_file_pawn_w() -> f64 {
     })
 }
 
-const KING_FILE_PAWN_W: f64 = 0.6;
+const KING_FILE_PAWN_W: f64 = 1.2;
 
 /// 裏付け無しの敵陣進入課税（`TSUITATE_UNBACKED_CAMP_W`、既定
 /// `UNBACKED_CAMP_W`）。歩・香・桂・玉以外が、観測裏付けの無い敵陣マスへ
@@ -2508,8 +2508,8 @@ impl Default for EvalParams {
             // 0 で従来挙動へ切り戻し。w=10 × capture_reveal_risk ≒ 1.3点の
             // リスク床で、玉でしか取れない駒の捕獲は gain が勝って生き残る
             king_capture_reveal: 10.0,
-            // 成りポテンシャルの敵玉近接重み。0.5 は序盤の 6六歩へ逃避したため既定 0
-            promo_king_prox: 0.0,
+            // 成りポテンシャルの敵玉近接重み（2026-08-13 既定 0.5）
+            promo_king_prox: 0.5,
             // 打ち反則で確定した駒への当たり（2026-08-07 実装、2026-08-08 採用）。
             // 0 で従来挙動へ切り戻し。drop_probe_w（情報を買う）の回収側
             foul_occ_attack_w: 2.0,
