@@ -680,14 +680,13 @@
     - 既定オン: `LINK_ENDGAME_DAMPEN=40` / `PROMOTE_FAR_W=2.5` /
       `material_degen_q0=0.3` / `GEN_NONPROMOTE` / `PROMO_RISK_PREROLE` /
       `CAPTURE_RETREAT_W=0.08` / `promo_king_prox=0.5`
-    - `TSUITATE_KING_FILE_PAWN_W`（既定 1.2）: 玉候補筋の**中央値**±2、かつ
-      中央値±2 に候補の 2/3 以上（`king_files_focused`）。成りは対象外
-    - `TSUITATE_UNBACKED_CAMP_W`（既定 0.8）: 歩香桂以外の裏付け無し敵陣進入
-    - `TSUITATE_HAND_ASSET_W`（既定 0.5、**金銀の打ちだけ**）: 自玉2マス以内
-      は守り打ちとして免税。1.0 は 4a3b+ クラスタを回帰させた
-    - `TSUITATE_PROMOTE_CHECK_REVEAL_W`（既定 1.2）: 成る王手の露見。玉筋が
-      読める局面だけ
-    - `TSUITATE_KING_KNOWN_APPROACH_W`（既定 1.0）: m099 の 7g6h 対策
+    - `TSUITATE_KING_FILE_PAWN_W`（既定 0.4）: 中央値±2 かつ集中度 2/3。
+      1.2 は終盤の 8六歩が 7c7b+ を押しのけた
+    - `TSUITATE_UNBACKED_CAMP_W`（既定 0.8）
+    - `TSUITATE_HAND_ASSET_W`（既定 0）: 金銀限定の実装は残すが未採点が
+      37→142 に増えたためオフ
+    - `TSUITATE_PROMOTE_CHECK_REVEAL_W`（既定 1.2）
+    - `TSUITATE_KING_KNOWN_APPROACH_W`（既定 1.0）
     - 切り戻しは各 env を 0 に
   - `TSUITATE_BLIND_HOME_RISK_W`（既定 0 = 無効）— **ブラインド進入リスク**
     （2026-08-09、quest31 の 1三角成 = 初期位置の歩へ成り込み1一の香に

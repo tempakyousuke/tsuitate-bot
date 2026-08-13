@@ -409,9 +409,9 @@ fn hand_asset_w() -> f64 {
     })
 }
 
-/// 金銀の無目的打ち課税の既定（2026-08-13。PR#1 作業点 0.5 を金銀限定で採用。
-/// 1.0 は 4a3b+ クラスタを回帰させた）
-const HAND_ASSET_W: f64 = 0.5;
+/// 金銀の無目的打ち課税の既定。5試行で未採点が 37→142 に増えたため 0。
+/// env で 0.5 を試せる
+const HAND_ASSET_W: f64 = 0.0;
 
 /// 玉の既知脅威への接近減点（`TSUITATE_KING_KNOWN_APPROACH_W`、既定
 /// `KING_KNOWN_APPROACH_W`。0 で切り戻し）。
@@ -483,7 +483,7 @@ fn king_file_pawn_w() -> f64 {
     })
 }
 
-const KING_FILE_PAWN_W: f64 = 1.2;
+const KING_FILE_PAWN_W: f64 = 0.4;
 
 /// 裏付け無しの敵陣進入課税（`TSUITATE_UNBACKED_CAMP_W`、既定
 /// `UNBACKED_CAMP_W`）。歩・香・桂・玉以外が、観測裏付けの無い敵陣マスへ
@@ -8820,7 +8820,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn hand_asset_w_default_on() {
+    fn hand_asset_w_default_off() {
         let w = std::env::var("TSUITATE_HAND_ASSET_W").ok();
         if w.is_none() {
             assert!((hand_asset_w() - HAND_ASSET_W).abs() < 1e-12);
