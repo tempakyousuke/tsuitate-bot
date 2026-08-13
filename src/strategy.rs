@@ -517,9 +517,11 @@ fn landing_def(view: &PlayerView, mv: &ShogiMove, own_attack: &[u8; 81]) -> f64 
     def.max(0.0)
 }
 
-/// 着地マスの自駒支えへの加点（`TSUITATE_LANDING_SUPPORT_W`、既定 0 = 無効）。
-/// `w × min(着手後の支え枚数, 2)/2` を gain へ加える。`king_cand_attack_w` と
-/// 同じゲート（玉候補が鋭い決定・王手中は無効）で発火する
+/// 玉候補接近ボーナスの**支えゲートの強さ**（`TSUITATE_LANDING_SUPPORT_W`、
+/// 既定 0 = ゲート無し）。係数は `(1−w) + w×min(着手後の支え枚数,2)/2` で、
+/// w=1 なら支え0枚の接近は加点ゼロ、w=0.5 なら半額。採点済み eval の局面内
+/// 回帰では支え枚数が +0.60点あるが、**独立した加算項にすると玉から遠い
+/// 「支えのある無意味なマス」まで加点する**ので接近側へ掛ける
 fn landing_support_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -4305,15 +4307,6 @@ impl Strategy for EstimatorStrategy {
                                 / (1.0 + exchange_value(role));
                         }
                     }
-                    // 着地マスの自駒支え（`landing_support_w`）。採点済み eval の
-                    // 局面内回帰で **支え枚数 +0.60点**（0枚 −0.20 / 3枚以上 +0.41）と
-                    // 距離・安さに次ぐ説明力を持つのに、ブラインド決定では
-                    // `expected` ごと取り返しリスクが消えるので同じ情報が評価に
-                    // 残らない。粒子不要（自駒の配置だけで決まる）
-                    if landing_support_w() > 0.0 {
-                        let def = landing_def(view, &mv, &own_attack);
-                        out.gain += landing_support_w() * (def / 2.0).min(1.0);
-                    }
                     // 「同じ仕事なら最安の駒で」（`foul_occ_attack_w` と同じ規約）。
                     // 歩を 1.0 に正規化した安さ係数を掛ける: 裸の銀・金を信念上の
                     // 玉の隣へ投げる手（m040 の教訓）は歩の垂らしより小さい加点に
@@ -4327,8 +4320,15 @@ impl Strategy for EstimatorStrategy {
                     // 玉候補の隣というだけで裸の金銀打ちが浮く m145 の G*8c（採点0）
                     // 対策で、m040 の「無防備な駒を信念上の玉の隣へ置くほど加点が
                     // 最大になる」と同型の穴）。採点回帰でも支え枚数は +0.60点ある
-                    let support = if landing_support_w() > 0.0 {
-                        0.5 + 0.5 * landing_def(view, &mv, &own_attack).min(2.0) / 2.0
+                    // 支えゲート（`landing_support_w` = ゲートの強さ）。
+                    // **独立した加算項にしてはいけない**: 玉候補ゲートの中とはいえ
+                    // 「支えのあるマスならどこでも加点」になり、飛車に支えられた
+                    // 無意味な 2二歩打が浮く（supp3 実測で P*2b が 0.85→3.9回/
+                    // シードに増え、失点 +0.154 の最大要因になった）。接近ボーナスへ
+                    // 掛けることで「支えのある寄せだけ満額」に限定する
+                    let sw = landing_support_w();
+                    let support = if sw > 0.0 {
+                        (1.0 - sw) + sw * landing_def(view, &mv, &own_attack).min(2.0) / 2.0
                     } else {
                         1.0
                     };
