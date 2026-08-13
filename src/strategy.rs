@@ -392,11 +392,12 @@ const LINK_ENDGAME_DAMPEN: f64 = 40.0;
 /// 0 で切り戻し）。打つ手に `w × exchange_value(role)` を gain から引く
 /// （仕事がある打ちは 0）。
 ///
-/// **金・銀・桂**と、**自陣への角・飛打ち**に限定する。PR#1 全駒種版は
+/// **金・銀・桂**と、**自陣への角・飛・歩打ち**に限定する。PR#1 全駒種版は
 /// kakudo の R*2d と lance/pawn-tether を巻き込みアリーナ −7pt だった。
-/// quest31 の G*5e 濫発は金銀、N*4g / N*5d は桂、B*1h 逃避は自陣の角打ち。
-/// 敵陣・中段の角飛打ち（B*3f / B*4a）は対象外（B*3f は m059 で 8 点）。
-/// 仕事: 自玉隣接または玉頭2マス（守り打ち）／敵陣かつ玉筋が読めるときの
+/// quest31 の G*5e 濫発は金銀、N*4g / N*5d は桂、B*1h 逃避は自陣の角打ち、
+/// P*4h / P*5h は自陣の歩打ち。敵陣・中段の角飛打ち（B*3f / B*4a）と
+/// 敵陣の歩打ち（P*7c / P*4f）は対象外。
+/// 仕事: 金は自玉 8 近傍、銀は玉頭2マス／敵陣かつ玉筋が読めるときの
 /// 敵玉近接／安い駒の裏付け当たり。打つ手だけ・王手中無効・粒子不要。
 /// 凍結版はこの名前を知らない。
 fn hand_asset_w() -> f64 {
@@ -410,8 +411,8 @@ fn hand_asset_w() -> f64 {
     })
 }
 
-/// 金銀桂＋自陣大駒の無目的打ち課税の既定。G*5e / N*4g / B*1h 濫発対策。
-/// 飛香歩の打ちは対象外（PR#1 全駒種版の kakudo / tether 回帰を避ける）。
+/// 金銀桂＋自陣大駒・自陣歩の無目的打ち課税の既定。
+/// 香の打ちは対象外（PR#1 全駒種版の lance-tether 回帰を避ける）。
 const HAND_ASSET_W: f64 = 1.0;
 
 /// 玉の既知脅威への接近減点（`TSUITATE_KING_KNOWN_APPROACH_W`、既定
@@ -460,9 +461,9 @@ fn promote_far_w() -> f64 {
     })
 }
 
-/// 大駒成りの遠方ペナルティの既定（2026-08-13。1.5 でも 4a3b+ が
-/// 玉筋歩ゲート後に復活したため 2.5。0 で切り戻し）
-const PROMOTE_FAR_W: f64 = 2.5;
+/// 大駒成りの遠方ペナルティの既定（2026-08-13。2.5 でも 4a3b+ が
+/// m081/m083/m085 で残ったため 4.0。0 で切り戻し）
+const PROMOTE_FAR_W: f64 = 4.0;
 
 /// 玉筋の歩前進（`TSUITATE_KING_FILE_PAWN_W`、既定 `KING_FILE_PAWN_W`）。
 /// **敵陣**の歩（前進・成り・打ち）が、玉候補筋の中央値から距離 ≤2 のとき
@@ -481,6 +482,48 @@ fn king_file_pawn_w() -> f64 {
 }
 
 const KING_FILE_PAWN_W: f64 = 1.2;
+
+/// 玉筋の金打ち（`TSUITATE_KING_FILE_GOLD_W`、既定 `KING_FILE_GOLD_W`）。
+/// 敵陣かつ玉候補筋の中央値から距離 ≤2 の金打ちへ `w / (1+d_file)` を
+/// gain に足す（quest31-m101 の G*7c）。歩成（7d7c+）は `king_file_pawn`
+/// で加点されるので、金打ち側にも同じ形の加点が要る。銀は対象外
+/// （m117 の S*7c が P*7c を押しのける）。王手中無効・粒子不要。
+/// 凍結版はこの名前を知らない。
+fn king_file_gold_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_KING_FILE_GOLD_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(KING_FILE_GOLD_W)
+    })
+}
+
+const KING_FILE_GOLD_W: f64 = 2.5;
+
+/// と金の玉筋逸れ（`TSUITATE_TOKIN_FILE_DRIFT_W`、既定
+/// `TOKIN_FILE_DRIFT_W`。0 で切り戻し）。敵陣のと金が、玉候補筋の中央値へ
+/// **近づかない**空きマス移動をする手へ `w × exchange_value(Tokin)` を
+/// gain から引く。
+///
+/// 発端は quest31-m046 の 4g4h（同じ 4 筋の空前進、採点 2）vs 3h4i 不成
+/// （10）。玉隣接税は focused 前提なので、玉が 5i に居ても候補が広いと
+/// 4h が免税で残る。こちらは中央値との筋距離が縮まないことだけを見る。
+/// 玉筋そのもの（d_file=0）の前進は免税（5c5b 型）。裏付けマスへの捕獲も
+/// 免税（2a3a）。2c3b は 5 筋へ近づくので免税。王手中無効・粒子不要。
+fn tokin_file_drift_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_TOKIN_FILE_DRIFT_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(TOKIN_FILE_DRIFT_W)
+    })
+}
+
+const TOKIN_FILE_DRIFT_W: f64 = 1.2;
 
 /// 裏付け無しの敵陣進入課税（`TSUITATE_UNBACKED_CAMP_W`、既定
 /// `UNBACKED_CAMP_W`）。歩・香・桂・玉以外が、観測裏付けの無い敵陣マスへ
@@ -529,8 +572,8 @@ fn king_adj_heavy_w() -> f64 {
 }
 
 /// 玉隣の高い駒進入課税の既定（2026-08-13。m021 の 3a4a 対策）。
-/// tokin 3.5 × 0.5 = 1.75 で rank 差 1.25 を覆す
-const KING_ADJ_HEAVY_W: f64 = 0.5;
+/// 0.5 では suite で 3a4a が 5/5 残ったため 1.5（tokin 3.5×1.5=5.25）
+const KING_ADJ_HEAVY_W: f64 = 1.5;
 
 /// 桂銀香の任意成り課税（`TSUITATE_OWN_CAMP_MINOR_PROMO_W`、既定
 /// `OWN_CAMP_MINOR_PROMO_W`。0 で切り戻し）。
@@ -784,6 +827,31 @@ fn king_file_pawn_drop_amount(
     1.0 / (1.0 + f64::from(d_file))
 }
 
+/// と金の玉筋逸れ量（`tokin_file_drift_w`）。裏付け捕獲と玉筋上は 0。
+fn tokin_file_drift_amount(
+    from: Coord,
+    to: Coord,
+    me: Color,
+    cands: &std::collections::BTreeSet<Coord>,
+    backed: &[bool; 81],
+) -> f64 {
+    if !in_enemy_camp(to, me) {
+        return 0.0;
+    }
+    if backed[crate::belief_features::sq_index(to)] {
+        return 0.0;
+    }
+    let Some(median) = king_file_median(cands) else {
+        return 0.0;
+    };
+    let d0 = (from.file - median).abs();
+    let d1 = (to.file - median).abs();
+    if d1 == 0 || d1 < d0 {
+        return 0.0;
+    }
+    1.0
+}
+
 /// 裏付け無し敵陣進入の課税量（`unbacked_camp_w`）。
 /// 角・飛・馬・龍だけ課税（3三角成 / 4a3b+）。と金・金銀は敵陣で働く駒なので
 /// 対象外（2a3a を巻き込むと m019 が壊れる）。玉隣のと金は `king_adj_heavy`。
@@ -869,9 +937,14 @@ fn own_camp_minor_promo_amount(
     }
 }
 
-/// 金銀打ちが自玉の守りか。同じ筋の玉頭ちょうど2マス前だけ
-/// （quest31 の G*5g）。隣接の S*5h / S*4h や斜めの S*3h は対象外。
-fn own_king_drop_is_defensive(to: Coord, king: Coord, me: Color) -> bool {
+/// 金銀打ちが自玉の守りか。
+/// - 金: 自玉の 8 近傍（quest31-m055 の G*5g / G*5h。玉が 6h に居るとき
+///   5g は斜め隣接。隣接銀打ち S*5h は対象外のまま）
+/// - 銀: 同じ筋の玉頭ちょうど2マスだけ（G*5g 型。S*5h / S*3h は課税）
+fn own_king_drop_is_defensive(role: Role, to: Coord, king: Coord, me: Color) -> bool {
+    if role == Role::Gold && chebyshev(to, king) <= 1 {
+        return true;
+    }
     if to.file != king.file {
         return false;
     }
@@ -913,8 +986,8 @@ fn king_known_approach_amount(
 
 /// 打ちの「仕事」があるか（`hand_asset_w`）。
 ///
-/// - **同じ筋の玉頭ちょうど2マスの金銀**: 守り打ち（quest31 の G*5g。
-///   隣接の S*5h や斜めの S*3h は対象外 = m027）
+/// - **金の自玉 8 近傍** / **銀の玉頭ちょうど2マス**: 守り打ち
+///   （quest31-m055 の G*5g。隣接の S*5h や斜めの S*3h は対象外 = m027）
 /// - **安い駒**（歩香桂）: 裏付け占有への当たり
 /// - **高い駒**: 敵陣かつ玉筋が読めるときの敵玉近接、またはその近くの裏付けへの当たり
 ///
@@ -933,7 +1006,7 @@ fn drop_has_hand_asset_work(
     let me = view.your_color;
     if matches!(role, Role::Gold | Role::Silver) {
         if let Some(k) = king_square(view) {
-            if own_king_drop_is_defensive(to, k, me) {
+            if own_king_drop_is_defensive(role, to, k, me) {
                 return true;
             }
         }
@@ -4283,7 +4356,8 @@ impl Strategy for EstimatorStrategy {
                 || hand_asset_w() > 0.0
                 || promote_far_w() > 0.0
                 || unbacked_camp_w() > 0.0
-                || king_adj_heavy_w() > 0.0)
+                || king_adj_heavy_w() > 0.0
+                || tokin_file_drift_w() > 0.0)
                 .then(|| opp_occupancy_evidence(view, log));
         // 玉接近減点の脅威マス（歴代の非歩打ち反則を含む。上記より広い）
         let king_threats =
@@ -4296,8 +4370,10 @@ impl Strategy for EstimatorStrategy {
         let promote_far_kings: Option<std::collections::BTreeSet<Coord>> =
             ((promote_far_w() > 0.0
                 || king_file_pawn_w() > 0.0
+                || king_file_gold_w() > 0.0
                 || unbacked_camp_w() > 0.0
-                || king_adj_heavy_w() > 0.0)
+                || king_adj_heavy_w() > 0.0
+                || tokin_file_drift_w() > 0.0)
                 && !view.you_in_check)
                 .then(|| crate::deduce::opp_king_candidates(view.your_color, log));
         // 成る王手の露見ペナルティ用玉候補（`promote_check_reveal_w`）。
@@ -4422,34 +4498,37 @@ impl Strategy for EstimatorStrategy {
                     }
                 }
             }
-            // 玉筋の歩前進・打ち（`king_file_pawn_w`）。gain の内側。
-            // 敵陣の歩だけ（7c7b+ / P*7c）。9六歩・4f4g+ は加点しない。
+            // 玉筋の歩前進・打ち（`king_file_pawn_w`）と金打ち（`king_file_gold_w`）。
+            // gain の内側。敵陣の歩だけ（7c7b+ / P*7c）。9六歩・4f4g+ は加点しない。
             if !view.you_in_check {
-                let pw = king_file_pawn_w();
-                if pw > 0.0 {
-                    if let Some(cands) = promote_far_kings.as_ref() {
-                        match mv {
-                            ShogiMove::Board { from, to, .. } => {
-                                let is_pawn = view
-                                    .your_pieces
-                                    .iter()
-                                    .find(|p| p.square == make_usi_square(from))
-                                    .is_some_and(|p| p.role == Role::Pawn);
-                                if is_pawn {
-                                    out.gain +=
-                                        pw * king_file_pawn_amount(from, to, view.your_color, cands);
-                                }
+                if let Some(cands) = promote_far_kings.as_ref() {
+                    let pw = king_file_pawn_w();
+                    let gw = king_file_gold_w();
+                    match mv {
+                        ShogiMove::Board { from, to, .. } if pw > 0.0 => {
+                            let is_pawn = view
+                                .your_pieces
+                                .iter()
+                                .find(|p| p.square == make_usi_square(from))
+                                .is_some_and(|p| p.role == Role::Pawn);
+                            if is_pawn {
+                                out.gain +=
+                                    pw * king_file_pawn_amount(from, to, view.your_color, cands);
                             }
-                            ShogiMove::Drop {
-                                role: Role::Pawn,
-                                to,
-                            } => {
-                                if in_enemy_camp(to, view.your_color) {
-                                    out.gain += pw * king_file_pawn_drop_amount(to, cands);
-                                }
-                            }
-                            _ => {}
                         }
+                        ShogiMove::Drop {
+                            role: Role::Pawn,
+                            to,
+                        } if pw > 0.0 && in_enemy_camp(to, view.your_color) => {
+                            out.gain += pw * king_file_pawn_drop_amount(to, cands);
+                        }
+                        ShogiMove::Drop {
+                            role: Role::Gold,
+                            to,
+                        } if gw > 0.0 && in_enemy_camp(to, view.your_color) => {
+                            out.gain += gw * king_file_pawn_drop_amount(to, cands);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -4487,6 +4566,32 @@ impl Strategy for EstimatorStrategy {
                             .map(|p| p.role);
                         if let Some(role) = role {
                             out.gain -= hw * king_adj_heavy_amount(role, to, cands, backed);
+                        }
+                    }
+                }
+            }
+            // と金の玉筋逸れ（`tokin_file_drift_w`）。盤上のと金移動だけ。
+            if !view.you_in_check {
+                let dw = tokin_file_drift_w();
+                if dw > 0.0 {
+                    if let (Some(cands), Some(backed), ShogiMove::Board { from, to, .. }) =
+                        (promote_far_kings.as_ref(), opp_occ_backed.as_ref(), mv)
+                    {
+                        let is_tokin = view
+                            .your_pieces
+                            .iter()
+                            .find(|p| p.square == make_usi_square(from))
+                            .is_some_and(|p| p.role == Role::Tokin);
+                        if is_tokin {
+                            out.gain -= dw
+                                * exchange_value(Role::Tokin)
+                                * tokin_file_drift_amount(
+                                    from,
+                                    to,
+                                    view.your_color,
+                                    cands,
+                                    backed,
+                                );
                         }
                     }
                 }
@@ -6839,14 +6944,19 @@ fn evaluate(
             let w = hand_asset_w();
             let taxable = match role {
                 Role::Gold | Role::Silver | Role::Knight => true,
-                Role::Bishop | Role::Rook => in_own_camp(to, view.your_color),
+                Role::Bishop | Role::Rook | Role::Pawn => in_own_camp(to, view.your_color),
                 _ => false,
             };
             if w <= 0.0 || !taxable || drop_has_hand_asset_work(view, role, to, backed, cands)
             {
                 0.0
             } else {
-                w * exchange_value(role)
+                let amount = if role == Role::Pawn {
+                    2.0
+                } else {
+                    exchange_value(role)
+                };
+                w * amount
             }
         }
         _ => 0.0,
@@ -8802,7 +8912,8 @@ pub(crate) mod tests {
             ),
             "unfocused king belief must not exempt far-from-own-king drops"
         );
-        // 自玉の玉頭2マス（5g）の金銀は守り打ち。隣接（5h）や斜め（3h）は対象外
+        // 自玉の玉頭2マス（5g）の金銀は守り打ち。銀の隣接（5h）や斜め（3h）は対象外。
+        // 金の隣接（5h）は 8 近傍なので守り（m055 の G*5h）
         assert!(
             drop_has_hand_asset_work(
                 &view,
@@ -8814,14 +8925,24 @@ pub(crate) mod tests {
             "G*5g on the king's file is defensive work"
         );
         assert!(
-            !drop_has_hand_asset_work(
+            drop_has_hand_asset_work(
                 &view,
                 Role::Gold,
                 Coord { file: 5, rank: 8 },
                 &backed,
                 &kings,
             ),
-            "G*5h adjacent to own king is not automatically defensive"
+            "G*5h adjacent to own king is defensive for gold"
+        );
+        assert!(
+            !drop_has_hand_asset_work(
+                &view,
+                Role::Silver,
+                Coord { file: 5, rank: 8 },
+                &backed,
+                &kings,
+            ),
+            "S*5h adjacent to own king is NOT defensive for silver"
         );
         assert!(
             !drop_has_hand_asset_work(
@@ -9210,6 +9331,80 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn tokin_file_drift_taxes_side_file_idle_not_approach() {
+        let mut cands = std::collections::BTreeSet::new();
+        cands.insert(Coord { file: 5, rank: 9 });
+        let backed = [false; 81];
+        let gote = Color::Gote;
+        // 4g4h: 同じ 4 筋の空前進（中央値 5 から距離 1 のまま）
+        let drift = tokin_file_drift_amount(
+            Coord { file: 4, rank: 7 },
+            Coord { file: 4, rank: 8 },
+            gote,
+            &cands,
+            &backed,
+        );
+        assert_eq!(drift, 1.0, "4g4h wanders on a side file");
+        // 2c3b: 5 筋へ近づく
+        let approach = tokin_file_drift_amount(
+            Coord { file: 2, rank: 3 },
+            Coord { file: 3, rank: 2 },
+            Color::Sente,
+            &cands,
+            &backed,
+        );
+        assert_eq!(approach, 0.0, "2c3b approaches the king file");
+        // 5c5b: 玉筋そのもの
+        let on_file = tokin_file_drift_amount(
+            Coord { file: 5, rank: 3 },
+            Coord { file: 5, rank: 2 },
+            Color::Sente,
+            &cands,
+            &backed,
+        );
+        assert_eq!(on_file, 0.0, "tokin on the king file is exempt");
+        // 2a3a 捕獲（裏付けあり）
+        let mut hit = [false; 81];
+        hit[crate::belief_features::sq_index(Coord { file: 3, rank: 1 })] = true;
+        let cap = tokin_file_drift_amount(
+            Coord { file: 2, rank: 1 },
+            Coord { file: 3, rank: 1 },
+            Color::Sente,
+            &cands,
+            &hit,
+        );
+        assert_eq!(cap, 0.0, "backed capture is exempt");
+        // 2c1c: 端へ逃げる
+        let away = tokin_file_drift_amount(
+            Coord { file: 2, rank: 3 },
+            Coord { file: 1, rank: 3 },
+            Color::Sente,
+            &cands,
+            &backed,
+        );
+        assert_eq!(away, 1.0, "2c1c drifts away from the king file");
+    }
+
+    #[test]
+    fn tokin_file_drift_and_king_file_gold_defaults_on() {
+        if std::env::var("TSUITATE_TOKIN_FILE_DRIFT_W").is_err() {
+            assert!((tokin_file_drift_w() - TOKIN_FILE_DRIFT_W).abs() < 1e-12);
+            assert!(TOKIN_FILE_DRIFT_W > 0.0);
+        }
+        if std::env::var("TSUITATE_KING_FILE_GOLD_W").is_err() {
+            assert!((king_file_gold_w() - KING_FILE_GOLD_W).abs() < 1e-12);
+            assert!(KING_FILE_GOLD_W > 0.0);
+        }
+        if std::env::var("TSUITATE_PROMOTE_FAR_W").is_err() {
+            assert!((promote_far_w() - PROMOTE_FAR_W).abs() < 1e-12);
+            assert!((PROMOTE_FAR_W - 4.0).abs() < 1e-12);
+        }
+        if std::env::var("TSUITATE_KING_ADJ_HEAVY_W").is_err() {
+            assert!((KING_ADJ_HEAVY_W - 1.5).abs() < 1e-12);
+        }
+    }
+
+    #[test]
     fn own_camp_minor_promo_taxes_silver_optional_promote() {
         // 後手の 3h4i+（quest31-m046）: 敵陣での任意成り
         let gote = Color::Gote;
@@ -9250,14 +9445,65 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn own_king_drop_defensive_is_head_two_squares() {
+    fn own_king_drop_defensive_gold_adjacent_silver_head_two() {
         let king = Coord { file: 5, rank: 9 };
         let me = Color::Sente;
-        assert!(!own_king_drop_is_defensive(Coord { file: 5, rank: 8 }, king, me));
-        assert!(!own_king_drop_is_defensive(Coord { file: 4, rank: 9 }, king, me));
-        assert!(own_king_drop_is_defensive(Coord { file: 5, rank: 7 }, king, me));
-        assert!(!own_king_drop_is_defensive(Coord { file: 3, rank: 8 }, king, me));
-        assert!(!own_king_drop_is_defensive(Coord { file: 5, rank: 5 }, king, me));
+        // 銀は玉頭2マスだけ
+        assert!(!own_king_drop_is_defensive(
+            Role::Silver,
+            Coord { file: 5, rank: 8 },
+            king,
+            me
+        ));
+        assert!(!own_king_drop_is_defensive(
+            Role::Silver,
+            Coord { file: 4, rank: 9 },
+            king,
+            me
+        ));
+        assert!(own_king_drop_is_defensive(
+            Role::Silver,
+            Coord { file: 5, rank: 7 },
+            king,
+            me
+        ));
+        assert!(!own_king_drop_is_defensive(
+            Role::Silver,
+            Coord { file: 3, rank: 8 },
+            king,
+            me
+        ));
+        // 金は 8 近傍も守り（m055 の G*5h / 斜め G*4h）
+        assert!(own_king_drop_is_defensive(
+            Role::Gold,
+            Coord { file: 5, rank: 8 },
+            king,
+            me
+        ));
+        assert!(own_king_drop_is_defensive(
+            Role::Gold,
+            Coord { file: 4, rank: 9 },
+            king,
+            me
+        ));
+        assert!(own_king_drop_is_defensive(
+            Role::Gold,
+            Coord { file: 5, rank: 7 },
+            king,
+            me
+        ));
+        assert!(!own_king_drop_is_defensive(
+            Role::Gold,
+            Coord { file: 5, rank: 5 },
+            king,
+            me
+        ));
+        assert!(!own_king_drop_is_defensive(
+            Role::Gold,
+            Coord { file: 3, rank: 8 },
+            king,
+            me
+        ));
     }
 
     #[test]
