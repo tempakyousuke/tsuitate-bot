@@ -590,11 +590,11 @@ fn unbacked_gs_capture_w() -> f64 {
 /// m081 の 6c6b / 4a3b+）。
 const UNBACKED_GS_CAPTURE_W: f64 = 1.0;
 
-/// 相手の初期金位置への金銀の当たり（`TSUITATE_HOME_GOLD_ATTACK_W`、既定 0）。
+/// 相手の初期金位置への金銀の当たり（`TSUITATE_HOME_GOLD_ATTACK_W`、既定
+/// `HOME_GOLD_ATTACK_W`）。capture≈0 のときだけ足す。
 ///
-/// 発端は quest31-m046 の 3h4i 不成（10点）。実測で m029 の 4b4a（逃げた
-/// 4a の金への銀）を押し上げて 6.40→4.00 に回帰したため既定オフ。
-/// env から試せる。と金は対象外（m021 の 3a4a）。
+/// 発端は quest31-m046 の 3h4i 不成（10点）。捕獲信念がある 4b4a（m029）へ
+/// 加点すると 3i3h へ流出したため、**粒子が駒を置いていない手に限る**。
 fn home_gold_attack_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -606,7 +606,7 @@ fn home_gold_attack_w() -> f64 {
     })
 }
 
-const HOME_GOLD_ATTACK_W: f64 = 0.0;
+const HOME_GOLD_ATTACK_W: f64 = 3.0;
 
 /// と金が玉筋へ寄る手の加点（`TSUITATE_TOKIN_APPROACH_W`、既定 0）。
 /// 敵陣のと金が、玉候補筋の中央値への筋距離を縮める手へ `w / (1+d_to)` を足す。
@@ -4777,8 +4777,17 @@ impl Strategy for EstimatorStrategy {
                             .find(|p| p.square == make_usi_square(from))
                             .map(|p| p.role);
                         if let Some(role) = role {
-                            out.gain += hw
-                                * home_gold_attack_amount(role, to, view.your_color, backed);
+                            // 粒子が捕獲を信じている手（m029 の 4b4a 幻金）は
+                            // 加点しない。capture=0 の 3h4i だけ事前を足す。
+                            if out.capture_value < 0.5 {
+                                out.gain += hw
+                                    * home_gold_attack_amount(
+                                        role,
+                                        to,
+                                        view.your_color,
+                                        backed,
+                                    );
+                            }
                         }
                     }
                 }
@@ -9697,7 +9706,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_HOME_GOLD_ATTACK_W").is_err() {
             assert!((home_gold_attack_w() - HOME_GOLD_ATTACK_W).abs() < 1e-12);
-            assert_eq!(HOME_GOLD_ATTACK_W, 0.0);
+            assert!((HOME_GOLD_ATTACK_W - 3.0).abs() < 1e-12);
         }
         if std::env::var("TSUITATE_TOKIN_APPROACH_W").is_err() {
             assert!((tokin_approach_w() - TOKIN_APPROACH_W).abs() < 1e-12);
