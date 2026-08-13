@@ -593,8 +593,8 @@ const UNBACKED_GS_CAPTURE_W: f64 = 1.0;
 /// 相手の初期金位置への金銀の当たり（`TSUITATE_HOME_GOLD_ATTACK_W`、既定
 /// `HOME_GOLD_ATTACK_W`）。capture≈0 のときだけ足す。
 ///
-/// 発端は quest31-m046 の 3h4i 不成（10点）。捕獲信念がある 4b4a（m029）へ
-/// 加点すると 3i3h へ流出したため、**粒子が駒を置いていない手に限る**。
+/// 発端は quest31-m046 の 3h4i 不成（10点）。捕獲信念がある手と
+/// move_number<40（m029 の 4b4a）は加点しない。
 fn home_gold_attack_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -4777,9 +4777,9 @@ impl Strategy for EstimatorStrategy {
                             .find(|p| p.square == make_usi_square(from))
                             .map(|p| p.role);
                         if let Some(role) = role {
-                            // 粒子が捕獲を信じている手（m029 の 4b4a 幻金）は
-                            // 加点しない。capture=0 の 3h4i だけ事前を足す。
-                            if out.capture_value < 0.5 {
+                            // 粒子が捕獲を信じている手（m029 の 4b4a）と
+                            // 序盤（初期金はもう逃げている）は加点しない。
+                            if out.capture_value < 0.5 && view.move_number >= 40 {
                                 out.gain += hw
                                     * home_gold_attack_amount(
                                         role,
