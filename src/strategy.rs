@@ -502,6 +502,20 @@ fn king_cand_attack_gate() -> usize {
     })
 }
 
+/// 着地マスの自駒支えへの加点（`TSUITATE_LANDING_SUPPORT_W`、既定 0 = 無効）。
+/// `w × min(着手後の支え枚数, 2)/2` を gain へ加える。`king_cand_attack_w` と
+/// 同じゲート（玉候補が鋭い決定・王手中は無効）で発火する
+fn landing_support_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_LANDING_SUPPORT_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
 /// `promote_far_w` の課税を**全駒種**へ広げるか（`TSUITATE_PROMOTE_FAR_ALL=1`、
 /// 既定 0 = 角・飛だけ）。課税額は着手駒の交換価値で頭打ちにする
 fn promote_far_all() -> bool {
@@ -4088,7 +4102,10 @@ impl Strategy for EstimatorStrategy {
         // 40〜55マスに散らばった候補への近接は「敵陣へ前進」以上の意味を
         // 持たない。王手中は無効（CheckSolver の領分）
         let king_cand_set: Option<std::collections::BTreeSet<Coord>> =
-            ((king_cand_attack_w() > 0.0 || king_cand_check_w() > 0.0) && !view.you_in_check)
+            ((king_cand_attack_w() > 0.0
+                || king_cand_check_w() > 0.0
+                || landing_support_w() > 0.0)
+                && !view.you_in_check)
                 .then(|| {
                     let cands = crate::deduce::opp_king_candidates(view.your_color, log);
                     (!cands.is_empty() && cands.len() <= king_cand_attack_gate()).then_some(cands)
@@ -4272,6 +4289,20 @@ impl Strategy for EstimatorStrategy {
                             out.gain += king_cand_check_w() * frac * 2.0
                                 / (1.0 + exchange_value(role));
                         }
+                    }
+                    // 着地マスの自駒支え（`landing_support_w`）。採点済み eval の
+                    // 局面内回帰で **支え枚数 +0.60点**（0枚 −0.20 / 3枚以上 +0.41）と
+                    // 距離・安さに次ぐ説明力を持つのに、ブラインド決定では
+                    // `expected` ごと取り返しリスクが消えるので同じ情報が評価に
+                    // 残らない。粒子不要（自駒の配置だけで決まる）
+                    if landing_support_w() > 0.0 {
+                        let mut def = f64::from(own_attack[crate::belief_features::sq_index(to)]);
+                        if let ShogiMove::Board { from, .. } = mv {
+                            if own_defends_from(view, from, to) {
+                                def -= 1.0;
+                            }
+                        }
+                        out.gain += landing_support_w() * (def.max(0.0) / 2.0).min(1.0);
                     }
                     // 「同じ仕事なら最安の駒で」（`foul_occ_attack_w` と同じ規約）。
                     // 歩を 1.0 に正規化した安さ係数を掛ける: 裸の銀・金を信念上の
