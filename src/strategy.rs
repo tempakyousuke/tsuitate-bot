@@ -502,6 +502,21 @@ fn king_cand_attack_gate() -> usize {
     })
 }
 
+/// 着手後に着地マスを守っている自駒の枚数（着手駒自身は自分のマスを守れないので
+/// 移動元から着地へ利いていたぶんを引く。`blind_attack_survive_w` と同じ規約）
+fn landing_def(view: &PlayerView, mv: &ShogiMove, own_attack: &[u8; 81]) -> f64 {
+    let to = match *mv {
+        ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+    };
+    let mut def = f64::from(own_attack[crate::belief_features::sq_index(to)]);
+    if let ShogiMove::Board { from, .. } = *mv {
+        if own_defends_from(view, from, to) {
+            def -= 1.0;
+        }
+    }
+    def.max(0.0)
+}
+
 /// 着地マスの自駒支えへの加点（`TSUITATE_LANDING_SUPPORT_W`、既定 0 = 無効）。
 /// `w × min(着手後の支え枚数, 2)/2` を gain へ加える。`king_cand_attack_w` と
 /// 同じゲート（玉候補が鋭い決定・王手中は無効）で発火する
@@ -4296,13 +4311,8 @@ impl Strategy for EstimatorStrategy {
                     // `expected` ごと取り返しリスクが消えるので同じ情報が評価に
                     // 残らない。粒子不要（自駒の配置だけで決まる）
                     if landing_support_w() > 0.0 {
-                        let mut def = f64::from(own_attack[crate::belief_features::sq_index(to)]);
-                        if let ShogiMove::Board { from, .. } = mv {
-                            if own_defends_from(view, from, to) {
-                                def -= 1.0;
-                            }
-                        }
-                        out.gain += landing_support_w() * (def.max(0.0) / 2.0).min(1.0);
+                        let def = landing_def(view, &mv, &own_attack);
+                        out.gain += landing_support_w() * (def / 2.0).min(1.0);
                     }
                     // 「同じ仕事なら最安の駒で」（`foul_occ_attack_w` と同じ規約）。
                     // 歩を 1.0 に正規化した安さ係数を掛ける: 裸の銀・金を信念上の
@@ -4313,7 +4323,16 @@ impl Strategy for EstimatorStrategy {
                     // 採点2）が玉の近くというだけで 40% の加点を受け、
                     // 狙いの「安い駒で寄せる」から外れる（supp 実測の回帰）
                     let cheapness = 2.0 / (1.0 + exchange_value(role));
-                    out.gain += king_cand_attack_w() * prox * cheapness;
+                    // **支えのある接近だけを満額にする**（2026-08-13 の supp2 実測。
+                    // 玉候補の隣というだけで裸の金銀打ちが浮く m145 の G*8c（採点0）
+                    // 対策で、m040 の「無防備な駒を信念上の玉の隣へ置くほど加点が
+                    // 最大になる」と同型の穴）。採点回帰でも支え枚数は +0.60点ある
+                    let support = if landing_support_w() > 0.0 {
+                        0.5 + 0.5 * landing_def(view, &mv, &own_attack).min(2.0) / 2.0
+                    } else {
+                        1.0
+                    };
+                    out.gain += king_cand_attack_w() * prox * cheapness * support;
                 }
             }
             // 歩・角・飛の成る王手の露見ペナルティ（`promote_check_reveal_w`）。
