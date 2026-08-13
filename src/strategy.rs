@@ -601,7 +601,11 @@ const UNBACKED_GS_CAPTURE_W: f64 = 1.0;
 /// 寄せ方: ネット占有 p_occ が盤面平均事前（0.25）を下回るときだけ、
 /// mix = w × (1 − p_occ/0.25) で粒子の p_hit を p_occ へ混ぜ、
 /// 差分ぶんの期待駒得を引く。p_occ≥0.25（ネットも居ると見ている）は
-/// 動かさない = 4七歩成クラスの正しい捕獲を巻き込みにくい。
+/// 動かさない。
+///
+/// **大駒（角飛馬竜）の移動だけ**: 全駒種に掛けると 5試行フル suite が
+/// 5.503→5.379（m029 のと金捕獲・m094 など安い正しい捕獲までネットの
+/// 空き誤認で沈んだ）。金銀は `unbacked_gs_capture_w`、歩桂香は対象外。
 /// 王手中無効・裏付けマスは満額。凍結版はこの名前を知らない。
 fn belief_occ_cap_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -7121,10 +7125,10 @@ fn evaluate(
             0.0
         };
         // 信念ネット占有キャップ（`belief_occ_cap_w`）。質量ゲートの後の残り
-        // 駒得に対して、ネットが空き寄りと見ているマスへの裏付け無し捕獲だけ
-        // 縮める。生存粒子が全員で同じ空きマスに駒を置いてもネットは独立なので
-        // 「自信を持って間違う」を質量では区別できない壁を越えられる。
-        // 金銀キャンセルより先に掛け、残りを gs_unbacked が受け取る（二重控除しない）
+        // 駒得に対して、ネットが空き寄りと見ているマスへの裏付け無し**大駒**
+        // 捕獲だけ縮める。全駒種版は 5.503→5.379 で、と金・歩の正しい捕獲まで
+        // ネットの空き誤認に巻かれた。金銀キャンセルより先に掛け、残りを
+        // gs_unbacked が受け取る（二重控除しない）
         let remaining_after_degen = (capture_ev - material_shrink).max(0.0);
         let belief_occ_shrink = if belief_occ_cap_w() > 0.0
             && !view.you_in_check
@@ -7132,14 +7136,32 @@ fn evaluate(
             && !capture_to_backed
         {
             match (*mv, belief_occ) {
-                (ShogiMove::Board { to, .. }, Some(occ)) => {
-                    let p_occ = occ[crate::belief_features::sq_index(to)];
-                    let shrink =
-                        belief_occ_cap_shrink(remaining_after_degen, p_hit, p_occ, belief_occ_cap_w());
-                    if crate::hits::enabled() {
-                        crate::hits::flag("belief_occ_cap", shrink > 0.05);
+                (ShogiMove::Board { from, to, .. }, Some(occ)) => {
+                    let mover_major = view
+                        .your_pieces
+                        .iter()
+                        .find(|p| p.square == make_usi_square(from))
+                        .is_some_and(|p| {
+                            matches!(
+                                p.role,
+                                Role::Bishop | Role::Rook | Role::Horse | Role::Dragon
+                            )
+                        });
+                    if !mover_major {
+                        0.0
+                    } else {
+                        let p_occ = occ[crate::belief_features::sq_index(to)];
+                        let shrink = belief_occ_cap_shrink(
+                            remaining_after_degen,
+                            p_hit,
+                            p_occ,
+                            belief_occ_cap_w(),
+                        );
+                        if crate::hits::enabled() {
+                            crate::hits::flag("belief_occ_cap", shrink > 0.05);
+                        }
+                        shrink
                     }
-                    shrink
                 }
                 _ => 0.0,
             }
@@ -9798,6 +9820,7 @@ pub(crate) mod tests {
 
     /// 信念ネット占有キャップ: 空き寄り（p_occ < 0.25）のときだけ縮み、
     /// ネットも居ると見ているマスは粒子の捕獲期待値を残す。
+    /// 呼び出し側は大駒の移動に限定する（全駒種は suite 5.379 で不採用）。
     #[test]
     fn belief_occ_cap_shrinks_only_when_net_says_empty() {
         let ev = 5.0;
