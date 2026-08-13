@@ -409,11 +409,12 @@ fn hand_asset_w() -> f64 {
     })
 }
 
-/// 金銀の無目的打ち課税の既定（2026-08-13。PR#1 作業点 0.5 を金銀限定で採用）
-const HAND_ASSET_W: f64 = 0.5;
+/// 金銀の無目的打ち課税の既定（2026-08-13。PR#1 の 0.5 を金銀限定のまま 1.0 へ。
+/// G*5e が 0.5 では link 加点に負けた）
+const HAND_ASSET_W: f64 = 1.0;
 
-/// 玉の既知脅威への接近減点（`TSUITATE_KING_KNOWN_APPROACH_W`、既定 0 = 無効。
-/// quest31 コンボ計測時の作業点は 2）。
+/// 玉の既知脅威への接近減点（`TSUITATE_KING_KNOWN_APPROACH_W`、既定
+/// `KING_KNOWN_APPROACH_W`。0 で切り戻し）。
 /// 観測で位置が確定している敵駒マスへ近づく玉の手へ `w × Δcloseness` を
 /// gain から引く。quest31-m099 の 6八玉（既知の 5六へ筋だけ寄る）が発端。
 /// 脅威マスは `king_threat_evidence`（捕獲マス＋歴代の非歩打ち反則）。
@@ -426,9 +427,13 @@ fn king_known_approach_w() -> f64 {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.0)
+            .unwrap_or(KING_KNOWN_APPROACH_W)
     })
 }
+
+/// 玉の既知脅威接近の既定（2026-08-13。quest31-m099 の 7g6h 対策）。
+/// PR#1 作業点 2.0 の半分。0 で切り戻し
+const KING_KNOWN_APPROACH_W: f64 = 1.0;
 
 /// 大駒成りの遠方ペナルティ（`TSUITATE_PROMOTE_FAR_W`、既定 0 = 無効。
 /// quest31 コンボ計測時の作業点は 1.0）。
@@ -478,7 +483,7 @@ fn king_file_pawn_w() -> f64 {
     })
 }
 
-const KING_FILE_PAWN_W: f64 = 1.2;
+const KING_FILE_PAWN_W: f64 = 0.6;
 
 /// 裏付け無しの敵陣進入課税（`TSUITATE_UNBACKED_CAMP_W`、既定
 /// `UNBACKED_CAMP_W`）。歩・香・桂・玉以外が、観測裏付けの無い敵陣マスへ
@@ -2503,10 +2508,8 @@ impl Default for EvalParams {
             // 0 で従来挙動へ切り戻し。w=10 × capture_reveal_risk ≒ 1.3点の
             // リスク床で、玉でしか取れない駒の捕獲は gain が勝って生き残る
             king_capture_reveal: 10.0,
-            // 成りポテンシャルの敵玉近接重み（2026-08-13 既定 0.5。
-            // 単独では m083 を動かさなかったが、king_file_pawn と組み合わせて
-            // 7六歩側の promo を引き上げる。0 で切り戻し）
-            promo_king_prox: 0.5,
+            // 成りポテンシャルの敵玉近接重み。0.5 は序盤の 6六歩へ逃避したため既定 0
+            promo_king_prox: 0.0,
             // 打ち反則で確定した駒への当たり（2026-08-07 実装、2026-08-08 採用）。
             // 0 で従来挙動へ切り戻し。drop_probe_w（情報を買う）の回収側
             foul_occ_attack_w: 2.0,
@@ -8806,6 +8809,14 @@ pub(crate) mod tests {
             king_file_pawn_drop_amount(Coord { file: 7, rank: 3 }, &all),
             0.0
         );
+    }
+
+    #[test]
+    fn king_known_approach_w_default_on() {
+        let w = std::env::var("TSUITATE_KING_KNOWN_APPROACH_W").ok();
+        if w.is_none() {
+            assert!((king_known_approach_w() - KING_KNOWN_APPROACH_W).abs() < 1e-12);
+        }
     }
 
     #[test]

@@ -680,14 +680,16 @@
     - 既定オン: `LINK_ENDGAME_DAMPEN=40` / `PROMOTE_FAR_W=1.5` /
       `material_degen_q0=0.3` / `GEN_NONPROMOTE` / `PROMO_RISK_PREROLE` /
       `CAPTURE_RETREAT_W=0.08` / `promo_king_prox=0.5`
-    - `TSUITATE_KING_FILE_PAWN_W`（既定 1.2）: 玉候補筋の**中央値**±2、かつ
+    - `TSUITATE_KING_FILE_PAWN_W`（既定 0.6）: 玉候補筋の**中央値**±2、かつ
       中央値±2 に候補の 2/3 以上（`king_files_focused`）。成りは対象外
     - `TSUITATE_UNBACKED_CAMP_W`（既定 0.8）: 歩香桂以外の裏付け無し敵陣進入
-    - `TSUITATE_HAND_ASSET_W`（既定 0.5、**金銀の打ちだけ**）: 自玉2マス以内
+    - `TSUITATE_HAND_ASSET_W`（既定 1.0、**金銀の打ちだけ**）: 自玉2マス以内
       は守り打ちとして免税。飛香桂歩は kakudo / tether 回帰回避で対象外
     - `TSUITATE_PROMOTE_CHECK_REVEAL_W`（既定 1.2）: 成る王手の露見。玉筋が
       読める局面だけ（4七歩成クラスを巻き込まない）
-    - 切り戻しは各 env を 0 に。`KING_KNOWN_APPROACH` は既定0のまま
+    - `TSUITATE_KING_KNOWN_APPROACH_W`（既定 1.0）: 既知脅威へ近づく玉の手
+    - `promo_king_prox` は 0.5 が序盤 6六歩へ逃避したため既定 0 のまま
+    - 切り戻しは各 env を 0 に
   - `TSUITATE_BLIND_HOME_RISK_W`（既定 0 = 無効）— **ブラインド進入リスク**
     （2026-08-09、quest31 の 1三角成 = 初期位置の歩へ成り込み1一の香に
     取り返される歩角交換、が発端。ユーザー指摘）。厳密粒子ゼロの決定では
