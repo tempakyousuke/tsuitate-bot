@@ -598,14 +598,14 @@ const UNBACKED_GS_CAPTURE_W: f64 = 1.0;
 /// 粒子より当たる（対数損失 0.62→0.38）ので、**観測裏付けの無い捕獲**の
 /// 期待駒得をネット占有へ安全方向だけ寄せる。
 ///
-/// 寄せ方: ネット占有 p_occ が盤面平均事前（0.25）を下回るときだけ、
-/// mix = w × (1 − p_occ/0.25) で粒子の p_hit を p_occ へ混ぜ、
-/// 差分ぶんの期待駒得を引く。p_occ≥0.25（ネットも居ると見ている）は
-/// 動かさない。
+/// 寄せ方: 粒子の p_hit がネット占有 p_occ を 0.3 以上上回るときだけ
+/// （自信過剰）、mix=w で p_hit を p_occ へ混ぜて差分ぶんの期待駒得を引く。
+/// 空き寄りゲート（p_occ<0.25）は 4a3b+ を逃がした: 敵陣のマスはネットも
+/// 「何か居る」と見なすことが多く、幻の駒種までは分からない。
 ///
-/// **大駒（角飛馬竜）の移動だけ**: 全駒種に掛けると 5試行フル suite が
-/// 5.503→5.379（m029 のと金捕獲・m094 など安い正しい捕獲までネットの
-/// 空き誤認で沈んだ）。金銀は `unbacked_gs_capture_w`、歩桂香は対象外。
+/// **大駒（角飛馬竜）の移動だけ**: 全駒種＋空き寄りは 5.503→5.379
+/// （m029 のと金捕獲まで沈んだ）。大駒＋空き寄りは 5.596 で 4a3b+ は残存。
+/// 金銀は `unbacked_gs_capture_w`、歩桂香は対象外。
 /// 王手中無効・裏付けマスは満額。凍結版はこの名前を知らない。
 fn belief_occ_cap_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -619,21 +619,21 @@ fn belief_occ_cap_w() -> f64 {
 }
 
 const BELIEF_OCC_CAP_W: f64 = 1.0;
-/// 信念ネットが「空き寄り」と見なす占有の上界。これ以上なら粒子の
-/// p_hit を上書きしない（盤面平均 prior_occ ≈ 0.21 の少し上）。
-const BELIEF_OCC_EMPTY_PRIOR: f64 = 0.25;
+/// 粒子占有がネットをどれだけ上回ったら自信過剰とみなすか。
+/// これ未満の差はネットの較正誤差として触らない。
+const BELIEF_OCC_OVERCONF_GAP: f64 = 0.3;
 
-/// 裏付け無し捕獲の期待駒得を、信念ネット占有が空き寄りのときだけ縮める。
+/// 裏付け無し捕獲の期待駒得を、粒子がネットより自信過剰なとき縮める。
 /// `capture_ev` = 粒子の E[捕獲価値]、`p_hit` = 粒子の占有率、`p_occ` = ネット。
 fn belief_occ_cap_shrink(capture_ev: f64, p_hit: f64, p_occ: f64, w: f64) -> f64 {
     if w <= 0.0 || capture_ev <= 0.0 || p_hit <= 1e-9 {
         return 0.0;
     }
-    let empty = ((BELIEF_OCC_EMPTY_PRIOR - p_occ) / BELIEF_OCC_EMPTY_PRIOR).clamp(0.0, 1.0);
-    if empty <= 0.0 {
+    let gap = p_hit - p_occ;
+    if gap < BELIEF_OCC_OVERCONF_GAP {
         return 0.0;
     }
-    let mix = (w * empty).clamp(0.0, 1.0);
+    let mix = w.clamp(0.0, 1.0);
     let effective_p = (1.0 - mix) * p_hit + mix * p_occ.min(p_hit);
     capture_ev * (1.0 - effective_p / p_hit).max(0.0)
 }
@@ -7125,10 +7125,9 @@ fn evaluate(
             0.0
         };
         // 信念ネット占有キャップ（`belief_occ_cap_w`）。質量ゲートの後の残り
-        // 駒得に対して、ネットが空き寄りと見ているマスへの裏付け無し**大駒**
-        // 捕獲だけ縮める。全駒種版は 5.503→5.379 で、と金・歩の正しい捕獲まで
-        // ネットの空き誤認に巻かれた。金銀キャンセルより先に掛け、残りを
-        // gs_unbacked が受け取る（二重控除しない）
+        // 駒得に対して、粒子がネットより自信過剰な大駒の裏付け無し捕獲だけ
+        // 縮める。空き寄りゲートは 4a3b+ を逃がした（敵陣はネットも占有寄り）。
+        // 金銀キャンセルより先に掛け、残りを gs_unbacked が受け取る（二重控除しない）
         let remaining_after_degen = (capture_ev - material_shrink).max(0.0);
         let belief_occ_shrink = if belief_occ_cap_w() > 0.0
             && !view.you_in_check
@@ -9818,30 +9817,32 @@ pub(crate) mod tests {
         }
     }
 
-    /// 信念ネット占有キャップ: 空き寄り（p_occ < 0.25）のときだけ縮み、
-    /// ネットも居ると見ているマスは粒子の捕獲期待値を残す。
-    /// 呼び出し側は大駒の移動に限定する（全駒種は suite 5.379 で不採用）。
+    /// 信念ネット占有キャップ: 粒子がネットより 0.3 以上自信過剰なときだけ縮む。
+    /// 呼び出し側は大駒の移動に限定する。
     #[test]
     fn belief_occ_cap_shrinks_only_when_net_says_empty() {
         let ev = 5.0;
-        // ネットも居る（0.40 ≥ 0.25）→ 縮まない
-        assert_eq!(belief_occ_cap_shrink(ev, 1.0, 0.40, 1.0), 0.0);
-        // 完全な空き → 全額
+        // 差が小さい（0.15 < 0.3）→ 縮まない
+        assert_eq!(belief_occ_cap_shrink(ev, 1.0, 0.85, 1.0), 0.0);
+        // ネットも同じ → 縮まない
+        assert_eq!(belief_occ_cap_shrink(ev, 0.40, 0.40, 1.0), 0.0);
+        // 完全な空き・粒子 p=1 → 全額
         let empty = belief_occ_cap_shrink(ev, 1.0, 0.0, 1.0);
         assert!(
             (empty - ev).abs() < 1e-9,
             "p_occ=0 は幻の駒得を全額キャンセル: {empty}"
         );
-        // 裾の空き（m067 型）: mix = 1-0.05/0.25 = 0.8、effective_p = 0.2+0.8*0.05 = 0.24
-        let tail = belief_occ_cap_shrink(ev, 1.0, 0.05, 1.0);
+        // 4a3b+ 型: ネットも「居そう」(0.40) だが粒子は 1.00。空き寄りゲート
+        // だと逃げる。gap=0.60 ≥ 0.3 なので w=1 なら 60% 縮小。
+        let over = belief_occ_cap_shrink(ev, 1.0, 0.40, 1.0);
         assert!(
-            (tail - ev * 0.76).abs() < 1e-9,
-            "p_occ=0.05 は 76% 縮小: {tail}"
+            (over - ev * 0.60).abs() < 1e-9,
+            "p_occ=0.40 vs p_hit=1 は 60% 縮小: {over}"
         );
         // w=0 は無効
         assert_eq!(belief_occ_cap_shrink(ev, 1.0, 0.0, 0.0), 0.0);
-        // 裏付け相当: p_hit が既にネット以下なら縮まない
-        assert_eq!(belief_occ_cap_shrink(ev, 0.05, 0.05, 1.0), 0.0);
+        // p_hit が既にネット以下なら縮まない
+        assert_eq!(belief_occ_cap_shrink(ev, 0.05, 0.40, 1.0), 0.0);
     }
 
     #[test]
