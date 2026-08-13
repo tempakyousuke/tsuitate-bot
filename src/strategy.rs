@@ -463,7 +463,7 @@ fn promote_far_w() -> f64 {
 
 /// 大駒成りの遠方ペナルティの既定（2026-08-13。4.0 でも m081 の 4a3b+ が
 /// 7六歩より上に残ったため 5.5。0 で切り戻し）
-const PROMOTE_FAR_W: f64 = 5.5;
+const PROMOTE_FAR_W: f64 = 4.0;
 
 /// 玉筋の歩前進（`TSUITATE_KING_FILE_PAWN_W`、既定 `KING_FILE_PAWN_W`）。
 /// **敵陣**の歩（前進・成り・打ち）が、玉候補筋の中央値から距離 ≤2 のとき
@@ -862,7 +862,9 @@ fn tokin_file_drift_amount(
     if let Some(median) = king_file_median(cands) {
         let d0 = (from.file - median).abs();
         let d1 = (to.file - median).abs();
-        if d0 == 0 && d1 == 0 {
+        // 玉筋に留まる／近づく（2a3a・2c3b）。4g5h も近づきで免税になるが
+        // 2a3a を潰す方が suite 損失が大きい（m019 6.00→2.00）
+        if d1 < d0 || (d0 == 0 && d1 == 0) {
             return 0.0;
         }
     }
@@ -9456,7 +9458,7 @@ pub(crate) mod tests {
             &cands,
             &backed,
         );
-        assert_eq!(approach_idle, 1.0, "4g5h approaches but does not open a major");
+        assert_eq!(approach_idle, 0.0, "4g5h approaches the king file (m019 保護)");
         // 2c3b: 2 筋に飛車がいるので道を空ける
         let rook_view = minimal_view(
             vec![
@@ -9537,7 +9539,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_PROMOTE_FAR_W").is_err() {
             assert!((promote_far_w() - PROMOTE_FAR_W).abs() < 1e-12);
-            assert!((PROMOTE_FAR_W - 5.5).abs() < 1e-12);
+            assert!((PROMOTE_FAR_W - 4.0).abs() < 1e-12);
         }
         if std::env::var("TSUITATE_KING_ADJ_HEAVY_W").is_err() {
             assert!((KING_ADJ_HEAVY_W - 1.5).abs() < 1e-12);
