@@ -690,7 +690,7 @@
     - `TSUITATE_OWN_CAMP_MINOR_PROMO_W`（既定 1.2）: 桂銀香の任意成りを課税
       （m046 の 3h4i+ vs 不成）
     - `TSUITATE_HAND_ASSET_W`（既定 1.0）: 金銀桂の無目的打ち＋自陣への角飛打ち。
-      金銀の守り打ちは自玉隣接または玉頭2マスだけ免税（S*3h は課税）。
+      金銀の守り打ちは同じ筋の玉頭2マスだけ免税（S*5h / S*3h は課税、G*5g は免税）。
       敵玉近接は敵陣かつ focused のときだけ
     - `TSUITATE_PROMOTE_CHECK_REVEAL_W`（既定 1.2）
     - `TSUITATE_KING_KNOWN_APPROACH_W`（既定 1.0）

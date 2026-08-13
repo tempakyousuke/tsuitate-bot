@@ -830,7 +830,20 @@ fn king_adj_heavy_amount(
         chebyshev(to, k) <= 1 && (k.file - median).abs() <= 2
     });
     if !adjacent {
-        return 0.0;
+        // 玉筋から外れたと金・金銀（2c1c 型）。隣接税の対象外でも
+        // 端へ逃げる高い駒は沈める
+        let off_file = matches!(
+            role,
+            Role::Tokin
+                | Role::Gold
+                | Role::Silver
+                | Role::Promotedlance
+                | Role::Promotedknight
+                | Role::Promotedsilver
+        ) && (to.file - median).abs() > 2;
+        if !off_file {
+            return 0.0;
+        }
     }
     exchange_value(role)
 }
@@ -856,13 +869,9 @@ fn own_camp_minor_promo_amount(
     }
 }
 
-/// 金銀打ちが自玉の守りか。隣接、または同じ筋の玉頭（1〜2マス前）。
-/// 斜め2マス（S*3h vs 5i）は守りの穴埋めにならないので対象外。
+/// 金銀打ちが自玉の守りか。同じ筋の玉頭ちょうど2マス前だけ
+/// （quest31 の G*5g）。隣接の S*5h / S*4h や斜めの S*3h は対象外。
 fn own_king_drop_is_defensive(to: Coord, king: Coord, me: Color) -> bool {
-    let d = chebyshev(to, king);
-    if d <= 1 {
-        return true;
-    }
     if to.file != king.file {
         return false;
     }
@@ -870,7 +879,7 @@ fn own_king_drop_is_defensive(to: Coord, king: Coord, me: Color) -> bool {
         Color::Sente => king.rank - to.rank,
         Color::Gote => to.rank - king.rank,
     };
-    d == 2 && forward > 0 && forward <= 2
+    forward == 2
 }
 
 /// 玉の既知脅威への接近量（`king_known_approach_w` の材料）。
@@ -904,8 +913,8 @@ fn king_known_approach_amount(
 
 /// 打ちの「仕事」があるか（`hand_asset_w`）。
 ///
-/// - **自玉隣接 / 同じ筋の玉頭 2 マス以内の金銀**: 守り打ち
-///   （quest31-m055 の G*5g。S*3h のような斜め2マスは対象外 = m027）
+/// - **同じ筋の玉頭ちょうど2マスの金銀**: 守り打ち（quest31 の G*5g。
+///   隣接の S*5h や斜めの S*3h は対象外 = m027）
 /// - **安い駒**（歩香桂）: 裏付け占有への当たり
 /// - **高い駒**: 敵陣かつ玉筋が読めるときの敵玉近接、またはその近くの裏付けへの当たり
 ///
@@ -8793,18 +8802,7 @@ pub(crate) mod tests {
             ),
             "unfocused king belief must not exempt far-from-own-king drops"
         );
-        // 自玉隣接の金銀は、敵玉が拡散していても守り打ちとして仕事
-        assert!(
-            drop_has_hand_asset_work(
-                &view,
-                Role::Gold,
-                Coord { file: 5, rank: 8 },
-                &backed,
-                &kings,
-            ),
-            "G*5h next to own king 5i is defensive work"
-        );
-        // 同じ筋の玉頭（5g）も守り。斜め2マス（3h）は対象外
+        // 自玉の玉頭2マス（5g）の金銀は守り打ち。隣接（5h）や斜め（3h）は対象外
         assert!(
             drop_has_hand_asset_work(
                 &view,
@@ -8814,6 +8812,16 @@ pub(crate) mod tests {
                 &kings,
             ),
             "G*5g on the king's file is defensive work"
+        );
+        assert!(
+            !drop_has_hand_asset_work(
+                &view,
+                Role::Gold,
+                Coord { file: 5, rank: 8 },
+                &backed,
+                &kings,
+            ),
+            "G*5h adjacent to own king is not automatically defensive"
         );
         assert!(
             !drop_has_hand_asset_work(
@@ -9161,6 +9169,16 @@ pub(crate) mod tests {
             &backed,
         );
         assert_eq!(three_b, 0.0, "2c3b is chebyshev 2 from 5a");
+        let one_c = king_adj_heavy_amount(
+            Role::Tokin,
+            Coord { file: 1, rank: 3 },
+            &cands,
+            &backed,
+        );
+        assert!(
+            (one_c - exchange_value(Role::Tokin)).abs() < 1e-9,
+            "2c1c is off the king file: {one_c}"
+        );
         let pawn = king_adj_heavy_amount(
             Role::Pawn,
             Coord { file: 4, rank: 1 },
@@ -9232,11 +9250,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn own_king_drop_defensive_is_adjacent_or_head() {
+    fn own_king_drop_defensive_is_head_two_squares() {
         let king = Coord { file: 5, rank: 9 };
         let me = Color::Sente;
-        assert!(own_king_drop_is_defensive(Coord { file: 5, rank: 8 }, king, me));
-        assert!(own_king_drop_is_defensive(Coord { file: 4, rank: 9 }, king, me));
+        assert!(!own_king_drop_is_defensive(Coord { file: 5, rank: 8 }, king, me));
+        assert!(!own_king_drop_is_defensive(Coord { file: 4, rank: 9 }, king, me));
         assert!(own_king_drop_is_defensive(Coord { file: 5, rank: 7 }, king, me));
         assert!(!own_king_drop_is_defensive(Coord { file: 3, rank: 8 }, king, me));
         assert!(!own_king_drop_is_defensive(Coord { file: 5, rank: 5 }, king, me));
