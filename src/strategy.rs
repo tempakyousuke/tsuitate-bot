@@ -507,9 +507,8 @@ const KING_FILE_GOLD_W: f64 = 0.0;
 /// 動く手へ `w × exchange_value(Tokin)` を gain から引く。
 ///
 /// 発端は quest31-m046 の 4g4h / 4g5h（採点 2）vs 3h4i 不成（10）。
-/// 4g5h は中央値 5 筋へ近づくので「距離が縮まない」判定だと免税になる。
-/// 免税は ①玉筋上に留まる ②自陣の大駒が居る筋を空ける（2c3b で飛車の道）
-/// ③裏付け捕獲、だけ。王手中無効・粒子不要。
+/// 4g5h は中央値 5 筋へ近づくので免税。相手最奥段（2a1a の香取り）も免税。
+/// その他の空きマス移動（4g4h・2c1c）は課税。王手中無効・粒子不要。
 fn tokin_file_drift_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -521,7 +520,7 @@ fn tokin_file_drift_w() -> f64 {
     })
 }
 
-const TOKIN_FILE_DRIFT_W: f64 = 0.0;
+const TOKIN_FILE_DRIFT_W: f64 = 0.8;
 
 /// 自陣の金銀桂の空きマス移動課税（`TSUITATE_OWN_CAMP_IDLE_W`、既定
 /// `OWN_CAMP_IDLE_W`。0 で切り戻し）。自陣への非捕獲移動へ
@@ -635,8 +634,8 @@ const TOKIN_APPROACH_W: f64 = 0.0;
 /// 発端は quest31-m021 の 4一と（3a4a）。unbacked_camp のと金課税は
 /// 本命の 2c3b（敵陣のと金移動）まで同じ税が乗って相対差が消える。
 /// こちらは玉隣だけなので 4a（5a の 8 近傍）は沈み、3b（チェビシェフ 2）は
-/// 免税。筋外れ課税は m019 の 2a1a（6点）を 9六歩へ流出させたため入れない。
-/// 打ちは HAND_ASSET / drop_probe の領分（S*4b を巻き込まない）。
+/// 免税。筋外れのと金（2c1c）は課税するが、相手最奥段（2a1a の香取り）は
+/// 免税。打ちは HAND_ASSET / drop_probe の領分（S*4b を巻き込まない）。
 /// 歩は対象外（4七歩成を巻き込まない = 旧 `king_adj_entry_w` の失敗）。
 /// 玉筋が読めていない序盤では発火しない。王手中無効・粒子不要。
 /// 凍結版はこの名前を知らない。
@@ -849,6 +848,14 @@ fn in_own_camp(to: Coord, me: Color) -> bool {
     }
 }
 
+/// 相手の最奥段（先手なら 1 段目、後手なら 9 段目）。香・金の初期位置。
+fn on_enemy_back_rank(to: Coord, me: Color) -> bool {
+    match me {
+        Color::Sente => to.rank == 1,
+        Color::Gote => to.rank == 9,
+    }
+}
+
 /// 玉候補の筋の中央値。空なら None。
 fn king_file_median(cands: &std::collections::BTreeSet<Coord>) -> Option<i8> {
     let n = cands.len();
@@ -921,6 +928,10 @@ fn tokin_file_drift_amount(
         return 0.0;
     }
     if backed[crate::belief_features::sq_index(to)] {
+        return 0.0;
+    }
+    // 相手最奥段の香・金取り（m019 の 2a1a）は逸れではない
+    if on_enemy_back_rank(to, me) {
         return 0.0;
     }
     if let Some(median) = king_file_median(cands) {
@@ -1065,6 +1076,7 @@ fn own_camp_idle_amount(
 fn king_adj_heavy_amount(
     role: Role,
     to: Coord,
+    me: Color,
     cands: &std::collections::BTreeSet<Coord>,
     backed: &[bool; 81],
 ) -> f64 {
@@ -1085,7 +1097,20 @@ fn king_adj_heavy_amount(
         chebyshev(to, k) <= 1 && (k.file - median).abs() <= 2
     });
     if !adjacent {
-        return 0.0;
+        // 玉筋から外れたと金（2c1c）。最奥段の香取り（2a1a）は免税
+        let off_file = matches!(
+            role,
+            Role::Tokin
+                | Role::Gold
+                | Role::Silver
+                | Role::Promotedlance
+                | Role::Promotedknight
+                | Role::Promotedsilver
+        ) && (to.file - median).abs() > 2
+            && !on_enemy_back_rank(to, me);
+        if !off_file {
+            return 0.0;
+        }
     }
     exchange_value(role)
 }
@@ -4795,7 +4820,7 @@ impl Strategy for EstimatorStrategy {
                             .find(|p| p.square == make_usi_square(from))
                             .map(|p| p.role);
                         if let Some(role) = role {
-                            out.gain -= hw * king_adj_heavy_amount(role, to, cands, backed);
+                            out.gain -= hw * king_adj_heavy_amount(role, to, view.your_color, cands, backed);
                         }
                     }
                 }
@@ -9687,9 +9712,11 @@ pub(crate) mod tests {
         let mut cands = std::collections::BTreeSet::new();
         cands.insert(Coord { file: 5, rank: 1 });
         let backed = [false; 81];
+        let me = Color::Sente;
         let four_a = king_adj_heavy_amount(
             Role::Tokin,
             Coord { file: 4, rank: 1 },
+            me,
             &cands,
             &backed,
         );
@@ -9700,6 +9727,7 @@ pub(crate) mod tests {
         let three_b = king_adj_heavy_amount(
             Role::Tokin,
             Coord { file: 3, rank: 2 },
+            me,
             &cands,
             &backed,
         );
@@ -9707,16 +9735,26 @@ pub(crate) mod tests {
         let one_c = king_adj_heavy_amount(
             Role::Tokin,
             Coord { file: 1, rank: 3 },
+            me,
             &cands,
             &backed,
         );
-        assert_eq!(
-            one_c, 0.0,
-            "2c1c is chebyshev 4 from 5a, not adjacent (off-file tax sank m019 2a1a)"
+        assert!(
+            (one_c - exchange_value(Role::Tokin)).abs() < 1e-9,
+            "2c1c is off the king file: {one_c}"
         );
+        let one_a = king_adj_heavy_amount(
+            Role::Tokin,
+            Coord { file: 1, rank: 1 },
+            me,
+            &cands,
+            &backed,
+        );
+        assert_eq!(one_a, 0.0, "2a1a is enemy back rank (lance take)");
         let pawn = king_adj_heavy_amount(
             Role::Pawn,
             Coord { file: 4, rank: 1 },
+            me,
             &cands,
             &backed,
         );
@@ -9727,6 +9765,7 @@ pub(crate) mod tests {
             king_adj_heavy_amount(
                 Role::Tokin,
                 Coord { file: 4, rank: 1 },
+                me,
                 &cands,
                 &backed_hit
             ),
@@ -9738,7 +9777,7 @@ pub(crate) mod tests {
             .flat_map(|file| (1..=9).map(move |rank| Coord { file, rank }))
             .collect();
         assert_eq!(
-            king_adj_heavy_amount(Role::Tokin, Coord { file: 4, rank: 1 }, &all, &backed),
+            king_adj_heavy_amount(Role::Tokin, Coord { file: 4, rank: 1 }, me, &all, &backed),
             0.0,
             "unfocused king files must not fire"
         );
@@ -9820,6 +9859,15 @@ pub(crate) mod tests {
             &hit,
         );
         assert_eq!(cap, 0.0, "backed capture is exempt");
+        let lance_take = tokin_file_drift_amount(
+            &gote_view,
+            Coord { file: 2, rank: 1 },
+            Coord { file: 1, rank: 1 },
+            Color::Sente,
+            &cands,
+            &backed,
+        );
+        assert_eq!(lance_take, 0.0, "2a1a is enemy back rank (lance take)");
     }
 
     #[test]
@@ -9848,7 +9896,7 @@ pub(crate) mod tests {
     fn tokin_file_drift_and_promote_far_defaults() {
         if std::env::var("TSUITATE_TOKIN_FILE_DRIFT_W").is_err() {
             assert!((tokin_file_drift_w() - TOKIN_FILE_DRIFT_W).abs() < 1e-12);
-            assert!(TOKIN_FILE_DRIFT_W == 0.0);
+            assert!((TOKIN_FILE_DRIFT_W - 0.8).abs() < 1e-12);
         }
         if std::env::var("TSUITATE_KING_FILE_GOLD_W").is_err() {
             assert!((king_file_gold_w() - KING_FILE_GOLD_W).abs() < 1e-12);
