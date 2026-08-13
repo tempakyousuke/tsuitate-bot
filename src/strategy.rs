@@ -525,8 +525,9 @@ const TOKIN_FILE_DRIFT_W: f64 = 1.2;
 /// `OWN_CAMP_IDLE_W`。0 で切り戻し）。自陣への非捕獲移動へ
 /// `w × exchange_value` を gain から引く。
 ///
-/// 発端は quest31-m046 の 7a7b（link 加点で 3h4i 不成を押しのける、採点 2）。
-/// 敵陣への銀移動（3h4i）は対象外。王手中無効・粒子不要。
+/// 発端は quest31-m046 の 7a7b。**既定 0**: m027 の 3i3h（採点 7 の銀繰り出し）
+/// まで同じ税が乗り、9六歩へ流出した。7a7b と 3i3h はどちらも「自陣から
+/// 一歩前進」なので幾何では区別できない。env から試せる。
 fn own_camp_idle_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -538,7 +539,7 @@ fn own_camp_idle_w() -> f64 {
     })
 }
 
-const OWN_CAMP_IDLE_W: f64 = 0.15;
+const OWN_CAMP_IDLE_W: f64 = 0.0;
 
 /// 裏付け無しの敵陣進入課税（`TSUITATE_UNBACKED_CAMP_W`、既定
 /// `UNBACKED_CAMP_W`）。歩・香・桂・玉以外が、観測裏付けの無い敵陣マスへ
@@ -9543,7 +9544,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_OWN_CAMP_IDLE_W").is_err() {
             assert!((own_camp_idle_w() - OWN_CAMP_IDLE_W).abs() < 1e-12);
-            assert!(OWN_CAMP_IDLE_W > 0.0);
+            assert_eq!(OWN_CAMP_IDLE_W, 0.0);
         }
     }
 

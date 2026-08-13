@@ -692,8 +692,8 @@
       4一と（3a4a）対策。0.5 では suite で 3a4a が残った。打ちと歩は対象外
     - `TSUITATE_TOKIN_FILE_DRIFT_W`（既定 1.2）: 敵陣のと金の空きマス移動を
       課税。玉筋に留まる・大駒の筋を空ける（2c3b）・裏付け捕獲は免税
-    - `TSUITATE_OWN_CAMP_IDLE_W`（既定 0.15）: 自陣の金銀桂の非捕獲移動
-      （m046 の 7a7b）
+    - `TSUITATE_OWN_CAMP_IDLE_W`（既定 0）: 自陣の金銀桂の非捕獲移動。
+      m046 の 7a7b 用に入れたが m027 の 3i3h を巻き込むためオフ
     - `TSUITATE_OWN_CAMP_MINOR_PROMO_W`（既定 1.2）: 桂銀香の任意成りを課税
       （m046 の 3h4i+ vs 不成）
     - `TSUITATE_HAND_ASSET_W`（既定 1.0）: 金銀桂の無目的打ち＋自陣への角飛・歩打ち。
