@@ -461,9 +461,9 @@ fn promote_far_w() -> f64 {
     })
 }
 
-/// 大駒成りの遠方ペナルティの既定（2026-08-13。2.5 でも 4a3b+ が
-/// m081/m083/m085 で残ったため 4.0。0 で切り戻し）
-const PROMOTE_FAR_W: f64 = 4.0;
+/// 大駒成りの遠方ペナルティの既定（2026-08-13。4.0 でも m081 の 4a3b+ が
+/// 7六歩より上に残ったため 5.5。0 で切り戻し）
+const PROMOTE_FAR_W: f64 = 5.5;
 
 /// 玉筋の歩前進（`TSUITATE_KING_FILE_PAWN_W`、既定 `KING_FILE_PAWN_W`）。
 /// **敵陣**の歩（前進・成り・打ち）が、玉候補筋の中央値から距離 ≤2 のとき
@@ -483,12 +483,10 @@ fn king_file_pawn_w() -> f64 {
 
 const KING_FILE_PAWN_W: f64 = 1.2;
 
-/// 玉筋の金打ち（`TSUITATE_KING_FILE_GOLD_W`、既定 `KING_FILE_GOLD_W`）。
+/// 玉筋の金打ち（`TSUITATE_KING_FILE_GOLD_W`、既定 0）。
 /// 敵陣かつ玉候補筋の中央値から距離 ≤2 の金打ちへ `w / (1+d_file)` を
-/// gain に足す（quest31-m101 の G*7c）。歩成（7d7c+）は `king_file_pawn`
-/// で加点されるので、金打ち側にも同じ形の加点が要る。銀は対象外
-/// （m117 の S*7c が P*7c を押しのける）。王手中無効・粒子不要。
-/// 凍結版はこの名前を知らない。
+/// gain に足す。m101 で G*8c / G*8a（0点）を玉筋として押し上げ
+/// 2.40→0.80 に回帰したため既定オフ。env から試せる。銀は対象外。
 fn king_file_gold_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -500,18 +498,16 @@ fn king_file_gold_w() -> f64 {
     })
 }
 
-const KING_FILE_GOLD_W: f64 = 2.5;
+const KING_FILE_GOLD_W: f64 = 0.0;
 
 /// と金の玉筋逸れ（`TSUITATE_TOKIN_FILE_DRIFT_W`、既定
-/// `TOKIN_FILE_DRIFT_W`。0 で切り戻し）。敵陣のと金が、玉候補筋の中央値へ
-/// **近づかない**空きマス移動をする手へ `w × exchange_value(Tokin)` を
-/// gain から引く。
+/// `TOKIN_FILE_DRIFT_W`。0 で切り戻し）。敵陣のと金が、裏付けの無い空きマスへ
+/// 動く手へ `w × exchange_value(Tokin)` を gain から引く。
 ///
-/// 発端は quest31-m046 の 4g4h（同じ 4 筋の空前進、採点 2）vs 3h4i 不成
-/// （10）。玉隣接税は focused 前提なので、玉が 5i に居ても候補が広いと
-/// 4h が免税で残る。こちらは中央値との筋距離が縮まないことだけを見る。
-/// 玉筋そのもの（d_file=0）の前進は免税（5c5b 型）。裏付けマスへの捕獲も
-/// 免税（2a3a）。2c3b は 5 筋へ近づくので免税。王手中無効・粒子不要。
+/// 発端は quest31-m046 の 4g4h / 4g5h（採点 2）vs 3h4i 不成（10）。
+/// 4g5h は中央値 5 筋へ近づくので「距離が縮まない」判定だと免税になる。
+/// 免税は ①玉筋上に留まる ②自陣の大駒が居る筋を空ける（2c3b で飛車の道）
+/// ③裏付け捕獲、だけ。王手中無効・粒子不要。
 fn tokin_file_drift_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -524,6 +520,25 @@ fn tokin_file_drift_w() -> f64 {
 }
 
 const TOKIN_FILE_DRIFT_W: f64 = 1.2;
+
+/// 自陣の金銀桂の空きマス移動課税（`TSUITATE_OWN_CAMP_IDLE_W`、既定
+/// `OWN_CAMP_IDLE_W`。0 で切り戻し）。自陣への非捕獲移動へ
+/// `w × exchange_value` を gain から引く。
+///
+/// 発端は quest31-m046 の 7a7b（link 加点で 3h4i 不成を押しのける、採点 2）。
+/// 敵陣への銀移動（3h4i）は対象外。王手中無効・粒子不要。
+fn own_camp_idle_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_OWN_CAMP_IDLE_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(OWN_CAMP_IDLE_W)
+    })
+}
+
+const OWN_CAMP_IDLE_W: f64 = 0.15;
 
 /// 裏付け無しの敵陣進入課税（`TSUITATE_UNBACKED_CAMP_W`、既定
 /// `UNBACKED_CAMP_W`）。歩・香・桂・玉以外が、観測裏付けの無い敵陣マスへ
@@ -827,8 +842,10 @@ fn king_file_pawn_drop_amount(
     1.0 / (1.0 + f64::from(d_file))
 }
 
-/// と金の玉筋逸れ量（`tokin_file_drift_w`）。裏付け捕獲と玉筋上は 0。
+/// と金の空きマス移動課税量（`tokin_file_drift_w`）。
+/// 玉筋に留まる・大駒の筋を空ける・裏付け捕獲は 0。
 fn tokin_file_drift_amount(
+    view: &PlayerView,
     from: Coord,
     to: Coord,
     me: Color,
@@ -841,25 +858,41 @@ fn tokin_file_drift_amount(
     if backed[crate::belief_features::sq_index(to)] {
         return 0.0;
     }
-    let Some(median) = king_file_median(cands) else {
-        return 0.0;
-    };
-    let d0 = (from.file - median).abs();
-    let d1 = (to.file - median).abs();
-    if d1 == 0 || d1 < d0 {
+    if let Some(median) = king_file_median(cands) {
+        let d0 = (from.file - median).abs();
+        let d1 = (to.file - median).abs();
+        if d0 == 0 && d1 == 0 {
+            return 0.0;
+        }
+    }
+    if tokin_vacates_major_file(view, from, to) {
         return 0.0;
     }
     1.0
 }
 
+fn tokin_vacates_major_file(view: &PlayerView, from: Coord, to: Coord) -> bool {
+    if from.file == to.file {
+        return false;
+    }
+    view.your_pieces.iter().any(|p| {
+        matches!(
+            p.role,
+            Role::Rook | Role::Dragon | Role::Bishop | Role::Horse
+        ) && parse_usi_square(&p.square).is_some_and(|c| c.file == from.file)
+    })
+}
+
 /// 裏付け無し敵陣進入の課税量（`unbacked_camp_w`）。
-/// 角・飛・馬・龍だけ課税（3三角成 / 4a3b+）。と金・金銀は敵陣で働く駒なので
-/// 対象外（2a3a を巻き込むと m019 が壊れる）。玉隣のと金は `king_adj_heavy`。
+/// 角・飛・馬・龍は打ちも移動も課税。金銀は**盤上移動だけ**
+/// （m081 の 6c6b 幻捕獲。G*7c のような打ちは HAND_ASSET の領分）。
+/// と金・歩は対象外（2a3a / 4七歩成）。
 fn unbacked_camp_amount(
     role: Role,
     to: Coord,
     me: Color,
     backed: &[bool; 81],
+    is_drop: bool,
 ) -> f64 {
     if !in_enemy_camp(to, me) {
         return 0.0;
@@ -869,8 +902,28 @@ fn unbacked_camp_amount(
     }
     match role {
         Role::Bishop | Role::Rook | Role::Horse | Role::Dragon => exchange_value(role),
+        Role::Gold | Role::Silver if !is_drop => exchange_value(role),
         _ => 0.0,
     }
+}
+
+/// 自陣の金銀桂の空きマス移動量（`own_camp_idle_w`）。
+fn own_camp_idle_amount(
+    role: Role,
+    to: Coord,
+    me: Color,
+    backed: &[bool; 81],
+) -> f64 {
+    if !matches!(role, Role::Gold | Role::Silver | Role::Knight) {
+        return 0.0;
+    }
+    if !in_own_camp(to, me) {
+        return 0.0;
+    }
+    if backed[crate::belief_features::sq_index(to)] {
+        return 0.0;
+    }
+    exchange_value(role)
 }
 
 /// 玉隣接への高い駒の無支え進入量（`king_adj_heavy_w`）。
@@ -4357,7 +4410,8 @@ impl Strategy for EstimatorStrategy {
                 || promote_far_w() > 0.0
                 || unbacked_camp_w() > 0.0
                 || king_adj_heavy_w() > 0.0
-                || tokin_file_drift_w() > 0.0)
+                || tokin_file_drift_w() > 0.0
+                || own_camp_idle_w() > 0.0)
                 .then(|| opp_occupancy_evidence(view, log));
         // 玉接近減点の脅威マス（歴代の非歩打ち反則を含む。上記より広い）
         let king_threats =
@@ -4542,12 +4596,18 @@ impl Strategy for EstimatorStrategy {
                                 .your_pieces
                                 .iter()
                                 .find(|p| p.square == make_usi_square(from))
-                                .map(|p| (p.role, to)),
-                            ShogiMove::Drop { role, to } => Some((role, to)),
+                                .map(|p| (p.role, to, false)),
+                            ShogiMove::Drop { role, to } => Some((role, to, true)),
                         };
-                        if let Some((role, to)) = landing {
-                            out.gain -=
-                                uw * unbacked_camp_amount(role, to, view.your_color, backed);
+                        if let Some((role, to, is_drop)) = landing {
+                            out.gain -= uw
+                                * unbacked_camp_amount(
+                                    role,
+                                    to,
+                                    view.your_color,
+                                    backed,
+                                    is_drop,
+                                );
                         }
                     }
                 }
@@ -4586,12 +4646,32 @@ impl Strategy for EstimatorStrategy {
                             out.gain -= dw
                                 * exchange_value(Role::Tokin)
                                 * tokin_file_drift_amount(
+                                    view,
                                     from,
                                     to,
                                     view.your_color,
                                     cands,
                                     backed,
                                 );
+                        }
+                    }
+                }
+            }
+            // 自陣の金銀桂の空きマス移動（`own_camp_idle_w`）。
+            if !view.you_in_check {
+                let iw = own_camp_idle_w();
+                if iw > 0.0 {
+                    if let (Some(backed), ShogiMove::Board { from, to, .. }) =
+                        (opp_occ_backed.as_ref(), mv)
+                    {
+                        let role = view
+                            .your_pieces
+                            .iter()
+                            .find(|p| p.square == make_usi_square(from))
+                            .map(|p| p.role);
+                        if let Some(role) = role {
+                            out.gain -=
+                                iw * own_camp_idle_amount(role, to, view.your_color, backed);
                         }
                     }
                 }
@@ -9252,19 +9332,33 @@ pub(crate) mod tests {
     fn unbacked_camp_taxes_expensive_unbacked_entry() {
         let me = Color::Sente;
         let mut backed = [false; 81];
-        let bishop_3c = unbacked_camp_amount(Role::Bishop, Coord { file: 3, rank: 3 }, me, &backed);
+        let bishop_3c =
+            unbacked_camp_amount(Role::Bishop, Coord { file: 3, rank: 3 }, me, &backed, false);
         assert!(
             (bishop_3c - exchange_value(Role::Bishop)).abs() < 1e-9,
             "bishop into 3c: {bishop_3c}"
         );
-        let tokin_4a = unbacked_camp_amount(Role::Tokin, Coord { file: 4, rank: 1 }, me, &backed);
+        let tokin_4a =
+            unbacked_camp_amount(Role::Tokin, Coord { file: 4, rank: 1 }, me, &backed, false);
         assert_eq!(tokin_4a, 0.0, "tokin working in camp is not taxed");
-        let pawn_7c = unbacked_camp_amount(Role::Pawn, Coord { file: 7, rank: 3 }, me, &backed);
+        let pawn_7c =
+            unbacked_camp_amount(Role::Pawn, Coord { file: 7, rank: 3 }, me, &backed, false);
         assert_eq!(pawn_7c, 0.0, "pawns are cheap probes");
-        let bishop_4g = unbacked_camp_amount(Role::Bishop, Coord { file: 4, rank: 7 }, me, &backed);
+        let bishop_4g =
+            unbacked_camp_amount(Role::Bishop, Coord { file: 4, rank: 7 }, me, &backed, false);
         assert_eq!(bishop_4g, 0.0, "rank 7 is not sente's enemy camp");
+        let gold_board =
+            unbacked_camp_amount(Role::Gold, Coord { file: 6, rank: 2 }, me, &backed, false);
+        assert!(
+            (gold_board - exchange_value(Role::Gold)).abs() < 1e-9,
+            "gold board move into enemy camp (6c6b) is taxed"
+        );
+        let gold_drop =
+            unbacked_camp_amount(Role::Gold, Coord { file: 7, rank: 3 }, me, &backed, true);
+        assert_eq!(gold_drop, 0.0, "gold drops are HAND_ASSET's job");
         backed[crate::belief_features::sq_index(Coord { file: 3, rank: 3 })] = true;
-        let recap = unbacked_camp_amount(Role::Bishop, Coord { file: 3, rank: 3 }, me, &backed);
+        let recap =
+            unbacked_camp_amount(Role::Bishop, Coord { file: 3, rank: 3 }, me, &backed, false);
         assert_eq!(recap, 0.0, "backed recapture is exempt");
     }
 
@@ -9331,42 +9425,74 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn tokin_file_drift_taxes_side_file_idle_not_approach() {
+    fn tokin_file_drift_taxes_idle_except_major_file_and_king_file() {
         let mut cands = std::collections::BTreeSet::new();
         cands.insert(Coord { file: 5, rank: 9 });
         let backed = [false; 81];
-        let gote = Color::Gote;
-        // 4g4h: 同じ 4 筋の空前進（中央値 5 から距離 1 のまま）
+        let gote_view = minimal_view(
+            vec![VisiblePiece {
+                square: "4g".into(),
+                role: Role::Tokin,
+            }],
+            HashMap::new(),
+        );
+        // 4g4h: 同じ筋の空前進
         let drift = tokin_file_drift_amount(
+            &gote_view,
             Coord { file: 4, rank: 7 },
             Coord { file: 4, rank: 8 },
-            gote,
+            Color::Gote,
             &cands,
             &backed,
         );
         assert_eq!(drift, 1.0, "4g4h wanders on a side file");
-        // 2c3b: 5 筋へ近づく
-        let approach = tokin_file_drift_amount(
+        // 4g5h: 5 筋へ近づくが大駒の道を開けない
+        let approach_idle = tokin_file_drift_amount(
+            &gote_view,
+            Coord { file: 4, rank: 7 },
+            Coord { file: 5, rank: 8 },
+            Color::Gote,
+            &cands,
+            &backed,
+        );
+        assert_eq!(approach_idle, 1.0, "4g5h approaches but does not open a major");
+        // 2c3b: 2 筋に飛車がいるので道を空ける
+        let rook_view = minimal_view(
+            vec![
+                VisiblePiece {
+                    square: "2c".into(),
+                    role: Role::Tokin,
+                },
+                VisiblePiece {
+                    square: "2a".into(),
+                    role: Role::Rook,
+                },
+            ],
+            HashMap::new(),
+        );
+        let opens = tokin_file_drift_amount(
+            &rook_view,
             Coord { file: 2, rank: 3 },
             Coord { file: 3, rank: 2 },
             Color::Sente,
             &cands,
             &backed,
         );
-        assert_eq!(approach, 0.0, "2c3b approaches the king file");
-        // 5c5b: 玉筋そのもの
+        assert_eq!(opens, 0.0, "2c3b vacates the rook's file");
+        // 5c5b: 玉筋に留まる
         let on_file = tokin_file_drift_amount(
+            &gote_view,
             Coord { file: 5, rank: 3 },
             Coord { file: 5, rank: 2 },
             Color::Sente,
             &cands,
             &backed,
         );
-        assert_eq!(on_file, 0.0, "tokin on the king file is exempt");
-        // 2a3a 捕獲（裏付けあり）
+        assert_eq!(on_file, 0.0, "tokin staying on the king file is exempt");
         let mut hit = [false; 81];
         hit[crate::belief_features::sq_index(Coord { file: 3, rank: 1 })] = true;
         let cap = tokin_file_drift_amount(
+            &gote_view,
             Coord { file: 2, rank: 1 },
             Coord { file: 3, rank: 1 },
             Color::Sente,
@@ -9374,33 +9500,50 @@ pub(crate) mod tests {
             &hit,
         );
         assert_eq!(cap, 0.0, "backed capture is exempt");
-        // 2c1c: 端へ逃げる
-        let away = tokin_file_drift_amount(
-            Coord { file: 2, rank: 3 },
-            Coord { file: 1, rank: 3 },
-            Color::Sente,
-            &cands,
-            &backed,
-        );
-        assert_eq!(away, 1.0, "2c1c drifts away from the king file");
     }
 
     #[test]
-    fn tokin_file_drift_and_king_file_gold_defaults_on() {
+    fn own_camp_idle_taxes_silver_retreat_not_enemy_entry() {
+        let backed = [false; 81];
+        let idle = own_camp_idle_amount(
+            Role::Silver,
+            Coord { file: 7, rank: 2 },
+            Color::Gote,
+            &backed,
+        );
+        assert!(
+            (idle - exchange_value(Role::Silver)).abs() < 1e-9,
+            "7a7b is gote own-camp idle: {idle}"
+        );
+        let entry = own_camp_idle_amount(
+            Role::Silver,
+            Coord { file: 4, rank: 9 },
+            Color::Gote,
+            &backed,
+        );
+        assert_eq!(entry, 0.0, "3h4i is enemy camp for gote");
+    }
+
+    #[test]
+    fn tokin_file_drift_and_promote_far_defaults() {
         if std::env::var("TSUITATE_TOKIN_FILE_DRIFT_W").is_err() {
             assert!((tokin_file_drift_w() - TOKIN_FILE_DRIFT_W).abs() < 1e-12);
             assert!(TOKIN_FILE_DRIFT_W > 0.0);
         }
         if std::env::var("TSUITATE_KING_FILE_GOLD_W").is_err() {
             assert!((king_file_gold_w() - KING_FILE_GOLD_W).abs() < 1e-12);
-            assert!(KING_FILE_GOLD_W > 0.0);
+            assert_eq!(KING_FILE_GOLD_W, 0.0);
         }
         if std::env::var("TSUITATE_PROMOTE_FAR_W").is_err() {
             assert!((promote_far_w() - PROMOTE_FAR_W).abs() < 1e-12);
-            assert!((PROMOTE_FAR_W - 4.0).abs() < 1e-12);
+            assert!((PROMOTE_FAR_W - 5.5).abs() < 1e-12);
         }
         if std::env::var("TSUITATE_KING_ADJ_HEAVY_W").is_err() {
             assert!((KING_ADJ_HEAVY_W - 1.5).abs() < 1e-12);
+        }
+        if std::env::var("TSUITATE_OWN_CAMP_IDLE_W").is_err() {
+            assert!((own_camp_idle_w() - OWN_CAMP_IDLE_W).abs() < 1e-12);
+            assert!(OWN_CAMP_IDLE_W > 0.0);
         }
     }
 
