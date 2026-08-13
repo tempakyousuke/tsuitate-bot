@@ -395,8 +395,9 @@ const LINK_ENDGAME_DAMPEN: f64 = 40.0;
 /// **金・銀・桂**と、**自陣への角・飛・歩打ち**に限定する。PR#1 全駒種版は
 /// kakudo の R*2d と lance/pawn-tether を巻き込みアリーナ −7pt だった。
 /// quest31 の G*5e 濫発は金銀、N*4g / N*5d は桂、B*1h 逃避は自陣の角打ち、
-/// P*4h / P*5h は自陣の歩打ち。敵陣・中段の角飛打ち（B*3f / B*4a）と
-/// 敵陣の歩打ち（P*7c / P*4f）は対象外。
+/// P*4h / P*5h / P*2b は自陣の歩打ち（歩の課税量は 4.0。exchange_value=1
+/// だと m046 の P*2b が 3h4i を押しのける）。敵陣・中段の角飛打ち
+/// （B*3f / B*4a）と敵陣の歩打ち（P*7c / P*4f）は対象外。
 /// 仕事: 金は自玉 8 近傍、銀は玉頭2マス／敵陣かつ玉筋が読めるときの
 /// 敵玉近接／安い駒の裏付け当たり。打つ手だけ・王手中無効・粒子不要。
 /// 凍結版はこの名前を知らない。
@@ -464,7 +465,7 @@ fn promote_far_w() -> f64 {
 /// 大駒成りの遠方ペナルティの既定（2026-08-13。歩成りは対象外なので
 /// 7d7c+ クラスは巻き込まない。4a3b+ を 7六歩の下へ沈める作業点）。
 /// 0 で切り戻し
-const PROMOTE_FAR_W: f64 = 3.5;
+const PROMOTE_FAR_W: f64 = 6.0;
 
 /// 玉筋の歩前進（`TSUITATE_KING_FILE_PAWN_W`、既定 `KING_FILE_PAWN_W`）。
 /// **敵陣**の歩（前進・成り・打ち）が、玉候補筋の中央値から距離 ≤2 のとき
@@ -565,15 +566,15 @@ fn unbacked_camp_w() -> f64 {
 
 const UNBACKED_CAMP_W: f64 = 0.8;
 
-/// 金銀の裏付け無し捕獲を gain から削る係数（`TSUITATE_UNBACKED_GS_CAPTURE_W`、
+/// 金銀・大駒の裏付け無し捕獲を gain から削る係数（`TSUITATE_UNBACKED_GS_CAPTURE_W`、
 /// 既定 `UNBACKED_GS_CAPTURE_W`。0 で切り戻し）。
 ///
-/// `material_degen_q0` は粒子質量が厚いと縮まない。金銀が観測裏付けの無い
-/// マスで「駒が居る」と信じた捕獲（quest31-m081 の 6c6b、幻の金）は
-/// p_hit≈1 で `capture_bet_var` も消える。こちらは**金銀の盤上移動だけ**
-/// 期待駒得を `w` 倍だけ引く（w=1 で幻の駒得を全額キャンセル）。
+/// `material_degen_q0` は粒子質量が厚いと縮まない。観測裏付けの無いマスで
+/// 「駒が居る」と信じた捕獲（quest31-m081 の 6c6b 幻の金、4a3b+ 幻の駒得）は
+/// p_hit≈1 で `capture_bet_var` も消える。こちらは**金銀と大駒の盤上移動**
+/// の期待駒得を `w` 倍だけ引く（w=1 で幻の駒得を全額キャンセル）。
 /// 打ちは捕獲にならない。王手中無効（kakutori）。裏付けマスは満額残す
-/// （recap-dragon）。と金・大駒は対象外（2c3b の銀取り・4七歩成を守る）。
+/// （recap-dragon）。と金・歩・桂・香は対象外（2c3b の銀取り・4七歩成）。
 /// 凍結版はこの名前を知らない。
 fn unbacked_gs_capture_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -586,18 +587,15 @@ fn unbacked_gs_capture_w() -> f64 {
     })
 }
 
-/// 金銀の裏付け無し捕獲をキャンセルする既定（2026-08-13。m081 の 6c6b）。
+/// 金銀・大駒の裏付け無し捕獲をキャンセルする既定（2026-08-13。
+/// m081 の 6c6b / 4a3b+）。
 const UNBACKED_GS_CAPTURE_W: f64 = 1.0;
 
-/// 相手の初期金位置への金銀の当たり（`TSUITATE_HOME_GOLD_ATTACK_W`、既定
-/// `HOME_GOLD_ATTACK_W`。0 で切り戻し）。
+/// 相手の初期金位置への金銀の当たり（`TSUITATE_HOME_GOLD_ATTACK_W`、既定 0）。
 ///
-/// 発端は quest31-m046 の 3h4i 不成（10点）。4i の金は相手の初期位置に
-/// 居る実在の駒だが、観測裏付けも粒子の捕獲信念も無いので capture=0。
-/// unbacked_camp が敵陣進入として銀を課税すると 4g4h / 7a7b に流出する。
-/// こちらは**相手の金の初期マス**（先手なら 4a/6a、後手なら 4i/6i）へ
-/// 金銀が盤上から入る手へ `w` を足す事前。と金は対象外（m021 の 3a4a）。
-/// 裏付けマスは capture が既に数えるので加点しない。王手中無効・粒子不要。
+/// 発端は quest31-m046 の 3h4i 不成（10点）。実測で m029 の 4b4a（逃げた
+/// 4a の金への銀）を押し上げて 6.40→4.00 に回帰したため既定オフ。
+/// env から試せる。と金は対象外（m021 の 3a4a）。
 fn home_gold_attack_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -609,16 +607,13 @@ fn home_gold_attack_w() -> f64 {
     })
 }
 
-const HOME_GOLD_ATTACK_W: f64 = 2.5;
+const HOME_GOLD_ATTACK_W: f64 = 0.0;
 
-/// と金が玉筋へ寄る手の加点（`TSUITATE_TOKIN_APPROACH_W`、既定
-/// `TOKIN_APPROACH_W`。0 で切り戻し）。敵陣のと金が、玉候補筋の中央値への
-/// 筋距離を縮める手へ `w / (1+d_to)` を足す。
+/// と金が玉筋へ寄る手の加点（`TSUITATE_TOKIN_APPROACH_W`、既定 0）。
+/// 敵陣のと金が、玉候補筋の中央値への筋距離を縮める手へ `w / (1+d_to)` を足す。
 ///
-/// 発端は quest31-m021 の 2c3b（10点）。3a4a を king_adj で沈めても
-/// 7六歩・9六歩が繰り上がる。2c3b は銀取りだが粒子が銀を置かないと
-/// capture=0 で、ただのと金移動に見える。玉筋へ寄る勾配だけを足す。
-/// 3a4a も寄るが king_adj の税（3.5×1.5）の方が大きい。王手中無効。
+/// 発端は quest31-m021 の 2c3b。実測で玉筋が読めていないと中央値が端に寄り
+/// 2c1c（1点）を 5/5 で選んだため既定オフ。`king_files_focused` ゲート付き。
 fn tokin_approach_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -630,7 +625,7 @@ fn tokin_approach_w() -> f64 {
     })
 }
 
-const TOKIN_APPROACH_W: f64 = 1.8;
+const TOKIN_APPROACH_W: f64 = 0.0;
 
 /// 玉隣接への高い駒の無支え進入（`TSUITATE_KING_ADJ_HEAVY_W`、既定
 /// `KING_ADJ_HEAVY_W`。0 で切り戻し）。
@@ -1035,6 +1030,9 @@ fn tokin_file_approach_amount(
     let Some(median) = king_file_median(cands) else {
         return 0.0;
     };
+    if !king_files_focused(cands, median) {
+        return 0.0;
+    }
     let d0 = (from.file - median).abs();
     let d1 = (to.file - median).abs();
     if d1 >= d0 {
@@ -7029,9 +7027,9 @@ fn evaluate(
         } else {
             0.0
         };
-        // 金銀の裏付け無し捕獲をキャンセル（`unbacked_gs_capture_w`）。
-        // 質量ゲートでは自信を持って間違う 6c6b が残るので、金銀に限り
-        // 期待駒得を w 倍だけ引く。王手中・裏付けマスは対象外。
+        // 金銀・大駒の裏付け無し捕獲をキャンセル（`unbacked_gs_capture_w`）。
+        // 質量ゲートでは自信を持って間違う 6c6b / 4a3b+ が残るので、
+        // 期待駒得を w 倍だけ引く。王手中・裏付けマス・と金歩桂香は対象外。
         let gs_unbacked_capture = if unbacked_gs_capture_w() > 0.0
             && !view.you_in_check
             && capture_hits > 0.0
@@ -7043,7 +7041,20 @@ fn evaluate(
                     .your_pieces
                     .iter()
                     .find(|p| p.square == make_usi_square(from))
-                    .is_some_and(|p| matches!(p.role, Role::Gold | Role::Silver))
+                    .is_some_and(|p| {
+                        matches!(
+                            p.role,
+                            Role::Gold
+                                | Role::Silver
+                                | Role::Bishop
+                                | Role::Rook
+                                | Role::Horse
+                                | Role::Dragon
+                                | Role::Promotedsilver
+                                | Role::Promotedknight
+                                | Role::Promotedlance
+                        )
+                    })
             );
             if mover_gs {
                 unbacked_gs_capture_w() * (capture_value_sum / legal)
@@ -7228,7 +7239,7 @@ fn evaluate(
                 0.0
             } else {
                 let amount = if role == Role::Pawn {
-                    2.0
+                    4.0
                 } else {
                     exchange_value(role)
                 };
@@ -9660,12 +9671,14 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_HOME_GOLD_ATTACK_W").is_err() {
             assert!((home_gold_attack_w() - HOME_GOLD_ATTACK_W).abs() < 1e-12);
+            assert_eq!(HOME_GOLD_ATTACK_W, 0.0);
         }
         if std::env::var("TSUITATE_TOKIN_APPROACH_W").is_err() {
             assert!((tokin_approach_w() - TOKIN_APPROACH_W).abs() < 1e-12);
+            assert_eq!(TOKIN_APPROACH_W, 0.0);
         }
         if std::env::var("TSUITATE_PROMOTE_FAR_W").is_err() {
-            assert!((promote_far_w() - 3.5).abs() < 1e-12);
+            assert!((promote_far_w() - 6.0).abs() < 1e-12);
         }
     }
 
@@ -9843,7 +9856,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_PROMOTE_FAR_W").is_err() {
             assert!((promote_far_w() - PROMOTE_FAR_W).abs() < 1e-12);
-            assert!((PROMOTE_FAR_W - 3.5).abs() < 1e-12);
+            assert!((PROMOTE_FAR_W - 6.0).abs() < 1e-12);
         }
         if std::env::var("TSUITATE_KING_ADJ_HEAVY_W").is_err() {
             assert!((KING_ADJ_HEAVY_W - 1.5).abs() < 1e-12);
