@@ -572,7 +572,8 @@ const UNBACKED_CAMP_W: f64 = 0.8;
 /// 発端は quest31-m021 の 4一と（3a4a）。unbacked_camp のと金課税は
 /// 本命の 2c3b（敵陣のと金移動）まで同じ税が乗って相対差が消える。
 /// こちらは玉隣だけなので 4a（5a の 8 近傍）は沈み、3b（チェビシェフ 2）は
-/// 免税。打ちは HAND_ASSET / drop_probe の領分（S*4b を巻き込まない）。
+/// 免税。筋外れ課税は m019 の 2a1a（6点）を 9六歩へ流出させたため入れない。
+/// 打ちは HAND_ASSET / drop_probe の領分（S*4b を巻き込まない）。
 /// 歩は対象外（4七歩成を巻き込まない = 旧 `king_adj_entry_w` の失敗）。
 /// 玉筋が読めていない序盤では発火しない。王手中無効・粒子不要。
 /// 凍結版はこの名前を知らない。
@@ -954,20 +955,7 @@ fn king_adj_heavy_amount(
         chebyshev(to, k) <= 1 && (k.file - median).abs() <= 2
     });
     if !adjacent {
-        // 玉筋から外れたと金・金銀（2c1c 型）。隣接税の対象外でも
-        // 端へ逃げる高い駒は沈める
-        let off_file = matches!(
-            role,
-            Role::Tokin
-                | Role::Gold
-                | Role::Silver
-                | Role::Promotedlance
-                | Role::Promotedknight
-                | Role::Promotedsilver
-        ) && (to.file - median).abs() > 2;
-        if !off_file {
-            return 0.0;
-        }
+        return 0.0;
     }
     exchange_value(role)
 }
@@ -9393,9 +9381,9 @@ pub(crate) mod tests {
             &cands,
             &backed,
         );
-        assert!(
-            (one_c - exchange_value(Role::Tokin)).abs() < 1e-9,
-            "2c1c is off the king file: {one_c}"
+        assert_eq!(
+            one_c, 0.0,
+            "2c1c is chebyshev 4 from 5a, not adjacent (off-file tax sank m019 2a1a)"
         );
         let pawn = king_adj_heavy_amount(
             Role::Pawn,
