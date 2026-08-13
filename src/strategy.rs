@@ -392,9 +392,10 @@ const LINK_ENDGAME_DAMPEN: f64 = 40.0;
 /// 0 で切り戻し）。打つ手に `w × exchange_value(role)` を gain から引く
 /// （仕事がある打ちは 0）。
 ///
-/// **金・銀の打ちに限定**する。PR#1 全駒種版は kakudo の R*2d と
-/// lance/pawn-tether を巻き込みアリーナ −7pt だった。quest31 の G*5e /
-/// G*1b 濫発は金銀に集中しているので、飛香桂歩は対象外。
+/// **金・銀**と、**自陣への角・飛打ち**に限定する。PR#1 全駒種版は
+/// kakudo の R*2d と lance/pawn-tether を巻き込みアリーナ −7pt だった。
+/// quest31 の G*5e 濫発は金銀、B*1h 逃避は自陣の角打ち。敵陣・中段の
+/// 角飛打ち（B*3f / B*4a）は対象外。
 /// 仕事: 自玉2マス以内（守り打ち）／玉筋が読めるときの敵玉近接／
 /// 安い駒の裏付け当たり。打つ手だけ・王手中無効・粒子不要。
 /// 凍結版はこの名前を知らない。
@@ -409,9 +410,9 @@ fn hand_asset_w() -> f64 {
     })
 }
 
-/// 金銀の無目的打ち課税の既定。5試行で未採点が 37→142 に増えたため 0。
-/// env で 0.5 を試せる
-const HAND_ASSET_W: f64 = 0.0;
+/// 金銀＋自陣大駒の無目的打ち課税の既定。G*5e / B*1h 濫発対策。
+/// 飛香桂歩の打ちは対象外（PR#1 全駒種版の kakudo / tether 回帰を避ける）。
+const HAND_ASSET_W: f64 = 1.0;
 
 /// 玉の既知脅威への接近減点（`TSUITATE_KING_KNOWN_APPROACH_W`、既定
 /// `KING_KNOWN_APPROACH_W`。0 で切り戻し）。
@@ -464,13 +465,9 @@ fn promote_far_w() -> f64 {
 const PROMOTE_FAR_W: f64 = 2.5;
 
 /// 玉筋の歩前進（`TSUITATE_KING_FILE_PAWN_W`、既定 `KING_FILE_PAWN_W`）。
-/// 未成の歩が、玉候補筋の**中央値**から距離 ≤2 の筋へ前進する手へ
-/// `w / (1+d_file)` を gain に足す。打ちも敵陣の同じ条件なら加点（P*7c 型）。
-/// **成りと捕獲は対象外**（4f4g+ 型を歩発展として加点しない）。
-///
-/// 最寄り玉との min 距離だと、序盤の広い候補集合（ほぼ全マス）で
-/// 9六歩まで加点されて m019/m029/m037 が壊れた。中央値 ±2 に候補の
-/// 2/3 以上がいるときだけ発火する（`king_files_focused`）。
+/// **敵陣**の歩（前進・成り・打ち）が、玉候補筋の中央値から距離 ≤2 のとき
+/// `w / (1+d_file)` を gain に足す（P*7c / 7c7b+ 型）。
+/// 自陣・中段の歩突き（9六歩・8六歩・7六歩・4f4g+）は加点しない。
 /// 王手中無効・粒子不要。凍結版はこの名前を知らない。
 fn king_file_pawn_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -483,7 +480,7 @@ fn king_file_pawn_w() -> f64 {
     })
 }
 
-const KING_FILE_PAWN_W: f64 = 0.4;
+const KING_FILE_PAWN_W: f64 = 1.2;
 
 /// 裏付け無しの敵陣進入課税（`TSUITATE_UNBACKED_CAMP_W`、既定
 /// `UNBACKED_CAMP_W`）。歩・香・桂・玉以外が、観測裏付けの無い敵陣マスへ
@@ -673,6 +670,13 @@ fn in_enemy_camp(to: Coord, me: Color) -> bool {
     }
 }
 
+fn in_own_camp(to: Coord, me: Color) -> bool {
+    match me {
+        Color::Sente => to.rank >= 7,
+        Color::Gote => to.rank <= 3,
+    }
+}
+
 /// 玉候補の筋の中央値。空なら None。
 fn king_file_median(cands: &std::collections::BTreeSet<Coord>) -> Option<i8> {
     let n = cands.len();
@@ -698,7 +702,7 @@ fn king_files_focused(cands: &std::collections::BTreeSet<Coord>, median: i8) -> 
     near * 3 >= n * 2
 }
 
-/// 玉筋の歩前進量（`king_file_pawn_w`）。前進1マスかつ中央値の筋距離 ≤2。
+/// 玉筋の歩前進量（`king_file_pawn_w`）。敵陣への前進1マスかつ中央値の筋距離 ≤2。
 fn king_file_pawn_amount(
     from: Coord,
     to: Coord,
@@ -709,14 +713,14 @@ fn king_file_pawn_amount(
         Color::Sente => to.file == from.file && to.rank == from.rank - 1,
         Color::Gote => to.file == from.file && to.rank == from.rank + 1,
     };
-    if !forward || cands.is_empty() {
+    if !forward || !in_enemy_camp(to, me) || cands.is_empty() {
         return 0.0;
     }
     king_file_pawn_drop_amount(to, cands)
 }
 
-/// 敵陣（または玉筋）への歩打ち。中央値の筋距離 ≤2 かつ玉筋が読めるとき
-/// `1/(1+d_file)`。
+/// 敵陣（または玉筋）への歩打ち。中央値の筋距離 ≤2 なら `1/(1+d_file)`。
+/// 全盤に広がった候補でも中央値は 5 筋付近なので 9六歩は加点 0。
 fn king_file_pawn_drop_amount(
     to: Coord,
     cands: &std::collections::BTreeSet<Coord>,
@@ -724,9 +728,6 @@ fn king_file_pawn_drop_amount(
     let Some(median) = king_file_median(cands) else {
         return 0.0;
     };
-    if !king_files_focused(cands, median) {
-        return 0.0;
-    }
     let d_file = (to.file - median).abs();
     if d_file > 2 {
         return 0.0;
@@ -735,7 +736,8 @@ fn king_file_pawn_drop_amount(
 }
 
 /// 裏付け無し敵陣進入の課税量（`unbacked_camp_w`）。
-/// 歩香桂玉は 0。裏付けマスは 0。それ以外は交換価値。
+/// 角・飛・馬・龍だけ課税（3三角成 / 4a3b+）。と金・金銀は敵陣で働く駒なので
+/// 対象外（2a3a を巻き込むと m019 が壊れる）。
 fn unbacked_camp_amount(
     role: Role,
     to: Coord,
@@ -749,8 +751,8 @@ fn unbacked_camp_amount(
         return 0.0;
     }
     match role {
-        Role::Pawn | Role::Lance | Role::Knight | Role::King => 0.0,
-        _ => exchange_value(role),
+        Role::Bishop | Role::Rook | Role::Horse | Role::Dragon => exchange_value(role),
+        _ => 0.0,
     }
 }
 
@@ -4282,17 +4284,13 @@ impl Strategy for EstimatorStrategy {
                 }
             }
             // 玉筋の歩前進・打ち（`king_file_pawn_w`）。gain の内側。
-            // 成りは対象外（4f4g+ を歩発展として加点しない）。
+            // 敵陣の歩だけ（7c7b+ / P*7c）。9六歩・4f4g+ は加点しない。
             if !view.you_in_check {
                 let pw = king_file_pawn_w();
                 if pw > 0.0 {
                     if let Some(cands) = promote_far_kings.as_ref() {
                         match mv {
-                            ShogiMove::Board {
-                                from,
-                                to,
-                                promote: false,
-                            } => {
+                            ShogiMove::Board { from, to, .. } => {
                                 let is_pawn = view
                                     .your_pieces
                                     .iter()
@@ -6659,9 +6657,12 @@ fn evaluate(
     let hand_asset_pen = match (hand_asset_kings, opp_occ_backed, mv) {
         (Some(cands), Some(backed), &ShogiMove::Drop { role, to }) => {
             let w = hand_asset_w();
-            if w <= 0.0
-                || !matches!(role, Role::Gold | Role::Silver)
-                || drop_has_hand_asset_work(view, role, to, backed, cands)
+            let taxable = match role {
+                Role::Gold | Role::Silver => true,
+                Role::Bishop | Role::Rook => in_own_camp(to, view.your_color),
+                _ => false,
+            };
+            if w <= 0.0 || !taxable || drop_has_hand_asset_work(view, role, to, backed, cands)
             {
                 0.0
             } else {
@@ -8756,25 +8757,36 @@ pub(crate) mod tests {
         );
     }
 
-    /// 7六歩は 6二玉候補に筋距離1、1六歩は距離5で加点0
+    /// 7四歩→7三歩は 6二玉候補に筋距離1、1四歩は距離5で加点0。
+    /// 中段の 7六歩は敵陣ではないので 0（9六歩・8六歩の乗っ取り対策）。
     #[test]
     fn king_file_pawn_prefers_king_files() {
         let mut cands = std::collections::BTreeSet::new();
         cands.insert(Coord { file: 6, rank: 2 });
         let seven = king_file_pawn_amount(
-            Coord { file: 7, rank: 7 },
-            Coord { file: 7, rank: 6 },
+            Coord { file: 7, rank: 4 },
+            Coord { file: 7, rank: 3 },
             Color::Sente,
             &cands,
         );
         let one = king_file_pawn_amount(
-            Coord { file: 1, rank: 7 },
-            Coord { file: 1, rank: 6 },
+            Coord { file: 1, rank: 4 },
+            Coord { file: 1, rank: 3 },
             Color::Sente,
             &cands,
         );
         assert!((seven - 0.5).abs() < 1e-9, "d_file=1 → 1/2, got {seven}");
         assert_eq!(one, 0.0, "d_file=5 is outside the ≤2 window");
+        // 中段の歩突きは加点しない
+        assert_eq!(
+            king_file_pawn_amount(
+                Coord { file: 7, rank: 7 },
+                Coord { file: 7, rank: 6 },
+                Color::Sente,
+                &cands,
+            ),
+            0.0
+        );
         // 横移動は前進ではない
         assert_eq!(
             king_file_pawn_amount(
@@ -8791,7 +8803,7 @@ pub(crate) mod tests {
         assert!((drop7 - 0.5).abs() < 1e-9);
         assert_eq!(drop2, 0.0);
 
-        // 全盤の広い候補では 9六歩も 7六歩も加点0（序盤の m019 回帰対策）
+        // 全盤の広い候補でも中央値は 5筋。9六歩は中段なので 0、7c 打ちは距離2で 1/3。
         let all: std::collections::BTreeSet<Coord> = (1..=9)
             .flat_map(|file| (1..=9).map(move |rank| Coord { file, rank }))
             .collect();
@@ -8803,10 +8815,20 @@ pub(crate) mod tests {
                 &all,
             ),
             0.0,
-            "unfocused 9g9f must not get king-file bonus"
+            "9g9f is not in enemy camp"
         );
+        assert!(
+            (king_file_pawn_drop_amount(Coord { file: 7, rank: 3 }, &all) - 1.0 / 3.0).abs()
+                < 1e-9
+        );
+        // 4f4g+ 相当: 自陣への歩前進は 0
         assert_eq!(
-            king_file_pawn_drop_amount(Coord { file: 7, rank: 3 }, &all),
+            king_file_pawn_amount(
+                Coord { file: 4, rank: 6 },
+                Coord { file: 4, rank: 7 },
+                Color::Sente,
+                &cands,
+            ),
             0.0
         );
     }
@@ -8820,10 +8842,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn hand_asset_w_default_off() {
+    fn hand_asset_w_default_on() {
         let w = std::env::var("TSUITATE_HAND_ASSET_W").ok();
         if w.is_none() {
             assert!((hand_asset_w() - HAND_ASSET_W).abs() < 1e-12);
+            assert!(HAND_ASSET_W > 0.0);
         }
     }
 
@@ -8835,23 +8858,32 @@ pub(crate) mod tests {
         }
     }
 
-    /// と金の 4一 は敵陣・裏付け無しで課税、歩の 7三 と裏付けマスは免税
+    /// 角の 3三 は敵陣・裏付け無しで課税、と金と歩は免税
     #[test]
     fn unbacked_camp_taxes_expensive_unbacked_entry() {
         let me = Color::Sente;
         let mut backed = [false; 81];
-        let tokin_4a = unbacked_camp_amount(Role::Tokin, Coord { file: 4, rank: 1 }, me, &backed);
+        let bishop_3c = unbacked_camp_amount(Role::Bishop, Coord { file: 3, rank: 3 }, me, &backed);
         assert!(
-            (tokin_4a - exchange_value(Role::Tokin)).abs() < 1e-9,
-            "tokin into 4a: {tokin_4a}"
+            (bishop_3c - exchange_value(Role::Bishop)).abs() < 1e-9,
+            "bishop into 3c: {bishop_3c}"
         );
+        let tokin_4a = unbacked_camp_amount(Role::Tokin, Coord { file: 4, rank: 1 }, me, &backed);
+        assert_eq!(tokin_4a, 0.0, "tokin working in camp is not taxed");
         let pawn_7c = unbacked_camp_amount(Role::Pawn, Coord { file: 7, rank: 3 }, me, &backed);
         assert_eq!(pawn_7c, 0.0, "pawns are cheap probes");
         let bishop_4g = unbacked_camp_amount(Role::Bishop, Coord { file: 4, rank: 7 }, me, &backed);
         assert_eq!(bishop_4g, 0.0, "rank 7 is not sente's enemy camp");
-        backed[crate::belief_features::sq_index(Coord { file: 4, rank: 1 })] = true;
-        let recap = unbacked_camp_amount(Role::Tokin, Coord { file: 4, rank: 1 }, me, &backed);
+        backed[crate::belief_features::sq_index(Coord { file: 3, rank: 3 })] = true;
+        let recap = unbacked_camp_amount(Role::Bishop, Coord { file: 3, rank: 3 }, me, &backed);
         assert_eq!(recap, 0.0, "backed recapture is exempt");
+    }
+
+    #[test]
+    fn in_own_camp_is_bottom_three_ranks() {
+        assert!(in_own_camp(Coord { file: 1, rank: 8 }, Color::Sente));
+        assert!(!in_own_camp(Coord { file: 3, rank: 6 }, Color::Sente));
+        assert!(in_own_camp(Coord { file: 5, rank: 2 }, Color::Gote));
     }
 
     /// ブラインド取り返し: 対象マスは**直前の相手手**で取られたマスに限る

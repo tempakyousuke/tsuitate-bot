@@ -680,11 +680,12 @@
     - 既定オン: `LINK_ENDGAME_DAMPEN=40` / `PROMOTE_FAR_W=2.5` /
       `material_degen_q0=0.3` / `GEN_NONPROMOTE` / `PROMO_RISK_PREROLE` /
       `CAPTURE_RETREAT_W=0.08` / `promo_king_prox=0.5`
-    - `TSUITATE_KING_FILE_PAWN_W`（既定 0.4）: 中央値±2 かつ集中度 2/3。
-      1.2 は終盤の 8六歩が 7c7b+ を押しのけた
-    - `TSUITATE_UNBACKED_CAMP_W`（既定 0.8）
-    - `TSUITATE_HAND_ASSET_W`（既定 0）: 金銀限定の実装は残すが未採点が
-      37→142 に増えたためオフ
+    - `TSUITATE_KING_FILE_PAWN_W`（既定 1.2）: 敵陣の歩（前進・成り・打ち）
+      が玉候補筋の中央値±2 なら `w/(1+d_file)`。9六歩・8六歩・4f4g+ は
+      中段/自陣なので加点しない
+    - `TSUITATE_UNBACKED_CAMP_W`（既定 0.8）: 角飛馬龍だけ。と金は免税
+    - `TSUITATE_HAND_ASSET_W`（既定 1.0）: 金銀の無目的打ち＋自陣への角飛打ち
+      （B*1h 逃避）。G*5g 型の自玉近接は仕事ありで免税
     - `TSUITATE_PROMOTE_CHECK_REVEAL_W`（既定 1.2）
     - `TSUITATE_KING_KNOWN_APPROACH_W`（既定 1.0）
     - 切り戻しは各 env を 0 に
