@@ -589,6 +589,51 @@ fn unbacked_gs_capture_w() -> f64 {
 /// 大駒まで広げると 5試行フル suite が 5.326 まで落ちたため金銀だけ。
 const UNBACKED_GS_CAPTURE_W: f64 = 1.0;
 
+/// 信念ネット占有による裏付け無し捕獲の縮小（`TSUITATE_BELIEF_OCC_CAP_W`、
+/// 既定 `BELIEF_OCC_CAP_W`。0 で切り戻し）。
+///
+/// `material_degen_q0` は粒子質量が厚いと縮まない。生存粒子が全員で空きマス
+/// に駒を置くと相対重みは動かず、p_hit≈1 の幻の駒得が残る（m067: 厳密9個が
+/// 4一に飛車 85.9%。taint 側は空 95.8% で正しかった）。信念ネットの占有は
+/// 粒子より当たる（対数損失 0.62→0.38）ので、**観測裏付けの無い捕獲**の
+/// 期待駒得をネット占有へ安全方向だけ寄せる。
+///
+/// 寄せ方: ネット占有 p_occ が盤面平均事前（0.25）を下回るときだけ、
+/// mix = w × (1 − p_occ/0.25) で粒子の p_hit を p_occ へ混ぜ、
+/// 差分ぶんの期待駒得を引く。p_occ≥0.25（ネットも居ると見ている）は
+/// 動かさない = 4七歩成クラスの正しい捕獲を巻き込みにくい。
+/// 王手中無効・裏付けマスは満額。凍結版はこの名前を知らない。
+fn belief_occ_cap_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_BELIEF_OCC_CAP_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(BELIEF_OCC_CAP_W)
+    })
+}
+
+const BELIEF_OCC_CAP_W: f64 = 1.0;
+/// 信念ネットが「空き寄り」と見なす占有の上界。これ以上なら粒子の
+/// p_hit を上書きしない（盤面平均 prior_occ ≈ 0.21 の少し上）。
+const BELIEF_OCC_EMPTY_PRIOR: f64 = 0.25;
+
+/// 裏付け無し捕獲の期待駒得を、信念ネット占有が空き寄りのときだけ縮める。
+/// `capture_ev` = 粒子の E[捕獲価値]、`p_hit` = 粒子の占有率、`p_occ` = ネット。
+fn belief_occ_cap_shrink(capture_ev: f64, p_hit: f64, p_occ: f64, w: f64) -> f64 {
+    if w <= 0.0 || capture_ev <= 0.0 || p_hit <= 1e-9 {
+        return 0.0;
+    }
+    let empty = ((BELIEF_OCC_EMPTY_PRIOR - p_occ) / BELIEF_OCC_EMPTY_PRIOR).clamp(0.0, 1.0);
+    if empty <= 0.0 {
+        return 0.0;
+    }
+    let mix = (w * empty).clamp(0.0, 1.0);
+    let effective_p = (1.0 - mix) * p_hit + mix * p_occ.min(p_hit);
+    capture_ev * (1.0 - effective_p / p_hit).max(0.0)
+}
+
 /// 相手の初期金位置への金銀の当たり（`TSUITATE_HOME_GOLD_ATTACK_W`、既定
 /// `HOME_GOLD_ATTACK_W`）。capture≈0 のときだけ足す。
 ///
@@ -4439,18 +4484,22 @@ impl Strategy for EstimatorStrategy {
         let blind_home = ((blind_home_risk_w() != 0.0 || blind_home_drop_occ_w() > 0.0)
             && !view.you_in_check)
             .then(|| blind_home_position(view, log));
-        // ブラインド時の信念ネット供給（NN段階②、`belief_gain_w`）。
-        // 81マスぶんの forward pass は決定点ごとに1回で足りる（粒子に依存しない）。
-        // 重み0（既定）なら計算もしない = 挙動不変
-        let blind_belief_board: Option<([f64; 81], f64)> =
-            (belief_gain_w() > 0.0 && sample.is_empty()).then(|| {
-                let ctx = crate::belief_features::BeliefContext::from_log(view.your_color, log);
-                (
-                    crate::belief_nn::board_occupancy(&ctx),
-                    blind_capture_estimate(view, log),
-                )
-            });
-        let blind_belief = blind_belief_board.as_ref().map(|(o, v)| (o, *v));
+        // 信念ネットのマスごと占有（NN段階②）。81マスぶんの forward pass は
+        // 決定点ごとに1回。`belief_gain_w`（ブラインド時の gain 供給）と
+        // `belief_occ_cap_w`（厳密粒子が居ても裏付け無し捕獲をネット占有へ
+        // 寄せる）が共有する。どちらも0なら計算しない
+        let belief_occ_board: Option<[f64; 81]> = (belief_occ_cap_w() > 0.0
+            || (belief_gain_w() > 0.0 && sample.is_empty()))
+        .then(|| {
+            let ctx = crate::belief_features::BeliefContext::from_log(view.your_color, log);
+            crate::belief_nn::board_occupancy(&ctx)
+        });
+        let blind_belief_mean = (belief_gain_w() > 0.0 && sample.is_empty())
+            .then(|| blind_capture_estimate(view, log));
+        let blind_belief = match (belief_occ_board.as_ref(), blind_belief_mean) {
+            (Some(o), Some(v)) => Some((o, v)),
+            _ => None,
+        };
         // 自駒の利き枚数（`blind_attack_survive_w` の守り枚数と
         // `adds_focal_attacker` の争点判定で共用。決定点ごとに1回）
         let own_attack = own_attack_counts(view);
@@ -4555,6 +4604,7 @@ impl Strategy for EstimatorStrategy {
                 || promote_far_w() > 0.0
                 || unbacked_camp_w() > 0.0
                 || unbacked_gs_capture_w() > 0.0
+                || belief_occ_cap_w() > 0.0
                 || home_gold_attack_w() > 0.0
                 || king_adj_heavy_w() > 0.0
                 || tokin_file_drift_w() > 0.0
@@ -4662,6 +4712,7 @@ impl Strategy for EstimatorStrategy {
                 opp_occ_backed.as_ref(),
                 hand_asset_kings.as_ref(),
                 king_threats.as_ref(),
+                belief_occ_board.as_ref(),
             );
             // 王手中: 仮説条件付きの「王手駒の除去期待値」（check.rs::removal_term）。
             // 王手駒のマスを取る手は受理された未来で脅威ごと駒を排除し、玉逃げ等の
@@ -6530,6 +6581,9 @@ fn evaluate(
     hand_asset_kings: Option<&std::collections::BTreeSet<Coord>>,
     // 玉接近減点の脅威マス（`king_known_approach_w`）。歴代非歩打ち反則込み
     king_threats: Option<&[bool; 81]>,
+    // 信念ネットのマスごと占有（`belief_occ_cap_w`）。厳密粒子が居る決定でも
+    // 裏付け無し捕獲の期待駒得をネット占有へ安全方向だけ寄せる。None なら無効
+    belief_occ: Option<&[f64; 81]>,
 ) -> EvalOut {
     let me = view.your_color;
     let opp = me.other();
@@ -7056,17 +7110,49 @@ fn evaluate(
             }
             _ => false,
         };
-        let material_shrink = if degen_gate < 1.0 && capture_hits > 0.0 && !capture_to_backed {
-            (1.0 - degen_gate) * (capture_value_sum / legal)
+        let capture_ev = if legal > 0.0 && capture_hits > 0.0 {
+            capture_value_sum / legal
         } else {
             0.0
         };
-        // 金銀・大駒の裏付け無し捕獲をキャンセル（`unbacked_gs_capture_w`）。
-        // 質量ゲートでは自信を持って間違う 6c6b / 4a3b+ が残るので、
-        // 期待駒得を w 倍だけ引く。王手中・裏付けマス・と金歩桂香は対象外。
+        let material_shrink = if degen_gate < 1.0 && capture_ev > 0.0 && !capture_to_backed {
+            (1.0 - degen_gate) * capture_ev
+        } else {
+            0.0
+        };
+        // 信念ネット占有キャップ（`belief_occ_cap_w`）。質量ゲートの後の残り
+        // 駒得に対して、ネットが空き寄りと見ているマスへの裏付け無し捕獲だけ
+        // 縮める。生存粒子が全員で同じ空きマスに駒を置いてもネットは独立なので
+        // 「自信を持って間違う」を質量では区別できない壁を越えられる。
+        // 金銀キャンセルより先に掛け、残りを gs_unbacked が受け取る（二重控除しない）
+        let remaining_after_degen = (capture_ev - material_shrink).max(0.0);
+        let belief_occ_shrink = if belief_occ_cap_w() > 0.0
+            && !view.you_in_check
+            && remaining_after_degen > 0.0
+            && !capture_to_backed
+        {
+            match (*mv, belief_occ) {
+                (ShogiMove::Board { to, .. }, Some(occ)) => {
+                    let p_occ = occ[crate::belief_features::sq_index(to)];
+                    let shrink =
+                        belief_occ_cap_shrink(remaining_after_degen, p_hit, p_occ, belief_occ_cap_w());
+                    if crate::hits::enabled() {
+                        crate::hits::flag("belief_occ_cap", shrink > 0.05);
+                    }
+                    shrink
+                }
+                _ => 0.0,
+            }
+        } else {
+            0.0
+        };
+        let remaining_after_belief = (remaining_after_degen - belief_occ_shrink).max(0.0);
+        // 金銀の裏付け無し捕獲をキャンセル（`unbacked_gs_capture_w`）。
+        // 信念ネットも「居る」と見ているマスで金銀が幻の駒得を残すときの床。
+        // 王手中・裏付けマス・と金歩桂香は対象外。
         let gs_unbacked_capture = if unbacked_gs_capture_w() > 0.0
             && !view.you_in_check
-            && capture_hits > 0.0
+            && remaining_after_belief > 0.0
             && !capture_to_backed
         {
             let mover_gs = matches!(
@@ -7078,7 +7164,7 @@ fn evaluate(
                     .is_some_and(|p| matches!(p.role, Role::Gold | Role::Silver))
             );
             if mover_gs {
-                unbacked_gs_capture_w() * (capture_value_sum / legal)
+                unbacked_gs_capture_w() * remaining_after_belief
             } else {
                 0.0
             }
@@ -7097,7 +7183,10 @@ fn evaluate(
         // 攻め側の項（王探し・玉周りの圧力・逃げマス被覆）は taint
         // フォールバック中は attack_scale で絞る。守り側（自玉への圧力・
         // 相手の打ち王手の危険）は絞らない = 安全方向は残す
-        value_sum / legal + mate_term - capture_bet_penalty - material_shrink - gs_unbacked_capture
+        value_sum / legal + mate_term - capture_bet_penalty
+            - material_shrink
+            - belief_occ_shrink
+            - gs_unbacked_capture
             + params.info_bonus * p_hit * (1.0 - p_hit)
             + attack_scale * params.king_probe_bonus * p_chk * (1.0 - p_chk)
             + value_nn_term
@@ -9701,6 +9790,35 @@ pub(crate) mod tests {
         if std::env::var("TSUITATE_PROMOTE_FAR_W").is_err() {
             assert!((promote_far_w() - 2.5).abs() < 1e-12);
         }
+        if std::env::var("TSUITATE_BELIEF_OCC_CAP_W").is_err() {
+            assert!((belief_occ_cap_w() - BELIEF_OCC_CAP_W).abs() < 1e-12);
+            assert!((BELIEF_OCC_CAP_W - 1.0).abs() < 1e-12);
+        }
+    }
+
+    /// 信念ネット占有キャップ: 空き寄り（p_occ < 0.25）のときだけ縮み、
+    /// ネットも居ると見ているマスは粒子の捕獲期待値を残す。
+    #[test]
+    fn belief_occ_cap_shrinks_only_when_net_says_empty() {
+        let ev = 5.0;
+        // ネットも居る（0.40 ≥ 0.25）→ 縮まない
+        assert_eq!(belief_occ_cap_shrink(ev, 1.0, 0.40, 1.0), 0.0);
+        // 完全な空き → 全額
+        let empty = belief_occ_cap_shrink(ev, 1.0, 0.0, 1.0);
+        assert!(
+            (empty - ev).abs() < 1e-9,
+            "p_occ=0 は幻の駒得を全額キャンセル: {empty}"
+        );
+        // 裾の空き（m067 型）: mix = 1-0.05/0.25 = 0.8、effective_p = 0.2+0.8*0.05 = 0.24
+        let tail = belief_occ_cap_shrink(ev, 1.0, 0.05, 1.0);
+        assert!(
+            (tail - ev * 0.76).abs() < 1e-9,
+            "p_occ=0.05 は 76% 縮小: {tail}"
+        );
+        // w=0 は無効
+        assert_eq!(belief_occ_cap_shrink(ev, 1.0, 0.0, 0.0), 0.0);
+        // 裏付け相当: p_hit が既にネット以下なら縮まない
+        assert_eq!(belief_occ_cap_shrink(ev, 0.05, 0.05, 1.0), 0.0);
     }
 
     #[test]
