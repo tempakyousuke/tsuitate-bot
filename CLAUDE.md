@@ -641,10 +641,10 @@
       未解決のまま。不成の発想自体は GEN=1 で候補化できるので、対人・本番で
       env から試す価値は残る。NN 双子評価はノブなしで残置（GEN 有効時のみ
       発火・既定挙動不変）
-    - `TSUITATE_CAPTURE_RETREAT_W`（既定 **0.08**、0 で無効）—
+    - `TSUITATE_CAPTURE_RETREAT_W`（既定 **0.16**、0 で無効）—
       **捕獲直後の厳密手戻り（不成のみ）を backtrack 免除＋ w×交換価値 加点**。
       GEN+PREROLE の既知回帰 m024（「取って逃げる」3b4b が 4f4g+ に沈む）への
-      対応で、コンボ計測では m024 得点 5.00→7.40 の回復を確認。成り逆
+      対応。0.08 では 4f4g+ がなお 0.43 上回ったため 0.16 に上げた。成り逆
       （4a3b+ 型の再突入）は除外（m087/m089 回帰の教訓）。桂銀香の
       promote_bias を不成側へ付け替える変更も GEN 有効時のみ発火するよう
       ゲート済み（既定挙動不変）
@@ -679,13 +679,19 @@
     m019/m029/m037 を壊していた。修正:
     - 既定オン: `LINK_ENDGAME_DAMPEN=40` / `PROMOTE_FAR_W=2.5` /
       `material_degen_q0=0.3` / `GEN_NONPROMOTE` / `PROMO_RISK_PREROLE` /
-      `CAPTURE_RETREAT_W=0.08` / `promo_king_prox=0.5`
+      `CAPTURE_RETREAT_W=0.16` / `promo_king_prox=0.5`
     - `TSUITATE_KING_FILE_PAWN_W`（既定 1.2）: 敵陣の歩（前進・成り・打ち）
       が玉候補筋の中央値±2 なら `w/(1+d_file)`。9六歩・8六歩・4f4g+ は
       中段/自陣なので加点しない
     - `TSUITATE_UNBACKED_CAMP_W`（既定 0.8）: 角飛馬龍だけ。と金は免税
-    - `TSUITATE_HAND_ASSET_W`（既定 1.0）: 金銀の無目的打ち＋自陣への角飛打ち
-      （B*1h 逃避）。G*5g 型の自玉近接は仕事ありで免税
+    - `TSUITATE_KING_ADJ_HEAVY_W`（既定 0.5）: 玉筋が読めるとき、観測裏付け
+      の無い玉候補8近傍へ歩香桂以外が**盤上から**入る手を課税。m021 の
+      4一と（3a4a）対策。打ちと歩は対象外（S*4b / 4七歩成を巻き込まない）
+    - `TSUITATE_OWN_CAMP_MINOR_PROMO_W`（既定 1.2）: 桂銀香の任意成りを課税
+      （m046 の 3h4i+ vs 不成）
+    - `TSUITATE_HAND_ASSET_W`（既定 1.0）: 金銀桂の無目的打ち＋自陣への角飛打ち。
+      金銀の守り打ちは自玉隣接または玉頭2マスだけ免税（S*3h は課税）。
+      敵玉近接は敵陣かつ focused のときだけ
     - `TSUITATE_PROMOTE_CHECK_REVEAL_W`（既定 1.2）
     - `TSUITATE_KING_KNOWN_APPROACH_W`（既定 1.0）
     - 切り戻しは各 env を 0 に
