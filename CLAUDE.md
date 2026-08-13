@@ -677,7 +677,7 @@
     アリーナ −7.4pt。犯人候補の `KING_KNOWN_APPROACH_W` は既定0のまま。
     5試行 suite が 5.349 で、玉筋歩の min 距離が序盤の 9六歩を押し上げて
     m019/m029/m037 を壊していた。修正:
-    - 既定オン: `LINK_ENDGAME_DAMPEN=40` / `PROMOTE_FAR_W=4.0` /
+    - 既定オン: `LINK_ENDGAME_DAMPEN=40` / `PROMOTE_FAR_W=2.5` /
       `material_degen_q0=0.3` / `GEN_NONPROMOTE` / `PROMO_RISK_PREROLE` /
       `CAPTURE_RETREAT_W=0.16` / `promo_king_prox=0.5`
     - `TSUITATE_KING_FILE_PAWN_W`（既定 1.2）: 敵陣の歩（前進・成り・打ち）
@@ -690,9 +690,9 @@
     - `TSUITATE_KING_ADJ_HEAVY_W`（既定 1.5）: 玉筋が読めるとき、観測裏付け
       の無い玉候補8近傍へ歩香桂以外が**盤上から**入る手を課税。m021 の
       4一と（3a4a）対策。0.5 では suite で 3a4a が残った。打ちと歩は対象外
-    - `TSUITATE_TOKIN_FILE_DRIFT_W`（既定 1.2）: 敵陣のと金が玉筋へ近づかない
-      空きマス移動を課税。接近・玉筋残留・大駒の筋を空ける・裏付け捕獲は免税
-      （接近免税を外すと m019 の 2a3a が沈む）
+    - `TSUITATE_TOKIN_FILE_DRIFT_W`（既定 0）: 敵陣のと金が玉筋へ近づかない
+      空きマス移動を課税。4g4h は沈むが 2a1a（m019 の 6 点）も沈み 9六歩へ
+      流出するためオフ
     - `TSUITATE_OWN_CAMP_IDLE_W`（既定 0）: 自陣の金銀桂の非捕獲移動。
       m046 の 7a7b 用に入れたが m027 の 3i3h を巻き込むためオフ
     - `TSUITATE_OWN_CAMP_MINOR_PROMO_W`（既定 1.2）: 桂銀香の任意成りを課税

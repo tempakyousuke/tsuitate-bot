@@ -463,7 +463,7 @@ fn promote_far_w() -> f64 {
 
 /// 大駒成りの遠方ペナルティの既定（2026-08-13。4.0 でも m081 の 4a3b+ が
 /// 7六歩より上に残ったため 5.5。0 で切り戻し）
-const PROMOTE_FAR_W: f64 = 4.0;
+const PROMOTE_FAR_W: f64 = 2.5;
 
 /// 玉筋の歩前進（`TSUITATE_KING_FILE_PAWN_W`、既定 `KING_FILE_PAWN_W`）。
 /// **敵陣**の歩（前進・成り・打ち）が、玉候補筋の中央値から距離 ≤2 のとき
@@ -519,7 +519,7 @@ fn tokin_file_drift_w() -> f64 {
     })
 }
 
-const TOKIN_FILE_DRIFT_W: f64 = 1.2;
+const TOKIN_FILE_DRIFT_W: f64 = 0.0;
 
 /// 自陣の金銀桂の空きマス移動課税（`TSUITATE_OWN_CAMP_IDLE_W`、既定
 /// `OWN_CAMP_IDLE_W`。0 で切り戻し）。自陣への非捕獲移動へ
@@ -9531,7 +9531,7 @@ pub(crate) mod tests {
     fn tokin_file_drift_and_promote_far_defaults() {
         if std::env::var("TSUITATE_TOKIN_FILE_DRIFT_W").is_err() {
             assert!((tokin_file_drift_w() - TOKIN_FILE_DRIFT_W).abs() < 1e-12);
-            assert!(TOKIN_FILE_DRIFT_W > 0.0);
+            assert!(TOKIN_FILE_DRIFT_W == 0.0);
         }
         if std::env::var("TSUITATE_KING_FILE_GOLD_W").is_err() {
             assert!((king_file_gold_w() - KING_FILE_GOLD_W).abs() < 1e-12);
@@ -9539,7 +9539,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_PROMOTE_FAR_W").is_err() {
             assert!((promote_far_w() - PROMOTE_FAR_W).abs() < 1e-12);
-            assert!((PROMOTE_FAR_W - 4.0).abs() < 1e-12);
+            assert!((PROMOTE_FAR_W - 2.5).abs() < 1e-12);
         }
         if std::env::var("TSUITATE_KING_ADJ_HEAVY_W").is_err() {
             assert!((KING_ADJ_HEAVY_W - 1.5).abs() < 1e-12);
