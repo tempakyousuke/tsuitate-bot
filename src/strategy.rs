@@ -4826,6 +4826,7 @@ impl Strategy for EstimatorStrategy {
                 }
             }
             // と金の玉筋逸れ（`tokin_file_drift_w`）。盤上のと金移動だけ。
+            // 粒子が捕獲を信じている手（m029 の 3b3c 桂取り）は免税。
             if !view.you_in_check {
                 let dw = tokin_file_drift_w();
                 if dw > 0.0 {
@@ -4837,7 +4838,7 @@ impl Strategy for EstimatorStrategy {
                             .iter()
                             .find(|p| p.square == make_usi_square(from))
                             .is_some_and(|p| p.role == Role::Tokin);
-                        if is_tokin {
+                        if is_tokin && out.capture_value < 0.5 {
                             out.gain -= dw
                                 * exchange_value(Role::Tokin)
                                 * tokin_file_drift_amount(
