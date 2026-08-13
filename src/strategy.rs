@@ -395,9 +395,8 @@ const LINK_ENDGAME_DAMPEN: f64 = 40.0;
 /// **金・銀・桂**と、**自陣への角・飛・歩打ち**に限定する。PR#1 全駒種版は
 /// kakudo の R*2d と lance/pawn-tether を巻き込みアリーナ −7pt だった。
 /// quest31 の G*5e 濫発は金銀、N*4g / N*5d は桂、B*1h 逃避は自陣の角打ち、
-/// P*4h / P*5h / P*2b は自陣の歩打ち（歩の課税量は 4.0。exchange_value=1
-/// だと m046 の P*2b が 3h4i を押しのける）。敵陣・中段の角飛打ち
-/// （B*3f / B*4a）と敵陣の歩打ち（P*7c / P*4f）は対象外。
+/// P*4h / P*5h は自陣の歩打ち。敵陣・中段の角飛打ち（B*3f / B*4a）と
+/// 敵陣の歩打ち（P*7c / P*4f）は対象外。
 /// 仕事: 金は自玉 8 近傍、銀は玉頭2マス／敵陣かつ玉筋が読めるときの
 /// 敵玉近接／安い駒の裏付け当たり。打つ手だけ・王手中無効・粒子不要。
 /// 凍結版はこの名前を知らない。
@@ -462,10 +461,10 @@ fn promote_far_w() -> f64 {
     })
 }
 
-/// 大駒成りの遠方ペナルティの既定（2026-08-13。歩成りは対象外なので
-/// 7d7c+ クラスは巻き込まない。4a3b+ を 7六歩の下へ沈める作業点）。
+/// 大駒成りの遠方ペナルティの既定（2026-08-13。歩成りは対象外。
+/// 6.0 は 5試行フル suite で平均を下げたため 2.5 に戻す）。
 /// 0 で切り戻し
-const PROMOTE_FAR_W: f64 = 6.0;
+const PROMOTE_FAR_W: f64 = 2.5;
 
 /// 玉筋の歩前進（`TSUITATE_KING_FILE_PAWN_W`、既定 `KING_FILE_PAWN_W`）。
 /// **敵陣**の歩（前進・成り・打ち）が、玉候補筋の中央値から距離 ≤2 のとき
@@ -520,7 +519,7 @@ fn tokin_file_drift_w() -> f64 {
     })
 }
 
-const TOKIN_FILE_DRIFT_W: f64 = 0.8;
+const TOKIN_FILE_DRIFT_W: f64 = 0.0;
 
 /// 自陣の金銀桂の空きマス移動課税（`TSUITATE_OWN_CAMP_IDLE_W`、既定
 /// `OWN_CAMP_IDLE_W`。0 で切り戻し）。自陣への非捕獲移動へ
@@ -586,8 +585,8 @@ fn unbacked_gs_capture_w() -> f64 {
     })
 }
 
-/// 金銀・大駒の裏付け無し捕獲をキャンセルする既定（2026-08-13。
-/// m081 の 6c6b / 4a3b+）。
+/// 金銀の裏付け無し捕獲をキャンセルする既定（2026-08-13。m081 の 6c6b）。
+/// 大駒まで広げると 5試行フル suite が 5.326 まで落ちたため金銀だけ。
 const UNBACKED_GS_CAPTURE_W: f64 = 1.0;
 
 /// 相手の初期金位置への金銀の当たり（`TSUITATE_HOME_GOLD_ATTACK_W`、既定
@@ -606,7 +605,7 @@ fn home_gold_attack_w() -> f64 {
     })
 }
 
-const HOME_GOLD_ATTACK_W: f64 = 3.0;
+const HOME_GOLD_ATTACK_W: f64 = 0.0;
 
 /// と金が玉筋へ寄る手の加点（`TSUITATE_TOKIN_APPROACH_W`、既定 0）。
 /// 敵陣のと金が、玉候補筋の中央値への筋距離を縮める手へ `w / (1+d_to)` を足す。
@@ -7076,20 +7075,7 @@ fn evaluate(
                     .your_pieces
                     .iter()
                     .find(|p| p.square == make_usi_square(from))
-                    .is_some_and(|p| {
-                        matches!(
-                            p.role,
-                            Role::Gold
-                                | Role::Silver
-                                | Role::Bishop
-                                | Role::Rook
-                                | Role::Horse
-                                | Role::Dragon
-                                | Role::Promotedsilver
-                                | Role::Promotedknight
-                                | Role::Promotedlance
-                        )
-                    })
+                    .is_some_and(|p| matches!(p.role, Role::Gold | Role::Silver))
             );
             if mover_gs {
                 unbacked_gs_capture_w() * (capture_value_sum / legal)
@@ -7274,7 +7260,7 @@ fn evaluate(
                 0.0
             } else {
                 let amount = if role == Role::Pawn {
-                    4.0
+                    2.0
                 } else {
                     exchange_value(role)
                 };
@@ -9706,14 +9692,14 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_HOME_GOLD_ATTACK_W").is_err() {
             assert!((home_gold_attack_w() - HOME_GOLD_ATTACK_W).abs() < 1e-12);
-            assert!((HOME_GOLD_ATTACK_W - 3.0).abs() < 1e-12);
+            assert_eq!(HOME_GOLD_ATTACK_W, 0.0);
         }
         if std::env::var("TSUITATE_TOKIN_APPROACH_W").is_err() {
             assert!((tokin_approach_w() - TOKIN_APPROACH_W).abs() < 1e-12);
             assert_eq!(TOKIN_APPROACH_W, 0.0);
         }
         if std::env::var("TSUITATE_PROMOTE_FAR_W").is_err() {
-            assert!((promote_far_w() - 6.0).abs() < 1e-12);
+            assert!((promote_far_w() - 2.5).abs() < 1e-12);
         }
     }
 
@@ -9906,7 +9892,7 @@ pub(crate) mod tests {
     fn tokin_file_drift_and_promote_far_defaults() {
         if std::env::var("TSUITATE_TOKIN_FILE_DRIFT_W").is_err() {
             assert!((tokin_file_drift_w() - TOKIN_FILE_DRIFT_W).abs() < 1e-12);
-            assert!((TOKIN_FILE_DRIFT_W - 0.8).abs() < 1e-12);
+            assert_eq!(TOKIN_FILE_DRIFT_W, 0.0);
         }
         if std::env::var("TSUITATE_KING_FILE_GOLD_W").is_err() {
             assert!((king_file_gold_w() - KING_FILE_GOLD_W).abs() < 1e-12);
@@ -9914,7 +9900,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_PROMOTE_FAR_W").is_err() {
             assert!((promote_far_w() - PROMOTE_FAR_W).abs() < 1e-12);
-            assert!((PROMOTE_FAR_W - 6.0).abs() < 1e-12);
+            assert!((PROMOTE_FAR_W - 2.5).abs() < 1e-12);
         }
         if std::env::var("TSUITATE_KING_ADJ_HEAVY_W").is_err() {
             assert!((KING_ADJ_HEAVY_W - 1.5).abs() < 1e-12);
