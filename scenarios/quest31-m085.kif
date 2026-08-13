@@ -1,4 +1,4 @@
-*scenario ply=84 target=5b6a+ scores=4a3b+:0,5b5a+:0,4a2c+:0,5f5e:2,1g1f:0,8i9g:2,3g3f:1,6d7c:1,6c7c:1,6c7b:2,6d7d:2,5b6a+:8,6c6b:2,2d3e:3,P*4c:1,6d5c:1,P*4d:4,8g8f:8,5b4c+:2,3c4c:1,3c2b:1,7g7f:8,6d6e:2,3c3e:0,P*2b:0,2d1c+:0,3c2c:1,6d5d:0,3c3b:7 bad=4a3b+,5b5a+,4a2c+,5f5e,1g1f,8i9g,3g3f,6d7c,6c7c,6c7b,6d7d,6c6b,P*4c,6d5c,5b4c+,3c4c,3c2b,6d6e,3c3e,P*2b,2d1c+,3c2c,6d5d desc=85手目（先手番）。6一銀成・8六歩・7六歩があり。実戦の7二金は「人間も指したがあまりよくなかった」判定
+*scenario ply=84 target=5b6a+ scores=4a3b+:0,5b5a+:0,4a2c+:0,5f5e:2,1g1f:0,8i9g:2,3g3f:1,6d7c:1,6c7c:1,6c7b:2,6d7d:2,5b6a+:8,6c6b:2,2d3e:3,P*4c:1,6d5c:1,P*4d:4,8g8f:8,5b4c+:2,3c4c:1,3c2b:1,7g7f:8,6d6e:2,3c3e:0,P*2b:0,2d1c+:0,3c2c:1,6d5d:0,3c3b:7,5b6a:7 bad=4a3b+,5b5a+,4a2c+,5f5e,1g1f,8i9g,3g3f,6d7c,6c7c,6c7b,6d7d,6c6b,P*4c,6d5c,5b4c+,3c4c,3c2b,6d6e,3c3e,P*2b,2d1c+,3c2c,6d5d desc=85手目（先手番）。6一銀成・8六歩・7六歩があり。実戦の7二金は「人間も指したがあまりよくなかった」判定
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
