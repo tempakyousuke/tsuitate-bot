@@ -380,9 +380,13 @@ fn link_endgame_dampen() -> f64 {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.0)
+            .unwrap_or(LINK_ENDGAME_DAMPEN)
     })
 }
+
+/// ブラインド終盤の紐減衰の既定（2026-08-13 採用。quest31 得点 6.0 目標）。
+/// 0 で従来挙動へ切り戻し
+const LINK_ENDGAME_DAMPEN: f64 = 40.0;
 
 /// 持ち駒の資産損（`TSUITATE_HAND_ASSET_W`、既定 0 = 無効。
 /// quest31 コンボ計測時の作業点は 0.5）。
@@ -442,9 +446,59 @@ fn promote_far_w() -> f64 {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.0)
+            .unwrap_or(PROMOTE_FAR_W)
     })
 }
+
+/// 大駒成りの遠方ペナルティの既定（2026-08-13。コンボ作業点 1.0 から 1.5 へ
+/// 引き上げ = 4a3b+ が w=1 でも残ったため）。0 で切り戻し
+const PROMOTE_FAR_W: f64 = 1.5;
+
+/// 玉筋の歩前進（`TSUITATE_KING_FILE_PAWN_W`、既定 `KING_FILE_PAWN_W`）。
+/// 未成の歩が、`deduce::opp_king_candidates` の最寄り玉から筋距離 ≤2 の
+/// 筋へ前進する手へ `w / (1+d_file)` を gain に足す。打ちも敵陣の同じ
+/// 条件なら加点（P*7c 型）。
+///
+/// quest31 の 7六歩 / 8六歩（採点 8）が 3二角成（0点）に負け続ける既知ギャップ
+/// への対応。`promo_king_prox` は将来の成りポテンシャル側で、歩突きそのもの
+/// への加点は無かった。遠方の大駒成りを沈めても次の悪手（3五角）が繰り上がる
+/// だけ、という m061 型を「良い歩を上げる」側で壊す。
+/// 王手中無効・粒子不要。凍結版はこの名前を知らない。
+fn king_file_pawn_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_KING_FILE_PAWN_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(KING_FILE_PAWN_W)
+    })
+}
+
+const KING_FILE_PAWN_W: f64 = 1.2;
+
+/// 裏付け無しの敵陣進入課税（`TSUITATE_UNBACKED_CAMP_W`、既定
+/// `UNBACKED_CAMP_W`）。歩・香・桂・玉以外が、観測裏付けの無い敵陣マスへ
+/// 入る手へ `w × exchange_value(着手駒)` を gain から引く。
+///
+/// 発端は quest31-m021 の 4一と（幻の金）と 4a3b+ / 2d3c+（幻の駒得で
+/// 大駒が敵陣へ成り込む）。`capture_bet_var_w` は p_hit≈1 で消え、
+/// `material_degen_q0` は粒子質量で縮めるが信念が自信を持って間違うと
+/// 残る。こちらは**観測の裏付けが無い敵陣マス**という安全方向だけの静的税。
+/// 裏付けマス（取られた/非歩打ち反則）への取り返しは免税。
+/// 王手中無効・粒子不要。凍結版はこの名前を知らない。
+fn unbacked_camp_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_UNBACKED_CAMP_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(UNBACKED_CAMP_W)
+    })
+}
+
+const UNBACKED_CAMP_W: f64 = 0.8;
 
 /// 成って王手する手の露見ペナルティ（`TSUITATE_PROMOTE_CHECK_REVEAL_W`、
 /// 既定 0 = 無効）。歩・角・飛の**成る王手**は宣言で位置が露見し、
@@ -598,6 +652,68 @@ fn chebyshev(a: Coord, b: Coord) -> i32 {
     i32::from((a.file - b.file).abs().max((a.rank - b.rank).abs()))
 }
 
+fn in_enemy_camp(to: Coord, me: Color) -> bool {
+    match me {
+        Color::Sente => to.rank <= 3,
+        Color::Gote => to.rank >= 7,
+    }
+}
+
+/// 玉筋の歩前進量（`king_file_pawn_w`）。前進1マスかつ最寄り玉の筋距離 ≤2。
+fn king_file_pawn_amount(
+    from: Coord,
+    to: Coord,
+    me: Color,
+    cands: &std::collections::BTreeSet<Coord>,
+) -> f64 {
+    let forward = match me {
+        Color::Sente => to.file == from.file && to.rank == from.rank - 1,
+        Color::Gote => to.file == from.file && to.rank == from.rank + 1,
+    };
+    if !forward || cands.is_empty() {
+        return 0.0;
+    }
+    king_file_pawn_drop_amount(to, cands)
+}
+
+/// 敵陣（または玉筋）への歩打ち。筋距離 ≤2 なら `1/(1+d_file)`。
+fn king_file_pawn_drop_amount(
+    to: Coord,
+    cands: &std::collections::BTreeSet<Coord>,
+) -> f64 {
+    let Some(d_file) = cands
+        .iter()
+        .map(|k| (to.file - k.file).abs())
+        .min()
+    else {
+        return 0.0;
+    };
+    if d_file > 2 {
+        return 0.0;
+    }
+    1.0 / (1.0 + f64::from(d_file))
+}
+
+/// 裏付け無し敵陣進入の課税量（`unbacked_camp_w`）。
+/// 歩香桂玉は 0。裏付けマスは 0。それ以外は交換価値。
+fn unbacked_camp_amount(
+    role: Role,
+    to: Coord,
+    me: Color,
+    backed: &[bool; 81],
+) -> f64 {
+    if !in_enemy_camp(to, me) {
+        return 0.0;
+    }
+    if backed[crate::belief_features::sq_index(to)] {
+        return 0.0;
+    }
+    match role {
+        Role::Pawn | Role::Lance | Role::Knight | Role::King => 0.0,
+        _ => exchange_value(role),
+    }
+}
+
 /// 玉の既知脅威への接近量（`king_known_approach_w` の材料）。
 /// チェビシェフが縮むときはその差分、同じ危険圏（≤2）で筋/段だけ寄るとき
 /// は 0.5（quest31-m099: 7g→6h は 5f へ dist=2 のまま筋だけ寄る）。
@@ -704,8 +820,8 @@ fn check_king_gain_mean() -> bool {
     })
 }
 
-/// 成りが任意の移動で**不成も候補に生成する**か（既定は無効 = 従来の
-/// 「成れるなら成る」）。`TSUITATE_GEN_NONPROMOTE=1` で有効。
+/// 成りが任意の移動で**不成も候補に生成する**か（既定は有効。
+/// `TSUITATE_GEN_NONPROMOTE=0` で従来の「成れるなら成る」へ切り戻し）。
 /// 凍結版は自前の candidate_moves を持つのでこの名前を知らない。
 ///
 /// 発端は quest_20260731 の95手目（人間の ７三歩**成らず**）。不成の価値は
@@ -722,11 +838,13 @@ fn check_king_gain_mean() -> bool {
 /// スケルトンにも載らない）。駒種フィルタは置かない（駒種特化を足さない方針）
 fn gen_nonpromote() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_GEN_NONPROMOTE").is_ok_and(|v| v == "1"))
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_GEN_NONPROMOTE").map_or(true, |v| v != "0")
+    })
 }
 
-/// 成る手の取られリスクを**成る前の駒価値**で数えるか（既定は無効 = 従来の
-/// 成った後の駒種で数える）。`TSUITATE_PROMO_RISK_PREROLE=1` で有効。
+/// 成る手の取られリスクを**成る前の駒価値**で数えるか（既定は有効。
+/// `TSUITATE_PROMO_RISK_PREROLE=0` で成った後の駒種に切り戻し）。
 /// 凍結版はこの名前を知らない。
 ///
 /// GEN_NONPROMOTE の初回計測（2026-08-08）で露呈した歪みへの対応:
@@ -739,7 +857,9 @@ fn gen_nonpromote() -> bool {
 /// 成りの付加価値は生き残った分岐（threat / promo 実現）でだけ実現させる
 fn promo_risk_prerole() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_PROMO_RISK_PREROLE").is_ok_and(|v| v == "1"))
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_PROMO_RISK_PREROLE").map_or(true, |v| v != "0")
+    })
 }
 
 /// 捕獲直後の手戻り免除・退避加点（`TSUITATE_CAPTURE_RETREAT_W`、既定 0 = 無効。
@@ -760,9 +880,13 @@ fn capture_retreat_w() -> f64 {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.0)
+            .unwrap_or(CAPTURE_RETREAT_W)
     })
 }
+
+/// 捕獲直後の手戻り免除の既定（2026-08-13。GEN+PREROLE の m024 回帰対策）。
+/// 0 で切り戻し
+const CAPTURE_RETREAT_W: f64 = 0.08;
 
 /// V1（利き数）のノブ。**既定は両方 無効**（＝従来の二値の利き判定）。
 ///
@@ -2335,13 +2459,16 @@ impl Default for EvalParams {
             // 0 で従来挙動へ切り戻し。w=10 × capture_reveal_risk ≒ 1.3点の
             // リスク床で、玉でしか取れない駒の捕獲は gain が勝って生き残る
             king_capture_reveal: 10.0,
-            // 成りポテンシャルの敵玉近接重み（2026-08-05）。0 = 従来と同一挙動
-            promo_king_prox: 0.0,
+            // 成りポテンシャルの敵玉近接重み（2026-08-13 既定 0.5。
+            // 単独では m083 を動かさなかったが、king_file_pawn と組み合わせて
+            // 7六歩側の promo を引き上げる。0 で切り戻し）
+            promo_king_prox: 0.5,
             // 打ち反則で確定した駒への当たり（2026-08-07 実装、2026-08-08 採用）。
             // 0 で従来挙動へ切り戻し。drop_probe_w（情報を買う）の回収側
             foul_occ_attack_w: 2.0,
-            // 材料の退化ゲート（2026-08-10）。0 = 従来と同一挙動
-            material_degen_q0: 0.0,
+            // 材料の退化ゲート（2026-08-13 既定 0.3 採用。quest31 の
+            // 3三角成クラスタを初めて動かした項。0 で切り戻し）
+            material_degen_q0: 0.3,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
             // 反則経済の新項（2026-07-16、オラクル測定で36ptの伸びしろを確認後に追加）。
@@ -3968,7 +4095,10 @@ impl Strategy for EstimatorStrategy {
         // 「裏付け無し捕獲だけ縮める」ゲート／`hand_asset_w` の仕事判定。
         // 決定点ごとに1回）
         let opp_occ_backed =
-            (params.material_degen_q0 > 0.0 || hand_asset_w() > 0.0 || promote_far_w() > 0.0)
+            (params.material_degen_q0 > 0.0
+                || hand_asset_w() > 0.0
+                || promote_far_w() > 0.0
+                || unbacked_camp_w() > 0.0)
                 .then(|| opp_occupancy_evidence(view, log));
         // 玉接近減点の脅威マス（歴代の非歩打ち反則を含む。上記より広い）
         let king_threats =
@@ -3977,9 +4107,10 @@ impl Strategy for EstimatorStrategy {
         let hand_asset_kings: Option<std::collections::BTreeSet<Coord>> =
             (hand_asset_w() > 0.0 && !view.you_in_check)
                 .then(|| crate::deduce::opp_king_candidates(view.your_color, log));
-        // 大駒成り遠方ペナルティの玉候補（`promote_far_w`）。王手中は無効
+        // 大駒成り遠方 / 玉筋歩 / 裏付け無し敵陣進入の玉候補。王手中は無効
         let promote_far_kings: Option<std::collections::BTreeSet<Coord>> =
-            (promote_far_w() > 0.0 && !view.you_in_check)
+            ((promote_far_w() > 0.0 || king_file_pawn_w() > 0.0 || unbacked_camp_w() > 0.0)
+                && !view.you_in_check)
                 .then(|| crate::deduce::opp_king_candidates(view.your_color, log));
         // 成る王手の露見ペナルティ用玉候補（`promote_check_reveal_w`）。
         // ブラインド決定でも効かせるため粒子不要。王手中は無効
@@ -4100,6 +4231,56 @@ impl Strategy for EstimatorStrategy {
                         .is_some_and(|b| b[crate::belief_features::sq_index(to)]);
                     if !backed_hit {
                         out.gain -= w * promote_far_amount(from, to, cands);
+                    }
+                }
+            }
+            // 玉筋の歩前進・打ち（`king_file_pawn_w`）。gain の内側。
+            if !view.you_in_check {
+                let pw = king_file_pawn_w();
+                if pw > 0.0 {
+                    if let Some(cands) = promote_far_kings.as_ref() {
+                        match mv {
+                            ShogiMove::Board { from, to, .. } => {
+                                let is_pawn = view
+                                    .your_pieces
+                                    .iter()
+                                    .find(|p| p.square == make_usi_square(from))
+                                    .is_some_and(|p| p.role == Role::Pawn);
+                                if is_pawn {
+                                    out.gain +=
+                                        pw * king_file_pawn_amount(from, to, view.your_color, cands);
+                                }
+                            }
+                            ShogiMove::Drop {
+                                role: Role::Pawn,
+                                to,
+                            } => {
+                                if in_enemy_camp(to, view.your_color) {
+                                    out.gain += pw * king_file_pawn_drop_amount(to, cands);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            // 裏付け無しの敵陣進入（`unbacked_camp_w`）。gain の内側。
+            if !view.you_in_check {
+                let uw = unbacked_camp_w();
+                if uw > 0.0 {
+                    if let Some(backed) = opp_occ_backed.as_ref() {
+                        let landing = match mv {
+                            ShogiMove::Board { from, to, .. } => view
+                                .your_pieces
+                                .iter()
+                                .find(|p| p.square == make_usi_square(from))
+                                .map(|p| (p.role, to)),
+                            ShogiMove::Drop { role, to } => Some((role, to)),
+                        };
+                        if let Some((role, to)) = landing {
+                            out.gain -=
+                                uw * unbacked_camp_amount(role, to, view.your_color, backed);
+                        }
                     }
                 }
             }
@@ -5466,9 +5647,8 @@ pub fn candidate_moves(
                 Promotion::None => push(make_usi_move(from, to, false), &mut out),
                 Promotion::Forced => push(make_usi_move(from, to, true), &mut out),
                 Promotion::Optional => {
-                    // 成れるなら成る（不成が有利な局面はまれなので候補を絞る）。
-                    // TSUITATE_GEN_NONPROMOTE=1 なら不成も生成して評価側に
-                    // 判断させる（gen_nonpromote の doc 参照）
+                    // 成れるなら成る、が従来。既定では不成も生成して評価側に
+                    // 判断させる（gen_nonpromote の doc 参照。=0 で旧挙動）
                     push(make_usi_move(from, to, true), &mut out);
                     if gen_nonpromote() {
                         push(make_usi_move(from, to, false), &mut out);
@@ -8482,15 +8662,12 @@ pub(crate) mod tests {
         ));
     }
 
-    /// 捕獲直後の手戻り免除ノブは既定 0 = 無効（作業点 0.08 は env で有効化）。
+    /// 捕獲直後の手戻り免除ノブは既定 0.08（GEN+PREROLE の m024 回帰対策）。
     #[test]
-    fn capture_retreat_w_default_off() {
-        // OnceLock はプロセス内で一度だけ読むので、このテストは「未設定なら 0」
-        // の契約だけを固定する（他テストが先に env を立てると壊れるので
-        // 環境変数は触らない）
+    fn capture_retreat_w_default_on() {
         let w = std::env::var("TSUITATE_CAPTURE_RETREAT_W").ok();
         if w.is_none() {
-            assert_eq!(capture_retreat_w(), 0.0);
+            assert!((capture_retreat_w() - CAPTURE_RETREAT_W).abs() < 1e-12);
         }
     }
 
@@ -8509,6 +8686,61 @@ pub(crate) mod tests {
             far > near && far >= 1.0,
             "2d3c+ landing should be farther than 7c: far={far} near={near} kings={kings:?}"
         );
+    }
+
+    /// 7六歩は 6二玉候補に筋距離1、1六歩は距離5で加点0
+    #[test]
+    fn king_file_pawn_prefers_king_files() {
+        let mut cands = std::collections::BTreeSet::new();
+        cands.insert(Coord { file: 6, rank: 2 });
+        let seven = king_file_pawn_amount(
+            Coord { file: 7, rank: 7 },
+            Coord { file: 7, rank: 6 },
+            Color::Sente,
+            &cands,
+        );
+        let one = king_file_pawn_amount(
+            Coord { file: 1, rank: 7 },
+            Coord { file: 1, rank: 6 },
+            Color::Sente,
+            &cands,
+        );
+        assert!((seven - 0.5).abs() < 1e-9, "d_file=1 → 1/2, got {seven}");
+        assert_eq!(one, 0.0, "d_file=5 is outside the ≤2 window");
+        // 横移動は前進ではない
+        assert_eq!(
+            king_file_pawn_amount(
+                Coord { file: 7, rank: 6 },
+                Coord { file: 8, rank: 6 },
+                Color::Sente,
+                &cands,
+            ),
+            0.0
+        );
+        // 敵陣の歩打ち: 7c は筋距離1、2c は距離4
+        let drop7 = king_file_pawn_drop_amount(Coord { file: 7, rank: 3 }, &cands);
+        let drop2 = king_file_pawn_drop_amount(Coord { file: 2, rank: 3 }, &cands);
+        assert!((drop7 - 0.5).abs() < 1e-9);
+        assert_eq!(drop2, 0.0);
+    }
+
+    /// と金の 4一 は敵陣・裏付け無しで課税、歩の 7三 と裏付けマスは免税
+    #[test]
+    fn unbacked_camp_taxes_expensive_unbacked_entry() {
+        let me = Color::Sente;
+        let mut backed = [false; 81];
+        let tokin_4a = unbacked_camp_amount(Role::Tokin, Coord { file: 4, rank: 1 }, me, &backed);
+        assert!(
+            (tokin_4a - exchange_value(Role::Tokin)).abs() < 1e-9,
+            "tokin into 4a: {tokin_4a}"
+        );
+        let pawn_7c = unbacked_camp_amount(Role::Pawn, Coord { file: 7, rank: 3 }, me, &backed);
+        assert_eq!(pawn_7c, 0.0, "pawns are cheap probes");
+        let bishop_4g = unbacked_camp_amount(Role::Bishop, Coord { file: 4, rank: 7 }, me, &backed);
+        assert_eq!(bishop_4g, 0.0, "rank 7 is not sente's enemy camp");
+        backed[crate::belief_features::sq_index(Coord { file: 4, rank: 1 })] = true;
+        let recap = unbacked_camp_amount(Role::Tokin, Coord { file: 4, rank: 1 }, me, &backed);
+        assert_eq!(recap, 0.0, "backed recapture is exempt");
     }
 
     /// ブラインド取り返し: 対象マスは**直前の相手手**で取られたマスに限る
