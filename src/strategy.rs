@@ -401,10 +401,9 @@ const LINK_ENDGAME_DAMPEN: f64 = 40.0;
 /// 仕事: 金は自玉 8 近傍、銀は玉頭2マス／敵陣かつ玉筋が読めるときの
 /// 敵玉近接（金は玉候補そのもの・玉筋隣接を除く）／安い駒の裏付け当たり。
 /// 打つ手だけ・王手中無効・粒子不要。
-/// **手数 `HAND_ASSET_MIN_MOVE` 以降は全域**（中段・敵陣の打ち課税は
-/// アリーナで反則押し出しになる。PR#1 / vs v13 43.3%）。
-/// **それ未満は自陣打ちだけ**（m027 の S*3h。銀の中段・敵陣打ちまで
-/// 序盤から課税すると m046 の 3h4i が P*2b に食われる）。
+/// **手数 `HAND_ASSET_MIN_MOVE` 以降**（序中盤の打ち課税はアリーナで
+/// 反則押し出しになる。PR#1 / vs v13 43.3%。自陣だけ先行すると
+/// m046/m048 の 3h4i が P*2b に食われる）。
 /// 凍結版はこの名前を知らない。
 fn hand_asset_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -420,9 +419,9 @@ fn hand_asset_w() -> f64 {
 /// 金銀桂＋敵陣以外の大駒打ち＋自陣歩の無目的打ち課税の既定。
 /// 香の打ちは対象外（PR#1 全駒種版の lance-tether 回帰を避ける）。
 const HAND_ASSET_W: f64 = 1.0;
-/// 中段・敵陣の打ち課税を始める手数。序中盤まで掛けると反則が増える
-/// （PR#1 コンボのアリーナ −7pt / vs v13 43.3%・反則 7.5/局の主犯候補）。
-/// 終盤の無目的打ち（m090 以降）は残す。それ未満は自陣打ちだけ。
+/// 序中盤まで掛けると打ち課税の押し出しで反則が増える（PR#1 コンボの
+/// アリーナ −7pt / vs v13 43.3%・反則 7.5/局の主犯候補）。
+/// 終盤の無目的打ち（m090 以降）は残す。
 const HAND_ASSET_MIN_MOVE: u32 = 80;
 
 /// 玉の既知脅威への接近減点（`TSUITATE_KING_KNOWN_APPROACH_W`、既定
@@ -821,6 +820,9 @@ const OWN_CAMP_IDLE_MIN_MOVE: u32 = 40;
 /// 減る前進なので免税。裏付け捕獲は免税。打ちは HAND_ASSET の領分。
 /// 0.25 は m055〜m063 の 3c5c（0点の龍横滑り）を復活させたので 0.5。
 /// 王手中無効・粒子不要。
+/// **手数 `BISHOP_RETREAT_MIN_MOVE` 以降**（m055 の 3c5c は残し、
+/// 序盤の角の横移動はアリーナの攻め手段）。
+/// 凍結版はこの名前を知らない。
 fn bishop_retreat_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -833,6 +835,8 @@ fn bishop_retreat_w() -> f64 {
 }
 
 const BISHOP_RETREAT_W: f64 = 0.5;
+/// m055（55手）の 3c5c を残す下限。
+const BISHOP_RETREAT_MIN_MOVE: u32 = 50;
 
 /// 終盤の敵陣成銀の筋替え（`TSUITATE_ENDGAME_CAMP_GENERAL_W`、既定
 /// `ENDGAME_CAMP_GENERAL_W`。0 で切り戻し）。手数 125 以降、敵陣にいる
@@ -1757,13 +1761,6 @@ fn hand_asset_drop_taxable(role: Role, to: Coord, me: Color) -> bool {
         Role::Pawn => in_own_camp(to, me),
         _ => false,
     }
-}
-
-/// この手数で持ち駒資産損を掛ける着地か。80手以降は従来どおり全域、
-/// それ未満は自陣打ちだけ（アリーナの中段・敵陣プローブを潰さない。
-/// m027 の S*3h は自陣なので残る）。
-fn hand_asset_active_at(to: Coord, me: Color, move_number: u32) -> bool {
-    move_number >= HAND_ASSET_MIN_MOVE || in_own_camp(to, me)
 }
 
 /// 玉隣接への高い駒の無支え進入量（`king_adj_heavy_w`）。
@@ -5287,12 +5284,12 @@ impl Strategy for EstimatorStrategy {
         let king_threats = (king_known_approach_w() > 0.0
             && view.move_number >= KING_KNOWN_APPROACH_MIN_MOVE)
             .then(|| king_threat_evidence(log));
-        // 持ち駒資産損の玉候補（`hand_asset_w`）。王手中は無効。
-        // 手数ゲートは `hand_asset_active_at`（自陣は常時、全域は80手以降）
+        // 持ち駒資産損の玉候補（`hand_asset_w`）。王手中は無効
         let hand_asset_kings: Option<std::collections::BTreeSet<Coord>> =
-            (hand_asset_w() > 0.0 && !view.you_in_check).then(|| {
-                crate::deduce::opp_king_candidates(view.your_color, log)
-            });
+            (hand_asset_w() > 0.0
+                && !view.you_in_check
+                && view.move_number >= HAND_ASSET_MIN_MOVE)
+                .then(|| crate::deduce::opp_king_candidates(view.your_color, log));
         // 大駒成り遠方 / 玉筋歩 / 裏付け無し敵陣進入の玉候補。王手中は無効
         let promote_far_kings: Option<std::collections::BTreeSet<Coord>> =
             ((promote_far_w() > 0.0
@@ -5674,7 +5671,7 @@ impl Strategy for EstimatorStrategy {
             // 角・馬の非前進空きマス移動（`bishop_retreat_w`）。
             if !view.you_in_check {
                 let bw = bishop_retreat_w();
-                if bw > 0.0 {
+                if bw > 0.0 && view.move_number >= BISHOP_RETREAT_MIN_MOVE {
                     if let (Some(backed), ShogiMove::Board { from, to, .. }) =
                         (opp_occ_backed.as_ref(), mv)
                     {
@@ -8255,8 +8252,7 @@ fn evaluate(
     let hand_asset_pen = match (hand_asset_kings, opp_occ_backed, mv) {
         (Some(cands), Some(backed), &ShogiMove::Drop { role, to }) => {
             let w = hand_asset_w();
-            let taxable = hand_asset_drop_taxable(role, to, view.your_color)
-                && hand_asset_active_at(to, view.your_color, view.move_number);
+            let taxable = hand_asset_drop_taxable(role, to, view.your_color);
             if w <= 0.0 || !taxable || drop_has_hand_asset_work(view, role, to, backed, cands)
             {
                 0.0
@@ -11051,31 +11047,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn hand_asset_active_at_own_camp_early_not_midboard() {
-        let me = Color::Sente;
-        let own = Coord { file: 3, rank: 8 };
-        let mid = Coord { file: 8, rank: 6 };
-        assert!(
-            hand_asset_active_at(own, me, 27),
-            "m027 S*3h own camp is taxed before 80"
-        );
-        assert!(
-            !hand_asset_active_at(mid, me, 27),
-            "mid-board drops stay exempt before 80"
-        );
-        assert!(
-            hand_asset_active_at(own, me, 46),
-            "own-camp drops stay taxed through the middlegame"
-        );
-        assert!(
-            !hand_asset_active_at(mid, me, 62),
-            "m062 mid-board stays exempt until 80"
-        );
-        assert!(hand_asset_active_at(mid, me, 80));
-        assert!(hand_asset_active_at(own, me, 90));
-    }
-
-    #[test]
     fn king_adj_heavy_w_default_on() {
         let w = std::env::var("TSUITATE_KING_ADJ_HEAVY_W").ok();
         if w.is_none() {
@@ -11619,6 +11590,7 @@ pub(crate) mod tests {
         if std::env::var("TSUITATE_BISHOP_RETREAT_W").is_err() {
             assert!((bishop_retreat_w() - BISHOP_RETREAT_W).abs() < 1e-12);
             assert!((BISHOP_RETREAT_W - 0.5).abs() < 1e-12);
+            assert_eq!(BISHOP_RETREAT_MIN_MOVE, 50);
         }
         if std::env::var("TSUITATE_PAWN_OFFFILE_W").is_err() {
             assert!((pawn_offfile_w() - PAWN_OFFFILE_W).abs() < 1e-12);
