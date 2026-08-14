@@ -508,6 +508,9 @@ const KING_FILE_GOLD_W: f64 = 0.0;
 /// 発端は quest31-m046 の 4g4h / 4g5h（採点 2）vs 3h4i 不成（10）。
 /// 4g5h は中央値 5 筋へ近づくので免税。相手最奥段（2a1a の香取り）も免税。
 /// その他の空きマス移動（4g4h・2c1c）は課税。王手中無効・粒子不要。
+///
+/// 初回は 2a1a 巻き込みで既定オフだったが、最奥段免税を入れてから
+/// quest31 の 4g4h クラスタ（m046/m048/m050）が残ったため 0.8 で再オン。
 fn tokin_file_drift_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -519,7 +522,58 @@ fn tokin_file_drift_w() -> f64 {
     })
 }
 
-const TOKIN_FILE_DRIFT_W: f64 = 0.0;
+/// と金の玉筋逸れの既定（2026-08-14。m046 の 4g4h）。0 で切り戻し
+const TOKIN_FILE_DRIFT_W: f64 = 0.8;
+
+/// 終盤の歩成り課税（`TSUITATE_PAWN_OFFFILE_W`、既定 `PAWN_OFFFILE_W`。
+/// 0 で切り戻し）。金または銀を持っているとき、敵陣への歩成りへ
+/// `w` を gain から引き、裏付けの無い捕獲期待値もキャンセルする。
+///
+/// 発端は quest31 終盤の 5f5g+ 固執（m098/m126/m130）。玉候補の中央が
+/// 5 筋に残っていると「玉筋の歩」扱いで `king_file_pawn_w` が加点し、
+/// 筋外れゲートでは永遠に沈まない。手数 80 以降に限るので序中盤の
+/// 4f4g+ は対象外。歩打ちは垂れ歩（P*2h / P*7c）を巻き込まないよう除外。
+/// 王手中無効・粒子不要。
+fn pawn_offfile_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_PAWN_OFFFILE_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(PAWN_OFFFILE_W)
+    })
+}
+
+/// 終盤の歩成り課税の既定（2026-08-14。5f5g+）。0 で切り戻し
+const PAWN_OFFFILE_W: f64 = 2.5;
+const PAWN_OFFFILE_MIN_MOVE: u32 = 80;
+
+/// 遠方の大駒成り捕獲の幻の駒得キャンセル（`TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W`、
+/// 既定 `FAR_MAJOR_PROMO_CAPTURE_W`。0 で切り戻し）。
+/// 角・飛の**成る手**が、観測裏付けの無いマスへ入り、かつ
+/// `promote_far_amount > 0`（玉から遠い／近づかない）のとき、
+/// 粒子の捕獲期待値を `w` 倍だけ gain から引く（w=1 で全額キャンセル）。
+///
+/// 発端は quest31 の 4a3b+ / 2d3c+（採点 0 の幻の角成り込み）。
+/// `unbacked_gs_capture_w` を大駒まで広げると正しい捕獲まで殺し
+/// （フル suite 5.326）、信念ネット占有も敵陣では「居る」と見なす。
+/// こちらは **成る × 遠い × 裏付け無し** の交差だけなので、
+/// recap-dragon（裏付け）と玉隣の成り捕獲（amount=0）は残る。
+/// 王手中無効・粒子不要（捕獲期待値は evaluate が出した値を外側で削る）。
+fn far_major_promo_capture_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(FAR_MAJOR_PROMO_CAPTURE_W)
+    })
+}
+
+/// 遠方の大駒成り捕獲キャンセルの既定（2026-08-14。4a3b+）。0 で切り戻し
+const FAR_MAJOR_PROMO_CAPTURE_W: f64 = 1.0;
 
 /// 自陣の金銀桂の空きマス移動課税（`TSUITATE_OWN_CAMP_IDLE_W`、既定
 /// `OWN_CAMP_IDLE_W`。0 で切り戻し）。自陣への非捕獲移動へ
@@ -962,6 +1016,23 @@ fn king_file_pawn_drop_amount(
         return 0.0;
     }
     1.0 / (1.0 + f64::from(d_file))
+}
+
+/// 金または銀を持っているか（歩の玉筋外れ課税の機会損失ゲート）。
+fn has_attacking_general(view: &PlayerView) -> bool {
+    view.your_hand.get(&Role::Gold).copied().unwrap_or(0) > 0
+        || view.your_hand.get(&Role::Silver).copied().unwrap_or(0) > 0
+}
+
+/// 終盤の敵陣歩成り量（`pawn_offfile_w`）。手数 80 以降かつ裏付け無し。
+fn pawn_late_promo_amount(to: Coord, me: Color, move_number: u32, backed_hit: bool) -> f64 {
+    if move_number < PAWN_OFFFILE_MIN_MOVE || backed_hit {
+        return 0.0;
+    }
+    if !in_enemy_camp(to, me) {
+        return 0.0;
+    }
+    1.0
 }
 
 /// と金の空きマス移動課税量（`tokin_file_drift_w`）。
@@ -4614,7 +4685,8 @@ impl Strategy for EstimatorStrategy {
                 || home_gold_attack_w() > 0.0
                 || king_adj_heavy_w() > 0.0
                 || tokin_file_drift_w() > 0.0
-                || own_camp_idle_w() > 0.0)
+                || own_camp_idle_w() > 0.0
+                || far_major_promo_capture_w() > 0.0)
                 .then(|| opp_occupancy_evidence(view, log));
         // 玉接近減点の脅威マス（歴代の非歩打ち反則を含む。上記より広い）
         let king_threats =
@@ -4631,7 +4703,9 @@ impl Strategy for EstimatorStrategy {
                 || tokin_approach_w() > 0.0
                 || unbacked_camp_w() > 0.0
                 || king_adj_heavy_w() > 0.0
-                || tokin_file_drift_w() > 0.0)
+                || tokin_file_drift_w() > 0.0
+                || pawn_offfile_w() > 0.0
+                || far_major_promo_capture_w() > 0.0)
                 && !view.you_in_check)
                 .then(|| crate::deduce::opp_king_candidates(view.your_color, log));
         // 成る王手の露見ペナルティ用玉候補（`promote_check_reveal_w`）。
@@ -4756,6 +4830,20 @@ impl Strategy for EstimatorStrategy {
                         out.gain -= w * promote_far_amount(from, to, cands);
                     }
                 }
+                // 遠方の大駒成り捕獲（`far_major_promo_capture_w`）。
+                // 裏付け無しかつ玉から遠い成りの幻の駒得を外側で削る。
+                let cw = far_major_promo_capture_w();
+                if cw > 0.0 && matches!(role, Some(Role::Bishop | Role::Rook)) {
+                    let backed_hit = opp_occ_backed
+                        .as_ref()
+                        .is_some_and(|b| b[crate::belief_features::sq_index(to)]);
+                    if !backed_hit
+                        && out.capture_value > 0.0
+                        && promote_far_amount(from, to, cands) > 0.0
+                    {
+                        out.gain -= cw * out.capture_value;
+                    }
+                }
             }
             // 玉筋の歩前進・打ち（`king_file_pawn_w`）と金打ち（`king_file_gold_w`）。
             // gain の内側。敵陣の歩だけ（7c7b+ / P*7c）。9六歩・4f4g+ は加点しない。
@@ -4788,6 +4876,40 @@ impl Strategy for EstimatorStrategy {
                             out.gain += gw * king_file_pawn_drop_amount(to, cands);
                         }
                         _ => {}
+                    }
+                    // 終盤の歩成り（`pawn_offfile_w`）。金銀を持つ手数 80 以降だけ。
+                    // 玉筋上の 5f5g+ も対象。歩打ちは垂れ歩保護のため除外。
+                    let ow = pawn_offfile_w();
+                    if ow > 0.0 && has_attacking_general(view) {
+                        if let ShogiMove::Board {
+                            from,
+                            to,
+                            promote: true,
+                        } = mv
+                        {
+                            let is_pawn = view
+                                .your_pieces
+                                .iter()
+                                .find(|p| p.square == make_usi_square(from))
+                                .is_some_and(|p| p.role == Role::Pawn);
+                            if is_pawn {
+                                let backed_hit = opp_occ_backed
+                                    .as_ref()
+                                    .is_some_and(|b| b[crate::belief_features::sq_index(to)]);
+                                let amt = pawn_late_promo_amount(
+                                    to,
+                                    view.your_color,
+                                    view.move_number,
+                                    backed_hit,
+                                );
+                                if amt > 0.0 {
+                                    out.gain -= ow * amt;
+                                    if out.capture_value > 0.0 {
+                                        out.gain -= out.capture_value;
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -10034,7 +10156,7 @@ pub(crate) mod tests {
     fn tokin_file_drift_and_promote_far_defaults() {
         if std::env::var("TSUITATE_TOKIN_FILE_DRIFT_W").is_err() {
             assert!((tokin_file_drift_w() - TOKIN_FILE_DRIFT_W).abs() < 1e-12);
-            assert_eq!(TOKIN_FILE_DRIFT_W, 0.0);
+            assert!((TOKIN_FILE_DRIFT_W - 0.8).abs() < 1e-12);
         }
         if std::env::var("TSUITATE_KING_FILE_GOLD_W").is_err() {
             assert!((king_file_gold_w() - KING_FILE_GOLD_W).abs() < 1e-12);
@@ -10051,6 +10173,60 @@ pub(crate) mod tests {
             assert!((own_camp_idle_w() - OWN_CAMP_IDLE_W).abs() < 1e-12);
             assert_eq!(OWN_CAMP_IDLE_W, 0.0);
         }
+        if std::env::var("TSUITATE_PAWN_OFFFILE_W").is_err() {
+            assert!((pawn_offfile_w() - PAWN_OFFFILE_W).abs() < 1e-12);
+            assert!((PAWN_OFFFILE_W - 2.5).abs() < 1e-12);
+        }
+        if std::env::var("TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W").is_err() {
+            assert!((far_major_promo_capture_w() - FAR_MAJOR_PROMO_CAPTURE_W).abs() < 1e-12);
+            assert!((FAR_MAJOR_PROMO_CAPTURE_W - 1.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn pawn_late_promo_taxes_endgame_not_midgame_or_backed() {
+        let me = Color::Gote;
+        let to = Coord { file: 5, rank: 7 }; // 5g、後手の敵陣
+        assert_eq!(
+            pawn_late_promo_amount(to, me, 98, false),
+            1.0,
+            "m098 の 5f5g+ は課税"
+        );
+        assert_eq!(
+            pawn_late_promo_amount(to, me, 26, false),
+            0.0,
+            "序中盤の歩成りは対象外"
+        );
+        assert_eq!(
+            pawn_late_promo_amount(to, me, 98, true),
+            0.0,
+            "裏付け捕獲は免税"
+        );
+        assert_eq!(
+            pawn_late_promo_amount(Coord { file: 5, rank: 6 }, me, 98, false),
+            0.0,
+            "敵陣でなければ対象外"
+        );
+    }
+
+    #[test]
+    fn promote_far_amount_positive_for_sideways_bishop_promo() {
+        // 4a3b+: 玉が 8a 付近なら着地は遠く、from からも近づかない
+        let mut cands = std::collections::BTreeSet::new();
+        cands.insert(Coord { file: 8, rank: 1 });
+        cands.insert(Coord { file: 7, rank: 1 });
+        let from = Coord { file: 4, rank: 1 };
+        let to = Coord { file: 3, rank: 2 };
+        let amt = promote_far_amount(from, to, &cands);
+        assert!(
+            amt >= 1.0,
+            "4a3b+ recedes from the king file: {amt}"
+        );
+        // 玉の隣へ成り込む手は免税（d_to=1 かつ近づく）
+        let near_to = Coord { file: 7, rank: 2 };
+        let near_from = Coord { file: 6, rank: 3 };
+        let near = promote_far_amount(near_from, near_to, &cands);
+        assert_eq!(near, 0.0, "approaching adjacent promo is free");
     }
 
     #[test]
