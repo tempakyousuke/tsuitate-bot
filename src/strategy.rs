@@ -527,16 +527,17 @@ fn tokin_file_drift_w() -> f64 {
 const TOKIN_FILE_DRIFT_W: f64 = 0.0;
 
 /// 終盤の歩成り課税（`TSUITATE_PAWN_OFFFILE_W`、既定 `PAWN_OFFFILE_W`。
-/// 0 で切り戻し）。金または銀を持っているとき、敵陣への歩成りへ
+/// 0 で切り戻し）。**中段から敵陣へ入る**歩の移動（成り・不成とも）へ
 /// `w` を gain から引き、裏付けの無い捕獲期待値もキャンセルする。
-/// 発火中は `king_file_pawn_w` を掛けない（1.5 では +1.2 と相殺して
-/// m126/m130 が動かなかった）。
+/// その手自体には `king_file_pawn_w` を掛けない（+1.2 が税を打ち消す）。
 ///
 /// 発端は quest31 終盤の 5f5g+ 固執（m098/m126/m130）。玉候補の中央が
-/// 5 筋に残っていると「玉筋の歩」扱いで `king_file_pawn_w` が加点し、
-/// 筋外れゲートでは永遠に沈まない。手数 125 以降に限るので m110 の
-/// 5f5g+（7点）は対象外。歩打ちは垂れ歩（P*2h / P*7c）を巻き込まない
-/// よう除外。王手中無効・粒子不要。
+/// 5 筋に残っていると「玉筋の歩」扱いで加点され、筋外れゲートでは沈まない。
+/// 手数 125 以降に限るので m110 の 5f5g+（7点）と m116/m120（6点）は対象外。
+/// **既に敵陣にいる歩の前進**（m127 の 7c7b+ = 9点）は課税しない。
+/// 不成も対象（GEN 有効時に 5f5g へ逃げる穴）。歩打ちは垂れ歩保護のため除外。
+/// 金銀の手持ちゲートは外す（盤上の 7b7c が受け皿で、持ち駒が角だけの局面が対象）。
+/// 王手中無効・粒子不要。
 fn pawn_offfile_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -548,11 +549,9 @@ fn pawn_offfile_w() -> f64 {
     })
 }
 
-/// 終盤の歩成り課税の既定。手数 125 以降なら m110（7点・110手）と
-/// m116/m120 の 5f5g+（6点）は対象外。m126/m130/m132 の 1〜2 点固執が対象。
-/// 1.5 では `king_file_pawn_w=1.2` と相殺して足りないので 3.0。発火中は
-/// 玉筋歩加点を掛けない。
-const PAWN_OFFFILE_W: f64 = 3.0;
+/// 終盤の歩成り課税の既定。3.0 でも 5f5g（不成）へ逃げ、5f5g+ は
+/// 持ち駒ゲートで不発だったので 5.0。手数 125 以降。
+const PAWN_OFFFILE_W: f64 = 5.0;
 const PAWN_OFFFILE_MIN_MOVE: u32 = 125;
 
 /// 遠方の大駒成り捕獲の幻の駒得キャンセル（`TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W`、
@@ -610,7 +609,7 @@ const OWN_CAMP_IDLE_MIN_MOVE: u32 = 40;
 /// 発端は quest31 の 2d3e（3五角、採点 0〜2 が m081/m083/m085 で首位）。
 /// 先手なら rank が増える＝敵陣から遠ざかる。kakudo の 7i2d は rank が
 /// 減る前進なので免税。裏付け捕獲は免税。打ちは HAND_ASSET の領分。
-/// 王手中無効・粒子不要。凍結版はこの名前を知らない。
+/// 0.5 は m087/m145 の金打ち回帰が出たので 0.25。王手中無効・粒子不要。
 fn bishop_retreat_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -622,7 +621,27 @@ fn bishop_retreat_w() -> f64 {
     })
 }
 
-const BISHOP_RETREAT_W: f64 = 0.5;
+const BISHOP_RETREAT_W: f64 = 0.25;
+
+/// 終盤の敵陣金銀・成銀移動（`TSUITATE_ENDGAME_CAMP_GENERAL_W`、既定
+/// `ENDGAME_CAMP_GENERAL_W`。0 で切り戻し）。手数 125 以降、敵陣にいる
+/// 金・銀・成銀が敵陣へ動く手へ `w` を gain に足す。
+///
+/// 発端は quest31-m145 の 7c8b（成銀、10点）が G*8c / G*9b（0点）に沈むこと。
+/// 打ちは HAND_ASSET / blind_king_attack の領分。王手中無効・粒子不要。
+fn endgame_camp_general_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_ENDGAME_CAMP_GENERAL_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(ENDGAME_CAMP_GENERAL_W)
+    })
+}
+
+const ENDGAME_CAMP_GENERAL_W: f64 = 2.0;
+const ENDGAME_CAMP_GENERAL_MIN_MOVE: u32 = 125;
 
 /// 裏付け無しの敵陣進入課税（`TSUITATE_UNBACKED_CAMP_W`、既定
 /// `UNBACKED_CAMP_W`）。歩・香・桂・玉以外が、観測裏付けの無い敵陣マスへ
@@ -1055,18 +1074,42 @@ fn king_file_pawn_drop_amount(
     1.0 / (1.0 + f64::from(d_file))
 }
 
-/// 金または銀を持っているか（歩の玉筋外れ課税の機会損失ゲート）。
-fn has_attacking_general(view: &PlayerView) -> bool {
-    view.your_hand.get(&Role::Gold).copied().unwrap_or(0) > 0
-        || view.your_hand.get(&Role::Silver).copied().unwrap_or(0) > 0
-}
-
-/// 終盤の敵陣歩成り量（`pawn_offfile_w`）。手数 125 以降かつ裏付け無し。
-fn pawn_late_promo_amount(to: Coord, me: Color, move_number: u32, backed_hit: bool) -> f64 {
+/// 終盤の敵陣歩進入量（`pawn_offfile_w`）。手数 125 以降かつ裏付け無し。
+/// 既に敵陣にいる歩の前進は 0（m127 の 7c7b+）。
+fn pawn_late_promo_amount(
+    from: Coord,
+    to: Coord,
+    me: Color,
+    move_number: u32,
+    backed_hit: bool,
+) -> f64 {
     if move_number < PAWN_OFFFILE_MIN_MOVE || backed_hit {
         return 0.0;
     }
     if !in_enemy_camp(to, me) {
+        return 0.0;
+    }
+    if in_enemy_camp(from, me) {
+        return 0.0;
+    }
+    1.0
+}
+
+/// 終盤の敵陣金銀・成銀移動量（`endgame_camp_general_w`）。
+fn endgame_camp_general_amount(
+    role: Role,
+    from: Coord,
+    to: Coord,
+    me: Color,
+    move_number: u32,
+) -> f64 {
+    if move_number < ENDGAME_CAMP_GENERAL_MIN_MOVE {
+        return 0.0;
+    }
+    if !matches!(role, Role::Gold | Role::Silver | Role::Promotedsilver) {
+        return 0.0;
+    }
+    if !in_enemy_camp(from, me) || !in_enemy_camp(to, me) {
         return 0.0;
     }
     1.0
@@ -4780,6 +4823,7 @@ impl Strategy for EstimatorStrategy {
                 || tokin_file_drift_w() > 0.0
                 || own_camp_idle_w() > 0.0
                 || bishop_retreat_w() > 0.0
+                || pawn_offfile_w() > 0.0
                 || far_major_promo_capture_w() > 0.0)
                 .then(|| opp_occupancy_evidence(view, log));
         // 玉接近減点の脅威マス（歴代の非歩打ち反則を含む。上記より広い）
@@ -4945,17 +4989,13 @@ impl Strategy for EstimatorStrategy {
                 if let Some(cands) = promote_far_kings.as_ref() {
                     let pw = king_file_pawn_w();
                     let gw = king_file_gold_w();
-                    // 終盤の歩成り（`pawn_offfile_w`）。金銀を持つ手数 125 以降だけ。
-                    // 玉筋上の 5f5g+ も対象。歩打ちは垂れ歩保護のため除外。
-                    // 発火中は king_file_pawn を掛けない（+1.2 が税を打ち消す）。
+                    // 終盤の歩進入（`pawn_offfile_w`）。手数 125 以降。
+                    // 中段→敵陣の歩（成り・不成）。既に敵陣の前進は除外。
+                    // その手には king_file_pawn を掛けない（+1.2 が税を打ち消す）。
                     let ow = pawn_offfile_w();
                     let mut late_pawn_promo = false;
-                    if ow > 0.0 && has_attacking_general(view) {
-                        if let ShogiMove::Board {
-                            from,
-                            to,
-                            promote: true,
-                        } = mv
+                    if ow > 0.0 {
+                        if let ShogiMove::Board { from, to, .. } = mv
                         {
                             let is_pawn = view
                                 .your_pieces
@@ -4967,6 +5007,7 @@ impl Strategy for EstimatorStrategy {
                                     .as_ref()
                                     .is_some_and(|b| b[crate::belief_features::sq_index(to)]);
                                 let amt = pawn_late_promo_amount(
+                                    from,
                                     to,
                                     view.your_color,
                                     view.move_number,
@@ -5151,6 +5192,29 @@ impl Strategy for EstimatorStrategy {
                         if let Some(role) = role {
                             out.gain -= bw
                                 * bishop_retreat_amount(role, from, to, view.your_color, backed);
+                        }
+                    }
+                }
+            }
+            // 終盤の敵陣金銀・成銀移動（`endgame_camp_general_w`）。
+            if !view.you_in_check {
+                let gw = endgame_camp_general_w();
+                if gw > 0.0 {
+                    if let ShogiMove::Board { from, to, .. } = mv {
+                        let role = view
+                            .your_pieces
+                            .iter()
+                            .find(|p| p.square == make_usi_square(from))
+                            .map(|p| p.role);
+                        if let Some(role) = role {
+                            out.gain += gw
+                                * endgame_camp_general_amount(
+                                    role,
+                                    from,
+                                    to,
+                                    view.your_color,
+                                    view.move_number,
+                                );
                         }
                     }
                 }
@@ -10453,12 +10517,16 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_BISHOP_RETREAT_W").is_err() {
             assert!((bishop_retreat_w() - BISHOP_RETREAT_W).abs() < 1e-12);
-            assert!((BISHOP_RETREAT_W - 0.5).abs() < 1e-12);
+            assert!((BISHOP_RETREAT_W - 0.25).abs() < 1e-12);
         }
         if std::env::var("TSUITATE_PAWN_OFFFILE_W").is_err() {
             assert!((pawn_offfile_w() - PAWN_OFFFILE_W).abs() < 1e-12);
-            assert!((PAWN_OFFFILE_W - 3.0).abs() < 1e-12);
+            assert!((PAWN_OFFFILE_W - 5.0).abs() < 1e-12);
             assert_eq!(PAWN_OFFFILE_MIN_MOVE, 125);
+        }
+        if std::env::var("TSUITATE_ENDGAME_CAMP_GENERAL_W").is_err() {
+            assert!((endgame_camp_general_w() - ENDGAME_CAMP_GENERAL_W).abs() < 1e-12);
+            assert!((ENDGAME_CAMP_GENERAL_W - 2.0).abs() < 1e-12);
         }
         if std::env::var("TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W").is_err() {
             assert!((far_major_promo_capture_w() - FAR_MAJOR_PROMO_CAPTURE_W).abs() < 1e-12);
@@ -10469,31 +10537,82 @@ pub(crate) mod tests {
     #[test]
     fn pawn_late_promo_taxes_endgame_not_midgame_or_backed() {
         let me = Color::Gote;
+        let from = Coord { file: 5, rank: 6 }; // 5f、中段
         let to = Coord { file: 5, rank: 7 }; // 5g、後手の敵陣
         assert_eq!(
-            pawn_late_promo_amount(to, me, 130, false),
+            pawn_late_promo_amount(from, to, me, 130, false),
             1.0,
             "m130 の 5f5g+ は課税"
         );
         assert_eq!(
-            pawn_late_promo_amount(to, me, 110, false),
+            pawn_late_promo_amount(from, to, me, 110, false),
             0.0,
             "m110 の 5f5g+（7点）は手数 125 未満で免税"
         );
         assert_eq!(
-            pawn_late_promo_amount(to, me, 26, false),
+            pawn_late_promo_amount(from, to, me, 26, false),
             0.0,
             "序中盤の歩成りは対象外"
         );
         assert_eq!(
-            pawn_late_promo_amount(to, me, 130, true),
+            pawn_late_promo_amount(from, to, me, 130, true),
             0.0,
             "裏付け捕獲は免税"
         );
         assert_eq!(
-            pawn_late_promo_amount(Coord { file: 5, rank: 6 }, me, 98, false),
+            pawn_late_promo_amount(
+                Coord { file: 5, rank: 5 },
+                Coord { file: 5, rank: 6 },
+                me,
+                130,
+                false
+            ),
             0.0,
             "敵陣でなければ対象外"
+        );
+        assert_eq!(
+            pawn_late_promo_amount(
+                Coord { file: 7, rank: 3 },
+                Coord { file: 7, rank: 2 },
+                Color::Sente,
+                127,
+                false
+            ),
+            0.0,
+            "m127 の 7c7b+ は既に敵陣なので免税"
+        );
+    }
+
+    #[test]
+    fn endgame_camp_general_boosts_promoted_silver_in_camp() {
+        let me = Color::Sente;
+        let from = Coord { file: 7, rank: 3 }; // 7c
+        let to = Coord { file: 8, rank: 2 }; // 8b
+        assert_eq!(
+            endgame_camp_general_amount(Role::Promotedsilver, from, to, me, 145),
+            1.0,
+            "m145 の 7c8b は加点"
+        );
+        assert_eq!(
+            endgame_camp_general_amount(Role::Promotedsilver, from, to, me, 80),
+            0.0,
+            "手数 125 未満は対象外"
+        );
+        assert_eq!(
+            endgame_camp_general_amount(
+                Role::Gold,
+                Coord { file: 7, rank: 2 },
+                Coord { file: 7, rank: 3 },
+                Color::Gote,
+                130
+            ),
+            0.0,
+            "後手の 7b7c は自陣なので加点しない"
+        );
+        assert_eq!(
+            endgame_camp_general_amount(Role::Pawn, from, to, me, 145),
+            0.0,
+            "歩は対象外"
         );
     }
 
