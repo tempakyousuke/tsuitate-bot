@@ -516,8 +516,8 @@ const KING_FILE_PAWN_MID_MAX_MOVE: u32 = 86;
 /// `KING_ENDGAME_FLEE_W`。0 で切り戻し）。手数 125 以降、王手中でない玉の
 /// 移動で、着地が観測裏付けの占有マスでなければ `w` を gain から引く。
 ///
-/// 発端は quest31-m140 の 8a9b / 8a8b / 8a7a（1〜2点）が 8c8b（8点）の上に
-/// 居ること。w=3 では seed0 で玉逃げが依然 1〜3 位だったので 8.0。
+/// 発端は quest31-m140 の 8a9b。w=3 でも w=8 でもフル suite は 8a9b×5 のまま
+/// （着地が裏付け占有だと免税され、金の 8c8b は動かない）。既定 0。
 /// 取る手は残す（recap-dragon）。王手中は CheckSolver / king-evade
 /// の領分なので無効。粒子不要。凍結版はこの名前を知らない。
 fn king_endgame_flee_w() -> f64 {
@@ -531,8 +531,67 @@ fn king_endgame_flee_w() -> f64 {
     })
 }
 
-const KING_ENDGAME_FLEE_W: f64 = 8.0;
+const KING_ENDGAME_FLEE_W: f64 = 0.0;
 const KING_ENDGAME_FLEE_MIN_MOVE: u32 = 125;
+
+/// 終盤の金が自玉へ隣接する盤上移動（`TSUITATE_GOLD_JOIN_KING_W`、既定
+/// `GOLD_JOIN_KING_W`。0 で切り戻し）。手数 125 以降、王手中でない金が
+/// 自玉の 8 近傍へ寄る手へ `w` を足す（既に隣接している金の移動は 0）。
+///
+/// 発端は quest31-m140 の 8c8b（8点）vs 8a9b（2点）。玉逃げ課税は効かず、
+/// 金側を直接押し上げる。粒子不要。凍結版はこの名前を知らない。
+fn gold_join_king_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_GOLD_JOIN_KING_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(GOLD_JOIN_KING_W)
+    })
+}
+
+const GOLD_JOIN_KING_W: f64 = 4.0;
+const GOLD_JOIN_KING_MIN_MOVE: u32 = 125;
+
+/// 終盤の桂の任意成り課税（`TSUITATE_KNIGHT_LATE_PROMO_W`、既定
+/// `KNIGHT_LATE_PROMO_W`。0 で切り戻し）。手数 100 以降、桂の任意成りへ
+/// `w` を引く。quest31 の桂成に 8 点以上は無く、8e7g+ は終盤で 0〜2 点。
+/// 序中盤の 4d3b+（7点・40手前後）は手数ゲートで守る。
+/// 王手中無効・粒子不要。凍結版はこの名前を知らない。
+fn knight_late_promo_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_KNIGHT_LATE_PROMO_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(KNIGHT_LATE_PROMO_W)
+    })
+}
+
+const KNIGHT_LATE_PROMO_W: f64 = 4.0;
+const KNIGHT_LATE_PROMO_MIN_MOVE: u32 = 100;
+
+/// 終盤の銀が自陣から出る手（`TSUITATE_SILVER_CAMP_EXIT_W`、既定
+/// `SILVER_CAMP_EXIT_W`。0 で切り戻し）。手数 100 以降、自陣の銀が
+/// 自陣の外へ動く手へ `w` を足す。
+///
+/// 発端は quest31-m106 の 7c6d（後手・自陣3段目→中段、8点）vs 8e7g+（2点）。
+/// 桂成課税と対で、吊るされた銀を進める側を押し上げる。王手中無効・粒子不要。
+fn silver_camp_exit_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_SILVER_CAMP_EXIT_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(SILVER_CAMP_EXIT_W)
+    })
+}
+
+const SILVER_CAMP_EXIT_W: f64 = 3.0;
+const SILVER_CAMP_EXIT_MIN_MOVE: u32 = 100;
 
 /// 玉筋の金打ち（`TSUITATE_KING_FILE_GOLD_W`、既定 0）。
 /// 敵陣かつ玉候補筋の中央値から距離 ≤2 の金打ちへ `w / (1+d_file)` を
@@ -1133,6 +1192,57 @@ fn king_endgame_flee_amount(
         return 0.0;
     }
     1.0
+}
+
+/// 終盤の金が自玉へ隣接する量（`gold_join_king_w`）。既に隣接している金は 0。
+fn gold_join_king_amount(from: Coord, to: Coord, king: Coord, move_number: u32) -> f64 {
+    if move_number < GOLD_JOIN_KING_MIN_MOVE {
+        return 0.0;
+    }
+    if chebyshev(from, king) <= 1 {
+        return 0.0;
+    }
+    if chebyshev(to, king) == 1 {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// 終盤の桂の任意成り課税量（`knight_late_promo_w`）。
+fn knight_late_promo_amount(
+    role: Role,
+    from: Coord,
+    to: Coord,
+    promote: bool,
+    me: Color,
+    move_number: u32,
+) -> f64 {
+    if !promote || role != Role::Knight || move_number < KNIGHT_LATE_PROMO_MIN_MOVE {
+        return 0.0;
+    }
+    match promotion_choice(role, from, to, me) {
+        Promotion::Optional => 1.0,
+        _ => 0.0,
+    }
+}
+
+/// 終盤の銀が自陣から出る量（`silver_camp_exit_w`）。
+fn silver_camp_exit_amount(
+    role: Role,
+    from: Coord,
+    to: Coord,
+    me: Color,
+    move_number: u32,
+) -> f64 {
+    if role != Role::Silver || move_number < SILVER_CAMP_EXIT_MIN_MOVE {
+        return 0.0;
+    }
+    if in_own_camp(from, me) && !in_own_camp(to, me) {
+        1.0
+    } else {
+        0.0
+    }
 }
 
 /// 玉筋の歩前進量（`king_file_pawn_w`）。敵陣への前進1マスかつ中央値の筋距離 ≤2。
@@ -5381,16 +5491,18 @@ impl Strategy for EstimatorStrategy {
                 }
             }
             // 桂銀香の任意成り課税（`own_camp_minor_promo_w`）。
+            // 終盤の桂任意成り（`knight_late_promo_w`）と銀の自陣脱出
+            // （`silver_camp_exit_w`）も同じ role を使う。
             if !view.you_in_check {
-                let mw = own_camp_minor_promo_w();
-                if mw > 0.0 {
-                    if let ShogiMove::Board { from, to, promote } = mv {
-                        let role = view
-                            .your_pieces
-                            .iter()
-                            .find(|p| p.square == make_usi_square(from))
-                            .map(|p| p.role);
-                        if let Some(role) = role {
+                if let ShogiMove::Board { from, to, promote } = mv {
+                    let role = view
+                        .your_pieces
+                        .iter()
+                        .find(|p| p.square == make_usi_square(from))
+                        .map(|p| p.role);
+                    if let Some(role) = role {
+                        let mw = own_camp_minor_promo_w();
+                        if mw > 0.0 {
                             out.gain -= mw
                                 * own_camp_minor_promo_amount(
                                     role,
@@ -5398,6 +5510,29 @@ impl Strategy for EstimatorStrategy {
                                     to,
                                     promote,
                                     view.your_color,
+                                );
+                        }
+                        let nw = knight_late_promo_w();
+                        if nw > 0.0 {
+                            out.gain -= nw
+                                * knight_late_promo_amount(
+                                    role,
+                                    from,
+                                    to,
+                                    promote,
+                                    view.your_color,
+                                    view.move_number,
+                                );
+                        }
+                        let sw = silver_camp_exit_w();
+                        if sw > 0.0 {
+                            out.gain += sw
+                                * silver_camp_exit_amount(
+                                    role,
+                                    from,
+                                    to,
+                                    view.your_color,
+                                    view.move_number,
                                 );
                         }
                     }
@@ -7914,6 +8049,26 @@ fn evaluate(
         _ => 0.0,
     };
 
+    // 終盤の金が自玉へ隣接する（`gold_join_king_w`）。王手中は無効。
+    let gold_join = match mv {
+        &ShogiMove::Board { from, to, .. } if !view.you_in_check => {
+            let w = gold_join_king_w();
+            match (w > 0.0).then(|| king_square(view)).flatten() {
+                Some(king)
+                    if view
+                        .your_pieces
+                        .iter()
+                        .find(|p| p.square == make_usi_square(from))
+                        .is_some_and(|p| p.role == Role::Gold) =>
+                {
+                    w * gold_join_king_amount(from, to, king, view.move_number)
+                }
+                _ => 0.0,
+            }
+        }
+        _ => 0.0,
+    };
+
     // V5（盤上駒の減価、やねうら王 Lv2 で +R50）: 「同じ駒なら持ち駒のほうが
     // 価値が高い」。この手で**盤上に増えた自駒の価値**にだけ比例して引く
     // （打ち＝打った駒、成り＝増えたぶん。盤上の合計は定数なので持たない
@@ -8112,6 +8267,7 @@ fn evaluate(
         - hand_asset_pen
         - king_approach_pen
         - king_flee_pen
+        + gold_join
         - board_discount
         + effect_value
         + foul_occ_attack
@@ -10345,6 +10501,104 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn gold_join_king_boosts_8c8b_after_125() {
+        let king = Coord { file: 8, rank: 1 }; // 8a
+        let from = Coord { file: 8, rank: 3 }; // 8c
+        let to = Coord { file: 8, rank: 2 }; // 8b
+        assert_eq!(
+            gold_join_king_amount(from, to, king, 140),
+            1.0,
+            "m140 の 8c8b は玉へ隣接する金"
+        );
+        assert_eq!(
+            gold_join_king_amount(from, to, king, 80),
+            0.0,
+            "手数 125 未満は対象外"
+        );
+        assert_eq!(
+            gold_join_king_amount(to, from, king, 140),
+            0.0,
+            "既に隣接している金の移動は 0"
+        );
+        assert_eq!(
+            gold_join_king_amount(from, Coord { file: 7, rank: 3 }, king, 140),
+            0.0,
+            "玉に隣接しない着地は 0"
+        );
+    }
+
+    #[test]
+    fn knight_late_promo_taxes_optional_after_100() {
+        let gote = Color::Gote;
+        let from = Coord { file: 8, rank: 5 }; // 8e
+        let to = Coord { file: 7, rank: 7 }; // 7g
+        assert_eq!(
+            knight_late_promo_amount(Role::Knight, from, to, true, gote, 106),
+            1.0,
+            "m106 の 8e7g+ は終盤の桂任意成り"
+        );
+        assert_eq!(
+            knight_late_promo_amount(Role::Knight, from, to, true, gote, 40),
+            0.0,
+            "40手前後の 4d3b+ クラスは手数ゲートで守る"
+        );
+        assert_eq!(
+            knight_late_promo_amount(Role::Knight, from, to, false, gote, 106),
+            0.0,
+            "不成は対象外"
+        );
+        assert_eq!(
+            knight_late_promo_amount(Role::Silver, from, to, true, gote, 106),
+            0.0,
+            "銀成りは own_camp_minor の領分"
+        );
+    }
+
+    #[test]
+    fn silver_camp_exit_boosts_own_camp_advance_after_100() {
+        let gote = Color::Gote;
+        let from = Coord { file: 7, rank: 3 }; // 7c、後手の自陣
+        let to = Coord { file: 6, rank: 4 }; // 6d、中段
+        assert_eq!(
+            silver_camp_exit_amount(Role::Silver, from, to, gote, 106),
+            1.0,
+            "m106 の 7c6d は自陣から出る銀"
+        );
+        assert_eq!(
+            silver_camp_exit_amount(Role::Silver, from, to, gote, 80),
+            0.0,
+            "手数 100 未満は対象外"
+        );
+        assert_eq!(
+            silver_camp_exit_amount(Role::Gold, from, to, gote, 106),
+            0.0,
+            "金は対象外"
+        );
+        assert_eq!(
+            silver_camp_exit_amount(
+                Role::Silver,
+                Coord { file: 7, rank: 8 },
+                Coord { file: 6, rank: 7 },
+                gote,
+                106
+            ),
+            0.0,
+            "敵陣の銀は自陣脱出ではない"
+        );
+        assert_eq!(
+            silver_camp_exit_amount(
+                Role::Silver,
+                from,
+                Coord { file: 7, rank: 2 },
+                gote,
+                106
+            ),
+            0.0,
+            "自陣内の移動は加点しない"
+        );
+    }
+
+    #[test]
     fn king_known_approach_w_default_on() {
         let w = std::env::var("TSUITATE_KING_KNOWN_APPROACH_W").ok();
         if w.is_none() {
@@ -10917,8 +11171,23 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_KING_ENDGAME_FLEE_W").is_err() {
             assert!((king_endgame_flee_w() - KING_ENDGAME_FLEE_W).abs() < 1e-12);
-            assert_eq!(KING_ENDGAME_FLEE_W, 8.0);
+            assert_eq!(KING_ENDGAME_FLEE_W, 0.0);
             assert_eq!(KING_ENDGAME_FLEE_MIN_MOVE, 125);
+        }
+        if std::env::var("TSUITATE_GOLD_JOIN_KING_W").is_err() {
+            assert!((gold_join_king_w() - GOLD_JOIN_KING_W).abs() < 1e-12);
+            assert_eq!(GOLD_JOIN_KING_W, 4.0);
+            assert_eq!(GOLD_JOIN_KING_MIN_MOVE, 125);
+        }
+        if std::env::var("TSUITATE_KNIGHT_LATE_PROMO_W").is_err() {
+            assert!((knight_late_promo_w() - KNIGHT_LATE_PROMO_W).abs() < 1e-12);
+            assert_eq!(KNIGHT_LATE_PROMO_W, 4.0);
+            assert_eq!(KNIGHT_LATE_PROMO_MIN_MOVE, 100);
+        }
+        if std::env::var("TSUITATE_SILVER_CAMP_EXIT_W").is_err() {
+            assert!((silver_camp_exit_w() - SILVER_CAMP_EXIT_W).abs() < 1e-12);
+            assert_eq!(SILVER_CAMP_EXIT_W, 3.0);
+            assert_eq!(SILVER_CAMP_EXIT_MIN_MOVE, 100);
         }
     }
 
