@@ -549,9 +549,9 @@ fn pawn_offfile_w() -> f64 {
     })
 }
 
-/// 終盤の歩成り課税の既定。3.0 でも 5f5g（不成）へ逃げ、5f5g+ は
-/// 持ち駒ゲートで不発だったので 5.0。手数 125 以降。
-const PAWN_OFFFILE_W: f64 = 5.0;
+/// 終盤の歩進入課税の既定。5.0 は m134/m136 の 5f5g+（4〜5点）まで
+/// B*7g へ沈めたので 3.0。不成も対象・手持ちゲートなし・既に敵陣は除外。
+const PAWN_OFFFILE_W: f64 = 3.0;
 const PAWN_OFFFILE_MIN_MOVE: u32 = 125;
 
 /// 遠方の大駒成り捕獲の幻の駒得キャンセル（`TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W`、
@@ -609,7 +609,8 @@ const OWN_CAMP_IDLE_MIN_MOVE: u32 = 40;
 /// 発端は quest31 の 2d3e（3五角、採点 0〜2 が m081/m083/m085 で首位）。
 /// 先手なら rank が増える＝敵陣から遠ざかる。kakudo の 7i2d は rank が
 /// 減る前進なので免税。裏付け捕獲は免税。打ちは HAND_ASSET の領分。
-/// 0.5 は m087/m145 の金打ち回帰が出たので 0.25。王手中無効・粒子不要。
+/// 0.25 は m055〜m063 の 3c5c（0点の龍横滑り）を復活させたので 0.5。
+/// 王手中無効・粒子不要。
 fn bishop_retreat_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -621,14 +622,15 @@ fn bishop_retreat_w() -> f64 {
     })
 }
 
-const BISHOP_RETREAT_W: f64 = 0.25;
+const BISHOP_RETREAT_W: f64 = 0.5;
 
-/// 終盤の敵陣金銀・成銀移動（`TSUITATE_ENDGAME_CAMP_GENERAL_W`、既定
+/// 終盤の敵陣成銀の筋替え（`TSUITATE_ENDGAME_CAMP_GENERAL_W`、既定
 /// `ENDGAME_CAMP_GENERAL_W`。0 で切り戻し）。手数 125 以降、敵陣にいる
-/// 金・銀・成銀が敵陣へ動く手へ `w` を gain に足す。
+/// 成銀が敵陣へ**筋を変えて**動く手へ `w` を gain に足す。
 ///
-/// 発端は quest31-m145 の 7c8b（成銀、10点）が G*8c / G*9b（0点）に沈むこと。
-/// 打ちは HAND_ASSET / blind_king_attack の領分。王手中無効・粒子不要。
+/// 発端は quest31-m145 の 7c8b（成銀、10点）。金銀まで広げると
+/// m139/m143 の 6b5a が繰り上がり、同筋前進 7c7b（2点）も同じ加点を
+/// 食う。打ちは HAND_ASSET の領分。王手中無効・粒子不要。
 fn endgame_camp_general_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -1095,7 +1097,7 @@ fn pawn_late_promo_amount(
     1.0
 }
 
-/// 終盤の敵陣金銀・成銀移動量（`endgame_camp_general_w`）。
+/// 終盤の敵陣成銀の筋替え量（`endgame_camp_general_w`）。
 fn endgame_camp_general_amount(
     role: Role,
     from: Coord,
@@ -1106,7 +1108,10 @@ fn endgame_camp_general_amount(
     if move_number < ENDGAME_CAMP_GENERAL_MIN_MOVE {
         return 0.0;
     }
-    if !matches!(role, Role::Gold | Role::Silver | Role::Promotedsilver) {
+    if role != Role::Promotedsilver {
+        return 0.0;
+    }
+    if from.file == to.file {
         return 0.0;
     }
     if !in_enemy_camp(from, me) || !in_enemy_camp(to, me) {
@@ -5196,7 +5201,7 @@ impl Strategy for EstimatorStrategy {
                     }
                 }
             }
-            // 終盤の敵陣金銀・成銀移動（`endgame_camp_general_w`）。
+            // 終盤の敵陣成銀の筋替え（`endgame_camp_general_w`）。
             if !view.you_in_check {
                 let gw = endgame_camp_general_w();
                 if gw > 0.0 {
@@ -10517,11 +10522,11 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_BISHOP_RETREAT_W").is_err() {
             assert!((bishop_retreat_w() - BISHOP_RETREAT_W).abs() < 1e-12);
-            assert!((BISHOP_RETREAT_W - 0.25).abs() < 1e-12);
+            assert!((BISHOP_RETREAT_W - 0.5).abs() < 1e-12);
         }
         if std::env::var("TSUITATE_PAWN_OFFFILE_W").is_err() {
             assert!((pawn_offfile_w() - PAWN_OFFFILE_W).abs() < 1e-12);
-            assert!((PAWN_OFFFILE_W - 5.0).abs() < 1e-12);
+            assert!((PAWN_OFFFILE_W - 3.0).abs() < 1e-12);
             assert_eq!(PAWN_OFFFILE_MIN_MOVE, 125);
         }
         if std::env::var("TSUITATE_ENDGAME_CAMP_GENERAL_W").is_err() {
@@ -10613,6 +10618,22 @@ pub(crate) mod tests {
             endgame_camp_general_amount(Role::Pawn, from, to, me, 145),
             0.0,
             "歩は対象外"
+        );
+        assert_eq!(
+            endgame_camp_general_amount(
+                Role::Promotedsilver,
+                Coord { file: 7, rank: 3 },
+                Coord { file: 7, rank: 2 },
+                me,
+                145
+            ),
+            0.0,
+            "m145 の 7c7b は同筋なので加点しない"
+        );
+        assert_eq!(
+            endgame_camp_general_amount(Role::Gold, from, to, me, 145),
+            0.0,
+            "素の金は対象外（m139 の 6b5a を押し上げない）"
         );
     }
 
