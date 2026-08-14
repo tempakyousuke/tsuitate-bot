@@ -392,11 +392,12 @@ const LINK_ENDGAME_DAMPEN: f64 = 40.0;
 /// 0 で切り戻し）。打つ手に `w × exchange_value(role)` を gain から引く
 /// （仕事がある打ちは 0）。
 ///
-/// **金・銀・桂**と、**自陣への角・飛・歩打ち**に限定する。PR#1 全駒種版は
-/// kakudo の R*2d と lance/pawn-tether を巻き込みアリーナ −7pt だった。
-/// quest31 の G*5e 濫発は金銀、N*4g / N*5d は桂、B*1h 逃避は自陣の角打ち、
-/// P*4h / P*5h は自陣の歩打ち。敵陣・中段の角飛打ち（B*3f / B*4a）と
-/// 敵陣の歩打ち（P*7c / P*4f）は対象外。
+/// **金・銀・桂**と、**敵陣以外への角・飛打ち**と**自陣への歩打ち**に限定する。
+/// PR#1 全駒種版は kakudo の R*2d と lance/pawn-tether を巻き込みアリーナ
+/// −7pt だった。quest31 の G*5e 濫発は金銀、N*4g / N*5d は桂、
+/// B*1h 逃避は自陣、B*6f / B*8f / B*2f は中段の無目的角打ち、
+/// P*4h / P*5h は自陣の歩打ち。敵陣の角飛打ち（B*3c / B*4a / B*3f で
+/// 玉近接なら仕事あり）と敵陣の歩打ち（P*7c / P*4f）は対象外。
 /// 仕事: 金は自玉 8 近傍、銀は玉頭2マス／敵陣かつ玉筋が読めるときの
 /// 敵玉近接／安い駒の裏付け当たり。打つ手だけ・王手中無効・粒子不要。
 /// 凍結版はこの名前を知らない。
@@ -411,7 +412,7 @@ fn hand_asset_w() -> f64 {
     })
 }
 
-/// 金銀桂＋自陣大駒・自陣歩の無目的打ち課税の既定。
+/// 金銀桂＋敵陣以外の大駒打ち＋自陣歩の無目的打ち課税の既定。
 /// 香の打ちは対象外（PR#1 全駒種版の lance-tether 回帰を避ける）。
 const HAND_ASSET_W: f64 = 1.0;
 
@@ -528,6 +529,8 @@ const TOKIN_FILE_DRIFT_W: f64 = 0.0;
 /// 終盤の歩成り課税（`TSUITATE_PAWN_OFFFILE_W`、既定 `PAWN_OFFFILE_W`。
 /// 0 で切り戻し）。金または銀を持っているとき、敵陣への歩成りへ
 /// `w` を gain から引き、裏付けの無い捕獲期待値もキャンセルする。
+/// 発火中は `king_file_pawn_w` を掛けない（1.5 では +1.2 と相殺して
+/// m126/m130 が動かなかった）。
 ///
 /// 発端は quest31 終盤の 5f5g+ 固執（m098/m126/m130）。玉候補の中央が
 /// 5 筋に残っていると「玉筋の歩」扱いで `king_file_pawn_w` が加点し、
@@ -547,7 +550,9 @@ fn pawn_offfile_w() -> f64 {
 
 /// 終盤の歩成り課税の既定。手数 125 以降なら m110（7点・110手）と
 /// m116/m120 の 5f5g+（6点）は対象外。m126/m130/m132 の 1〜2 点固執が対象。
-const PAWN_OFFFILE_W: f64 = 1.5;
+/// 1.5 では `king_file_pawn_w=1.2` と相殺して足りないので 3.0。発火中は
+/// 玉筋歩加点を掛けない。
+const PAWN_OFFFILE_W: f64 = 3.0;
 const PAWN_OFFFILE_MIN_MOVE: u32 = 125;
 
 /// 遠方の大駒成り捕獲の幻の駒得キャンセル（`TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W`、
@@ -597,6 +602,27 @@ fn own_camp_idle_w() -> f64 {
 
 const OWN_CAMP_IDLE_W: f64 = 0.0;
 const OWN_CAMP_IDLE_MIN_MOVE: u32 = 40;
+
+/// 角・馬の非前進空きマス移動（`TSUITATE_BISHOP_RETREAT_W`、既定
+/// `BISHOP_RETREAT_W`。0 で切り戻し）。敵陣に入らず前進もしない
+/// 盤上移動へ `w × exchange_value` を gain から引く。
+///
+/// 発端は quest31 の 2d3e（3五角、採点 0〜2 が m081/m083/m085 で首位）。
+/// 先手なら rank が増える＝敵陣から遠ざかる。kakudo の 7i2d は rank が
+/// 減る前進なので免税。裏付け捕獲は免税。打ちは HAND_ASSET の領分。
+/// 王手中無効・粒子不要。凍結版はこの名前を知らない。
+fn bishop_retreat_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_BISHOP_RETREAT_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(BISHOP_RETREAT_W)
+    })
+}
+
+const BISHOP_RETREAT_W: f64 = 0.5;
 
 /// 裏付け無しの敵陣進入課税（`TSUITATE_UNBACKED_CAMP_W`、既定
 /// `UNBACKED_CAMP_W`）。歩・香・桂・玉以外が、観測裏付けの無い敵陣マスへ
@@ -1219,6 +1245,44 @@ fn own_camp_idle_amount(
         return 0.0;
     }
     exchange_value(role)
+}
+
+/// 角・馬の非前進空きマス移動量（`bishop_retreat_w`）。
+/// 前進（先手なら rank 減、後手なら rank 増）と敵陣進入・裏付けは 0。
+fn bishop_retreat_amount(
+    role: Role,
+    from: Coord,
+    to: Coord,
+    me: Color,
+    backed: &[bool; 81],
+) -> f64 {
+    if !matches!(role, Role::Bishop | Role::Horse) {
+        return 0.0;
+    }
+    if in_enemy_camp(to, me) {
+        return 0.0;
+    }
+    if backed[crate::belief_features::sq_index(to)] {
+        return 0.0;
+    }
+    let advancing = match me {
+        Color::Sente => to.rank < from.rank,
+        Color::Gote => to.rank > from.rank,
+    };
+    if advancing {
+        return 0.0;
+    }
+    exchange_value(role)
+}
+
+/// 持ち駒資産損の対象駒・着地か。金銀桂は全域、角飛は敵陣以外、歩は自陣だけ。
+fn hand_asset_drop_taxable(role: Role, to: Coord, me: Color) -> bool {
+    match role {
+        Role::Gold | Role::Silver | Role::Knight => true,
+        Role::Bishop | Role::Rook => !in_enemy_camp(to, me),
+        Role::Pawn => in_own_camp(to, me),
+        _ => false,
+    }
 }
 
 /// 玉隣接への高い駒の無支え進入量（`king_adj_heavy_w`）。
@@ -4715,6 +4779,7 @@ impl Strategy for EstimatorStrategy {
                 || king_adj_heavy_w() > 0.0
                 || tokin_file_drift_w() > 0.0
                 || own_camp_idle_w() > 0.0
+                || bishop_retreat_w() > 0.0
                 || far_major_promo_capture_w() > 0.0)
                 .then(|| opp_occupancy_evidence(view, log));
         // 玉接近減点の脅威マス（歴代の非歩打ち反則を含む。上記より広い）
@@ -4880,35 +4945,11 @@ impl Strategy for EstimatorStrategy {
                 if let Some(cands) = promote_far_kings.as_ref() {
                     let pw = king_file_pawn_w();
                     let gw = king_file_gold_w();
-                    match mv {
-                        ShogiMove::Board { from, to, .. } if pw > 0.0 => {
-                            let is_pawn = view
-                                .your_pieces
-                                .iter()
-                                .find(|p| p.square == make_usi_square(from))
-                                .is_some_and(|p| p.role == Role::Pawn);
-                            if is_pawn {
-                                out.gain +=
-                                    pw * king_file_pawn_amount(from, to, view.your_color, cands);
-                            }
-                        }
-                        ShogiMove::Drop {
-                            role: Role::Pawn,
-                            to,
-                        } if pw > 0.0 && in_enemy_camp(to, view.your_color) => {
-                            out.gain += pw * king_file_pawn_drop_amount(to, cands);
-                        }
-                        ShogiMove::Drop {
-                            role: Role::Gold,
-                            to,
-                        } if gw > 0.0 && in_enemy_camp(to, view.your_color) => {
-                            out.gain += gw * king_file_pawn_drop_amount(to, cands);
-                        }
-                        _ => {}
-                    }
                     // 終盤の歩成り（`pawn_offfile_w`）。金銀を持つ手数 125 以降だけ。
                     // 玉筋上の 5f5g+ も対象。歩打ちは垂れ歩保護のため除外。
+                    // 発火中は king_file_pawn を掛けない（+1.2 が税を打ち消す）。
                     let ow = pawn_offfile_w();
+                    let mut late_pawn_promo = false;
                     if ow > 0.0 && has_attacking_general(view) {
                         if let ShogiMove::Board {
                             from,
@@ -4932,6 +4973,7 @@ impl Strategy for EstimatorStrategy {
                                     backed_hit,
                                 );
                                 if amt > 0.0 {
+                                    late_pawn_promo = true;
                                     out.gain -= ow * amt;
                                     if out.capture_value > 0.0 {
                                         out.gain -= out.capture_value;
@@ -4939,6 +4981,32 @@ impl Strategy for EstimatorStrategy {
                                 }
                             }
                         }
+                    }
+                    match mv {
+                        ShogiMove::Board { from, to, .. } if pw > 0.0 && !late_pawn_promo => {
+                            let is_pawn = view
+                                .your_pieces
+                                .iter()
+                                .find(|p| p.square == make_usi_square(from))
+                                .is_some_and(|p| p.role == Role::Pawn);
+                            if is_pawn {
+                                out.gain +=
+                                    pw * king_file_pawn_amount(from, to, view.your_color, cands);
+                            }
+                        }
+                        ShogiMove::Drop {
+                            role: Role::Pawn,
+                            to,
+                        } if pw > 0.0 && in_enemy_camp(to, view.your_color) => {
+                            out.gain += pw * king_file_pawn_drop_amount(to, cands);
+                        }
+                        ShogiMove::Drop {
+                            role: Role::Gold,
+                            to,
+                        } if gw > 0.0 && in_enemy_camp(to, view.your_color) => {
+                            out.gain += gw * king_file_pawn_drop_amount(to, cands);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -5064,6 +5132,25 @@ impl Strategy for EstimatorStrategy {
                                     backed,
                                     view.move_number,
                                 );
+                        }
+                    }
+                }
+            }
+            // 角・馬の非前進空きマス移動（`bishop_retreat_w`）。
+            if !view.you_in_check {
+                let bw = bishop_retreat_w();
+                if bw > 0.0 {
+                    if let (Some(backed), ShogiMove::Board { from, to, .. }) =
+                        (opp_occ_backed.as_ref(), mv)
+                    {
+                        let role = view
+                            .your_pieces
+                            .iter()
+                            .find(|p| p.square == make_usi_square(from))
+                            .map(|p| p.role);
+                        if let Some(role) = role {
+                            out.gain -= bw
+                                * bishop_retreat_amount(role, from, to, view.your_color, backed);
                         }
                     }
                 }
@@ -7556,11 +7643,7 @@ fn evaluate(
     let hand_asset_pen = match (hand_asset_kings, opp_occ_backed, mv) {
         (Some(cands), Some(backed), &ShogiMove::Drop { role, to }) => {
             let w = hand_asset_w();
-            let taxable = match role {
-                Role::Gold | Role::Silver | Role::Knight => true,
-                Role::Bishop | Role::Rook | Role::Pawn => in_own_camp(to, view.your_color),
-                _ => false,
-            };
+            let taxable = hand_asset_drop_taxable(role, to, view.your_color);
             if w <= 0.0 || !taxable || drop_has_hand_asset_work(view, role, to, backed, cands)
             {
                 0.0
@@ -10278,6 +10361,76 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn hand_asset_drop_taxable_bishop_midboard_not_enemy() {
+        let me = Color::Sente;
+        assert!(
+            hand_asset_drop_taxable(Role::Bishop, Coord { file: 6, rank: 6 }, me),
+            "B*6f mid-board is taxable"
+        );
+        assert!(
+            hand_asset_drop_taxable(Role::Bishop, Coord { file: 1, rank: 8 }, me),
+            "B*1h own camp stays taxable"
+        );
+        assert!(
+            !hand_asset_drop_taxable(Role::Bishop, Coord { file: 4, rank: 1 }, me),
+            "B*4a enemy camp is exempt (m069)"
+        );
+        assert!(
+            !hand_asset_drop_taxable(Role::Bishop, Coord { file: 3, rank: 3 }, me),
+            "B*3c enemy camp is exempt"
+        );
+        assert!(
+            !hand_asset_drop_taxable(Role::Pawn, Coord { file: 4, rank: 6 }, me),
+            "P*4f mid-board pawn stays exempt (drop probe)"
+        );
+        assert!(
+            hand_asset_drop_taxable(Role::Pawn, Coord { file: 4, rank: 8 }, me),
+            "P*4h own-camp pawn stays taxable"
+        );
+    }
+
+    #[test]
+    fn bishop_retreat_taxes_sideways_not_forward() {
+        let backed = [false; 81];
+        let me = Color::Sente;
+        let retreat = bishop_retreat_amount(
+            Role::Bishop,
+            Coord { file: 2, rank: 4 },
+            Coord { file: 3, rank: 5 },
+            me,
+            &backed,
+        );
+        assert!(
+            (retreat - exchange_value(Role::Bishop)).abs() < 1e-9,
+            "2d3e is a retreat for sente: {retreat}"
+        );
+        let forward = bishop_retreat_amount(
+            Role::Bishop,
+            Coord { file: 7, rank: 9 },
+            Coord { file: 2, rank: 4 },
+            me,
+            &backed,
+        );
+        assert_eq!(forward, 0.0, "kakudo 7i2d advances toward enemy camp");
+        let into_camp = bishop_retreat_amount(
+            Role::Bishop,
+            Coord { file: 4, rank: 4 },
+            Coord { file: 3, rank: 3 },
+            me,
+            &backed,
+        );
+        assert_eq!(into_camp, 0.0, "4d3c enters enemy camp");
+        let gold = bishop_retreat_amount(
+            Role::Gold,
+            Coord { file: 2, rank: 4 },
+            Coord { file: 3, rank: 5 },
+            me,
+            &backed,
+        );
+        assert_eq!(gold, 0.0, "only bishop/horse");
+    }
+
+    #[test]
     fn tokin_file_drift_and_promote_far_defaults() {
         if std::env::var("TSUITATE_TOKIN_FILE_DRIFT_W").is_err() {
             assert!((tokin_file_drift_w() - TOKIN_FILE_DRIFT_W).abs() < 1e-12);
@@ -10298,9 +10451,13 @@ pub(crate) mod tests {
             assert!((own_camp_idle_w() - OWN_CAMP_IDLE_W).abs() < 1e-12);
             assert_eq!(OWN_CAMP_IDLE_W, 0.0);
         }
+        if std::env::var("TSUITATE_BISHOP_RETREAT_W").is_err() {
+            assert!((bishop_retreat_w() - BISHOP_RETREAT_W).abs() < 1e-12);
+            assert!((BISHOP_RETREAT_W - 0.5).abs() < 1e-12);
+        }
         if std::env::var("TSUITATE_PAWN_OFFFILE_W").is_err() {
             assert!((pawn_offfile_w() - PAWN_OFFFILE_W).abs() < 1e-12);
-            assert!((PAWN_OFFFILE_W - 1.5).abs() < 1e-12);
+            assert!((PAWN_OFFFILE_W - 3.0).abs() < 1e-12);
             assert_eq!(PAWN_OFFFILE_MIN_MOVE, 125);
         }
         if std::env::var("TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W").is_err() {
