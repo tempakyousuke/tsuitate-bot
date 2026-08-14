@@ -470,6 +470,7 @@ const PROMOTE_FAR_W: f64 = 2.5;
 /// **敵陣**の歩（前進・成り・打ち）が、玉候補筋の中央値から距離 ≤2 のとき
 /// `w / (1+d_file)` を gain に足す（P*7c / 7c7b+ 型）。
 /// 自陣・中段の歩突き（9六歩・8六歩・7六歩・4f4g+）は加点しない。
+/// **盤上の入口段**（先手3段・後手7段 = 5f5g+ 型）も加点しない。打ちは残す。
 /// 王手中無効・粒子不要。凍結版はこの名前を知らない。
 fn king_file_pawn_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -522,9 +523,10 @@ fn tokin_file_drift_w() -> f64 {
     })
 }
 
-/// と金の玉筋逸れの既定。4g4h を沈めると 4g5h（同点の悪手）へ逃げるため既定 0。
-/// 3h4i 側を押し上げるのは `home_gold_attack_w`。
-const TOKIN_FILE_DRIFT_W: f64 = 0.0;
+/// と金の玉筋逸れの既定。接近免税は 2c3b（本命）と m019 の 2a3a を守る。
+/// 4g4h は課税、4g5h は接近で免税のまま（home_gold での押し上げは
+/// m042/m054 回帰で不採用）。歩成り課税との複合は m110 を壊したので単体オン。
+const TOKIN_FILE_DRIFT_W: f64 = 0.8;
 
 /// 終盤の歩成り課税（`TSUITATE_PAWN_OFFFILE_W`、既定 `PAWN_OFFFILE_W`。
 /// 0 で切り戻し）。金または銀を持っているとき、敵陣への歩成りへ
@@ -574,9 +576,10 @@ fn far_major_promo_capture_w() -> f64 {
     })
 }
 
-/// 遠方の大駒成り捕獲キャンセルの既定。と金逸れ・歩成りと複合すると
-/// 4a3b+ が増えたため一旦オフ。単体再判定は `TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W=1`。
-const FAR_MAJOR_PROMO_CAPTURE_W: f64 = 0.0;
+/// 遠方の大駒成り捕獲キャンセルの既定。4a3b+ は全決定点で採点 0〜1 なので
+/// 沈めても指標穴にならない。歩成り課税との複合は 4a3b+ が増えたが、
+/// こちら単体なら幻の角成り込みだけを削る。
+const FAR_MAJOR_PROMO_CAPTURE_W: f64 = 1.0;
 
 /// 自陣の金銀桂の空きマス移動課税（`TSUITATE_OWN_CAMP_IDLE_W`、既定
 /// `OWN_CAMP_IDLE_W`。0 で切り戻し）。自陣への非捕獲移動へ
@@ -703,9 +706,8 @@ fn belief_occ_cap_shrink(capture_ev: f64, p_hit: f64, p_occ: f64, w: f64) -> f64
 /// 発端は quest31-m046 の 3h4i 不成（10点）。捕獲信念がある手と
 /// move_number<40（m029 の 4b4a）は加点しない。
 ///
-/// 以前は他ノブとの複合で切り戻したが、capture=0 かつ 40 手以降のゲート付きなら
-/// m029 は発火しない。4g4h クラスタは沈めると 4g5h へ逃げるので、こちらで
-/// 3h4i を押し上げる。既定 3.0（交換価値の金よりやや下）。
+/// フル suite 5試行で平均 5.503→5.400（m046 クラスタは改善したが
+/// m042/m054/m090 の回帰と未採点 43→62 が勝った）。コードは残して env で再試行可。
 fn home_gold_attack_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -717,7 +719,7 @@ fn home_gold_attack_w() -> f64 {
     })
 }
 
-const HOME_GOLD_ATTACK_W: f64 = 3.0;
+const HOME_GOLD_ATTACK_W: f64 = 0.0;
 
 /// と金が玉筋へ寄る手の加点（`TSUITATE_TOKIN_APPROACH_W`、既定 0）。
 /// 敵陣のと金が、玉候補筋の中央値への筋距離を縮める手へ `w / (1+d_to)` を足す。
@@ -993,6 +995,11 @@ fn king_files_focused(cands: &std::collections::BTreeSet<Coord>, median: i8) -> 
 }
 
 /// 玉筋の歩前進量（`king_file_pawn_w`）。敵陣への前進1マスかつ中央値の筋距離 ≤2。
+///
+/// **入口段（先手3段・後手7段）の盤上前進は加点しない**。quest31 の 5f5g+ は
+/// 玉筋上なので距離ゲートでは沈まず、終盤では 0〜2 点なのに `w=1.2` で
+/// 首位になっていた。入口段の加点は打ち（P*7c）に残し、深い成り（7c7b+）は
+/// 従来どおり加点する。手数ゲートの歩成り課税は m110（5f5g+=7点）を壊した。
 fn king_file_pawn_amount(
     from: Coord,
     to: Coord,
@@ -1004,6 +1011,13 @@ fn king_file_pawn_amount(
         Color::Gote => to.file == from.file && to.rank == from.rank + 1,
     };
     if !forward || !in_enemy_camp(to, me) || cands.is_empty() {
+        return 0.0;
+    }
+    let entry_rank = match me {
+        Color::Sente => 3,
+        Color::Gote => 7,
+    };
+    if to.rank == entry_rank {
         return 0.0;
     }
     king_file_pawn_drop_amount(to, cands)
@@ -9685,20 +9699,45 @@ pub(crate) mod tests {
     fn king_file_pawn_prefers_king_files() {
         let mut cands = std::collections::BTreeSet::new();
         cands.insert(Coord { file: 6, rank: 2 });
+        // 入口段（3段目）の盤上前進は 5f5g+ 型なので加点しない。
+        // 深い前進（7c7b）だけ d_file で加点する。
+        assert_eq!(
+            king_file_pawn_amount(
+                Coord { file: 7, rank: 4 },
+                Coord { file: 7, rank: 3 },
+                Color::Sente,
+                &cands,
+            ),
+            0.0,
+            "7d7c is enemy-camp entry rank"
+        );
         let seven = king_file_pawn_amount(
-            Coord { file: 7, rank: 4 },
             Coord { file: 7, rank: 3 },
+            Coord { file: 7, rank: 2 },
             Color::Sente,
             &cands,
         );
         let one = king_file_pawn_amount(
-            Coord { file: 1, rank: 4 },
             Coord { file: 1, rank: 3 },
+            Coord { file: 1, rank: 2 },
             Color::Sente,
             &cands,
         );
         assert!((seven - 0.5).abs() < 1e-9, "d_file=1 → 1/2, got {seven}");
         assert_eq!(one, 0.0, "d_file=5 is outside the ≤2 window");
+        // 後手の 5f5g（入口段）も盤上は 0。打ち P*5g は残す。
+        let gote_entry = king_file_pawn_amount(
+            Coord { file: 5, rank: 6 },
+            Coord { file: 5, rank: 7 },
+            Color::Gote,
+            &cands,
+        );
+        assert_eq!(gote_entry, 0.0, "gote 5f5g is entry rank");
+        let drop_entry = king_file_pawn_drop_amount(Coord { file: 5, rank: 7 }, &cands);
+        assert!(
+            (drop_entry - 0.5).abs() < 1e-9,
+            "P*5g drop still gets the king-file bonus: {drop_entry}"
+        );
         // 中段の歩突きは加点しない
         assert_eq!(
             king_file_pawn_amount(
@@ -9933,7 +9972,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_HOME_GOLD_ATTACK_W").is_err() {
             assert!((home_gold_attack_w() - HOME_GOLD_ATTACK_W).abs() < 1e-12);
-            assert!((HOME_GOLD_ATTACK_W - 3.0).abs() < 1e-12);
+            assert_eq!(HOME_GOLD_ATTACK_W, 0.0);
         }
         if std::env::var("TSUITATE_TOKIN_APPROACH_W").is_err() {
             assert!((tokin_approach_w() - TOKIN_APPROACH_W).abs() < 1e-12);
@@ -10163,7 +10202,7 @@ pub(crate) mod tests {
     fn tokin_file_drift_and_promote_far_defaults() {
         if std::env::var("TSUITATE_TOKIN_FILE_DRIFT_W").is_err() {
             assert!((tokin_file_drift_w() - TOKIN_FILE_DRIFT_W).abs() < 1e-12);
-            assert_eq!(TOKIN_FILE_DRIFT_W, 0.0);
+            assert!((TOKIN_FILE_DRIFT_W - 0.8).abs() < 1e-12);
         }
         if std::env::var("TSUITATE_KING_FILE_GOLD_W").is_err() {
             assert!((king_file_gold_w() - KING_FILE_GOLD_W).abs() < 1e-12);
@@ -10186,7 +10225,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W").is_err() {
             assert!((far_major_promo_capture_w() - FAR_MAJOR_PROMO_CAPTURE_W).abs() < 1e-12);
-            assert_eq!(FAR_MAJOR_PROMO_CAPTURE_W, 0.0);
+            assert!((FAR_MAJOR_PROMO_CAPTURE_W - 1.0).abs() < 1e-12);
         }
     }
 
