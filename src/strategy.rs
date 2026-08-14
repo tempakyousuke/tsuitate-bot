@@ -562,12 +562,13 @@ const GOLD_JOIN_KING_MIN_MOVE: u32 = 125;
 
 /// 終盤、自玉に既に隣接している金が玉筋へ動く手（`TSUITATE_GOLD_KING_FILE_W`、
 /// 既定 `GOLD_KING_FILE_W`。0 で切り戻し）。手数 125 以降、**非王手**で
-/// 金が玉の 8 近傍から玉筋（同じ file）の 1〜2 マスへ動く手へ `w` を足す。
+/// 金が玉の 8 近傍から玉筋（同じ file）の **距離 2** へ動く手へ `w` を足す。
 ///
 /// 発端は quest31-m130 の 7b8c（6点）vs 5f5g+（2点）。金は 7b で既に
-/// 玉 8a に隣接しているので `gold_join` は 0。歩成り課税は金銀手持ち
-/// ゲートのため、盤上の金だけでは 5f5g+ を沈められない。王手中は
-/// `gold_join` / CheckSolver の領分。粒子不要。凍結版はこの名前を知らない。
+/// 玉 8a に隣接しているので `gold_join` は 0。距離 1（7b8b）まで入れると
+/// 未採点の 8b へ逃げる。歩成り課税は金銀手持ちゲートのため、盤上の金
+/// だけでは 5f5g+ を沈められない。王手中は `gold_join` / CheckSolver の領分。
+/// 粒子不要。凍結版はこの名前を知らない。
 fn gold_king_file_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -582,13 +583,14 @@ fn gold_king_file_w() -> f64 {
 const GOLD_KING_FILE_W: f64 = 6.0;
 const GOLD_KING_FILE_MIN_MOVE: u32 = 125;
 
-/// 終盤の桂の敵陣進入課税（`TSUITATE_KNIGHT_LATE_PROMO_W`、既定
+/// 終盤の桂の敵陣成り課税（`TSUITATE_KNIGHT_LATE_PROMO_W`、既定
 /// `KNIGHT_LATE_PROMO_W`。0 で切り戻し）。手数 100..=136、桂が敵陣へ
-/// 入る盤上移動へ `w` を引く（成り・不成とも）。
+/// **成って**入る盤上移動へ `w` を引く。
 ///
-/// 発端は quest31-m100 の 8e7g 不成（5点）が 5f5g+（8点）の上に居ること。
-/// 成りだけ課税すると不成へ逃げる。手数 137 以降は m138 の 8e7g+（4点）
-/// が 5f5g+（0点）の受け皿なので上限で切る。序中盤の 4d3b+ は min で守る。
+/// 発端は quest31-m100 の 8e7g+（2点）が 5f5g+（8点）の上に居ること。
+/// 不成まで課税すると 8e7g 不成（5点）が沈み、8c8d / N*3a（0点）へ
+/// 押し出される（m036 型）。手数 137 以降の 8e7g+（m138 = 4点）は
+/// `knight_endgame_promo_w` の加点側。序中盤の 4d3b+ は min で守る。
 /// 王手中無効・粒子不要。凍結版はこの名前を知らない。
 fn knight_late_promo_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -604,6 +606,47 @@ fn knight_late_promo_w() -> f64 {
 const KNIGHT_LATE_PROMO_W: f64 = 6.0;
 const KNIGHT_LATE_PROMO_MIN_MOVE: u32 = 100;
 const KNIGHT_LATE_PROMO_MAX_MOVE: u32 = 136;
+
+/// 終盤の桂の敵陣成り加点（`TSUITATE_KNIGHT_ENDGAME_PROMO_W`、既定
+/// `KNIGHT_ENDGAME_PROMO_W`。0 で切り戻し）。手数 137 以降、桂が敵陣へ
+/// **成って**入る盤上移動へ `w` を足す（`knight_late_promo` の税の逆）。
+///
+/// 発端は quest31-m138 の 8e7g+（4点）。歩 force で 5f5g+（0点）を沈めると
+/// P*4g へ逃げるので、採点済みの受け皿を押し上げる。不成は加点しない
+/// （eval に無い 8e7g 不成へ逃げるため）。王手中無効・粒子不要。
+fn knight_endgame_promo_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_KNIGHT_ENDGAME_PROMO_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(KNIGHT_ENDGAME_PROMO_W)
+    })
+}
+
+const KNIGHT_ENDGAME_PROMO_W: f64 = 6.0;
+const KNIGHT_ENDGAME_PROMO_MIN_MOVE: u32 = 137;
+
+/// 終盤、自陣の桂が中段へ出る手（`TSUITATE_KNIGHT_CAMP_EXIT_W`、既定
+/// `KNIGHT_CAMP_EXIT_W`。0 で切り戻し）。手数 120 以降、自陣の桂が
+/// 自陣でも敵陣でもないマスへ動く手へ `w` を足す。
+///
+/// 発端は quest31-m124 の 6b7d（8点）vs 5f5g+（5点）。敵陣進入は
+/// `knight_late_promo` の課税側。王手中無効・粒子不要。
+fn knight_camp_exit_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_KNIGHT_CAMP_EXIT_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(KNIGHT_CAMP_EXIT_W)
+    })
+}
+
+const KNIGHT_CAMP_EXIT_W: f64 = 4.0;
+const KNIGHT_CAMP_EXIT_MIN_MOVE: u32 = 120;
 
 /// 終盤の銀が自陣から出る手（`TSUITATE_SILVER_CAMP_EXIT_W`、既定
 /// `SILVER_CAMP_EXIT_W`。0 で切り戻し）。手数 100 以降、自陣の銀が
@@ -1255,7 +1298,7 @@ fn gold_join_king_amount(
 }
 
 /// 終盤、自玉隣接の金が玉筋へ動く量（`gold_king_file_w`）。
-/// 非王手・既に隣接・着地が玉と同じ筋かつ距離 1〜2 のときだけ 1。
+/// 非王手・既に隣接・着地が玉と同じ筋かつ距離 2 のときだけ 1。
 fn gold_king_file_amount(
     from: Coord,
     to: Coord,
@@ -1272,29 +1315,65 @@ fn gold_king_file_amount(
     if to.file != king.file {
         return 0.0;
     }
-    let d = chebyshev(to, king);
-    if (1..=2).contains(&d) {
+    if chebyshev(to, king) == 2 {
         1.0
     } else {
         0.0
     }
 }
 
-/// 終盤の桂の敵陣進入課税量（`knight_late_promo_w`）。
+/// 終盤の桂の敵陣成り課税量（`knight_late_promo_w`）。成りのみ。
 fn knight_late_promo_amount(
     role: Role,
     _from: Coord,
     to: Coord,
-    _promote: bool,
+    promote: bool,
     me: Color,
     move_number: u32,
 ) -> f64 {
     if role != Role::Knight
+        || !promote
         || !(KNIGHT_LATE_PROMO_MIN_MOVE..=KNIGHT_LATE_PROMO_MAX_MOVE).contains(&move_number)
     {
         return 0.0;
     }
     if in_enemy_camp(to, me) {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// 終盤の桂の敵陣成り加点量（`knight_endgame_promo_w`）。手数 137 以降・成りのみ。
+fn knight_endgame_promo_amount(
+    role: Role,
+    to: Coord,
+    promote: bool,
+    me: Color,
+    move_number: u32,
+) -> f64 {
+    if role != Role::Knight || !promote || move_number < KNIGHT_ENDGAME_PROMO_MIN_MOVE {
+        return 0.0;
+    }
+    if in_enemy_camp(to, me) {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// 終盤、自陣の桂が中段へ出る量（`knight_camp_exit_w`）。
+fn knight_camp_exit_amount(
+    role: Role,
+    from: Coord,
+    to: Coord,
+    me: Color,
+    move_number: u32,
+) -> f64 {
+    if role != Role::Knight || move_number < KNIGHT_CAMP_EXIT_MIN_MOVE {
+        return 0.0;
+    }
+    if in_own_camp(from, me) && !in_own_camp(to, me) && !in_enemy_camp(to, me) {
         1.0
     } else {
         0.0
@@ -5567,8 +5646,9 @@ impl Strategy for EstimatorStrategy {
                 }
             }
             // 桂銀香の任意成り課税（`own_camp_minor_promo_w`）。
-            // 終盤の桂任意成り（`knight_late_promo_w`）と銀の自陣脱出
-            // （`silver_camp_exit_w`）も同じ role を使う。
+            // 終盤の桂敵陣成り課税（`knight_late_promo_w`）・終盤の桂成り加点
+            // （`knight_endgame_promo_w`）・桂の自陣脱出（`knight_camp_exit_w`）
+            // と銀の自陣脱出（`silver_camp_exit_w`）も同じ role を使う。
             if !view.you_in_check {
                 if let ShogiMove::Board { from, to, promote } = mv {
                     let role = view
@@ -5596,6 +5676,28 @@ impl Strategy for EstimatorStrategy {
                                     from,
                                     to,
                                     promote,
+                                    view.your_color,
+                                    view.move_number,
+                                );
+                        }
+                        let np = knight_endgame_promo_w();
+                        if np > 0.0 {
+                            out.gain += np
+                                * knight_endgame_promo_amount(
+                                    role,
+                                    to,
+                                    promote,
+                                    view.your_color,
+                                    view.move_number,
+                                );
+                        }
+                        let nx = knight_camp_exit_w();
+                        if nx > 0.0 {
+                            out.gain += nx
+                                * knight_camp_exit_amount(
+                                    role,
+                                    from,
+                                    to,
                                     view.your_color,
                                     view.move_number,
                                 );
@@ -10678,6 +10780,11 @@ pub(crate) mod tests {
             0.0,
             "玉筋以外（7c）は 0"
         );
+        assert_eq!(
+            gold_king_file_amount(from, Coord { file: 8, rank: 2 }, king, 130, false),
+            0.0,
+            "距離 1 の 7b8b は未採点逃避なので対象外"
+        );
     }
 
     #[test]
@@ -10692,8 +10799,8 @@ pub(crate) mod tests {
         );
         assert_eq!(
             knight_late_promo_amount(Role::Knight, from, to, false, gote, 100),
-            1.0,
-            "m100 の 8e7g 不成も敵陣進入として課税する"
+            0.0,
+            "m100 の 8e7g 不成（5点）は課税しない"
         );
         assert_eq!(
             knight_late_promo_amount(Role::Knight, from, to, true, gote, 40),
@@ -10721,6 +10828,71 @@ pub(crate) mod tests {
             ),
             0.0,
             "先手の 8i7g は自陣側なので課税しない（手数上限でも 0）"
+        );
+    }
+
+    #[test]
+    fn knight_endgame_promo_boosts_8e7g_after_137() {
+        let gote = Color::Gote;
+        let to = Coord { file: 7, rank: 7 }; // 7g
+        assert_eq!(
+            knight_endgame_promo_amount(Role::Knight, to, true, gote, 138),
+            1.0,
+            "m138 の 8e7g+（4点）は終盤の桂成り加点"
+        );
+        assert_eq!(
+            knight_endgame_promo_amount(Role::Knight, to, false, gote, 138),
+            0.0,
+            "不成は加点しない"
+        );
+        assert_eq!(
+            knight_endgame_promo_amount(Role::Knight, to, true, gote, 100),
+            0.0,
+            "手数 136 までは課税側"
+        );
+        assert_eq!(
+            knight_endgame_promo_amount(Role::Silver, to, true, gote, 138),
+            0.0,
+            "銀は対象外"
+        );
+    }
+
+    #[test]
+    fn knight_camp_exit_boosts_6b7d_after_120() {
+        let gote = Color::Gote;
+        let from = Coord { file: 6, rank: 2 }; // 6b
+        let to = Coord { file: 7, rank: 4 }; // 7d
+        assert_eq!(
+            knight_camp_exit_amount(Role::Knight, from, to, gote, 124),
+            1.0,
+            "m124 の 6b7d は自陣から中段へ出る桂"
+        );
+        assert_eq!(
+            knight_camp_exit_amount(Role::Knight, from, to, gote, 100),
+            0.0,
+            "手数 120 未満は対象外"
+        );
+        assert_eq!(
+            knight_camp_exit_amount(
+                Role::Knight,
+                Coord { file: 8, rank: 5 },
+                Coord { file: 7, rank: 7 },
+                gote,
+                124
+            ),
+            0.0,
+            "敵陣進入は knight_late_promo の領分"
+        );
+        assert_eq!(
+            knight_camp_exit_amount(
+                Role::Knight,
+                Coord { file: 8, rank: 9 },
+                Coord { file: 7, rank: 7 },
+                Color::Sente,
+                137
+            ),
+            0.0,
+            "先手の 8i7g は自陣に留まる"
         );
     }
 
@@ -11360,6 +11532,16 @@ pub(crate) mod tests {
             assert_eq!(KNIGHT_LATE_PROMO_W, 6.0);
             assert_eq!(KNIGHT_LATE_PROMO_MIN_MOVE, 100);
             assert_eq!(KNIGHT_LATE_PROMO_MAX_MOVE, 136);
+        }
+        if std::env::var("TSUITATE_KNIGHT_ENDGAME_PROMO_W").is_err() {
+            assert!((knight_endgame_promo_w() - KNIGHT_ENDGAME_PROMO_W).abs() < 1e-12);
+            assert_eq!(KNIGHT_ENDGAME_PROMO_W, 6.0);
+            assert_eq!(KNIGHT_ENDGAME_PROMO_MIN_MOVE, 137);
+        }
+        if std::env::var("TSUITATE_KNIGHT_CAMP_EXIT_W").is_err() {
+            assert!((knight_camp_exit_w() - KNIGHT_CAMP_EXIT_W).abs() < 1e-12);
+            assert_eq!(KNIGHT_CAMP_EXIT_W, 4.0);
+            assert_eq!(KNIGHT_CAMP_EXIT_MIN_MOVE, 120);
         }
         if std::env::var("TSUITATE_SILVER_CAMP_EXIT_W").is_err() {
             assert!((silver_camp_exit_w() - SILVER_CAMP_EXIT_W).abs() < 1e-12);
