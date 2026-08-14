@@ -533,8 +533,8 @@ fn landing_support_w() -> f64 {
     })
 }
 
-/// 粒子の玉位置ビリーフによる接近ボーナス（`TSUITATE_KING_BELIEF_PROX_W`、
-/// 既定 0 = 無効）。`king_cand_attack_w` の**後手側用の対**。
+/// **玉位置ネット**による接近ボーナス（`TSUITATE_KING_BELIEF_PROX_W`、
+/// 既定 0 = 無効）。`king_cand_attack_w` の**王手を掛けていない側用の対**。
 ///
 /// `deduce::opp_king_candidates` は「自分が王手を宣言した履歴」から絞るので、
 /// 王手をあまり掛けられていない側では 35〜55 マスに散ってゲートを通らない
@@ -4184,12 +4184,17 @@ impl Strategy for EstimatorStrategy {
             && !view.you_in_check
             && king_cand_prox.is_none())
         .then(|| {
-            let pool: &[(&Position, f64)] = if !sample.is_empty() {
-                &sample
-            } else {
-                &taint_pool
-            };
-            let dist = taint_king_distribution(pool, opp_color);
+            // 情報源は**玉位置ネット**（`king_belief_nn`）。粒子ではない:
+            // `bin/king_cands` の実測（quest_20260731、14手目以降）で
+            // 後手側は真マス確率 0.272（一様 0.021 の13倍）・top1 46%・
+            // 実効サポート 7.2 と鋭いのに対し、粒子由来の分布は
+            // ブラインド top1 42%（メモリ）で、実際に接近ボーナスへ
+            // 流すと全水準で負けた（h1/h2/h3 実測）。
+            // ネットは deduce と**相補的**（先手は deduce が鋭くネットが
+            // top1 7%、後手はその逆）なので、deduce が鈍い側でだけ使う
+            let ctx = crate::belief_features::BeliefContext::from_log(view.your_color, log);
+            let cands = crate::deduce::opp_king_candidates(view.your_color, log);
+            let dist = crate::king_belief_nn::king_distribution(&ctx, &cands);
             if dist.is_empty() {
                 return None;
             }
