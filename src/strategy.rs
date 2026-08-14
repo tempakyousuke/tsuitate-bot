@@ -522,8 +522,9 @@ fn tokin_file_drift_w() -> f64 {
     })
 }
 
-/// と金の玉筋逸れの既定（2026-08-14。m046 の 4g4h）。0 で切り戻し
-const TOKIN_FILE_DRIFT_W: f64 = 0.8;
+/// と金の玉筋逸れの既定。4g4h を沈めると 4g5h（同点の悪手）へ逃げるため既定 0。
+/// 3h4i 側を押し上げるのは `home_gold_attack_w`。
+const TOKIN_FILE_DRIFT_W: f64 = 0.0;
 
 /// 終盤の歩成り課税（`TSUITATE_PAWN_OFFFILE_W`、既定 `PAWN_OFFFILE_W`。
 /// 0 で切り戻し）。金または銀を持っているとき、敵陣への歩成りへ
@@ -545,8 +546,9 @@ fn pawn_offfile_w() -> f64 {
     })
 }
 
-/// 終盤の歩成り課税の既定（2026-08-14。5f5g+）。0 で切り戻し
-const PAWN_OFFFILE_W: f64 = 2.5;
+/// 終盤の歩成り課税の既定。5f5g+ は m110 では 7 点・終盤では 0 点なので
+/// 手数ゲートでは区別できず、フル suite で m110 が 7→4（未採点逃避）になった。
+const PAWN_OFFFILE_W: f64 = 0.0;
 const PAWN_OFFFILE_MIN_MOVE: u32 = 80;
 
 /// 遠方の大駒成り捕獲の幻の駒得キャンセル（`TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W`、
@@ -572,8 +574,9 @@ fn far_major_promo_capture_w() -> f64 {
     })
 }
 
-/// 遠方の大駒成り捕獲キャンセルの既定（2026-08-14。4a3b+）。0 で切り戻し
-const FAR_MAJOR_PROMO_CAPTURE_W: f64 = 1.0;
+/// 遠方の大駒成り捕獲キャンセルの既定。と金逸れ・歩成りと複合すると
+/// 4a3b+ が増えたため一旦オフ。単体再判定は `TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W=1`。
+const FAR_MAJOR_PROMO_CAPTURE_W: f64 = 0.0;
 
 /// 自陣の金銀桂の空きマス移動課税（`TSUITATE_OWN_CAMP_IDLE_W`、既定
 /// `OWN_CAMP_IDLE_W`。0 で切り戻し）。自陣への非捕獲移動へ
@@ -699,6 +702,10 @@ fn belief_occ_cap_shrink(capture_ev: f64, p_hit: f64, p_occ: f64, w: f64) -> f64
 ///
 /// 発端は quest31-m046 の 3h4i 不成（10点）。捕獲信念がある手と
 /// move_number<40（m029 の 4b4a）は加点しない。
+///
+/// 以前は他ノブとの複合で切り戻したが、capture=0 かつ 40 手以降のゲート付きなら
+/// m029 は発火しない。4g4h クラスタは沈めると 4g5h へ逃げるので、こちらで
+/// 3h4i を押し上げる。既定 3.0（交換価値の金よりやや下）。
 fn home_gold_attack_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -710,7 +717,7 @@ fn home_gold_attack_w() -> f64 {
     })
 }
 
-const HOME_GOLD_ATTACK_W: f64 = 0.0;
+const HOME_GOLD_ATTACK_W: f64 = 3.0;
 
 /// と金が玉筋へ寄る手の加点（`TSUITATE_TOKIN_APPROACH_W`、既定 0）。
 /// 敵陣のと金が、玉候補筋の中央値への筋距離を縮める手へ `w / (1+d_to)` を足す。
@@ -9926,7 +9933,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_HOME_GOLD_ATTACK_W").is_err() {
             assert!((home_gold_attack_w() - HOME_GOLD_ATTACK_W).abs() < 1e-12);
-            assert_eq!(HOME_GOLD_ATTACK_W, 0.0);
+            assert!((HOME_GOLD_ATTACK_W - 3.0).abs() < 1e-12);
         }
         if std::env::var("TSUITATE_TOKIN_APPROACH_W").is_err() {
             assert!((tokin_approach_w() - TOKIN_APPROACH_W).abs() < 1e-12);
@@ -10156,7 +10163,7 @@ pub(crate) mod tests {
     fn tokin_file_drift_and_promote_far_defaults() {
         if std::env::var("TSUITATE_TOKIN_FILE_DRIFT_W").is_err() {
             assert!((tokin_file_drift_w() - TOKIN_FILE_DRIFT_W).abs() < 1e-12);
-            assert!((TOKIN_FILE_DRIFT_W - 0.8).abs() < 1e-12);
+            assert_eq!(TOKIN_FILE_DRIFT_W, 0.0);
         }
         if std::env::var("TSUITATE_KING_FILE_GOLD_W").is_err() {
             assert!((king_file_gold_w() - KING_FILE_GOLD_W).abs() < 1e-12);
@@ -10175,11 +10182,11 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_PAWN_OFFFILE_W").is_err() {
             assert!((pawn_offfile_w() - PAWN_OFFFILE_W).abs() < 1e-12);
-            assert!((PAWN_OFFFILE_W - 2.5).abs() < 1e-12);
+            assert_eq!(PAWN_OFFFILE_W, 0.0);
         }
         if std::env::var("TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W").is_err() {
             assert!((far_major_promo_capture_w() - FAR_MAJOR_PROMO_CAPTURE_W).abs() < 1e-12);
-            assert!((FAR_MAJOR_PROMO_CAPTURE_W - 1.0).abs() < 1e-12);
+            assert_eq!(FAR_MAJOR_PROMO_CAPTURE_W, 0.0);
         }
     }
 
