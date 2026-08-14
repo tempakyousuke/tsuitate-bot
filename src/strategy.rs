@@ -401,6 +401,8 @@ const LINK_ENDGAME_DAMPEN: f64 = 40.0;
 /// 仕事: 金は自玉 8 近傍、銀は玉頭2マス／敵陣かつ玉筋が読めるときの
 /// 敵玉近接（金は玉候補そのもの・玉筋隣接を除く）／安い駒の裏付け当たり。
 /// 打つ手だけ・王手中無効・粒子不要。
+/// **手数 `HAND_ASSET_MIN_MOVE` 以降**（序中盤の打ち課税はアリーナで
+/// 反則押し出しになる。PR#1 / vs v13 43.3%）。
 /// 凍結版はこの名前を知らない。
 fn hand_asset_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -416,6 +418,10 @@ fn hand_asset_w() -> f64 {
 /// 金銀桂＋敵陣以外の大駒打ち＋自陣歩の無目的打ち課税の既定。
 /// 香の打ちは対象外（PR#1 全駒種版の lance-tether 回帰を避ける）。
 const HAND_ASSET_W: f64 = 1.0;
+/// 序中盤まで掛けると打ち課税の押し出しで反則が増える（PR#1 コンボの
+/// アリーナ −7pt / 現行 vs v13 43.3%・反則 7.5/局の主犯候補）。
+/// 終盤の無目的打ち（m090 以降）は残す。
+const HAND_ASSET_MIN_MOVE: u32 = 80;
 
 /// 玉の既知脅威への接近減点（`TSUITATE_KING_KNOWN_APPROACH_W`、既定
 /// `KING_KNOWN_APPROACH_W`。0 で切り戻し）。
@@ -438,6 +444,10 @@ fn king_known_approach_w() -> f64 {
 /// 玉の既知脅威接近の既定（2026-08-13。quest31-m099 の 7g6h 対策）。
 /// PR#1 作業点 2.0 の半分。0 で切り戻し
 const KING_KNOWN_APPROACH_W: f64 = 1.0;
+/// m099（99手・王手中）は残し、序中盤の王手逃げまで課税しない。
+/// 王手中に全域で掛けると解消手の反則が増える（vs v13 の王手中反則
+/// 2.5〜3.8/局）。
+const KING_KNOWN_APPROACH_MIN_MOVE: u32 = 90;
 
 /// 大駒成りの遠方ペナルティ（`TSUITATE_PROMOTE_FAR_W`、既定 0 = 無効。
 /// quest31 コンボ計測時の作業点は 1.0）。
@@ -467,6 +477,9 @@ fn promote_far_w() -> f64 {
 /// 6.0 は 5試行フル suite で平均を下げたため 2.5 に戻す）。
 /// 0 で切り戻し
 const PROMOTE_FAR_W: f64 = 2.5;
+/// m081/m083 の 4a3b+ 以降を残し、序盤の大駒成り（材料として正しい手）は
+/// 課税しない。
+const PROMOTE_FAR_MIN_MOVE: u32 = 80;
 
 /// 玉筋の歩前進（`TSUITATE_KING_FILE_PAWN_W`、既定 `KING_FILE_PAWN_W`）。
 /// **敵陣**の歩（前進・成り・打ち）が、玉候補筋の中央値から距離 ≤2 のとき
@@ -887,6 +900,8 @@ fn unbacked_gs_capture_w() -> f64 {
 /// 金銀の裏付け無し捕獲をキャンセルする既定（2026-08-13。m081 の 6c6b）。
 /// 大駒まで広げると 5試行フル suite が 5.326 まで落ちたため金銀だけ。
 const UNBACKED_GS_CAPTURE_W: f64 = 1.0;
+/// m081 の 6c6b は残し、序中盤の正しい金銀捕獲まで殺さない。
+const UNBACKED_GS_CAPTURE_MIN_MOVE: u32 = 80;
 
 /// 信念ネット占有による裏付け無し捕獲の縮小（`TSUITATE_BELIEF_OCC_CAP_W`、
 /// 既定 `BELIEF_OCC_CAP_W`。0 で切り戻し）。
@@ -1042,9 +1057,10 @@ const OWN_CAMP_MINOR_PROMO_W: f64 = 1.2;
 /// （取って詰み）は対象外。
 /// **玉筋が読めていない序盤では発火しない**（広い候補だと全ての歩成りが
 /// 「誰かの8近傍」になり 4七歩成クラスを巻き込む）。
-/// **手数 `PROMOTE_CHECK_REVEAL_MAX_MOVE` まで**（m095=2点・m101=2点の
+/// **手数 `PROMOTE_CHECK_REVEAL_MIN_MOVE..=MAX_MOVE`**（m095=2点・m101=2点の
 /// 7d7c+ は課税、m103/m111/m119/m121 の 7d7c+/7c7b+ =10/9 点は課税しない。
-/// 同じ USI でも終盤は既知玉への寄せ）。凍結版はこの名前を知らない。
+/// 同じ USI でも終盤は既知玉への寄せ）。下限は序中盤の成る王手（相手の
+/// 解消反則を誘う手）を潰さないため。凍結版はこの名前を知らない。
 fn promote_check_reveal_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -1059,6 +1075,8 @@ fn promote_check_reveal_w() -> f64 {
 /// 成る王手の露見ペナルティ既定（2026-08-13。m095 の 7d7c+ 対策）。
 /// 玉筋が読める局面だけで発火する
 const PROMOTE_CHECK_REVEAL_W: f64 = 1.2;
+/// m095（95手）から課税。それより前の成る王手はアリーナの攻め手段。
+const PROMOTE_CHECK_REVEAL_MIN_MOVE: u32 = 90;
 /// m101（7d7c+ = 2）まで課税、m103（7d7c+ = 10）以降は切る。
 const PROMOTE_CHECK_REVEAL_MAX_MOVE: u32 = 102;
 
@@ -5249,11 +5267,14 @@ impl Strategy for EstimatorStrategy {
                 || far_major_promo_capture_w() > 0.0)
                 .then(|| opp_occupancy_evidence(view, log));
         // 玉接近減点の脅威マス（歴代の非歩打ち反則を含む。上記より広い）
-        let king_threats =
-            (king_known_approach_w() > 0.0).then(|| king_threat_evidence(log));
+        let king_threats = (king_known_approach_w() > 0.0
+            && view.move_number >= KING_KNOWN_APPROACH_MIN_MOVE)
+            .then(|| king_threat_evidence(log));
         // 持ち駒資産損の玉候補（`hand_asset_w`）。王手中は無効
         let hand_asset_kings: Option<std::collections::BTreeSet<Coord>> =
-            (hand_asset_w() > 0.0 && !view.you_in_check)
+            (hand_asset_w() > 0.0
+                && !view.you_in_check
+                && view.move_number >= HAND_ASSET_MIN_MOVE)
                 .then(|| crate::deduce::opp_king_candidates(view.your_color, log));
         // 大駒成り遠方 / 玉筋歩 / 裏付け無し敵陣進入の玉候補。王手中は無効
         let promote_far_kings: Option<std::collections::BTreeSet<Coord>> =
@@ -5274,7 +5295,10 @@ impl Strategy for EstimatorStrategy {
         // 成る王手の露見ペナルティ用玉候補（`promote_check_reveal_w`）。
         // ブラインド決定でも効かせるため粒子不要。王手中は無効
         let promote_check_kings: Option<std::collections::BTreeSet<Coord>> =
-            (promote_check_reveal_w() > 0.0 && !view.you_in_check)
+            (promote_check_reveal_w() > 0.0
+                && !view.you_in_check
+                && (PROMOTE_CHECK_REVEAL_MIN_MOVE..=PROMOTE_CHECK_REVEAL_MAX_MOVE)
+                    .contains(&view.move_number))
                 .then(|| crate::deduce::opp_king_candidates(view.your_color, log));
 
         // この手番の打ち反則で占有が確定したマスと、残存敵駒の平均交換価値
@@ -5384,7 +5408,10 @@ impl Strategy for EstimatorStrategy {
                     .iter()
                     .find(|p| p.square == make_usi_square(from))
                     .map(|p| p.role);
-                if w > 0.0 && matches!(role, Some(Role::Bishop | Role::Rook)) {
+                if w > 0.0
+                    && view.move_number >= PROMOTE_FAR_MIN_MOVE
+                    && matches!(role, Some(Role::Bishop | Role::Rook))
+                {
                     // 観測裏付けの占有マスへの成り捕獲は「材料」なので免税
                     let backed_hit = opp_occ_backed
                         .as_ref()
@@ -5755,7 +5782,8 @@ impl Strategy for EstimatorStrategy {
                     .find(|p| p.square == make_usi_square(from))
                     .map(|p| p.role);
                 if w > 0.0
-                    && view.move_number <= PROMOTE_CHECK_REVEAL_MAX_MOVE
+                    && (PROMOTE_CHECK_REVEAL_MIN_MOVE..=PROMOTE_CHECK_REVEAL_MAX_MOVE)
+                        .contains(&view.move_number)
                     && matches!(role, Some(Role::Pawn | Role::Bishop | Role::Rook))
                     && king_file_median(cands)
                         .is_some_and(|m| king_files_focused(cands, m))
@@ -8022,6 +8050,7 @@ fn evaluate(
         // 王手中・裏付けマス・と金歩桂香は対象外。
         let gs_unbacked_capture = if unbacked_gs_capture_w() > 0.0
             && !view.you_in_check
+            && view.move_number >= UNBACKED_GS_CAPTURE_MIN_MOVE
             && remaining_after_belief > 0.0
             && !capture_to_backed
         {
@@ -10989,6 +11018,7 @@ pub(crate) mod tests {
         let w = std::env::var("TSUITATE_KING_KNOWN_APPROACH_W").ok();
         if w.is_none() {
             assert!((king_known_approach_w() - KING_KNOWN_APPROACH_W).abs() < 1e-12);
+            assert_eq!(KING_KNOWN_APPROACH_MIN_MOVE, 90);
         }
     }
 
@@ -10998,6 +11028,7 @@ pub(crate) mod tests {
         if w.is_none() {
             assert!((hand_asset_w() - HAND_ASSET_W).abs() < 1e-12);
             assert!(HAND_ASSET_W > 0.0);
+            assert_eq!(HAND_ASSET_MIN_MOVE, 80);
         }
     }
 
@@ -11022,6 +11053,7 @@ pub(crate) mod tests {
         let w = std::env::var("TSUITATE_PROMOTE_CHECK_REVEAL_W").ok();
         if w.is_none() {
             assert!((promote_check_reveal_w() - PROMOTE_CHECK_REVEAL_W).abs() < 1e-12);
+            assert_eq!(PROMOTE_CHECK_REVEAL_MIN_MOVE, 90);
             assert_eq!(PROMOTE_CHECK_REVEAL_MAX_MOVE, 102);
         }
     }
@@ -11202,6 +11234,7 @@ pub(crate) mod tests {
         if std::env::var("TSUITATE_UNBACKED_GS_CAPTURE_W").is_err() {
             assert!((unbacked_gs_capture_w() - UNBACKED_GS_CAPTURE_W).abs() < 1e-12);
             assert!((UNBACKED_GS_CAPTURE_W - 1.0).abs() < 1e-12);
+            assert_eq!(UNBACKED_GS_CAPTURE_MIN_MOVE, 80);
         }
         if std::env::var("TSUITATE_HOME_GOLD_ATTACK_W").is_err() {
             assert!((home_gold_attack_w() - HOME_GOLD_ATTACK_W).abs() < 1e-12);
@@ -11525,6 +11558,7 @@ pub(crate) mod tests {
         if std::env::var("TSUITATE_PROMOTE_FAR_W").is_err() {
             assert!((promote_far_w() - PROMOTE_FAR_W).abs() < 1e-12);
             assert!((PROMOTE_FAR_W - 2.5).abs() < 1e-12);
+            assert_eq!(PROMOTE_FAR_MIN_MOVE, 80);
         }
         if std::env::var("TSUITATE_KING_ADJ_HEAVY_W").is_err() {
             assert!((KING_ADJ_HEAVY_W - 1.5).abs() < 1e-12);
