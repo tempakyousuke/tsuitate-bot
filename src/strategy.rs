@@ -625,11 +625,11 @@ const BISHOP_RETREAT_W: f64 = 0.5;
 
 /// 終盤の敵陣成銀の筋替え（`TSUITATE_ENDGAME_CAMP_GENERAL_W`、既定
 /// `ENDGAME_CAMP_GENERAL_W`。0 で切り戻し）。手数 125 以降、敵陣にいる
-/// 成銀が敵陣へ**筋を変えて**動く手へ `w` を gain に足す。
+/// 成銀が敵陣へ**玉筋（中央値）へ近づく筋替え**をする手へ `w` を足す。
 ///
-/// 発端は quest31-m145 の 7c8b（成銀、10点）。w=2 は 7c6b（逆方向・未収載）
-/// へ逃避してフル suite 5.771→5.571。既定オフ。env から試せる。
-/// 打ちは HAND_ASSET の領分。王手中無効・粒子不要。
+/// 発端は quest31-m145 の 7c8b（成銀、10点）。方向無しの筋替えは
+/// 7c6b（逆方向・未収載の仮4点）へ逃避した。打ちは HAND_ASSET の領分。
+/// 王手中無効・粒子不要。
 fn endgame_camp_general_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -641,7 +641,7 @@ fn endgame_camp_general_w() -> f64 {
     })
 }
 
-const ENDGAME_CAMP_GENERAL_W: f64 = 0.0;
+const ENDGAME_CAMP_GENERAL_W: f64 = 2.0;
 const ENDGAME_CAMP_GENERAL_MIN_MOVE: u32 = 125;
 
 /// 裏付け無しの敵陣進入課税（`TSUITATE_UNBACKED_CAMP_W`、既定
@@ -1103,12 +1103,14 @@ fn pawn_late_promo_amount(
 }
 
 /// 終盤の敵陣成銀の筋替え量（`endgame_camp_general_w`）。
+/// 玉筋（中央値）へ近づくときだけ 1。
 fn endgame_camp_general_amount(
     role: Role,
     from: Coord,
     to: Coord,
     me: Color,
     move_number: u32,
+    cands: &std::collections::BTreeSet<Coord>,
 ) -> f64 {
     if move_number < ENDGAME_CAMP_GENERAL_MIN_MOVE {
         return 0.0;
@@ -1120,6 +1122,12 @@ fn endgame_camp_general_amount(
         return 0.0;
     }
     if !in_enemy_camp(from, me) || !in_enemy_camp(to, me) {
+        return 0.0;
+    }
+    let Some(median) = king_file_median(cands) else {
+        return 0.0;
+    };
+    if (to.file - median).abs() >= (from.file - median).abs() {
         return 0.0;
     }
     1.0
@@ -1497,6 +1505,10 @@ fn drop_has_hand_asset_work(
         return false;
     };
     if !king_files_focused(king_cands, median) {
+        return false;
+    }
+    // 金を玉筋から 3 筋以上外して打つのは仕事なし（m145 の G*6b）。
+    if role == Role::Gold && (to.file - median).abs() > 2 {
         return false;
     }
     let near_king = |c: Coord| {
@@ -5224,11 +5236,13 @@ impl Strategy for EstimatorStrategy {
                     }
                 }
             }
-            // 終盤の敵陣成銀の筋替え（`endgame_camp_general_w`）。
+            // 終盤の敵陣成銀の筋替え（`endgame_camp_general_w`）。玉筋へ近づくときだけ。
             if !view.you_in_check {
                 let gw = endgame_camp_general_w();
                 if gw > 0.0 {
-                    if let ShogiMove::Board { from, to, .. } = mv {
+                    if let (Some(cands), ShogiMove::Board { from, to, .. }) =
+                        (promote_far_kings.as_ref(), mv)
+                    {
                         let role = view
                             .your_pieces
                             .iter()
@@ -5242,6 +5256,7 @@ impl Strategy for EstimatorStrategy {
                                     to,
                                     view.your_color,
                                     view.move_number,
+                                    cands,
                                 );
                         }
                     }
@@ -9873,6 +9888,16 @@ pub(crate) mod tests {
             ),
             "G*9b is a king candidate and should be taxed at m145"
         );
+        assert!(
+            !drop_has_hand_asset_work(
+                &view,
+                Role::Gold,
+                Coord { file: 6, rank: 2 },
+                &backed,
+                &kings
+            ),
+            "G*6b is 3 files off the median king file and should be taxed at m145"
+        );
     }
 
     /// m062 の G*1b が広い玉候補近接で work 免除されていないか
@@ -10628,7 +10653,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_ENDGAME_CAMP_GENERAL_W").is_err() {
             assert!((endgame_camp_general_w() - ENDGAME_CAMP_GENERAL_W).abs() < 1e-12);
-            assert_eq!(ENDGAME_CAMP_GENERAL_W, 0.0);
+            assert_eq!(ENDGAME_CAMP_GENERAL_W, 2.0);
         }
         if std::env::var("TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W").is_err() {
             assert!((far_major_promo_capture_w() - FAR_MAJOR_PROMO_CAPTURE_W).abs() < 1e-12);
@@ -10690,13 +10715,20 @@ pub(crate) mod tests {
         let me = Color::Sente;
         let from = Coord { file: 7, rank: 3 }; // 7c
         let to = Coord { file: 8, rank: 2 }; // 8b
+        // m145: 7a/8a/9a/9b/9c → median file 9
+        let mut kings = std::collections::BTreeSet::new();
+        kings.insert(Coord { file: 7, rank: 1 });
+        kings.insert(Coord { file: 8, rank: 1 });
+        kings.insert(Coord { file: 9, rank: 1 });
+        kings.insert(Coord { file: 9, rank: 2 });
+        kings.insert(Coord { file: 9, rank: 3 });
         assert_eq!(
-            endgame_camp_general_amount(Role::Promotedsilver, from, to, me, 145),
+            endgame_camp_general_amount(Role::Promotedsilver, from, to, me, 145, &kings),
             1.0,
-            "m145 の 7c8b は加点"
+            "m145 の 7c8b は玉筋へ近づくので加点"
         );
         assert_eq!(
-            endgame_camp_general_amount(Role::Promotedsilver, from, to, me, 80),
+            endgame_camp_general_amount(Role::Promotedsilver, from, to, me, 80, &kings),
             0.0,
             "手数 125 未満は対象外"
         );
@@ -10706,13 +10738,14 @@ pub(crate) mod tests {
                 Coord { file: 7, rank: 2 },
                 Coord { file: 7, rank: 3 },
                 Color::Gote,
-                130
+                130,
+                &kings
             ),
             0.0,
             "後手の 7b7c は自陣なので加点しない"
         );
         assert_eq!(
-            endgame_camp_general_amount(Role::Pawn, from, to, me, 145),
+            endgame_camp_general_amount(Role::Pawn, from, to, me, 145, &kings),
             0.0,
             "歩は対象外"
         );
@@ -10722,13 +10755,26 @@ pub(crate) mod tests {
                 Coord { file: 7, rank: 3 },
                 Coord { file: 7, rank: 2 },
                 me,
-                145
+                145,
+                &kings
             ),
             0.0,
             "m145 の 7c7b は同筋なので加点しない"
         );
         assert_eq!(
-            endgame_camp_general_amount(Role::Gold, from, to, me, 145),
+            endgame_camp_general_amount(
+                Role::Promotedsilver,
+                Coord { file: 7, rank: 3 },
+                Coord { file: 6, rank: 2 },
+                me,
+                145,
+                &kings
+            ),
+            0.0,
+            "m145 の 7c6b は玉筋から遠ざかるので加点しない"
+        );
+        assert_eq!(
+            endgame_camp_general_amount(Role::Gold, from, to, me, 145, &kings),
             0.0,
             "素の金は対象外（m139 の 6b5a を押し上げない）"
         );
