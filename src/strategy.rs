@@ -401,8 +401,10 @@ const LINK_ENDGAME_DAMPEN: f64 = 40.0;
 /// 仕事: 金は自玉 8 近傍、銀は玉頭2マス／敵陣かつ玉筋が読めるときの
 /// 敵玉近接（金は玉候補そのもの・玉筋隣接を除く）／安い駒の裏付け当たり。
 /// 打つ手だけ・王手中無効・粒子不要。
-/// **手数 `HAND_ASSET_MIN_MOVE` 以降**（序中盤の打ち課税はアリーナで
-/// 反則押し出しになる。PR#1 / vs v13 43.3%）。
+/// **手数 `HAND_ASSET_MIN_MOVE` 以降は全域**（中段・敵陣の打ち課税は
+/// アリーナで反則押し出しになる。PR#1 / vs v13 43.3%）。
+/// **それ未満は自陣打ちだけ**（m027 の S*3h。銀の中段・敵陣打ちまで
+/// 序盤から課税すると m046 の 3h4i が P*2b に食われる）。
 /// 凍結版はこの名前を知らない。
 fn hand_asset_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -418,9 +420,9 @@ fn hand_asset_w() -> f64 {
 /// 金銀桂＋敵陣以外の大駒打ち＋自陣歩の無目的打ち課税の既定。
 /// 香の打ちは対象外（PR#1 全駒種版の lance-tether 回帰を避ける）。
 const HAND_ASSET_W: f64 = 1.0;
-/// 序中盤まで掛けると打ち課税の押し出しで反則が増える（PR#1 コンボの
-/// アリーナ −7pt / 現行 vs v13 43.3%・反則 7.5/局の主犯候補）。
-/// 終盤の無目的打ち（m090 以降）は残す。
+/// 中段・敵陣の打ち課税を始める手数。序中盤まで掛けると反則が増える
+/// （PR#1 コンボのアリーナ −7pt / vs v13 43.3%・反則 7.5/局の主犯候補）。
+/// 終盤の無目的打ち（m090 以降）は残す。それ未満は自陣打ちだけ。
 const HAND_ASSET_MIN_MOVE: u32 = 80;
 
 /// 玉の既知脅威への接近減点（`TSUITATE_KING_KNOWN_APPROACH_W`、既定
@@ -862,7 +864,10 @@ const ENDGAME_CAMP_GENERAL_MIN_MOVE: u32 = 125;
 /// `material_degen_q0` は粒子質量で縮めるが信念が自信を持って間違うと
 /// 残る。こちらは**観測の裏付けが無い敵陣マス**という安全方向だけの静的税。
 /// 裏付けマス（取られた/非歩打ち反則）への取り返しは免税。
-/// 王手中無効・粒子不要。凍結版はこの名前を知らない。
+/// 王手中無効・粒子不要。
+/// **手数 `UNBACKED_CAMP_MIN_MOVE` 以降**（m021 の 4一とは残し、
+/// 序盤 1–19 の敵陣進入課税は切ってアリーナの反則押し出しを減らす）。
+/// 凍結版はこの名前を知らない。
 fn unbacked_camp_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -875,6 +880,8 @@ fn unbacked_camp_w() -> f64 {
 }
 
 const UNBACKED_CAMP_W: f64 = 0.8;
+/// m021（21手）の 4一とを残す下限。序盤の敵陣進入はアリーナの攻め手段。
+const UNBACKED_CAMP_MIN_MOVE: u32 = 20;
 
 /// 金銀・大駒の裏付け無し捕獲を gain から削る係数（`TSUITATE_UNBACKED_GS_CAPTURE_W`、
 /// 既定 `UNBACKED_GS_CAPTURE_W`。0 で切り戻し）。
@@ -1006,6 +1013,7 @@ const TOKIN_APPROACH_W: f64 = 0.0;
 /// 免税。打ちは HAND_ASSET / drop_probe の領分（S*4b を巻き込まない）。
 /// 歩は対象外（4七歩成を巻き込まない = 旧 `king_adj_entry_w` の失敗）。
 /// 玉筋が読めていない序盤では発火しない。王手中無効・粒子不要。
+/// **手数 `KING_ADJ_HEAVY_MIN_MOVE` 以降**（m021 の 3a4a は残す）。
 /// 凍結版はこの名前を知らない。
 fn king_adj_heavy_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -1021,6 +1029,8 @@ fn king_adj_heavy_w() -> f64 {
 /// 玉隣の高い駒進入課税の既定（2026-08-13。m021 の 3a4a 対策）。
 /// 0.5 では suite で 3a4a が 5/5 残ったため 1.5（tokin 3.5×1.5=5.25）
 const KING_ADJ_HEAVY_W: f64 = 1.5;
+/// m021（21手）の 3a4a を残す下限。
+const KING_ADJ_HEAVY_MIN_MOVE: u32 = 20;
 
 /// 桂銀香の任意成り課税（`TSUITATE_OWN_CAMP_MINOR_PROMO_W`、既定
 /// `OWN_CAMP_MINOR_PROMO_W`。0 で切り戻し）。
@@ -1747,6 +1757,13 @@ fn hand_asset_drop_taxable(role: Role, to: Coord, me: Color) -> bool {
         Role::Pawn => in_own_camp(to, me),
         _ => false,
     }
+}
+
+/// この手数で持ち駒資産損を掛ける着地か。80手以降は従来どおり全域、
+/// それ未満は自陣打ちだけ（アリーナの中段・敵陣プローブを潰さない。
+/// m027 の S*3h は自陣なので残る）。
+fn hand_asset_active_at(to: Coord, me: Color, move_number: u32) -> bool {
+    move_number >= HAND_ASSET_MIN_MOVE || in_own_camp(to, me)
 }
 
 /// 玉隣接への高い駒の無支え進入量（`king_adj_heavy_w`）。
@@ -5270,12 +5287,12 @@ impl Strategy for EstimatorStrategy {
         let king_threats = (king_known_approach_w() > 0.0
             && view.move_number >= KING_KNOWN_APPROACH_MIN_MOVE)
             .then(|| king_threat_evidence(log));
-        // 持ち駒資産損の玉候補（`hand_asset_w`）。王手中は無効
+        // 持ち駒資産損の玉候補（`hand_asset_w`）。王手中は無効。
+        // 手数ゲートは `hand_asset_active_at`（自陣は常時、全域は80手以降）
         let hand_asset_kings: Option<std::collections::BTreeSet<Coord>> =
-            (hand_asset_w() > 0.0
-                && !view.you_in_check
-                && view.move_number >= HAND_ASSET_MIN_MOVE)
-                .then(|| crate::deduce::opp_king_candidates(view.your_color, log));
+            (hand_asset_w() > 0.0 && !view.you_in_check).then(|| {
+                crate::deduce::opp_king_candidates(view.your_color, log)
+            });
         // 大駒成り遠方 / 玉筋歩 / 裏付け無し敵陣進入の玉候補。王手中は無効
         let promote_far_kings: Option<std::collections::BTreeSet<Coord>> =
             ((promote_far_w() > 0.0
@@ -5532,7 +5549,7 @@ impl Strategy for EstimatorStrategy {
             // 金銀は粒子が捕獲を信じているときだけ（3h4i の capture=0 を守る）。
             if !view.you_in_check {
                 let uw = unbacked_camp_w();
-                if uw > 0.0 {
+                if uw > 0.0 && view.move_number >= UNBACKED_CAMP_MIN_MOVE {
                     if let Some(backed) = opp_occ_backed.as_ref() {
                         let landing = match mv {
                             ShogiMove::Board { from, to, .. } => view
@@ -5586,7 +5603,7 @@ impl Strategy for EstimatorStrategy {
             // 玉隣接への高い駒の無支え進入（`king_adj_heavy_w`）。盤上の移動だけ。
             if !view.you_in_check {
                 let hw = king_adj_heavy_w();
-                if hw > 0.0 {
+                if hw > 0.0 && view.move_number >= KING_ADJ_HEAVY_MIN_MOVE {
                     if let (Some(cands), Some(backed), ShogiMove::Board { from, to, .. }) =
                         (promote_far_kings.as_ref(), opp_occ_backed.as_ref(), mv)
                     {
@@ -8238,7 +8255,8 @@ fn evaluate(
     let hand_asset_pen = match (hand_asset_kings, opp_occ_backed, mv) {
         (Some(cands), Some(backed), &ShogiMove::Drop { role, to }) => {
             let w = hand_asset_w();
-            let taxable = hand_asset_drop_taxable(role, to, view.your_color);
+            let taxable = hand_asset_drop_taxable(role, to, view.your_color)
+                && hand_asset_active_at(to, view.your_color, view.move_number);
             if w <= 0.0 || !taxable || drop_has_hand_asset_work(view, role, to, backed, cands)
             {
                 0.0
@@ -11033,10 +11051,36 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn hand_asset_active_at_own_camp_early_not_midboard() {
+        let me = Color::Sente;
+        let own = Coord { file: 3, rank: 8 };
+        let mid = Coord { file: 8, rank: 6 };
+        assert!(
+            hand_asset_active_at(own, me, 27),
+            "m027 S*3h own camp is taxed before 80"
+        );
+        assert!(
+            !hand_asset_active_at(mid, me, 27),
+            "mid-board drops stay exempt before 80"
+        );
+        assert!(
+            hand_asset_active_at(own, me, 46),
+            "own-camp drops stay taxed through the middlegame"
+        );
+        assert!(
+            !hand_asset_active_at(mid, me, 62),
+            "m062 mid-board stays exempt until 80"
+        );
+        assert!(hand_asset_active_at(mid, me, 80));
+        assert!(hand_asset_active_at(own, me, 90));
+    }
+
+    #[test]
     fn king_adj_heavy_w_default_on() {
         let w = std::env::var("TSUITATE_KING_ADJ_HEAVY_W").ok();
         if w.is_none() {
             assert!((king_adj_heavy_w() - KING_ADJ_HEAVY_W).abs() < 1e-12);
+            assert_eq!(KING_ADJ_HEAVY_MIN_MOVE, 20);
         }
     }
 
@@ -11235,6 +11279,10 @@ pub(crate) mod tests {
             assert!((unbacked_gs_capture_w() - UNBACKED_GS_CAPTURE_W).abs() < 1e-12);
             assert!((UNBACKED_GS_CAPTURE_W - 1.0).abs() < 1e-12);
             assert_eq!(UNBACKED_GS_CAPTURE_MIN_MOVE, 80);
+        }
+        if std::env::var("TSUITATE_UNBACKED_CAMP_W").is_err() {
+            assert!((unbacked_camp_w() - UNBACKED_CAMP_W).abs() < 1e-12);
+            assert_eq!(UNBACKED_CAMP_MIN_MOVE, 20);
         }
         if std::env::var("TSUITATE_HOME_GOLD_ATTACK_W").is_err() {
             assert!((home_gold_attack_w() - HOME_GOLD_ATTACK_W).abs() < 1e-12);
@@ -11562,6 +11610,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_KING_ADJ_HEAVY_W").is_err() {
             assert!((KING_ADJ_HEAVY_W - 1.5).abs() < 1e-12);
+            assert_eq!(KING_ADJ_HEAVY_MIN_MOVE, 20);
         }
         if std::env::var("TSUITATE_OWN_CAMP_IDLE_W").is_err() {
             assert!((own_camp_idle_w() - OWN_CAMP_IDLE_W).abs() < 1e-12);
