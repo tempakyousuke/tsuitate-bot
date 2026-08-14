@@ -507,11 +507,9 @@ const KING_FILE_GOLD_W: f64 = 0.0;
 /// 動く手へ `w × exchange_value(Tokin)` を gain から引く。
 ///
 /// 発端は quest31-m046 の 4g4h / 4g5h（採点 2）vs 3h4i 不成（10）。
-/// 4g5h は中央値 5 筋へ近づくので免税。相手最奥段（2a1a の香取り）も免税。
-/// その他の空きマス移動（4g4h・2c1c）は課税。王手中無効・粒子不要。
-///
-/// 初回は 2a1a 巻き込みで既定オフだったが、最奥段免税を入れてから
-/// quest31 の 4g4h クラスタ（m046/m048/m050）が残ったため 0.8 で再オン。
+/// 接近免税は 4g5h が同点で繰り上がるだけだったので外す。残す免税は
+/// 玉筋滞在・大駒の筋空け・相手最奥段（2a1a の香取り）・裏付け捕獲。
+/// 王手中無効・粒子不要。
 fn tokin_file_drift_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -523,9 +521,8 @@ fn tokin_file_drift_w() -> f64 {
     })
 }
 
-/// と金の玉筋逸れの既定。接近免税は 2c3b（本命）と m019 の 2a3a を守る。
-/// 4g4h は課税、4g5h は接近で免税のまま（home_gold での押し上げは
-/// m042/m054 回帰で不採用）。歩成り課税との複合は m110 を壊したので単体オン。
+/// と金の玉筋逸れの既定。接近免税なし（4g5h 逃避対策）。
+/// 2a3a は最奥段免税、2c3b は大駒筋空け免税が残る。
 const TOKIN_FILE_DRIFT_W: f64 = 0.8;
 
 /// 終盤の歩成り課税（`TSUITATE_PAWN_OFFFILE_W`、既定 `PAWN_OFFFILE_W`。
@@ -585,9 +582,9 @@ const FAR_MAJOR_PROMO_CAPTURE_W: f64 = 1.0;
 /// `OWN_CAMP_IDLE_W`。0 で切り戻し）。自陣への非捕獲移動へ
 /// `w × exchange_value` を gain から引く。
 ///
-/// 発端は quest31-m046 の 7a7b。**既定 0**: m027 の 3i3h（採点 7 の銀繰り出し）
-/// まで同じ税が乗り、9六歩へ流出した。7a7b と 3i3h はどちらも「自陣から
-/// 一歩前進」なので幾何では区別できない。env から試せる。
+/// 発端は quest31-m046 の 7a7b。幾何だけでは m027 の 3i3h（採点 7）と
+/// 区別できないので **手数 40 以降だけ** 掛ける（3i3h は 27 手目）。
+/// 王手中は無効（m086 の 7a7b は 8 点の受け）。
 fn own_camp_idle_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -599,7 +596,8 @@ fn own_camp_idle_w() -> f64 {
     })
 }
 
-const OWN_CAMP_IDLE_W: f64 = 0.0;
+const OWN_CAMP_IDLE_W: f64 = 1.0;
+const OWN_CAMP_IDLE_MIN_MOVE: u32 = 40;
 
 /// 裏付け無しの敵陣進入課税（`TSUITATE_UNBACKED_CAMP_W`、既定
 /// `UNBACKED_CAMP_W`）。歩・香・桂・玉以外が、観測裏付けの無い敵陣マスへ
@@ -996,10 +994,9 @@ fn king_files_focused(cands: &std::collections::BTreeSet<Coord>, median: i8) -> 
 
 /// 玉筋の歩前進量（`king_file_pawn_w`）。敵陣への前進1マスかつ中央値の筋距離 ≤2。
 ///
-/// **入口段（先手3段・後手7段）の盤上前進は加点しない**。quest31 の 5f5g+ は
-/// 玉筋上なので距離ゲートでは沈まず、終盤では 0〜2 点なのに `w=1.2` で
-/// 首位になっていた。入口段の加点は打ち（P*7c）に残し、深い成り（7c7b+）は
-/// 従来どおり加点する。手数ゲートの歩成り課税は m110（5f5g+=7点）を壊した。
+/// 入口段の盤上加点除外は 5f5g+ が 5〜6 点の局面まで沈み、B*2f / P*4g へ
+/// 流出してネット負だったので戻す。終盤の悪い 5f5g+ は手数ゲートの歩成り
+/// 課税でも m110（7点）を壊すため、ここでは触らない。
 fn king_file_pawn_amount(
     from: Coord,
     to: Coord,
@@ -1011,13 +1008,6 @@ fn king_file_pawn_amount(
         Color::Gote => to.file == from.file && to.rank == from.rank + 1,
     };
     if !forward || !in_enemy_camp(to, me) || cands.is_empty() {
-        return 0.0;
-    }
-    let entry_rank = match me {
-        Color::Sente => 3,
-        Color::Gote => 7,
-    };
-    if to.rank == entry_rank {
         return 0.0;
     }
     king_file_pawn_drop_amount(to, cands)
@@ -1079,9 +1069,8 @@ fn tokin_file_drift_amount(
     if let Some(median) = king_file_median(cands) {
         let d0 = (from.file - median).abs();
         let d1 = (to.file - median).abs();
-        // 玉筋に留まる／近づく（2a3a・2c3b）。4g5h も近づきで免税になるが
-        // 2a3a を潰す方が suite 損失が大きい（m019 6.00→2.00）
-        if d1 < d0 || (d0 == 0 && d1 == 0) {
+        // 玉筋に留まるだけ免税。近づき免税は 4g5h（採点 2）が繰り上がる。
+        if d0 == 0 && d1 == 0 {
             return 0.0;
         }
     }
@@ -1200,7 +1189,11 @@ fn own_camp_idle_amount(
     to: Coord,
     me: Color,
     backed: &[bool; 81],
+    move_number: u32,
 ) -> f64 {
+    if move_number < OWN_CAMP_IDLE_MIN_MOVE {
+        return 0.0;
+    }
     if !matches!(role, Role::Gold | Role::Silver | Role::Knight) {
         return 0.0;
     }
@@ -5074,8 +5067,14 @@ impl Strategy for EstimatorStrategy {
                             .find(|p| p.square == make_usi_square(from))
                             .map(|p| p.role);
                         if let Some(role) = role {
-                            out.gain -=
-                                iw * own_camp_idle_amount(role, to, view.your_color, backed);
+                            out.gain -= iw
+                                * own_camp_idle_amount(
+                                    role,
+                                    to,
+                                    view.your_color,
+                                    backed,
+                                    view.move_number,
+                                );
                         }
                     }
                 }
@@ -9699,45 +9698,20 @@ pub(crate) mod tests {
     fn king_file_pawn_prefers_king_files() {
         let mut cands = std::collections::BTreeSet::new();
         cands.insert(Coord { file: 6, rank: 2 });
-        // 入口段（3段目）の盤上前進は 5f5g+ 型なので加点しない。
-        // 深い前進（7c7b）だけ d_file で加点する。
-        assert_eq!(
-            king_file_pawn_amount(
-                Coord { file: 7, rank: 4 },
-                Coord { file: 7, rank: 3 },
-                Color::Sente,
-                &cands,
-            ),
-            0.0,
-            "7d7c is enemy-camp entry rank"
-        );
         let seven = king_file_pawn_amount(
+            Coord { file: 7, rank: 4 },
             Coord { file: 7, rank: 3 },
-            Coord { file: 7, rank: 2 },
             Color::Sente,
             &cands,
         );
         let one = king_file_pawn_amount(
+            Coord { file: 1, rank: 4 },
             Coord { file: 1, rank: 3 },
-            Coord { file: 1, rank: 2 },
             Color::Sente,
             &cands,
         );
         assert!((seven - 0.5).abs() < 1e-9, "d_file=1 → 1/2, got {seven}");
         assert_eq!(one, 0.0, "d_file=5 is outside the ≤2 window");
-        // 後手の 5f5g（入口段）も盤上は 0。打ち P*5g は残す。
-        let gote_entry = king_file_pawn_amount(
-            Coord { file: 5, rank: 6 },
-            Coord { file: 5, rank: 7 },
-            Color::Gote,
-            &cands,
-        );
-        assert_eq!(gote_entry, 0.0, "gote 5f5g is entry rank");
-        let drop_entry = king_file_pawn_drop_amount(Coord { file: 5, rank: 7 }, &cands);
-        assert!(
-            (drop_entry - 0.5).abs() < 1e-9,
-            "P*5g drop still gets the king-file bonus: {drop_entry}"
-        );
         // 中段の歩突きは加点しない
         assert_eq!(
             king_file_pawn_amount(
@@ -10111,7 +10085,7 @@ pub(crate) mod tests {
             &backed,
         );
         assert_eq!(drift, 1.0, "4g4h wanders on a side file");
-        // 4g5h: 5 筋へ近づくが大駒の道を開けない
+        // 4g5h: 5 筋へ近づくが空きマス逸れ。接近免税は外した
         let approach_idle = tokin_file_drift_amount(
             &gote_view,
             Coord { file: 4, rank: 7 },
@@ -10120,7 +10094,7 @@ pub(crate) mod tests {
             &cands,
             &backed,
         );
-        assert_eq!(approach_idle, 0.0, "4g5h approaches the king file (m019 保護)");
+        assert_eq!(approach_idle, 1.0, "4g5h is still idle (approach is not exempt)");
         // 2c3b: 2 筋に飛車がいるので道を空ける
         let rook_view = minimal_view(
             vec![
@@ -10184,16 +10158,26 @@ pub(crate) mod tests {
             Coord { file: 7, rank: 2 },
             Color::Gote,
             &backed,
+            46,
         );
         assert!(
             (idle - exchange_value(Role::Silver)).abs() < 1e-9,
-            "7a7b is gote own-camp idle: {idle}"
+            "7a7b is gote own-camp idle after move 40: {idle}"
         );
+        let early = own_camp_idle_amount(
+            Role::Silver,
+            Coord { file: 7, rank: 2 },
+            Color::Gote,
+            &backed,
+            27,
+        );
+        assert_eq!(early, 0.0, "m027 3i3h-class must stay exempt");
         let entry = own_camp_idle_amount(
             Role::Silver,
             Coord { file: 4, rank: 9 },
             Color::Gote,
             &backed,
+            46,
         );
         assert_eq!(entry, 0.0, "3h4i is enemy camp for gote");
     }
@@ -10217,7 +10201,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_OWN_CAMP_IDLE_W").is_err() {
             assert!((own_camp_idle_w() - OWN_CAMP_IDLE_W).abs() < 1e-12);
-            assert_eq!(OWN_CAMP_IDLE_W, 0.0);
+            assert!((OWN_CAMP_IDLE_W - 1.0).abs() < 1e-12);
         }
         if std::env::var("TSUITATE_PAWN_OFFFILE_W").is_err() {
             assert!((pawn_offfile_w() - PAWN_OFFFILE_W).abs() < 1e-12);
