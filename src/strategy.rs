@@ -521,8 +521,8 @@ fn tokin_file_drift_w() -> f64 {
     })
 }
 
-/// と金の玉筋逸れの既定。接近免税なし（4g5h 逃避対策）。
-/// 2a3a は最奥段免税、2c3b は大駒筋空け免税が残る。
+/// と金の玉筋逸れの既定。接近免税なし。単独では 4g5h / P*2b に逃げるが、
+/// `home_gold_attack_w` が 3h4i 不成を押し上げる受け皿になる前提でオン。
 const TOKIN_FILE_DRIFT_W: f64 = 0.8;
 
 /// 終盤の歩成り課税（`TSUITATE_PAWN_OFFFILE_W`、既定 `PAWN_OFFFILE_W`。
@@ -531,9 +531,9 @@ const TOKIN_FILE_DRIFT_W: f64 = 0.8;
 ///
 /// 発端は quest31 終盤の 5f5g+ 固執（m098/m126/m130）。玉候補の中央が
 /// 5 筋に残っていると「玉筋の歩」扱いで `king_file_pawn_w` が加点し、
-/// 筋外れゲートでは永遠に沈まない。手数 80 以降に限るので序中盤の
-/// 4f4g+ は対象外。歩打ちは垂れ歩（P*2h / P*7c）を巻き込まないよう除外。
-/// 王手中無効・粒子不要。
+/// 筋外れゲートでは永遠に沈まない。手数 125 以降に限るので m110 の
+/// 5f5g+（7点）は対象外。歩打ちは垂れ歩（P*2h / P*7c）を巻き込まない
+/// よう除外。王手中無効・粒子不要。
 fn pawn_offfile_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -545,10 +545,10 @@ fn pawn_offfile_w() -> f64 {
     })
 }
 
-/// 終盤の歩成り課税の既定。5f5g+ は m110 では 7 点・終盤では 0 点なので
-/// 手数ゲートでは区別できず、フル suite で m110 が 7→4（未採点逃避）になった。
-const PAWN_OFFFILE_W: f64 = 0.0;
-const PAWN_OFFFILE_MIN_MOVE: u32 = 80;
+/// 終盤の歩成り課税の既定。手数 125 以降なら m110（7点・110手）は対象外。
+/// m126/m130/m132 の 5f5g+ 固執（1〜2点）だけを沈める。
+const PAWN_OFFFILE_W: f64 = 1.5;
+const PAWN_OFFFILE_MIN_MOVE: u32 = 125;
 
 /// 遠方の大駒成り捕獲の幻の駒得キャンセル（`TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W`、
 /// 既定 `FAR_MAJOR_PROMO_CAPTURE_W`。0 で切り戻し）。
@@ -596,7 +596,7 @@ fn own_camp_idle_w() -> f64 {
     })
 }
 
-const OWN_CAMP_IDLE_W: f64 = 1.0;
+const OWN_CAMP_IDLE_W: f64 = 0.0;
 const OWN_CAMP_IDLE_MIN_MOVE: u32 = 40;
 
 /// 裏付け無しの敵陣進入課税（`TSUITATE_UNBACKED_CAMP_W`、既定
@@ -704,8 +704,9 @@ fn belief_occ_cap_shrink(capture_ev: f64, p_hit: f64, p_occ: f64, w: f64) -> f64
 /// 発端は quest31-m046 の 3h4i 不成（10点）。捕獲信念がある手と
 /// move_number<40（m029 の 4b4a）は加点しない。
 ///
-/// フル suite 5試行で平均 5.503→5.400（m046 クラスタは改善したが
-/// m042/m054/m090 の回帰と未採点 43→62 が勝った）。コードは残して env で再試行可。
+/// w=3 の一律加点は m042（3h4i が 4f4g+ を上書き）と m054（3h4g 捕獲がある
+/// のに空の 4i へ逃げる）で回帰した。再オン時のゲート:
+/// 不成のみ・手数 ≥44・同一駒に捕獲が無い。と金逸れの受け皿として使う。
 fn home_gold_attack_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -717,7 +718,8 @@ fn home_gold_attack_w() -> f64 {
     })
 }
 
-const HOME_GOLD_ATTACK_W: f64 = 0.0;
+const HOME_GOLD_ATTACK_W: f64 = 2.0;
+const HOME_GOLD_MIN_MOVE: u32 = 44;
 
 /// と金が玉筋へ寄る手の加点（`TSUITATE_TOKIN_APPROACH_W`、既定 0）。
 /// 敵陣のと金が、玉候補筋の中央値への筋距離を縮める手へ `w / (1+d_to)` を足す。
@@ -1140,12 +1142,17 @@ fn opp_gold_homes(me: Color) -> [Coord; 2] {
 }
 
 /// 相手の初期金位置への金銀の当たり量（`home_gold_attack_w`）。
+/// 成る手（3h4i+）は 0。観測裏付けのあるマスは捕獲側が既に数える。
 fn home_gold_attack_amount(
     role: Role,
     to: Coord,
     me: Color,
     backed: &[bool; 81],
+    promote: bool,
 ) -> f64 {
+    if promote {
+        return 0.0;
+    }
     if !matches!(role, Role::Gold | Role::Silver) {
         return 0.0;
     }
@@ -4891,7 +4898,7 @@ impl Strategy for EstimatorStrategy {
                         }
                         _ => {}
                     }
-                    // 終盤の歩成り（`pawn_offfile_w`）。金銀を持つ手数 80 以降だけ。
+                    // 終盤の歩成り（`pawn_offfile_w`）。金銀を持つ手数 125 以降だけ。
                     // 玉筋上の 5f5g+ も対象。歩打ちは垂れ歩保護のため除外。
                     let ow = pawn_offfile_w();
                     if ow > 0.0 && has_attacking_general(view) {
@@ -4956,34 +4963,8 @@ impl Strategy for EstimatorStrategy {
                     }
                 }
             }
-            // 相手の初期金位置への金銀当たり（`home_gold_attack_w`）。
-            if !view.you_in_check {
-                let hw = home_gold_attack_w();
-                if hw > 0.0 {
-                    if let (Some(backed), ShogiMove::Board { from, to, .. }) =
-                        (opp_occ_backed.as_ref(), mv)
-                    {
-                        let role = view
-                            .your_pieces
-                            .iter()
-                            .find(|p| p.square == make_usi_square(from))
-                            .map(|p| p.role);
-                        if let Some(role) = role {
-                            // 粒子が捕獲を信じている手（m029 の 4b4a）と
-                            // 序盤（初期金はもう逃げている）は加点しない。
-                            if out.capture_value < 0.5 && view.move_number >= 40 {
-                                out.gain += hw
-                                    * home_gold_attack_amount(
-                                        role,
-                                        to,
-                                        view.your_color,
-                                        backed,
-                                    );
-                            }
-                        }
-                    }
-                }
-            }
+            // 相手の初期金位置への金銀当たりは、全候補の捕獲が見えてから
+            // 後段で足す（同一駒に 3h4g 型の捕獲があるときの 3h4i 逃避を防ぐ）。
             // と金の玉筋接近（`tokin_approach_w`）。
             if !view.you_in_check {
                 let tw = tokin_approach_w();
@@ -5282,6 +5263,63 @@ impl Strategy for EstimatorStrategy {
                 for (j, &i) in king_idx.iter().enumerate() {
                     scored[i].2.gain = mean - approach_pens[j];
                     scored[i].4 = scored[i].2.score() + scored[i].3;
+                }
+            }
+        }
+
+        // 相手の初期金位置への金銀当たり（`home_gold_attack_w`）。
+        // 不成のみ・手数 ≥44・同一駒に捕獲が無いときだけ。m042 の 4f4g+ と
+        // m054 の 3h4g を守りつつ、m046 の 3h4i を 4g4h の受け皿にする。
+        if !view.you_in_check {
+            let hw = home_gold_attack_w();
+            if hw > 0.0 {
+                if let Some(backed) = opp_occ_backed.as_ref() {
+                    let capturing_from: HashSet<Coord> = scored
+                        .iter()
+                        .filter_map(|(_, mv, out, _, _)| match mv {
+                            ShogiMove::Board { from, .. } if out.capture_value >= 0.5 => {
+                                Some(*from)
+                            }
+                            _ => None,
+                        })
+                        .collect();
+                    for (_, mv, out, adjust, score) in scored.iter_mut() {
+                        let ShogiMove::Board {
+                            from,
+                            to,
+                            promote,
+                            ..
+                        } = *mv
+                        else {
+                            continue;
+                        };
+                        if view.move_number < HOME_GOLD_MIN_MOVE
+                            || capturing_from.contains(&from)
+                            || out.capture_value >= 0.5
+                        {
+                            continue;
+                        }
+                        let Some(role) = view
+                            .your_pieces
+                            .iter()
+                            .find(|p| p.square == make_usi_square(from))
+                            .map(|p| p.role)
+                        else {
+                            continue;
+                        };
+                        let bonus = hw
+                            * home_gold_attack_amount(
+                                role,
+                                to,
+                                view.your_color,
+                                backed,
+                                promote,
+                            );
+                        if bonus > 0.0 {
+                            out.gain += bonus;
+                            *score = out.score() + *adjust;
+                        }
+                    }
                 }
             }
         }
@@ -9868,6 +9906,7 @@ pub(crate) mod tests {
             Coord { file: 4, rank: 9 },
             Color::Gote,
             &backed,
+            false,
         );
         assert_eq!(gote_4i, 1.0, "3h4i is sente's gold home");
         let sente_4a = home_gold_attack_amount(
@@ -9875,13 +9914,23 @@ pub(crate) mod tests {
             Coord { file: 4, rank: 1 },
             Color::Sente,
             &backed,
+            false,
         );
         assert_eq!(sente_4a, 1.0, "gold to 4a is gote's gold home");
+        let promo = home_gold_attack_amount(
+            Role::Silver,
+            Coord { file: 4, rank: 9 },
+            Color::Gote,
+            &backed,
+            true,
+        );
+        assert_eq!(promo, 0.0, "3h4i+ must not get the gold-home bonus");
         let tokin = home_gold_attack_amount(
             Role::Tokin,
             Coord { file: 4, rank: 1 },
             Color::Sente,
             &backed,
+            false,
         );
         assert_eq!(tokin, 0.0, "tokin 3a4a must not get the gold-home bonus");
         let miss = home_gold_attack_amount(
@@ -9889,6 +9938,7 @@ pub(crate) mod tests {
             Coord { file: 3, rank: 9 },
             Color::Gote,
             &backed,
+            false,
         );
         assert_eq!(miss, 0.0, "3i is silver home, not gold");
         let mut hit = [false; 81];
@@ -9898,7 +9948,8 @@ pub(crate) mod tests {
                 Role::Silver,
                 Coord { file: 4, rank: 9 },
                 Color::Gote,
-                &hit
+                &hit,
+                false,
             ),
             0.0,
             "backed recapture is already counted as capture"
@@ -9946,7 +9997,8 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_HOME_GOLD_ATTACK_W").is_err() {
             assert!((home_gold_attack_w() - HOME_GOLD_ATTACK_W).abs() < 1e-12);
-            assert_eq!(HOME_GOLD_ATTACK_W, 0.0);
+            assert!((HOME_GOLD_ATTACK_W - 2.0).abs() < 1e-12);
+            assert_eq!(HOME_GOLD_MIN_MOVE, 44);
         }
         if std::env::var("TSUITATE_TOKIN_APPROACH_W").is_err() {
             assert!((tokin_approach_w() - TOKIN_APPROACH_W).abs() < 1e-12);
@@ -10201,11 +10253,12 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_OWN_CAMP_IDLE_W").is_err() {
             assert!((own_camp_idle_w() - OWN_CAMP_IDLE_W).abs() < 1e-12);
-            assert!((OWN_CAMP_IDLE_W - 1.0).abs() < 1e-12);
+            assert_eq!(OWN_CAMP_IDLE_W, 0.0);
         }
         if std::env::var("TSUITATE_PAWN_OFFFILE_W").is_err() {
             assert!((pawn_offfile_w() - PAWN_OFFFILE_W).abs() < 1e-12);
-            assert_eq!(PAWN_OFFFILE_W, 0.0);
+            assert!((PAWN_OFFFILE_W - 1.5).abs() < 1e-12);
+            assert_eq!(PAWN_OFFFILE_MIN_MOVE, 125);
         }
         if std::env::var("TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W").is_err() {
             assert!((far_major_promo_capture_w() - FAR_MAJOR_PROMO_CAPTURE_W).abs() < 1e-12);
@@ -10218,9 +10271,14 @@ pub(crate) mod tests {
         let me = Color::Gote;
         let to = Coord { file: 5, rank: 7 }; // 5g、後手の敵陣
         assert_eq!(
-            pawn_late_promo_amount(to, me, 98, false),
+            pawn_late_promo_amount(to, me, 130, false),
             1.0,
-            "m098 の 5f5g+ は課税"
+            "m130 の 5f5g+ は課税"
+        );
+        assert_eq!(
+            pawn_late_promo_amount(to, me, 110, false),
+            0.0,
+            "m110 の 5f5g+（7点）は手数 125 未満で免税"
         );
         assert_eq!(
             pawn_late_promo_amount(to, me, 26, false),
@@ -10228,7 +10286,7 @@ pub(crate) mod tests {
             "序中盤の歩成りは対象外"
         );
         assert_eq!(
-            pawn_late_promo_amount(to, me, 98, true),
+            pawn_late_promo_amount(to, me, 130, true),
             0.0,
             "裏付け捕獲は免税"
         );
