@@ -615,28 +615,6 @@ const KNIGHT_LATE_PROMO_MAX_MOVE: u32 = 136;
 const KNIGHT_LATE_NONPROMO_SCALE: f64 = 0.5;
 const KNIGHT_LATE_NONPROMO_MIN_MOVE: u32 = 110;
 
-/// 終盤の歩の敵陣不成課税（`TSUITATE_PAWN_LATE_NONPROMO_W`、既定
-/// `PAWN_LATE_NONPROMO_W`。0 で切り戻し）。手数 110..=136、歩が敵陣へ
-/// **成らず**入る盤上移動へ `w` を引く。成りは対象外（m116 の 5f5g+）。
-///
-/// 発端は quest31-m111 の 7d7c 不成（3点）が 7d7c+（10点）の上に居ること
-/// （`c863904` で不成×4 = 4.40）。m121 の 7c7b 不成（1点）対 7c7b+（10点）
-/// も同型。m095 の 7三歩不成は手数ゲートで守る。王手中無効・粒子不要。
-fn pawn_late_nonpromo_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_PAWN_LATE_NONPROMO_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(PAWN_LATE_NONPROMO_W)
-    })
-}
-
-const PAWN_LATE_NONPROMO_W: f64 = 3.0;
-const PAWN_LATE_NONPROMO_MIN_MOVE: u32 = 110;
-const PAWN_LATE_NONPROMO_MAX_MOVE: u32 = 136;
-
 /// 終盤の桂の敵陣成り加点（`TSUITATE_KNIGHT_ENDGAME_PROMO_W`、既定
 /// `KNIGHT_ENDGAME_PROMO_W`。0 で切り戻し）。手数 137 以降、桂が敵陣へ
 /// **成って**入る盤上移動へ `w` を足す（`knight_late_promo` の税の逆）。
@@ -1377,27 +1355,6 @@ fn knight_late_promo_amount(
         1.0
     } else if move_number >= KNIGHT_LATE_NONPROMO_MIN_MOVE {
         KNIGHT_LATE_NONPROMO_SCALE
-    } else {
-        0.0
-    }
-}
-
-/// 終盤の歩の敵陣不成課税量（`pawn_late_nonpromo_w`）。不成のみ。
-fn pawn_late_nonpromo_amount(
-    role: Role,
-    to: Coord,
-    promote: bool,
-    me: Color,
-    move_number: u32,
-) -> f64 {
-    if role != Role::Pawn
-        || promote
-        || !(PAWN_LATE_NONPROMO_MIN_MOVE..=PAWN_LATE_NONPROMO_MAX_MOVE).contains(&move_number)
-    {
-        return 0.0;
-    }
-    if in_enemy_camp(to, me) {
-        1.0
     } else {
         0.0
     }
@@ -5711,8 +5668,7 @@ impl Strategy for EstimatorStrategy {
                 }
             }
             // 桂銀香の任意成り課税（`own_camp_minor_promo_w`）。
-            // 終盤の桂敵陣成り課税（`knight_late_promo_w`）・歩の敵陣不成課税
-            // （`pawn_late_nonpromo_w`）・終盤の桂成り加点
+            // 終盤の桂敵陣成り課税（`knight_late_promo_w`）・終盤の桂成り加点
             // （`knight_endgame_promo_w`）・桂の自陣脱出（`knight_camp_exit_w`）
             // と銀の自陣脱出（`silver_camp_exit_w`）も同じ role を使う。
             if !view.you_in_check {
@@ -5740,17 +5696,6 @@ impl Strategy for EstimatorStrategy {
                                 * knight_late_promo_amount(
                                     role,
                                     from,
-                                    to,
-                                    promote,
-                                    view.your_color,
-                                    view.move_number,
-                                );
-                        }
-                        let pw = pawn_late_nonpromo_w();
-                        if pw > 0.0 {
-                            out.gain -= pw
-                                * pawn_late_nonpromo_amount(
-                                    role,
                                     to,
                                     promote,
                                     view.your_color,
@@ -10914,60 +10859,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn pawn_late_nonpromo_taxes_7d7c_after_110() {
-        let sente = Color::Sente;
-        let to = Coord { file: 7, rank: 3 }; // 7c
-        assert_eq!(
-            pawn_late_nonpromo_amount(Role::Pawn, to, false, sente, 111),
-            1.0,
-            "m111 の 7d7c 不成（3点）は終盤の歩の敵陣不成"
-        );
-        assert_eq!(
-            pawn_late_nonpromo_amount(Role::Pawn, to, true, sente, 111),
-            0.0,
-            "7d7c+（10点）は課税しない"
-        );
-        assert_eq!(
-            pawn_late_nonpromo_amount(Role::Pawn, to, false, sente, 95),
-            0.0,
-            "m095 の 7三歩不成は手数ゲートで守る"
-        );
-        assert_eq!(
-            pawn_late_nonpromo_amount(Role::Pawn, to, false, sente, 138),
-            0.0,
-            "137 手以降は pawn_offfile の領分"
-        );
-        assert_eq!(
-            pawn_late_nonpromo_amount(Role::Knight, to, false, sente, 111),
-            0.0,
-            "桂は knight_late_promo の領分"
-        );
-        let gote = Color::Gote;
-        assert_eq!(
-            pawn_late_nonpromo_amount(
-                Role::Pawn,
-                Coord { file: 5, rank: 7 },
-                false,
-                gote,
-                116,
-            ),
-            1.0,
-            "後手の 5f5g 不成も敵陣なら課税（成り 5f5g+ は 0）"
-        );
-        assert_eq!(
-            pawn_late_nonpromo_amount(
-                Role::Pawn,
-                Coord { file: 5, rank: 7 },
-                true,
-                gote,
-                116,
-            ),
-            0.0,
-            "m116 の 5f5g+ は不成税の対象外"
-        );
-    }
-
-    #[test]
     fn knight_endgame_promo_boosts_8e7g_after_137() {
         let gote = Color::Gote;
         let to = Coord { file: 7, rank: 7 }; // 7g
@@ -11681,12 +11572,6 @@ pub(crate) mod tests {
             assert_eq!(KNIGHT_LATE_PROMO_MAX_MOVE, 136);
             assert!((KNIGHT_LATE_NONPROMO_SCALE - 0.5).abs() < 1e-12);
             assert_eq!(KNIGHT_LATE_NONPROMO_MIN_MOVE, 110);
-        }
-        if std::env::var("TSUITATE_PAWN_LATE_NONPROMO_W").is_err() {
-            assert!((pawn_late_nonpromo_w() - PAWN_LATE_NONPROMO_W).abs() < 1e-12);
-            assert_eq!(PAWN_LATE_NONPROMO_W, 3.0);
-            assert_eq!(PAWN_LATE_NONPROMO_MIN_MOVE, 110);
-            assert_eq!(PAWN_LATE_NONPROMO_MAX_MOVE, 136);
         }
         if std::env::var("TSUITATE_KNIGHT_ENDGAME_PROMO_W").is_err() {
             assert!((knight_endgame_promo_w() - KNIGHT_ENDGAME_PROMO_W).abs() < 1e-12);
