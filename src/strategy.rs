@@ -513,13 +513,15 @@ const KING_FILE_PAWN_MID_MIN_MOVE: u32 = 80;
 const KING_FILE_PAWN_MID_MAX_MOVE: u32 = 86;
 
 /// 終盤の玉の非捕獲逃げ（`TSUITATE_KING_ENDGAME_FLEE_W`、既定
-/// `KING_ENDGAME_FLEE_W`。0 で切り戻し）。手数 125 以降、王手中でない玉の
-/// 移動で、着地が観測裏付けの占有マスでなければ `w` を gain から引く。
+/// `KING_ENDGAME_FLEE_W`。0 で切り戻し）。手数 125 以降の玉の移動で、
+/// 着地が観測裏付けの占有マスでなければ `w` を gain から引く。
 ///
 /// 発端は quest31-m140 の 8a9b / 8a8b / 8a7a（1〜2点）が 8c8b（8点）の上に
 /// 居ること。w=3 では seed0 で玉逃げが依然 1〜3 位だったので 8.0。
-/// 取る手は残す（recap-dragon）。王手中は CheckSolver / king-evade
-/// の領分なので無効。粒子不要。凍結版はこの名前を知らない。
+/// 取る手は残す（recap-dragon）。王手中も空マス逃げは課税する
+/// （m140 は打ち込み王手で 8b が裏付けに乗らず、非王手ゲートだと
+/// 8a9b が CheckSolver の p_legal で首位のまま）。king-evade は
+/// 手数 125 未満なので手数ゲートで守る。粒子不要。凍結版はこの名前を知らない。
 fn king_endgame_flee_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -541,6 +543,7 @@ const KING_ENDGAME_FLEE_MIN_MOVE: u32 = 125;
 /// 発端は quest31-m140 の 8c8b（8点）vs 8a9b（2点）。玉逃げ課税は着地が
 /// 裏付け占有だと免税され、非王手の寄りは m138 の未採点 8c8b へ逃げる。
 /// 打ち込み王手は観測されないので占有裏付けは要求しない。
+/// w=4 では王手中の p_legal 割引の内側で 8a9b を逆転できなかったので 8.0。
 /// 粒子不要。凍結版はこの名前を知らない。
 fn gold_join_king_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -553,7 +556,7 @@ fn gold_join_king_w() -> f64 {
     })
 }
 
-const GOLD_JOIN_KING_W: f64 = 4.0;
+const GOLD_JOIN_KING_W: f64 = 8.0;
 const GOLD_JOIN_KING_MIN_MOVE: u32 = 125;
 
 /// 終盤の桂の任意成り課税（`TSUITATE_KNIGHT_LATE_PROMO_W`、既定
@@ -1182,12 +1185,13 @@ fn king_file_pawn_mid_amount(
 }
 
 /// 終盤の玉の非捕獲逃げ量（`king_endgame_flee_w`）。
+/// 王手中の空マス逃げも含む。裏付け占有（取り返し）は 0。
 fn king_endgame_flee_amount(
     to: Coord,
     view: &PlayerView,
     backed: Option<&[bool; 81]>,
 ) -> f64 {
-    if view.you_in_check || view.move_number < KING_ENDGAME_FLEE_MIN_MOVE {
+    if view.move_number < KING_ENDGAME_FLEE_MIN_MOVE {
         return 0.0;
     }
     if backed.is_some_and(|b| b[crate::belief_features::sq_index(to)]) {
@@ -8046,7 +8050,7 @@ fn evaluate(
         _ => 0.0,
     };
 
-    // 終盤の玉の非捕獲逃げ（`king_endgame_flee_w`）。王手中は無効。
+    // 終盤の玉の非捕獲逃げ（`king_endgame_flee_w`）。王手中の空マスも課税。
     let king_flee_pen = match mv {
         &ShogiMove::Board { from, to, .. } if king_square(view) == Some(from) => {
             let w = king_endgame_flee_w();
@@ -8059,7 +8063,7 @@ fn evaluate(
         _ => 0.0,
     };
 
-    // 終盤の金が自玉へ隣接する（`gold_join_king_w`）。王手中の裏付け捕獲のみ。
+    // 終盤の金が自玉へ隣接する（`gold_join_king_w`）。王手中の盤上移動。
     let gold_join = match mv {
         &ShogiMove::Board { from, to, .. } => {
             let w = gold_join_king_w();
@@ -10505,7 +10509,11 @@ pub(crate) mod tests {
         assert_eq!(king_endgame_flee_amount(to, &view, None), 0.0);
         view.move_number = 140;
         view.you_in_check = true;
-        assert_eq!(king_endgame_flee_amount(to, &view, None), 0.0);
+        assert_eq!(
+            king_endgame_flee_amount(to, &view, None),
+            1.0,
+            "m140 は王手中の空マス逃げ 8a9b を課税する"
+        );
         view.you_in_check = false;
         let mut backed = [false; 81];
         backed[crate::belief_features::sq_index(to)] = true;
@@ -11197,7 +11205,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_GOLD_JOIN_KING_W").is_err() {
             assert!((gold_join_king_w() - GOLD_JOIN_KING_W).abs() < 1e-12);
-            assert_eq!(GOLD_JOIN_KING_W, 4.0);
+            assert_eq!(GOLD_JOIN_KING_W, 8.0);
             assert_eq!(GOLD_JOIN_KING_MIN_MOVE, 125);
         }
         if std::env::var("TSUITATE_KNIGHT_LATE_PROMO_W").is_err() {
