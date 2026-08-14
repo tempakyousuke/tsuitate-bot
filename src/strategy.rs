@@ -545,9 +545,9 @@ fn pawn_offfile_w() -> f64 {
     })
 }
 
-/// 終盤の歩成り課税の既定。手数 125 以降なら m110（7点・110手）は対象外。
-/// 複合では m126 は動いたが他項の副作用でネット負。コードは残して既定オフ。
-const PAWN_OFFFILE_W: f64 = 0.0;
+/// 終盤の歩成り課税の既定。手数 125 以降なら m110（7点・110手）と
+/// m116/m120 の 5f5g+（6点）は対象外。m126/m130/m132 の 1〜2 点固執が対象。
+const PAWN_OFFFILE_W: f64 = 1.5;
 const PAWN_OFFFILE_MIN_MOVE: u32 = 125;
 
 /// 遠方の大駒成り捕獲の幻の駒得キャンセル（`TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W`、
@@ -659,12 +659,10 @@ const UNBACKED_GS_CAPTURE_W: f64 = 1.0;
 /// mix = w × (1 − p_occ/0.25) で粒子の p_hit を p_occ へ混ぜ、
 /// 差分ぶんの期待駒得を引く。
 ///
-/// **既定 0**: 全駒種＋空き寄りは 5.503→5.379、大駒＋空き寄りは 5.596
-/// （+0.09 だが m081 の 4a3b+ は残存・悪化）、大駒＋自信過剰ギャップは
-/// 5.351・未採点 61 で 4a3b+ が増えた。敵陣の幻駒はネットも「居る」と
-/// 見なすことが多く、占有だけでは駒種の誤りを切れない。
-/// 有効化は `TSUITATE_BELIEF_OCC_CAP_W=1`（大駒＋空き寄り）。
-/// 金銀は `unbacked_gs_capture_w`。王手中無効・裏付けマスは満額。
+/// **既定 1.0**（大駒＋空き寄り。2026-08-14）。単体 5試行は recover 5.503→
+/// 5.596。4a3b+ クラスタ（m095 3.60→8.40・m087 1.20→5.00）が主因。
+/// 全駒種版は 5.379、自信過剰ギャップは 5.351 で不採用。金銀は
+/// `unbacked_gs_capture_w`。王手中無効・裏付けマスは満額。
 /// 凍結版はこの名前を知らない。
 fn belief_occ_cap_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -677,7 +675,7 @@ fn belief_occ_cap_w() -> f64 {
     })
 }
 
-const BELIEF_OCC_CAP_W: f64 = 0.0;
+const BELIEF_OCC_CAP_W: f64 = 1.0;
 /// 信念ネットが「空き寄り」と見なす占有の上界。これ以上なら粒子の
 /// p_hit を上書きしない（盤面平均 prior_occ ≈ 0.21 の少し上）。
 const BELIEF_OCC_EMPTY_PRIOR: f64 = 0.25;
@@ -701,13 +699,12 @@ fn belief_occ_cap_shrink(capture_ev: f64, p_hit: f64, p_occ: f64, w: f64) -> f64
 /// `HOME_GOLD_ATTACK_W`）。capture≈0 のときだけ足す。
 ///
 /// 発端は quest31-m046 の 3h4i 不成（10点）。捕獲信念がある手と
-/// move_number<40（m029 の 4b4a）は加点しない。
+/// move_number<44（m042 の 4f4g+）は加点しない。
 ///
-/// w=3 の一律加点は m042（3h4i が 4f4g+ を上書き）と m054（3h4g 捕獲がある
-/// のに空の 4i へ逃げる）で回帰した。再オン時のゲート:
-/// 不成のみ・手数 ≥44・同一駒に**裏付けのある**捕獲（m054 の 3h4g）が無い。
-/// 「捕獲が一つでもあれば加点しない」は 3h2i 型の幻捕獲まで巻き込み、
-/// 複合 5試行で 3h4i が 1/5 しか選ばれなかった。
+/// w=3 の一律加点は m042 と m054 で回帰。裏付け捕獲ゲートは m054 の 4g が
+/// capture≈0 のとき外れ、3h4i が 4/5 で選ばれた（5.426、m054 10→2）。
+/// 同筋の別マスへ動ける駒（3h4g が候補に載っている）なら加点しない。
+/// 3h2i は 2 筋なので m046 の受け皿は残る。
 fn home_gold_attack_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -1038,7 +1035,7 @@ fn has_attacking_general(view: &PlayerView) -> bool {
         || view.your_hand.get(&Role::Silver).copied().unwrap_or(0) > 0
 }
 
-/// 終盤の敵陣歩成り量（`pawn_offfile_w`）。手数 80 以降かつ裏付け無し。
+/// 終盤の敵陣歩成り量（`pawn_offfile_w`）。手数 125 以降かつ裏付け無し。
 fn pawn_late_promo_amount(to: Coord, me: Color, move_number: u32, backed_hit: bool) -> f64 {
     if move_number < PAWN_OFFFILE_MIN_MOVE || backed_hit {
         return 0.0;
@@ -1142,22 +1139,14 @@ fn opp_gold_homes(me: Color) -> [Coord; 2] {
     }
 }
 
-/// 同一駒の兄弟手が「裏付けのある捕獲」なら、空の初期金への加点を抑える。
-/// m054 の 3h4g（取られたと金の取り返し）は抑え、m046 の 3h2i 型の幻捕獲は
-/// 通す。初期金マス自体への捕獲は `capture_value` 側が既に数えるので除外。
-fn home_gold_sibling_blocks(
-    capture_to: Coord,
-    capture_value: f64,
-    me: Color,
-    backed: &[bool; 81],
-) -> bool {
-    if capture_value < 0.5 {
-        return false;
-    }
-    if opp_gold_homes(me).iter().any(|&h| h == capture_to) {
-        return false;
-    }
-    backed[crate::belief_features::sq_index(capture_to)]
+/// 同一駒が初期金の筋の別マスへ動けるなら、空の初期金への加点を抑える。
+/// m054 の 3h4g は 4 筋なので 3h4i をブロック。m046 は自と金が 4g にいて
+/// 3h4g が無く、3h2i は 2 筋なので通す。捕獲信念も裏付けも使わない
+/// （m054 の 4g は capture≈0 でも候補に載る）。
+fn home_gold_file_sibling(to: Coord, me: Color) -> bool {
+    opp_gold_homes(me)
+        .iter()
+        .any(|&h| h.file == to.file && h != to)
 }
 
 /// 相手の初期金位置への金銀の当たり量（`home_gold_attack_w`）。
@@ -5287,22 +5276,21 @@ impl Strategy for EstimatorStrategy {
         }
 
         // 相手の初期金位置への金銀当たり（`home_gold_attack_w`）。
-        // 不成のみ・手数 ≥44・同一駒に裏付け捕獲が無いときだけ。m042 の
-        // 4f4g+ と m054 の 3h4g を守りつつ、m046 の 3h4i を受け皿にする。
+        // 不成のみ・手数 ≥44・同一駒が初期金の筋の別マスへ動けないときだけ。
+        // m042 の 4f4g+ と m054 の 3h4g を守りつつ、m046 の 3h4i を受け皿にする。
         if !view.you_in_check {
             let hw = home_gold_attack_w();
             if hw > 0.0 {
                 if let Some(backed) = opp_occ_backed.as_ref() {
-                    let capturing_from: HashSet<Coord> = scored
+                    let file_sibling_from: HashSet<Coord> = scored
                         .iter()
-                        .filter_map(|(_, mv, out, _, _)| match mv {
+                        .filter_map(|(_, mv, _, _, _)| match mv {
                             ShogiMove::Board { from, to, .. }
-                                if home_gold_sibling_blocks(
-                                    *to,
-                                    out.capture_value,
-                                    view.your_color,
-                                    backed,
-                                ) =>
+                                if home_gold_file_sibling(*to, view.your_color)
+                                    && view.your_pieces.iter().any(|p| {
+                                        p.square == make_usi_square(*from)
+                                            && matches!(p.role, Role::Gold | Role::Silver)
+                                    }) =>
                             {
                                 Some(*from)
                             }
@@ -5320,7 +5308,7 @@ impl Strategy for EstimatorStrategy {
                             continue;
                         };
                         if view.move_number < HOME_GOLD_MIN_MOVE
-                            || capturing_from.contains(&from)
+                            || file_sibling_from.contains(&from)
                             || out.capture_value >= 0.5
                         {
                             continue;
@@ -7332,10 +7320,10 @@ fn evaluate(
         } else {
             0.0
         };
-        // 信念ネット占有キャップ（`belief_occ_cap_w`、既定 0）。質量ゲートの後
+        // 信念ネット占有キャップ（`belief_occ_cap_w`、既定 1）。質量ゲートの後
         // の残り駒得に対して、ネットが空き寄りと見ているマスへの裏付け無し
-        // **大駒**捕獲だけ縮める。既定オフ（実測は関数コメント）。
-        // 金銀キャンセルより先に掛け、残りを gs_unbacked が受け取る（二重控除しない）
+        // **大駒**捕獲だけ縮める。金銀キャンセルより先に掛け、残りを
+        // gs_unbacked が受け取る（二重控除しない）
         let remaining_after_degen = (capture_ev - material_shrink).max(0.0);
         let belief_occ_shrink = if belief_occ_cap_w() > 0.0
             && !view.you_in_check
@@ -9983,28 +9971,31 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn home_gold_sibling_blocks_only_backed_non_home_captures() {
+    fn home_gold_file_sibling_blocks_same_file_not_other_file() {
         let me = Color::Gote;
-        let mut backed = [false; 81];
         let four_g = Coord { file: 4, rank: 7 };
         let two_i = Coord { file: 2, rank: 9 };
         let four_i = Coord { file: 4, rank: 9 };
-        backed[crate::belief_features::sq_index(four_g)] = true;
         assert!(
-            home_gold_sibling_blocks(four_g, 3.5, me, &backed),
-            "m054 3h4g recapture on backed 4g blocks 3h4i"
+            home_gold_file_sibling(four_g, me),
+            "m054 3h4g is on gold-home file 4"
         );
         assert!(
-            !home_gold_sibling_blocks(two_i, 3.5, me, &backed),
-            "phantom 3h2i capture is unbacked and must not block"
+            !home_gold_file_sibling(two_i, me),
+            "phantom 3h2i is file 2, must not block 3h4i"
         );
         assert!(
-            !home_gold_sibling_blocks(four_i, 5.0, me, &backed),
-            "gold-home itself is counted as capture_value, not a sibling block"
+            !home_gold_file_sibling(four_i, me),
+            "gold-home itself is the boosted move, not a sibling"
+        );
+        let sente = Color::Sente;
+        assert!(
+            home_gold_file_sibling(Coord { file: 4, rank: 2 }, sente),
+            "4b shares file with gote gold home 4a"
         );
         assert!(
-            !home_gold_sibling_blocks(four_g, 0.0, me, &backed),
-            "non-capture sibling does not block"
+            !home_gold_file_sibling(Coord { file: 5, rank: 1 }, sente),
+            "5a is not a gold-home file"
         );
     }
 
@@ -10061,13 +10052,13 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_BELIEF_OCC_CAP_W").is_err() {
             assert!((belief_occ_cap_w() - BELIEF_OCC_CAP_W).abs() < 1e-12);
-            assert_eq!(BELIEF_OCC_CAP_W, 0.0);
+            assert_eq!(BELIEF_OCC_CAP_W, 1.0);
         }
     }
 
     /// 信念ネット占有キャップ: 空き寄り（p_occ < 0.25）のときだけ縮み、
     /// ネットも居ると見ているマスは粒子の捕獲期待値を残す。
-    /// 呼び出し側は大駒の移動に限定。既定 w=0。
+    /// 呼び出し側は大駒の移動に限定。既定 w=1。
     #[test]
     fn belief_occ_cap_shrinks_only_when_net_says_empty() {
         let ev = 5.0;
@@ -10309,7 +10300,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_PAWN_OFFFILE_W").is_err() {
             assert!((pawn_offfile_w() - PAWN_OFFFILE_W).abs() < 1e-12);
-            assert_eq!(PAWN_OFFFILE_W, 0.0);
+            assert!((PAWN_OFFFILE_W - 1.5).abs() < 1e-12);
             assert_eq!(PAWN_OFFFILE_MIN_MOVE, 125);
         }
         if std::env::var("TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W").is_err() {
