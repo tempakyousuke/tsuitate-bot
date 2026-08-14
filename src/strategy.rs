@@ -533,7 +533,7 @@ fn king_endgame_flee_w() -> f64 {
     })
 }
 
-const KING_ENDGAME_FLEE_W: f64 = 8.0;
+const KING_ENDGAME_FLEE_W: f64 = 12.0;
 const KING_ENDGAME_FLEE_MIN_MOVE: u32 = 125;
 
 /// 終盤の金が自玉へ隣接する盤上移動（`TSUITATE_GOLD_JOIN_KING_W`、既定
@@ -557,13 +557,38 @@ fn gold_join_king_w() -> f64 {
     })
 }
 
-const GOLD_JOIN_KING_W: f64 = 8.0;
+const GOLD_JOIN_KING_W: f64 = 16.0;
 const GOLD_JOIN_KING_MIN_MOVE: u32 = 125;
 
-/// 終盤の桂の任意成り課税（`TSUITATE_KNIGHT_LATE_PROMO_W`、既定
-/// `KNIGHT_LATE_PROMO_W`。0 で切り戻し）。手数 100 以降、桂の任意成りへ
-/// `w` を引く。quest31 の桂成に 8 点以上は無く、8e7g+ は終盤で 0〜2 点。
-/// 序中盤の 4d3b+（7点・40手前後）は手数ゲートで守る。
+/// 終盤、自玉に既に隣接している金が玉筋へ動く手（`TSUITATE_GOLD_KING_FILE_W`、
+/// 既定 `GOLD_KING_FILE_W`。0 で切り戻し）。手数 125 以降、**非王手**で
+/// 金が玉の 8 近傍から玉筋（同じ file）の 1〜2 マスへ動く手へ `w` を足す。
+///
+/// 発端は quest31-m130 の 7b8c（6点）vs 5f5g+（2点）。金は 7b で既に
+/// 玉 8a に隣接しているので `gold_join` は 0。歩成り課税は金銀手持ち
+/// ゲートのため、盤上の金だけでは 5f5g+ を沈められない。王手中は
+/// `gold_join` / CheckSolver の領分。粒子不要。凍結版はこの名前を知らない。
+fn gold_king_file_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_GOLD_KING_FILE_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(GOLD_KING_FILE_W)
+    })
+}
+
+const GOLD_KING_FILE_W: f64 = 6.0;
+const GOLD_KING_FILE_MIN_MOVE: u32 = 125;
+
+/// 終盤の桂の敵陣進入課税（`TSUITATE_KNIGHT_LATE_PROMO_W`、既定
+/// `KNIGHT_LATE_PROMO_W`。0 で切り戻し）。手数 100..=136、桂が敵陣へ
+/// 入る盤上移動へ `w` を引く（成り・不成とも）。
+///
+/// 発端は quest31-m100 の 8e7g 不成（5点）が 5f5g+（8点）の上に居ること。
+/// 成りだけ課税すると不成へ逃げる。手数 137 以降は m138 の 8e7g+（4点）
+/// が 5f5g+（0点）の受け皿なので上限で切る。序中盤の 4d3b+ は min で守る。
 /// 王手中無効・粒子不要。凍結版はこの名前を知らない。
 fn knight_late_promo_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -576,8 +601,9 @@ fn knight_late_promo_w() -> f64 {
     })
 }
 
-const KNIGHT_LATE_PROMO_W: f64 = 4.0;
+const KNIGHT_LATE_PROMO_W: f64 = 6.0;
 const KNIGHT_LATE_PROMO_MIN_MOVE: u32 = 100;
+const KNIGHT_LATE_PROMO_MAX_MOVE: u32 = 136;
 
 /// 終盤の銀が自陣から出る手（`TSUITATE_SILVER_CAMP_EXIT_W`、既定
 /// `SILVER_CAMP_EXIT_W`。0 で切り戻し）。手数 100 以降、自陣の銀が
@@ -648,8 +674,9 @@ const TOKIN_FILE_DRIFT_W: f64 = 0.0;
 /// 限るので m110 の 5f5g+（7点）と m116/m120（6点）は対象外。
 /// **既に敵陣にいる歩の前進**（m127 の 7c7b+ = 9点）は課税しない。
 /// 不成・手持ちゲート無しの 5.0 は m134/m136 の妥当な 5f5g+（4〜5点）まで
-/// B*7g へ沈めたので、成り＋金銀手持ちに戻す。歩打ちは垂れ歩保護のため除外。
-/// 王手中無効・粒子不要。
+/// B*7g へ沈めたので、成り＋金銀手持ちに戻す。手数 137 以降だけ
+/// 手持ちゲートを外す（m138 の 5f5g+ = 0 点。金は盤上にいる）。
+/// 歩打ちは垂れ歩保護のため除外。王手中無効・粒子不要。
 fn pawn_offfile_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -662,8 +689,11 @@ fn pawn_offfile_w() -> f64 {
 }
 
 /// 終盤の歩成り課税の既定。手数 125 以降・金銀手持ち・成りのみ。
+/// 手数 `PAWN_OFFFILE_FORCE_MIN_MOVE` 以降は手持ちゲートを外す
+/// （m138 の 5f5g+ = 0 点。金は盤上 8c にいるので手持ちゲートだと発火しない）。
 const PAWN_OFFFILE_W: f64 = 3.0;
 const PAWN_OFFFILE_MIN_MOVE: u32 = 125;
+const PAWN_OFFFILE_FORCE_MIN_MOVE: u32 = 137;
 
 /// 遠方の大駒成り捕獲の幻の駒得キャンセル（`TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W`、
 /// 既定 `FAR_MAJOR_PROMO_CAPTURE_W`。0 で切り戻し）。
@@ -1224,21 +1254,50 @@ fn gold_join_king_amount(
     }
 }
 
-/// 終盤の桂の任意成り課税量（`knight_late_promo_w`）。
-fn knight_late_promo_amount(
-    role: Role,
+/// 終盤、自玉隣接の金が玉筋へ動く量（`gold_king_file_w`）。
+/// 非王手・既に隣接・着地が玉と同じ筋かつ距離 1〜2 のときだけ 1。
+fn gold_king_file_amount(
     from: Coord,
     to: Coord,
-    promote: bool,
+    king: Coord,
+    move_number: u32,
+    in_check: bool,
+) -> f64 {
+    if in_check || move_number < GOLD_KING_FILE_MIN_MOVE {
+        return 0.0;
+    }
+    if chebyshev(from, king) != 1 {
+        return 0.0;
+    }
+    if to.file != king.file {
+        return 0.0;
+    }
+    let d = chebyshev(to, king);
+    if (1..=2).contains(&d) {
+        1.0
+    } else {
+        0.0
+    }
+}
+
+/// 終盤の桂の敵陣進入課税量（`knight_late_promo_w`）。
+fn knight_late_promo_amount(
+    role: Role,
+    _from: Coord,
+    to: Coord,
+    _promote: bool,
     me: Color,
     move_number: u32,
 ) -> f64 {
-    if !promote || role != Role::Knight || move_number < KNIGHT_LATE_PROMO_MIN_MOVE {
+    if role != Role::Knight
+        || !(KNIGHT_LATE_PROMO_MIN_MOVE..=KNIGHT_LATE_PROMO_MAX_MOVE).contains(&move_number)
+    {
         return 0.0;
     }
-    match promotion_choice(role, from, to, me) {
-        Promotion::Optional => 1.0,
-        _ => 0.0,
+    if in_enemy_camp(to, me) {
+        1.0
+    } else {
+        0.0
     }
 }
 
@@ -5249,13 +5308,15 @@ impl Strategy for EstimatorStrategy {
                 if let Some(cands) = promote_far_kings.as_ref() {
                     let pw = king_file_pawn_w();
                     let gw = king_file_gold_w();
-                    // 終盤の歩成り（`pawn_offfile_w`）。金銀を持つ手数 125 以降だけ。
-                    // 中段→敵陣の歩成り。既に敵陣の前進は除外。不成は対象外
-                    // （m134/m136 の妥当な 5f5g+ を守る）。発火中は king_file_pawn
-                    // を掛けない（+1.2 が税を打ち消す）。
+                    // 終盤の歩成り（`pawn_offfile_w`）。金銀を持つ手数 125 以降、
+                    // または手数 137 以降（手持ちゲートなし）。中段→敵陣の歩成り。
+                    // 既に敵陣の前進は除外。不成は対象外（m134/m136 の妥当な
+                    // 5f5g+ を守る）。発火中は king_file_pawn を掛けない。
                     let ow = pawn_offfile_w();
                     let mut late_pawn_promo = false;
-                    if ow > 0.0 && has_attacking_general(view) {
+                    let pawn_offfile_gate = has_attacking_general(view)
+                        || view.move_number >= PAWN_OFFFILE_FORCE_MIN_MOVE;
+                    if ow > 0.0 && pawn_offfile_gate {
                         if let ShogiMove::Board {
                             from,
                             to,
@@ -8067,10 +8128,10 @@ fn evaluate(
     // 終盤の金が自玉へ隣接する（`gold_join_king_w`）。王手中の盤上移動。
     // CheckSolver が打ち込み王手駒を仮説に持てないので p_legal 割引の
     // **外側**（`foul_probe` に加算）へ置く。
-    let gold_join = match mv {
+    // 非王手で既に隣接している金の玉筋移動は `gold_king_file_w`（gain 内）。
+    let (gold_join, gold_file_guard) = match mv {
         &ShogiMove::Board { from, to, .. } => {
-            let w = gold_join_king_w();
-            match (w > 0.0).then(|| king_square(view)).flatten() {
+            match king_square(view) {
                 Some(king)
                     if view
                         .your_pieces
@@ -8078,18 +8139,40 @@ fn evaluate(
                         .find(|p| p.square == make_usi_square(from))
                         .is_some_and(|p| p.role == Role::Gold) =>
                 {
-                    w * gold_join_king_amount(
-                        from,
-                        to,
-                        king,
-                        view.move_number,
-                        view.you_in_check,
-                    )
+                    let join = {
+                        let w = gold_join_king_w();
+                        if w > 0.0 {
+                            w * gold_join_king_amount(
+                                from,
+                                to,
+                                king,
+                                view.move_number,
+                                view.you_in_check,
+                            )
+                        } else {
+                            0.0
+                        }
+                    };
+                    let guard = {
+                        let w = gold_king_file_w();
+                        if w > 0.0 {
+                            w * gold_king_file_amount(
+                                from,
+                                to,
+                                king,
+                                view.move_number,
+                                view.you_in_check,
+                            )
+                        } else {
+                            0.0
+                        }
+                    };
+                    (join, guard)
                 }
-                _ => 0.0,
+                _ => (0.0, 0.0),
             }
         }
-        _ => 0.0,
+        _ => (0.0, 0.0),
     };
 
     // V5（盤上駒の減価、やねうら王 Lv2 で +R50）: 「同じ駒なら持ち駒のほうが
@@ -8290,6 +8373,7 @@ fn evaluate(
         - hand_asset_pen
         - king_approach_pen
         - king_flee_pen
+        + gold_file_guard
         - board_discount
         + effect_value
         + foul_occ_attack
@@ -10559,6 +10643,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn gold_king_file_boosts_7b8c_not_in_check() {
+        let king = Coord { file: 8, rank: 1 }; // 8a
+        let from = Coord { file: 7, rank: 2 }; // 7b
+        let to = Coord { file: 8, rank: 3 }; // 8c
+        assert_eq!(
+            gold_king_file_amount(from, to, king, 130, false),
+            1.0,
+            "m130 の 7b8c は隣接金が玉筋へ動く"
+        );
+        assert_eq!(
+            gold_king_file_amount(from, to, king, 130, true),
+            0.0,
+            "王手中は gold_join / CheckSolver の領分"
+        );
+        assert_eq!(
+            gold_king_file_amount(from, to, king, 80, false),
+            0.0,
+            "手数 125 未満は対象外"
+        );
+        assert_eq!(
+            gold_king_file_amount(
+                Coord { file: 8, rank: 3 },
+                Coord { file: 8, rank: 2 },
+                king,
+                140,
+                false,
+            ),
+            0.0,
+            "既に隣接していない金（8c）は gold_join の領分"
+        );
+        assert_eq!(
+            gold_king_file_amount(from, Coord { file: 7, rank: 3 }, king, 130, false),
+            0.0,
+            "玉筋以外（7c）は 0"
+        );
+    }
+
+    #[test]
     fn knight_late_promo_taxes_optional_after_100() {
         let gote = Color::Gote;
         let from = Coord { file: 8, rank: 5 }; // 8e
@@ -10566,7 +10688,12 @@ pub(crate) mod tests {
         assert_eq!(
             knight_late_promo_amount(Role::Knight, from, to, true, gote, 106),
             1.0,
-            "m106 の 8e7g+ は終盤の桂任意成り"
+            "m106 の 8e7g+ は終盤の桂の敵陣進入"
+        );
+        assert_eq!(
+            knight_late_promo_amount(Role::Knight, from, to, false, gote, 100),
+            1.0,
+            "m100 の 8e7g 不成も敵陣進入として課税する"
         );
         assert_eq!(
             knight_late_promo_amount(Role::Knight, from, to, true, gote, 40),
@@ -10574,14 +10701,26 @@ pub(crate) mod tests {
             "40手前後の 4d3b+ クラスは手数ゲートで守る"
         );
         assert_eq!(
-            knight_late_promo_amount(Role::Knight, from, to, false, gote, 106),
+            knight_late_promo_amount(Role::Knight, from, to, true, gote, 138),
             0.0,
-            "不成は対象外"
+            "m138 の 8e7g+（4点）は手数上限で免税"
         );
         assert_eq!(
             knight_late_promo_amount(Role::Silver, from, to, true, gote, 106),
             0.0,
             "銀成りは own_camp_minor の領分"
+        );
+        assert_eq!(
+            knight_late_promo_amount(
+                Role::Knight,
+                Coord { file: 8, rank: 9 },
+                Coord { file: 7, rank: 7 },
+                false,
+                Color::Sente,
+                137,
+            ),
+            0.0,
+            "先手の 8i7g は自陣側なので課税しない（手数上限でも 0）"
         );
     }
 
@@ -11185,6 +11324,7 @@ pub(crate) mod tests {
             assert!((pawn_offfile_w() - PAWN_OFFFILE_W).abs() < 1e-12);
             assert!((PAWN_OFFFILE_W - 3.0).abs() < 1e-12);
             assert_eq!(PAWN_OFFFILE_MIN_MOVE, 125);
+            assert_eq!(PAWN_OFFFILE_FORCE_MIN_MOVE, 137);
         }
         if std::env::var("TSUITATE_ENDGAME_CAMP_GENERAL_W").is_err() {
             assert!((endgame_camp_general_w() - ENDGAME_CAMP_GENERAL_W).abs() < 1e-12);
@@ -11202,18 +11342,24 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_KING_ENDGAME_FLEE_W").is_err() {
             assert!((king_endgame_flee_w() - KING_ENDGAME_FLEE_W).abs() < 1e-12);
-            assert_eq!(KING_ENDGAME_FLEE_W, 8.0);
+            assert_eq!(KING_ENDGAME_FLEE_W, 12.0);
             assert_eq!(KING_ENDGAME_FLEE_MIN_MOVE, 125);
         }
         if std::env::var("TSUITATE_GOLD_JOIN_KING_W").is_err() {
             assert!((gold_join_king_w() - GOLD_JOIN_KING_W).abs() < 1e-12);
-            assert_eq!(GOLD_JOIN_KING_W, 8.0);
+            assert_eq!(GOLD_JOIN_KING_W, 16.0);
             assert_eq!(GOLD_JOIN_KING_MIN_MOVE, 125);
+        }
+        if std::env::var("TSUITATE_GOLD_KING_FILE_W").is_err() {
+            assert!((gold_king_file_w() - GOLD_KING_FILE_W).abs() < 1e-12);
+            assert_eq!(GOLD_KING_FILE_W, 6.0);
+            assert_eq!(GOLD_KING_FILE_MIN_MOVE, 125);
         }
         if std::env::var("TSUITATE_KNIGHT_LATE_PROMO_W").is_err() {
             assert!((knight_late_promo_w() - KNIGHT_LATE_PROMO_W).abs() < 1e-12);
-            assert_eq!(KNIGHT_LATE_PROMO_W, 4.0);
+            assert_eq!(KNIGHT_LATE_PROMO_W, 6.0);
             assert_eq!(KNIGHT_LATE_PROMO_MIN_MOVE, 100);
+            assert_eq!(KNIGHT_LATE_PROMO_MAX_MOVE, 136);
         }
         if std::env::var("TSUITATE_SILVER_CAMP_EXIT_W").is_err() {
             assert!((silver_camp_exit_w() - SILVER_CAMP_EXIT_W).abs() < 1e-12);
