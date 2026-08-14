@@ -4180,7 +4180,7 @@ impl Strategy for EstimatorStrategy {
             king_cand_set.as_ref().map(|c| king_cand_prox_map(c));
         // 粒子の玉位置ビリーフによる近接マップ（`king_belief_prox_w`）。
         // deduce の玉候補が鈍い側（＝王手をあまり掛けていない側）でだけ使う
-        let king_belief_prox: Option<[f64; 81]> = (king_belief_prox_w() > 0.0
+        let king_belief_dist: Option<Vec<(Coord, f64)>> = (king_belief_prox_w() > 0.0
             && !view.you_in_check
             && king_cand_prox.is_none())
         .then(|| {
@@ -4201,9 +4201,11 @@ impl Strategy for EstimatorStrategy {
             // 実効サポート数（1/Σp²）が広いときは「敵陣へ前進」以上の情報が
             // 無いので使わない。閾値は deduce 側と同じノブを共用する
             let eff = 1.0 / dist.iter().map(|&(_, p)| p * p).sum::<f64>();
-            (eff <= king_cand_attack_gate() as f64).then(|| king_dist_prox_map(&dist))
+            (eff <= king_cand_attack_gate() as f64).then_some(dist)
         })
         .flatten();
+        let king_belief_prox: Option<[f64; 81]> =
+            king_belief_dist.as_ref().map(|d| king_dist_prox_map(d));
         // 成る王手の露見ペナルティ用玉候補（`promote_check_reveal_w`）。
         // ブラインド決定でも効かせるため粒子不要。王手中は無効
         let promote_check_kings: Option<std::collections::BTreeSet<Coord>> =
@@ -4372,12 +4374,20 @@ impl Strategy for EstimatorStrategy {
                     // 玉候補マスへ**実際に利く**手への追加加点
                     // （`king_cand_check_w`）。採点済み eval の局面内回帰では
                     // 距離を制御してもなお +0.78 点ぶんの説明力がある
-                    if king_cand_check_w() > 0.0 && king_cand_prox.is_some() {
-                        if let Some(cands) = king_cand_set.as_ref() {
-                            let dist: Vec<(Coord, f64)> = cands
-                                .iter()
-                                .map(|&k| (k, 1.0 / cands.len() as f64))
-                                .collect();
+                    if king_cand_check_w() > 0.0 {
+                        // 分布は deduce 側なら候補集合上の一様分布、
+                        // ネット側なら玉位置ネットの分布そのもの
+                        let dist: Option<Vec<(Coord, f64)>> = if king_cand_prox.is_some() {
+                            king_cand_set.as_ref().map(|cands| {
+                                cands
+                                    .iter()
+                                    .map(|&k| (k, 1.0 / cands.len() as f64))
+                                    .collect()
+                            })
+                        } else {
+                            king_belief_dist.clone()
+                        };
+                        if let Some(dist) = dist {
                             let frac = blind_king_attack(view, &mv, &dist);
                             out.gain += king_cand_check_w() * frac * 2.0
                                 / (1.0 + exchange_value(role));
