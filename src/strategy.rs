@@ -516,8 +516,8 @@ const KING_FILE_PAWN_MID_MAX_MOVE: u32 = 86;
 /// `KING_ENDGAME_FLEE_W`。0 で切り戻し）。手数 125 以降、王手中でない玉の
 /// 移動で、着地が観測裏付けの占有マスでなければ `w` を gain から引く。
 ///
-/// 発端は quest31-m140 の 8a9b。w=3 でも w=8 でもフル suite は 8a9b×5 のまま
-/// （着地が裏付け占有だと免税され、金の 8c8b は動かない）。既定 0。
+/// 発端は quest31-m140 の 8a9b / 8a8b / 8a7a（1〜2点）が 8c8b（8点）の上に
+/// 居ること。w=3 では seed0 で玉逃げが依然 1〜3 位だったので 8.0。
 /// 取る手は残す（recap-dragon）。王手中は CheckSolver / king-evade
 /// の領分なので無効。粒子不要。凍結版はこの名前を知らない。
 fn king_endgame_flee_w() -> f64 {
@@ -531,15 +531,17 @@ fn king_endgame_flee_w() -> f64 {
     })
 }
 
-const KING_ENDGAME_FLEE_W: f64 = 0.0;
+const KING_ENDGAME_FLEE_W: f64 = 8.0;
 const KING_ENDGAME_FLEE_MIN_MOVE: u32 = 125;
 
 /// 終盤の金が自玉へ隣接する盤上移動（`TSUITATE_GOLD_JOIN_KING_W`、既定
-/// `GOLD_JOIN_KING_W`。0 で切り戻し）。手数 125 以降、王手中でない金が
-/// 自玉の 8 近傍へ寄る手へ `w` を足す（既に隣接している金の移動は 0）。
+/// `GOLD_JOIN_KING_W`。0 で切り戻し）。手数 125 以降、**王手中**に金が
+/// 自玉の 8 近傍へ寄る盤上移動へ `w` を足す（既に隣接は 0）。
 ///
-/// 発端は quest31-m140 の 8c8b（8点）vs 8a9b（2点）。玉逃げ課税は効かず、
-/// 金側を直接押し上げる。粒子不要。凍結版はこの名前を知らない。
+/// 発端は quest31-m140 の 8c8b（8点）vs 8a9b（2点）。玉逃げ課税は着地が
+/// 裏付け占有だと免税され、非王手の寄りは m138 の未採点 8c8b へ逃げる。
+/// 打ち込み王手は観測されないので占有裏付けは要求しない。
+/// 粒子不要。凍結版はこの名前を知らない。
 fn gold_join_king_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -1194,9 +1196,17 @@ fn king_endgame_flee_amount(
     1.0
 }
 
-/// 終盤の金が自玉へ隣接する量（`gold_join_king_w`）。既に隣接している金は 0。
-fn gold_join_king_amount(from: Coord, to: Coord, king: Coord, move_number: u32) -> f64 {
-    if move_number < GOLD_JOIN_KING_MIN_MOVE {
+/// 終盤の金が自玉へ隣接する量（`gold_join_king_w`）。
+/// 王手中に金が玉へ寄るときだけ 1。打ち込み王手は観測されないので
+/// 占有裏付けは要求しない。
+fn gold_join_king_amount(
+    from: Coord,
+    to: Coord,
+    king: Coord,
+    move_number: u32,
+    in_check: bool,
+) -> f64 {
+    if !in_check || move_number < GOLD_JOIN_KING_MIN_MOVE {
         return 0.0;
     }
     if chebyshev(from, king) <= 1 {
@@ -8049,9 +8059,9 @@ fn evaluate(
         _ => 0.0,
     };
 
-    // 終盤の金が自玉へ隣接する（`gold_join_king_w`）。王手中は無効。
+    // 終盤の金が自玉へ隣接する（`gold_join_king_w`）。王手中の裏付け捕獲のみ。
     let gold_join = match mv {
-        &ShogiMove::Board { from, to, .. } if !view.you_in_check => {
+        &ShogiMove::Board { from, to, .. } => {
             let w = gold_join_king_w();
             match (w > 0.0).then(|| king_square(view)).flatten() {
                 Some(king)
@@ -8061,7 +8071,13 @@ fn evaluate(
                         .find(|p| p.square == make_usi_square(from))
                         .is_some_and(|p| p.role == Role::Gold) =>
                 {
-                    w * gold_join_king_amount(from, to, king, view.move_number)
+                    w * gold_join_king_amount(
+                        from,
+                        to,
+                        king,
+                        view.move_number,
+                        view.you_in_check,
+                    )
                 }
                 _ => 0.0,
             }
@@ -10501,27 +10517,32 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn gold_join_king_boosts_8c8b_after_125() {
+    fn gold_join_king_boosts_8c8b_in_check() {
         let king = Coord { file: 8, rank: 1 }; // 8a
         let from = Coord { file: 8, rank: 3 }; // 8c
         let to = Coord { file: 8, rank: 2 }; // 8b
         assert_eq!(
-            gold_join_king_amount(from, to, king, 140),
+            gold_join_king_amount(from, to, king, 140, true),
             1.0,
-            "m140 の 8c8b は玉へ隣接する金"
+            "m140 の 8c8b は王手中の金が玉へ寄る"
         );
         assert_eq!(
-            gold_join_king_amount(from, to, king, 80),
+            gold_join_king_amount(from, to, king, 140, false),
+            0.0,
+            "非王手の寄りは m138 の未採点逃避になるので対象外"
+        );
+        assert_eq!(
+            gold_join_king_amount(from, to, king, 80, true),
             0.0,
             "手数 125 未満は対象外"
         );
         assert_eq!(
-            gold_join_king_amount(to, from, king, 140),
+            gold_join_king_amount(to, from, king, 140, true),
             0.0,
             "既に隣接している金の移動は 0"
         );
         assert_eq!(
-            gold_join_king_amount(from, Coord { file: 7, rank: 3 }, king, 140),
+            gold_join_king_amount(from, Coord { file: 7, rank: 3 }, king, 140, true),
             0.0,
             "玉に隣接しない着地は 0"
         );
@@ -11171,7 +11192,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_KING_ENDGAME_FLEE_W").is_err() {
             assert!((king_endgame_flee_w() - KING_ENDGAME_FLEE_W).abs() < 1e-12);
-            assert_eq!(KING_ENDGAME_FLEE_W, 0.0);
+            assert_eq!(KING_ENDGAME_FLEE_W, 8.0);
             assert_eq!(KING_ENDGAME_FLEE_MIN_MOVE, 125);
         }
         if std::env::var("TSUITATE_GOLD_JOIN_KING_W").is_err() {
