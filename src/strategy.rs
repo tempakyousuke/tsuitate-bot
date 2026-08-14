@@ -401,9 +401,11 @@ const LINK_ENDGAME_DAMPEN: f64 = 40.0;
 /// 仕事: 金は自玉 8 近傍、銀は玉頭2マス／敵陣かつ玉筋が読めるときの
 /// 敵玉近接（金は玉候補そのもの・玉筋隣接を除く）／安い駒の裏付け当たり。
 /// 打つ手だけ・王手中無効・粒子不要。
-/// **手数 `HAND_ASSET_MIN_MOVE` 以降**（序中盤の打ち課税はアリーナで
-/// 反則押し出しになる。PR#1 / vs v13 43.3%）。
-/// 凍結版はこの名前を知らない。
+/// **手数 `HAND_ASSET_MIN_MOVE` 以降は全域**（中段・敵陣の打ち課税は
+/// アリーナで反則押し出しになる。PR#1 / vs v13 43.3%）。
+/// **手数 `HAND_ASSET_OWN_CAMP_MAX_MOVE` 未満は自陣打ちだけ**（m027 の
+/// S*3h。銀の敵陣打ちまで序盤から課税すると m046 の 3h4i が P*2b に
+/// 食われる）。凍結版はこの名前を知らない。
 fn hand_asset_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -418,10 +420,13 @@ fn hand_asset_w() -> f64 {
 /// 金銀桂＋敵陣以外の大駒打ち＋自陣歩の無目的打ち課税の既定。
 /// 香の打ちは対象外（PR#1 全駒種版の lance-tether 回帰を避ける）。
 const HAND_ASSET_W: f64 = 1.0;
-/// 序中盤まで掛けると打ち課税の押し出しで反則が増える（PR#1 コンボの
-/// アリーナ −7pt / 現行 vs v13 43.3%・反則 7.5/局の主犯候補）。
+/// 中段・敵陣の打ち課税を始める手数。序中盤まで掛けると反則が増える
+/// （PR#1 コンボのアリーナ −7pt / vs v13 43.3%・反則 7.5/局の主犯候補）。
 /// 終盤の無目的打ち（m090 以降）は残す。
 const HAND_ASSET_MIN_MOVE: u32 = 80;
+/// 自陣打ちだけ先行して課税する上限（含まない）。m027=27 は入れ、
+/// m046=46 の銀課税押し出しは入れない。
+const HAND_ASSET_OWN_CAMP_MAX_MOVE: u32 = 40;
 
 /// 玉の既知脅威への接近減点（`TSUITATE_KING_KNOWN_APPROACH_W`、既定
 /// `KING_KNOWN_APPROACH_W`。0 で切り戻し）。
@@ -1747,6 +1752,15 @@ fn hand_asset_drop_taxable(role: Role, to: Coord, me: Color) -> bool {
         Role::Pawn => in_own_camp(to, me),
         _ => false,
     }
+}
+
+/// この手数で持ち駒資産損を掛ける着地か。80手以降は従来どおり全域、
+/// 40手未満は自陣打ちだけ（アリーナの敵陣プローブを潰さない）。
+fn hand_asset_active_at(to: Coord, me: Color, move_number: u32) -> bool {
+    if move_number >= HAND_ASSET_MIN_MOVE {
+        return true;
+    }
+    move_number < HAND_ASSET_OWN_CAMP_MAX_MOVE && in_own_camp(to, me)
 }
 
 /// 玉隣接への高い駒の無支え進入量（`king_adj_heavy_w`）。
@@ -5270,12 +5284,12 @@ impl Strategy for EstimatorStrategy {
         let king_threats = (king_known_approach_w() > 0.0
             && view.move_number >= KING_KNOWN_APPROACH_MIN_MOVE)
             .then(|| king_threat_evidence(log));
-        // 持ち駒資産損の玉候補（`hand_asset_w`）。王手中は無効
+        // 持ち駒資産損の玉候補（`hand_asset_w`）。王手中は無効。
+        // 手数ゲートは `hand_asset_active_at`（自陣は40手未満、全域は80手以降）
         let hand_asset_kings: Option<std::collections::BTreeSet<Coord>> =
-            (hand_asset_w() > 0.0
-                && !view.you_in_check
-                && view.move_number >= HAND_ASSET_MIN_MOVE)
-                .then(|| crate::deduce::opp_king_candidates(view.your_color, log));
+            (hand_asset_w() > 0.0 && !view.you_in_check).then(|| {
+                crate::deduce::opp_king_candidates(view.your_color, log)
+            });
         // 大駒成り遠方 / 玉筋歩 / 裏付け無し敵陣進入の玉候補。王手中は無効
         let promote_far_kings: Option<std::collections::BTreeSet<Coord>> =
             ((promote_far_w() > 0.0
@@ -8238,7 +8252,8 @@ fn evaluate(
     let hand_asset_pen = match (hand_asset_kings, opp_occ_backed, mv) {
         (Some(cands), Some(backed), &ShogiMove::Drop { role, to }) => {
             let w = hand_asset_w();
-            let taxable = hand_asset_drop_taxable(role, to, view.your_color);
+            let taxable = hand_asset_drop_taxable(role, to, view.your_color)
+                && hand_asset_active_at(to, view.your_color, view.move_number);
             if w <= 0.0 || !taxable || drop_has_hand_asset_work(view, role, to, backed, cands)
             {
                 0.0
@@ -11029,7 +11044,33 @@ pub(crate) mod tests {
             assert!((hand_asset_w() - HAND_ASSET_W).abs() < 1e-12);
             assert!(HAND_ASSET_W > 0.0);
             assert_eq!(HAND_ASSET_MIN_MOVE, 80);
+            assert_eq!(HAND_ASSET_OWN_CAMP_MAX_MOVE, 40);
         }
+    }
+
+    #[test]
+    fn hand_asset_active_at_own_camp_early_not_midboard() {
+        let me = Color::Sente;
+        let own = Coord { file: 3, rank: 8 };
+        let mid = Coord { file: 8, rank: 6 };
+        assert!(
+            hand_asset_active_at(own, me, 27),
+            "m027 S*3h own camp is taxed before 40"
+        );
+        assert!(
+            !hand_asset_active_at(mid, me, 27),
+            "mid-board drops stay exempt before 80"
+        );
+        assert!(
+            !hand_asset_active_at(own, me, 46),
+            "m046 own-camp silver tax would push P*2b"
+        );
+        assert!(
+            !hand_asset_active_at(mid, me, 62),
+            "m062 mid-board stays exempt until 80"
+        );
+        assert!(hand_asset_active_at(mid, me, 80));
+        assert!(hand_asset_active_at(own, me, 90));
     }
 
     #[test]
