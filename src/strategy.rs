@@ -521,9 +521,9 @@ fn tokin_file_drift_w() -> f64 {
     })
 }
 
-/// と金の玉筋逸れの既定。接近免税なし。単独では 4g5h / P*2b に逃げるが、
-/// `home_gold_attack_w` が 3h4i 不成を押し上げる受け皿になる前提でオン。
-const TOKIN_FILE_DRIFT_W: f64 = 0.8;
+/// と金の玉筋逸れの既定。接近免税なしでも 4g5h / P*2b へ逃げるだけで、
+/// 受け皿なしのフル suite は 5.503→5.460。コードは残して既定オフ。
+const TOKIN_FILE_DRIFT_W: f64 = 0.0;
 
 /// 終盤の歩成り課税（`TSUITATE_PAWN_OFFFILE_W`、既定 `PAWN_OFFFILE_W`。
 /// 0 で切り戻し）。金または銀を持っているとき、敵陣への歩成りへ
@@ -546,8 +546,8 @@ fn pawn_offfile_w() -> f64 {
 }
 
 /// 終盤の歩成り課税の既定。手数 125 以降なら m110（7点・110手）は対象外。
-/// m126/m130/m132 の 5f5g+ 固執（1〜2点）だけを沈める。
-const PAWN_OFFFILE_W: f64 = 1.5;
+/// 複合では m126 は動いたが他項の副作用でネット負。コードは残して既定オフ。
+const PAWN_OFFFILE_W: f64 = 0.0;
 const PAWN_OFFFILE_MIN_MOVE: u32 = 125;
 
 /// 遠方の大駒成り捕獲の幻の駒得キャンセル（`TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W`、
@@ -573,10 +573,9 @@ fn far_major_promo_capture_w() -> f64 {
     })
 }
 
-/// 遠方の大駒成り捕獲キャンセルの既定。4a3b+ は全決定点で採点 0〜1 なので
-/// 沈めても指標穴にならない。歩成り課税との複合は 4a3b+ が増えたが、
-/// こちら単体なら幻の角成り込みだけを削る。
-const FAR_MAJOR_PROMO_CAPTURE_W: f64 = 1.0;
+/// 遠方の大駒成り捕獲キャンセルの既定。複合フル suite で 4a3b+ は減らず
+/// 他項の副作用が勝った（5.503→5.281）。コードは残して既定オフ。
+const FAR_MAJOR_PROMO_CAPTURE_W: f64 = 0.0;
 
 /// 自陣の金銀桂の空きマス移動課税（`TSUITATE_OWN_CAMP_IDLE_W`、既定
 /// `OWN_CAMP_IDLE_W`。0 で切り戻し）。自陣への非捕獲移動へ
@@ -706,7 +705,9 @@ fn belief_occ_cap_shrink(capture_ev: f64, p_hit: f64, p_occ: f64, w: f64) -> f64
 ///
 /// w=3 の一律加点は m042（3h4i が 4f4g+ を上書き）と m054（3h4g 捕獲がある
 /// のに空の 4i へ逃げる）で回帰した。再オン時のゲート:
-/// 不成のみ・手数 ≥44・同一駒に捕獲が無い。と金逸れの受け皿として使う。
+/// 不成のみ・手数 ≥44・同一駒に**裏付けのある**捕獲（m054 の 3h4g）が無い。
+/// 「捕獲が一つでもあれば加点しない」は 3h2i 型の幻捕獲まで巻き込み、
+/// 複合 5試行で 3h4i が 1/5 しか選ばれなかった。
 fn home_gold_attack_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -718,7 +719,7 @@ fn home_gold_attack_w() -> f64 {
     })
 }
 
-const HOME_GOLD_ATTACK_W: f64 = 2.0;
+const HOME_GOLD_ATTACK_W: f64 = 4.0;
 const HOME_GOLD_MIN_MOVE: u32 = 44;
 
 /// と金が玉筋へ寄る手の加点（`TSUITATE_TOKIN_APPROACH_W`、既定 0）。
@@ -1139,6 +1140,24 @@ fn opp_gold_homes(me: Color) -> [Coord; 2] {
             Coord { file: 6, rank: 9 },
         ],
     }
+}
+
+/// 同一駒の兄弟手が「裏付けのある捕獲」なら、空の初期金への加点を抑える。
+/// m054 の 3h4g（取られたと金の取り返し）は抑え、m046 の 3h2i 型の幻捕獲は
+/// 通す。初期金マス自体への捕獲は `capture_value` 側が既に数えるので除外。
+fn home_gold_sibling_blocks(
+    capture_to: Coord,
+    capture_value: f64,
+    me: Color,
+    backed: &[bool; 81],
+) -> bool {
+    if capture_value < 0.5 {
+        return false;
+    }
+    if opp_gold_homes(me).iter().any(|&h| h == capture_to) {
+        return false;
+    }
+    backed[crate::belief_features::sq_index(capture_to)]
 }
 
 /// 相手の初期金位置への金銀の当たり量（`home_gold_attack_w`）。
@@ -5268,8 +5287,8 @@ impl Strategy for EstimatorStrategy {
         }
 
         // 相手の初期金位置への金銀当たり（`home_gold_attack_w`）。
-        // 不成のみ・手数 ≥44・同一駒に捕獲が無いときだけ。m042 の 4f4g+ と
-        // m054 の 3h4g を守りつつ、m046 の 3h4i を 4g4h の受け皿にする。
+        // 不成のみ・手数 ≥44・同一駒に裏付け捕獲が無いときだけ。m042 の
+        // 4f4g+ と m054 の 3h4g を守りつつ、m046 の 3h4i を受け皿にする。
         if !view.you_in_check {
             let hw = home_gold_attack_w();
             if hw > 0.0 {
@@ -5277,7 +5296,14 @@ impl Strategy for EstimatorStrategy {
                     let capturing_from: HashSet<Coord> = scored
                         .iter()
                         .filter_map(|(_, mv, out, _, _)| match mv {
-                            ShogiMove::Board { from, .. } if out.capture_value >= 0.5 => {
+                            ShogiMove::Board { from, to, .. }
+                                if home_gold_sibling_blocks(
+                                    *to,
+                                    out.capture_value,
+                                    view.your_color,
+                                    backed,
+                                ) =>
+                            {
                                 Some(*from)
                             }
                             _ => None,
@@ -9957,6 +9983,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn home_gold_sibling_blocks_only_backed_non_home_captures() {
+        let me = Color::Gote;
+        let mut backed = [false; 81];
+        let four_g = Coord { file: 4, rank: 7 };
+        let two_i = Coord { file: 2, rank: 9 };
+        let four_i = Coord { file: 4, rank: 9 };
+        backed[crate::belief_features::sq_index(four_g)] = true;
+        assert!(
+            home_gold_sibling_blocks(four_g, 3.5, me, &backed),
+            "m054 3h4g recapture on backed 4g blocks 3h4i"
+        );
+        assert!(
+            !home_gold_sibling_blocks(two_i, 3.5, me, &backed),
+            "phantom 3h2i capture is unbacked and must not block"
+        );
+        assert!(
+            !home_gold_sibling_blocks(four_i, 5.0, me, &backed),
+            "gold-home itself is counted as capture_value, not a sibling block"
+        );
+        assert!(
+            !home_gold_sibling_blocks(four_g, 0.0, me, &backed),
+            "non-capture sibling does not block"
+        );
+    }
+
+    #[test]
     fn tokin_approach_rewards_closing_king_file() {
         let mut cands = std::collections::BTreeSet::new();
         cands.insert(Coord { file: 5, rank: 1 });
@@ -9997,7 +10049,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_HOME_GOLD_ATTACK_W").is_err() {
             assert!((home_gold_attack_w() - HOME_GOLD_ATTACK_W).abs() < 1e-12);
-            assert!((HOME_GOLD_ATTACK_W - 2.0).abs() < 1e-12);
+            assert!((HOME_GOLD_ATTACK_W - 4.0).abs() < 1e-12);
             assert_eq!(HOME_GOLD_MIN_MOVE, 44);
         }
         if std::env::var("TSUITATE_TOKIN_APPROACH_W").is_err() {
@@ -10238,7 +10290,7 @@ pub(crate) mod tests {
     fn tokin_file_drift_and_promote_far_defaults() {
         if std::env::var("TSUITATE_TOKIN_FILE_DRIFT_W").is_err() {
             assert!((tokin_file_drift_w() - TOKIN_FILE_DRIFT_W).abs() < 1e-12);
-            assert!((TOKIN_FILE_DRIFT_W - 0.8).abs() < 1e-12);
+            assert_eq!(TOKIN_FILE_DRIFT_W, 0.0);
         }
         if std::env::var("TSUITATE_KING_FILE_GOLD_W").is_err() {
             assert!((king_file_gold_w() - KING_FILE_GOLD_W).abs() < 1e-12);
@@ -10257,12 +10309,12 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_PAWN_OFFFILE_W").is_err() {
             assert!((pawn_offfile_w() - PAWN_OFFFILE_W).abs() < 1e-12);
-            assert!((PAWN_OFFFILE_W - 1.5).abs() < 1e-12);
+            assert_eq!(PAWN_OFFFILE_W, 0.0);
             assert_eq!(PAWN_OFFFILE_MIN_MOVE, 125);
         }
         if std::env::var("TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W").is_err() {
             assert!((far_major_promo_capture_w() - FAR_MAJOR_PROMO_CAPTURE_W).abs() < 1e-12);
-            assert!((FAR_MAJOR_PROMO_CAPTURE_W - 1.0).abs() < 1e-12);
+            assert_eq!(FAR_MAJOR_PROMO_CAPTURE_W, 0.0);
         }
     }
 
