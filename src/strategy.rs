@@ -540,11 +540,12 @@ const KING_ENDGAME_FLEE_MIN_MOVE: u32 = 125;
 /// `GOLD_JOIN_KING_W`。0 で切り戻し）。手数 125 以降、**王手中**に金が
 /// 自玉の 8 近傍へ寄る盤上移動へ `w` を足す（既に隣接は 0）。
 ///
-/// 発端は quest31-m140 の 8c8b（8点）vs 8a9b（2点）。玉逃げ課税は着地が
-/// 裏付け占有だと免税され、非王手の寄りは m138 の未採点 8c8b へ逃げる。
-/// 打ち込み王手は観測されないので占有裏付けは要求しない。
-/// w=4 では王手中の p_legal 割引の内側で 8a9b を逆転できなかったので 8.0。
-/// 粒子不要。凍結版はこの名前を知らない。
+/// 発端は quest31-m140 の 8c8b（8点）vs 8a9b（2点）。打ち込み王手は
+/// 観測されないので CheckSolver の仮説に 8b が乗らず、8c8b の p_legal が
+/// 薄い（kakutori 同型）。gain 内（p_legal 割引の内側）では w=4 でも
+/// 8a9b を逆転できなかったので **combine_score の外側**（`foul_probe` と同じ）
+/// に足す。盤上の金移動なので打ち反則スパムにはならない。非王手の寄りは
+/// m138 の未採点 8c8b へ逃げるので対象外。粒子不要。凍結版はこの名前を知らない。
 fn gold_join_king_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -8064,6 +8065,8 @@ fn evaluate(
     };
 
     // 終盤の金が自玉へ隣接する（`gold_join_king_w`）。王手中の盤上移動。
+    // CheckSolver が打ち込み王手駒を仮説に持てないので p_legal 割引の
+    // **外側**（`foul_probe` に加算）へ置く。
     let gold_join = match mv {
         &ShogiMove::Board { from, to, .. } => {
             let w = gold_join_king_w();
@@ -8287,7 +8290,6 @@ fn evaluate(
         - hand_asset_pen
         - king_approach_pen
         - king_flee_pen
-        + gold_join
         - board_discount
         + effect_value
         + foul_occ_attack
@@ -8364,7 +8366,7 @@ fn evaluate(
         promo,
         hand_option: hand_option_pen,
         board_discount,
-        foul_probe,
+        foul_probe: foul_probe + gold_join,
     }
 }
 
