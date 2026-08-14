@@ -401,8 +401,9 @@ const LINK_ENDGAME_DAMPEN: f64 = 40.0;
 /// 仕事: 金は自玉 8 近傍、銀は玉頭2マス／敵陣かつ玉筋が読めるときの
 /// 敵玉近接（金は玉候補そのもの・玉筋隣接を除く）／安い駒の裏付け当たり。
 /// 打つ手だけ・王手中無効・粒子不要。
-/// **手数 `HAND_ASSET_MIN_MOVE` 以降**（序中盤の打ち課税はアリーナで
-/// 反則押し出しになる。PR#1 / vs v13 43.3%）。
+/// **手数ゲート**: 銀は常時、金桂角飛歩は `HAND_ASSET_MIN_MOVE` 以降
+/// （序中盤の打ち課税はアリーナで反則押し出しになる。PR#1 / vs v13 43.3%。
+/// 銀だけ残すのは m027 の S*3h）。
 /// 凍結版はこの名前を知らない。
 fn hand_asset_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -418,10 +419,17 @@ fn hand_asset_w() -> f64 {
 /// 金銀桂＋敵陣以外の大駒打ち＋自陣歩の無目的打ち課税の既定。
 /// 香の打ちは対象外（PR#1 全駒種版の lance-tether 回帰を避ける）。
 const HAND_ASSET_W: f64 = 1.0;
-/// 序中盤まで掛けると打ち課税の押し出しで反則が増える（PR#1 コンボの
-/// アリーナ −7pt / 現行 vs v13 43.3%・反則 7.5/局の主犯候補）。
-/// 終盤の無目的打ち（m090 以降）は残す。
+/// 序中盤まで金桂角飛歩の打ち課税を掛けると押し出しで反則が増える
+/// （PR#1 コンボのアリーナ −7pt / vs v13 43.3%・反則 7.5/局の主犯候補）。
+/// 銀の無目的打ち（m027 の S*3h）は序盤から残す。
 const HAND_ASSET_MIN_MOVE: u32 = 80;
+
+fn hand_asset_active_for(role: Role, move_number: u32) -> bool {
+    match role {
+        Role::Silver => true,
+        _ => move_number >= HAND_ASSET_MIN_MOVE,
+    }
+}
 
 /// 玉の既知脅威への接近減点（`TSUITATE_KING_KNOWN_APPROACH_W`、既定
 /// `KING_KNOWN_APPROACH_W`。0 で切り戻し）。
@@ -5272,9 +5280,7 @@ impl Strategy for EstimatorStrategy {
             .then(|| king_threat_evidence(log));
         // 持ち駒資産損の玉候補（`hand_asset_w`）。王手中は無効
         let hand_asset_kings: Option<std::collections::BTreeSet<Coord>> =
-            (hand_asset_w() > 0.0
-                && !view.you_in_check
-                && view.move_number >= HAND_ASSET_MIN_MOVE)
+            (hand_asset_w() > 0.0 && !view.you_in_check)
                 .then(|| crate::deduce::opp_king_candidates(view.your_color, log));
         // 大駒成り遠方 / 玉筋歩 / 裏付け無し敵陣進入の玉候補。王手中は無効
         let promote_far_kings: Option<std::collections::BTreeSet<Coord>> =
@@ -8239,7 +8245,10 @@ fn evaluate(
         (Some(cands), Some(backed), &ShogiMove::Drop { role, to }) => {
             let w = hand_asset_w();
             let taxable = hand_asset_drop_taxable(role, to, view.your_color);
-            if w <= 0.0 || !taxable || drop_has_hand_asset_work(view, role, to, backed, cands)
+            if w <= 0.0
+                || !taxable
+                || !hand_asset_active_for(role, view.move_number)
+                || drop_has_hand_asset_work(view, role, to, backed, cands)
             {
                 0.0
             } else {
@@ -11029,6 +11038,9 @@ pub(crate) mod tests {
             assert!((hand_asset_w() - HAND_ASSET_W).abs() < 1e-12);
             assert!(HAND_ASSET_W > 0.0);
             assert_eq!(HAND_ASSET_MIN_MOVE, 80);
+            assert!(hand_asset_active_for(Role::Silver, 27));
+            assert!(!hand_asset_active_for(Role::Gold, 27));
+            assert!(hand_asset_active_for(Role::Gold, 80));
         }
     }
 
