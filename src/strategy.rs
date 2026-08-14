@@ -533,6 +533,31 @@ fn landing_support_w() -> f64 {
     })
 }
 
+/// 粒子の玉位置ビリーフによる接近ボーナス（`TSUITATE_KING_BELIEF_PROX_W`、
+/// 既定 0 = 無効）。`king_cand_attack_w` の**後手側用の対**。
+///
+/// `deduce::opp_king_candidates` は「自分が王手を宣言した履歴」から絞るので、
+/// 王手をあまり掛けられていない側では 35〜55 マスに散ってゲートを通らない
+/// （quest_20260731 の実測: 先手は 67手目以降ずっと 6〜17 マスなのに後手は
+/// 全局面で 35〜55）。残る失点上位 `5f5g+` / `8a7c` / `4g4h` はすべて後手側の
+/// 決定で、接近ボーナスが原理的に発火していないのが上限になっている。
+///
+/// そこで **deduce が鈍いときだけ**、粒子（厳密が生きていれば厳密、全滅して
+/// いれば taint）の玉位置分布を使って同じ近接度を作る。分布が散っているとき
+/// （実効サポート数 1/Σp² が `king_cand_attack_gate` 超）は使わない。
+/// deduce が鋭いときは `king_cand_attack_w` の領分なので発火しない（二重計上
+/// を避ける）。王手中は無効
+fn king_belief_prox_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_KING_BELIEF_PROX_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
 /// `promote_far_w` の課税を**全駒種**へ広げるか（`TSUITATE_PROMOTE_FAR_ALL=1`、
 /// 既定 0 = 角・飛だけ）。課税額は着手駒の交換価値で頭打ちにする
 fn promote_far_all() -> bool {
@@ -1493,6 +1518,29 @@ fn king_cand_prox_map(cands: &std::collections::BTreeSet<Coord>) -> [f64; 81] {
     // 正規化しないと w の意味が候補集合の広さで変わる）。**最短距離でなく
     // 候補全体の和**を使うのは、候補が固まっている側（玉が居そうな一帯）を
     // 素直に重くしたいから
+    let max = map.iter().cloned().fold(0.0f64, f64::max);
+    if max > 0.0 {
+        for slot in map.iter_mut() {
+            *slot /= max;
+        }
+    }
+    map
+}
+
+/// 玉位置分布からの近接マップ（`king_belief_prox_w`）。`king_cand_prox_map` の
+/// 確率重み版で、こちらも盤の最大で正規化する
+fn king_dist_prox_map(dist: &[(Coord, f64)]) -> [f64; 81] {
+    let mut map = [0.0f64; 81];
+    for (i, slot) in map.iter_mut().enumerate() {
+        let sq = Coord {
+            file: (i / 9) as i8 + 1,
+            rank: (i % 9) as i8 + 1,
+        };
+        *slot = dist
+            .iter()
+            .map(|&(k, p)| p * 0.5f64.powi(i32::from(cheb(sq, k))))
+            .sum::<f64>();
+    }
     let max = map.iter().cloned().fold(0.0f64, f64::max);
     if max > 0.0 {
         for slot in map.iter_mut() {
@@ -4130,6 +4178,27 @@ impl Strategy for EstimatorStrategy {
                 .flatten();
         let king_cand_prox: Option<[f64; 81]> =
             king_cand_set.as_ref().map(|c| king_cand_prox_map(c));
+        // 粒子の玉位置ビリーフによる近接マップ（`king_belief_prox_w`）。
+        // deduce の玉候補が鈍い側（＝王手をあまり掛けていない側）でだけ使う
+        let king_belief_prox: Option<[f64; 81]> = (king_belief_prox_w() > 0.0
+            && !view.you_in_check
+            && king_cand_prox.is_none())
+        .then(|| {
+            let pool: &[(&Position, f64)] = if !sample.is_empty() {
+                &sample
+            } else {
+                &taint_pool
+            };
+            let dist = taint_king_distribution(pool, opp_color);
+            if dist.is_empty() {
+                return None;
+            }
+            // 実効サポート数（1/Σp²）が広いときは「敵陣へ前進」以上の情報が
+            // 無いので使わない。閾値は deduce 側と同じノブを共用する
+            let eff = 1.0 / dist.iter().map(|&(_, p)| p * p).sum::<f64>();
+            (eff <= king_cand_attack_gate() as f64).then(|| king_dist_prox_map(&dist))
+        })
+        .flatten();
         // 成る王手の露見ペナルティ用玉候補（`promote_check_reveal_w`）。
         // ブラインド決定でも効かせるため粒子不要。王手中は無効
         let promote_check_kings: Option<std::collections::BTreeSet<Coord>> =
@@ -4272,9 +4341,11 @@ impl Strategy for EstimatorStrategy {
             // gain の内側（攻め加点は p_legal 割引の内側に置く。
             // dragon-check-drop の教訓）。着地マスの近接度を「着地する駒の
             // 安さ」で割る（同じ仕事なら最安の駒で）
-            if let Some(map) = king_cand_prox
+            if let Some((map, term_w)) = king_cand_prox
                 .as_ref()
                 .filter(|_| !king_cand_attack_blind_only() || sample.is_empty())
+                .map(|m| (m, king_cand_attack_w()))
+                .or_else(|| king_belief_prox.as_ref().map(|m| (m, king_belief_prox_w())))
             {
                 let (to, role) = match mv {
                     ShogiMove::Drop { role, to } => (to, role),
@@ -4296,7 +4367,7 @@ impl Strategy for EstimatorStrategy {
                     // 玉候補マスへ**実際に利く**手への追加加点
                     // （`king_cand_check_w`）。採点済み eval の局面内回帰では
                     // 距離を制御してもなお +0.78 点ぶんの説明力がある
-                    if king_cand_check_w() > 0.0 {
+                    if king_cand_check_w() > 0.0 && king_cand_prox.is_some() {
                         if let Some(cands) = king_cand_set.as_ref() {
                             let dist: Vec<(Coord, f64)> = cands
                                 .iter()
@@ -4332,7 +4403,7 @@ impl Strategy for EstimatorStrategy {
                     } else {
                         1.0
                     };
-                    out.gain += king_cand_attack_w() * prox * cheapness * support;
+                    out.gain += term_w * prox * cheapness * support;
                 }
             }
             // 歩・角・飛の成る王手の露見ペナルティ（`promote_check_reveal_w`）。
