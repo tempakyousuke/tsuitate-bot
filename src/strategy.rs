@@ -1041,7 +1041,10 @@ const OWN_CAMP_MINOR_PROMO_W: f64 = 1.2;
 /// だけを見た利きで判定する。詰み級の寄せは候補が着地そのもののとき
 /// （取って詰み）は対象外。
 /// **玉筋が読めていない序盤では発火しない**（広い候補だと全ての歩成りが
-/// 「誰かの8近傍」になり 4七歩成クラスを巻き込む）。凍結版はこの名前を知らない。
+/// 「誰かの8近傍」になり 4七歩成クラスを巻き込む）。
+/// **手数 `PROMOTE_CHECK_REVEAL_MAX_MOVE` まで**（m095=2点・m101=2点の
+/// 7d7c+ は課税、m103/m111/m119/m121 の 7d7c+/7c7b+ =10/9 点は課税しない。
+/// 同じ USI でも終盤は既知玉への寄せ）。凍結版はこの名前を知らない。
 fn promote_check_reveal_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -1056,6 +1059,8 @@ fn promote_check_reveal_w() -> f64 {
 /// 成る王手の露見ペナルティ既定（2026-08-13。m095 の 7d7c+ 対策）。
 /// 玉筋が読める局面だけで発火する
 const PROMOTE_CHECK_REVEAL_W: f64 = 1.2;
+/// m101（7d7c+ = 2）まで課税、m103（7d7c+ = 10）以降は切る。
+const PROMOTE_CHECK_REVEAL_MAX_MOVE: u32 = 102;
 
 /// 成る手が `deduce` 玉候補のいずれかに王手を掛けるか（観測のみ）。
 fn promote_checks_king_cand(
@@ -5750,6 +5755,7 @@ impl Strategy for EstimatorStrategy {
                     .find(|p| p.square == make_usi_square(from))
                     .map(|p| p.role);
                 if w > 0.0
+                    && view.move_number <= PROMOTE_CHECK_REVEAL_MAX_MOVE
                     && matches!(role, Some(Role::Pawn | Role::Bishop | Role::Rook))
                     && king_file_median(cands)
                         .is_some_and(|m| king_files_focused(cands, m))
@@ -11016,6 +11022,7 @@ pub(crate) mod tests {
         let w = std::env::var("TSUITATE_PROMOTE_CHECK_REVEAL_W").ok();
         if w.is_none() {
             assert!((promote_check_reveal_w() - PROMOTE_CHECK_REVEAL_W).abs() < 1e-12);
+            assert_eq!(PROMOTE_CHECK_REVEAL_MAX_MOVE, 102);
         }
     }
 
