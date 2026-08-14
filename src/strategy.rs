@@ -399,7 +399,8 @@ const LINK_ENDGAME_DAMPEN: f64 = 40.0;
 /// P*4h / P*5h は自陣の歩打ち。敵陣の角飛打ち（B*3c / B*4a / B*3f で
 /// 玉近接なら仕事あり）と敵陣の歩打ち（P*7c / P*4f）は対象外。
 /// 仕事: 金は自玉 8 近傍、銀は玉頭2マス／敵陣かつ玉筋が読めるときの
-/// 敵玉近接／安い駒の裏付け当たり。打つ手だけ・王手中無効・粒子不要。
+/// 敵玉近接（金は玉候補そのもの・玉筋隣接を除く）／安い駒の裏付け当たり。
+/// 打つ手だけ・王手中無効・粒子不要。
 /// 凍結版はこの名前を知らない。
 fn hand_asset_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -527,16 +528,15 @@ fn tokin_file_drift_w() -> f64 {
 const TOKIN_FILE_DRIFT_W: f64 = 0.0;
 
 /// 終盤の歩成り課税（`TSUITATE_PAWN_OFFFILE_W`、既定 `PAWN_OFFFILE_W`。
-/// 0 で切り戻し）。**中段から敵陣へ入る**歩の移動（成り・不成とも）へ
-/// `w` を gain から引き、裏付けの無い捕獲期待値もキャンセルする。
-/// その手自体には `king_file_pawn_w` を掛けない（+1.2 が税を打ち消す）。
+/// 0 で切り戻し）。金または銀を持っているとき、中段から敵陣へ入る
+/// **歩成り**へ `w` を gain から引き、裏付けの無い捕獲期待値もキャンセルする。
+/// 発火中は `king_file_pawn_w` を掛けない（+1.2 が税を打ち消す）。
 ///
-/// 発端は quest31 終盤の 5f5g+ 固執（m098/m126/m130）。玉候補の中央が
-/// 5 筋に残っていると「玉筋の歩」扱いで加点され、筋外れゲートでは沈まない。
-/// 手数 125 以降に限るので m110 の 5f5g+（7点）と m116/m120（6点）は対象外。
+/// 発端は quest31 終盤の 5f5g+ 固執（m098/m126/m130）。手数 125 以降に
+/// 限るので m110 の 5f5g+（7点）と m116/m120（6点）は対象外。
 /// **既に敵陣にいる歩の前進**（m127 の 7c7b+ = 9点）は課税しない。
-/// 不成も対象（GEN 有効時に 5f5g へ逃げる穴）。歩打ちは垂れ歩保護のため除外。
-/// 金銀の手持ちゲートは外す（盤上の 7b7c が受け皿で、持ち駒が角だけの局面が対象）。
+/// 不成・手持ちゲート無しの 5.0 は m134/m136 の妥当な 5f5g+（4〜5点）まで
+/// B*7g へ沈めたので、成り＋金銀手持ちに戻す。歩打ちは垂れ歩保護のため除外。
 /// 王手中無効・粒子不要。
 fn pawn_offfile_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -549,8 +549,7 @@ fn pawn_offfile_w() -> f64 {
     })
 }
 
-/// 終盤の歩進入課税の既定。5.0 は m134/m136 の 5f5g+（4〜5点）まで
-/// B*7g へ沈めたので 3.0。不成も対象・手持ちゲートなし・既に敵陣は除外。
+/// 終盤の歩成り課税の既定。手数 125 以降・金銀手持ち・成りのみ。
 const PAWN_OFFFILE_W: f64 = 3.0;
 const PAWN_OFFFILE_MIN_MOVE: u32 = 125;
 
@@ -628,9 +627,9 @@ const BISHOP_RETREAT_W: f64 = 0.5;
 /// `ENDGAME_CAMP_GENERAL_W`。0 で切り戻し）。手数 125 以降、敵陣にいる
 /// 成銀が敵陣へ**筋を変えて**動く手へ `w` を gain に足す。
 ///
-/// 発端は quest31-m145 の 7c8b（成銀、10点）。金銀まで広げると
-/// m139/m143 の 6b5a が繰り上がり、同筋前進 7c7b（2点）も同じ加点を
-/// 食う。打ちは HAND_ASSET の領分。王手中無効・粒子不要。
+/// 発端は quest31-m145 の 7c8b（成銀、10点）。w=2 は 7c6b（逆方向・未収載）
+/// へ逃避してフル suite 5.771→5.571。既定オフ。env から試せる。
+/// 打ちは HAND_ASSET の領分。王手中無効・粒子不要。
 fn endgame_camp_general_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -642,7 +641,7 @@ fn endgame_camp_general_w() -> f64 {
     })
 }
 
-const ENDGAME_CAMP_GENERAL_W: f64 = 2.0;
+const ENDGAME_CAMP_GENERAL_W: f64 = 0.0;
 const ENDGAME_CAMP_GENERAL_MIN_MOVE: u32 = 125;
 
 /// 裏付け無しの敵陣進入課税（`TSUITATE_UNBACKED_CAMP_W`、既定
@@ -1076,6 +1075,12 @@ fn king_file_pawn_drop_amount(
     1.0 / (1.0 + f64::from(d_file))
 }
 
+/// 金または銀を持っているか（歩の玉筋外れ課税の機会損失ゲート）。
+fn has_attacking_general(view: &PlayerView) -> bool {
+    view.your_hand.get(&Role::Gold).copied().unwrap_or(0) > 0
+        || view.your_hand.get(&Role::Silver).copied().unwrap_or(0) > 0
+}
+
 /// 終盤の敵陣歩進入量（`pawn_offfile_w`）。手数 125 以降かつ裏付け無し。
 /// 既に敵陣にいる歩の前進は 0（m127 の 7c7b+）。
 fn pawn_late_promo_amount(
@@ -1450,7 +1455,9 @@ fn king_known_approach_amount(
 /// - **金の自玉 8 近傍** / **銀の玉頭ちょうど2マス**: 守り打ち
 ///   （quest31-m055 の G*5g。隣接の S*5h や斜めの S*3h は対象外 = m027）
 /// - **安い駒**（歩香桂）: 裏付け占有への当たり
-/// - **高い駒**: 敵陣かつ玉筋が読めるときの敵玉近接、またはその近くの裏付けへの当たり
+/// - **高い駒**: 敵陣かつ玉筋が読めるときの敵玉近接、またはその近くの裏付けへの当たり。
+///   金に限り、玉候補そのもの／玉筋（中央値）の 8 近傍への打ちは近接免税しない
+///   （m087 の G*7c、m145 の G*8c）。銀の寄せ打ちは残す。
 ///
 /// 発端は quest31-m062 の `G*1b`。玉候補が41マスに拡散している局面で
 /// 「昔取られた 2c に当たる」だけで金打ちが免税され、端への無目的な
@@ -1502,6 +1509,17 @@ fn drop_has_hand_asset_work(
         return false;
     }
     if near_king(to) {
+        // 金を玉候補そのもの、または玉筋（中央値の筋）の隣接へ打つのは
+        // 仕事ではなくプローブ／裸の打ち込み（m087 の G*7c、m145 の G*8c）。
+        // 裏付け当たりへも落とさない（7c が何かに当たっても 1 点のまま）。
+        // 銀は 4b 型の寄せ打ちを残す。チェビシェフ2 の金（m087 の G*6c）は免税。
+        if role == Role::Gold {
+            let on_king = king_cands.contains(&to);
+            let adj_median_king = king_cands
+                .iter()
+                .any(|&k| chebyshev(to, k) <= 1 && k.file == median);
+            return !on_king && !adj_median_king;
+        }
         return true;
     }
     // 高い駒: 玉の近くの裏付けを取る／当てる打ちだけ仕事
@@ -4994,13 +5012,18 @@ impl Strategy for EstimatorStrategy {
                 if let Some(cands) = promote_far_kings.as_ref() {
                     let pw = king_file_pawn_w();
                     let gw = king_file_gold_w();
-                    // 終盤の歩進入（`pawn_offfile_w`）。手数 125 以降。
-                    // 中段→敵陣の歩（成り・不成）。既に敵陣の前進は除外。
-                    // その手には king_file_pawn を掛けない（+1.2 が税を打ち消す）。
+                    // 終盤の歩成り（`pawn_offfile_w`）。金銀を持つ手数 125 以降だけ。
+                    // 中段→敵陣の歩成り。既に敵陣の前進は除外。不成は対象外
+                    // （m134/m136 の妥当な 5f5g+ を守る）。発火中は king_file_pawn
+                    // を掛けない（+1.2 が税を打ち消す）。
                     let ow = pawn_offfile_w();
                     let mut late_pawn_promo = false;
-                    if ow > 0.0 {
-                        if let ShogiMove::Board { from, to, .. } = mv
+                    if ow > 0.0 && has_attacking_general(view) {
+                        if let ShogiMove::Board {
+                            from,
+                            to,
+                            promote: true,
+                        } = mv
                         {
                             let is_pawn = view
                                 .your_pieces
@@ -9664,6 +9687,17 @@ pub(crate) mod tests {
             &backed,
             &kings,
         ));
+        // 金を玉の 8 近傍（5b）へ打つのはプローブなので仕事なし
+        assert!(
+            !drop_has_hand_asset_work(
+                &view,
+                Role::Gold,
+                Coord { file: 5, rank: 2 },
+                &backed,
+                &kings,
+            ),
+            "G*5b adjacent to median-file king is not hand-asset work"
+        );
         // 候補が全筋に拡散していると敵玉近接は数えない
         for f in 1..=9i8 {
             kings.insert(Coord { file: f, rank: 1 });
@@ -9776,6 +9810,69 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    /// m087 の G*6c（8点）は仕事、G*7c（1点）は玉筋隣接なので課税。
+    /// m145 の G*8c（0点）も玉筋隣接。
+    #[test]
+    fn hand_asset_gold_adj_median_king_is_not_work() {
+        let text = std::fs::read_to_string("scenarios/quest31-m087.kif").expect("kif");
+        let kifu = crate::kifu::parse_kif(&text).expect("parse");
+        let rep = crate::scenario_core::replay(&kifu, 86);
+        let side = rep.pos.turn();
+        let view = crate::scenario_core::make_view(&rep.pos, side, &rep.fouls);
+        let log = &rep.logs[crate::scenario_core::side_idx(side)];
+        let kings = crate::deduce::opp_king_candidates(side, log);
+        let backed = opp_occupancy_evidence(&view, log);
+        assert!(
+            drop_has_hand_asset_work(
+                &view,
+                Role::Gold,
+                Coord { file: 6, rank: 3 },
+                &backed,
+                &kings
+            ),
+            "G*6c should keep work at m087 (kings={kings:?})"
+        );
+        assert!(
+            !drop_has_hand_asset_work(
+                &view,
+                Role::Gold,
+                Coord { file: 7, rank: 3 },
+                &backed,
+                &kings
+            ),
+            "G*7c should be taxed at m087 (kings={kings:?})"
+        );
+
+        let text = std::fs::read_to_string("scenarios/quest31-m145.kif").expect("kif");
+        let kifu = crate::kifu::parse_kif(&text).expect("parse");
+        let rep = crate::scenario_core::replay(&kifu, 144);
+        let side = rep.pos.turn();
+        let view = crate::scenario_core::make_view(&rep.pos, side, &rep.fouls);
+        let log = &rep.logs[crate::scenario_core::side_idx(side)];
+        let kings = crate::deduce::opp_king_candidates(side, log);
+        let backed = opp_occupancy_evidence(&view, log);
+        assert!(
+            !drop_has_hand_asset_work(
+                &view,
+                Role::Gold,
+                Coord { file: 8, rank: 3 },
+                &backed,
+                &kings
+            ),
+            "G*8c should be taxed at m145 (kings={kings:?})"
+        );
+        assert!(
+            !drop_has_hand_asset_work(
+                &view,
+                Role::Gold,
+                Coord { file: 9, rank: 2 },
+                &backed,
+                &kings
+            ),
+            "G*9b is a king candidate and should be taxed at m145"
+        );
     }
 
     /// m062 の G*1b が広い玉候補近接で work 免除されていないか
@@ -10531,7 +10628,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_ENDGAME_CAMP_GENERAL_W").is_err() {
             assert!((endgame_camp_general_w() - ENDGAME_CAMP_GENERAL_W).abs() < 1e-12);
-            assert!((ENDGAME_CAMP_GENERAL_W - 2.0).abs() < 1e-12);
+            assert_eq!(ENDGAME_CAMP_GENERAL_W, 0.0);
         }
         if std::env::var("TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W").is_err() {
             assert!((far_major_promo_capture_w() - FAR_MAJOR_PROMO_CAPTURE_W).abs() < 1e-12);
