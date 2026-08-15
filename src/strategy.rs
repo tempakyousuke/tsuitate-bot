@@ -387,6 +387,8 @@ fn link_endgame_dampen() -> f64 {
 /// ブラインド終盤の紐減衰の既定（2026-08-13 採用。quest31 得点 6.0 目標）。
 /// 0 で従来挙動へ切り戻し
 const LINK_ENDGAME_DAMPEN: f64 = 40.0;
+/// アリーナ平均手数 ~106 では発火させず、quest31 の 3三角成帯（127〜）は残す。
+const LINK_ENDGAME_DAMPEN_MIN_MOVE: u32 = 110;
 
 /// 持ち駒の資産損（`TSUITATE_HAND_ASSET_W`、既定 `HAND_ASSET_W`。
 /// 0 で切り戻し）。打つ手に `w × exchange_value(role)` を gain から引く
@@ -401,9 +403,8 @@ const LINK_ENDGAME_DAMPEN: f64 = 40.0;
 /// 仕事: 金は自玉 8 近傍、銀は玉頭2マス／敵陣かつ玉筋が読めるときの
 /// 敵玉近接（金は玉候補そのもの・玉筋隣接を除く）／安い駒の裏付け当たり。
 /// 打つ手だけ・王手中無効・粒子不要。
-/// **手数 `HAND_ASSET_MIN_MOVE` 以降**（序中盤の打ち課税はアリーナで
-/// 反則押し出しになる。PR#1 / vs v13 43.3%。自陣だけ先行すると
-/// m046/m048 の 3h4i が P*2b に食われる）。
+/// **手数 `HAND_ASSET_MIN_MOVE` 以降**（アリーナ平均 ~106 ではほぼ発火
+/// させない。自陣だけ先行すると m046/m048 の 3h4i が P*2b に食われる）。
 /// 凍結版はこの名前を知らない。
 fn hand_asset_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -421,8 +422,9 @@ fn hand_asset_w() -> f64 {
 const HAND_ASSET_W: f64 = 1.0;
 /// 序中盤まで掛けると打ち課税の押し出しで反則が増える（PR#1 コンボの
 /// アリーナ −7pt / vs v13 43.3%・反則 7.5/局の主犯候補）。
-/// 終盤の無目的打ち（m090 以降）は残す。
-const HAND_ASSET_MIN_MOVE: u32 = 80;
+/// 手数ゲート後も対 v13 46.6%・反則 7.15/局のままなので、アリーナ平均
+/// ~106 手ではほぼ発火させず、quest31 終盤の無目的打ちは残す。
+const HAND_ASSET_MIN_MOVE: u32 = 110;
 
 /// 玉の既知脅威への接近減点（`TSUITATE_KING_KNOWN_APPROACH_W`、既定
 /// `KING_KNOWN_APPROACH_W`。0 で切り戻し）。
@@ -869,8 +871,8 @@ const ENDGAME_CAMP_GENERAL_MIN_MOVE: u32 = 125;
 /// 残る。こちらは**観測の裏付けが無い敵陣マス**という安全方向だけの静的税。
 /// 裏付けマス（取られた/非歩打ち反則）への取り返しは免税。
 /// 王手中無効・粒子不要。
-/// **手数 `UNBACKED_CAMP_MIN_MOVE` 以降**（m021 の 4一とは残し、
-/// 序盤 1–19 の敵陣進入課税は切ってアリーナの反則押し出しを減らす）。
+/// **手数 `UNBACKED_CAMP_MIN_MOVE` 以降**（と金は対象外なので m021 は
+/// KING_ADJ 側。大駒の幻成り込みは 80 手以降だけ課税）。
 /// 凍結版はこの名前を知らない。
 fn unbacked_camp_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -884,8 +886,9 @@ fn unbacked_camp_w() -> f64 {
 }
 
 const UNBACKED_CAMP_W: f64 = 0.8;
-/// m021（21手）の 4一とを残す下限。序盤の敵陣進入はアリーナの攻め手段。
-const UNBACKED_CAMP_MIN_MOVE: u32 = 20;
+/// と金は対象外なので m021 は KING_ADJ 側。こちらは 4a3b+ / 2d3c+ の
+/// 大駒成り込み用で、序中盤から掛けるとアリーナの正しい敵陣進入まで殺す。
+const UNBACKED_CAMP_MIN_MOVE: u32 = 80;
 
 /// 金銀・大駒の裏付け無し捕獲を gain から削る係数（`TSUITATE_UNBACKED_GS_CAPTURE_W`、
 /// 既定 `UNBACKED_GS_CAPTURE_W`。0 で切り戻し）。
@@ -944,6 +947,8 @@ fn belief_occ_cap_w() -> f64 {
 }
 
 const BELIEF_OCC_CAP_W: f64 = 1.0;
+/// m067（67手・4一の幻の飛車）は残し、序盤の正しい大駒捕獲は縮めない。
+const BELIEF_OCC_CAP_MIN_MOVE: u32 = 60;
 /// 信念ネットが「空き寄り」と見なす占有の上界。これ以上なら粒子の
 /// p_hit を上書きしない（盤面平均 prior_occ ≈ 0.21 の少し上）。
 const BELIEF_OCC_EMPTY_PRIOR: f64 = 0.25;
@@ -1764,7 +1769,8 @@ fn hand_asset_drop_taxable(role: Role, to: Coord, me: Color) -> bool {
 }
 
 /// 玉隣接への高い駒の無支え進入量（`king_adj_heavy_w`）。
-/// 玉筋が読めて、着地が候補の 8 近傍で、観測裏付けが無く、歩香桂玉以外。
+/// **と金だけ**（m021 の 3a4a / 2c1c）。金銀大駒まで広げるとアリーナの
+/// 寄せ・支えまで課税して反則押し出しになる（対 v13 46.6% の残差）。
 fn king_adj_heavy_amount(
     role: Role,
     to: Coord,
@@ -1772,9 +1778,8 @@ fn king_adj_heavy_amount(
     cands: &std::collections::BTreeSet<Coord>,
     backed: &[bool; 81],
 ) -> f64 {
-    match role {
-        Role::Pawn | Role::Lance | Role::Knight | Role::King => return 0.0,
-        _ => {}
+    if role != Role::Tokin {
+        return 0.0;
     }
     if backed[crate::belief_features::sq_index(to)] {
         return 0.0;
@@ -1790,16 +1795,7 @@ fn king_adj_heavy_amount(
     });
     if !adjacent {
         // 玉筋から外れたと金（2c1c）。最奥段の香取り（2a1a）は免税
-        let off_file = matches!(
-            role,
-            Role::Tokin
-                | Role::Gold
-                | Role::Silver
-                | Role::Promotedlance
-                | Role::Promotedknight
-                | Role::Promotedsilver
-        ) && (to.file - median).abs() > 2
-            && !on_enemy_back_rank(to, me);
+        let off_file = (to.file - median).abs() > 2 && !on_enemy_back_rank(to, me);
         if !off_file {
             return 0.0;
         }
@@ -3628,14 +3624,17 @@ impl Default for EvalParams {
             // 0 で従来挙動へ切り戻し。w=10 × capture_reveal_risk ≒ 1.3点の
             // リスク床で、玉でしか取れない駒の捕獲は gain が勝って生き残る
             king_capture_reveal: 10.0,
-            // 成りポテンシャルの敵玉近接重み（2026-08-13 既定 0.5）
-            promo_king_prox: 0.5,
+            // 成りポテンシャルの敵玉近接重み。main どおり既定 0
+            // （機構は動くが m083 は動かず、全域の promo 価格改定は
+            // C1 と同型でアリーナ負。対 v13 60% 目標で切り戻し）
+            promo_king_prox: 0.0,
             // 打ち反則で確定した駒への当たり（2026-08-07 実装、2026-08-08 採用）。
             // 0 で従来挙動へ切り戻し。drop_probe_w（情報を買う）の回収側
             foul_occ_attack_w: 2.0,
-            // 材料の退化ゲート（2026-08-13 既定 0.3 採用。quest31 の
-            // 3三角成クラスタを初めて動かした項。0 で切り戻し）
-            material_degen_q0: 0.3,
+            // 材料の退化ゲート。main どおり既定 0（正しい捕獲まで殺す。
+            // 3三角成は PROMOTE_FAR / LINK_ENDGAME_DAMPEN / KING_FILE_PAWN
+            // が担う。対 v13 60% 目標で切り戻し）
+            material_degen_q0: 0.0,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
             // 反則経済の新項（2026-07-16、オラクル測定で36ptの伸びしろを確認後に追加）。
@@ -5077,7 +5076,10 @@ impl Strategy for EstimatorStrategy {
                 // **ブラインド決定に限定**: 厳密粒子がある局面では紐の働き重みが
                 // まだ使え、序中盤の予防的な紐（v12）を壊したくない
                 let damp = link_endgame_dampen();
-                if damp > 0.0 && sample.is_empty() {
+                if damp > 0.0
+                    && sample.is_empty()
+                    && view.move_number >= LINK_ENDGAME_DAMPEN_MIN_MOVE
+                {
                     p.link_w /= 1.0 + damp * push;
                 }
             }
@@ -8021,6 +8023,7 @@ fn evaluate(
         // gs_unbacked が受け取る（二重控除しない）
         let remaining_after_degen = (capture_ev - material_shrink).max(0.0);
         let belief_occ_shrink = if belief_occ_cap_w() > 0.0
+            && view.move_number >= BELIEF_OCC_CAP_MIN_MOVE
             && !view.you_in_check
             && remaining_after_degen > 0.0
             && !capture_to_backed
@@ -11042,7 +11045,7 @@ pub(crate) mod tests {
         if w.is_none() {
             assert!((hand_asset_w() - HAND_ASSET_W).abs() < 1e-12);
             assert!(HAND_ASSET_W > 0.0);
-            assert_eq!(HAND_ASSET_MIN_MOVE, 80);
+            assert_eq!(HAND_ASSET_MIN_MOVE, 110);
         }
     }
 
@@ -11253,7 +11256,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_UNBACKED_CAMP_W").is_err() {
             assert!((unbacked_camp_w() - UNBACKED_CAMP_W).abs() < 1e-12);
-            assert_eq!(UNBACKED_CAMP_MIN_MOVE, 20);
+            assert_eq!(UNBACKED_CAMP_MIN_MOVE, 80);
         }
         if std::env::var("TSUITATE_HOME_GOLD_ATTACK_W").is_err() {
             assert!((home_gold_attack_w() - HOME_GOLD_ATTACK_W).abs() < 1e-12);
@@ -11270,6 +11273,7 @@ pub(crate) mod tests {
         if std::env::var("TSUITATE_BELIEF_OCC_CAP_W").is_err() {
             assert!((belief_occ_cap_w() - BELIEF_OCC_CAP_W).abs() < 1e-12);
             assert_eq!(BELIEF_OCC_CAP_W, 1.0);
+            assert_eq!(BELIEF_OCC_CAP_MIN_MOVE, 60);
         }
     }
 
@@ -11351,6 +11355,28 @@ pub(crate) mod tests {
             &backed,
         );
         assert_eq!(pawn, 0.0, "pawns are exempt (4七歩成)");
+        assert_eq!(
+            king_adj_heavy_amount(
+                Role::Gold,
+                Coord { file: 4, rank: 1 },
+                me,
+                &cands,
+                &backed
+            ),
+            0.0,
+            "gold next to king is not taxed (arena mid-game)"
+        );
+        assert_eq!(
+            king_adj_heavy_amount(
+                Role::Bishop,
+                Coord { file: 4, rank: 1 },
+                me,
+                &cands,
+                &backed
+            ),
+            0.0,
+            "bishop next to king is not taxed (arena mid-game)"
+        );
         let mut backed_hit = [false; 81];
         backed_hit[crate::belief_features::sq_index(Coord { file: 4, rank: 1 })] = true;
         assert_eq!(
