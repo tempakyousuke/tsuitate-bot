@@ -1660,6 +1660,18 @@ fn promo_king_prox_map(w: f64, cands: &std::collections::BTreeSet<Coord>) -> Opt
 /// 候補集合全体の平均なので、候補が1点に絞れているときは隣接で 0.5・
 /// 2マス離れで 0.25 と急峻に落ち、候補が広いほど全マスで平坦になる
 /// （＝情報が無いときは自然に効かなくなる）
+/// 近接マップから**着地マス自身**（距離0）を除くか
+/// （`TSUITATE_KING_PROX_EXCLUDE_SELF=1`、既定 0 = 従来挙動）。
+///
+/// 着手できたということは玉はそのマスに居ない（打ちなら反則、移動なら玉は
+/// 取れない）ので、距離0の項は「玉に近い」根拠にならない。従来版は玉候補
+/// マスそのものへの垂れ歩に最大加点を与えていた（quest31-m119 の P*5b、
+/// ユーザー採点0）
+fn king_prox_exclude_self() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TSUITATE_KING_PROX_EXCLUDE_SELF").is_ok_and(|v| v == "1"))
+}
+
 fn king_cand_prox_map(cands: &std::collections::BTreeSet<Coord>) -> [f64; 81] {
     let mut map = [0.0f64; 81];
     for (i, slot) in map.iter_mut().enumerate() {
@@ -1667,8 +1679,13 @@ fn king_cand_prox_map(cands: &std::collections::BTreeSet<Coord>) -> [f64; 81] {
             file: (i / 9) as i8 + 1,
             rank: (i % 9) as i8 + 1,
         };
+        // 着地マス自身（距離0）は数えない: そこへ着手できたということは
+        // **玉はそこに居ない**（打ちなら反則、移動なら玉は取れない）ので、
+        // 「玉に近い」根拠にならない。数えていた版は玉候補マスそのものへの
+        // 無意味な垂れ歩（quest31-m119 の P*5b、採点0）へ最大加点を与えていた
         *slot = cands
             .iter()
+            .filter(|&&k| !king_prox_exclude_self() || k != sq)
             .map(|&k| 0.5f64.powi(i32::from(cheb(sq, k))))
             .sum::<f64>();
     }
@@ -1694,8 +1711,10 @@ fn king_dist_prox_map(dist: &[(Coord, f64)]) -> [f64; 81] {
             file: (i / 9) as i8 + 1,
             rank: (i % 9) as i8 + 1,
         };
+        // 着地マス自身は数えない（`king_cand_prox_map` と同じ理由）
         *slot = dist
             .iter()
+            .filter(|&&(k, _)| !king_prox_exclude_self() || k != sq)
             .map(|&(k, p)| p * 0.5f64.powi(i32::from(cheb(sq, k))))
             .sum::<f64>();
     }
