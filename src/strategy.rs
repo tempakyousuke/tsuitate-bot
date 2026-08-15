@@ -696,8 +696,20 @@ fn promotion_check_mass(
     to: Coord,
     role: Role,
     dist: &[(Coord, f64)],
+    certain_occ: &[bool; 81],
 ) -> f64 {
     if !nonpromote_check_role_ok(role) {
+        return 0.0;
+    }
+    // **着地の占有が観測で確定しているなら成る**: 露見が損になるのは
+    // 「取れなかった場合」に駒だけ晒されるからで、確実に取れるマスなら
+    // 取った時点で相手に通知される（露見コストは既に払っている）。
+    // ユーザー採点がこの区別を裏づける（2026-08-15）: 95手目
+    // 7三歩不成=10「相手が7三に駒を打っていなかった場合、王手がかかって
+    // しまい、取られてしまう」に対し、7二の銀が既知の 121/127手目は
+    // 7二歩成=9/10・不成=1、同じ 6b7c でも占有確定の 135/143手目は
+    // 銀不成=1/5
+    if certain_occ[crate::belief_features::sq_index(to)] {
         return 0.0;
     }
     let Some(promo_role) = promoted_role(role) else {
@@ -738,8 +750,9 @@ fn promotion_adds_check(
     to: Coord,
     role: Role,
     dist: &[(Coord, f64)],
+    certain_occ: &[bool; 81],
 ) -> bool {
-    promotion_check_mass(view, from, to, role, dist) >= nonpromote_check_p()
+    promotion_check_mass(view, from, to, role, dist, certain_occ) >= nonpromote_check_p()
 }
 
 /// `nonpromote_check_w` 用の玉位置分布（deduce 候補上の玉位置ネット）。
@@ -4400,10 +4413,10 @@ impl Strategy for EstimatorStrategy {
                 .then(|| crate::deduce::opp_king_candidates(view.your_color, log));
         // 不成の双子がある成り手への露見減点（`nonpromote_check_w`）。
         // 生成側と同じ条件・同じ候補集合を使う
-        let nonpromote_check_kings: Option<Vec<(Coord, f64)>> =
+        let nonpromote_check_kings: Option<(Vec<(Coord, f64)>, [bool; 81])> =
             (nonpromote_check_w() > 0.0 && !view.you_in_check)
-                .then(|| nonpromote_king_dist(view, log))
-                .filter(|d| !d.is_empty());
+                .then(|| (nonpromote_king_dist(view, log), king_threat_evidence(log)))
+                .filter(|(d, _)| !d.is_empty());
 
         // この手番の打ち反則で占有が確定したマスと、残存敵駒の平均交換価値
         // （`foul_occ_attack_w`）。反則では手番が変わらないので情報は完全に新鮮。
@@ -4635,7 +4648,7 @@ impl Strategy for EstimatorStrategy {
             // 不成の双子がある成り手（＝成ると玉候補への利きが増える手）への
             // 露見減点（`nonpromote_check_w`）。生成側と同一条件なので、
             // 減点が掛かる手には必ず不成の逃げ道がある
-            if let (Some(cands), ShogiMove::Board { from, to, promote }) =
+            if let (Some((cands, occ_ev)), ShogiMove::Board { from, to, promote }) =
                 (nonpromote_check_kings.as_ref(), mv)
             {
                 let role = view
@@ -4645,7 +4658,7 @@ impl Strategy for EstimatorStrategy {
                     .map(|p| p.role);
                 if let Some(r) = role {
                     if promotion_choice(r, from, to, view.your_color) == Promotion::Optional {
-                        let mass = promotion_check_mass(view, from, to, r, cands);
+                        let mass = promotion_check_mass(view, from, to, r, cands, occ_ev);
                         if mass >= nonpromote_check_p() {
                             // 双子の間の**中心化再配分**にする（成りへ減点だけ
                             // だと、成り駒の利き・交換価値の差ぶん不成が沈んだ
@@ -6000,10 +6013,10 @@ pub fn candidate_moves_with_log(
 ) -> Vec<(String, ShogiMove)> {
     let color = view.your_color;
     // 成ると玉候補への利きが増える手だけ不成の双子を作る（`nonpromote_check_w`）
-    let nonpromote_kings: Option<Vec<(Coord, f64)>> = log
+    let nonpromote_gate: Option<(Vec<(Coord, f64)>, [bool; 81])> = log
         .filter(|_| nonpromote_check_w() > 0.0 && !view.you_in_check)
-        .map(|l| nonpromote_king_dist(view, l))
-        .filter(|d| !d.is_empty());
+        .map(|l| (nonpromote_king_dist(view, l), king_threat_evidence(l)))
+        .filter(|(d, _)| !d.is_empty());
     let mut out = vec![];
     let push = |usi: String, out: &mut Vec<(String, ShogiMove)>| {
         if !foul_tried.contains(&usi) {
@@ -6036,8 +6049,8 @@ pub fn candidate_moves_with_log(
                     // （歩飛角）はついたて固有で局面依存、という2系統の差が
                     // そのまま出た形
                     if gen_nonpromote_for(piece.role)
-                        || nonpromote_kings.as_ref().is_some_and(|c| {
-                            promotion_adds_check(view, from, to, piece.role, c)
+                        || nonpromote_gate.as_ref().is_some_and(|(d, occ)| {
+                            promotion_adds_check(view, from, to, piece.role, d, occ)
                         })
                     {
                         push(make_usi_move(from, to, false), &mut out);
@@ -9064,9 +9077,12 @@ pub(crate) mod tests {
         let view = crate::scenario_core::make_view(&rep.pos, side, &[0, 0]);
         let log = &rep.logs[crate::scenario_core::side_idx(side)];
         let dist = nonpromote_king_dist(&view, log);
+        let occ = crate::strategy::king_threat_evidence(log);
         let from = Coord { file: 3, rank: 8 }; // 3h
-        let good = promotion_check_mass(&view, from, Coord { file: 4, rank: 9 }, Role::Silver, &dist);
-        let other = promotion_check_mass(&view, from, Coord { file: 2, rank: 9 }, Role::Silver, &dist);
+        let good =
+            promotion_check_mass(&view, from, Coord { file: 4, rank: 9 }, Role::Silver, &dist, &occ);
+        let other =
+            promotion_check_mass(&view, from, Coord { file: 2, rank: 9 }, Role::Silver, &dist, &occ);
         assert!(
             good > other,
             "3h4i+ (checks the 5i king) must carry more check mass than 3h2i+: {good} vs {other}"
@@ -9083,7 +9099,7 @@ pub(crate) mod tests {
                     continue;
                 }
                 optional += 1;
-                if promotion_check_mass(&view, f, to, piece.role, &dist) >= good {
+                if promotion_check_mass(&view, f, to, piece.role, &dist, &occ) >= good {
                     fires += 1;
                 }
             }
