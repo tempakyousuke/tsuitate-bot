@@ -673,36 +673,30 @@
       blind_home と同型）が犯人候補。**どのノブが −7pt の犯人かは per-knob
       ablation 未実施**。シナリオ改善が大きいので、切り分けのうえ部分集合の
       再判定は次の課題として残る
-  - **quest31 得点 6.0 目標（2026-08-13）**: PR#1 全ノブオンは 5.274 で頭打ちかつ
-    アリーナ −7.4pt。犯人候補の `KING_KNOWN_APPROACH_W` は既定0のまま。
-    5試行 suite が 5.349 で、玉筋歩の min 距離が序盤の 9六歩を押し上げて
-    m019/m029/m037 を壊していた。修正:
-    - 既定オン: `LINK_ENDGAME_DAMPEN=40` / `PROMOTE_FAR_W=2.5` /
-      `material_degen_q0=0.3` / `GEN_NONPROMOTE` / `PROMO_RISK_PREROLE` /
-      `CAPTURE_RETREAT_W=0.16` / `promo_king_prox=0.5`
-    - `TSUITATE_KING_FILE_PAWN_W`（既定 1.2）: 敵陣の歩（前進・成り・打ち）
-      が玉候補筋の中央値±2 なら `w/(1+d_file)`。9六歩・8六歩・4f4g+ は
-      中段/自陣なので加点しない
-    - `TSUITATE_KING_FILE_GOLD_W`（既定 0）: 敵陣の金打ちへ同じ形の加点。
-      m101 で G*8c を押し上げて回帰したためオフ
-    - `TSUITATE_UNBACKED_CAMP_W`（既定 0.8）: 角飛馬龍は打ちも移動も。金銀は
-      盤上移動だけ（m081 の 6c6b 幻捕獲）。と金は免税
-    - `TSUITATE_KING_ADJ_HEAVY_W`（既定 1.5）: 玉筋が読めるとき、観測裏付け
-      の無い玉候補8近傍へ歩香桂以外が**盤上から**入る手を課税。m021 の
-      4一と（3a4a）対策。0.5 では suite で 3a4a が残った。打ちと歩は対象外
-    - `TSUITATE_TOKIN_FILE_DRIFT_W`（既定 0）: 敵陣のと金が玉筋へ近づかない
-      空きマス移動を課税。4g4h は沈むが 2a1a（m019 の 6 点）も沈み 9六歩へ
-      流出するためオフ
-    - `TSUITATE_OWN_CAMP_IDLE_W`（既定 0）: 自陣の金銀桂の非捕獲移動。
-      m046 の 7a7b 用に入れたが m027 の 3i3h を巻き込むためオフ
-    - `TSUITATE_OWN_CAMP_MINOR_PROMO_W`（既定 1.2）: 桂銀香の任意成りを課税
-      （m046 の 3h4i+ vs 不成）
-    - `TSUITATE_HAND_ASSET_W`（既定 1.0）: 金銀桂の無目的打ち＋自陣への角飛・歩打ち。
-      金の守り打ちは自玉 8 近傍（m055 の G*5h）、銀は玉頭2マスだけ
-      （S*5h / S*3h は課税）。敵玉近接は敵陣かつ focused のときだけ
-    - `TSUITATE_PROMOTE_CHECK_REVEAL_W`（既定 1.2）
-    - `TSUITATE_KING_KNOWN_APPROACH_W`（既定 1.0）
-    - 切り戻しは各 env を 0 に
+  - **quest31 6.0 実験の切り戻し（2026-08-15）**:
+    b939bd3 以降の「対v13 60%を狙う」反復（手数ゲートでアリーナでは発火させない）
+    は検証迂回なので中止。ガントレットは合格させる対象ではなく計測。
+    ユーザーが既定0と決めたノブを既定オンへ戻さない:
+    `HAND_ASSET_W` / `KING_KNOWN_APPROACH_W`（PR#1 の −7.4pt 容疑、2026-08-12 に既定0で確定）、
+    `GEN_NONPROMOTE` / `PROMO_RISK_PREROLE`（2026-08-09 に保留・既定0）、
+    `promo_king_prox` / `material_degen_q0` / `PROMOTE_FAR_W` / `CAPTURE_RETREAT_W` /
+    `PROMOTE_CHECK_REVEAL_W` / `LINK_ENDGAME_DAMPEN` / `taint_occ_legal_w` /
+    `LAST_FOUL_GUARD_2` / `_3` および quest31 手数窓つきの終盤項は**すべて既定0**。
+    提案は env ノブとして残す（作業点はコードの定数コメント）。手数窓
+    （80〜86・110以降・`PROMOTE_CHECK_REVEAL_MAX_MOVE=102` = m101=2点と m103=10点の間）
+    は quest31 への過学習で、別棋譜の汎化根拠が無い限り既定オンにしない。
+    **採用指標は quest31 146件ではなく全件 suite**（keima/kakutori/king-evade 等の
+    回帰込み）。同一コミットで対照と20試行ずつ。未採点162件は採点が済むまで
+    suite 差を信じない（仮4点が全部0でも −0.08 は計算違い。正しくは
+    162×4÷2920 ≈ −0.22、最悪 6.100→5.88 で 6.0 を割る）。
+    CI の `-f scenarios=` は完全一致。`quest31` 指定の run 31884570596 は全シャード
+    0件で無効。全件はフィルタなしで回す。
+    **マージの合格条件（この順）**: ①新出の未採点手をユーザーが採点 → sync_eval
+    → ②同一コミットで全件 suite（CI 20試行）を対照つきで再計測
+    → ③arena.yml ガントレット v9〜v13 で全基準に有意勝ち越し・main 対照から低下なし
+    → ④既定オンにしたいノブは per-knob ablation で単体の寄与を示す。
+    成る王手の露見の局面フェーズ依存など、方向自体は否定しない。既定オンにする
+    部分集合は上の手順を通った最小集合に限る
   - `TSUITATE_BLIND_HOME_RISK_W`（既定 0 = 無効）— **ブラインド進入リスク**
     （2026-08-09、quest31 の 1三角成 = 初期位置の歩へ成り込み1一の香に
     取り返される歩角交換、が発端。ユーザー指摘）。厳密粒子ゼロの決定では
