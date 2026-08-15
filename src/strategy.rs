@@ -596,6 +596,129 @@ fn promote_check_reveal_w() -> f64 {
     })
 }
 
+/// **成ると王手が増える手にだけ不成の双子を作り、その露見を値付けする**
+/// （`TSUITATE_NONPROMOTE_CHECK_W`、既定 0 = 無効。生成と減点の両方を
+/// この1本のノブが担う）。
+///
+/// 発端は quest_20260731 の採点済み eval に出る同型の6局面（2026-08-15）:
+/// 46/48手目の 4九銀不成(3h4i)=10 vs 4九銀成(3h4i+)=2、95手目の
+/// 7三歩不成(7d7c)=10 vs 7三歩成(7d7c+)=2、101手目 6 vs 2、50手目 6 vs 3。
+/// ユーザーの採点コメントが判定条件そのものを述べている:
+/// 「4九銀成は金が取れなかった場合、**王手がかかってしまい**、そのまま銀が
+/// 取られる展開になるので、4九銀不成の方がいい」/「成ると王手がかかって
+/// しまい、取られてしまう…成らずとしておくと、駒が取れない場合にこの歩の
+/// 存在を相手は観測できず、次に7二歩成ができる」。
+///
+/// つまり不成の価値は**成った駒種の利きが玉候補に届くかどうか**で決まる。
+/// `TSUITATE_GEN_NONPROMOTE=1`（全駒種の不成を生成）が eval で負けたのは
+/// 条件を見ずに双子を作るためで（7二歩不成=1「取れることが確定している
+/// ので不成にする意味が全くない」が最大の失点源になった）、ここでは
+/// **成りが玉候補へ新たに利きを作る手だけ**に双子を絞る。
+///
+/// 減点は成り側へ `w`（gain 内）。双子が存在する手にしか掛からないので、
+/// 逃げ場のない成り（`Promotion::Forced`）や王手が増えない成りは不動。
+/// **粒子不要**（`deduce::opp_king_candidates` 上の幾何）で、m095 のような
+/// 厳密粒子ゼロのブラインド決定でも効く。王手中は無効。
+/// 凍結版はこの名前を知らない。
+fn nonpromote_check_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_NONPROMOTE_CHECK_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
+/// 成り駒種（不成が選べる駒だけ）。
+fn promoted_role(role: Role) -> Option<Role> {
+    Some(match role {
+        Role::Pawn => Role::Tokin,
+        Role::Lance => Role::Promotedlance,
+        Role::Knight => Role::Promotedknight,
+        Role::Silver => Role::Promotedsilver,
+        Role::Bishop => Role::Horse,
+        Role::Rook => Role::Dragon,
+        _ => return None,
+    })
+}
+
+/// 双子を作る最小の王手確率（`TSUITATE_NONPROMOTE_CHECK_P`、既定 0.2）。
+fn nonpromote_check_p() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_NONPROMOTE_CHECK_P")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(0.2)
+    })
+}
+
+/// 成ることで**新たに**玉へ利きが生じる確率（不成では生じない分だけ）。
+/// `promote_checks_king_cand` との違いは2点:
+/// - **差分**であること（不成でも王手なら「成ると露見する」理由にならない）
+/// - 候補集合の**真偽でなく玉位置ネットの質量**で測ること。deduce の候補は
+///   王手をあまり掛けていない側では 35〜55 マスに散るので、真偽で見ると
+///   隣のマスへの成り（quest31-m046 の 2九銀成）まで発火してしまう
+///   （実測: 真偽版は 46手目の Optional 成りの半分以上で発火した）
+fn promotion_check_mass(
+    view: &PlayerView,
+    from: Coord,
+    to: Coord,
+    role: Role,
+    dist: &[(Coord, f64)],
+) -> f64 {
+    let Some(promo_role) = promoted_role(role) else {
+        return 0.0;
+    };
+    let me = view.your_color;
+    let mut own = [false; 81];
+    for p in &view.your_pieces {
+        let Some(c) = parse_usi_square(&p.square) else {
+            continue;
+        };
+        if c == from {
+            continue; // 動かす駒は vacate
+        }
+        own[crate::belief_features::sq_index(c)] = true;
+    }
+    let mut mass = 0.0;
+    for &(k, p) in dist {
+        if k == to {
+            continue; // 玉が着地そのもの＝取る王手は「寄せ」
+        }
+        if own[crate::belief_features::sq_index(k)] {
+            continue; // 自駒マスに玉は居ない
+        }
+        if piece_attacks_sq(promo_role, me, to, k, &own)
+            && !piece_attacks_sq(role, me, to, k, &own)
+        {
+            mass += p;
+        }
+    }
+    mass
+}
+
+/// 不成の双子を作る/減点する対象か（王手確率がしきい値以上）。
+fn promotion_adds_check(
+    view: &PlayerView,
+    from: Coord,
+    to: Coord,
+    role: Role,
+    dist: &[(Coord, f64)],
+) -> bool {
+    promotion_check_mass(view, from, to, role, dist) >= nonpromote_check_p()
+}
+
+/// `nonpromote_check_w` 用の玉位置分布（deduce 候補上の玉位置ネット）。
+fn nonpromote_king_dist(view: &PlayerView, log: &ObservationLog) -> Vec<(Coord, f64)> {
+    let ctx = crate::belief_features::BeliefContext::from_log(view.your_color, log);
+    let cands = crate::deduce::opp_king_candidates(view.your_color, log);
+    crate::king_belief_nn::king_distribution(&ctx, &cands)
+}
+
 /// 成る手が `deduce` 玉候補のいずれかに王手を掛けるか（観測のみ）。
 fn promote_checks_king_cand(
     view: &PlayerView,
@@ -3763,7 +3886,7 @@ impl Strategy for EstimatorStrategy {
             return Some(usi);
         }
 
-        let mut candidates = candidate_moves(view, foul_tried);
+        let mut candidates = candidate_moves_with_log(view, foul_tried, Some(log));
         if view.you_in_check {
             // 王手中: 解消しえない手は（王手駒がどこにいても）王手放置で必ず反則に
             // なるので候補から外す。全滅したら元の候補に戻す（投了よりは反則のほうが
@@ -4226,6 +4349,12 @@ impl Strategy for EstimatorStrategy {
         let promote_check_kings: Option<std::collections::BTreeSet<Coord>> =
             (promote_check_reveal_w() > 0.0 && !view.you_in_check)
                 .then(|| crate::deduce::opp_king_candidates(view.your_color, log));
+        // 不成の双子がある成り手への露見減点（`nonpromote_check_w`）。
+        // 生成側と同じ条件・同じ候補集合を使う
+        let nonpromote_check_kings: Option<Vec<(Coord, f64)>> =
+            (nonpromote_check_w() > 0.0 && !view.you_in_check)
+                .then(|| nonpromote_king_dist(view, log))
+                .filter(|d| !d.is_empty());
 
         // この手番の打ち反則で占有が確定したマスと、残存敵駒の平均交換価値
         // （`foul_occ_attack_w`）。反則では手番が変わらないので情報は完全に新鮮。
@@ -4452,6 +4581,34 @@ impl Strategy for EstimatorStrategy {
                     && promote_checks_king_cand(view, from, to, role.unwrap(), cands)
                 {
                     out.gain -= w;
+                }
+            }
+            // 不成の双子がある成り手（＝成ると玉候補への利きが増える手）への
+            // 露見減点（`nonpromote_check_w`）。生成側と同一条件なので、
+            // 減点が掛かる手には必ず不成の逃げ道がある
+            if let (Some(cands), ShogiMove::Board { from, to, promote }) =
+                (nonpromote_check_kings.as_ref(), mv)
+            {
+                let role = view
+                    .your_pieces
+                    .iter()
+                    .find(|p| p.square == make_usi_square(from))
+                    .map(|p| p.role);
+                if let Some(r) = role {
+                    if promotion_choice(r, from, to, view.your_color) == Promotion::Optional {
+                        let mass = promotion_check_mass(view, from, to, r, cands);
+                        if mass >= nonpromote_check_p() {
+                            // 双子の間の**中心化再配分**にする（成りへ減点だけ
+                            // だと、成り駒の利き・交換価値の差ぶん不成が沈んだ
+                            // ままで第三の手が繰り上がる。実測 2026-08-15:
+                            // 減点のみの版は m046/m048 で 4九銀成が消えた代わりに
+                            // 5八と（採点2）が出て 4九銀不成（採点10）は浮かなかった）。
+                            // 露見は王手が実際に掛かったときだけ起きるので
+                            // 期待値（質量）でスケールする
+                            let d = nonpromote_check_w() * mass;
+                            out.gain += if promote { -d } else { d };
+                        }
+                    }
                 }
             }
             if debug_check_enabled && view.you_in_check {
@@ -5781,7 +5938,23 @@ pub fn candidate_moves(
     view: &PlayerView,
     foul_tried: &HashSet<String>,
 ) -> Vec<(String, ShogiMove)> {
+    candidate_moves_with_log(view, foul_tried, None)
+}
+
+/// `candidate_moves` の観測ログつき版。`nonpromote_check_w` の不成生成は
+/// `deduce::opp_king_candidates`（観測のみ）を要るのでログが必要。
+/// ログ無しの呼び出し（bin/analyze の検証）では従来どおり成り一択になる。
+pub fn candidate_moves_with_log(
+    view: &PlayerView,
+    foul_tried: &HashSet<String>,
+    log: Option<&ObservationLog>,
+) -> Vec<(String, ShogiMove)> {
     let color = view.your_color;
+    // 成ると玉候補への利きが増える手だけ不成の双子を作る（`nonpromote_check_w`）
+    let nonpromote_kings: Option<Vec<(Coord, f64)>> = log
+        .filter(|_| nonpromote_check_w() > 0.0 && !view.you_in_check)
+        .map(|l| nonpromote_king_dist(view, l))
+        .filter(|d| !d.is_empty());
     let mut out = vec![];
     let push = |usi: String, out: &mut Vec<(String, ShogiMove)>| {
         if !foul_tried.contains(&usi) {
@@ -5813,7 +5986,11 @@ pub fn candidate_moves(
                     // 安定して良く、「王手が増えて宣言で露見するのを避ける」系
                     // （歩飛角）はついたて固有で局面依存、という2系統の差が
                     // そのまま出た形
-                    if gen_nonpromote_for(piece.role) {
+                    if gen_nonpromote_for(piece.role)
+                        || nonpromote_kings.as_ref().is_some_and(|c| {
+                            promotion_adds_check(view, from, to, piece.role, c)
+                        })
+                    {
                         push(make_usi_move(from, to, false), &mut out);
                     }
                 }
@@ -8823,6 +9000,49 @@ pub(crate) mod tests {
             Coord { file: 6, rank: 4 }, // 6d
             &own
         ));
+    }
+
+    /// 不成の双子を作る条件（`nonpromote_check_w`）は「成ると玉候補への
+    /// 利きが**増える**」こと。quest31 の 46手目でユーザーが 4九銀不成=10 /
+    /// 4九銀成=2 と採点した根拠（成銀が 5九の玉に王手 → 宣言で露見）を固定し、
+    /// 同時に隣の 2九銀成が対象外（王手が増えない）であることも確かめる
+    #[test]
+    fn nonpromote_check_quest31_m046_silver() {
+        let text = std::fs::read_to_string("scenarios/quest31-m046.kif").expect("kif");
+        let kifu = crate::kifu::parse_kif(&text).expect("parse");
+        let rep = crate::scenario_core::replay(&kifu, 45);
+        let side = rep.pos.turn();
+        let view = crate::scenario_core::make_view(&rep.pos, side, &[0, 0]);
+        let log = &rep.logs[crate::scenario_core::side_idx(side)];
+        let dist = nonpromote_king_dist(&view, log);
+        let from = Coord { file: 3, rank: 8 }; // 3h
+        let good = promotion_check_mass(&view, from, Coord { file: 4, rank: 9 }, Role::Silver, &dist);
+        let other = promotion_check_mass(&view, from, Coord { file: 2, rank: 9 }, Role::Silver, &dist);
+        assert!(
+            good > other,
+            "3h4i+ (checks the 5i king) must carry more check mass than 3h2i+: {good} vs {other}"
+        );
+        // 双子の乱造チェック: 成りが選べる手のうち発火するのはごく一部
+        let mut optional = 0usize;
+        let mut fires = 0usize;
+        for piece in &view.your_pieces {
+            let Some(f) = parse_usi_square(&piece.square) else {
+                continue;
+            };
+            for to in move_targets(&view.your_pieces, piece, side) {
+                if promotion_choice(piece.role, f, to, side) != Promotion::Optional {
+                    continue;
+                }
+                optional += 1;
+                if promotion_check_mass(&view, f, to, piece.role, &dist) >= good {
+                    fires += 1;
+                }
+            }
+        }
+        assert!(
+            fires * 3 <= optional,
+            "twin generation should stay narrow: {fires}/{optional} (3h4i+ mass={good})"
+        );
     }
 
     /// 捕獲直後の手戻り免除ノブは既定 0 = 無効（作業点 0.08 は env で有効化）。
