@@ -848,6 +848,21 @@ fn check_king_gain_mean() -> bool {
 /// 従来は生成段階で不成を刈っていたため、評価側（mover_check_extra /
 /// promo_potential）に判断させる機会すら無かった（実戦の 7d7c が make_eval の
 /// スケルトンにも載らない）。駒種フィルタは置かない（駒種特化を足さない方針）
+/// 不成を生成する駒種か（`TSUITATE_GEN_NONPROMOTE`）。
+/// `1` は全駒種、`minor` は**銀・桂・香だけ**（元の利きを保つ系）
+fn gen_nonpromote_for(role: Role) -> bool {
+    if gen_nonpromote_minor() {
+        return matches!(role, Role::Silver | Role::Knight | Role::Lance);
+    }
+    gen_nonpromote()
+}
+
+/// `TSUITATE_GEN_NONPROMOTE=minor`（銀桂香だけ不成を生成）か
+fn gen_nonpromote_minor() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TSUITATE_GEN_NONPROMOTE").is_ok_and(|v| v == "minor"))
+}
+
 fn gen_nonpromote() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("TSUITATE_GEN_NONPROMOTE").is_ok_and(|v| v == "1"))
@@ -5788,7 +5803,17 @@ pub fn candidate_moves(
                     // TSUITATE_GEN_NONPROMOTE=1 なら不成も生成して評価側に
                     // 判断させる（gen_nonpromote の doc 参照）
                     push(make_usi_move(from, to, true), &mut out);
-                    if gen_nonpromote() {
+                    // `TSUITATE_GEN_NONPROMOTE=minor` なら**銀・桂・香だけ**
+                    // 不成を生成する。採点済み eval の実測（2026-08-14）:
+                    // 銀の不成は 3九銀不成(3h4i)=10 が2局面とも最善で一貫して
+                    // 良いのに対し、歩の不成は 10/6/3/1/1 と文脈依存で、
+                    // 全駒種で生成すると 7二歩不成（採点1「取れることが確定して
+                    // いるので不成にする意味が全くない」）が最大の失点源になる。
+                    // 「元の利きを保つ」系（銀桂香）は通常将棋と共通の理屈で
+                    // 安定して良く、「王手が増えて宣言で露見するのを避ける」系
+                    // （歩飛角）はついたて固有で局面依存、という2系統の差が
+                    // そのまま出た形
+                    if gen_nonpromote_for(piece.role) {
                         push(make_usi_move(from, to, false), &mut out);
                     }
                 }
@@ -6645,7 +6670,7 @@ fn evaluate(
                 .iter()
                 .find(|p| p.square == make_usi_square(from))
                 .map(|p| p.role);
-            let promo_bonus = if gen_nonpromote() {
+            let promo_bonus = if gen_nonpromote() || gen_nonpromote_minor() {
                 match (promote, role) {
                     (true, Some(Role::Silver | Role::Knight | Role::Lance)) => 0.0,
                     (false, Some(r @ (Role::Silver | Role::Knight | Role::Lance)))
