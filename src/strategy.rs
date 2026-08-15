@@ -922,9 +922,10 @@ const UNBACKED_GS_CAPTURE_MIN_MOVE: u32 = 80;
 /// mix = w × (1 − p_occ/0.25) で粒子の p_hit を p_occ へ混ぜ、
 /// 差分ぶんの期待駒得を引く。
 ///
-/// **既定 0**（env 作業点は 1.0。大駒＋空き寄り。2026-08-14 の単体 5試行は
-/// recover 5.503→5.596 だが未採点・全件 suite・アリーナ未了）。4a3b+
-/// クラスタ（m095 3.60→8.40・m087 1.20→5.00）が主因。
+/// **既定 1.0**（2026-08-15。対 v13 負け局の只取られ／幻の大駒成り込みと
+/// quest31 の 2d3c+ / 4a3b+ クラスへの対応）。手数ゲートは付けない
+/// （空き寄り `p_occ < 0.25` のときだけ縮むので、ネットが居ると見ている
+/// 序盤の正しい大駒捕獲は残る）。0 で切り戻し。
 /// 全駒種版は 5.379、自信過剰ギャップは 5.351 で不採用。金銀は
 /// `unbacked_gs_capture_w`。王手中無効・裏付けマスは満額。
 /// 凍結版はこの名前を知らない。
@@ -939,9 +940,7 @@ fn belief_occ_cap_w() -> f64 {
     })
 }
 
-const BELIEF_OCC_CAP_W: f64 = 0.0;
-/// m067（67手・4一の幻の飛車）は残し、序盤の正しい大駒捕獲は縮めない。
-const BELIEF_OCC_CAP_MIN_MOVE: u32 = 60;
+const BELIEF_OCC_CAP_W: f64 = 1.0;
 /// 信念ネットが「空き寄り」と見なす占有の上界。これ以上なら粒子の
 /// p_hit を上書きしない（盤面平均 prior_occ ≈ 0.21 の少し上）。
 const BELIEF_OCC_EMPTY_PRIOR: f64 = 0.25;
@@ -1973,6 +1972,32 @@ fn check_king_gain_mean() -> bool {
     *V.get_or_init(|| {
         std::env::var("TSUITATE_CHECK_KING_GAIN_MEAN").map_or(true, |v| v != "0")
     })
+}
+
+/// 王手中に「ほぼ確実な解消手」があるのに低い p の手を選んで反則するのを止める
+/// （`TSUITATE_CHECK_SAFE_RESOLVE`、既定 on、0 で従来挙動）。
+///
+/// 対 v13 104局の analyze: 王手中反則 247回 → ソルバー方策なら 139回。
+/// p_max≥0.9 なのに平均 p=0.41 の手を選んだ反則が19回（安全手を無視して
+/// CheckUnresolved）。`combine_score` は幻の駒得 gain が p_legal を上書きする。
+/// p_max が閾値未満（kakutori 型の仮説希釈）では何もしないので、捕獲プローブは残る。
+/// 凍結版はこの名前を知らない。
+fn check_safe_resolve_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_CHECK_SAFE_RESOLVE").map_or(true, |v| v != "0")
+    })
+}
+
+const CHECK_SAFE_RESOLVE_PMAX: f64 = 0.85;
+const CHECK_SAFE_RESOLVE_MARGIN: f64 = 0.25;
+
+fn check_safe_resolve_active(p_max: f64) -> bool {
+    p_max >= CHECK_SAFE_RESOLVE_PMAX
+}
+
+fn check_safe_resolve_thresh(p_max: f64) -> f64 {
+    p_max - CHECK_SAFE_RESOLVE_MARGIN
 }
 
 /// 成りが任意の移動で**不成も候補に生成する**か（既定は無効 =
@@ -5961,6 +5986,34 @@ impl Strategy for EstimatorStrategy {
             }
         }
 
+        // 王手中にほぼ確実な解消手があるなら、そこから大きく落ちる手を捨てる
+        // （`check_safe_resolve_enabled`。対 v13 の「安全手 p≥0.9 を無視して
+        // CheckUnresolved」を止める。p_max が低い kakutori 型では発火しない）
+        if view.you_in_check && check_safe_resolve_enabled() {
+            if let Some(solver) = check_solver.as_mut() {
+                if !scored.is_empty() {
+                    let ps: Vec<f64> = scored
+                        .iter()
+                        .map(|s| solver.resolve_probability(&s.1))
+                        .collect();
+                    let p_max = ps.iter().copied().fold(0.0_f64, f64::max);
+                    if check_safe_resolve_active(p_max) {
+                        let thresh = check_safe_resolve_thresh(p_max);
+                        let before = scored.len();
+                        let mut i = 0;
+                        scored.retain(|_| {
+                            let keep = ps[i] + 1e-12 >= thresh;
+                            i += 1;
+                            keep
+                        });
+                        if crate::hits::enabled() {
+                            crate::hits::flag("check_safe_resolve", scored.len() < before);
+                        }
+                    }
+                }
+            }
+        }
+
         // 相手の初期金位置への金銀当たり（`home_gold_attack_w`）。
         // 不成のみ・手数 ≥44・同一駒が初期金の筋の別マスへ動けないときだけ。
         // m042 の 4f4g+ と m054 の 3h4g を守りつつ、m046 の 3h4i を受け皿にする。
@@ -8056,7 +8109,6 @@ fn evaluate(
         // gs_unbacked が受け取る（二重控除しない）
         let remaining_after_degen = (capture_ev - material_shrink).max(0.0);
         let belief_occ_shrink = if belief_occ_cap_w() > 0.0
-            && view.move_number >= BELIEF_OCC_CAP_MIN_MOVE
             && !view.you_in_check
             && remaining_after_degen > 0.0
             && !capture_to_backed
@@ -11326,8 +11378,24 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_BELIEF_OCC_CAP_W").is_err() {
             assert!((belief_occ_cap_w() - BELIEF_OCC_CAP_W).abs() < 1e-12);
-            assert_eq!(BELIEF_OCC_CAP_W, 0.0);
+            assert_eq!(BELIEF_OCC_CAP_W, 1.0);
         }
+        if std::env::var("TSUITATE_CHECK_SAFE_RESOLVE").is_err() {
+            assert!(check_safe_resolve_enabled());
+        }
+    }
+
+    /// 王手中の安全解消ゲート: p_max が高いときだけ低い p を捨て、
+    /// kakutori 型（p_max が閾値未満）では何も切らない。
+    #[test]
+    fn check_safe_resolve_keeps_diluted_and_drops_ignored_safe() {
+        assert!(!check_safe_resolve_active(0.70));
+        assert!(check_safe_resolve_active(0.91));
+        let thresh = check_safe_resolve_thresh(0.91);
+        assert!(0.91 + 1e-12 >= thresh);
+        assert!(0.70 + 1e-12 >= thresh);
+        assert!(0.41 + 1e-12 < thresh);
+        assert!(0.17 + 1e-12 < thresh);
     }
 
     /// 信念ネット占有キャップ: 空き寄り（p_occ < 0.25）のときだけ縮み、
