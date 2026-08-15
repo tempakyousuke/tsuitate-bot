@@ -364,8 +364,8 @@ fn eval_taint_attack_w() -> f64 {
     })
 }
 
-/// 終盤の紐減衰（`TSUITATE_LINK_ENDGAME_DAMPEN`、既定 0 = 無効。
-/// quest31 コンボ計測時の作業点は 40）。
+/// 終盤の紐減衰（`TSUITATE_LINK_ENDGAME_DAMPEN`、既定 40。
+/// 0 で切り戻し）。
 /// ブラインド決定でのみ `link_w /= 1 + w × endgame_push`。
 ///
 /// quest31 終盤の 3三角成（2d3c+）固執が発端: 駒得ゼロなのに
@@ -384,9 +384,9 @@ fn link_endgame_dampen() -> f64 {
     })
 }
 
-/// ブラインド終盤の紐減衰の既定（2026-08-13 採用。quest31 得点 6.0 目標）。
+/// ブラインド終盤の紐減衰の既定（quest31 得点 6.0。手数 110 以降のみ）。
 /// 0 で従来挙動へ切り戻し
-const LINK_ENDGAME_DAMPEN: f64 = 0.0;
+const LINK_ENDGAME_DAMPEN: f64 = 40.0;
 /// アリーナ平均手数 ~106 では発火させず、quest31 の 3三角成帯（127〜）は残す。
 const LINK_ENDGAME_DAMPEN_MIN_MOVE: u32 = 110;
 
@@ -419,7 +419,7 @@ fn hand_asset_w() -> f64 {
 
 /// 金銀桂＋敵陣以外の大駒打ち＋自陣歩の無目的打ち課税の既定。
 /// 香の打ちは対象外（PR#1 全駒種版の lance-tether 回帰を避ける）。
-const HAND_ASSET_W: f64 = 0.0;
+const HAND_ASSET_W: f64 = 1.0;
 /// 序中盤まで掛けると打ち課税の押し出しで反則が増える（PR#1 コンボの
 /// アリーナ −7pt / vs v13 43.3%・反則 7.5/局の主犯候補）。
 /// 手数ゲート後も対 v13 46.6%・反則 7.15/局のままなので、アリーナ平均
@@ -446,7 +446,7 @@ fn king_known_approach_w() -> f64 {
 
 /// 玉の既知脅威接近の既定（2026-08-13。quest31-m099 の 7g6h 対策）。
 /// PR#1 作業点 2.0 の半分。0 で切り戻し
-const KING_KNOWN_APPROACH_W: f64 = 0.0;
+const KING_KNOWN_APPROACH_W: f64 = 1.0;
 /// m099（99手・王手中）は残し、序中盤の王手逃げまで課税しない。
 /// 王手中に全域で掛けると解消手の反則が増える（vs v13 の王手中反則
 /// 2.5〜3.8/局）。
@@ -479,7 +479,7 @@ fn promote_far_w() -> f64 {
 /// 大駒成りの遠方ペナルティの既定（2026-08-13。歩成りは対象外。
 /// 6.0 は 5試行フル suite で平均を下げたため 2.5 に戻す）。
 /// 0 で切り戻し
-const PROMOTE_FAR_W: f64 = 0.0;
+const PROMOTE_FAR_W: f64 = 2.5;
 /// m081/m083 の 4a3b+ 以降を残し、序盤の大駒成り（材料として正しい手）は
 /// 課税しない。
 const PROMOTE_FAR_MIN_MOVE: u32 = 80;
@@ -501,7 +501,7 @@ fn king_file_pawn_w() -> f64 {
     })
 }
 
-const KING_FILE_PAWN_W: f64 = 0.0;
+const KING_FILE_PAWN_W: f64 = 1.2;
 
 /// 中段の玉筋歩前進（`TSUITATE_KING_FILE_PAWN_MID_W`、既定
 /// `KING_FILE_PAWN_MID_W`。0 で切り戻し）。手数 80..=86、自陣段からの
@@ -524,7 +524,7 @@ fn king_file_pawn_mid_w() -> f64 {
     })
 }
 
-const KING_FILE_PAWN_MID_W: f64 = 0.0;
+const KING_FILE_PAWN_MID_W: f64 = 4.0;
 const KING_FILE_PAWN_MID_MIN_MOVE: u32 = 80;
 const KING_FILE_PAWN_MID_MAX_MOVE: u32 = 86;
 
@@ -549,7 +549,7 @@ fn king_endgame_flee_w() -> f64 {
     })
 }
 
-const KING_ENDGAME_FLEE_W: f64 = 0.0;
+const KING_ENDGAME_FLEE_W: f64 = 12.0;
 const KING_ENDGAME_FLEE_MIN_MOVE: u32 = 125;
 
 /// 終盤の金が自玉へ隣接する盤上移動（`TSUITATE_GOLD_JOIN_KING_W`、既定
@@ -573,7 +573,7 @@ fn gold_join_king_w() -> f64 {
     })
 }
 
-const GOLD_JOIN_KING_W: f64 = 0.0;
+const GOLD_JOIN_KING_W: f64 = 16.0;
 const GOLD_JOIN_KING_MIN_MOVE: u32 = 125;
 
 /// 終盤、自玉に既に隣接している金が玉筋へ動く手（`TSUITATE_GOLD_KING_FILE_W`、
@@ -596,7 +596,7 @@ fn gold_king_file_w() -> f64 {
     })
 }
 
-const GOLD_KING_FILE_W: f64 = 0.0;
+const GOLD_KING_FILE_W: f64 = 6.0;
 const GOLD_KING_FILE_MIN_MOVE: u32 = 125;
 
 /// 終盤の桂の敵陣成り課税（`TSUITATE_KNIGHT_LATE_PROMO_W`、既定
@@ -623,7 +623,7 @@ fn knight_late_promo_w() -> f64 {
     })
 }
 
-const KNIGHT_LATE_PROMO_W: f64 = 0.0;
+const KNIGHT_LATE_PROMO_W: f64 = 6.0;
 const KNIGHT_LATE_PROMO_MIN_MOVE: u32 = 100;
 const KNIGHT_LATE_PROMO_MAX_MOVE: u32 = 136;
 /// 不成の敵陣進入は成り税のこの倍率。100 手からの課税は m100 を 0 点混在へ
@@ -649,7 +649,7 @@ fn knight_endgame_promo_w() -> f64 {
     })
 }
 
-const KNIGHT_ENDGAME_PROMO_W: f64 = 0.0;
+const KNIGHT_ENDGAME_PROMO_W: f64 = 6.0;
 const KNIGHT_ENDGAME_PROMO_MIN_MOVE: u32 = 137;
 
 /// 終盤、自陣の桂が中段へ出る手（`TSUITATE_KNIGHT_CAMP_EXIT_W`、既定
@@ -672,7 +672,7 @@ fn knight_camp_exit_w() -> f64 {
     })
 }
 
-const KNIGHT_CAMP_EXIT_W: f64 = 0.0;
+const KNIGHT_CAMP_EXIT_W: f64 = 4.0;
 const KNIGHT_CAMP_EXIT_MIN_MOVE: u32 = 120;
 
 /// 終盤の銀が自陣から出る手（`TSUITATE_SILVER_CAMP_EXIT_W`、既定
@@ -692,7 +692,7 @@ fn silver_camp_exit_w() -> f64 {
     })
 }
 
-const SILVER_CAMP_EXIT_W: f64 = 0.0;
+const SILVER_CAMP_EXIT_W: f64 = 5.0;
 const SILVER_CAMP_EXIT_MIN_MOVE: u32 = 100;
 
 /// 玉筋の金打ち（`TSUITATE_KING_FILE_GOLD_W`、既定 0）。
@@ -761,7 +761,7 @@ fn pawn_offfile_w() -> f64 {
 /// 終盤の歩成り課税の既定。手数 125 以降・金銀手持ち・成りのみ。
 /// 手数 `PAWN_OFFFILE_FORCE_MIN_MOVE` 以降は手持ちゲートを外す
 /// （m138 の 5f5g+ = 0 点。金は盤上 8c にいるので手持ちゲートだと発火しない）。
-const PAWN_OFFFILE_W: f64 = 0.0;
+const PAWN_OFFFILE_W: f64 = 3.0;
 const PAWN_OFFFILE_MIN_MOVE: u32 = 125;
 const PAWN_OFFFILE_FORCE_MIN_MOVE: u32 = 137;
 
@@ -836,7 +836,7 @@ fn bishop_retreat_w() -> f64 {
     })
 }
 
-const BISHOP_RETREAT_W: f64 = 0.0;
+const BISHOP_RETREAT_W: f64 = 0.5;
 /// m055（55手）の 3c5c を残す下限。
 const BISHOP_RETREAT_MIN_MOVE: u32 = 50;
 
@@ -858,7 +858,7 @@ fn endgame_camp_general_w() -> f64 {
     })
 }
 
-const ENDGAME_CAMP_GENERAL_W: f64 = 0.0;
+const ENDGAME_CAMP_GENERAL_W: f64 = 2.0;
 const ENDGAME_CAMP_GENERAL_MIN_MOVE: u32 = 125;
 
 /// 裏付け無しの敵陣進入課税（`TSUITATE_UNBACKED_CAMP_W`、既定
@@ -885,7 +885,7 @@ fn unbacked_camp_w() -> f64 {
     })
 }
 
-const UNBACKED_CAMP_W: f64 = 0.0;
+const UNBACKED_CAMP_W: f64 = 0.8;
 /// と金は対象外なので m021 は KING_ADJ 側。こちらは 4a3b+ / 2d3c+ の
 /// 大駒成り込み用で、序中盤から掛けるとアリーナの正しい敵陣進入まで殺す。
 const UNBACKED_CAMP_MIN_MOVE: u32 = 80;
@@ -913,7 +913,7 @@ fn unbacked_gs_capture_w() -> f64 {
 
 /// 金銀の裏付け無し捕獲をキャンセルする既定（2026-08-13。m081 の 6c6b）。
 /// 大駒まで広げると 5試行フル suite が 5.326 まで落ちたため金銀だけ。
-const UNBACKED_GS_CAPTURE_W: f64 = 0.0;
+const UNBACKED_GS_CAPTURE_W: f64 = 1.0;
 /// m081 の 6c6b は残し、序中盤の正しい金銀捕獲まで殺さない。
 const UNBACKED_GS_CAPTURE_MIN_MOVE: u32 = 80;
 
@@ -946,7 +946,7 @@ fn belief_occ_cap_w() -> f64 {
     })
 }
 
-const BELIEF_OCC_CAP_W: f64 = 0.0;
+const BELIEF_OCC_CAP_W: f64 = 1.0;
 /// m067（67手・4一の幻の飛車）は残し、序盤の正しい大駒捕獲は縮めない。
 const BELIEF_OCC_CAP_MIN_MOVE: u32 = 60;
 /// 信念ネットが「空き寄り」と見なす占有の上界。これ以上なら粒子の
@@ -989,7 +989,7 @@ fn home_gold_attack_w() -> f64 {
     })
 }
 
-const HOME_GOLD_ATTACK_W: f64 = 0.0;
+const HOME_GOLD_ATTACK_W: f64 = 4.0;
 const HOME_GOLD_MIN_MOVE: u32 = 44;
 
 /// と金が玉筋へ寄る手の加点（`TSUITATE_TOKIN_APPROACH_W`、既定 0）。
@@ -1037,7 +1037,7 @@ fn king_adj_heavy_w() -> f64 {
 
 /// 玉隣の高い駒進入課税の既定（2026-08-13。m021 の 3a4a 対策）。
 /// 0.5 では suite で 3a4a が 5/5 残ったため 1.5（tokin 3.5×1.5=5.25）
-const KING_ADJ_HEAVY_W: f64 = 0.0;
+const KING_ADJ_HEAVY_W: f64 = 1.5;
 /// m021（21手）の 3a4a を残す下限。
 const KING_ADJ_HEAVY_MIN_MOVE: u32 = 20;
 
@@ -1061,7 +1061,7 @@ fn own_camp_minor_promo_w() -> f64 {
     })
 }
 
-const OWN_CAMP_MINOR_PROMO_W: f64 = 0.0;
+const OWN_CAMP_MINOR_PROMO_W: f64 = 1.2;
 
 /// 成って王手する手の露見ペナルティ（`TSUITATE_PROMOTE_CHECK_REVEAL_W`、
 /// 既定 `PROMOTE_CHECK_REVEAL_W`。0 で切り戻し）。歩・角・飛の**成る王手**
@@ -1093,7 +1093,7 @@ fn promote_check_reveal_w() -> f64 {
 
 /// 成る王手の露見ペナルティ既定（2026-08-13。m095 の 7d7c+ 対策）。
 /// 玉筋が読める局面だけで発火する
-const PROMOTE_CHECK_REVEAL_W: f64 = 0.0;
+const PROMOTE_CHECK_REVEAL_W: f64 = 1.2;
 /// m095（95手）から課税。それより前の成る王手はアリーナの攻め手段。
 const PROMOTE_CHECK_REVEAL_MIN_MOVE: u32 = 90;
 /// m101（7d7c+ = 2）まで課税、m103（7d7c+ = 10）以降は切る。
@@ -2048,9 +2048,8 @@ fn capture_retreat_w() -> f64 {
     })
 }
 
-/// 捕獲直後の手戻り免除の既定。対 v13 アリーナ 50%（b939bd3）のため 0。
-/// env で 0.16 を渡せば m024 用の作業点に戻せる。
-const CAPTURE_RETREAT_W: f64 = 0.0;
+/// 捕獲直後の手戻り免除の既定（m024 の作業点 0.16。0 で切り戻し）。
+const CAPTURE_RETREAT_W: f64 = 0.16;
 
 /// V1（利き数）のノブ。**既定は両方 無効**（＝従来の二値の利き判定）。
 ///
@@ -6487,9 +6486,9 @@ fn last_foul_guard() -> f64 {
 const LAST_FOUL_GUARD: f64 = 60.0;
 
 /// 残り反則2回の床（`TSUITATE_LAST_FOUL_GUARD_2`、既定 36、0 で無効）。
-/// 既定の急峻化は残り2回でも約5.4点。quest31 課税を切っても対 v13 は
-/// 50%（run 31870269045、foul_limit 79/104）で、自滅は残り1回の直前から
-/// 始まっている。凍結版はこの名前を知らない。
+/// 既定の急峻化は残り2回でも約5.4点。quest31 課税を手数ゲート付きで
+/// 戻したうえで、対 v13 の foul_limit 自滅（b939bd3 で 79/104）を
+/// 残り2回から抑える。凍結版はこの名前を知らない。
 fn last_foul_guard_2() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -10617,13 +10616,13 @@ pub(crate) mod tests {
         ));
     }
 
-    /// 捕獲直後の手戻り免除ノブは既定 0（対 v13 アリーナ 50% のため切り戻し）。
+    /// 捕獲直後の手戻り免除ノブは既定 0.16（m024）。
     #[test]
     fn capture_retreat_w_default_on() {
         let w = std::env::var("TSUITATE_CAPTURE_RETREAT_W").ok();
         if w.is_none() {
             assert!((capture_retreat_w() - CAPTURE_RETREAT_W).abs() < 1e-12);
-            assert_eq!(CAPTURE_RETREAT_W, 0.0);
+            assert!((CAPTURE_RETREAT_W - 0.16).abs() < 1e-12);
         }
     }
 
@@ -11100,7 +11099,7 @@ pub(crate) mod tests {
         let w = std::env::var("TSUITATE_HAND_ASSET_W").ok();
         if w.is_none() {
             assert!((hand_asset_w() - HAND_ASSET_W).abs() < 1e-12);
-            assert_eq!(HAND_ASSET_W, 0.0);
+            assert!((HAND_ASSET_W - 1.0).abs() < 1e-12);
             assert_eq!(HAND_ASSET_MIN_MOVE, 110);
         }
     }
@@ -11307,7 +11306,7 @@ pub(crate) mod tests {
     fn unbacked_gs_capture_and_home_gold_defaults() {
         if std::env::var("TSUITATE_UNBACKED_GS_CAPTURE_W").is_err() {
             assert!((unbacked_gs_capture_w() - UNBACKED_GS_CAPTURE_W).abs() < 1e-12);
-            assert_eq!(UNBACKED_GS_CAPTURE_W, 0.0);
+            assert!((UNBACKED_GS_CAPTURE_W - 1.0).abs() < 1e-12);
             assert_eq!(UNBACKED_GS_CAPTURE_MIN_MOVE, 80);
         }
         if std::env::var("TSUITATE_UNBACKED_CAMP_W").is_err() {
@@ -11316,7 +11315,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_HOME_GOLD_ATTACK_W").is_err() {
             assert!((home_gold_attack_w() - HOME_GOLD_ATTACK_W).abs() < 1e-12);
-            assert_eq!(HOME_GOLD_ATTACK_W, 0.0);
+            assert!((HOME_GOLD_ATTACK_W - 4.0).abs() < 1e-12);
             assert_eq!(HOME_GOLD_MIN_MOVE, 44);
         }
         if std::env::var("TSUITATE_TOKIN_APPROACH_W").is_err() {
@@ -11324,11 +11323,11 @@ pub(crate) mod tests {
             assert_eq!(TOKIN_APPROACH_W, 0.0);
         }
         if std::env::var("TSUITATE_PROMOTE_FAR_W").is_err() {
-            assert_eq!(promote_far_w(), 0.0);
+            assert!((promote_far_w() - 2.5).abs() < 1e-12);
         }
         if std::env::var("TSUITATE_BELIEF_OCC_CAP_W").is_err() {
             assert!((belief_occ_cap_w() - BELIEF_OCC_CAP_W).abs() < 1e-12);
-            assert_eq!(BELIEF_OCC_CAP_W, 0.0);
+            assert!((BELIEF_OCC_CAP_W - 1.0).abs() < 1e-12);
             assert_eq!(BELIEF_OCC_CAP_MIN_MOVE, 60);
         }
     }
@@ -11658,11 +11657,11 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_PROMOTE_FAR_W").is_err() {
             assert!((promote_far_w() - PROMOTE_FAR_W).abs() < 1e-12);
-            assert_eq!(PROMOTE_FAR_W, 0.0);
+            assert!((PROMOTE_FAR_W - 2.5).abs() < 1e-12);
             assert_eq!(PROMOTE_FAR_MIN_MOVE, 80);
         }
         if std::env::var("TSUITATE_KING_ADJ_HEAVY_W").is_err() {
-            assert_eq!(KING_ADJ_HEAVY_W, 0.0);
+            assert!((KING_ADJ_HEAVY_W - 1.5).abs() < 1e-12);
             assert_eq!(KING_ADJ_HEAVY_MIN_MOVE, 20);
         }
         if std::env::var("TSUITATE_OWN_CAMP_IDLE_W").is_err() {
@@ -11671,18 +11670,18 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_BISHOP_RETREAT_W").is_err() {
             assert!((bishop_retreat_w() - BISHOP_RETREAT_W).abs() < 1e-12);
-            assert_eq!(BISHOP_RETREAT_W, 0.0);
+            assert!((BISHOP_RETREAT_W - 0.5).abs() < 1e-12);
             assert_eq!(BISHOP_RETREAT_MIN_MOVE, 50);
         }
         if std::env::var("TSUITATE_PAWN_OFFFILE_W").is_err() {
             assert!((pawn_offfile_w() - PAWN_OFFFILE_W).abs() < 1e-12);
-            assert_eq!(PAWN_OFFFILE_W, 0.0);
+            assert!((PAWN_OFFFILE_W - 3.0).abs() < 1e-12);
             assert_eq!(PAWN_OFFFILE_MIN_MOVE, 125);
             assert_eq!(PAWN_OFFFILE_FORCE_MIN_MOVE, 137);
         }
         if std::env::var("TSUITATE_ENDGAME_CAMP_GENERAL_W").is_err() {
             assert!((endgame_camp_general_w() - ENDGAME_CAMP_GENERAL_W).abs() < 1e-12);
-            assert_eq!(ENDGAME_CAMP_GENERAL_W, 0.0);
+            assert_eq!(ENDGAME_CAMP_GENERAL_W, 2.0);
         }
         if std::env::var("TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W").is_err() {
             assert!((far_major_promo_capture_w() - FAR_MAJOR_PROMO_CAPTURE_W).abs() < 1e-12);
@@ -11690,28 +11689,28 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_KING_FILE_PAWN_MID_W").is_err() {
             assert!((king_file_pawn_mid_w() - KING_FILE_PAWN_MID_W).abs() < 1e-12);
-            assert_eq!(KING_FILE_PAWN_MID_W, 0.0);
+            assert_eq!(KING_FILE_PAWN_MID_W, 4.0);
             assert_eq!(KING_FILE_PAWN_MID_MIN_MOVE, 80);
             assert_eq!(KING_FILE_PAWN_MID_MAX_MOVE, 86);
         }
         if std::env::var("TSUITATE_KING_ENDGAME_FLEE_W").is_err() {
             assert!((king_endgame_flee_w() - KING_ENDGAME_FLEE_W).abs() < 1e-12);
-            assert_eq!(KING_ENDGAME_FLEE_W, 0.0);
+            assert_eq!(KING_ENDGAME_FLEE_W, 12.0);
             assert_eq!(KING_ENDGAME_FLEE_MIN_MOVE, 125);
         }
         if std::env::var("TSUITATE_GOLD_JOIN_KING_W").is_err() {
             assert!((gold_join_king_w() - GOLD_JOIN_KING_W).abs() < 1e-12);
-            assert_eq!(GOLD_JOIN_KING_W, 0.0);
+            assert_eq!(GOLD_JOIN_KING_W, 16.0);
             assert_eq!(GOLD_JOIN_KING_MIN_MOVE, 125);
         }
         if std::env::var("TSUITATE_GOLD_KING_FILE_W").is_err() {
             assert!((gold_king_file_w() - GOLD_KING_FILE_W).abs() < 1e-12);
-            assert_eq!(GOLD_KING_FILE_W, 0.0);
+            assert_eq!(GOLD_KING_FILE_W, 6.0);
             assert_eq!(GOLD_KING_FILE_MIN_MOVE, 125);
         }
         if std::env::var("TSUITATE_KNIGHT_LATE_PROMO_W").is_err() {
             assert!((knight_late_promo_w() - KNIGHT_LATE_PROMO_W).abs() < 1e-12);
-            assert_eq!(KNIGHT_LATE_PROMO_W, 0.0);
+            assert_eq!(KNIGHT_LATE_PROMO_W, 6.0);
             assert_eq!(KNIGHT_LATE_PROMO_MIN_MOVE, 100);
             assert_eq!(KNIGHT_LATE_PROMO_MAX_MOVE, 136);
             assert!((KNIGHT_LATE_NONPROMO_SCALE - 0.5).abs() < 1e-12);
@@ -11719,17 +11718,17 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_KNIGHT_ENDGAME_PROMO_W").is_err() {
             assert!((knight_endgame_promo_w() - KNIGHT_ENDGAME_PROMO_W).abs() < 1e-12);
-            assert_eq!(KNIGHT_ENDGAME_PROMO_W, 0.0);
+            assert_eq!(KNIGHT_ENDGAME_PROMO_W, 6.0);
             assert_eq!(KNIGHT_ENDGAME_PROMO_MIN_MOVE, 137);
         }
         if std::env::var("TSUITATE_KNIGHT_CAMP_EXIT_W").is_err() {
             assert!((knight_camp_exit_w() - KNIGHT_CAMP_EXIT_W).abs() < 1e-12);
-            assert_eq!(KNIGHT_CAMP_EXIT_W, 0.0);
+            assert_eq!(KNIGHT_CAMP_EXIT_W, 4.0);
             assert_eq!(KNIGHT_CAMP_EXIT_MIN_MOVE, 120);
         }
         if std::env::var("TSUITATE_SILVER_CAMP_EXIT_W").is_err() {
             assert!((silver_camp_exit_w() - SILVER_CAMP_EXIT_W).abs() < 1e-12);
-            assert_eq!(SILVER_CAMP_EXIT_W, 0.0);
+            assert_eq!(SILVER_CAMP_EXIT_W, 5.0);
             assert_eq!(SILVER_CAMP_EXIT_MIN_MOVE, 100);
         }
     }
