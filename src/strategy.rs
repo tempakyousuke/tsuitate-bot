@@ -656,9 +656,19 @@ fn promoted_role(role: Role) -> Option<Role> {
 /// 別の手を指される」（成=10）。どちらになるかは「成った駒がそこで
 /// 生き残れるか」で決まり、ブラインド決定では観測から判定できない。
 /// 歩を含めた合計は −57.9/146件、銀桂香だけなら +11.7 と符号が逆になる
-fn nonpromote_check_all_roles() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_NONPROMOTE_CHECK_ROLES").is_ok_and(|v| v == "all"))
+fn nonpromote_check_roles() -> &'static str {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        std::env::var("TSUITATE_NONPROMOTE_CHECK_ROLES").unwrap_or_else(|_| "minor".into())
+    })
+}
+
+fn nonpromote_check_role_ok(role: Role) -> bool {
+    match nonpromote_check_roles() {
+        "all" => true,
+        "silver" => role == Role::Silver,
+        _ => matches!(role, Role::Silver | Role::Knight | Role::Lance),
+    }
 }
 
 /// 双子を作る最小の王手確率（`TSUITATE_NONPROMOTE_CHECK_P`、既定 0.2）。
@@ -687,7 +697,7 @@ fn promotion_check_mass(
     role: Role,
     dist: &[(Coord, f64)],
 ) -> f64 {
-    if !nonpromote_check_all_roles() && !matches!(role, Role::Silver | Role::Knight | Role::Lance) {
+    if !nonpromote_check_role_ok(role) {
         return 0.0;
     }
     let Some(promo_role) = promoted_role(role) else {
