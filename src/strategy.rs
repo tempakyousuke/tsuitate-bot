@@ -2679,16 +2679,16 @@ impl Default for EvalParams {
             home_knownness: 0.0027,
             recapture_defended: 0.4692,
             exposed_defended: 0.3031,
-            attack_w: 0.0434,
+            attack_w: 0.0479,
             pressure_w: 0.0918,
             foul_cost_base: 0.637,
             foul_cost_pow: 1.3331,
-            advance_w: 0.0699,
-            promote_bias: 0.4,
-            drop_bias: 0.2616,
+            advance_w: 0.0763,
+            promote_bias: 0.4123,
+            drop_bias: 0.238,
             prior_weight: 4.9065,
             prior_weight_degen: 7.9515,
-            threat_w: 0.4586,
+            threat_w: 0.4716,
             info_bonus: 0.64,
             big_home_penalty: 0.3156,
             hand_drop_w: 0.0757,
@@ -2696,7 +2696,7 @@ impl Default for EvalParams {
             shuffle_penalty: 0.2996,
             soft_decay: 0.6753,
             king_probe_bonus: 0.2451,
-            coverage_w: 0.0013,
+            coverage_w: 0.0023,
             depth2_replace: 0.6205,
             // 2手読みの楽観上限（2026-08-03、F3）。0 = 従来と同一挙動。
             // アリーナがペア比較で中立〜負（cap=1.0 で −1.5pt、0.5 で −6.5pt）
@@ -2782,7 +2782,7 @@ impl Default for EvalParams {
             // 反則は単調に減り続ける（6.48→5.18）のに勝率が落ちるのは、守りが
             // 目的化して攻めなくなり手数だけ伸びる変質（85手→112手）。
             // 平坦部の下端を採るのは、手数が短く引き分け化のリスクが小さいため
-            link_w: 0.06,
+            link_w: 0.0623,
             board_discount_w: 0.0,
             effect_own_w: 0.0,
             effect_opp_w: 0.0,
@@ -2803,7 +2803,7 @@ impl Default for EvalParams {
             // 成りで増える利きのポテンシャル（2026-07-30 採用）。w スイープの実測で
             // 0.2（0.5 は垂れ歩の常用化・成り済み駒のマス好み副作用で過剰）。
             // シナリオ大幅改善・ペアアリーナ3シード中立で採用（CLAUDE.md 参照）
-            promo_potential_w: 0.2,
+            promo_potential_w: 0.1848,
             // 持ち駒のオプション価値（2026-07-30）。未調整の新項なので
             // w スイープで決める
             hand_option_w: 0.0,
