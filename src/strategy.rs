@@ -644,6 +644,23 @@ fn promoted_role(role: Role) -> Option<Role> {
     })
 }
 
+/// 双子を作る駒種（`TSUITATE_NONPROMOTE_CHECK_ROLES`、既定 `minor` =
+/// 銀・桂・香）。`all` で歩・角・飛も対象にする。
+///
+/// **歩を既定で外すのは実測による**（2026-08-15、700ms・10シード）:
+/// 全駒種版は「成りが最善」の局面を軒並み壊した（m121 10.00→1.00・
+/// m127 9.00→1.00・m111 10.00→3.00・m020/m040 −6・m103 −6）。歩の成りは
+/// **王手が掛かること自体が狙い**の場合があり、ユーザーの採点コメントが
+/// まさに両側を述べている: 95手目「成ると王手がかかってしまい、取られて
+/// しまう」（不成=10）vs 111手目「王手がかからないと、この歩を無視して
+/// 別の手を指される」（成=10）。どちらになるかは「成った駒がそこで
+/// 生き残れるか」で決まり、ブラインド決定では観測から判定できない。
+/// 歩を含めた合計は −57.9/146件、銀桂香だけなら +11.7 と符号が逆になる
+fn nonpromote_check_all_roles() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TSUITATE_NONPROMOTE_CHECK_ROLES").is_ok_and(|v| v == "all"))
+}
+
 /// 双子を作る最小の王手確率（`TSUITATE_NONPROMOTE_CHECK_P`、既定 0.2）。
 fn nonpromote_check_p() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -670,6 +687,9 @@ fn promotion_check_mass(
     role: Role,
     dist: &[(Coord, f64)],
 ) -> f64 {
+    if !nonpromote_check_all_roles() && !matches!(role, Role::Silver | Role::Knight | Role::Lance) {
+        return 0.0;
+    }
     let Some(promo_role) = promoted_role(role) else {
         return 0.0;
     };
