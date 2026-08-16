@@ -922,10 +922,9 @@ const UNBACKED_GS_CAPTURE_MIN_MOVE: u32 = 80;
 /// mix = w × (1 − p_occ/0.25) で粒子の p_hit を p_occ へ混ぜ、
 /// 差分ぶんの期待駒得を引く。
 ///
-/// **既定 1.0**（2026-08-15。対 v13 負け局の只取られ／幻の大駒成り込みと
-/// quest31 の 2d3c+ / 4a3b+ クラスへの対応）。手数ゲートは付けない
-/// （空き寄り `p_occ < 0.25` のときだけ縮むので、ネットが居ると見ている
-/// 序盤の正しい大駒捕獲は残る）。0 で切り戻し。
+/// **既定 0**（2026-08-16。対 v13 12局で発火 32%・駒得負け越し・2勝9敗1分。
+/// ネットが空きと見たマスへの実在大駒捕獲まで沈み、対 bot の勝率を落とす）。
+/// 手数ゲートは付けない。quest31 の 2d3c+ 向けに env から試せる。
 /// 全駒種版は 5.379、自信過剰ギャップは 5.351 で不採用。金銀は
 /// `unbacked_gs_capture_w`。王手中無効・裏付けマスは満額。
 /// 凍結版はこの名前を知らない。
@@ -940,7 +939,7 @@ fn belief_occ_cap_w() -> f64 {
     })
 }
 
-const BELIEF_OCC_CAP_W: f64 = 1.0;
+const BELIEF_OCC_CAP_W: f64 = 0.0;
 /// 信念ネットが「空き寄り」と見なす占有の上界。これ以上なら粒子の
 /// p_hit を上書きしない（盤面平均 prior_occ ≈ 0.21 の少し上）。
 const BELIEF_OCC_EMPTY_PRIOR: f64 = 0.25;
@@ -1978,8 +1977,8 @@ fn check_king_gain_mean() -> bool {
 /// （`TSUITATE_CHECK_SAFE_RESOLVE`、既定 on、0 で従来挙動）。
 ///
 /// 対 v13 104局の analyze: 王手中反則 247回 → ソルバー方策なら 139回。
-/// p_max≥0.9 なのに平均 p=0.41 の手を選んだ反則が19回（安全手を無視して
-/// CheckUnresolved）。`combine_score` は幻の駒得 gain が p_legal を上書きする。
+/// 「ソルバー方策なら 0回」の手番は p_max 0.70〜0.84 に集中し、≥0.9 は少数
+/// （19回）。`combine_score` は幻の駒得 gain が p_legal を上書きする。
 /// p_max が閾値未満（kakutori 型の仮説希釈）では何もしないので、捕獲プローブは残る。
 /// 凍結版はこの名前を知らない。
 fn check_safe_resolve_enabled() -> bool {
@@ -1989,7 +1988,7 @@ fn check_safe_resolve_enabled() -> bool {
     })
 }
 
-const CHECK_SAFE_RESOLVE_PMAX: f64 = 0.85;
+const CHECK_SAFE_RESOLVE_PMAX: f64 = 0.70;
 const CHECK_SAFE_RESOLVE_MARGIN: f64 = 0.25;
 
 fn check_safe_resolve_active(p_max: f64) -> bool {
@@ -5987,7 +5986,7 @@ impl Strategy for EstimatorStrategy {
         }
 
         // 王手中にほぼ確実な解消手があるなら、そこから大きく落ちる手を捨てる
-        // （`check_safe_resolve_enabled`。対 v13 の「安全手 p≥0.9 を無視して
+        // （`check_safe_resolve_enabled`。対 v13 の「安全手 p≥0.70 を無視して
         // CheckUnresolved」を止める。p_max が低い kakutori 型では発火しない）
         if view.you_in_check && check_safe_resolve_enabled() {
             if let Some(solver) = check_solver.as_mut() {
@@ -8103,7 +8102,7 @@ fn evaluate(
         } else {
             0.0
         };
-        // 信念ネット占有キャップ（`belief_occ_cap_w`、既定 1）。質量ゲートの後
+        // 信念ネット占有キャップ（`belief_occ_cap_w`、既定 0）。質量ゲートの後
         // の残り駒得に対して、ネットが空き寄りと見ているマスへの裏付け無し
         // **大駒**捕獲だけ縮める。金銀キャンセルより先に掛け、残りを
         // gs_unbacked が受け取る（二重控除しない）
@@ -11378,7 +11377,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_BELIEF_OCC_CAP_W").is_err() {
             assert!((belief_occ_cap_w() - BELIEF_OCC_CAP_W).abs() < 1e-12);
-            assert_eq!(BELIEF_OCC_CAP_W, 1.0);
+            assert_eq!(BELIEF_OCC_CAP_W, 0.0);
         }
         if std::env::var("TSUITATE_CHECK_SAFE_RESOLVE").is_err() {
             assert!(check_safe_resolve_enabled());
@@ -11389,18 +11388,22 @@ pub(crate) mod tests {
     /// kakutori 型（p_max が閾値未満）では何も切らない。
     #[test]
     fn check_safe_resolve_keeps_diluted_and_drops_ignored_safe() {
-        assert!(!check_safe_resolve_active(0.70));
+        assert!(!check_safe_resolve_active(0.69));
+        assert!(check_safe_resolve_active(0.70));
         assert!(check_safe_resolve_active(0.91));
         let thresh = check_safe_resolve_thresh(0.91);
         assert!(0.91 + 1e-12 >= thresh);
         assert!(0.70 + 1e-12 >= thresh);
         assert!(0.41 + 1e-12 < thresh);
         assert!(0.17 + 1e-12 < thresh);
+        let thresh70 = check_safe_resolve_thresh(0.70);
+        assert!(0.70 + 1e-12 >= thresh70);
+        assert!(0.44 + 1e-12 < thresh70);
     }
 
     /// 信念ネット占有キャップ: 空き寄り（p_occ < 0.25）のときだけ縮み、
     /// ネットも居ると見ているマスは粒子の捕獲期待値を残す。
-    /// 呼び出し側は大駒の移動に限定。既定 w=1。
+    /// 呼び出し側は大駒の移動に限定。既定 w=0（env で試す）。
     #[test]
     fn belief_occ_cap_shrinks_only_when_net_says_empty() {
         let ev = 5.0;
