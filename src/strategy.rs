@@ -546,7 +546,9 @@ fn landing_support_w() -> f64 {
 /// いれば taint）の玉位置分布を使って同じ近接度を作る。分布が散っているとき
 /// （実効サポート数 1/Σp² が `king_cand_attack_gate` 超）は使わない。
 /// deduce が鋭いときは `king_cand_attack_w` の領分なので発火しない（二重計上
-/// を避ける）。王手中は無効
+/// を避ける。ただしこの排他は `king_cand_attack_w` / `king_cand_check_w` の
+/// どちらかがオンで deduce 側のマップが作られたときだけ成立し、本ノブ単独で
+/// 有効化すると deduce が鋭くてもネット経路が発火する）。王手中は無効
 fn king_belief_prox_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -631,19 +633,6 @@ fn nonpromote_check_w() -> f64 {
     })
 }
 
-/// 成り駒種（不成が選べる駒だけ）。
-fn promoted_role(role: Role) -> Option<Role> {
-    Some(match role {
-        Role::Pawn => Role::Tokin,
-        Role::Lance => Role::Promotedlance,
-        Role::Knight => Role::Promotedknight,
-        Role::Silver => Role::Promotedsilver,
-        Role::Bishop => Role::Horse,
-        Role::Rook => Role::Dragon,
-        _ => return None,
-    })
-}
-
 /// 双子を作る駒種（`TSUITATE_NONPROMOTE_CHECK_ROLES`、既定 `minor` =
 /// 銀・桂・香）。`all` で歩・角・飛も対象にする。
 ///
@@ -712,7 +701,7 @@ fn promotion_check_mass(
     if certain_occ[crate::belief_features::sq_index(to)] {
         return 0.0;
     }
-    let Some(promo_role) = promoted_role(role) else {
+    let Some(promo_role) = promote_role(role) else {
         return 0.0;
     };
     let me = view.your_color;
