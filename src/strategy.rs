@@ -1063,7 +1063,9 @@ const OWN_CAMP_MINOR_PROMO_W: f64 = 0.0;
 /// `deduce::opp_king_candidates`（**健全**＝真の玉を絶対に落とさない候補集合）が
 /// 鋭いとき、着地マスの近接度 `Σ_k 0.5^cheb(to,k)`（盤の最大で正規化）を
 /// `w × 近接度 × 安さ係数` で gain へ加点する（近接度は `king_cand_prox_map`、
-/// 安さ係数は歩を 1.0 に正規化した `2/(1+交換価値)`）。
+/// 安さ係数は歩を 1.0 に正規化した `2/(1+交換価値)`。**持ち込んだ駒**で数え、
+/// 成る手も成り後の駒種にはしない。成り後だと 7c7b+ がと金扱いになり、
+/// 候補の隣への垂れ歩（quest31-m121 の P*5b、採点0）に負ける）。
 ///
 /// 発端は quest31 終盤（plies 67〜148）の実測: 王手宣言のおかげで **先手側の
 /// 玉候補は 6〜17 マス**まで絞れていて真の玉（8二/8一）を必ず含むのに、
@@ -6255,14 +6257,21 @@ impl Strategy for EstimatorStrategy {
             {
                 let (to, role) = match mv {
                     ShogiMove::Drop { role, to } => (to, role),
-                    ShogiMove::Board { from, to, promote } => {
+                    ShogiMove::Board {
+                        from,
+                        to,
+                        promote: _,
+                    } => {
                         let r = view
                             .your_pieces
                             .iter()
                             .find(|p| p.square == make_usi_square(from))
                             .map(|p| p.role);
+                        // 安さは**持ち込んだ駒**で数える（成り後の駒種ではない）。
+                        // 歩が玉隣で成るとと金扱いの cheapness ≈0.4 になり、
+                        // 候補の隣への垂れ歩（m121 の P*5b、採点0）が
+                        // 本命の 7c7b+（採点10）を cheapness 差で上回っていた。
                         match r {
-                            Some(r) if promote => (to, promote_role(r).unwrap_or(r)),
                             Some(r) => (to, r),
                             None => (to, Role::King),
                         }
@@ -12070,6 +12079,14 @@ pub(crate) mod tests {
         assert!(
             pawn > bishop * 8.0,
             "adjacent pawn bonus {pawn} should beat far bishop promo {bishop}"
+        );
+        // 成る歩の安さはと金でなく歩。と金換算だと cheapness が約半分になり、
+        // 玉隣の成り込みが少し遠い垂れ歩（m121 の P*5b）に負ける
+        let pawn_c = 2.0 / (1.0 + exchange_value(Role::Pawn));
+        let tokin_c = 2.0 / (1.0 + exchange_value(Role::Tokin));
+        assert!(
+            pawn_c > tokin_c * 1.5,
+            "prerole pawn cheapness {pawn_c} must dwarf tokin {tokin_c}"
         );
     }
 
