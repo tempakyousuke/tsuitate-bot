@@ -1172,9 +1172,10 @@ const LANDING_SUPPORT_W: f64 = 0.7;
 /// 全局面で 35〜55）。残る失点上位 `5f5g+` / `8a7c` / `4g4h` はすべて後手側の
 /// 決定で、接近ボーナスが原理的に発火していないのが上限になっている。
 ///
-/// そこで **deduce が鈍いときだけ**、粒子（厳密が生きていれば厳密、全滅して
-/// いれば taint）の玉位置分布を使って同じ近接度を作る。分布が散っているとき
-/// （実効サポート数 1/Σp² が `king_cand_attack_gate` 超）は使わない。
+/// そこで **deduce が鈍いときだけ**、玉位置ネット（`king_belief_nn`）の分布を
+/// 使って同じ近接度を作る。粒子版は全水準で負けた（情報が無かったのではなく
+/// 情報源が違った）。分布が散っているとき（実効サポート数 1/Σp² が
+/// `king_cand_attack_gate` 超）は使わない。
 /// deduce が鋭いときは `king_cand_attack_w` の領分なので発火しない（二重計上
 /// を避ける。ただしこの排他は `king_cand_attack_w` / `king_cand_check_w` の
 /// どちらかがオンで deduce 側のマップが作られたときだけ成立し、本ノブ単独で
@@ -2966,15 +2967,22 @@ fn promo_king_prox_map(w: f64, cands: &std::collections::BTreeSet<Coord>) -> Opt
 /// 2マス離れで 0.25 と急峻に落ち、候補が広いほど全マスで平坦になる
 /// （＝情報が無いときは自然に効かなくなる）
 /// 近接マップから**着地マス自身**（距離0）を除くか
-/// （`TSUITATE_KING_PROX_EXCLUDE_SELF=1`、既定 0 = 従来挙動）。
+/// （`TSUITATE_KING_PROX_EXCLUDE_SELF`、**既定 on**、`0` で従来挙動）。
 ///
 /// 着手できたということは玉はそのマスに居ない（打ちなら反則、移動なら玉は
 /// 取れない）ので、距離0の項は「玉に近い」根拠にならない。従来版は玉候補
 /// マスそのものへの垂れ歩に最大加点を与えていた（quest31-m119 の P*5b、
-/// ユーザー採点0）
+/// ユーザー採点0）。`king_cand_attack_w` が既定 0 のときは得点中立だったが、
+/// 接近ボーナスを既定オンにしたので、距離0を残すと P*5b 型が最大加点を
+/// 受ける。凍結版はこの名前を知らない。
 fn king_prox_exclude_self() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_KING_PROX_EXCLUDE_SELF").is_ok_and(|v| v == "1"))
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_KING_PROX_EXCLUDE_SELF")
+            .ok()
+            .map(|v| v != "0")
+            .unwrap_or(true)
+    })
 }
 
 fn king_cand_prox_map(cands: &std::collections::BTreeSet<Coord>) -> [f64; 81] {
@@ -5715,7 +5723,7 @@ impl Strategy for EstimatorStrategy {
             .flatten();
         let king_cand_prox: Option<[f64; 81]> =
             king_cand_set.as_ref().map(|c| king_cand_prox_map(c));
-        // 粒子の玉位置ビリーフによる近接マップ（`king_belief_prox_w`）。
+        // 玉位置ネットによる近接マップ（`king_belief_prox_w`）。
         // deduce の玉候補が鈍い側（＝王手をあまり掛けていない側）でだけ使う
         let king_belief_dist: Option<Vec<(Coord, f64)>> =
             (king_belief_prox_w() > 0.0 && !view.you_in_check && king_cand_prox.is_none())
@@ -12034,6 +12042,35 @@ pub(crate) mod tests {
             assert!((king_belief_prox_w() - KING_BELIEF_PROX_W).abs() < 1e-12);
             assert_eq!(KING_BELIEF_PROX_W, 5.0);
         }
+        if std::env::var("TSUITATE_KING_PROX_EXCLUDE_SELF").is_err() {
+            assert!(king_prox_exclude_self());
+        }
+    }
+
+    /// 接近ボーナスは玉候補の隣の安い駒を、遠い大駒成り込みより高くする。
+    /// 着地マス自身（玉候補そのものへの打ち）は最大加点にしない。
+    #[test]
+    fn king_cand_prox_prefers_adjacent_cheap_over_far_bishop() {
+        let mut cands = std::collections::BTreeSet::new();
+        cands.insert(Coord { file: 8, rank: 2 }); // 8b
+        cands.insert(Coord { file: 8, rank: 1 });
+        cands.insert(Coord { file: 7, rank: 1 });
+        let map = king_cand_prox_map(&cands);
+        let idx = |file: i8, rank: i8| ((file - 1) * 9 + (rank - 1)) as usize;
+        let adj = map[idx(7, 2)]; // 7b、玉候補の隣
+        let far = map[idx(3, 3)]; // 3c、3三角成の着地
+        let on_king = map[idx(8, 2)]; // 8b そのもの（着手できた＝玉は居ない）
+        assert!(adj > far * 4.0, "7b prox {adj} should dwarf 3c prox {far}");
+        assert!(
+            adj > on_king,
+            "landing on a king-candidate square must not be the peak: 7b={adj} 8b={on_king}"
+        );
+        let pawn = KING_CAND_ATTACK_W * adj * (2.0 / (1.0 + exchange_value(Role::Pawn)));
+        let bishop = KING_CAND_ATTACK_W * far * (2.0 / (1.0 + exchange_value(Role::Bishop)));
+        assert!(
+            pawn > bishop * 8.0,
+            "adjacent pawn bonus {pawn} should beat far bishop promo {bishop}"
+        );
     }
 
     /// 王手中の安全解消ゲート: p_max が高いときだけ低い p を捨て、

@@ -749,7 +749,10 @@
     有効時は王手駒捕獲（`captures_checker`）と玉の手を残す。
     **得点側の既定オンは手数窓なしの玉候補接近束だけ**:
     `KING_CAND_ATTACK_W=4` / `KING_CAND_CHECK_W=1` / `LANDING_SUPPORT_W=0.7` /
-    `KING_BELIEF_PROX_W=5`（2000ms・20シードで GEN オフの記録 **5.894**）。
+    `KING_BELIEF_PROX_W=5` / **`KING_PROX_EXCLUDE_SELF=on`**
+    （2000ms・20シードで GEN オフの記録 **5.894**。距離0除外は接近オン後の
+    P*5b 型対策で、接近オフ時は得点中立）。情報源は deduce の玉候補集合
+    （鋭いとき）と玉位置ネット（鈍いとき。粒子版は不発）。
     HAND_ASSET / LINK_ENDGAME_DAMPEN / KING_KNOWN_APPROACH / MATERIAL_DEGEN /
     GEN / CAPTURE_RETREAT は既定 0 のまま（5.9 構成のアリーナ犯人候補と
     不成の失点）。接近束単体のアリーナは未測なので採否は今回のガントレット。
@@ -801,13 +804,14 @@
     「成った駒がそこで生き残れるか」で決まる。ブラインド決定では観測から
     判定できないので静的項では表現できない（depth2_focal_k・
     promote_check_reveal_w と同じ壁）。凍結版はこれらの名前を知らない
-  - `TSUITATE_KING_PROX_EXCLUDE_SELF`（既定 0 = 従来挙動）— 玉候補近接マップ
+  - `TSUITATE_KING_PROX_EXCLUDE_SELF`（**既定 on**、`0` で従来挙動）— 玉候補近接マップ
     から**着地マス自身**（距離0）を除く。着手できたということは玉はそこに
     居ない（打ちなら反則、移動なら玉は取れない）ので距離0の項は「玉に近い」
     根拠にならず、従来版は玉候補マスそのものへの垂れ歩に最大加点を与えて
     いた（quest31-m119 の P*5b、採点0。rank_probe で2位→3位）。
-    **実測は中立**（700ms・10シード 6.062 vs 対照 6.072）なので既定は
-    従来挙動のまま。診断としては正しいが得点は動かない
+    接近ボーナスが既定 0 のときの実測は中立（700ms・10シード 6.062 vs 対照 6.072）
+    だったが、`king_cand_attack_w` を既定オンにしたので距離0を残すと
+    P*5b 型が最大加点を受ける。`0` で切り戻し。
   - `TSUITATE_KING_CAND_ATTACK_W`（既定 **4.0**、0 で無効）/ `TSUITATE_KING_CAND_ATTACK_GATE`
     （既定 20）/ `TSUITATE_KING_CAND_CHECK_W`（既定 **1.0**）/
     `TSUITATE_LANDING_SUPPORT_W`（既定 **0.7**）— **玉候補への接近ボーナス**
