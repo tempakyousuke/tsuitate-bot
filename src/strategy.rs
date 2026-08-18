@@ -1,9 +1,11 @@
 //! 指し手の選択。
 //!
 //! `Strategy` trait の実装を差し替えて強さを比較する（bin/arena.rs で対戦できる）。
+//! 既定（`DEFAULT_STRATEGY`）は `estimator`。
 //! - `Heuristic`: サイト内蔵の簡易botと同じ「前進を好むヒューリスティック＋乱数」
 //! - `EstimatorStrategy`: 観測履歴から相手局面の粒子集合を維持し（estimator.rs）、
 //!   候補手を粒子平均で評価する
+//! - `estimator_v6` … `estimator_v13`: `frozen/` の凍結版（アリーナの基準）
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};

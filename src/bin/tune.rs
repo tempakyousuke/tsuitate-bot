@@ -927,7 +927,7 @@ fn main() {
         }),
     );
     println!("\n採用する場合は strategy.rs の EvalParams::default を最終パラメータで書き換え、");
-    println!("フルガントレット（CI・全凍結版に勝ち越し・僅差なら200局）で確認すること。");
+    println!("フルガントレット（CI・既定は v9 以降に勝ち越し・僅差なら200局）で確認すること。");
 }
 
 #[cfg(test)]
