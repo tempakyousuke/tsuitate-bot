@@ -619,8 +619,8 @@
     反則/局 6.43〜6.73 で悪化なし。**2026-08-08 に既定 2.0 で採用**
     （ユーザー判断。観測のみ由来の情報項＋動機シナリオ解決＋アリーナ中立の
     採用パターン）。以後の suite 対照は w=2.0 の 950 / 4.844
-  - `TSUITATE_GEN_NONPROMOTE`（既定 **on**、`=0` で従来の「成れるなら成る」）/
-    `TSUITATE_PROMO_RISK_PREROLE`（既定 **on**、`=0` で成った後の駒種でリスクを数える）—
+  - `TSUITATE_GEN_NONPROMOTE`（既定 0 = 従来の「成れるなら成る」）/
+    `TSUITATE_PROMO_RISK_PREROLE`（既定 0 = 成った後の駒種でリスクを数える）—
     **不成の候補生成と、成る手の取られリスクの価格**（2026-08-08、
     quest_20260731 の95手目・人間の ７三歩**成らず**が発端）。不成の価値は
     2系統（ユーザーの指導）: 歩・飛・角は成ると王手が増え**宣言で露見**する
@@ -656,10 +656,10 @@
       未解決のまま。不成の発想自体は GEN=1 で候補化できるので、対人・本番で
       env から試す価値は残る。NN 双子評価はノブなしで残置（GEN 有効時のみ
       発火・既定挙動不変）
-    - `TSUITATE_CAPTURE_RETREAT_W`（既定 **0.16**、0 で無効）—
+    - `TSUITATE_CAPTURE_RETREAT_W`（既定 0 = 無効、PR#1 の作業点 0.08）—
       **捕獲直後の厳密手戻り（不成のみ）を backtrack 免除＋ w×交換価値 加点**。
       GEN+PREROLE の既知回帰 m024（「取って逃げる」3b4b が 4f4g+ に沈む）への
-      対応。0.08 では 4f4g+ がなお 0.43 上回ったため 0.16 に上げた。成り逆
+      対応で、コンボ計測では m024 得点 5.00→7.40 の回復を確認。成り逆
       （4a3b+ 型の再突入）は除外（m087/m089 回帰の教訓）。桂銀香の
       promote_bias を不成側へ付け替える変更も GEN 有効時のみ発火するよう
       ゲート済み（既定挙動不変）
@@ -736,6 +736,23 @@
     思考 avg 1.22〜1.25s で変質なし = 新ノブは全部既定 0/off で main と
     同一挙動という読みを数字で裏づけた。suite の新基準線は同じ PR ブランチ
     で run 32107127130（1185 / 4.663）
+  - **安全解消ゲート既定 on は CI で不合格**（2026-08-18、SHA `59c3bd5`）:
+    `TSUITATE_CHECK_SAFE_RESOLVE` を既定 on・p_max≥0.70 で切る版。
+    arena run 32094628907（104局×5）: v9 67.3 / v10 70.2 / v11 67.3 /
+    **v12 58.7 / v13 48.1%**（対照 run 31343066021 の v13 51.9、
+    ペア run 32110295921 の v13 50.0 からも低下）。反則/局は v9〜v11 で
+    4.6〜5.2 と減るが、v13 戦は 6.33（相手 6.22）で削減が消える。
+    suite run 32094626767: 不合格 **1238** / 平均 **4.614**（対照 1185 / 4.663）、
+    **kakutori 2/20**（本命回帰。仮説希釈でも p_max が 0.70 を超えて正しい
+    捕獲プローブを `p_max-0.25` 未満として捨てていた）。12局のローカル再測
+    （8勝4敗）は過大評価。**既定 off** に戻し、env `=1` のときだけ動かす。
+    有効時は王手駒捕獲（`captures_checker`）と玉の手を残す。
+    **得点側の既定オンは手数窓なしの玉候補接近束だけ**:
+    `KING_CAND_ATTACK_W=4` / `KING_CAND_CHECK_W=1` / `LANDING_SUPPORT_W=0.7` /
+    `KING_BELIEF_PROX_W=5`（2000ms・20シードで GEN オフの記録 **5.894**）。
+    HAND_ASSET / LINK_ENDGAME_DAMPEN / KING_KNOWN_APPROACH / MATERIAL_DEGEN /
+    GEN / CAPTURE_RETREAT は既定 0 のまま（5.9 構成のアリーナ犯人候補と
+    不成の失点）。接近束単体のアリーナは未測なので採否は今回のガントレット。
   - **SPSA（`TUNE_OBJECTIVE=scenario_score`）は quest31 では不発**（2026-08-15）。
     `TUNE_A0` / `TUNE_BIG_A` / `TUNE_C0` を env 化して歩幅を上げられるように
     したうえで（既定 a0=0.15 / A=10 は1反復目の実効歩幅が範囲の 3.5% しかなく、
@@ -791,9 +808,9 @@
     いた（quest31-m119 の P*5b、採点0。rank_probe で2位→3位）。
     **実測は中立**（700ms・10シード 6.062 vs 対照 6.072）なので既定は
     従来挙動のまま。診断としては正しいが得点は動かない
-  - `TSUITATE_KING_CAND_ATTACK_W`（既定 0）/ `TSUITATE_KING_CAND_ATTACK_GATE`
-    （既定 20）/ `TSUITATE_KING_CAND_CHECK_W`（既定 0）/
-    `TSUITATE_LANDING_SUPPORT_W`（既定 0）— **玉候補への接近ボーナス**
+  - `TSUITATE_KING_CAND_ATTACK_W`（既定 **4.0**、0 で無効）/ `TSUITATE_KING_CAND_ATTACK_GATE`
+    （既定 20）/ `TSUITATE_KING_CAND_CHECK_W`（既定 **1.0**）/
+    `TSUITATE_LANDING_SUPPORT_W`（既定 **0.7**）— **玉候補への接近ボーナス**
     （2026-08-13、quest31 終盤の固執が発端）。`deduce::opp_king_candidates`
     （健全＝真の玉を絶対に落とさない候補集合）が鋭いとき（既定 20 マス以下）だけ、
     着地マスの近接度 `Σ_k 0.5^cheb(to,k)`（盤の最大で正規化）×
@@ -853,7 +870,7 @@
     `DROP_HIT_EVAC_W=0.2` 5.242（未採点327件＝eval の外へ大量流出）/
     `PROMOTE_CHECK_REVEAL_W=1` 5.205。「シナリオでは good だがアリーナで
     負けた」系のノブを積み増しても得点は上がらない
-  - `TSUITATE_KING_BELIEF_PROX_W`（既定 0）— **玉位置ネットによる接近ボーナス**
+  - `TSUITATE_KING_BELIEF_PROX_W`（既定 **5.0**、0 で無効）— **玉位置ネットによる接近ボーナス**
     （`king_cand_attack_w` の「王手を掛けていない側」用の対、2026-08-14）。
     `deduce::opp_king_candidates` は自分の王手宣言の履歴から絞るので、王手を
     あまり掛けていない側では 35〜55 マスに散ってゲートを通らない。そこで

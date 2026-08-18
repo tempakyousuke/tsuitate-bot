@@ -13,20 +13,20 @@ use std::time::{Duration, Instant};
 use rand::Rng;
 
 use crate::board::{
-    Coord, Promotion, defend_targets, drop_targets, make_usi_drop, make_usi_move, make_usi_square,
-    move_targets, parse_usi_square, promotion_choice,
+    defend_targets, drop_targets, make_usi_drop, make_usi_move, make_usi_square, move_targets,
+    parse_usi_square, promotion_choice, Coord, Promotion,
 };
 use crate::check::CheckSolver;
-use crate::estimator::{EPS_INFO, Estimator, opp_reply_weights};
-use crate::likelihood::{FITTED_THETA, ParticleCtx, particle_features, particle_log_weight};
+use crate::estimator::{opp_reply_weights, Estimator, EPS_INFO};
+use crate::likelihood::{particle_features, particle_log_weight, ParticleCtx, FITTED_THETA};
 use crate::model::GameModel;
 use crate::observation::{Observation, ObservationLog};
 use crate::opening::OpeningBook;
-use rand::SeedableRng;
 use rand::rngs::StdRng;
+use rand::SeedableRng;
 
 use crate::protocol::{Color, PlayerView, Role, VisiblePiece};
-use crate::shogi::{Position, ShogiMove, parse_usi, piece_value, promote_role, unpromote_role};
+use crate::shogi::{parse_usi, piece_value, promote_role, unpromote_role, Position, ShogiMove};
 
 /// 1インスタンス = 1対局。対局開始ごとに `make` で作り直す。
 pub trait Strategy {
@@ -1057,7 +1057,8 @@ fn own_camp_minor_promo_w() -> f64 {
 
 const OWN_CAMP_MINOR_PROMO_W: f64 = 0.0;
 
-/// 玉候補への接近ボーナス（`TSUITATE_KING_CAND_ATTACK_W`、既定 0 = 無効）。
+/// 玉候補への接近ボーナス（`TSUITATE_KING_CAND_ATTACK_W`、既定 **4.0**、
+/// 0 で従来挙動 = 切り戻しノブ）。
 ///
 /// `deduce::opp_king_candidates`（**健全**＝真の玉を絶対に落とさない候補集合）が
 /// 鋭いとき、着地マスの近接度 `Σ_k 0.5^cheb(to,k)`（盤の最大で正規化）を
@@ -1074,6 +1075,12 @@ const OWN_CAMP_MINOR_PROMO_W: f64 = 0.0;
 /// 粒子不要・ノイズゼロ（自分の観測だけで決まる）。**候補集合が鋭いときだけ**
 /// 発火するので中盤（|cands| が 30〜50）では素通りする。王手中は無効。
 /// 凍結版はこの名前を知らない。
+///
+/// 既定 4.0 は 2026-08-13 の作業点（w=2 で飽和、`promote_far_w` を外して
+/// w=4）。PR#1 の hand_asset / link_endgame / king_known_approach /
+/// material_degen は既定 0 のまま（これら込みの 5.9 構成はアリーナが対照を
+/// 上回らず不採用）。安全解消ゲート既定 on が kakutori と v13 を壊したので、
+/// こちらだけを既定オンにする。
 fn king_cand_attack_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -1081,11 +1088,15 @@ fn king_cand_attack_w() -> f64 {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.0)
+            .unwrap_or(KING_CAND_ATTACK_W)
     })
 }
 
-/// 玉候補マスへ利く手への追加加点（`TSUITATE_KING_CAND_CHECK_W`、既定 0 = 無効）。
+/// 玉候補接近ボーナスの既定（2026-08-13 作業点）。0 で切り戻し
+const KING_CAND_ATTACK_W: f64 = 4.0;
+
+/// 玉候補マスへ利く手への追加加点（`TSUITATE_KING_CAND_CHECK_W`、既定 **1.0**、
+/// 0 で無効 = 切り戻しノブ）。
 /// `king_cand_attack_w`（着地マスの近接度）と同じゲート・同じ安さ係数で、
 /// 「その駒が実際に玉候補へ利くか」を `blind_king_attack` で測って加点する
 /// （分布は候補集合上の一様分布 = 粒子不要）
@@ -1096,9 +1107,12 @@ fn king_cand_check_w() -> f64 {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.0)
+            .unwrap_or(KING_CAND_CHECK_W)
     })
 }
+
+/// 玉候補へ利く手の加点既定（2026-08-13 作業点）
+const KING_CAND_CHECK_W: f64 = 1.0;
 
 /// `king_cand_attack_w` が発火する玉候補集合の上限（`TSUITATE_KING_CAND_ATTACK_GATE`、
 /// 既定 20）。これを超えると候補が盤の半分に散っていて近接度が
@@ -1129,7 +1143,8 @@ fn landing_def(view: &PlayerView, mv: &ShogiMove, own_attack: &[u8; 81]) -> f64 
 }
 
 /// 玉候補接近ボーナスの**支えゲートの強さ**（`TSUITATE_LANDING_SUPPORT_W`、
-/// 既定 0 = ゲート無し）。係数は `(1−w) + w×min(着手後の支え枚数,2)/2` で、
+/// 既定 **0.7**、0 でゲート無し = 切り戻しノブ）。
+/// 係数は `(1−w) + w×min(着手後の支え枚数,2)/2` で、
 /// w=1 なら支え0枚の接近は加点ゼロ、w=0.5 なら半額。採点済み eval の局面内
 /// 回帰では支え枚数が +0.60点あるが、**独立した加算項にすると玉から遠い
 /// 「支えのある無意味なマス」まで加点する**ので接近側へ掛ける
@@ -1140,12 +1155,16 @@ fn landing_support_w() -> f64 {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.0)
+            .unwrap_or(LANDING_SUPPORT_W)
     })
 }
 
+/// 接近ボーナスの支えゲート既定（2026-08-13 作業点。m145 の裸の金打ち対策）
+const LANDING_SUPPORT_W: f64 = 0.7;
+
 /// **玉位置ネット**による接近ボーナス（`TSUITATE_KING_BELIEF_PROX_W`、
-/// 既定 0 = 無効）。`king_cand_attack_w` の**王手を掛けていない側用の対**。
+/// 既定 **5.0**、0 で無効 = 切り戻しノブ）。
+/// `king_cand_attack_w` の**王手を掛けていない側用の対**。
 ///
 /// `deduce::opp_king_candidates` は「自分が王手を宣言した履歴」から絞るので、
 /// 王手をあまり掛けられていない側では 35〜55 マスに散ってゲートを通らない
@@ -1167,9 +1186,12 @@ fn king_belief_prox_w() -> f64 {
             .ok()
             .and_then(|v| v.parse::<f64>().ok())
             .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.0)
+            .unwrap_or(KING_BELIEF_PROX_W)
     })
 }
+
+/// 玉位置ネット接近ボーナスの既定（2026-08-14 作業点。粒子版は不発）
+const KING_BELIEF_PROX_W: f64 = 5.0;
 
 /// `promote_far_w` の課税を**全駒種**へ広げるか（`TSUITATE_PROMOTE_FAR_ALL=1`、
 /// 既定 0 = 角・飛だけ）。課税額は着手駒の交換価値で頭打ちにする
@@ -1604,7 +1626,11 @@ fn gold_join_king_amount(
     if chebyshev(from, king) <= 1 {
         return 0.0;
     }
-    if chebyshev(to, king) == 1 { 1.0 } else { 0.0 }
+    if chebyshev(to, king) == 1 {
+        1.0
+    } else {
+        0.0
+    }
 }
 
 /// 終盤、自玉隣接の金が玉筋へ動く量（`gold_king_file_w`）。
@@ -1625,7 +1651,11 @@ fn gold_king_file_amount(
     if to.file != king.file {
         return 0.0;
     }
-    if chebyshev(to, king) == 2 { 1.0 } else { 0.0 }
+    if chebyshev(to, king) == 2 {
+        1.0
+    } else {
+        0.0
+    }
 }
 
 /// 終盤の桂の敵陣進入課税量（`knight_late_promo_w`）。成りは 1、
@@ -1666,7 +1696,11 @@ fn knight_endgame_promo_amount(
     if role != Role::Knight || !promote || move_number < KNIGHT_ENDGAME_PROMO_MIN_MOVE {
         return 0.0;
     }
-    if in_enemy_camp(to, me) { 1.0 } else { 0.0 }
+    if in_enemy_camp(to, me) {
+        1.0
+    } else {
+        0.0
+    }
 }
 
 /// 終盤、自陣の桂が中段へ出る量（`knight_camp_exit_w`）。
@@ -2205,18 +2239,18 @@ fn check_king_gain_mean() -> bool {
 }
 
 /// 王手中に「ほぼ確実な解消手」があるのに低い p の手を選んで反則するのを止める
-/// （`TSUITATE_CHECK_SAFE_RESOLVE`、既定 on、0 で従来挙動）。
+/// （`TSUITATE_CHECK_SAFE_RESOLVE`、**既定 off**、`1` で有効）。
 ///
-/// 対 v13 104局の analyze: 王手中反則 247回 → ソルバー方策なら 139回。
-/// 「ソルバー方策なら 0回」の手番は p_max 0.70〜0.84 に集中し、≥0.9 は少数
-/// （19回）。`combine_score` は幻の駒得 gain が p_legal を上書きする。
-/// p_max が閾値未満（kakutori 型の仮説希釈）では何もしないので、捕獲プローブは残る。
-/// 再測（seed 20260816、キャップ既定0＋本ゲート 0.70）: 8勝4敗、反則/局
-/// 4.58 vs 相手 6.17。同条件のキャップ1.0＋閾値0.85は 2勝9敗1分。
+/// 対 v13 104局の analyze: 王手中反則 247回 → ソルバー方策なら 139回、という
+/// 診断は正しい。しかし既定 on・p_max≥0.70 で切る版は CI ガントレット
+/// （run 32094628907、104局）で **v13 48.1%**・kakutori **2/20**
+/// （suite run 32094626767、平均 4.614）と両方壊した。
+/// 仮説希釈で p_max が 0.70 を超える kakutori 型では、正しい捕獲プローブまで
+/// `p_max-0.25` 未満として捨てていた。有効時は王手駒捕獲と玉の手を残す。
 /// 凍結版はこの名前を知らない。
 fn check_safe_resolve_enabled() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_CHECK_SAFE_RESOLVE").map_or(true, |v| v != "0"))
+    *V.get_or_init(|| std::env::var("TSUITATE_CHECK_SAFE_RESOLVE").is_ok_and(|v| v != "0"))
 }
 
 const CHECK_SAFE_RESOLVE_PMAX: f64 = 0.70;
@@ -2228,6 +2262,12 @@ fn check_safe_resolve_active(p_max: f64) -> bool {
 
 fn check_safe_resolve_thresh(p_max: f64) -> f64 {
     p_max - CHECK_SAFE_RESOLVE_MARGIN
+}
+
+/// 安全解消ゲートで残す手か。閾値以上に加え、王手駒捕獲と玉の手は
+/// 仮説希釈で p が低くても残す（kakutori の捕獲プローブを落とさない）。
+fn check_safe_resolve_keep(p: f64, thresh: f64, captures_checker: bool, is_king: bool) -> bool {
+    p + 1e-12 >= thresh || captures_checker || is_king
 }
 
 /// 成りが任意の移動で**不成も候補に生成する**か（既定は無効 =
@@ -6486,8 +6526,7 @@ impl Strategy for EstimatorStrategy {
         }
 
         // 王手中にほぼ確実な解消手があるなら、そこから大きく落ちる手を捨てる
-        // （`check_safe_resolve_enabled`。対 v13 の「安全手 p≥0.70 を無視して
-        // CheckUnresolved」を止める。p_max が低い kakutori 型では発火しない）
+        // （`check_safe_resolve_enabled`。既定 off。有効時も王手駒捕獲と玉の手は残す）
         if view.you_in_check && check_safe_resolve_enabled() {
             if let Some(solver) = check_solver.as_mut() {
                 if !scored.is_empty() {
@@ -6500,8 +6539,13 @@ impl Strategy for EstimatorStrategy {
                         let thresh = check_safe_resolve_thresh(p_max);
                         let before = scored.len();
                         let mut i = 0;
-                        scored.retain(|_| {
-                            let keep = ps[i] + 1e-12 >= thresh;
+                        scored.retain(|s| {
+                            let keep = check_safe_resolve_keep(
+                                ps[i],
+                                thresh,
+                                solver.captures_checker(&s.1),
+                                is_king_move(&s.1),
+                            );
                             i += 1;
                             keep
                         });
@@ -11972,12 +12016,28 @@ pub(crate) mod tests {
             assert_eq!(BELIEF_OCC_CAP_W, 0.0);
         }
         if std::env::var("TSUITATE_CHECK_SAFE_RESOLVE").is_err() {
-            assert!(check_safe_resolve_enabled());
+            assert!(!check_safe_resolve_enabled());
+        }
+        if std::env::var("TSUITATE_KING_CAND_ATTACK_W").is_err() {
+            assert!((king_cand_attack_w() - KING_CAND_ATTACK_W).abs() < 1e-12);
+            assert_eq!(KING_CAND_ATTACK_W, 4.0);
+        }
+        if std::env::var("TSUITATE_KING_CAND_CHECK_W").is_err() {
+            assert!((king_cand_check_w() - KING_CAND_CHECK_W).abs() < 1e-12);
+            assert_eq!(KING_CAND_CHECK_W, 1.0);
+        }
+        if std::env::var("TSUITATE_LANDING_SUPPORT_W").is_err() {
+            assert!((landing_support_w() - LANDING_SUPPORT_W).abs() < 1e-12);
+            assert_eq!(LANDING_SUPPORT_W, 0.7);
+        }
+        if std::env::var("TSUITATE_KING_BELIEF_PROX_W").is_err() {
+            assert!((king_belief_prox_w() - KING_BELIEF_PROX_W).abs() < 1e-12);
+            assert_eq!(KING_BELIEF_PROX_W, 5.0);
         }
     }
 
     /// 王手中の安全解消ゲート: p_max が高いときだけ低い p を捨て、
-    /// kakutori 型（p_max が閾値未満）では何も切らない。
+    /// 王手駒捕獲と玉の手は仮説希釈でも残す。
     #[test]
     fn check_safe_resolve_keeps_diluted_and_drops_ignored_safe() {
         assert!(!check_safe_resolve_active(0.69));
@@ -11991,6 +12051,16 @@ pub(crate) mod tests {
         let thresh70 = check_safe_resolve_thresh(0.70);
         assert!(0.70 + 1e-12 >= thresh70);
         assert!(0.44 + 1e-12 < thresh70);
+        assert!(check_safe_resolve_keep(0.70, thresh70, false, false));
+        assert!(!check_safe_resolve_keep(0.44, thresh70, false, false));
+        assert!(
+            check_safe_resolve_keep(0.17, thresh70, true, false),
+            "kakutori の捕獲プローブは残す"
+        );
+        assert!(
+            check_safe_resolve_keep(0.17, thresh70, false, true),
+            "玉の手は残す"
+        );
     }
 
     /// 信念ネット占有キャップ: 空き寄り（p_occ < 0.25）のときだけ縮み、
@@ -12407,7 +12477,7 @@ pub(crate) mod tests {
         let me = Color::Sente;
         let from = Coord { file: 7, rank: 3 }; // 7c
         let to = Coord { file: 8, rank: 2 }; // 8b
-        // m145: 7a/8a/9a/9b/9c → median file 9
+                                             // m145: 7a/8a/9a/9b/9c → median file 9
         let mut kings = std::collections::BTreeSet::new();
         kings.insert(Coord { file: 7, rank: 1 });
         kings.insert(Coord { file: 8, rank: 1 });
@@ -12942,10 +13012,9 @@ pub(crate) mod tests {
         // ネット無しは従来どおり最近傍（9i から近いのは 5b = rank 差が小さい方…
         // チェビシェフ距離は 5a が max(4,8)=8・5b が max(4,7)=7 なので 5b）
         let out = project_taint_kings(&pool, &cands, Color::Gote, None);
-        assert!(
-            out.iter()
-                .all(|(p, _)| p.king_square(Color::Gote) == Some(b))
-        );
+        assert!(out
+            .iter()
+            .all(|(p, _)| p.king_square(Color::Gote) == Some(b)));
     }
 
     /// V3: 紐は「移動できるマス」ではなく「利かせているマス」で数える。
