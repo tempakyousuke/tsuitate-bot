@@ -1,8 +1,9 @@
 # ついたて将棋ビューワー向け webhook bot（`webhook_bot`）
 
-tsuboshun氏運営の第三者サイト「ついたて将棋ビューワー」に estimator_v10 を
-参加させるためのアダプタ。tsuitate リポジトリ本体（本番bot、`main.rs`/`client.rs`
-のSocket.IO常駐接続）とは完全に独立したプロセス・プロトコル。
+tsuboshun氏運営の第三者サイト「ついたて将棋ビューワー」向けの HTTP アダプタ。
+既定の戦略は凍結版 `estimator_v10`（現行 `estimator` にしたいときは
+`TSUITATE_WEBHOOK_STRATEGY=estimator`）。tsuitate リポジトリ本体（本番bot、
+`main.rs`/`client.rs` のSocket.IO常駐接続）とは完全に独立したプロセス・プロトコル。
 
 対応は**標準「ついたて」(9x9) のみ**。盤サイズ9x9はboard.rs/shogi.rs/estimator.rs/
 strategy.rs/NN特徴量にモジュール横断でハードコードされており、「ついたて5五」や

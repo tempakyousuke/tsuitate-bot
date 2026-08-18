@@ -12,8 +12,9 @@
 //!   利用側が局面で解決する）
 //! - 終局行（投了・反則負け等）以降の `*illegal:` は trailing_fouls に入れる
 //! - `*scenario key=value ...` — このリポジトリ独自のシナリオ指定
-//!   （ply=再生する手数 / target=注目手USI / diag=利き診断マス / desc=説明。
-//!   desc は行末まで）
+//!   （ply=再生する手数 / target=注目手USI / bad=不合格リスト /
+//!   fouls=注入する反則列 / scores=採点表 / diag=利き診断マス / desc=説明。
+//!   desc は行末まで。未知の key も directives に残る）
 
 use std::collections::HashMap;
 

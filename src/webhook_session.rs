@@ -16,7 +16,7 @@
 //! sfen は使わない: 各plyの `lastMove`(CSA)/`lastInfo`/`lastCapture`/
 //! `wasPromotion` から直接 `Observation` イベントを組み立てられるため、
 //! 既存の `GameModel::from_log` 相当の増分適用（`GameModel::apply`）だけで
-//! 自分の可視局面が再構成できる（詳細はプロジェクトのplan参照）。
+//! 自分の可視局面が再構成できる（手順は `docs/tsuitate-viewer-webhook-bot.md`）。
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;

@@ -690,10 +690,23 @@ fn main() {
         }
     };
 
-    // SPSA係数（正規化座標）。c0: 摂動幅（範囲の8%）、a0/A/α/γ: 標準的な減衰
-    let c0 = 0.08;
-    let a0 = 0.15;
-    let big_a = 10.0;
+    // SPSA係数（正規化座標）。c0: 摂動幅（範囲の8%）、a0/A/α/γ: 標準的な減衰。
+    // **既定はアリーナ目的向けの較正**で、1反復目の実効歩幅は
+    // a0/(A+1)^α ≒ 範囲の 3.5%（TUNE_SPAN=0.4 なら 1.4%）しかない。
+    // シナリオ得点目的は評価1回が安く反復数を稼げないので、
+    // TUNE_A0 / TUNE_BIG_A / TUNE_C0 で歩幅を上げられるようにしてある
+    // （2026-08-15: 既定のまま24反復回して link_w が 0.0597→0.062 と
+    // 1〜3%しか動かず、目的関数を動かせないことを実測）
+    let envf = |name: &str, dflt: f64| -> f64 {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(dflt)
+    };
+    let c0 = envf("TUNE_C0", 0.08);
+    let a0 = envf("TUNE_A0", 0.15);
+    let big_a = envf("TUNE_BIG_A", 10.0);
     let alpha = 0.602;
     let gamma = 0.101;
 
@@ -914,7 +927,7 @@ fn main() {
         }),
     );
     println!("\n採用する場合は strategy.rs の EvalParams::default を最終パラメータで書き換え、");
-    println!("フルガントレット（CI・全凍結版に勝ち越し・僅差なら200局）で確認すること。");
+    println!("フルガントレット（CI・既定は v9 以降に勝ち越し・僅差なら200局）で確認すること。");
 }
 
 #[cfg(test)]

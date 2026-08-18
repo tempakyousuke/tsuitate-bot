@@ -1,5 +1,13 @@
 # やねうら王から取り込めるもの／取り込めないもの（2026-07-26 調査）
 
+> **調査時点の記録**。本文中の `strategy.rs:行番号` は 2026-07-26 のもので、
+> 以後の追加でずれている。その後に確定した主な帰結:
+> - V3（紐）は `link_w=0.06` で v12 に採用（王手中もゲートしない）
+> - V5（盤上減価）は w に単調悪化で不採用
+> - `tokin_probe_w` は 2026-07-30 に削除し、一般項 `promo_potential_w` へ置換
+> - 思考予算は 2000ms で飽和（900ms へ絞ると −14.5pt。もう強さの調整ノブではない）
+> 現行のノブ採否は `CLAUDE.md`、実行計画の当時版は `docs/improvement-plan-2026-07-26-yaneuraou.md`。
+
 調査対象: https://github.com/yaneurao/YaneuraOu
 （HEAD `0899d1d`, 2026-07-25。`source/` 約29k行 + `engine/`・`eval/`・`mate/`・`book/`）
 
