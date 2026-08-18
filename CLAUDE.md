@@ -747,15 +747,15 @@
     捕獲プローブを `p_max-0.25` 未満として捨てていた）。12局のローカル再測
     （8勝4敗）は過大評価。**既定 off** に戻し、env `=1` のときだけ動かす。
     有効時は王手駒捕獲（`captures_checker`）と玉の手を残す。
-    **得点側の既定オンは手数窓なしの玉候補接近束だけ**:
+    **得点側の既定オンは deduce が鋭いときだけ発火する接近ボーナス**:
     `KING_CAND_ATTACK_W=4` / `KING_CAND_CHECK_W=1` / `LANDING_SUPPORT_W=0.7` /
-    `KING_BELIEF_PROX_W=5` / **`KING_PROX_EXCLUDE_SELF=on`**
-    （2000ms・20シードで GEN オフの記録 **5.894**。距離0除外は接近オン後の
-    P*5b 型対策で、接近オフ時は得点中立）。情報源は deduce の玉候補集合
-    （鋭いとき）と玉位置ネット（鈍いとき。粒子版は不発）。
+    **`KING_PROX_EXCLUDE_SELF=on`**。距離0除外は接近オン後の P*5b 型対策。
+    **`KING_BELIEF_PROX_W` は既定 0 のまま**（ネット接近は deduce が鈍い
+    大半の局面で発火する。5.9 構成に w=5 で入り、アリーナ合算 54.0% vs
+    対照 56.3% で不採用）。情報源は deduce の玉候補集合が ≤20 マスのときだけ。
     HAND_ASSET / LINK_ENDGAME_DAMPEN / KING_KNOWN_APPROACH / MATERIAL_DEGEN /
     GEN / CAPTURE_RETREAT は既定 0 のまま（5.9 構成のアリーナ犯人候補と
-    不成の失点）。接近束単体のアリーナは未測なので採否は今回のガントレット。
+    不成の失点）。deduce 鋭い接近だけのアリーナは未測なので採否はガントレット。
   - **SPSA（`TUNE_OBJECTIVE=scenario_score`）は quest31 では不発**（2026-08-15）。
     `TUNE_A0` / `TUNE_BIG_A` / `TUNE_C0` を env 化して歩幅を上げられるように
     したうえで（既定 a0=0.15 / A=10 は1反復目の実効歩幅が範囲の 3.5% しかなく、
@@ -875,8 +875,10 @@
     `DROP_HIT_EVAC_W=0.2` 5.242（未採点327件＝eval の外へ大量流出）/
     `PROMOTE_CHECK_REVEAL_W=1` 5.205。「シナリオでは good だがアリーナで
     負けた」系のノブを積み増しても得点は上がらない
-  - `TSUITATE_KING_BELIEF_PROX_W`（既定 **5.0**、0 で無効）— **玉位置ネットによる接近ボーナス**
-    （`king_cand_attack_w` の「王手を掛けていない側」用の対、2026-08-14）。
+  - `TSUITATE_KING_BELIEF_PROX_W`（既定 **0**、作業点 5.0、env でオン）— **玉位置ネットによる接近ボーナス**
+    （`king_cand_attack_w` の「王手を掛けていない側」用の対、2026-08-14。
+    **既定オフ**: 5.9 構成のアリーナで対照を下回ったため。`king_cand_attack_w`
+    は `|cands|≤20` の終盤だけだが、こちらは deduce が鈍い対局の大半で発火する）。
     `deduce::opp_king_candidates` は自分の王手宣言の履歴から絞るので、王手を
     あまり掛けていない側では 35〜55 マスに散ってゲートを通らない。そこで
     deduce が鈍いときだけ、**玉位置ネット**（`king_belief_nn`）の分布で同じ

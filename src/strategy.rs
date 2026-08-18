@@ -1078,11 +1078,13 @@ const OWN_CAMP_MINOR_PROMO_W: f64 = 0.0;
 /// 発火するので中盤（|cands| が 30〜50）では素通りする。王手中は無効。
 /// 凍結版はこの名前を知らない。
 ///
-/// 既定 4.0 は 2026-08-13 の作業点（w=2 で飽和、`promote_far_w` を外して
-/// w=4）。PR#1 の hand_asset / link_endgame / king_known_approach /
-/// material_degen は既定 0 のまま（これら込みの 5.9 構成はアリーナが対照を
-/// 上回らず不採用）。安全解消ゲート既定 on が kakutori と v13 を壊したので、
-/// こちらだけを既定オンにする。
+/// 既定 4.0 は 2026-08-13 の作業点（`promote_far_w` を外したときの作業点。
+/// PR#1 の hand_asset / link_endgame / king_known_approach /
+/// material_degen は既定 0 のまま）。安全解消ゲート既定 on は
+/// arena v13 48.1%・suite 4.614・kakutori 2/20 で不合格。
+/// **既定オンは deduce が鋭いときだけ発火する接近ボーナスに限る**
+/// （`king_belief_prox_w` は既定 0。ネット接近は deduce が鈍い大半の
+/// 局面で発火し、5.9 構成のアリーナ合算 54.0% vs 対照 56.3% に入っていた）。
 fn king_cand_attack_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -1165,7 +1167,7 @@ fn landing_support_w() -> f64 {
 const LANDING_SUPPORT_W: f64 = 0.7;
 
 /// **玉位置ネット**による接近ボーナス（`TSUITATE_KING_BELIEF_PROX_W`、
-/// 既定 **5.0**、0 で無効 = 切り戻しノブ）。
+/// 既定 **0**、env 作業点は 5.0）。
 /// `king_cand_attack_w` の**王手を掛けていない側用の対**。
 ///
 /// `deduce::opp_king_candidates` は「自分が王手を宣言した履歴」から絞るので、
@@ -1181,7 +1183,12 @@ const LANDING_SUPPORT_W: f64 = 0.7;
 /// deduce が鋭いときは `king_cand_attack_w` の領分なので発火しない（二重計上
 /// を避ける。ただしこの排他は `king_cand_attack_w` / `king_cand_check_w` の
 /// どちらかがオンで deduce 側のマップが作られたときだけ成立し、本ノブ単独で
-/// 有効化すると deduce が鋭くてもネット経路が発火する）。王手中は無効
+/// 有効化すると deduce が鋭くてもネット経路が発火する）。王手中は無効。
+///
+/// **既定 0**: ネット接近は deduce が鈍い＝対局の大半で発火する。
+/// 5.9 構成（本ノブ w=5 込み）はシナリオ 5.901 でもアリーナ合算 54.0% vs
+/// 対照 56.3% で不採用。安全解消ゲート不合格のあと接近束ごと既定オンに
+/// していたが、アリーナを下げる側の項を既定に残さない。
 fn king_belief_prox_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -1193,8 +1200,8 @@ fn king_belief_prox_w() -> f64 {
     })
 }
 
-/// 玉位置ネット接近ボーナスの既定（2026-08-14 作業点。粒子版は不発）
-const KING_BELIEF_PROX_W: f64 = 5.0;
+/// 玉位置ネット接近ボーナスの既定。0 = 無効（env 作業点は 5.0。粒子版は不発）
+const KING_BELIEF_PROX_W: f64 = 0.0;
 
 /// `promote_far_w` の課税を**全駒種**へ広げるか（`TSUITATE_PROMOTE_FAR_ALL=1`、
 /// 既定 0 = 角・飛だけ）。課税額は着手駒の交換価値で頭打ちにする
@@ -12049,7 +12056,7 @@ pub(crate) mod tests {
         }
         if std::env::var("TSUITATE_KING_BELIEF_PROX_W").is_err() {
             assert!((king_belief_prox_w() - KING_BELIEF_PROX_W).abs() < 1e-12);
-            assert_eq!(KING_BELIEF_PROX_W, 5.0);
+            assert_eq!(KING_BELIEF_PROX_W, 0.0);
         }
         if std::env::var("TSUITATE_KING_PROX_EXCLUDE_SELF").is_err() {
             assert!(king_prox_exclude_self());
