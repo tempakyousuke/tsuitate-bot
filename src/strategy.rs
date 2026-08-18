@@ -13,20 +13,20 @@ use std::time::{Duration, Instant};
 use rand::Rng;
 
 use crate::board::{
-    defend_targets, drop_targets, make_usi_drop, make_usi_move, make_usi_square, move_targets,
-    parse_usi_square, promotion_choice, Coord, Promotion,
+    Coord, Promotion, defend_targets, drop_targets, make_usi_drop, make_usi_move, make_usi_square,
+    move_targets, parse_usi_square, promotion_choice,
 };
 use crate::check::CheckSolver;
-use crate::estimator::{opp_reply_weights, Estimator, EPS_INFO};
-use crate::likelihood::{particle_features, particle_log_weight, ParticleCtx, FITTED_THETA};
+use crate::estimator::{EPS_INFO, Estimator, opp_reply_weights};
+use crate::likelihood::{FITTED_THETA, ParticleCtx, particle_features, particle_log_weight};
 use crate::model::GameModel;
 use crate::observation::{Observation, ObservationLog};
 use crate::opening::OpeningBook;
-use rand::rngs::StdRng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 
 use crate::protocol::{Color, PlayerView, Role, VisiblePiece};
-use crate::shogi::{parse_usi, piece_value, promote_role, unpromote_role, Position, ShogiMove};
+use crate::shogi::{Position, ShogiMove, parse_usi, piece_value, promote_role, unpromote_role};
 
 /// 1インスタンス = 1対局。対局開始ごとに `make` で作り直す。
 pub trait Strategy {
@@ -1604,11 +1604,7 @@ fn gold_join_king_amount(
     if chebyshev(from, king) <= 1 {
         return 0.0;
     }
-    if chebyshev(to, king) == 1 {
-        1.0
-    } else {
-        0.0
-    }
+    if chebyshev(to, king) == 1 { 1.0 } else { 0.0 }
 }
 
 /// 終盤、自玉隣接の金が玉筋へ動く量（`gold_king_file_w`）。
@@ -1629,11 +1625,7 @@ fn gold_king_file_amount(
     if to.file != king.file {
         return 0.0;
     }
-    if chebyshev(to, king) == 2 {
-        1.0
-    } else {
-        0.0
-    }
+    if chebyshev(to, king) == 2 { 1.0 } else { 0.0 }
 }
 
 /// 終盤の桂の敵陣進入課税量（`knight_late_promo_w`）。成りは 1、
@@ -1674,11 +1666,7 @@ fn knight_endgame_promo_amount(
     if role != Role::Knight || !promote || move_number < KNIGHT_ENDGAME_PROMO_MIN_MOVE {
         return 0.0;
     }
-    if in_enemy_camp(to, me) {
-        1.0
-    } else {
-        0.0
-    }
+    if in_enemy_camp(to, me) { 1.0 } else { 0.0 }
 }
 
 /// 終盤、自陣の桂が中段へ出る量（`knight_camp_exit_w`）。
@@ -12419,7 +12407,7 @@ pub(crate) mod tests {
         let me = Color::Sente;
         let from = Coord { file: 7, rank: 3 }; // 7c
         let to = Coord { file: 8, rank: 2 }; // 8b
-                                             // m145: 7a/8a/9a/9b/9c → median file 9
+        // m145: 7a/8a/9a/9b/9c → median file 9
         let mut kings = std::collections::BTreeSet::new();
         kings.insert(Coord { file: 7, rank: 1 });
         kings.insert(Coord { file: 8, rank: 1 });
@@ -12954,9 +12942,10 @@ pub(crate) mod tests {
         // ネット無しは従来どおり最近傍（9i から近いのは 5b = rank 差が小さい方…
         // チェビシェフ距離は 5a が max(4,8)=8・5b が max(4,7)=7 なので 5b）
         let out = project_taint_kings(&pool, &cands, Color::Gote, None);
-        assert!(out
-            .iter()
-            .all(|(p, _)| p.king_square(Color::Gote) == Some(b)));
+        assert!(
+            out.iter()
+                .all(|(p, _)| p.king_square(Color::Gote) == Some(b))
+        );
     }
 
     /// V3: 紐は「移動できるマス」ではなく「利かせているマス」で数える。
