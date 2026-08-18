@@ -1,6 +1,7 @@
 //! ついたて将棋bot のライブラリ部分。
 //!
-//! main.rs（本番bot）と bin/arena.rs（戦略同士のローカル対戦）が共有する。
+//! 本番bot（`main.rs`）・アリーナ（`bin/arena.rs`）・シナリオ（`bin/scenario`）・
+//! webhook アダプタ（`bin/webhook_bot`）など、対局・診断ツールが共有する。
 
 pub mod belief_features;
 pub mod belief_nn;

@@ -4,7 +4,8 @@
 //! - TSUITATE_URL: 接続先（既定 http://localhost:5173）
 //! - TSUITATE_BOT_TOKEN: マイページで発行したAPIトークン（必須）
 //! - TSUITATE_THINK_MS: 着手前の待ち時間 ms（既定 600）
-//! - TSUITATE_STRATEGY: 戦略名（既定は strategy::DEFAULT_STRATEGY）
+//! - TSUITATE_THINK_BUDGET_MS: estimator の1手あたり思考予算 ms（既定 2000）
+//! - TSUITATE_STRATEGY: 戦略名（既定は strategy::DEFAULT_STRATEGY = estimator）
 //! - TSUITATE_QUEUE_RETRY_MS: キュー参加拒否（受付時間外）後の再試行間隔 ms（既定 60000）
 //! - TSUITATE_RECORD_DIR: 対局記録（JSONL）の出力先（既定 records。空文字で記録しない）
 

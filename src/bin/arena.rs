@@ -6,8 +6,8 @@
 //!   cargo run --release --bin arena -- [対局数] [候補] [基準1] [基準2] ...
 //!
 //! 基準を複数並べるとガントレット: 候補が各基準と [対局数] ずつ対戦する。
-//! 新戦略は直近の凍結版だけでなく過去の凍結版すべてに勝ち越すこと
-//! （v2 に勝つが v1 に負ける、という非推移性の検出。src/frozen/ 参照）。
+//! 新戦略の合格条件は凍結版への勝ち越し。既定の対象は v9 以降（src/frozen/ 参照）。
+//! 引数を省略したときの戦略名は `heuristic`（本番既定の `estimator` ではない）。
 
 use tsuitate_bot::selfplay::{
     MatchStats, fischer_increment_ms, fischer_initial_ms, run_match_with, run_match_with_seeds,

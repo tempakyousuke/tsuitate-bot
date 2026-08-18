@@ -3,9 +3,9 @@
 //! `likelihood.rs::particle_features` と同じ発想（手作り特徴量・名前付き配列）
 //! だが、あちらは「粒子1個の尤もらしさ」を測る相手視点の特徴、こちらは
 //! 「局面そのものの優劣」を測る両者視点の特徴。学習データ書き出し
-//! （`bin/export_value_data`）専用で、真の `Position`（両者の駒配置が既知）
-//! からのみ計算する。将来 evaluate() へ推論を統合するときも、特徴量の定義は
-//! ここに一本化し、学習側（tsuitate-nn）とズレないようにする。
+//! （`bin/export_value_data`）と本番推論（`value_nn.rs` → `evaluate()`、
+//! estimator_v10 以降）の両方で使う。真の `Position`（両者の駒配置が既知）
+//! からのみ計算する。学習側（tsuitate-nn）とズレないよう定義はここへ一本化する。
 
 use crate::protocol::{Color, Role};
 use crate::shogi::{Position, ShogiMove, piece_value};
