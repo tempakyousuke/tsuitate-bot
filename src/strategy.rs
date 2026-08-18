@@ -446,6 +446,136 @@ fn promote_far_w() -> f64 {
     })
 }
 
+/// 玉候補への接近ボーナス（`TSUITATE_KING_CAND_ATTACK_W`、既定 0 = 無効）。
+///
+/// `deduce::opp_king_candidates`（**健全**＝真の玉を絶対に落とさない候補集合）が
+/// 鋭いとき、着地マスの近接度 `Σ_k 0.5^cheb(to,k)`（盤の最大で正規化）を
+/// `w × 近接度 × 安さ係数` で gain へ加点する（近接度は `king_cand_prox_map`、
+/// 安さ係数は歩を 1.0 に正規化した `2/(1+交換価値)`）。
+///
+/// 発端は quest31 終盤（plies 67〜148）の実測: 王手宣言のおかげで **先手側の
+/// 玉候補は 6〜17 マス**まで絞れていて真の玉（8二/8一）を必ず含むのに、
+/// この情報を使う項は `promote_far_w`（成りへの課税）しか無い。評価は
+/// 終盤ブラインドで `link`（紐）が支配し（実測: gain 3.7 のうち link 2.8）、
+/// 玉から一番遠い 3二角成／3三角成が首位を占め続けていた。採点済み eval の
+/// 高得点手は P*7c / G*7c / 7c7b+ / 7d7c+ と**玉の隣接圏に集中**する。
+///
+/// 粒子不要・ノイズゼロ（自分の観測だけで決まる）。**候補集合が鋭いときだけ**
+/// 発火するので中盤（|cands| が 30〜50）では素通りする。王手中は無効。
+/// 凍結版はこの名前を知らない。
+fn king_cand_attack_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_KING_CAND_ATTACK_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
+/// 玉候補マスへ利く手への追加加点（`TSUITATE_KING_CAND_CHECK_W`、既定 0 = 無効）。
+/// `king_cand_attack_w`（着地マスの近接度）と同じゲート・同じ安さ係数で、
+/// 「その駒が実際に玉候補へ利くか」を `blind_king_attack` で測って加点する
+/// （分布は候補集合上の一様分布 = 粒子不要）
+fn king_cand_check_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_KING_CAND_CHECK_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
+/// `king_cand_attack_w` が発火する玉候補集合の上限（`TSUITATE_KING_CAND_ATTACK_GATE`、
+/// 既定 20）。これを超えると候補が盤の半分に散っていて近接度が
+/// 「敵陣へ前進」以上の情報を持たない
+fn king_cand_attack_gate() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_KING_CAND_ATTACK_GATE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(20)
+    })
+}
+
+/// 着手後に着地マスを守っている自駒の枚数（着手駒自身は自分のマスを守れないので
+/// 移動元から着地へ利いていたぶんを引く。`blind_attack_survive_w` と同じ規約）
+fn landing_def(view: &PlayerView, mv: &ShogiMove, own_attack: &[u8; 81]) -> f64 {
+    let to = match *mv {
+        ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+    };
+    let mut def = f64::from(own_attack[crate::belief_features::sq_index(to)]);
+    if let ShogiMove::Board { from, .. } = *mv {
+        if own_defends_from(view, from, to) {
+            def -= 1.0;
+        }
+    }
+    def.max(0.0)
+}
+
+/// 玉候補接近ボーナスの**支えゲートの強さ**（`TSUITATE_LANDING_SUPPORT_W`、
+/// 既定 0 = ゲート無し）。係数は `(1−w) + w×min(着手後の支え枚数,2)/2` で、
+/// w=1 なら支え0枚の接近は加点ゼロ、w=0.5 なら半額。採点済み eval の局面内
+/// 回帰では支え枚数が +0.60点あるが、**独立した加算項にすると玉から遠い
+/// 「支えのある無意味なマス」まで加点する**ので接近側へ掛ける
+fn landing_support_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_LANDING_SUPPORT_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
+/// **玉位置ネット**による接近ボーナス（`TSUITATE_KING_BELIEF_PROX_W`、
+/// 既定 0 = 無効）。`king_cand_attack_w` の**王手を掛けていない側用の対**。
+///
+/// `deduce::opp_king_candidates` は「自分が王手を宣言した履歴」から絞るので、
+/// 王手をあまり掛けられていない側では 35〜55 マスに散ってゲートを通らない
+/// （quest_20260731 の実測: 先手は 67手目以降ずっと 6〜17 マスなのに後手は
+/// 全局面で 35〜55）。残る失点上位 `5f5g+` / `8a7c` / `4g4h` はすべて後手側の
+/// 決定で、接近ボーナスが原理的に発火していないのが上限になっている。
+///
+/// そこで **deduce が鈍いときだけ**、粒子（厳密が生きていれば厳密、全滅して
+/// いれば taint）の玉位置分布を使って同じ近接度を作る。分布が散っているとき
+/// （実効サポート数 1/Σp² が `king_cand_attack_gate` 超）は使わない。
+/// deduce が鋭いときは `king_cand_attack_w` の領分なので発火しない（二重計上
+/// を避ける。ただしこの排他は `king_cand_attack_w` / `king_cand_check_w` の
+/// どちらかがオンで deduce 側のマップが作られたときだけ成立し、本ノブ単独で
+/// 有効化すると deduce が鋭くてもネット経路が発火する）。王手中は無効
+fn king_belief_prox_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_KING_BELIEF_PROX_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
+/// `promote_far_w` の課税を**全駒種**へ広げるか（`TSUITATE_PROMOTE_FAR_ALL=1`、
+/// 既定 0 = 角・飛だけ）。課税額は着手駒の交換価値で頭打ちにする
+fn promote_far_all() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TSUITATE_PROMOTE_FAR_ALL").is_ok_and(|v| v == "1"))
+}
+
+/// `king_cand_attack_w` を**厳密粒子ゼロの決定だけ**に限るか
+/// （`TSUITATE_KING_CAND_ATTACK_BLIND=1`、既定 0 = 常に発火）。
+/// 厳密粒子が生きている決定では駒得・攻め圧力が情報を持つので、
+/// 玉候補の幾何だけで引っ張る必要は薄い、という仮説の検証用
+fn king_cand_attack_blind_only() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TSUITATE_KING_CAND_ATTACK_BLIND").is_ok_and(|v| v == "1"))
+}
+
 /// 成って王手する手の露見ペナルティ（`TSUITATE_PROMOTE_CHECK_REVEAL_W`、
 /// 既定 0 = 無効）。歩・角・飛の**成る王手**は宣言で位置が露見し、
 /// 安い駒でも回収されやすい（quest31-m095 の 7三歩成 vs 不成が発端。
@@ -466,6 +596,159 @@ fn promote_check_reveal_w() -> f64 {
             .filter(|v| v.is_finite() && *v >= 0.0)
             .unwrap_or(0.0)
     })
+}
+
+/// **成ると王手が増える手にだけ不成の双子を作り、その露見を値付けする**
+/// （`TSUITATE_NONPROMOTE_CHECK_W`、既定 0 = 無効。生成と減点の両方を
+/// この1本のノブが担う）。
+///
+/// 発端は quest_20260731 の採点済み eval に出る同型の6局面（2026-08-15）:
+/// 46/48手目の 4九銀不成(3h4i)=10 vs 4九銀成(3h4i+)=2、95手目の
+/// 7三歩不成(7d7c)=10 vs 7三歩成(7d7c+)=2、101手目 6 vs 2、50手目 6 vs 3。
+/// ユーザーの採点コメントが判定条件そのものを述べている:
+/// 「4九銀成は金が取れなかった場合、**王手がかかってしまい**、そのまま銀が
+/// 取られる展開になるので、4九銀不成の方がいい」/「成ると王手がかかって
+/// しまい、取られてしまう…成らずとしておくと、駒が取れない場合にこの歩の
+/// 存在を相手は観測できず、次に7二歩成ができる」。
+///
+/// つまり不成の価値は**成った駒種の利きが玉候補に届くかどうか**で決まる。
+/// `TSUITATE_GEN_NONPROMOTE=1`（全駒種の不成を生成）が eval で負けたのは
+/// 条件を見ずに双子を作るためで（7二歩不成=1「取れることが確定している
+/// ので不成にする意味が全くない」が最大の失点源になった）、ここでは
+/// **成りが玉候補へ新たに利きを作る手だけ**に双子を絞る。
+///
+/// 減点は成り側へ `w`（gain 内）。双子が存在する手にしか掛からないので、
+/// 逃げ場のない成り（`Promotion::Forced`）や王手が増えない成りは不動。
+/// **粒子不要**（`deduce::opp_king_candidates` 上の幾何）で、m095 のような
+/// 厳密粒子ゼロのブラインド決定でも効く。王手中は無効。
+/// 凍結版はこの名前を知らない。
+fn nonpromote_check_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_NONPROMOTE_CHECK_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
+/// 双子を作る駒種（`TSUITATE_NONPROMOTE_CHECK_ROLES`、既定 `minor` =
+/// 銀・桂・香）。`all` で歩・角・飛も対象にする。
+///
+/// **歩を既定で外すのは実測による**（2026-08-15、700ms・10シード）:
+/// 全駒種版は「成りが最善」の局面を軒並み壊した（m121 10.00→1.00・
+/// m127 9.00→1.00・m111 10.00→3.00・m020/m040 −6・m103 −6）。歩の成りは
+/// **王手が掛かること自体が狙い**の場合があり、ユーザーの採点コメントが
+/// まさに両側を述べている: 95手目「成ると王手がかかってしまい、取られて
+/// しまう」（不成=10）vs 111手目「王手がかからないと、この歩を無視して
+/// 別の手を指される」（成=10）。どちらになるかは「成った駒がそこで
+/// 生き残れるか」で決まり、ブラインド決定では観測から判定できない。
+/// 歩を含めた合計は −57.9/146件、銀桂香だけなら +11.7 と符号が逆になる
+fn nonpromote_check_roles() -> &'static str {
+    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    V.get_or_init(|| {
+        std::env::var("TSUITATE_NONPROMOTE_CHECK_ROLES").unwrap_or_else(|_| "minor".into())
+    })
+}
+
+fn nonpromote_check_role_ok(role: Role) -> bool {
+    match nonpromote_check_roles() {
+        "all" => true,
+        "silver" => role == Role::Silver,
+        _ => matches!(role, Role::Silver | Role::Knight | Role::Lance),
+    }
+}
+
+/// 双子を作る最小の王手確率（`TSUITATE_NONPROMOTE_CHECK_P`、既定 0.2）。
+fn nonpromote_check_p() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_NONPROMOTE_CHECK_P")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(0.2)
+    })
+}
+
+/// 成ることで**新たに**玉へ利きが生じる確率（不成では生じない分だけ）。
+/// `promote_checks_king_cand` との違いは2点:
+/// - **差分**であること（不成でも王手なら「成ると露見する」理由にならない）
+/// - 候補集合の**真偽でなく玉位置ネットの質量**で測ること。deduce の候補は
+///   王手をあまり掛けていない側では 35〜55 マスに散るので、真偽で見ると
+///   隣のマスへの成り（quest31-m046 の 2九銀成）まで発火してしまう
+///   （実測: 真偽版は 46手目の Optional 成りの半分以上で発火した）
+fn promotion_check_mass(
+    view: &PlayerView,
+    from: Coord,
+    to: Coord,
+    role: Role,
+    dist: &[(Coord, f64)],
+    certain_occ: &[bool; 81],
+) -> f64 {
+    if !nonpromote_check_role_ok(role) {
+        return 0.0;
+    }
+    // **着地の占有が観測で確定しているなら成る**: 露見が損になるのは
+    // 「取れなかった場合」に駒だけ晒されるからで、確実に取れるマスなら
+    // 取った時点で相手に通知される（露見コストは既に払っている）。
+    // ユーザー採点がこの区別を裏づける（2026-08-15）: 95手目
+    // 7三歩不成=10「相手が7三に駒を打っていなかった場合、王手がかかって
+    // しまい、取られてしまう」に対し、7二の銀が既知の 121/127手目は
+    // 7二歩成=9/10・不成=1、同じ 6b7c でも占有確定の 135/143手目は
+    // 銀不成=1/5
+    if certain_occ[crate::belief_features::sq_index(to)] {
+        return 0.0;
+    }
+    let Some(promo_role) = promote_role(role) else {
+        return 0.0;
+    };
+    let me = view.your_color;
+    let mut own = [false; 81];
+    for p in &view.your_pieces {
+        let Some(c) = parse_usi_square(&p.square) else {
+            continue;
+        };
+        if c == from {
+            continue; // 動かす駒は vacate
+        }
+        own[crate::belief_features::sq_index(c)] = true;
+    }
+    let mut mass = 0.0;
+    for &(k, p) in dist {
+        if k == to {
+            continue; // 玉が着地そのもの＝取る王手は「寄せ」
+        }
+        if own[crate::belief_features::sq_index(k)] {
+            continue; // 自駒マスに玉は居ない
+        }
+        if piece_attacks_sq(promo_role, me, to, k, &own)
+            && !piece_attacks_sq(role, me, to, k, &own)
+        {
+            mass += p;
+        }
+    }
+    mass
+}
+
+/// 不成の双子を作る/減点する対象か（王手確率がしきい値以上）。
+fn promotion_adds_check(
+    view: &PlayerView,
+    from: Coord,
+    to: Coord,
+    role: Role,
+    dist: &[(Coord, f64)],
+    certain_occ: &[bool; 81],
+) -> bool {
+    promotion_check_mass(view, from, to, role, dist, certain_occ) >= nonpromote_check_p()
+}
+
+/// `nonpromote_check_w` 用の玉位置分布（deduce 候補上の玉位置ネット）。
+fn nonpromote_king_dist(view: &PlayerView, log: &ObservationLog) -> Vec<(Coord, f64)> {
+    let ctx = crate::belief_features::BeliefContext::from_log(view.your_color, log);
+    let cands = crate::deduce::opp_king_candidates(view.your_color, log);
+    crate::king_belief_nn::king_distribution(&ctx, &cands)
 }
 
 /// 成る手が `deduce` 玉候補のいずれかに王手を掛けるか（観測のみ）。
@@ -720,6 +1003,21 @@ fn check_king_gain_mean() -> bool {
 /// 従来は生成段階で不成を刈っていたため、評価側（mover_check_extra /
 /// promo_potential）に判断させる機会すら無かった（実戦の 7d7c が make_eval の
 /// スケルトンにも載らない）。駒種フィルタは置かない（駒種特化を足さない方針）
+/// 不成を生成する駒種か（`TSUITATE_GEN_NONPROMOTE`）。
+/// `1` は全駒種、`minor` は**銀・桂・香だけ**（元の利きを保つ系）
+fn gen_nonpromote_for(role: Role) -> bool {
+    if gen_nonpromote_minor() {
+        return matches!(role, Role::Silver | Role::Knight | Role::Lance);
+    }
+    gen_nonpromote()
+}
+
+/// `TSUITATE_GEN_NONPROMOTE=minor`（銀桂香だけ不成を生成）か
+fn gen_nonpromote_minor() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TSUITATE_GEN_NONPROMOTE").is_ok_and(|v| v == "minor"))
+}
+
 fn gen_nonpromote() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| std::env::var("TSUITATE_GEN_NONPROMOTE").is_ok_and(|v| v == "1"))
@@ -1367,6 +1665,78 @@ fn promo_king_prox_map(w: f64, cands: &std::collections::BTreeSet<Coord>) -> Opt
         *slot = (1.0 - w) + w / (1.0 + d as f64);
     }
     Some(map)
+}
+
+/// `king_cand_attack_w` の近接マップ。マスごとに `Σ_k 0.5^cheb(sq,k) / |cands|`。
+///
+/// 候補集合全体の平均なので、候補が1点に絞れているときは隣接で 0.5・
+/// 2マス離れで 0.25 と急峻に落ち、候補が広いほど全マスで平坦になる
+/// （＝情報が無いときは自然に効かなくなる）
+/// 近接マップから**着地マス自身**（距離0）を除くか
+/// （`TSUITATE_KING_PROX_EXCLUDE_SELF=1`、既定 0 = 従来挙動）。
+///
+/// 着手できたということは玉はそのマスに居ない（打ちなら反則、移動なら玉は
+/// 取れない）ので、距離0の項は「玉に近い」根拠にならない。従来版は玉候補
+/// マスそのものへの垂れ歩に最大加点を与えていた（quest31-m119 の P*5b、
+/// ユーザー採点0）
+fn king_prox_exclude_self() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TSUITATE_KING_PROX_EXCLUDE_SELF").is_ok_and(|v| v == "1"))
+}
+
+fn king_cand_prox_map(cands: &std::collections::BTreeSet<Coord>) -> [f64; 81] {
+    let mut map = [0.0f64; 81];
+    for (i, slot) in map.iter_mut().enumerate() {
+        let sq = Coord {
+            file: (i / 9) as i8 + 1,
+            rank: (i % 9) as i8 + 1,
+        };
+        // 着地マス自身（距離0）は数えない: そこへ着手できたということは
+        // **玉はそこに居ない**（打ちなら反則、移動なら玉は取れない）ので、
+        // 「玉に近い」根拠にならない。数えていた版は玉候補マスそのものへの
+        // 無意味な垂れ歩（quest31-m119 の P*5b、採点0）へ最大加点を与えていた
+        *slot = cands
+            .iter()
+            .filter(|&&k| !king_prox_exclude_self() || k != sq)
+            .map(|&k| 0.5f64.powi(i32::from(cheb(sq, k))))
+            .sum::<f64>();
+    }
+    // 最大が 1 になるよう正規化する（候補が散っているほど生の値は小さいので、
+    // 正規化しないと w の意味が候補集合の広さで変わる）。**最短距離でなく
+    // 候補全体の和**を使うのは、候補が固まっている側（玉が居そうな一帯）を
+    // 素直に重くしたいから
+    let max = map.iter().cloned().fold(0.0f64, f64::max);
+    if max > 0.0 {
+        for slot in map.iter_mut() {
+            *slot /= max;
+        }
+    }
+    map
+}
+
+/// 玉位置分布からの近接マップ（`king_belief_prox_w`）。`king_cand_prox_map` の
+/// 確率重み版で、こちらも盤の最大で正規化する
+fn king_dist_prox_map(dist: &[(Coord, f64)]) -> [f64; 81] {
+    let mut map = [0.0f64; 81];
+    for (i, slot) in map.iter_mut().enumerate() {
+        let sq = Coord {
+            file: (i / 9) as i8 + 1,
+            rank: (i % 9) as i8 + 1,
+        };
+        // 着地マス自身は数えない（`king_cand_prox_map` と同じ理由）
+        *slot = dist
+            .iter()
+            .filter(|&&(k, _)| !king_prox_exclude_self() || k != sq)
+            .map(|&(k, p)| p * 0.5f64.powi(i32::from(cheb(sq, k))))
+            .sum::<f64>();
+    }
+    let max = map.iter().cloned().fold(0.0f64, f64::max);
+    if max > 0.0 {
+        for slot in map.iter_mut() {
+            *slot /= max;
+        }
+    }
+    map
 }
 
 /// **大駒（飛・角・香）の成り道**の価値（`major_promo_path_w`、2026-08-03）。
@@ -3567,7 +3937,7 @@ impl Strategy for EstimatorStrategy {
             return Some(usi);
         }
 
-        let mut candidates = candidate_moves(view, foul_tried);
+        let mut candidates = candidate_moves_with_log(view, foul_tried, Some(log));
         if view.you_in_check {
             // 王手中: 解消しえない手は（王手駒がどこにいても）王手放置で必ず反則に
             // なるので候補から外す。全滅したら元の候補に戻す（投了よりは反則のほうが
@@ -3981,11 +4351,61 @@ impl Strategy for EstimatorStrategy {
         let promote_far_kings: Option<std::collections::BTreeSet<Coord>> =
             (promote_far_w() > 0.0 && !view.you_in_check)
                 .then(|| crate::deduce::opp_king_candidates(view.your_color, log));
+        // 玉候補への接近ボーナスの近接マップ（`king_cand_attack_w`）。
+        // 候補集合が**鋭いときだけ**（`king_cand_attack_gate` 以下）作る:
+        // 40〜55マスに散らばった候補への近接は「敵陣へ前進」以上の意味を
+        // 持たない。王手中は無効（CheckSolver の領分）
+        let king_cand_set: Option<std::collections::BTreeSet<Coord>> =
+            ((king_cand_attack_w() > 0.0
+                || king_cand_check_w() > 0.0
+                || landing_support_w() > 0.0)
+                && !view.you_in_check)
+                .then(|| {
+                    let cands = crate::deduce::opp_king_candidates(view.your_color, log);
+                    (!cands.is_empty() && cands.len() <= king_cand_attack_gate()).then_some(cands)
+                })
+                .flatten();
+        let king_cand_prox: Option<[f64; 81]> =
+            king_cand_set.as_ref().map(|c| king_cand_prox_map(c));
+        // 粒子の玉位置ビリーフによる近接マップ（`king_belief_prox_w`）。
+        // deduce の玉候補が鈍い側（＝王手をあまり掛けていない側）でだけ使う
+        let king_belief_dist: Option<Vec<(Coord, f64)>> = (king_belief_prox_w() > 0.0
+            && !view.you_in_check
+            && king_cand_prox.is_none())
+        .then(|| {
+            // 情報源は**玉位置ネット**（`king_belief_nn`）。粒子ではない:
+            // `bin/king_cands` の実測（quest_20260731、14手目以降）で
+            // 後手側は真マス確率 0.272（一様 0.021 の13倍）・top1 46%・
+            // 実効サポート 7.2 と鋭いのに対し、粒子由来の分布は
+            // ブラインド top1 42%（メモリ）で、実際に接近ボーナスへ
+            // 流すと全水準で負けた（h1/h2/h3 実測）。
+            // ネットは deduce と**相補的**（先手は deduce が鋭くネットが
+            // top1 7%、後手はその逆）なので、deduce が鈍い側でだけ使う
+            let ctx = crate::belief_features::BeliefContext::from_log(view.your_color, log);
+            let cands = crate::deduce::opp_king_candidates(view.your_color, log);
+            let dist = crate::king_belief_nn::king_distribution(&ctx, &cands);
+            if dist.is_empty() {
+                return None;
+            }
+            // 実効サポート数（1/Σp²）が広いときは「敵陣へ前進」以上の情報が
+            // 無いので使わない。閾値は deduce 側と同じノブを共用する
+            let eff = 1.0 / dist.iter().map(|&(_, p)| p * p).sum::<f64>();
+            (eff <= king_cand_attack_gate() as f64).then_some(dist)
+        })
+        .flatten();
+        let king_belief_prox: Option<[f64; 81]> =
+            king_belief_dist.as_ref().map(|d| king_dist_prox_map(d));
         // 成る王手の露見ペナルティ用玉候補（`promote_check_reveal_w`）。
         // ブラインド決定でも効かせるため粒子不要。王手中は無効
         let promote_check_kings: Option<std::collections::BTreeSet<Coord>> =
             (promote_check_reveal_w() > 0.0 && !view.you_in_check)
                 .then(|| crate::deduce::opp_king_candidates(view.your_color, log));
+        // 不成の双子がある成り手への露見減点（`nonpromote_check_w`）。
+        // 生成側と同じ条件・同じ候補集合を使う
+        let nonpromote_check_kings: Option<(Vec<(Coord, f64)>, [bool; 81])> =
+            (nonpromote_check_w() > 0.0 && !view.you_in_check)
+                .then(|| (nonpromote_king_dist(view, log), king_threat_evidence(log)))
+                .filter(|(d, _)| !d.is_empty());
 
         // この手番の打ち反則で占有が確定したマスと、残存敵駒の平均交換価値
         // （`foul_occ_attack_w`）。反則では手番が変わらないので情報は完全に新鮮。
@@ -4093,14 +4513,107 @@ impl Strategy for EstimatorStrategy {
                     .iter()
                     .find(|p| p.square == make_usi_square(from))
                     .map(|p| p.role);
-                if w > 0.0 && matches!(role, Some(Role::Bishop | Role::Rook)) {
+                let target_role = if promote_far_all() {
+                    // 全駒種へ拡張（`TSUITATE_PROMOTE_FAR_ALL=1`）。
+                    // 玉から遠い「意味のない成り」は歩・桂・銀でも同じ理屈で
+                    // 課税されるべき（実測の失点上位は 4a3b+/5f5g+/7d7c+/4a6c+ と
+                    // ほぼ全部が成る手）。ただし課税額は駒の交換価値で頭打ちに
+                    // する（歩の成りに角と同じ 5 点を課すのは過剰）
+                    role.is_some()
+                } else {
+                    matches!(role, Some(Role::Bishop | Role::Rook))
+                };
+                if w > 0.0 && target_role {
                     // 観測裏付けの占有マスへの成り捕獲は「材料」なので免税
                     let backed_hit = opp_occ_backed
                         .as_ref()
                         .is_some_and(|b| b[crate::belief_features::sq_index(to)]);
                     if !backed_hit {
-                        out.gain -= w * promote_far_amount(from, to, cands);
+                        let mut pen = w * promote_far_amount(from, to, cands);
+                        if promote_far_all() {
+                            if let Some(r) = role {
+                                pen = pen.min(exchange_value(r));
+                            }
+                        }
+                        out.gain -= pen;
                     }
+                }
+            }
+            // 玉候補への接近ボーナス（`king_cand_attack_w` の doc 参照）。
+            // gain の内側（攻め加点は p_legal 割引の内側に置く。
+            // dragon-check-drop の教訓）。着地マスの近接度を「着地する駒の
+            // 安さ」で割る（同じ仕事なら最安の駒で）
+            if let Some((map, term_w)) = king_cand_prox
+                .as_ref()
+                .filter(|_| !king_cand_attack_blind_only() || sample.is_empty())
+                .map(|m| (m, king_cand_attack_w()))
+                .or_else(|| king_belief_prox.as_ref().map(|m| (m, king_belief_prox_w())))
+            {
+                let (to, role) = match mv {
+                    ShogiMove::Drop { role, to } => (to, role),
+                    ShogiMove::Board { from, to, promote } => {
+                        let r = view
+                            .your_pieces
+                            .iter()
+                            .find(|p| p.square == make_usi_square(from))
+                            .map(|p| p.role);
+                        match r {
+                            Some(r) if promote => (to, promote_role(r).unwrap_or(r)),
+                            Some(r) => (to, r),
+                            None => (to, Role::King),
+                        }
+                    }
+                };
+                if role != Role::King {
+                    let prox = map[crate::belief_features::sq_index(to)];
+                    // 玉候補マスへ**実際に利く**手への追加加点
+                    // （`king_cand_check_w`）。採点済み eval の局面内回帰では
+                    // 距離を制御してもなお +0.78 点ぶんの説明力がある
+                    if king_cand_check_w() > 0.0 {
+                        // 分布は deduce 側なら候補集合上の一様分布、
+                        // ネット側なら玉位置ネットの分布そのもの
+                        let dist: Option<Vec<(Coord, f64)>> = if king_cand_prox.is_some() {
+                            king_cand_set.as_ref().map(|cands| {
+                                cands
+                                    .iter()
+                                    .map(|&k| (k, 1.0 / cands.len() as f64))
+                                    .collect()
+                            })
+                        } else {
+                            king_belief_dist.clone()
+                        };
+                        if let Some(dist) = dist {
+                            let frac = blind_king_attack(view, &mv, &dist);
+                            out.gain += king_cand_check_w() * frac * 2.0
+                                / (1.0 + exchange_value(role));
+                        }
+                    }
+                    // 「同じ仕事なら最安の駒で」（`foul_occ_attack_w` と同じ規約）。
+                    // 歩を 1.0 に正規化した安さ係数を掛ける: 裸の銀・金を信念上の
+                    // 玉の隣へ投げる手（m040 の教訓）は歩の垂らしより小さい加点に
+                    // なる。採点済み eval の局面内回帰でも歩 +0.53 / 角 −0.53 と
+                    // 「安い駒の手ほど良い」が出ている
+                    // 床は敷かない: 0.4 で止めると角・飛の成り込み（4a6c+ 型、
+                    // 採点2）が玉の近くというだけで 40% の加点を受け、
+                    // 狙いの「安い駒で寄せる」から外れる（supp 実測の回帰）
+                    let cheapness = 2.0 / (1.0 + exchange_value(role));
+                    // **支えのある接近だけを満額にする**（2026-08-13 の supp2 実測。
+                    // 玉候補の隣というだけで裸の金銀打ちが浮く m145 の G*8c（採点0）
+                    // 対策で、m040 の「無防備な駒を信念上の玉の隣へ置くほど加点が
+                    // 最大になる」と同型の穴）。採点回帰でも支え枚数は +0.60点ある
+                    // 支えゲート（`landing_support_w` = ゲートの強さ）。
+                    // **独立した加算項にしてはいけない**: 玉候補ゲートの中とはいえ
+                    // 「支えのあるマスならどこでも加点」になり、飛車に支えられた
+                    // 無意味な 2二歩打が浮く（supp3 実測で P*2b が 0.85→3.9回/
+                    // シードに増え、失点 +0.154 の最大要因になった）。接近ボーナスへ
+                    // 掛けることで「支えのある寄せだけ満額」に限定する
+                    let sw = landing_support_w();
+                    let support = if sw > 0.0 {
+                        (1.0 - sw) + sw * landing_def(view, &mv, &own_attack).min(2.0) / 2.0
+                    } else {
+                        1.0
+                    };
+                    out.gain += term_w * prox * cheapness * support;
                 }
             }
             // 歩・角・飛の成る王手の露見ペナルティ（`promote_check_reveal_w`）。
@@ -4119,6 +4632,34 @@ impl Strategy for EstimatorStrategy {
                     && promote_checks_king_cand(view, from, to, role.unwrap(), cands)
                 {
                     out.gain -= w;
+                }
+            }
+            // 不成の双子がある成り手（＝成ると玉候補への利きが増える手）への
+            // 露見減点（`nonpromote_check_w`）。生成側と同一条件なので、
+            // 減点が掛かる手には必ず不成の逃げ道がある
+            if let (Some((cands, occ_ev)), ShogiMove::Board { from, to, promote }) =
+                (nonpromote_check_kings.as_ref(), mv)
+            {
+                let role = view
+                    .your_pieces
+                    .iter()
+                    .find(|p| p.square == make_usi_square(from))
+                    .map(|p| p.role);
+                if let Some(r) = role {
+                    if promotion_choice(r, from, to, view.your_color) == Promotion::Optional {
+                        let mass = promotion_check_mass(view, from, to, r, cands, occ_ev);
+                        if mass >= nonpromote_check_p() {
+                            // 双子の間の**中心化再配分**にする（成りへ減点だけ
+                            // だと、成り駒の利き・交換価値の差ぶん不成が沈んだ
+                            // ままで第三の手が繰り上がる。実測 2026-08-15:
+                            // 減点のみの版は m046/m048 で 4九銀成が消えた代わりに
+                            // 5八と（採点2）が出て 4九銀不成（採点10）は浮かなかった）。
+                            // 露見は王手が実際に掛かったときだけ起きるので
+                            // 期待値（質量）でスケールする
+                            let d = nonpromote_check_w() * mass;
+                            out.gain += if promote { -d } else { d };
+                        }
+                    }
                 }
             }
             if debug_check_enabled && view.you_in_check {
@@ -5448,7 +5989,23 @@ pub fn candidate_moves(
     view: &PlayerView,
     foul_tried: &HashSet<String>,
 ) -> Vec<(String, ShogiMove)> {
+    candidate_moves_with_log(view, foul_tried, None)
+}
+
+/// `candidate_moves` の観測ログつき版。`nonpromote_check_w` の不成生成は
+/// `deduce::opp_king_candidates`（観測のみ）を要るのでログが必要。
+/// ログ無しの呼び出し（bin/analyze の検証）では従来どおり成り一択になる。
+pub fn candidate_moves_with_log(
+    view: &PlayerView,
+    foul_tried: &HashSet<String>,
+    log: Option<&ObservationLog>,
+) -> Vec<(String, ShogiMove)> {
     let color = view.your_color;
+    // 成ると玉候補への利きが増える手だけ不成の双子を作る（`nonpromote_check_w`）
+    let nonpromote_gate: Option<(Vec<(Coord, f64)>, [bool; 81])> = log
+        .filter(|_| nonpromote_check_w() > 0.0 && !view.you_in_check)
+        .map(|l| (nonpromote_king_dist(view, l), king_threat_evidence(l)))
+        .filter(|(d, _)| !d.is_empty());
     let mut out = vec![];
     let push = |usi: String, out: &mut Vec<(String, ShogiMove)>| {
         if !foul_tried.contains(&usi) {
@@ -5470,7 +6027,21 @@ pub fn candidate_moves(
                     // TSUITATE_GEN_NONPROMOTE=1 なら不成も生成して評価側に
                     // 判断させる（gen_nonpromote の doc 参照）
                     push(make_usi_move(from, to, true), &mut out);
-                    if gen_nonpromote() {
+                    // `TSUITATE_GEN_NONPROMOTE=minor` なら**銀・桂・香だけ**
+                    // 不成を生成する。採点済み eval の実測（2026-08-14）:
+                    // 銀の不成は 3九銀不成(3h4i)=10 が2局面とも最善で一貫して
+                    // 良いのに対し、歩の不成は 10/6/3/1/1 と文脈依存で、
+                    // 全駒種で生成すると 7二歩不成（採点1「取れることが確定して
+                    // いるので不成にする意味が全くない」）が最大の失点源になる。
+                    // 「元の利きを保つ」系（銀桂香）は通常将棋と共通の理屈で
+                    // 安定して良く、「王手が増えて宣言で露見するのを避ける」系
+                    // （歩飛角）はついたて固有で局面依存、という2系統の差が
+                    // そのまま出た形
+                    if gen_nonpromote_for(piece.role)
+                        || nonpromote_gate.as_ref().is_some_and(|(d, occ)| {
+                            promotion_adds_check(view, from, to, piece.role, d, occ)
+                        })
+                    {
                         push(make_usi_move(from, to, false), &mut out);
                     }
                 }
@@ -6327,7 +6898,7 @@ fn evaluate(
                 .iter()
                 .find(|p| p.square == make_usi_square(from))
                 .map(|p| p.role);
-            let promo_bonus = if gen_nonpromote() {
+            let promo_bonus = if gen_nonpromote() || gen_nonpromote_minor() {
                 match (promote, role) {
                     (true, Some(Role::Silver | Role::Knight | Role::Lance)) => 0.0,
                     (false, Some(r @ (Role::Silver | Role::Knight | Role::Lance)))
@@ -8480,6 +9051,52 @@ pub(crate) mod tests {
             Coord { file: 6, rank: 4 }, // 6d
             &own
         ));
+    }
+
+    /// 不成の双子を作る条件（`nonpromote_check_w`）は「成ると玉候補への
+    /// 利きが**増える**」こと。quest31 の 46手目でユーザーが 4九銀不成=10 /
+    /// 4九銀成=2 と採点した根拠（成銀が 5九の玉に王手 → 宣言で露見）を固定し、
+    /// 同時に隣の 2九銀成が対象外（王手が増えない）であることも確かめる
+    #[test]
+    fn nonpromote_check_quest31_m046_silver() {
+        let text = std::fs::read_to_string("scenarios/quest31-m046.kif").expect("kif");
+        let kifu = crate::kifu::parse_kif(&text).expect("parse");
+        let rep = crate::scenario_core::replay(&kifu, 45);
+        let side = rep.pos.turn();
+        let view = crate::scenario_core::make_view(&rep.pos, side, &[0, 0]);
+        let log = &rep.logs[crate::scenario_core::side_idx(side)];
+        let dist = nonpromote_king_dist(&view, log);
+        let occ = crate::strategy::king_threat_evidence(log);
+        let from = Coord { file: 3, rank: 8 }; // 3h
+        let good =
+            promotion_check_mass(&view, from, Coord { file: 4, rank: 9 }, Role::Silver, &dist, &occ);
+        let other =
+            promotion_check_mass(&view, from, Coord { file: 2, rank: 9 }, Role::Silver, &dist, &occ);
+        assert!(
+            good > other,
+            "3h4i+ (checks the 5i king) must carry more check mass than 3h2i+: {good} vs {other}"
+        );
+        // 双子の乱造チェック: 成りが選べる手のうち発火するのはごく一部
+        let mut optional = 0usize;
+        let mut fires = 0usize;
+        for piece in &view.your_pieces {
+            let Some(f) = parse_usi_square(&piece.square) else {
+                continue;
+            };
+            for to in move_targets(&view.your_pieces, piece, side) {
+                if promotion_choice(piece.role, f, to, side) != Promotion::Optional {
+                    continue;
+                }
+                optional += 1;
+                if promotion_check_mass(&view, f, to, piece.role, &dist, &occ) >= good {
+                    fires += 1;
+                }
+            }
+        }
+        assert!(
+            fires * 3 <= optional,
+            "twin generation should stay narrow: {fires}/{optional} (3h4i+ mass={good})"
+        );
     }
 
     /// 捕獲直後の手戻り免除ノブは既定 0 = 無効（作業点 0.08 は env で有効化）。
