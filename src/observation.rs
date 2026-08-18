@@ -7,7 +7,6 @@
 //! がすべて。これが bot が得る情報の全量で、`GameModel` が自駒配置を再構成し、
 //! `Estimator` が相手局面の粒子集合を維持する入力になる。
 //! 対局記録（`record.rs`）と終局サマリも同じ履歴を書く。
-#![allow(dead_code)]
 
 use serde::{Deserialize, Serialize};
 

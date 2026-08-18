@@ -281,7 +281,10 @@ JSON（DBの列をそのままJSON.parseして詰め直すだけでよい）。`
   **未収載候補の追記は `scripts/quest_review/append_unscored.py`**
   （suite の TRIAL TSV から、選ばれたのに eval に無い手を `?` で足す）。
   評価ノブを変えると候補の顔ぶれが変わるので、採用のたびに回してユーザーの
-  評価を仰ぐ。USI を併記してあるのは重複判定を確実にするため
+  評価を仰ぐ。USI を併記してあるのは重複判定を確実にするため。
+  md 時代の前身 `append_new_candidates.py`（`bin/rank_dump` の出力から
+  docs/quest_20260731.md へ足す）は残してあるが、eval が一次資料になった今は
+  使わない。
   ベースライン（2026-08-02 main、20試行）: 不合格 20/20 が4件
   （m015=2二と・m021=4一と・m027=4一龍・m029=4一龍）で、診断と改善の優先順は
   `docs/improvement-plan-2026-08-02-quest31.md`（要約: 幻の詰みボーナス

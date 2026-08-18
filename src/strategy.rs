@@ -302,9 +302,11 @@ pub fn choose_move(view: &PlayerView, foul_tried: &HashSet<String>) -> Option<St
 const EVAL_PARTICLES: usize = 192;
 
 /// 1手の思考予算（ms）の既定値。TSUITATE_THINK_BUDGET_MS で上書きできる。
-/// このリポジトリのアリーナは 1000秒+3秒 なので既定はやや厚めに使う。
-/// 本番サイト（300秒+3秒）へのデプロイ時は環境変数で絞って
-/// 思考時間（=強さ）を調整する（例: 900 で v5 相当の予算）
+/// **アリーナ（1000秒+3秒）も本番サイト（300秒+3秒）も既定の 2000 のまま**でよい
+/// （2026-07-26 実測: 300秒+3秒・100局で時間切れ0・クロック消費13.9%）。
+/// 900 へ絞ると −14.5pt、8000 へ増やしても +0.5pt で飽和しており、
+/// もう強さの調整ノブではない。候補側だけ変える版比較・スイープには
+/// `TSUITATE_CAND_THINK_BUDGET_MS` を使う（凍結版はこの名前を知らない）。
 const DEFAULT_THINK_BUDGET_MS: u64 = 2000;
 /// スケール1.0の基準予算。v5 までの暗黙の実測上限（p99 ≒ 900ms）
 const REFERENCE_BUDGET_MS: f64 = 900.0;
