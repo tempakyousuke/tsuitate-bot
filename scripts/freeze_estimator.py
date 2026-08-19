@@ -16,7 +16,10 @@
 - `EstimatorStrategy` → `EstimatorVN`、`fn name()` の戻り値 → "estimator_vN"
 - **運用ノブ（TSUITATE_* の env）は既定値に固定する**。凍結版が候補側の
   w スイープに反応すると比較が壊れるため（2026-07-26 に判明した罠。
-  TSUITATE_THINK_BUDGET_MS だけは既存の凍結版と揃えて残す）
+  TSUITATE_THINK_BUDGET_MS だけは既存の凍結版と揃えて残す。候補側専用の
+  TSUITATE_CAND_THINK_BUDGET_MS は落とす）。
+  **固定できるのは PINNED に列挙した関数だけ**で、それ以外の `TSUITATE_*` は
+  凍結時点の読み方のまま残る（凍結版が読む env の一覧は CLAUDE.md）
 """
 
 import re
@@ -147,6 +150,16 @@ def main() -> None:
 
     body = "\n\n".join(strip_file(p) for p in SRC)
     body = pin_env_knobs(body)
+    # 候補側専用の思考予算 `TSUITATE_CAND_THINK_BUDGET_MS` は凍結版に読ませない
+    # （v12/v13 は凍結時にこの行ごと持ち込んでしまい「候補側だけ予算を変える」
+    # 前提が崩れていた。v14 以降は既存版と同じ `TSUITATE_THINK_BUDGET_MS` だけ）
+    body, n_budget = re.subn(
+        r'for name in \["TSUITATE_CAND_THINK_BUDGET_MS", "TSUITATE_THINK_BUDGET_MS"\]',
+        'for name in ["TSUITATE_THINK_BUDGET_MS"]',
+        body,
+    )
+    if n_budget != 1:
+        raise SystemExit(f"思考予算の env 名リストの置換に失敗（{n_budget}件）")
     # 診断フック（発火率カウンタ）は凍結版では動かさない
     body = re.sub(
         r" *if crate::hits::enabled\(\) \{.*?\n *\}\n",

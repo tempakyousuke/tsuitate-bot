@@ -8,7 +8,7 @@ doc の各行は「4七歩成(4f4g+) 悪手。…」の形。評価語の判定:
 - 「悪くない」「悪くはない」「悪手ではない」「悪手とは言えない」→ not bad
   （否定形を先に潰してから「悪手」を探す）
 反則後ブロック（`### N手目（…の反則後）`）は `fouls=` 付きシナリオへ対応させる
-（FOUL_MAP）。**冪等**なので、doc に判定を書き足すたびに回せばよい。
+（対応表は foul_blocks.py に一本化。ここに私製の表を持たない）。**冪等**なので、doc に判定を書き足すたびに回せばよい。
 
 注意: 判定は**候補行に書く**こと（節見出しに書いても拾えない）。bot の候補に
 上がらなかった手でも、行として足しておけば bad に入る
@@ -20,26 +20,14 @@ import os
 import pathlib
 import re
 
+from foul_blocks import scenario_for
+
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 DOC = pathlib.Path(os.environ.get("QUEST_DOC", ROOT / "docs" / "quest_20260731.md"))
 SCN = ROOT / "scenarios"
 SEC_RE = re.compile(r"^## (\d+)手目")
 SUB_RE = re.compile(r"^### (\d+)手目（(.+?)の反則後）")
 USI_RE = re.compile(r"\((\d[a-i]\d[a-i]\+?|[PLNSGBR]\*\d[a-i])\)")
-
-# 反則後ブロックの見出しキー → シナリオ名
-FOUL_MAP = {
-    (30, "1二飛(5b1b)"): "quest31-m030f1",
-    (30, "2一歩打(P*2a)"): "quest31-m030f2",
-    (40, "5六銀打(S*5f)"): "quest31-m040f1",
-    (41, "2一龍(2d2a)"): "quest31-m041f1",
-    (50, "3五玉(4e3e)"): "quest31-m050f1",
-    (58, "4七歩打(P*4g)"): "quest31-m058f1",
-    (62, "4七歩打(P*4g)"): "quest31-m062f1",
-    (66, "4六玉(4e4f)"): "quest31-m066f1",
-    (75, "6二銀打(S*6b)"): "quest31-m075f1",
-    (90, "7八歩打(P*7h)"): "quest31-m090f1",
-}
 
 
 def is_bad(text: str) -> bool:
@@ -73,7 +61,7 @@ def main() -> None:
 
     changed = 0
     for (num, sub), entries in sorted(blocks.items(), key=lambda kv: (kv[0][0], kv[0][1] or "")):
-        name = FOUL_MAP.get((num, sub)) if sub else f"quest31-m{num:03d}"
+        name = scenario_for((num, sub))
         if name is None:
             continue
         path = SCN / f"{name}.kif"

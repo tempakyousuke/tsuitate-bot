@@ -36,7 +36,7 @@ cargo run --release
 | `TSUITATE_BOT_TOKEN` | （必須） | マイページで発行したAPIトークン |
 | `TSUITATE_THINK_MS` | `600` | 着手前の待ち時間 ms |
 | `TSUITATE_THINK_BUDGET_MS` | `2000` | estimator の1手あたり思考予算 ms（アリーナ・本番ともこのまま） |
-| `TSUITATE_STRATEGY` | `estimator` | 戦略名（`heuristic` や `estimator_v13` なども可） |
+| `TSUITATE_STRATEGY` | `estimator` | 戦略名（`heuristic` や `estimator_v14` なども可） |
 | `TSUITATE_QUEUE_RETRY_MS` | `60000` | キュー参加拒否（受付時間外など）後の再試行間隔 ms |
 | `TSUITATE_RECORD_DIR` | `records` | 対局記録（JSONL）の出力先。空文字で無効 |
 
