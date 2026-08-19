@@ -474,13 +474,13 @@
             </button>
           </div>
           <div class="status dim">
-            {view.totalMoves}手 / 反則 ▲{view.snapshot.fouls[0]} △{view.snapshot.fouls[1]}
+            {view.totalMoves}手 / 反則 ▲{view.snapshot.fouls[0]} △{view.snapshot.fouls[1]}（残り ▲{10 - view.snapshot.fouls[0]} △{10 - view.snapshot.fouls[1]}）
             / ▲{view.names[0]}（seed={view.seeds[0]}）vs △{view.names[1]}（seed={view
               .seeds[1]}）{view.budgetMs}ms
           </div>
         {:else}
           <div class="status dim">
-            {view.totalMoves}手 / 反則 ▲{view.snapshot.fouls[0]} △{view.snapshot.fouls[1]} /
+            {view.totalMoves}手 / 反則 ▲{view.snapshot.fouls[0]} △{view.snapshot.fouls[1]}（残り ▲{10 - view.snapshot.fouls[0]} △{10 - view.snapshot.fouls[1]}） /
             bot={view.humanColor === "sente" ? view.names[1] : view.names[0]}（seed={view
               .humanColor === "sente"
               ? view.seeds[1]

@@ -171,6 +171,7 @@
         </div>
         <div class="replay-info dim">
           反則累計 ▲{snapshot.fouls[0]} △{snapshot.fouls[1]}
+          （残り ▲{10 - snapshot.fouls[0]} △{10 - snapshot.fouls[1]}）
           {#if kifu.target}／ 注目手: {kifu.target}{/if}
         </div>
       </section>
