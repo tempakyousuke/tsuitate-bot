@@ -6,5 +6,5 @@
   "shards": 4,
   "oracle": "",
   "clock": "",
-  "env": "TSUITATE_CHECK_FOUL_EVIDENCE=1"
+  "env": "TSUITATE_TURN_FOUL_ESCALATION=0.5"
 }

@@ -5938,6 +5938,9 @@ impl Strategy for EstimatorStrategy {
             // p_legal を安全方向に落とすだけ。gain 内の課税は anchor_move の
             // 教訓で反則経済を壊すので使わない。
             out.p_legal *= king_repeat_legal_factor(&mv, my_king, &stale_king_dests, repeat_w);
+            // 同一手番で既に反則した回数による反則コストの割り増し
+            // （`turn_foul_escalation`。既定 0 = 従来挙動）
+            out.foul_cost *= turn_foul_cost_factor(foul_tried.len());
             // 王手中: 仮説条件付きの「王手駒の除去期待値」（check.rs::removal_term）。
             // 王手駒のマスを取る手は受理された未来で脅威ごと駒を排除し、玉逃げ等の
             // 解消手は王手駒を盤に残す。この差は粒子が真の王手駒を外している局面
@@ -7198,6 +7201,47 @@ fn king_repeat_legal_factor(
         }
         _ => 1.0,
     }
+}
+
+/// **同一手番で既に反則した回数による反則コストの割り増し**
+/// （`TSUITATE_TURN_FOUL_ESCALATION`、既定 **0** = 従来挙動、作業点 0.5）。
+///
+/// 反則コストは「残り反則予算」だけで決まり、**この手番で既に何回外したか**を
+/// 見ていない。しかし同一手番の反則は「この局面でのモデル（王手駒仮説・占有
+/// 信念）が外れている」という直接の証拠なので、次の候補の実際の反則確率は
+/// モデルの p_legal より高い。つまり期待コストは予算だけで決まる値より高い。
+///
+/// 実測（`bin/mine_check` が採掘した被王手の決定点、2026-08-19）: 1手番で
+/// 4〜7回の反則を焼く決定点が実在し、arena-check-foul01 は 10 回の予算のうち
+/// 7 回を1手番で使っていた。アリーナの反則内訳（104局のシャード実測）は
+/// 打ちマス 77 / 王手解消失敗 72 / 経路 18 で、王手中のバーストは
+/// 反則負け（全終局の約55%）に直結する。
+///
+/// `foul_cost *= 1 + w × この手番の反則回数`。反則0回のときは何も変えないので、
+/// **反則を1回も出していない決定の序列は不変**（静的な反則課税が押し出しを
+/// 生んだ `anchor_move` / `drop_probe_repeat_gate` の失敗を避ける）。
+/// 凍結版はこの名前を知らないので `-f env=` は候補側にだけ効く
+fn turn_foul_escalation() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_TURN_FOUL_ESCALATION")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(TURN_FOUL_ESCALATION)
+    })
+}
+
+/// `turn_foul_escalation` の既定（0 = 従来挙動）
+const TURN_FOUL_ESCALATION: f64 = 0.0;
+
+/// この手番の反則回数に応じた反則コストの倍率（`turn_foul_escalation` の doc）
+fn turn_foul_cost_factor(fouls_this_turn: usize) -> f64 {
+    let w = turn_foul_escalation();
+    if w <= 0.0 || fouls_this_turn == 0 {
+        return 1.0;
+    }
+    1.0 + w * fouls_this_turn as f64
 }
 
 /// 残り反則1回（次の反則で即負け）のときの反則コストの床
@@ -10541,6 +10585,18 @@ pub(crate) mod tests {
     }
 
     /// 残り反則 1/2/3 回の床。材料スケールのコストは押し上げ、詰みスケールは通す。
+    #[test]
+    fn turn_foul_escalation_is_identity_by_default_and_scales_with_fouls() {
+        // 既定（env なし）は倍率1.0 = 挙動不変
+        if std::env::var("TSUITATE_TURN_FOUL_ESCALATION").is_err() {
+            assert_eq!(TURN_FOUL_ESCALATION, 0.0);
+            assert_eq!(turn_foul_cost_factor(0), 1.0);
+            assert_eq!(turn_foul_cost_factor(3), 1.0);
+        }
+        // 反則0回のときは w に依らず 1.0（反則を出していない決定の序列は不変）
+        assert_eq!(1.0 + 0.5 * 0.0, 1.0);
+    }
+
     #[test]
     fn foul_budget_floors_raise_material_cost_not_mate() {
         if std::env::var("TSUITATE_LAST_FOUL_GUARD").is_err()
