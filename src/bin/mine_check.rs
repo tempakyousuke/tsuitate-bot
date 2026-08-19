@@ -278,14 +278,14 @@ fn main() {
                     h.k
                 ),
             };
-            let mut out = String::new();
-            out.push_str("棋戦：arena\n手合割：平手\n先手：先手\n後手：後手\n手数----指手---------消費時間--\n");
-            out.push_str(&format!(
+            // *scenario 行は先頭（sync_eval.py は1行目をヘッダとして書き換える）
+            let mut out = format!(
                 "*scenario ply={} target={} desc={}\n",
                 h.ply,
                 h.target,
                 desc.replace('\n', " ")
-            ));
+            );
+            out.push_str("棋戦：arena\n手合割：平手\n先手：先手\n後手：後手\n手数----指手---------消費時間--\n");
             let ending = if h.foul_attempts.iter().any(|(mn, _)| *mn as usize > h.moves.len()) {
                 Some("反則負け")
             } else {

@@ -43,10 +43,18 @@
 ## ワークフロー
 
 1. **スケルトン生成**（新しい棋譜のレビュー開始・候補の追記）:
-   `cargo run --release --bin make_eval -- <kif> [eval出力] [top_n=15] [seed=0]`
+   `cargo run --release --bin make_eval -- [--ply N] <kif> [eval出力] [top_n=15] [seed=0]`
    全決定点（反則後サブ状態含む）の候補上位と実戦手を列挙する。**冪等**:
    既存の採点・コメントは保全し、未収載の候補だけ追記する（ランキングの
-   揺れで再実行ごとに数行増えることはある）。重い（1棋譜 ≒ 対局1局ぶん）
+   揺れで再実行ごとに数行増えることはある）。重い（1棋譜 ≒ 対局1局ぶん）。
+   `--ply N` で決定点を1つ（kif の `*scenario ply=` と同じ数え方）に絞れる
+   = **単一決定点シナリオ**（`scenarios/arena-check-*.kif` のような
+   1 kif = 1 決定点のもの）用。eval は `evals/<シナリオ名>.eval.md` に置き、
+   sync_eval は eval の stem と同名の kif があれば `## N手目` を N == ply+1 の
+   ときだけそのシナリオへ、反則後ブロックは `fouls=` 末尾が一致する
+   `<名>f<k>.kif` へ同期する（foul_blocks の表は不要）。
+   arena-check の eval には採点の参考として真実の盤面（`bin/scenario <名> board`
+   の出力）を引用で入れてある（パーサは `和名(USI) 点` 行しか読まないので無害）
 2. **採点**: `?` を 0〜10 に書き換える（コメント任意）
 3. **同期**: `python3 scripts/quest_review/sync_eval.py [evalパス]`
    シナリオの `scores=`（採点全量）と `bad=`（**2点以下**）を更新する。

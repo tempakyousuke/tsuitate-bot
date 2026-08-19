@@ -1,7 +1,12 @@
 //! 棋譜から採点式評価ファイル（evals/*.eval.md）のスケルトンを生成・追記する。
 //!
 //! usage:
-//!   cargo run --release --bin make_eval -- <kifへのパス> [eval出力パス] [top_n=15] [seed=0]
+//!   cargo run --release --bin make_eval -- [--ply N] <kifへのパス> [eval出力パス] [top_n=15] [seed=0]
+//!
+//! `--ply N` で決定点を1つ（N 手まで再生した局面 = N+1 手目。kif の
+//! `*scenario ply=` と同じ数え方）に絞る（単一決定点のシナリオ kif、
+//! 例 scenarios/arena-check-*.kif 用。推定器の構築はその ply までで済む）。
+//! 省略時は従来どおり全決定点。
 //!
 //! 各決定点（反則後サブ状態を含む）について現行 estimator の候補上位 top_n と
 //! 実戦手を列挙し、eval ファイルに `和名(USI) ?` の行として書く。**冪等**:
@@ -171,9 +176,19 @@ fn candidates_of(snap: &dyn Strategy, chosen: &Option<String>, top_n: usize) -> 
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let mut only_ply: Option<usize> = None;
+    if let Some(i) = args.iter().position(|a| a == "--ply") {
+        let v = args.get(i + 1).and_then(|v| v.parse().ok());
+        let Some(v) = v else {
+            eprintln!("--ply には数値が必要です");
+            std::process::exit(2);
+        };
+        only_ply = Some(v);
+        args.drain(i..i + 2);
+    }
     if args.is_empty() {
-        eprintln!("usage: make_eval <kifへのパス> [eval出力パス] [top_n=15] [seed=0]");
+        eprintln!("usage: make_eval [--ply N] <kifへのパス> [eval出力パス] [top_n=15] [seed=0]");
         std::process::exit(2);
     }
     let kif_path = PathBuf::from(&args[0]);
@@ -206,7 +221,14 @@ fn main() {
     let mut chains: [Option<Chain>; 2] = [None, None];
     let mut added = 0usize;
     let last = kifu.plies.len();
-    for m in 1..=last {
+    let (m_from, m_to) = match only_ply {
+        Some(p) => {
+            assert!(p < last, "--ply {p} が棋譜の手数 {last} 以上です");
+            (p + 1, p + 1)
+        }
+        None => (1, last),
+    };
+    for m in m_from..=m_to {
         let ply = m - 1;
         let rep = replay(&kifu, ply);
         let side = rep.pos.turn();

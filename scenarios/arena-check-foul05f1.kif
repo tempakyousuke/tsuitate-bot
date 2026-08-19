@@ -1,4 +1,4 @@
-*scenario ply=138 target=5g6g desc=アリーナ自己対局 1787110033730-arena-6 の139手目（bot=Sente）: 被王手（王手駒 6gTokin）で反則 4 回（5g5h 5g4h 4g5h 3h6h）のあと 5g6g を指した。K=1
+*scenario ply=138 fouls=5g5h target=5g6g desc=アリーナ自己対局 1787110033730-arena-6 の139手目（bot=Sente）: 被王手（王手駒 6gTokin）で反則 4 回（5g5h 5g4h 4g5h 3h6h）のあと 5g6g を指した。K=1｜反則後サブ状態 f1（5g5h の反則後）
 棋戦：arena
 手合割：平手
 先手：先手

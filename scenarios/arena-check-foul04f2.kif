@@ -1,4 +1,4 @@
-*scenario ply=49 target=2e2f desc=アリーナ自己対局 1787111496787-arena-35 の50手目（bot=Gote）: 被王手（王手駒 2fKnight）で反則 5 回（1c3e 4d4e 1c2d 1c4f 2a4c）のあと 2e2f を指した。K=3
+*scenario ply=49 fouls=1c3e,4d4e target=2e2f desc=アリーナ自己対局 1787111496787-arena-35 の50手目（bot=Gote）: 被王手（王手駒 2fKnight）で反則 5 回（1c3e 4d4e 1c2d 1c4f 2a4c）のあと 2e2f を指した。K=3｜反則後サブ状態 f2（1c3e 4d4e の反則後）
 棋戦：arena
 手合割：平手
 先手：先手

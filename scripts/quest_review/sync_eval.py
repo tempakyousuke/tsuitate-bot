@@ -6,6 +6,10 @@
 - `scores=` は採点済み（? 以外）の全候補 `USI:点` を列挙
 - `bad=` は score <= BAD_THRESHOLD の手（従来の不合格計との互換表示用）
 - 反則後ブロック（`### N手目（…の反則後）`）は foul_blocks.FOUL_MAP のシナリオへ対応
+- **単一決定点の eval**（eval の stem と同名の `scenarios/<stem>.kif` がある場合、
+  例 `evals/arena-check-foul01.eval.md`）: `## N手目` は N == ply+1 のときだけ
+  `<stem>` へ、反則後ブロックは `fouls=` の末尾がその USI に一致する
+  `<stem>f*.kif` へ対応（foul_blocks の表は使わない）
 - **冪等**。eval に点を書き足すたびに回せばよい
 """
 
@@ -63,15 +67,48 @@ def set_directive(header: str, name: str, value: str | None) -> str:
     return f"{header} {name}={value}"
 
 
+def _header_directive(path: pathlib.Path, name: str) -> str | None:
+    head = path.read_text(encoding="utf-8").split("\n", 1)[0]
+    m = re.search(rf"(?:^|\s){name}=(\S+)", head)
+    return m.group(1) if m else None
+
+
+def single_decision_map(stem: str):
+    """単一決定点シナリオ（`scenarios/<stem>.kif` が存在）のブロック→シナリオ対応。
+    該当しなければ None を返す（従来の foul_blocks 経路）"""
+    base = SCN / f"{stem}.kif"
+    if not base.exists():
+        return None
+    ply = int(_header_directive(base, "ply") or -1)
+    # 反則後サブ状態: <stem>f<k>.kif の fouls= 末尾 USI -> 名前
+    subs: dict[str, str] = {}
+    for p in SCN.glob(f"{stem}f*.kif"):
+        fouls = _header_directive(p, "fouls")
+        if fouls:
+            subs[fouls.split(",")[-1]] = p.stem
+
+    def lookup(key: tuple[int, str | None]) -> str | None:
+        num, sub = key
+        if num != ply + 1:
+            return None
+        if sub is None:
+            return stem
+        m = re.search(r"\(([^)]+)\)", sub)
+        return subs.get(m.group(1)) if m else None
+
+    return lookup
+
+
 def main() -> None:
     eval_path = pathlib.Path(
         sys.argv[1] if len(sys.argv) > 1 else ROOT / "evals" / "quest_20260731.eval.md"
     )
     prefix = os.environ.get("EVAL_SCENARIO_PREFIX", "quest31-m")
     blocks = parse_eval(eval_path)
+    single = single_decision_map(eval_path.name.split(".")[0])
     changed = 0
     for (num, sub), entries in sorted(blocks.items(), key=lambda kv: (kv[0][0], kv[0][1] or "")):
-        name = scenario_for((num, sub), prefix)
+        name = single((num, sub)) if single else scenario_for((num, sub), prefix)
         if name is None:
             continue
         path = SCN / f"{name}.kif"

@@ -1,4 +1,4 @@
-*scenario ply=98 target=4h4g desc=アリーナ自己対局 1787111913279-arena-34 の99手目（bot=Sente）: 被王手（王手駒 4gTokin）で反則 4 回（4h3h 4h5i 4h5h 4h4i）のあと 4h4g を指した。K=1
+*scenario ply=98 fouls=4h3h target=4h4g desc=アリーナ自己対局 1787111913279-arena-34 の99手目（bot=Sente）: 被王手（王手駒 4gTokin）で反則 4 回（4h3h 4h5i 4h5h 4h4i）のあと 4h4g を指した。K=1｜反則後サブ状態 f1（4h3h の反則後）
 棋戦：arena
 手合割：平手
 先手：先手

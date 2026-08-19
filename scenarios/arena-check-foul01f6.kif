@@ -1,4 +1,4 @@
-*scenario ply=79 target=N*2a desc=アリーナ自己対局 1787112584864-arena-43 の80手目（bot=Gote）: 被王手（王手駒 1aRook）で反則 7 回（3a3b 3c2b 4b2b 4a3b 3a2a 4b3b 3a2b）のあと N*2a を指した。K=1
+*scenario ply=79 fouls=3a3b,3c2b,4b2b,4a3b,3a2a,4b3b target=N*2a desc=アリーナ自己対局 1787112584864-arena-43 の80手目（bot=Gote）: 被王手（王手駒 1aRook）で反則 7 回（3a3b 3c2b 4b2b 4a3b 3a2a 4b3b 3a2b）のあと N*2a を指した。K=1｜反則後サブ状態 f6（3a3b 3c2b 4b2b 4a3b 3a2a 4b3b の反則後）
 棋戦：arena
 手合割：平手
 先手：先手
