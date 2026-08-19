@@ -7166,7 +7166,7 @@ fn king_repeat_foul_w() -> f64 {
 /// 玉行き先の再訪割引。既定 0（作業点は 0.8）。
 const KING_REPEAT_FOUL_W: f64 = 0.0;
 
-/// 玉の手の p_legal を、厳密粒子の合法割合へ寄せる
+/// 玉の手の p_legal を、厳密粒子の合法割合で安全方向に締める
 /// （`TSUITATE_KING_PARTICLE_LEGAL_W`、既定 **1.0**。0 で従来の
 /// prior ブレンドのまま）。
 ///
@@ -7180,6 +7180,7 @@ const KING_REPEAT_FOUL_W: f64 = 0.0;
 /// 粒子が「支え付きで非合法」と言っているのに prior=0.73 / 退化ブレンドで
 /// p_legal が 0.4 まで持ち上がると、その gain が逃げ手を上回る
 /// （king-evade のオラクル錨でも 6a5b・6a7b が先に出る残ギャップ）。
+/// **押し上げはしない**: 置換版は通常 king-evade で幻合法を信じて悪化した。
 /// taint / 粒子ゼロでは発火しない（recap-dragon のブラインド取り返しは不変）。
 /// 非玉の手は触らない（kakutori の捕獲プローブは CheckSolver のまま）。
 /// 凍結版はこの名前を知らないので `-f env=` は候補側にだけ効く。
@@ -7194,18 +7195,23 @@ fn king_particle_legal_w() -> f64 {
     })
 }
 
-/// 玉の手の粒子合法割合ミックス。既定 1.0（作業点=既定。0 で切り戻し）。
+/// 玉の手の粒子合法割合ミックス（安全方向のみ）。既定 1.0。0 で切り戻し。
 const KING_PARTICLE_LEGAL_W: f64 = 1.0;
 
 /// ブレンド済み p_legal と粒子の合法割合 `legal/n` を w で混ぜる。
-/// w=0 または粒子質量 0 ならブレンド側のまま。w≥1 なら粒子割合そのもの。
+/// **安全方向のみ**（`min`）: 粒子が合法と言っても押し上げない。
+/// 非オラクルの king-evade で w=1 置換が 6a7b/6a6b の幻合法を信じて
+/// 反則 5→9/3試行に増えた（2026-08-19）。オラクルでは 6a5b が消えるので
+/// 「粒子が非合法と言ったときだけ落とす」が両方を満たす。
+/// w=0 または粒子質量 0 ならブレンド側のまま。
 fn mix_king_particle_legal(blended: f64, legal: f64, n: f64, w: f64) -> f64 {
     if w <= 0.0 || n <= 0.0 {
         return blended;
     }
     let frac = (legal / n).clamp(0.0, 1.0);
     let w = w.min(1.0);
-    (1.0 - w) * blended + w * frac
+    let mixed = (1.0 - w) * blended + w * frac;
+    mixed.min(blended)
 }
 
 /// 玉の手が汚名のある行き先なら `1-w`、それ以外は 1。
@@ -10228,19 +10234,20 @@ pub(crate) mod tests {
         );
     }
 
-    /// 玉の手の粒子合法割合ミックス: w=1 なら粒子の legal/n そのもの、
-    /// w=0 や粒子ゼロはブレンド側を残す。退化ブレンドで持ち上がった
-    /// p_legal を、全員非合法の粒子が 0 へ落とせる。
+    /// 玉の手の粒子合法割合ミックス: 粒子が非合法なら落とす。
+    /// 粒子が合法と言っても blended より上にはしない（安全方向のみ）。
     #[test]
-    fn mix_king_particle_legal_prefers_particle_fraction() {
+    fn mix_king_particle_legal_only_lowers() {
         let blended = 0.45; // prior=0.73・退化 w が大きいときの玉捕獲
         assert_eq!(mix_king_particle_legal(blended, 0.0, 8.0, 1.0), 0.0);
-        assert_eq!(mix_king_particle_legal(blended, 8.0, 8.0, 1.0), 1.0);
-        assert!((mix_king_particle_legal(blended, 4.0, 8.0, 1.0) - 0.5).abs() < 1e-12);
+        assert_eq!(mix_king_particle_legal(blended, 8.0, 8.0, 1.0), blended);
+        assert_eq!(mix_king_particle_legal(blended, 4.0, 8.0, 1.0), blended);
         assert_eq!(mix_king_particle_legal(blended, 0.0, 8.0, 0.0), blended);
         assert_eq!(mix_king_particle_legal(blended, 0.0, 0.0, 1.0), blended);
         assert!((mix_king_particle_legal(blended, 0.0, 8.0, 0.5) - 0.5 * blended).abs() < 1e-12);
         assert_eq!(mix_king_particle_legal(blended, 0.0, 8.0, 2.0), 0.0);
+        let high = 0.9;
+        assert!((mix_king_particle_legal(high, 2.0, 8.0, 1.0) - 0.25).abs() < 1e-12);
     }
 
     #[test]
