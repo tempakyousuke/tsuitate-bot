@@ -761,21 +761,28 @@ fn advance(
                     to,
                     role_after,
                 } => {
-                    // wasPromotion が欠落した場合（反則エントリで観測済み）は、
-                    // 着手前に from にあった自駒の成り先と着手後の駒種2文字を
-                    // 比較して成りを復元する。役に立つ比較ができない場合
+                    // 成りの判定は wasPromotion だけに頼らない。実戦 dispatcher は
+                    // **反則エントリで `wasPromotion: false` を明示的に返す**
+                    // （着手が適用されなかったので「成りは起きていない」扱い。
+                    // 2026-08-19 に VPS ログ 1,302 反則行で確認: 成駒コード付きの
+                    // 反則 202 件すべてが false）。欠落時だけの復元では
+                    // `Some(false)` を素通しして `4g4a+` の反則を `4g4a` と記録し、
+                    // foul_tried の完全一致から漏れて同じ成り手を反則し続けていた
+                    // （実測: 同一成り手の連続反則 65 回、`+4741NY` ×4 等）。
+                    // そこで「着手前に from にあった自駒の成り先 == 着手後の駒種
+                    // 2文字」なら常に成りとみなす。役に立つ比較ができない場合
                     // （from に自駒が見つからない、成れない駒種等。存在しない駒を
                     // 動かす反則など role_after が pre-role と無関係な場合を含む）
-                    // は不成扱い（従来どおり）
-                    let promoted = entry.was_promotion.unwrap_or_else(|| {
-                        session
-                            .model
-                            .my_pieces()
-                            .into_iter()
-                            .find(|p| p.square == make_usi_square(from))
-                            .and_then(|p| promote_role(p.role))
-                            == Some(role_after)
-                    });
+                    // は wasPromotion の値（欠落なら不成）に従う
+                    let role_after_is_promotion_of_pre_role = session
+                        .model
+                        .my_pieces()
+                        .into_iter()
+                        .find(|p| p.square == make_usi_square(from))
+                        .and_then(|p| promote_role(p.role))
+                        == Some(role_after);
+                    let promoted =
+                        role_after_is_promotion_of_pre_role || entry.was_promotion == Some(true);
                     make_usi_move(from, to, promoted)
                 }
                 CsaMoveKind::Drop { role, to } => {
@@ -1221,6 +1228,69 @@ mod tests {
             _ => None,
         });
         assert_eq!(my_move.as_deref(), Some("8h2b+"));
+    }
+
+    #[test]
+    fn foul_entry_with_explicit_false_was_promotion_still_records_promoted_usi() {
+        // 実戦 dispatcher の反則エントリ: lastMove は成駒コード付きの手そのもの
+        // （+4741NY = 4七香→4一成）だが wasPromotion は明示的に false で返る。
+        // ここで "4g4a" と記録すると foul_tried が "4g4a+" を除外できず
+        // 同じ成り手を反則し続ける（VPS ログで確認済みの実バグ）
+        let mut session = GameSession::new("heuristic", Color::Sente).unwrap();
+        let mut positions = HashMap::new();
+        positions.insert("0".to_string(), initial_entry());
+        // 香を 9i→9g→... と動かすのは手数がかかるので、初期配置の角(8h)の
+        // 成り込み反則で同じ経路を検証する
+        positions.insert(
+            "1".to_string(),
+            PositionEntry {
+                sfen: "ignored".into(),
+                fouls: Some(FoulsField { b: 8, w: 9 }),
+                last_move: Some("+8822UM".into()),
+                last_info: Some(INFO_FOUL),
+                last_capture: None,
+                was_promotion: Some(false),
+            },
+        );
+        advance(&mut session, &positions, 1).unwrap();
+
+        let foul_usi = session.log.events().iter().find_map(|e| match e {
+            Observation::MyFoul { usi, .. } => Some(usi.clone()),
+            _ => None,
+        });
+        assert_eq!(foul_usi.as_deref(), Some("8h2b+"));
+        let foul_tried = collect_foul_tried(&session.log, session.next_move_number);
+        assert!(foul_tried.contains("8h2b+"));
+        assert!(!foul_tried.contains("8h2b"));
+        assert_eq!(session.next_move_number, 1, "反則なので手番は進まない");
+    }
+
+    #[test]
+    fn accepted_unpromoted_move_with_false_was_promotion_stays_unpromoted() {
+        // 成れる駒が成らずに動いた受理手（wasPromotion=false・末尾は元の駒種）
+        // は従来どおり不成のまま。role_after(角) != promote_role(角)=馬 なので
+        // 新しい判定でも成りに化けない
+        let mut session = GameSession::new("heuristic", Color::Sente).unwrap();
+        let mut positions = HashMap::new();
+        positions.insert("0".to_string(), initial_entry());
+        positions.insert(
+            "1".to_string(),
+            PositionEntry {
+                sfen: "ignored".into(),
+                fouls: Some(FoulsField { b: 9, w: 9 }),
+                last_move: Some("+8822KA".into()),
+                last_info: Some(INFO_NONE),
+                last_capture: None,
+                was_promotion: Some(false),
+            },
+        );
+        advance(&mut session, &positions, 1).unwrap();
+
+        let my_move = session.log.events().iter().find_map(|e| match e {
+            Observation::MyMove { usi, .. } => Some(usi.clone()),
+            _ => None,
+        });
+        assert_eq!(my_move.as_deref(), Some("8h2b"));
     }
 
     #[test]
