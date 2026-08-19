@@ -14,7 +14,9 @@ name: Scenario Suite
 # ChoiceStats を共有するので suite と完全一致）。
 # シード・試行数は旧方式と同一なので統計的には等価。
 #
-# 手動起動のみ。
+# 起動は次の2通り（通常のコード push では走らない）:
+#   1. Actions UI / `gh workflow run` の手動起動（workflow_dispatch）
+#   2. `.github/ci/scenario.request.json` を含む push（エージェントが gh 無しで回す用）
 on:
   workflow_dispatch:
     inputs:
@@ -34,17 +36,60 @@ on:
         description: "評価ノブ（スペース区切りの TSUITATE_XXX=値。arena.yml と同じ形式）"
         required: false
         default: ""
+  push:
+    paths:
+      - ".github/ci/scenario.request.json"
 
 jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
       seeds: ${{ steps.list.outputs.seeds }}
+      trials: ${{ steps.list.outputs.trials }}
+      strategy: ${{ steps.list.outputs.strategy }}
+      scenarios: ${{ steps.list.outputs.scenarios }}
+      env: ${{ steps.list.outputs.env }}
     steps:
+      - uses: actions/checkout@v4
       - id: list
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IN_TRIALS: ${{ github.event.inputs.trials }}
+          IN_STRATEGY: ${{ github.event.inputs.strategy }}
+          IN_SCENARIOS: ${{ github.event.inputs.scenarios }}
+          IN_ENV: ${{ github.event.inputs.env }}
         run: |
-          trials='${{ inputs.trials }}'
-          echo "seeds=$(jq -c -n --argjson n "${trials:-20}" '[range(0; $n)]')" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          req='.github/ci/scenario.request.json'
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            trials="${IN_TRIALS:-20}"
+            strategy="${IN_STRATEGY:-estimator}"
+            scenarios="${IN_SCENARIOS:-}"
+            extra_env="${IN_ENV:-}"
+          else
+            if [ ! -f "$req" ]; then
+              echo "push 起動なのに $req が無い" >&2
+              exit 1
+            fi
+            trials=$(jq -r '.trials // 20' "$req")
+            strategy=$(jq -r '.strategy // "estimator"' "$req")
+            scenarios=$(jq -r '
+              if (.scenarios | type) == "array" then .scenarios | join(" ")
+              else .scenarios // ""
+              end
+            ' "$req")
+            extra_env=$(jq -r '.env // ""' "$req")
+          fi
+          echo "起動: event=$EVENT_NAME trials=$trials strategy=$strategy scenarios=$scenarios env=$extra_env"
+          echo "seeds=$(jq -c -n --argjson n "${trials}" '[range(0; $n)]')" >> "$GITHUB_OUTPUT"
+          echo "trials=$trials" >> "$GITHUB_OUTPUT"
+          echo "strategy=$strategy" >> "$GITHUB_OUTPUT"
+          echo "scenarios=$scenarios" >> "$GITHUB_OUTPUT"
+          {
+            echo "env<<EOF"
+            echo "$extra_env"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
   shard:
     needs: plan
@@ -62,8 +107,8 @@ jobs:
 
       - name: Run suite shard
         env:
-          SCENARIO_EXTRA_ENV: ${{ inputs.env }}
-          SCENARIO_ONLY: ${{ inputs.scenarios }}
+          SCENARIO_EXTRA_ENV: ${{ needs.plan.outputs.env }}
+          SCENARIO_ONLY: ${{ needs.plan.outputs.scenarios }}
         run: |
           # 評価ノブ（TSUITATE_* のみ許可）。arena.yml と同じ規約
           for kv in $SCENARIO_EXTRA_ENV; do
@@ -77,7 +122,7 @@ jobs:
             only_args=(--only "$SCENARIO_ONLY")
           fi
           cargo run --release --bin scenario -- \
-            suite 1 "${{ inputs.strategy }}" \
+            suite 1 "${{ needs.plan.outputs.strategy }}" \
             --seed-base "${{ matrix.seed }}" --tsv "${only_args[@]}" \
             | tee result.txt
 
@@ -98,7 +143,7 @@ jobs:
           path: result.txt
 
   aggregate:
-    needs: shard
+    needs: [plan, shard]
     if: always()
     runs-on: ubuntu-latest
     steps:
@@ -117,7 +162,7 @@ jobs:
         run: |
           cargo run --release --bin scenario -- merge results/*/result.txt | tee merged.md
           {
-            echo "## Scenario Suite（各 ${{ inputs.trials }} 試行 / 戦略 ${{ inputs.strategy }} / env '${{ inputs.env }}'）"
+            echo "## Scenario Suite（各 ${{ needs.plan.outputs.trials }} 試行 / 戦略 ${{ needs.plan.outputs.strategy }} / env '${{ needs.plan.outputs.env }}'）"
             echo ""
             cat merged.md
           } >> "$GITHUB_STEP_SUMMARY"

@@ -17,9 +17,13 @@
   明示指定すれば対戦は可能）。
   50%付近の信頼区間は 100局で±10pt / 200局で±7pt / 1000局で±3.1pt。当面（開発最初期）は
   100局を既定とし、結果が信頼区間内で判定できない僅差のときだけ局数を増やす。
-  **実行はローカルでなく GitHub Actions で行う**（`.github/workflows/arena.yml`、手動起動のみ）:
-  対象ブランチを push して
+  **実行はローカルでなく GitHub Actions で行う**（`.github/workflows/arena.yml`）。
+  起動は2通りで、**通常のコード push では走らない**:
+  1. 手動: 対象ブランチを push して
   `gh workflow run arena.yml --ref <ブランチ> -f games=100 -f candidate=estimator -f baselines="estimator_v6 estimator_v7"`。
+  2. リクエストファイル: `.github/ci/arena.request.json` を書いてそのファイルを含む
+  commit を push する（例は `arena.request.example.json`。エージェントが
+  `gh` 無しで回す用。JSON のキーは手動起動の inputs と同じ）。
   「基準 × シャード」の matrix に分割され（`-f shards=4` 既定。単一基準の
   200局も4ランナーに並列化される）、総合結果は **aggregate ジョブのサマリー**
   （および artifact `arena-combined`）に合算表で出る。シャード個別は
@@ -155,8 +159,10 @@
   suite は (棋譜,手番) グループ単位でコア数までスレッド並列
   （`SCENARIO_WORKERS` で上書き可）。
   **全件 suite は CI のシードシャードで回す**
-  （`.github/workflows/scenario.yml`、手動起動のみ）:
-  `gh workflow run scenario.yml --ref <ブランチ> -f trials=20`。
+  （`.github/workflows/scenario.yml`。通常のコード push では走らない）:
+  手動は `gh workflow run scenario.yml --ref <ブランチ> -f trials=20`。
+  `gh` が使えないときは `.github/ci/scenario.request.json` を書いて push
+  （例は `scenario.request.example.json`）。
   **1シード=1ランナー**の matrix（trials=N でシード 0..N-1 の N ランナー。
   各ランナーは `suite 1 --seed-base <シード> --tsv` で全シナリオ1試行）で、
   ランナー内はチェーン共有＋グループ並列が効く。総合表は aggregate ジョブが
