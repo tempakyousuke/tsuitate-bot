@@ -1,0 +1,6 @@
+{
+  "trials": 20,
+  "strategy": "estimator",
+  "scenarios": "",
+  "env": "TSUITATE_CHECK_BELIEF_OCC_W=0"
+}
