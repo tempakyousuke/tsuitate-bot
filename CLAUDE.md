@@ -240,6 +240,13 @@
   N は平均79〜82手で N<10 はアリーナ800局で出現ゼロ（対人・終盤では効きうるので
   指標には残す）。王手の期待反則数は「手段クラス数 × 解消手の互いに素性 ÷ 解消手数」
   で決まる（詳細はメモリ strong-check-few-resolutions）
+- `cargo run --release --bin mine_check -- [--min-fouls N] [--emit <dir> <接頭辞>] <records/*.jsonl...>`
+  — **被王手の決定点の採掘**（2026-08-19）。記録の真実を再生し bot 側の被王手
+  決定点から「反則を N 回以上した」（foul）と「王手駒を玉以外で取れたのに
+  玉を逃げた」（flee、取り返しの有無つき）を TSV で列挙、`--emit` で
+  `scenarios/` 形式の kif を書き出す（`*scenario ply= target= desc=` 付き、
+  flee の target は最安の捕獲手）。粒子を回さないので一瞬。採掘した12件は
+  `scenarios/arena-check-*.kif`（scenarios/README.md）
 - `cargo run --release --bin king_cands -- <kif> [開始手目] [終了手目]` — 各決定点で
   `deduce::opp_king_candidates` が何マスまで絞れているか・真の玉を含んでいるか
   （健全性）を一覧する（2026-08-13）。**粒子を回さないので一瞬で終わる**ので、
