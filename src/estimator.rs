@@ -461,6 +461,14 @@ pub struct Estimator {
     /// belief を計算した時点の観測イベント数。同じ履歴で `update` が複数回
     /// 呼ばれても（prewarm・webhook のコールドスタート）作り直さないためのキャッシュ鍵
     belief_at: usize,
+    /// **オラクル錨**（bin/scenario の `oracle=` / `--oracle` 用）: Some なら
+    /// 粒子集合は `(真実の局面, その時点の制約 index)` から出発している。
+    /// リプレイ生成（replay_once）は初期局面でなくこの錨から始める。
+    /// 実対局では常に None（観測にない情報は使わない、という公平性の前提は
+    /// この経路を呼ばないことで守る。`oracle_anchor` の doc 参照）
+    anchor: Option<(Position, usize)>,
+    /// oracle_anchor が履歴の帳簿だけを進めている間 replenish を抑止する
+    suppress_replenish: bool,
     rng: StdRng,
 }
 
@@ -534,8 +542,60 @@ impl Estimator {
             in_check_at: vec![],
             belief: None,
             belief_at: usize::MAX,
+            anchor: None,
+            suppress_replenish: false,
             rng: StdRng::seed_from_u64(seed),
         }
+    }
+
+    /// **オラクル錨**: 観測ログの接頭辞 `log_prefix` までの履歴を帳簿（制約列・
+    /// 自玉位置・被王手状態・取ったマス等）だけ進め、粒子集合をその時点の
+    /// **真実の局面** `truth` の複製で張り直す。以後の `update` は通常どおり
+    /// （接頭辞より後の相手手は観測と整合する合法手をサンプルして分岐する）。
+    ///
+    /// 用途は局面再現実験の切り分け専用: 「直前の相手手だけが分からない」
+    /// 状態を粒子生成なしで一瞬で作り、被王手時の悪手が信念（粒子）の問題か
+    /// 評価パラメータの問題かを分ける。**真実を粒子に与えるので、本来確証の
+    /// ない駒を取りに行く等「完全確定粒子がなければ分かり得ない手」が出る**。
+    /// 実対局・アリーナからは決して呼ばないこと（観測にない情報を使う）。
+    ///
+    /// 未更新（cursor=0）の推定器にだけ使える。`log_prefix` は以後渡すログの
+    /// 接頭辞でなければならない（update は cursor から続きを消化する）。
+    /// リプレイ生成（粒子が全滅・不足したときの再生成）は初期局面でなく
+    /// この錨から始める（錨より前の制約は真実で満たされている）
+    pub fn oracle_anchor(&mut self, log_prefix: &ObservationLog, truth: &Position) {
+        assert!(
+            self.cursor == 0 && self.constraints.is_empty(),
+            "oracle_anchor は未更新の推定器にだけ使える"
+        );
+        // 粒子を空にして帳簿だけ進める（空集合の apply_constraint は救済・
+        // 若返り・墓場のどれも走らないので安い）。replenish は抑止する
+        self.particles.clear();
+        self.info_miss.clear();
+        self.logw.clear();
+        self.hist.clear();
+        self.phys_taint.clear();
+        self.graveyard.clear();
+        self.suppress_replenish = true;
+        self.update(log_prefix);
+        self.suppress_replenish = false;
+        // 真実で張り直す。hist は空（錨より前へは巻き戻せない = 錨は真実なので
+        // 戻る必要もない）、logw は 0 起点（rebase も錨に揃える）
+        let n = self.target;
+        self.particles = vec![truth.clone(); n];
+        self.info_miss = vec![0; n];
+        self.logw = vec![0.0; n];
+        self.hist = vec![VecDeque::new(); n];
+        self.phys_taint = vec![0; n];
+        self.rebase_cidx = self.constraints.len();
+        self.anchor = Some((truth.clone(), self.constraints.len()));
+        self.healthy = true;
+        self.last_ess = n as f64;
+    }
+
+    /// オラクル錨が張られているか（診断表示用）
+    pub fn is_oracle_anchored(&self) -> bool {
+        self.anchor.is_some()
     }
 
     /// 粒子の目標数（思考予算に応じてスケール済み）
@@ -716,6 +776,9 @@ impl Estimator {
                 self.my_touched_sq.push(to);
             }
             self.constraints.push(constraint);
+        }
+        if self.suppress_replenish {
+            return;
         }
         self.replenish();
     }
@@ -1590,11 +1653,14 @@ impl Estimator {
         let belief_from = self.belief_from_cidx();
         let step_budget = n * 4 + 32;
         let mut steps = 0usize;
-        let mut pos = Position::initial();
+        // オラクル錨があればそこから（錨より前の制約は真実で満たされている）
+        let (mut pos, mut i) = match &self.anchor {
+            Some((truth, cidx)) => (truth.clone(), *cidx),
+            None => (Position::initial(), 0),
+        };
         let mut lw = 0.0f64;
         // 決定点スタック: (制約index, 適用前の局面, 適用前の対数重み, 再試行回数)
         let mut stack: Vec<(usize, Position, f64, u32)> = vec![];
-        let mut i = 0;
         while i < n {
             steps += 1;
             if steps > step_budget {

@@ -24,6 +24,10 @@
 //!   cargo run --release --bin scenario -- <名前> continue [対局数=10] [手番側戦略] [相手戦略]
 //!   cargo run --release --bin scenario -- suite [試行数=10] [戦略=estimator]
 //!   共通フラグ: --ply N / --target USI / --diag 5g,4h （*scenario 行より優先）
+//!   オラクル錨: --oracle N（N手目までの真実を手番側に与える）/ --oracle-lag K
+//!   （ply−K 手目まで。K=1 で「直前の相手手だけ分からない」）。*scenario 行の
+//!   oracle=N より優先。粒子生成を省くので一瞬で終わるが、真実由来の手が出る
+//!   ことを織り込んで読む（scenario_core::Scenario::oracle の doc 参照）
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -33,9 +37,10 @@ use tsuitate_bot::estimator::Estimator;
 use tsuitate_bot::observation::Observation;
 use tsuitate_bot::protocol::{Color, Role};
 use tsuitate_bot::scenario_core::{
-    ChoiceStats, Replayed, Scenario, apply_scenario_fouls, build_estimator, choice_trials,
-    choice_trials_batch, choice_trials_batch_range_with, clone_log, kifu_key, load_scenario,
-    make_view, replay, scenarios_dir, side_idx, weighted_unique_particles,
+    ChoiceStats, Replayed, Scenario, apply_scenario_fouls, apply_scenario_oracle,
+    build_estimator, choice_trials, choice_trials_batch, choice_trials_batch_range_with,
+    clone_log, kifu_key, load_scenario, make_view, prewarm_for_trial, replay, scenarios_dir,
+    side_idx, weighted_unique_particles,
 };
 use tsuitate_bot::shogi::{Outcome, Position, ShogiMove, parse_usi, unpromote_role};
 use tsuitate_bot::strategy;
@@ -48,7 +53,64 @@ fn usage() -> &'static str {
   cargo run --release --bin scenario -- suite [試行数=10] [戦略=estimator]
   cargo run --release --bin scenario -- merge <TRIAL行入りファイル...>
   共通フラグ: --ply N / --target USI / --diag 5g,4h
+  オラクル錨: --oracle N / --oracle-lag K（*scenario oracle=N より優先。
+             手番側に N 手目までの真実を与え、以後は観測だけで考えさせる）
   suite用フラグ: --seed-base N / --tsv / --only 名前,..."
+}
+
+/// オラクル錨のコマンドライン上書き
+#[derive(Clone, Copy)]
+enum OracleFlag {
+    /// 上書きなし（*scenario oracle= があればそれ）
+    Keep,
+    /// N 手目までの真実
+    Abs(usize),
+    /// ply−K 手目までの真実（K=1 = 直前の相手手だけ不明）
+    Lag(usize),
+}
+
+/// オラクル錨の上書きを適用する（ply を超える指定は起動時エラー）
+fn resolve_oracle(sc: &mut Scenario, flag: OracleFlag) {
+    match flag {
+        OracleFlag::Keep => {}
+        OracleFlag::Abs(n) => {
+            if n > sc.ply {
+                exit_usage(&format!(
+                    "{}: --oracle {n} が ply={} を超えています",
+                    sc.name, sc.ply
+                ));
+            }
+            sc.oracle = Some(n);
+        }
+        OracleFlag::Lag(k) => {
+            if k > sc.ply {
+                exit_usage(&format!(
+                    "{}: --oracle-lag {k} が ply={} を超えています",
+                    sc.name, sc.ply
+                ));
+            }
+            sc.oracle = Some(sc.ply - k);
+        }
+    }
+}
+
+/// シナリオのリプレイ（真実の局面・観測ログ）を作る: 反則注入（fouls=）と
+/// オラクル錨（oracle=）を反映した Replayed
+fn prepare_replay(sc: &Scenario) -> Replayed {
+    let mut rep = replay(&sc.kifu, sc.ply);
+    apply_scenario_fouls(&mut rep, &sc.fouls);
+    if let Some(o) = sc.oracle {
+        apply_scenario_oracle(&mut rep, &sc.kifu, o);
+    }
+    rep
+}
+
+/// オラクル錨の表示用注記（ヘッダに添える）
+fn oracle_note(sc: &Scenario) -> String {
+    match sc.oracle {
+        Some(o) => format!(" / オラクル錨: {o}手目までの真実（{}手ぶん観測のみ）", sc.ply - o),
+        None => String::new(),
+    }
 }
 
 fn exit_usage(msg: &str) -> ! {
@@ -81,11 +143,12 @@ fn run_choice_trials(
     if verbose {
         println!("局面: {}", sc.desc);
         println!(
-            "手番: {:?}（{}手目）/ ここまでの反則 先手{} 後手{} / 戦略: {name} / 試行 {trials} 回",
+            "手番: {:?}（{}手目）/ ここまでの反則 先手{} 後手{} / 戦略: {name} / 試行 {trials} 回{}",
             side,
             sc.ply + 1,
             rep.fouls[0],
-            rep.fouls[1]
+            rep.fouls[1],
+            oracle_note(sc)
         );
         println!();
     }
@@ -140,18 +203,18 @@ fn print_tally(sc: &Scenario, stats: &ChoiceStats, trials: u64) {
 
 /// 複数シナリオの一括選択試行。同一棋譜×同一手番側のシナリオは推定器の構築を
 /// 継ぎ足しで共有する（詳細は scenario_core::choice_trials_batch）
-fn run_batch(specs: &[String], trials: u64, name: &str) {
+fn run_batch(specs: &[String], trials: u64, name: &str, oracle: OracleFlag) {
     let mut loaded: Vec<(Scenario, Replayed)> = vec![];
     for spec in specs {
-        let sc = match load_scenario(spec, None, None, None) {
+        let mut sc = match load_scenario(spec, None, None, None) {
             Ok(sc) => sc,
             Err(e) => {
                 eprintln!("{spec}: 読み込み失敗: {e}");
                 std::process::exit(1);
             }
         };
-        let mut rep = replay(&sc.kifu, sc.ply);
-        apply_scenario_fouls(&mut rep, &sc.fouls);
+        resolve_oracle(&mut sc, oracle);
+        let rep = prepare_replay(&sc);
         if let Some(outcome) = rep.pos.outcome() {
             eprintln!("{spec}: ply={} の局面は終局しています（{outcome:?}）", sc.ply);
             std::process::exit(1);
@@ -183,7 +246,7 @@ fn run_batch(specs: &[String], trials: u64, name: &str) {
     });
     for ((sc, _), st) in loaded.iter().zip(&stats) {
         println!();
-        println!("===== {}（{}手目） =====", sc.name, sc.ply + 1);
+        println!("===== {}（{}手目）{} =====", sc.name, sc.ply + 1, oracle_note(sc));
         print_tally(sc, st, trials);
     }
 }
@@ -636,7 +699,12 @@ fn continue_games(sc: &Scenario, rep: &Replayed, games: u64, name_me: &str, name
         let mut logs = [clone_log(&rep.logs[0]), clone_log(&rep.logs[1])];
         for (i, strat) in strats.iter_mut().enumerate() {
             let color = if i == 0 { Color::Sente } else { Color::Gote };
-            strategy::prewarm_strategy(&mut **strat, &make_view(&rep.pos, color, &rep.fouls), &logs[i]);
+            if color == me {
+                // 手番側だけオラクル錨（oracle=）を反映する。相手側は通常どおり
+                prewarm_for_trial(&mut **strat, rep);
+            } else {
+                strategy::prewarm_strategy(&mut **strat, &make_view(&rep.pos, color, &rep.fouls), &logs[i]);
+            }
         }
         let mut fouls = rep.fouls;
         let mut foul_tried: [HashSet<String>; 2] = [HashSet::new(), HashSet::new()];
@@ -774,7 +842,14 @@ fn continue_games(sc: &Scenario, rep: &Replayed, games: u64, name_me: &str, name
 /// (棋譜, 手番側) のグループごとにワーカースレッドへ分配して並列実行する
 /// （bin/tune のシナリオ目的関数と同じ分割。ワーカー数は物理コア数まで =
 /// choose の壁時計予算を奪い合わない範囲。`SCENARIO_WORKERS` で上書き可）
-fn run_suite(trials: u64, name: &str, seed_base: u64, tsv: bool, only: &[String]) {
+fn run_suite(
+    trials: u64,
+    name: &str,
+    seed_base: u64,
+    tsv: bool,
+    only: &[String],
+    oracle: OracleFlag,
+) {
     let dir = scenarios_dir();
     let mut paths: Vec<PathBuf> = std::fs::read_dir(&dir)
         .unwrap_or_else(|e| panic!("{} を読めません: {e}", dir.display()))
@@ -787,22 +862,33 @@ fn run_suite(trials: u64, name: &str, seed_base: u64, tsv: bool, only: &[String]
         })
         .collect();
     paths.sort();
+    let oracle_banner = match oracle {
+        OracleFlag::Keep => String::new(),
+        OracleFlag::Abs(n) => format!(" / オラクル錨 --oracle {n}"),
+        OracleFlag::Lag(k) => format!(" / オラクル錨 --oracle-lag {k}"),
+    };
     println!(
-        "スイート: {} 件 / 戦略 {name} / 各 {trials} 試行 seed {seed_base}〜（同一棋譜×同一手番は構築を共有）",
+        "スイート: {} 件 / 戦略 {name} / 各 {trials} 試行 seed {seed_base}〜（同一棋譜×同一手番は構築を共有）{oracle_banner}",
         paths.len()
     );
     println!();
     let mut loaded: Vec<(Scenario, Replayed)> = vec![];
     for path in paths {
-        let sc = match load_scenario(&path.to_string_lossy(), None, None, None) {
+        let mut sc = match load_scenario(&path.to_string_lossy(), None, None, None) {
             Ok(sc) => sc,
             Err(e) => {
                 println!("{}: 読み込み失敗: {e}", path.display());
                 continue;
             }
         };
-        let mut rep = replay(&sc.kifu, sc.ply);
-        apply_scenario_fouls(&mut rep, &sc.fouls);
+        // --oracle-lag が ply を超えるシナリオ（序盤の短い棋譜）は 0 手目 =
+        // 初期局面で錨を張る（全て観測のみ = 実質通常どおり）
+        match oracle {
+            OracleFlag::Lag(k) if k > sc.ply => sc.oracle = Some(0),
+            OracleFlag::Abs(n) if n > sc.ply => sc.oracle = Some(sc.ply),
+            f => resolve_oracle(&mut sc, f),
+        }
+        let rep = prepare_replay(&sc);
         loaded.push((sc, rep));
     }
 
@@ -1027,6 +1113,7 @@ fn main() {
     let mut seed_base: u64 = 0;
     let mut tsv = false;
     let mut only: Vec<String> = vec![];
+    let mut oracle = OracleFlag::Keep;
     let mut args: Vec<String> = vec![];
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -1070,6 +1157,20 @@ fn main() {
                 tsv = true;
                 i += 1;
             }
+            "--oracle" => {
+                let Some(value) = raw.get(i + 1) else {
+                    exit_usage("--oracle には値（手数）が必要です");
+                };
+                oracle = OracleFlag::Abs(parse_u64_arg("--oracle", value) as usize);
+                i += 2;
+            }
+            "--oracle-lag" => {
+                let Some(value) = raw.get(i + 1) else {
+                    exit_usage("--oracle-lag には値（手数）が必要です");
+                };
+                oracle = OracleFlag::Lag(parse_u64_arg("--oracle-lag", value) as usize);
+                i += 2;
+            }
             "--only" => {
                 let Some(value) = raw.get(i + 1) else {
                     exit_usage("--only には値が必要です");
@@ -1094,7 +1195,7 @@ fn main() {
         let trials = args.get(1).map(|s| parse_u64_arg("試行数", s)).unwrap_or(10);
         let name = args.get(2).map(String::as_str).unwrap_or("estimator");
         validate_strategy_name(name);
-        run_suite(trials, name, seed_base, tsv, &only);
+        run_suite(trials, name, seed_base, tsv, &only, oracle);
         return;
     }
     if spec == "merge" {
@@ -1122,11 +1223,11 @@ fn main() {
         if specs.is_empty() {
             exit_usage("batch にはシナリオ名を1つ以上指定してください");
         }
-        run_batch(&specs, trials, &name);
+        run_batch(&specs, trials, &name, oracle);
         return;
     }
 
-    let sc = match load_scenario(spec, ply_flag, target_flag, diag_flag) {
+    let mut sc = match load_scenario(spec, ply_flag, target_flag, diag_flag) {
         Ok(sc) => sc,
         Err(e) => {
             eprintln!("{e}");
@@ -1137,8 +1238,8 @@ fn main() {
             std::process::exit(1);
         }
     };
-    let mut rep = replay(&sc.kifu, sc.ply);
-    apply_scenario_fouls(&mut rep, &sc.fouls);
+    resolve_oracle(&mut sc, oracle);
+    let rep = prepare_replay(&sc);
     if let Some(outcome) = rep.pos.outcome() {
         eprintln!(
             "ply={} の局面は終局しています（{outcome:?}）。--ply を見直してください",
@@ -1149,6 +1250,9 @@ fn main() {
 
     match args.get(1).map(String::as_str) {
         Some("board") => print_truth_board(&sc, &rep),
+        Some("diag") if sc.oracle.is_some() => {
+            exit_usage("diag はオラクル錨（oracle= / --oracle）と併用できません（粒子の信念を測る診断なので錨では意味がない）");
+        }
         Some("diag") => {
             let n = args
                 .get(2)

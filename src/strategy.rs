@@ -66,6 +66,39 @@ pub trait Strategy {
     fn clone_boxed(&self) -> Option<Box<dyn Strategy>> {
         None
     }
+
+    /// **オラクル錨**（bin/scenario 専用）: 観測ログの接頭辞 `log_prefix` の
+    /// 時点の**真実の局面** `truth` を内部推定器に与え、以後の観測だけを
+    /// 通常どおり処理させる（`Estimator::oracle_anchor`）。「直前の相手手だけが
+    /// 分からない」状態を粒子生成なしで作るための切り分け用。対応しない戦略
+    /// （凍結版）は false を返す。**実対局・アリーナからは呼ばない**
+    fn oracle_anchor(
+        &mut self,
+        _view: &PlayerView,
+        _log_prefix: &ObservationLog,
+        _truth: &Position,
+    ) -> bool {
+        false
+    }
+}
+
+/// `prewarm_strategy` の「先頭 `skip` イベントは prewarm せずに記録だけする」版。
+/// オラクル錨（`Strategy::oracle_anchor`）で接頭辞まで帳簿を進めた戦略に、
+/// 残りのイベントだけを実対局と同じ規約（自分手番イベントの直前で prewarm）で
+/// 食わせるために使う
+pub fn prewarm_strategy_from(
+    strat: &mut dyn Strategy,
+    view: &PlayerView,
+    full: &ObservationLog,
+    skip: usize,
+) {
+    let mut running = ObservationLog::default();
+    for (i, e) in full.events().iter().enumerate() {
+        if i >= skip && matches!(e, Observation::MyMove { .. } | Observation::MyFoul { .. }) {
+            strat.prewarm(view, &running);
+        }
+        running.record(e.clone());
+    }
 }
 
 /// 蓄積済みの観測ログを「自分の手番ごとの逐次 update」で戦略に温めさせる。
@@ -5238,6 +5271,22 @@ impl Strategy for EstimatorStrategy {
             None => Estimator::with_scale(view.your_color, budget.scale),
         });
         est.update(log);
+    }
+
+    fn oracle_anchor(
+        &mut self,
+        view: &PlayerView,
+        log_prefix: &ObservationLog,
+        truth: &Position,
+    ) -> bool {
+        let budget = self.budget;
+        let seed = self.seed;
+        let est = self.est.get_or_insert_with(|| match seed {
+            Some(s) => Estimator::with_seed_and_scale(view.your_color, s, budget.scale),
+            None => Estimator::with_scale(view.your_color, budget.scale),
+        });
+        est.oracle_anchor(log_prefix, truth);
+        true
     }
 
     fn choose(

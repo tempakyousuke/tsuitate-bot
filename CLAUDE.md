@@ -158,6 +158,12 @@
   食わせる。等価性テストあり）。
   suite は (棋譜,手番) グループ単位でコア数までスレッド並列
   （`SCENARIO_WORKERS` で上書き可）。
+  **オラクル錨**（2026-08-19）: `--oracle N` / `--oracle-lag K`（kif の
+  `oracle=N`）で手番側の推定器に「N 手目までの真実」を与え、以後は観測だけで
+  処理させる（`Estimator::oracle_anchor`。`--oracle-lag 1` = 直前の相手手だけ
+  不明）。粒子生成を省くので一瞬で終わり、悪手が「錨でも出る＝評価/CheckSolver
+  側」「錨で消える＝信念側」の切り分けに使う。真実由来の手が出ることは織り込む。
+  実対局・アリーナからは呼ばない（観測にない情報）。詳細は scenarios/README.md
   **全件 suite は CI のシードシャードで回す**
   （`.github/workflows/scenario.yml`。通常のコード push では走らない）:
   手動は `gh workflow run scenario.yml --ref <ブランチ> -f trials=20`。

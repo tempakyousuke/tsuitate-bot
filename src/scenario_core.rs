@@ -36,6 +36,17 @@ pub struct Scenario {
     /// 1二飛・2一歩打の反則後に4二金を指した）。choice_trial_body と同じ規約で
     /// MyFoul 観測・反則カウント・foul_tried に反映される
     pub fouls: Vec<String>,
+    /// **オラクル錨**（`oracle=<手数>`、bin/scenario の `--oracle N` /
+    /// `--oracle-lag K` で上書き）: Some(N) なら手番側の推定器に「N 手目
+    /// までの真実の局面」を与え、N+1 手目以降は観測だけで処理させる
+    /// （`Estimator::oracle_anchor`）。例: ply=40 oracle=39 = 「39手目までの
+    /// 盤面は分かっているが 40手目（相手の直前の手）だけ分からない」状態で
+    /// 41手目を考えさせる。粒子生成を丸ごと省くので一瞬で終わり、被王手時の
+    /// 悪手が信念（粒子）の問題か評価の問題かを切り分けられる。
+    /// **真実を与えるので「確定粒子がなければ分かり得ない手」が出る**ことは
+    /// 織り込んで読む。suite の集計上は通常シナリオと区別しないので、
+    /// 常設 suite に oracle つきの kif を混ぜないこと（比較用に一時的に使う）
+    pub oracle: Option<usize>,
     /// diag で相手駒の利き枚数分布を測るマス
     pub diag_squares: Vec<String>,
     /// continue の足切り手数（**通算**の手数。必勝局面の遂行実験で、これを
@@ -128,6 +139,18 @@ pub fn load_scenario(
         .get("limit")
         .and_then(|s| s.parse().ok())
         .unwrap_or(200);
+    let oracle: Option<usize> = match kifu.directives.get("oracle") {
+        Some(v) => Some(
+            v.parse::<usize>()
+                .map_err(|_| format!("oracle を数値として読めません: {v}"))?,
+        ),
+        None => None,
+    };
+    if let Some(o) = oracle {
+        if o > ply {
+            return Err(format!("oracle={o} が ply={ply} を超えています"));
+        }
+    }
     let name = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
@@ -147,6 +170,7 @@ pub fn load_scenario(
         scores,
         ply,
         fouls,
+        oracle,
         diag_squares,
         limit,
         kifu,
@@ -164,6 +188,12 @@ pub struct Replayed {
     /// チェーン共有はこれが異なるシナリオを別グループにする（ログが
     /// プレフィックス拡張でなくなるため）
     pub injected_fouls: Vec<String>,
+    /// オラクル錨（`apply_scenario_oracle` が設定）: `(手番側ログの接頭辞長,
+    /// その時点の真実の局面)`。Some なら試行前の prewarm は接頭辞までを
+    /// `Strategy::oracle_anchor` で一括に与え、残りだけを通常 prewarm する
+    /// （`prewarm_for_trial`）。バッチのチェーン共有は使わない（粒子生成が
+    /// 無いので共有する意味もない）
+    pub oracle: Option<(usize, Position)>,
 }
 
 pub fn side_idx(c: Color) -> usize {
@@ -252,6 +282,60 @@ pub fn replay(kifu: &Kifu, upto: usize) -> Replayed {
         fouls,
         plies: upto as u32,
         injected_fouls: vec![],
+        oracle: None,
+    }
+}
+
+/// `oracle=` ディレクティブ（`Scenario::oracle`）を Replayed に反映する:
+/// 同じ棋譜を `oracle_ply` 手まで再生した真実の局面と、手番側の観測ログの
+/// その時点の長さを錨として持つ。`replay` の後に呼ぶ（`apply_scenario_fouls`
+/// とは順不同: 注入反則はログ末尾に付くので接頭辞関係は崩れない）。
+/// `oracle_ply == ply` は「直前の相手手まで全部知っている」全知条件
+pub fn apply_scenario_oracle(rep: &mut Replayed, kifu: &Kifu, oracle_ply: usize) {
+    assert!(
+        oracle_ply as u32 <= rep.plies,
+        "oracle={oracle_ply} が再生手数 {} を超えています",
+        rep.plies
+    );
+    let side = rep.pos.turn();
+    let anchor = replay(kifu, oracle_ply);
+    let prefix_len = anchor.logs[side_idx(side)].events().len();
+    // 接頭辞関係の検証（replay は決定的なので必ず成り立つはずだが、
+    // 注入反則や将来の改修で崩れたら即座に気づけるように）
+    let full = rep.logs[side_idx(side)].events();
+    assert!(
+        prefix_len <= full.len()
+            && anchor.logs[side_idx(side)]
+                .events()
+                .iter()
+                .zip(full)
+                .all(|(a, b)| format!("{a:?}") == format!("{b:?}")),
+        "oracle の接頭辞ログが手番側ログの接頭辞になっていません"
+    );
+    rep.oracle = Some((prefix_len, anchor.pos));
+}
+
+/// 試行前の戦略の温め: 通常は `prewarm_strategy`、オラクル錨つきなら
+/// 接頭辞までを `Strategy::oracle_anchor` で一括に与えて残りだけを
+/// 逐次 prewarm する。単発試行・ランキング・バッチが共有する
+pub fn prewarm_for_trial(strat: &mut dyn strategy::Strategy, rep: &Replayed) {
+    let side = rep.pos.turn();
+    let log = clone_log(&rep.logs[side_idx(side)]);
+    let view = make_view(&rep.pos, side, &rep.fouls);
+    match &rep.oracle {
+        None => strategy::prewarm_strategy(strat, &view, &log),
+        Some((prefix_len, truth)) => {
+            let mut prefix = ObservationLog::default();
+            for e in &log.events()[..*prefix_len] {
+                prefix.record(e.clone());
+            }
+            assert!(
+                strat.oracle_anchor(&view, &prefix, truth),
+                "戦略 {} はオラクル錨（oracle=）に対応していません（現行 estimator のみ）",
+                strat.name()
+            );
+            strategy::prewarm_strategy_from(strat, &view, &log, *prefix_len);
+        }
     }
 }
 
@@ -394,10 +478,8 @@ pub fn choice_trial_one_with(
     seed: u64,
     factory: SeededFactory,
 ) -> (String, Vec<String>) {
-    let side = rep.pos.turn();
     let mut strat = factory(seed);
-    let log = clone_log(&rep.logs[side_idx(side)]);
-    strategy::prewarm_strategy(&mut *strat, &make_view(&rep.pos, side, &rep.fouls), &log);
+    prewarm_for_trial(&mut *strat, rep);
     choice_trial_body(&mut *strat, rep)
 }
 
@@ -445,7 +527,7 @@ pub fn ranking_one(
     let side = rep.pos.turn();
     let mut strat = strategy::make_seeded(name, seed).expect("未知の戦略名");
     let log = clone_log(&rep.logs[side_idx(side)]);
-    strategy::prewarm_strategy(&mut *strat, &make_view(&rep.pos, side, &rep.fouls), &log);
+    prewarm_for_trial(&mut *strat, rep);
     let view = make_view(&rep.pos, side, &rep.fouls);
     let chosen = strat.choose(&view, &log, &HashSet::new())?;
     let ranking = strat.last_ranking()?.to_vec();
@@ -791,6 +873,13 @@ pub fn choice_trials_batch_range_with(
             let mut consumed = 0usize;
             for &i in idxs {
                 let (_sc, rep) = items[i];
+                if rep.oracle.is_some() {
+                    // オラクル錨つきは粒子生成が無いので共有せず毎回作る
+                    // （チェーンはこの項目を飛ばすだけ。ply 昇順は保たれる）
+                    let (accepted, foul_seq) = choice_trial_one_with(rep, seed, factory);
+                    record(i, accepted, foul_seq);
+                    continue;
+                }
                 let side = rep.pos.turn();
                 let view = make_view(&rep.pos, side, &rep.fouls);
                 let log = &rep.logs[side_idx(side)];
@@ -1077,6 +1166,74 @@ mod tests {
             v
         };
         assert_eq!(key(inc.est()), key(&fresh), "引き継ぎと作り直しで粒子集合が違う");
+    }
+
+    /// オラクル錨（oracle=）の担保: 錨を張った直後の粒子は全て真実の局面、
+    /// 以後の相手手を観測だけで処理した後の粒子は「真実の後継局面かつ
+    /// 観測と整合」で、真実の粒子（= 実際に指された手）がその中に残っている。
+    /// 反則注入（fouls=）と併用しても接頭辞関係が崩れないことも見る
+    #[test]
+    fn オラクル錨は真実から出発して観測だけで分岐する() {
+        // kakutori: 48手目の角の王手を49手目（先手）が受ける。錨 = 47手目まで
+        let sc = load("kakutori");
+        assert_eq!(sc.ply, 48);
+        let mut rep = replay(&sc.kifu, sc.ply);
+        apply_scenario_oracle(&mut rep, &sc.kifu, 47);
+        let side = rep.pos.turn();
+        let (prefix_len, truth47) = rep.oracle.clone().expect("錨が設定されていない");
+        assert_eq!(truth47.turn(), side.other(), "47手目までなら相手番のはず");
+        assert!(prefix_len < rep.logs[side_idx(side)].events().len());
+
+        // 錨直後: 全粒子が真実
+        let mut est = Estimator::with_seed_and_scale(side, 7, 1.0);
+        let mut prefix = ObservationLog::default();
+        for e in &rep.logs[side_idx(side)].events()[..prefix_len] {
+            prefix.record(e.clone());
+        }
+        est.oracle_anchor(&prefix, &truth47);
+        assert!(est.is_oracle_anchored());
+        assert!(!est.particles().is_empty());
+        assert!(
+            est.particles().iter().all(|p| p.fingerprint() == truth47.fingerprint()),
+            "錨直後の粒子が真実と一致しない"
+        );
+
+        // 48手目（相手の王手）を観測だけで処理: 粒子は真実の合法後継で、
+        // 自玉に王手が掛かっていて、真実（実際の 1五角）も残っている
+        est.update(&rep.logs[side_idx(side)]);
+        let parts = est.particles();
+        assert!(!parts.is_empty(), "観測処理後に粒子が消えた");
+        let truth48 = &rep.pos;
+        let mut has_truth = false;
+        for p in parts {
+            assert_eq!(p.turn(), side);
+            assert!(p.in_check(side), "王手宣言と整合しない粒子");
+            assert_eq!(
+                p.pieces_of(side).len(),
+                truth48.pieces_of(side).len(),
+                "自駒が増減している（真実の後継でない）"
+            );
+            has_truth |= p.fingerprint() == truth48.fingerprint();
+        }
+        assert!(has_truth, "真実の局面が粒子集合から落ちている");
+
+        // Strategy 経由（prewarm_for_trial）でも同じ錨が張られ、choose が動く
+        let mut strat = strategy::EstimatorStrategy::with_params_line_seed(
+            strategy::EvalParams::default(),
+            None,
+            Some(0),
+        );
+        prewarm_for_trial(&mut strat, &rep);
+        assert!(strat.estimator().is_some_and(|e| e.is_oracle_anchored()));
+        let (accepted, _) = choice_trial_body(&mut strat, &rep);
+        assert!(parse_usi(&accepted).is_some(), "choose が手を返さない: {accepted}");
+
+        // fouls= 併用: 注入反則はログ末尾なので接頭辞関係は崩れない（assert が通る）
+        let sc2 = load("quest31-m030f2");
+        let mut rep2 = replay(&sc2.kifu, sc2.ply);
+        apply_scenario_fouls(&mut rep2, &sc2.fouls);
+        apply_scenario_oracle(&mut rep2, &sc2.kifu, sc2.ply - 1);
+        assert!(rep2.oracle.is_some());
     }
 
     /// バッチ実行の Strategy 版の担保: 「ply A まで prewarm → 続きを ply B まで
