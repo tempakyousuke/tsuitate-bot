@@ -1,0 +1,10 @@
+{
+  "games": 100,
+  "candidate": "estimator",
+  "baselines": "estimator_v14",
+  "match_seed": 20260819,
+  "shards": 4,
+  "oracle": "",
+  "clock": "",
+  "env": "TSUITATE_KING_REPEAT_FOUL_W=0.8"
+}

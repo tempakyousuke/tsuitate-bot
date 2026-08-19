@@ -1,0 +1,6 @@
+{
+  "trials": 20,
+  "strategy": "estimator",
+  "scenarios": "",
+  "env": "TSUITATE_KING_REPEAT_FOUL_W=0.8"
+}
