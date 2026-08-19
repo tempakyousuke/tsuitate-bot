@@ -34,9 +34,11 @@
 
   const randomSeed = () => Math.floor(Math.random() * 1_000_000);
 
-  // 設定（対人 / 観戦の2モード。予算は共通）
+  // 設定（対人 / 観戦の2モード。予算は共通。既定 2000ms = 本番と同じ。
+  // 900ms は粒子数スケールの基準値であって本番相当ではない: CLAUDE.md
+  // `TSUITATE_THINK_BUDGET_MS`）
   let panelMode = $state<"human" | "watch">("human");
-  let budgetMs = $state(900);
+  let budgetMs = $state(2000);
   // 対人
   let engine = $state("estimator");
   let humanColor = $state<Color>("sente");
@@ -411,8 +413,8 @@
       思考予算
       <select bind:value={budgetMs} disabled={locked}>
         <option value={500}>500ms</option>
-        <option value={900}>900ms（本番相当）</option>
-        <option value={2000}>2000ms</option>
+        <option value={900}>900ms（スケール基準）</option>
+        <option value={2000}>2000ms（既定・本番相当）</option>
         <option value={5000}>5000ms</option>
       </select>
     </label>

@@ -3614,7 +3614,7 @@ const REFERENCE_BUDGET_MS: f64 = 900.0;
 /// `TSUITATE_CAND_THINK_BUDGET_MS` を使う: この名前は現行 `strategy.rs` しか
 /// 知らないので、凍結版は既定（または `TSUITATE_THINK_BUDGET_MS`）のまま残る
 fn think_budget_ms() -> u64 {
-    for name in ["TSUITATE_CAND_THINK_BUDGET_MS", "TSUITATE_THINK_BUDGET_MS"] {
+    for name in ["TSUITATE_THINK_BUDGET_MS"] {
         if let Some(ms) = std::env::var(name).ok().and_then(|v| v.parse().ok()) {
             return ms;
         }
@@ -4369,7 +4369,7 @@ const OWN_CAMP_MINOR_PROMO_W: f64 = 0.0;
 ///
 /// 粒子不要・ノイズゼロ（自分の観測だけで決まる）。**候補集合が鋭いときだけ**
 /// 発火するので中盤（|cands| が 30〜50）では素通りする。王手中は無効。
-/// 凍結版はこの名前を知らない。
+/// v13 以前の凍結版はこの名前を知らない（v14 は読む）。
 ///
 /// 既定 4.0 は 2026-08-13 の作業点（`promote_far_w` を外したときの作業点。
 /// PR#1 の hand_asset / link_endgame / king_known_approach /
@@ -4378,6 +4378,7 @@ const OWN_CAMP_MINOR_PROMO_W: f64 = 0.0;
 /// **既定オンは deduce が鋭いときだけ発火する接近ボーナスに限る**
 /// （`king_belief_prox_w` は既定 0。ネット接近は deduce が鈍い大半の
 /// 局面で発火し、5.9 構成のアリーナ合算 54.0% vs 対照 56.3% に入っていた）。
+/// 2026-08-19 に estimator_v14 として凍結（suite 5.197、vs v13 200局 60.0%）。
 fn king_cand_attack_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -6274,7 +6275,7 @@ fn promo_king_prox_map(w: f64, cands: &std::collections::BTreeSet<Coord>) -> Opt
 /// マスそのものへの垂れ歩に最大加点を与えていた（quest31-m119 の P*5b、
 /// ユーザー採点0）。`king_cand_attack_w` が既定 0 のときは得点中立だったが、
 /// 接近ボーナスを既定オンにしたので、距離0を残すと P*5b 型が最大加点を
-/// 受ける。凍結版はこの名前を知らない。
+/// 受ける。v13 以前の凍結版はこの名前を知らない（v14 は読む）。
 fn king_prox_exclude_self() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {

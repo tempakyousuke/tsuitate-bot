@@ -277,7 +277,10 @@
     時間切れ0・消費13.9%・残り最小300秒）。900 へ絞ると −14.5pt、8000 へ増やしても
     +0.5pt（飽和）なので、**もう強さの調整ノブではない**。
     候補側だけ変えたいとき（版比較・スイープ）は `TSUITATE_CAND_THINK_BUDGET_MS`
-    を使う（凍結版はこの名前を知らない）
+    を使う。**ただし v12 / v13 はこの名前も読む**（凍結時に持ち込んだまま。
+    2026-08-19 に判明、凍結後は編集しない方針で残置）ので、v12/v13 相手の
+    予算スイープは両側が動く。v6〜v11 と v14 以降は読まない（v14 から
+    `freeze_estimator.py` がこの名前を落とす）
   - `TSUITATE_LINK_WORK_W` / `_REF` / `TSUITATE_REPEAT_PENALTY_W` — 2026-07-28 に
     採用した項の切り戻し・スイープ用（既定は 1.0 / 2.0 / 0.3。0 にすると従来挙動）
   - `TSUITATE_CHECK_STRENGTH_W`（既定 0 = 無効）— **王手の強さ**（相手の合法解消手数 K）
@@ -1539,10 +1542,14 @@
   凍結後は編集しない。改善が確定したら
   `python3 scripts/freeze_estimator.py <N> <日付> "<差分の要約>" > src/frozen/estimator_vN.rs`
   で生成し（estimator.rs/check.rs/strategy.rs を1ファイルへまとめ、テストと
-  運用ノブの env を落とす）、`frozen/mod.rs`・`strategy::make`/`make_seeded`・
-  `arena.yml` の baselines 既定値へ登録する。**生成後は
-  `arena 20 estimator estimator_vN` が約50%になることを確認**すること
-  （挙動が同一である担保）。
+  診断フックを落とす。**env は PINNED の4関数と `TSUITATE_CAND_THINK_BUDGET_MS`
+  だけ落とし、他の `TSUITATE_*` は凍結時点の読み方のまま残る**）、
+  `frozen/mod.rs`・`strategy::make`/`make_seeded`・`arena.yml` の baselines
+  既定値へ登録する。**生成後は同一性確認**として、①スクリプトを再実行して
+  凍結ファイルと diff がコメント以外ゼロであること、②CI で
+  `-f games=100 -f baselines=estimator_vN` が 50%±10 に入ることを確認する
+  （挙動が同一である担保。ローカル `arena 20` は ±22pt で検出力がなく、
+  v14 では 7勝13敗と出た。同一コードでも 100 局で 44% まで振れる）。
   明らかに弱くなった古い凍結版は破棄してよい（v1 は王手放置癖、v2〜v5 は v7 凍結時に
   全て80%超で上回ったため 2026-07-18 破棄。成績は git 履歴と tuning/README.md に残る）
 - `client.rs` — 接続と対局ループ。反則リトライ（同じ手を繰り返さない）、

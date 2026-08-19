@@ -310,7 +310,8 @@ const EVAL_PARTICLES: usize = 192;
 /// （2026-07-26 実測: 300秒+3秒・100局で時間切れ0・クロック消費13.9%）。
 /// 900 へ絞ると −14.5pt、8000 へ増やしても +0.5pt で飽和しており、
 /// もう強さの調整ノブではない。候補側だけ変える版比較・スイープには
-/// `TSUITATE_CAND_THINK_BUDGET_MS` を使う（凍結版はこの名前を知らない）。
+/// `TSUITATE_CAND_THINK_BUDGET_MS` を使う（v6〜v11 と v14 以降の凍結版はこの名前を
+/// 知らない。**v12 / v13 は凍結時に持ち込んでいて読む**）。
 const DEFAULT_THINK_BUDGET_MS: u64 = 2000;
 /// スケール1.0の基準予算。v5 までの暗黙の実測上限（p99 ≒ 900ms）
 const REFERENCE_BUDGET_MS: f64 = 900.0;
@@ -321,8 +322,10 @@ const REFERENCE_BUDGET_MS: f64 = 900.0;
 /// アリーナの `-f env=` で渡すと**両側の予算が動いて比較にならない**。
 /// 候補側だけ予算を変えたいとき（予算-強さ曲線の測定、時間配分の検証。
 /// docs/improvement-plan-2026-07-26-yaneuraou.md 項目1）は
-/// `TSUITATE_CAND_THINK_BUDGET_MS` を使う: この名前は現行 `strategy.rs` しか
-/// 知らないので、凍結版は既定（または `TSUITATE_THINK_BUDGET_MS`）のまま残る
+/// `TSUITATE_CAND_THINK_BUDGET_MS` を使う: 凍結スクリプトがこの名前を落とすので
+/// 凍結版は既定（または `TSUITATE_THINK_BUDGET_MS`）のまま残る。
+/// **例外は v12 / v13**（凍結時にこの行ごと持ち込んでいて読む。凍結後は
+/// 編集しない方針なのでそのまま。v12/v13 相手のスイープでは基準側も動く）
 fn think_budget_ms() -> u64 {
     for name in ["TSUITATE_CAND_THINK_BUDGET_MS", "TSUITATE_THINK_BUDGET_MS"] {
         if let Some(ms) = std::env::var(name).ok().and_then(|v| v.parse().ok()) {

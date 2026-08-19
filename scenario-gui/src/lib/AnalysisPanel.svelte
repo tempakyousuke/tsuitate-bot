@@ -204,8 +204,8 @@
       思考予算
       <select bind:value={budgetMs} disabled={running}>
         <option value={500}>500ms</option>
-        <option value={900}>900ms（本番相当）</option>
-        <option value={2000}>2000ms（既定）</option>
+        <option value={900}>900ms（スケール基準）</option>
+        <option value={2000}>2000ms（既定・本番相当）</option>
         <option value={5000}>5000ms</option>
         <option value={10000}>10000ms</option>
       </select>
