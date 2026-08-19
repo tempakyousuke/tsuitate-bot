@@ -5,7 +5,7 @@
 //! - `Heuristic`: サイト内蔵の簡易botと同じ「前進を好むヒューリスティック＋乱数」
 //! - `EstimatorStrategy`: 観測履歴から相手局面の粒子集合を維持し（estimator.rs）、
 //!   候補手を粒子平均で評価する
-//! - `estimator_v6` … `estimator_v13`: `frozen/` の凍結版（アリーナの基準）
+//! - `estimator_v6` … `estimator_v14`: `frozen/` の凍結版（アリーナの基準）
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -144,6 +144,9 @@ pub fn make_seeded(name: &str, seed: u64) -> Option<Box<dyn Strategy + Send>> {
         "estimator_v13" => Some(Box::new(
             crate::frozen::estimator_v13::EstimatorV13::with_seed(seed),
         )),
+        "estimator_v14" => Some(Box::new(
+            crate::frozen::estimator_v14::EstimatorV14::with_seed(seed),
+        )),
         _ => make(name),
     }
 }
@@ -170,6 +173,7 @@ pub fn make(name: &str) -> Option<Box<dyn Strategy + Send>> {
         "estimator_v11" => Some(Box::new(crate::frozen::estimator_v11::EstimatorV11::new())),
         "estimator_v12" => Some(Box::new(crate::frozen::estimator_v12::EstimatorV12::new())),
         "estimator_v13" => Some(Box::new(crate::frozen::estimator_v13::EstimatorV13::new())),
+        "estimator_v14" => Some(Box::new(crate::frozen::estimator_v14::EstimatorV14::new())),
         _ => None,
     }
 }
@@ -1076,7 +1080,7 @@ const OWN_CAMP_MINOR_PROMO_W: f64 = 0.0;
 ///
 /// 粒子不要・ノイズゼロ（自分の観測だけで決まる）。**候補集合が鋭いときだけ**
 /// 発火するので中盤（|cands| が 30〜50）では素通りする。王手中は無効。
-/// 凍結版はこの名前を知らない。
+/// v13 以前の凍結版はこの名前を知らない（v14 は読む）。
 ///
 /// 既定 4.0 は 2026-08-13 の作業点（`promote_far_w` を外したときの作業点。
 /// PR#1 の hand_asset / link_endgame / king_known_approach /
@@ -1085,6 +1089,7 @@ const OWN_CAMP_MINOR_PROMO_W: f64 = 0.0;
 /// **既定オンは deduce が鋭いときだけ発火する接近ボーナスに限る**
 /// （`king_belief_prox_w` は既定 0。ネット接近は deduce が鈍い大半の
 /// 局面で発火し、5.9 構成のアリーナ合算 54.0% vs 対照 56.3% に入っていた）。
+/// 2026-08-19 に estimator_v14 として凍結（suite 5.197、vs v13 200局 60.0%）。
 fn king_cand_attack_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -2983,7 +2988,7 @@ fn promo_king_prox_map(w: f64, cands: &std::collections::BTreeSet<Coord>) -> Opt
 /// マスそのものへの垂れ歩に最大加点を与えていた（quest31-m119 の P*5b、
 /// ユーザー採点0）。`king_cand_attack_w` が既定 0 のときは得点中立だったが、
 /// 接近ボーナスを既定オンにしたので、距離0を残すと P*5b 型が最大加点を
-/// 受ける。凍結版はこの名前を知らない。
+/// 受ける。v13 以前の凍結版はこの名前を知らない（v14 は読む）。
 fn king_prox_exclude_self() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -13547,6 +13552,8 @@ pub(crate) mod tests {
         assert!(make_seeded("estimator_v12", 1).is_some());
         assert!(make("estimator_v13").is_some());
         assert!(make_seeded("estimator_v13", 1).is_some());
+        assert!(make("estimator_v14").is_some());
+        assert!(make_seeded("estimator_v14", 1).is_some());
         // 破棄済みの凍結版は登録されていない
         assert!(make("estimator_v5").is_none());
     }
