@@ -1533,7 +1533,9 @@
   1185 / 4.663 から不合格 −181・得点 +0.534。ガントレット run 32155897486
   各104局: v9 77.9 / v10 67.3 / v11 64.4 / v12 68.3 / v13 61.5%。
   vs v13 追試200局 run 32211483091: **60.0%±6.8**。反則/局 4.47〜6.45、
-  時間切れ0。kakutori 8/20 は残ギャップ）。
+  時間切れ0。kakutori 8/20 は残ギャップ。
+  生成後の同一性確認 `arena 20 estimator estimator_v14` は 7勝13敗
+  （35.0%±20.9、50%は区間内。思考平均 1214 vs 1223ms））。
   凍結後は編集しない。改善が確定したら
   `python3 scripts/freeze_estimator.py <N> <日付> "<差分の要約>" > src/frozen/estimator_vN.rs`
   で生成し（estimator.rs/check.rs/strategy.rs を1ファイルへまとめ、テストと
