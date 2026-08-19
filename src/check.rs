@@ -181,6 +181,41 @@ fn foul_evidence_w() -> f64 {
 /// 反則の証拠の強さを手の種類で分けるかどうかの既定（0 = 従来の一律）
 const CHECK_FOUL_EVIDENCE_W: f64 = 0.0;
 
+/// **同一手番で玉の手が反則になったあと、残りの玉の手の解消確率を割り引く**
+/// （`TSUITATE_CHECK_ESCAPE_DECAY`、既定 **1.0** = 従来挙動、作業点 0.6）。
+///
+/// `legal_under` は仮説の王手駒1枚しか置かないので、**見えない第2の駒が
+/// 逃げ先を覆っている**場合を表現できない（実測: 単独仮説で合法な玉の逃げが
+/// 実際に合法だったのは 75〜81%）。一律に割り引いた 2026-07-29 の第1版は
+/// 較正が正しいのにアリーナ3シードで全敗した（不確実な合駒・捕獲プローブへの
+/// 押し出し）。
+///
+/// ここは**証拠が出たあとだけ**割り引く: この手番で玉の手が反則になったなら、
+/// 「見えない駒が自玉の周りを覆っている」が確定した（仮説では説明できない
+/// 反則なら仮説側は既に減衰しているが、玉の隣接マスの被覆は**相関する** =
+/// 1枚の飛角金銀は複数の逃げ先を同時に覆う）。玉の手の解消確率へ
+/// `decay^(この手番の玉の反則回数)` を掛け、合駒・捕獲へ早めに移らせる。
+/// 反則0回の決定は完全に不変。
+///
+/// 発端は `bin/mine_check` の arena-check-foul01（玉 3一、真の王手駒は
+/// 1一の飛車、逃げ先 3二/2二/2一 は見えない角と成香が覆っていて全滅）:
+/// 3二 0.74 / 2一 0.51 / 2二 0.49 と高いまま3回焼き、正解の合駒 N*2a は
+/// 0.04〜0.20 で最後まで浮かなかった。
+/// 凍結版はこの名前を知らないので `-f env=` は候補側にだけ効く
+fn escape_decay() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_CHECK_ESCAPE_DECAY")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|v: &f64| v.is_finite() && (0.0..=1.0).contains(v))
+            .unwrap_or(CHECK_ESCAPE_DECAY)
+    })
+}
+
+/// `escape_decay` の既定（1.0 = 従来挙動）
+const CHECK_ESCAPE_DECAY: f64 = 1.0;
+
 /// 実測 75〜81% の中央付近（玉の逃げが単独仮説で合法だった率）
 const KING_ESCAPE_LEGAL_PRIOR: f64 = 0.78;
 /// 玉以外の駒での捕獲の反則は仮説をほぼ否定する（実測 97%）
@@ -257,6 +292,10 @@ pub struct CheckSolver {
     /// 反則の証拠の強さを手の種類で分ける強さ（`foul_evidence_w`）。
     /// 構築時に env を1回読んで持つ（テストから明示指定できるように）
     foul_evidence: f64,
+    /// 玉の手の解消確率の割引率（`escape_decay`）
+    escape_decay: f64,
+    /// この手番で反則になった玉の手の回数（`escape_decay` の指数）
+    king_fouls: u32,
 }
 
 impl CheckSolver {
@@ -275,6 +314,7 @@ impl CheckSolver {
             log,
             hyp_prior_w(),
             foul_evidence_w(),
+            escape_decay(),
         )
     }
 
@@ -286,6 +326,7 @@ impl CheckSolver {
         log: &ObservationLog,
         prior_w: f64,
         foul_evidence: f64,
+        escape_decay: f64,
     ) -> Option<CheckSolver> {
         let my_color = view.your_color;
         let mut base = Position::empty(my_color);
@@ -336,6 +377,8 @@ impl CheckSolver {
             hypotheses: vec![],
             threat_cache: vec![],
             foul_evidence,
+            escape_decay,
+            king_fouls: 0,
         };
         solver.enumerate(&opponent_role_counts(view, log), prior_w);
         if solver.hypotheses.is_empty() {
@@ -634,6 +677,11 @@ impl CheckSolver {
     /// 支えで反則になる」確率が高い（実測27%）ので、減衰を 1 − 事前確率
     /// まで緩めて真の仮説を殺しにくくする（他の手は従来の減衰のまま）
     fn observe_foul(&mut self, foul: &ShogiMove) {
+        if let ShogiMove::Board { from, .. } = *foul {
+            if self.base.king_square(self.my_color) == Some(from) {
+                self.king_fouls += 1;
+            }
+        }
         for i in 0..self.hypotheses.len() {
             if self.legal_under(i, foul) {
                 let decay = self.foul_decay_for(foul, self.hypotheses[i].square);
@@ -705,7 +753,22 @@ impl CheckSolver {
         if total <= 0.0 {
             return 0.5; // 全仮説が死んだ（両王手など）: 情報なしに戻す
         }
-        resolved / total
+        resolved / total * self.escape_factor(mv)
+    }
+
+    /// 玉の手の解消確率に掛ける割引（`escape_decay` の doc）。
+    /// この手番で玉の手が反則になっていなければ 1.0（挙動不変）
+    fn escape_factor(&self, mv: &ShogiMove) -> f64 {
+        if self.king_fouls == 0 || self.escape_decay >= 1.0 {
+            return 1.0;
+        }
+        let ShogiMove::Board { from, .. } = *mv else {
+            return 1.0;
+        };
+        if self.base.king_square(self.my_color) != Some(from) {
+            return 1.0;
+        }
+        self.escape_decay.powi(self.king_fouls as i32)
     }
 
     /// mv が「王手駒仮説のマスへ、自玉以外の駒で移動して、その仮説の下で
@@ -1356,7 +1419,7 @@ mod tests {
         let view = view_with(vec![("5e", Role::King)]);
         let log = ObservationLog::default();
         let mass = |prior_w: f64, file: i8, rank: i8| -> f64 {
-            let s = CheckSolver::with_knobs(&view, &[], &[], &log, prior_w, 0.0).unwrap();
+            let s = CheckSolver::with_knobs(&view, &[], &[], &log, prior_w, 0.0, 1.0).unwrap();
             let total: f64 = s.hypotheses.iter().map(|h| h.weight).sum();
             let sq = Coord { file, rank };
             s.hypotheses
@@ -1388,7 +1451,7 @@ mod tests {
         let log = ObservationLog::default();
         let p_after = |foul: &str, w: f64| -> f64 {
             let fouls = [mv(foul)];
-            let mut s = CheckSolver::with_knobs(&view, &[], &fouls, &log, 0.0, w).unwrap();
+            let mut s = CheckSolver::with_knobs(&view, &[], &fouls, &log, 0.0, w, 1.0).unwrap();
             s.resolve_probability(&mv("4e4d"))
         };
         // 玉の逃げ（5e5f）は 4d 仮説を殺さない方向、金の捕獲（4e4d）は殺す方向
@@ -1401,6 +1464,26 @@ mod tests {
         // 従来（w=0）より、捕獲の反則の否定は強く、玉の逃げの否定は弱い
         assert!(capture_w1 < p_after("4e4d", 0.0));
         assert!(escape_w1 >= p_after("5e5f", 0.0) - 1e-12);
+    }
+
+    #[test]
+    fn escape_decay_only_fires_after_a_king_foul_and_only_on_king_moves() {
+        let view = view_with(vec![("5e", Role::King), ("4e", Role::Gold)]);
+        let log = ObservationLog::default();
+        let p = |fouls: &[ShogiMove], decay: f64, m: &str| -> f64 {
+            let mut s =
+                CheckSolver::with_knobs(&view, &[], fouls, &log, 0.0, 0.0, decay).unwrap();
+            s.resolve_probability(&mv(m))
+        };
+        // 反則0回なら decay に依らず同じ（挙動不変）
+        assert_eq!(p(&[], 1.0, "5e5f"), p(&[], 0.5, "5e5f"));
+        // 玉の反則が1回あれば、以後の玉の手だけが割り引かれる
+        let fouls = [mv("5e4d")];
+        let king_plain = p(&fouls, 1.0, "5e5f");
+        let king_decayed = p(&fouls, 0.5, "5e5f");
+        assert!((king_decayed - king_plain * 0.5).abs() < 1e-9);
+        // 非玉の手（金の捕獲）は割り引かない
+        assert_eq!(p(&fouls, 1.0, "4e4d"), p(&fouls, 0.5, "4e4d"));
     }
 
     #[test]
