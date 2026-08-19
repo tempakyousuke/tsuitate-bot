@@ -3750,6 +3750,14 @@ pub struct EvalParams {
     /// 7七桂成クラスを沈める一方、観測確実な取り返しは満額残す。
     /// `TSUITATE_MATERIAL_DEGEN_Q0` で上書き可・SPSA対応。凍結版は知らない
     pub material_degen_q0: f64,
+    /// **自玉近傍の敵駒の排除**（2026-08-20、arena-recap01 が発端。ユーザー
+    /// 「リスクを恐れすぎて逆にリスクを作っている。玉の近くの敵駒を排除する
+    /// ことに加点する項を作っていい」）。粒子上で自玉のチェビシェフ距離 ≤2 に
+    /// いる相手駒を取る手へ、交換価値とは別に w × (距離1: 1.0 / 距離2: 0.5)
+    /// を加点（粒子重み付きなので占有確率が暗黙に掛かる）。`defender_capture_w`
+    /// （相手玉の守り駒）の自玉側の鏡像。王手中は無効（CheckSolver の領分）。
+    /// `TSUITATE_OWN_ZONE_CAPTURE_W` で上書き可・SPSA対応。凍結版は知らない
+    pub own_zone_capture_w: f64,
     /// **taint 粒子の占有合意で打ちの反則確率を下げる**（2026-08-03、ユーザー指摘の
     /// 38手目 `S*4g` が発端）。厳密粒子が全滅した決定では `p_legal` が
     /// `prior_legal` だけで決まるが、その打ち側は**マスに依らない定数**
@@ -4069,6 +4077,7 @@ impl Default for EvalParams {
             foul_occ_attack_w: 2.0,
             // 材料の退化ゲート。既定 0（2026-08-10: 正しい捕獲まで殺す）
             material_degen_q0: 0.0,
+            own_zone_capture_w: 0.0,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
             // 反則経済の新項（2026-07-16、オラクル測定で36ptの伸びしろを確認後に追加）。
@@ -4165,7 +4174,7 @@ pub struct ParamSpec {
 }
 
 impl EvalParams {
-    pub const SPECS: [ParamSpec; 70] = [
+    pub const SPECS: [ParamSpec; 71] = [
         ParamSpec {
             name: "check_bonus",
             lo: 0.0,
@@ -4562,6 +4571,12 @@ impl EvalParams {
             lo: 0.0,
             hi: 1.0,
         },
+        ParamSpec {
+            // 自玉近傍（距離≤2）の敵駒を取る手への加点。0 = 無効
+            name: "own_zone_capture_w",
+            lo: 0.0,
+            hi: 6.0,
+        },
     ];
 
     pub fn to_vec(&self) -> Vec<f64> {
@@ -4636,6 +4651,7 @@ impl EvalParams {
             self.promo_king_prox,
             self.foul_occ_attack_w,
             self.material_degen_q0,
+            self.own_zone_capture_w,
         ]
     }
 
@@ -4712,6 +4728,7 @@ impl EvalParams {
             promo_king_prox: v[67],
             foul_occ_attack_w: v[68],
             material_degen_q0: v[69],
+            own_zone_capture_w: v[70],
         }
     }
 }
@@ -5053,6 +5070,18 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
     {
         Some(w) => EvalParams {
             material_degen_q0: w,
+            ..params
+        },
+        None => params,
+    };
+    // 自玉近傍の敵駒の排除（0 で従来挙動）
+    let params = match std::env::var("TSUITATE_OWN_ZONE_CAPTURE_W")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+    {
+        Some(w) => EvalParams {
+            own_zone_capture_w: w,
             ..params
         },
         None => params,
@@ -8395,6 +8424,20 @@ fn evaluate(
                 }
             }
         }
+        // 自玉近傍の敵駒の排除（own_zone_capture_w）: 自玉の距離≤2 にいる相手駒を
+        // 取る手は、交換価値とは別に「自陣の脅威が1枚減る」価値を持つ（arena-recap01:
+        // 1二で角を取られた直後、飛車で取り返せば自玉3一の隣接圏から敵駒が消える
+        // のに、幻の紐（1五の香 52%）へのリスクが勝って 3五歩。取り返さなかった
+        // 成駒が30手後の詰みの材料になった）。距離1は満額、距離2は半額。王手中は無効
+        if params.own_zone_capture_w != 0.0 && !view.you_in_check && captured_value > 0.0 {
+            if let (ShogiMove::Board { to, .. }, Some(mk)) = (*mv, pos.king_square(me)) {
+                match cheb(to, mk) {
+                    1 => v += params.own_zone_capture_w,
+                    2 => v += 0.5 * params.own_zone_capture_w,
+                    _ => {}
+                }
+            }
+        }
 
         // 取られリスクは「相手がこの駒の位置を知っているか」で重みを分ける。
         // 駒を取った直後は取られたマスが相手に通知される → 着手駒の位置は確実にバレて
@@ -10688,6 +10731,7 @@ pub(crate) mod tests {
         assert_field_index!(promo_king_prox);
         assert_field_index!(foul_occ_attack_w);
         assert_field_index!(material_degen_q0);
+        assert_field_index!(own_zone_capture_w);
 
         // 既定値は自分の SPECS 範囲内にあること（SPSA の中心点が
         // クランプで別の値へ化けるのを防ぐ。位置ズレの二重の網でもある）
