@@ -10,6 +10,8 @@
 //!   見つけたかに依らないので、相手が弱い環境でも自玉の受けの失敗を直接測れる
 //! - 王手ソルバー（check.rs）の再現検証: 記録上の王手中の反則それぞれについて、
 //!   その時点の観測だけからソルバーが選んだ手が真の局面で合法だったかを判定する
+//! - 被王手時に汚名マスへの玉移動が真に合法だったのに選ばず反則した回数
+//!   （`KING_REPEAT_FOUL_W` が正しい王手解消を沈める機会）
 //!
 //! 使い方: cargo run --release --bin analyze -- records/*.jsonl
 
@@ -467,6 +469,111 @@ fn cause_label(c: FoulCause) -> &'static str {
 }
 
 /// bot の手番で1手詰み（相手玉）が存在するか
+/// 王手中に汚名マスへの玉移動が真に合法だったのに、それを選ばずに失敗した回数。
+/// `TSUITATE_KING_REPEAT_FOUL_W` が正しい王手解消を沈める機会の上限。
+struct CheckStaleKingMissed {
+    /// 王手中の決定で、汚名マスへの玉移動が真局面で合法だった回数
+    legal_escape_decisions: u32,
+    /// そのうち反則した（その合法な玉移動を選ばなかった）
+    missed_fouls: u32,
+    /// その合法な玉移動を選んで解消した
+    used: u32,
+}
+
+fn king_board_move(from: Coord, to: Coord) -> ShogiMove {
+    ShogiMove::Board {
+        from,
+        to,
+        promote: false,
+    }
+}
+
+/// 汚名マスへの玉移動のうち、真局面で王手を解消できる行き先。
+fn legal_stale_king_escapes(
+    pos: &Position,
+    bot: Color,
+    stale: &HashSet<Coord>,
+) -> Vec<Coord> {
+    let Some(king) = pos.king_square(bot) else {
+        return vec![];
+    };
+    if !pos.in_check(bot) {
+        return vec![];
+    }
+    stale
+        .iter()
+        .copied()
+        .filter(|&to| pos.is_legal(&king_board_move(king, to)))
+        .collect()
+}
+
+fn tally_check_stale_king_missed(
+    observations: &[Observation],
+    positions: &[Position],
+    bot: Color,
+    print: bool,
+) -> CheckStaleKingMissed {
+    let mut out = CheckStaleKingMissed {
+        legal_escape_decisions: 0,
+        missed_fouls: 0,
+        used: 0,
+    };
+    let mut prefix = ObservationLog::default();
+    for obs in observations {
+        match obs {
+            Observation::MyFoul { move_number, usi } => {
+                let idx = (*move_number as usize).saturating_sub(1);
+                if let Some(pos) = positions.get(idx) {
+                    if pos.in_check(bot) {
+                        let stale = stale_king_foul_dests(&prefix, bot, *move_number);
+                        let legal = legal_stale_king_escapes(pos, bot, &stale);
+                        if !legal.is_empty() {
+                            out.legal_escape_decisions += 1;
+                            out.missed_fouls += 1;
+                            if print {
+                                let king = pos.king_square(bot).unwrap();
+                                let escapes = legal
+                                    .iter()
+                                    .map(|&to| king_board_move(king, to).to_usi())
+                                    .collect::<Vec<_>>()
+                                    .join("/");
+                                println!(
+                                    "  王手中・汚名マスへの玉逃げが真に合法なのに反則: {}手目 {}（合法な解消 {escapes}）",
+                                    move_number, usi
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+            Observation::MyMove {
+                move_number, usi, ..
+            } => {
+                // MyMove の move_number は適用後。決定時は −1。
+                let decision_mn = move_number.saturating_sub(1);
+                let idx = (*move_number as usize).saturating_sub(2);
+                if let Some(pos) = positions.get(idx) {
+                    if pos.in_check(bot) {
+                        let stale = stale_king_foul_dests(&prefix, bot, decision_mn);
+                        let legal = legal_stale_king_escapes(pos, bot, &stale);
+                        if !legal.is_empty() {
+                            out.legal_escape_decisions += 1;
+                            if let Some(ShogiMove::Board { from, to, .. }) = parse_usi(usi) {
+                                if pos.king_square(bot) == Some(from) && legal.contains(&to) {
+                                    out.used += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        prefix.record(obs.clone());
+    }
+    out
+}
+
 fn has_mate_in_one(pos: &Position) -> Option<String> {
     for mv in pos.legal_moves() {
         let mut next = pos.clone();
@@ -569,6 +676,11 @@ fn main() {
     let mut total_king_move_fouls = 0u32;
     let mut total_king_repeat_dest = 0u32;
     let mut total_king_stale_repeat = 0u32;
+    // 被王手時: 汚名マスへの玉移動が真に合法（解消できる）なのに選ばず反則した回数。
+    // KING_REPEAT_FOUL_W が正しい王手解消を沈める機会の上限
+    let mut total_check_stale_king_legal = 0u32;
+    let mut total_check_stale_king_missed = 0u32;
+    let mut total_check_stale_king_used = 0u32;
     // 無意味な往復: bot が指した後の**自陣形**（盤上の自駒＋持ち駒）が、
     // その対局で既に出現していた回数。ついたてでは自分側は完全既知なので
     // ノイズゼロで測れる。「何も起きていないのに同じ形へ戻った」= 手番を
@@ -684,6 +796,17 @@ fn main() {
                 }
                 prefix.record(obs.clone());
             }
+        }
+        {
+            let missed = tally_check_stale_king_missed(
+                &rec.observations,
+                &positions,
+                bot,
+                true,
+            );
+            total_check_stale_king_legal += missed.legal_escape_decisions;
+            total_check_stale_king_missed += missed.missed_fouls;
+            total_check_stale_king_used += missed.used;
         }
         // 駒の損得: 各手の捕獲を追い、直後の取り返しをペアにする
         let mut bot_captured = 0.0;
@@ -1171,6 +1294,11 @@ fn main() {
             "玉移動反則の行き先再訪: {total_king_repeat_dest}/{total_king_move_fouls}（同一局内で既に同じ to へ玉反則。同手番の再試行含む） / うち手番またぎ汚名マス {total_king_stale_repeat}（解除証拠なし。KING_REPEAT_FOUL_W の発火上限）"
         );
     }
+    if total_check_stale_king_legal > 0 {
+        println!(
+            "王手中の汚名マス玉逃げ: 真に解消できる決定 {total_check_stale_king_legal} / その合法手で解消 {total_check_stale_king_used} / 選ばず反則 {total_check_stale_king_missed}（KING_REPEAT_FOUL_W が正しい王手解消を沈める機会）"
+        );
+    }
     if total_bot_moves > 0 {
         println!(
             "無意味な往復（自陣形の再出現）: {total_repeat_configs}/{total_bot_moves}手 ({:.1}%) / {games_with_repeat}局（自分側は完全既知なのでノイズゼロ。repeat_penalty_w が狙う現象の頻度＝改善の天井）",
@@ -1290,5 +1418,189 @@ fn main() {
             rate(single_hyp[4]),
             rate(single_hyp[5]),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tsuitate_bot::board::parse_usi_square;
+    use tsuitate_bot::shogi::Piece;
+
+    fn sq(usi: &str) -> Coord {
+        parse_usi_square(usi).unwrap()
+    }
+
+    /// 先手玉5i・後手飛5d・後手玉8a。5筋の王手。
+    /// 合法逃げは 4i/6i/4h/6h。5h は筋上で非合法。
+    fn rook_file_check() -> Position {
+        let mut pos = Position::empty(Color::Sente);
+        pos.set(
+            sq("5i"),
+            Some(Piece {
+                color: Color::Sente,
+                role: Role::King,
+            }),
+        );
+        pos.set(
+            sq("5d"),
+            Some(Piece {
+                color: Color::Gote,
+                role: Role::Rook,
+            }),
+        );
+        pos.set(
+            sq("8a"),
+            Some(Piece {
+                color: Color::Gote,
+                role: Role::King,
+            }),
+        );
+        pos
+    }
+
+    fn positions_at(idx: usize, pos: Position) -> Vec<Position> {
+        let mut v = vec![Position::empty(Color::Sente); idx + 1];
+        v[idx] = pos;
+        v
+    }
+
+    #[test]
+    fn 汚名マスへの玉逃げが真に合法なら列挙する() {
+        let pos = rook_file_check();
+        assert!(pos.in_check(Color::Sente));
+        assert!(pos.is_legal(&parse_usi("5i4h").unwrap()));
+        assert!(!pos.is_legal(&parse_usi("5i5h").unwrap()));
+        let stale = HashSet::from([sq("4h"), sq("5h")]);
+        let mut legal = legal_stale_king_escapes(&pos, Color::Sente, &stale);
+        legal.sort();
+        assert_eq!(legal, vec![sq("4h")]);
+    }
+
+    #[test]
+    fn 王手中に合法な汚名マス玉逃げがあるのに反則したらmissed() {
+        let positions = positions_at(11, rook_file_check());
+        let observations = vec![
+            Observation::MyFoul {
+                move_number: 10,
+                usi: "5i4h".into(),
+            },
+            Observation::OpponentMoved {
+                move_number: 11,
+                captured_my_piece_at: None,
+            },
+            Observation::MyFoul {
+                move_number: 12,
+                usi: "5i5h".into(),
+            },
+        ];
+        let t = tally_check_stale_king_missed(&observations, &positions, Color::Sente, false);
+        assert_eq!(t.legal_escape_decisions, 1);
+        assert_eq!(t.missed_fouls, 1);
+        assert_eq!(t.used, 0);
+    }
+
+    #[test]
+    fn 王手中に合法な汚名マス玉逃げを選んだらused() {
+        let positions = positions_at(11, rook_file_check());
+        let observations = vec![
+            Observation::MyFoul {
+                move_number: 10,
+                usi: "5i4h".into(),
+            },
+            Observation::OpponentMoved {
+                move_number: 11,
+                captured_my_piece_at: None,
+            },
+            Observation::MyMove {
+                move_number: 13,
+                usi: "5i4h".into(),
+                captured: None,
+            },
+        ];
+        let t = tally_check_stale_king_missed(&observations, &positions, Color::Sente, false);
+        assert_eq!(t.legal_escape_decisions, 1);
+        assert_eq!(t.missed_fouls, 0);
+        assert_eq!(t.used, 1);
+    }
+
+    #[test]
+    fn 同手番の玉反則は汚名に入らないのでmissedにしない() {
+        let positions = positions_at(11, rook_file_check());
+        let observations = vec![
+            Observation::MyFoul {
+                move_number: 12,
+                usi: "5i4h".into(),
+            },
+            Observation::MyMove {
+                move_number: 13,
+                usi: "5i6i".into(),
+                captured: None,
+            },
+        ];
+        let t = tally_check_stale_king_missed(&observations, &positions, Color::Sente, false);
+        assert_eq!(t.legal_escape_decisions, 0);
+        assert_eq!(t.missed_fouls, 0);
+        assert_eq!(t.used, 0);
+    }
+
+    #[test]
+    fn 汚名が非合法マスだけならmissedにしない() {
+        let positions = positions_at(11, rook_file_check());
+        let observations = vec![
+            Observation::MyFoul {
+                move_number: 10,
+                usi: "5i5h".into(),
+            },
+            Observation::OpponentMoved {
+                move_number: 11,
+                captured_my_piece_at: None,
+            },
+            Observation::MyFoul {
+                move_number: 12,
+                usi: "5i4i".into(),
+            },
+        ];
+        let t = tally_check_stale_king_missed(&observations, &positions, Color::Sente, false);
+        assert_eq!(t.legal_escape_decisions, 0);
+        assert_eq!(t.missed_fouls, 0);
+    }
+
+    #[test]
+    fn 王手でなければ数えない() {
+        let mut pos = Position::empty(Color::Sente);
+        pos.set(
+            sq("5i"),
+            Some(Piece {
+                color: Color::Sente,
+                role: Role::King,
+            }),
+        );
+        pos.set(
+            sq("8a"),
+            Some(Piece {
+                color: Color::Gote,
+                role: Role::King,
+            }),
+        );
+        let positions = positions_at(11, pos);
+        let observations = vec![
+            Observation::MyFoul {
+                move_number: 10,
+                usi: "5i4h".into(),
+            },
+            Observation::OpponentMoved {
+                move_number: 11,
+                captured_my_piece_at: None,
+            },
+            Observation::MyFoul {
+                move_number: 12,
+                usi: "5i5h".into(),
+            },
+        ];
+        let t = tally_check_stale_king_missed(&observations, &positions, Color::Sente, false);
+        assert_eq!(t.legal_escape_decisions, 0);
+        assert_eq!(t.missed_fouls, 0);
+        assert_eq!(t.used, 0);
     }
 }
