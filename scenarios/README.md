@@ -75,7 +75,7 @@ npm run tauri dev
      （通常 8/20 = 残ギャップは信念側）、king-evade 6a7a 10/10 だが
      **全シードで 6a5b・6a7b の反則2回が先に出る**（= 玉での王手駒捕獲の
      過大評価は粒子が真実でも残る評価側の問題。`TSUITATE_KING_PARTICLE_LEGAL_W`
-     がこの層。アリーナ未計測）、dragon-check-drop 5c4d
+     がこの層（安全方向のみ）。アリーナ未計測）、dragon-check-drop 5c4d
      10/10・反則12、quest31-m030f2 4f4g+ 10/10
 3. 実行:
    ```
