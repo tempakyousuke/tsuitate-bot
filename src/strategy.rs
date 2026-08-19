@@ -5444,7 +5444,23 @@ impl Strategy for EstimatorStrategy {
             } else {
                 &sample
             };
-            CheckSolver::new(view, votes, &fouls, log)
+            let solver = CheckSolver::new(view, votes, &fouls, log);
+            if std::env::var("TSUITATE_DEBUG_CHECK").is_ok() {
+                if let Some(s) = solver.as_ref() {
+                    let hyps = s.debug_hypotheses();
+                    let shown: Vec<String> = hyps
+                        .iter()
+                        .take(14)
+                        .map(|(sq, role, w)| format!("{sq}{role:?}={w:.3}"))
+                        .collect();
+                    eprintln!(
+                        "DEBUG hypotheses({}): {}",
+                        hyps.len(),
+                        shown.join(" ")
+                    );
+                }
+            }
+            solver
         } else {
             None
         };

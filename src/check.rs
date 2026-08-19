@@ -117,6 +117,91 @@ fn occupancy_prior(p_occ: f64, w: f64) -> f64 {
     (1.0 - w) + w * p
 }
 
+/// **王手駒仮説のマス単位正規化**（`TSUITATE_CHECK_HYP_PRIOR`、既定 **0** =
+/// 従来の一様、作業点 1.0）。
+///
+/// 仮説は（マス, 駒種）の直積で列挙され、重みは一様 1.0 だった。すると
+/// **P(王手駒のマス) ∝ そのマスから王手になりうる駒種の個数**になる。
+/// 自玉の隣接マスは金・と金・成香・成桂・成銀・馬・龍・飛…と 8〜10 通りが
+/// 立つのに対し、離れた飛び駒のマスは飛/龍の 2 通りしか立たない。
+/// つまり**隣接の幻仮説が距離のある真の王手駒より構造的に 4〜5 倍重い**。
+/// 実測（arena-check-foul01、真の王手駒は 1一に打たれた飛車）: 2一の
+/// 8仮説が質量 0.33 を占め、1一の 2仮説は 0.048 しかない。正しい合駒
+/// N*2a の p_legal は 0.041 まで薄まり、幻の 3二/2二捕獲（gain 17）が
+/// 7連続反則を生んだ。kakutori の「離れた角の捕獲が薄まる」残ギャップも同型。
+///
+/// w=1 で各マスの仮説の重み和を 1 に揃える（= P(マス) が一様、
+/// P(駒種|マス) が在庫枚数×成り割引に比例）。w=0 は従来どおり。
+/// **仮説は消さない**（重みは常に正）ので健全性は不変。
+/// 凍結版はこの名前を知らないので `-f env=` は候補側にだけ効く
+fn hyp_prior_w() -> f64 {
+    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("TSUITATE_CHECK_HYP_PRIOR")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|v: &f64| v.is_finite() && (0.0..=1.0).contains(v))
+            .unwrap_or(CHECK_HYP_PRIOR_W)
+    })
+}
+
+/// マス単位正規化の既定（0 = 従来挙動）
+const CHECK_HYP_PRIOR_W: f64 = 0.0;
+
+/// **反則の証拠としての強さを手の種類で分ける**（`TSUITATE_CHECK_FOUL_EVIDENCE`、
+/// 既定 **0** = 従来の一律、作業点 1.0）。
+///
+/// `observe_foul` は「その仮説の下では合法だったはずの手が反則になった」ことを
+/// 一律 `UNEXPLAINED_FOUL_DECAY`（0.15）で減衰させていた。しかし
+/// **単独仮説で合法だった手が実際にも合法だった率は手の種類で大きく違う**
+/// （アリーナ400局・王手中2481決定の実測、KING_CAPTURE_LEGAL_PRIOR の doc）:
+/// 玉で王手駒を取る 73% / 玉の逃げ 75〜81% / 玉以外の捕獲 97% / 打ち 100%。
+/// つまり玉の手の反則は「別の隠れ駒が覆っていた」で説明できる余地が 2〜3 割
+/// あるのに対し、打ち・合駒・非玉の捕獲の反則は**その仮説そのものを強く否定
+/// する**（ほぼ確実に王手駒はそこではない）。一律 0.15 は前者を殺しすぎ・
+/// 後者を殺し足りない。
+///
+/// w=1 で実測どおりの減衰（玉の逃げ 0.22 / 玉の捕獲 0.27 / 非玉の捕獲 0.03 /
+/// 打ち・合駒 0.05）に切り替える。w=0 は従来。**resolve_probability 側は
+/// 触らない**: 玉の逃げの解消確率まで割り引いた 2026-07-29 の第1版は
+/// 較正が正しいのにアリーナ3シードで全て悪化した（不確実な合駒・捕獲プローブへ
+/// の押し出し）。ここは「証拠の重み付け」だけを直す。
+/// 凍結版はこの名前を知らないので `-f env=` は候補側にだけ効く
+fn foul_evidence_w() -> f64 {
+    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("TSUITATE_CHECK_FOUL_EVIDENCE")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|v: &f64| v.is_finite() && (0.0..=1.0).contains(v))
+            .unwrap_or(CHECK_FOUL_EVIDENCE_W)
+    })
+}
+
+/// 反則の証拠の強さを手の種類で分けるかどうかの既定（0 = 従来の一律）
+const CHECK_FOUL_EVIDENCE_W: f64 = 0.0;
+
+/// 実測 75〜81% の中央付近（玉の逃げが単独仮説で合法だった率）
+const KING_ESCAPE_LEGAL_PRIOR: f64 = 0.78;
+/// 玉以外の駒での捕獲の反則は仮説をほぼ否定する（実測 97%）
+const NONKING_CAPTURE_FOUL_DECAY: f64 = 0.03;
+/// 打ち・合駒の反則も仮説をほぼ否定する（実測 100%。床として 0.05 を置く）
+const QUIET_FOUL_DECAY: f64 = 0.05;
+
+/// 成駒の事前割引（同じ基本駒種の在庫のうち「既に成っている」割合の近似）
+const PROMOTED_PRIOR: f64 = 0.5;
+
+/// 駒種の在庫事前: 相手が持ちうる枚数 n（基本駒種で数える）に成り割引を掛ける。
+/// 歩 9 枚 > 金銀桂香 2 枚 > 飛角 1 枚 の序列がそのまま P(駒種|マス) になる
+fn role_inventory_prior(role: Role, n: i32) -> f64 {
+    let base = n.max(0) as f64;
+    if unpromote_role(role) == role {
+        base
+    } else {
+        base * PROMOTED_PRIOR
+    }
+}
+
 /// 粒子のうち自玉が王手されているものが1つでもあれば投票できる。
 /// 占有事前はこのとき掛けない（投票と乗算で喧嘩するため）
 fn particles_vote_check(particles: &[(&Position, f64)], my_color: Color) -> bool {
@@ -169,6 +254,9 @@ pub struct CheckSolver {
     hypotheses: Vec<Hypothesis>,
     /// 仮説ごとの残存脅威（threat_of）の遅延キャッシュ。hypotheses と同じ並び
     threat_cache: Vec<Option<f64>>,
+    /// 反則の証拠の強さを手の種類で分ける強さ（`foul_evidence_w`）。
+    /// 構築時に env を1回読んで持つ（テストから明示指定できるように）
+    foul_evidence: f64,
 }
 
 impl CheckSolver {
@@ -179,6 +267,25 @@ impl CheckSolver {
         particles: &[(&Position, f64)],
         fouls_this_turn: &[ShogiMove],
         log: &ObservationLog,
+    ) -> Option<CheckSolver> {
+        Self::with_knobs(
+            view,
+            particles,
+            fouls_this_turn,
+            log,
+            hyp_prior_w(),
+            foul_evidence_w(),
+        )
+    }
+
+    /// ノブを明示指定して作る（`new` は env から読んで委譲する。テスト用）
+    fn with_knobs(
+        view: &PlayerView,
+        particles: &[(&Position, f64)],
+        fouls_this_turn: &[ShogiMove],
+        log: &ObservationLog,
+        prior_w: f64,
+        foul_evidence: f64,
     ) -> Option<CheckSolver> {
         let my_color = view.your_color;
         let mut base = Position::empty(my_color);
@@ -228,8 +335,9 @@ impl CheckSolver {
             my_color,
             hypotheses: vec![],
             threat_cache: vec![],
+            foul_evidence,
         };
-        solver.enumerate(&opponent_role_counts(view, log));
+        solver.enumerate(&opponent_role_counts(view, log), prior_w);
         if solver.hypotheses.is_empty() {
             return None;
         }
@@ -296,7 +404,7 @@ impl CheckSolver {
     /// 取られた直後の王手なのに、taint 粒子の多数決が5二を非王手駒と近似して
     /// 仮説が列挙されなかった）。健全性（真の王手駒を仮説から落とさない）を
     /// 優先し、近似駒種は他の仮説の判定時の遮蔽・利き被覆にだけ使う
-    fn enumerate(&mut self, opp_counts: &HashMap<Role, i32>) {
+    fn enumerate(&mut self, opp_counts: &HashMap<Role, i32>, prior_w: f64) {
         let opp = self.my_color.other();
         let king = self
             .base
@@ -313,11 +421,14 @@ impl CheckSolver {
                 if sq == king {
                     continue;
                 }
+                // このマスから王手になる駒種を先に集め、駒種事前（在庫枚数×成り
+                // 割引）で**マス単位に正規化**する（`hyp_prior_w` の doc 参照）
+                let mut roles: Vec<(Role, f64)> = vec![];
                 for role in CHECKER_ROLES {
-                    if opp_counts
-                        .get(&unpromote_role(role))
-                        .is_none_or(|&n| n <= 0)
-                    {
+                    let Some(&n) = opp_counts.get(&unpromote_role(role)) else {
+                        continue;
+                    };
+                    if n <= 0 {
                         continue;
                     }
                     self.base
@@ -325,12 +436,20 @@ impl CheckSolver {
                     let checks = self.base.in_check(self.my_color);
                     self.base.set(sq, existing);
                     if checks {
-                        self.hypotheses.push(Hypothesis {
-                            square: sq,
-                            role,
-                            weight: 1.0,
-                        });
+                        roles.push((role, role_inventory_prior(role, n)));
                     }
+                }
+                let total: f64 = roles.iter().map(|(_, p)| *p).sum();
+                for (role, p) in roles {
+                    // w=0 で従来の一様（(マス,駒種)ごとに 1.0）、w=1 でマス単位
+                    // 正規化（Σ_駒種 = 1）。間は線形補間
+                    let normalized = if total > 0.0 { p / total } else { 1.0 };
+                    let weight = (1.0 - prior_w) + prior_w * normalized;
+                    self.hypotheses.push(Hypothesis {
+                        square: sq,
+                        role,
+                        weight,
+                    });
                 }
             }
         }
@@ -517,10 +636,39 @@ impl CheckSolver {
     fn observe_foul(&mut self, foul: &ShogiMove) {
         for i in 0..self.hypotheses.len() {
             if self.legal_under(i, foul) {
-                let prior = self.single_hyp_legal_prior(foul, self.hypotheses[i].square);
-                self.hypotheses[i].weight *= UNEXPLAINED_FOUL_DECAY.max(1.0 - prior);
+                let decay = self.foul_decay_for(foul, self.hypotheses[i].square);
+                self.hypotheses[i].weight *= decay;
             }
         }
+    }
+
+    /// 反則1件が「その仮説の下では合法だったはず」のときの減衰係数。
+    /// `foul_evidence_w` が 0 なら従来どおり一律（玉での仮説マス捕獲だけ緩め）、
+    /// 1 なら手の種類ごとの実測合法率に基づく（`foul_evidence_w` の doc）
+    fn foul_decay_for(&self, foul: &ShogiMove, hyp_square: Coord) -> f64 {
+        let legacy =
+            UNEXPLAINED_FOUL_DECAY.max(1.0 - self.single_hyp_legal_prior(foul, hyp_square));
+        let w = self.foul_evidence;
+        if w <= 0.0 {
+            return legacy;
+        }
+        let measured = match *foul {
+            ShogiMove::Drop { .. } => QUIET_FOUL_DECAY,
+            ShogiMove::Board { from, to, .. } => {
+                if self.base.king_square(self.my_color) == Some(from) {
+                    if to == hyp_square {
+                        (1.0 - KING_CAPTURE_LEGAL_PRIOR).max(UNEXPLAINED_FOUL_DECAY)
+                    } else {
+                        1.0 - KING_ESCAPE_LEGAL_PRIOR
+                    }
+                } else if to == hyp_square || self.base.piece_at(to).is_some() {
+                    NONKING_CAPTURE_FOUL_DECAY
+                } else {
+                    QUIET_FOUL_DECAY
+                }
+            }
+        };
+        (1.0 - w) * legacy + w * measured
     }
 
     /// 仮説 i の下で（他の隠れ駒を無視して）mv が合法か = 王手を解消するか。
@@ -690,6 +838,27 @@ impl CheckSolver {
     #[cfg(test)]
     fn hypothesis_count(&self) -> usize {
         self.hypotheses.len()
+    }
+
+    /// 仮説分布の診断ダンプ（`TSUITATE_DEBUG_CHECK=1` のときだけ呼ばれる）。
+    /// (マスの USI, 駒種, 正規化重み) を重みの降順で返す。
+    /// 「正しい解消手の p_legal が薄い」局面で、どの幻仮説が質量を
+    /// 持っているかを見るために使う
+    pub fn debug_hypotheses(&self) -> Vec<(String, Role, f64)> {
+        let total: f64 = self.hypotheses.iter().map(|h| h.weight).sum();
+        let mut out: Vec<(String, Role, f64)> = self
+            .hypotheses
+            .iter()
+            .map(|h| {
+                (
+                    crate::board::make_usi_square(h.square),
+                    h.role,
+                    if total > 0.0 { h.weight / total } else { 0.0 },
+                )
+            })
+            .collect();
+        out.sort_by(|a, b| b.2.total_cmp(&a.2));
+        out
     }
 }
 
@@ -1176,6 +1345,70 @@ mod tests {
             stay_a < stay_b,
             "重み付き投票なら飛重視側で5筋残留が不利（a={stay_a:.2} b={stay_b:.2}）"
         );
+    }
+
+    #[test]
+    fn hypothesis_prior_normalizes_mass_per_square() {
+        // 玉 5五・自駒なし。隣接マスは金・と金・成香…と多数の駒種が立つのに対し、
+        // 離れた 5一（縦の飛び道）は飛/龍/香/成香の少数しか立たない。
+        // w=0（従来）は（マス,駒種）一様なので隣接が構造的に重く、
+        // w=1 はマス単位で正規化されるので両者が同格になる
+        let view = view_with(vec![("5e", Role::King)]);
+        let log = ObservationLog::default();
+        let mass = |prior_w: f64, file: i8, rank: i8| -> f64 {
+            let s = CheckSolver::with_knobs(&view, &[], &[], &log, prior_w, 0.0).unwrap();
+            let total: f64 = s.hypotheses.iter().map(|h| h.weight).sum();
+            let sq = Coord { file, rank };
+            s.hypotheses
+                .iter()
+                .filter(|h| h.square == sq)
+                .map(|h| h.weight)
+                .sum::<f64>()
+                / total
+        };
+        // 隣接（5四）と遠方の飛び道（5一）の質量比
+        let legacy = mass(0.0, 5, 4) / mass(0.0, 5, 1);
+        let normalized = mass(1.0, 5, 4) / mass(1.0, 5, 1);
+        assert!(
+            legacy > 2.0,
+            "従来は隣接マスが遠方より構造的に重い（実測比 {legacy:.2}）"
+        );
+        assert!(
+            (normalized - 1.0).abs() < 1e-9,
+            "w=1 ではマス単位の質量が揃う（比 {normalized:.3}）"
+        );
+    }
+
+    #[test]
+    fn foul_evidence_makes_quiet_fouls_stronger_refuters_than_king_escapes() {
+        // 4四に王手駒仮説。玉の逃げの反則と、非玉の駒での捕獲の反則で、
+        // 同じ仮説がどれだけ否定されるかを比べる（w=1 では実測どおり
+        // 捕獲の反則のほうが強く否定する）
+        let view = view_with(vec![("5e", Role::King), ("4e", Role::Gold)]);
+        let log = ObservationLog::default();
+        let p_after = |foul: &str, w: f64| -> f64 {
+            let fouls = [mv(foul)];
+            let mut s = CheckSolver::with_knobs(&view, &[], &fouls, &log, 0.0, w).unwrap();
+            s.resolve_probability(&mv("4e4d"))
+        };
+        // 玉の逃げ（5e5f）は 4d 仮説を殺さない方向、金の捕獲（4e4d）は殺す方向
+        let escape_w1 = p_after("5e5f", 1.0);
+        let capture_w1 = p_after("4e4d", 1.0);
+        assert!(
+            capture_w1 < escape_w1,
+            "捕獲の反則 {capture_w1:.3} は玉の逃げの反則 {escape_w1:.3} より仮説を強く否定する"
+        );
+        // 従来（w=0）より、捕獲の反則の否定は強く、玉の逃げの否定は弱い
+        assert!(capture_w1 < p_after("4e4d", 0.0));
+        assert!(escape_w1 >= p_after("5e5f", 0.0) - 1e-12);
+    }
+
+    #[test]
+    fn role_inventory_prior_discounts_promoted_roles() {
+        assert_eq!(role_inventory_prior(Role::Pawn, 9), 9.0);
+        assert_eq!(role_inventory_prior(Role::Tokin, 9), 9.0 * PROMOTED_PRIOR);
+        assert_eq!(role_inventory_prior(Role::Rook, 1), 1.0);
+        assert_eq!(role_inventory_prior(Role::Dragon, 1), PROMOTED_PRIOR);
     }
 
     #[test]
