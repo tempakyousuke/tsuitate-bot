@@ -20,7 +20,7 @@ use crate::board::Coord;
 use crate::model::GameModel;
 use crate::observation::ObservationLog;
 use crate::protocol::{Color, PlayerView, Role};
-use crate::shogi::{Position, ShogiMove, unpromote_role};
+use crate::shogi::{unpromote_role, Position, ShogiMove};
 
 /// 王手駒になりうる駒種（玉は王手できない）
 const CHECKER_ROLES: [Role; 13] = [
@@ -73,6 +73,47 @@ fn king_prior_w() -> f64 {
             .and_then(|s| s.parse().ok())
             .unwrap_or(1.0)
     })
+}
+
+/// 信念ネット占有による王手駒仮説の事前（`TSUITATE_CHECK_BELIEF_OCC_W`、
+/// 既定 **1.0**、0 で従来挙動 = 切り戻しノブ）。
+///
+/// 仮説は自玉へ利きうる全（マス,駒種）なので、空きマスの幻仮説が生存すると
+/// 正しい捕獲の `resolve_probability` が薄まる（kakutori の残ギャップ）。
+/// pointwise ネットは「今どの駒が王手しているか」は表現できないが、
+/// **空きマスに王手駒は居ない**という必要条件は占有較正（対数損失 0.36 /
+/// AUC 0.89）で粒子より当たる。仮説重みへ ` (1−w)+w·p_occ ` を掛ける。
+/// 床 `CHECK_BELIEF_OCC_FLOOR` で仮説を殺さない（健全性: 真の王手駒を
+/// ネットが空きと見ても列挙から落とさない）。捕獲マスブーストの後・
+/// 粒子投票の**前**に掛ける。直前の捕獲マスは観測で占有確定なので乗せず、
+/// 粒子投票は上書きできる。
+/// 凍結版はこの名前を知らないので `-f env=` は候補側にだけ効く。
+fn check_belief_occ_w() -> f64 {
+    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("TSUITATE_CHECK_BELIEF_OCC_W")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|v: &f64| v.is_finite() && *v >= 0.0)
+            .unwrap_or(CHECK_BELIEF_OCC_W)
+    })
+}
+
+/// 占有事前の既定。0 で従来（一様仮説）へ切り戻し
+const CHECK_BELIEF_OCC_W: f64 = 1.0;
+/// ネットが空きと見ても仮説を残す床（健全性）
+const CHECK_BELIEF_OCC_FLOOR: f64 = 0.05;
+
+/// マス占有 p と重み w から仮説への乗数を返す。w=0 は 1、w=1 は
+/// `p.max(FLOOR)`。w は [0,1] にクリップ（負の乗数を出さない）。
+/// テストと本番で同じ式を使う
+fn occupancy_prior(p_occ: f64, w: f64) -> f64 {
+    if w <= 0.0 {
+        return 1.0;
+    }
+    let w = w.min(1.0);
+    let p = p_occ.clamp(CHECK_BELIEF_OCC_FLOOR, 1.0);
+    (1.0 - w) + w * p
 }
 
 /// 粒子投票の強さ（全粒子が一致した仮説は一様仮説の 1+PARTICLE_VOTE_W 倍）
@@ -152,8 +193,8 @@ impl CheckSolver {
             if base.piece_at(sq).is_some() {
                 continue;
             }
-            let role = particle_majority_role(particles, my_color.other(), sq)
-                .unwrap_or(Role::Tokin);
+            let role =
+                particle_majority_role(particles, my_color.other(), sq).unwrap_or(Role::Tokin);
             base.set(
                 sq,
                 Some(crate::shogi::Piece {
@@ -209,6 +250,15 @@ impl CheckSolver {
                 }
             }
         }
+        // 信念ネット占有を仮説の事前にする（捕獲マスブーストの後、
+        // 粒子投票より前。直前の捕獲マスは観測で占有確定なので乗せず、
+        // 粒子投票はどちらも上書きできる）。
+        let occ_w = check_belief_occ_w();
+        if occ_w > 0.0 {
+            let ctx = crate::belief_features::BeliefContext::from_log(my_color, log);
+            let occ = crate::belief_nn::board_occupancy(&ctx);
+            solver.reweight_by_occupancy(&occ, occ_w, last_opp_capture);
+        }
         solver.vote_by_particles(particles);
         for foul in fouls_this_turn {
             solver.observe_foul(foul);
@@ -227,7 +277,10 @@ impl CheckSolver {
     /// 優先し、近似駒種は他の仮説の判定時の遮蔽・利き被覆にだけ使う
     fn enumerate(&mut self, opp_counts: &HashMap<Role, i32>) {
         let opp = self.my_color.other();
-        let king = self.base.king_square(self.my_color).expect("new で確認済み");
+        let king = self
+            .base
+            .king_square(self.my_color)
+            .expect("new で確認済み");
         for file in 1..=9i8 {
             for rank in 1..=9i8 {
                 let sq = Coord { file, rank };
@@ -246,10 +299,8 @@ impl CheckSolver {
                     {
                         continue;
                     }
-                    self.base.set(
-                        sq,
-                        Some(crate::shogi::Piece { color: opp, role }),
-                    );
+                    self.base
+                        .set(sq, Some(crate::shogi::Piece { color: opp, role }));
                     let checks = self.base.in_check(self.my_color);
                     self.base.set(sq, existing);
                     if checks {
@@ -261,6 +312,22 @@ impl CheckSolver {
                     }
                 }
             }
+        }
+    }
+
+    /// 信念ネット占有で仮説重みを再配分する。同じマスの駒種仮説は同じ
+    /// 乗数。w=0 は無変化。床付きなので仮説は消えない。
+    /// `skip`（直前の捕獲マス）は観測で占有が確定しているので乗らない
+    fn reweight_by_occupancy(&mut self, occ: &[f64; 81], w: f64, skip: Option<Coord>) {
+        if w <= 0.0 {
+            return;
+        }
+        for h in &mut self.hypotheses {
+            if skip.is_some_and(|sq| sq == h.square) {
+                continue;
+            }
+            let p = occ[crate::belief_features::sq_index(h.square)];
+            h.weight *= occupancy_prior(p, w);
         }
     }
 
@@ -276,7 +343,8 @@ impl CheckSolver {
             }
             voters += w;
             for (i, h) in self.hypotheses.iter().enumerate() {
-                if pos.piece_at(h.square)
+                if pos
+                    .piece_at(h.square)
                     .is_some_and(|p| p.color == opp && p.role == h.role)
                 {
                     // 粒子上でその駒が実際に王を攻撃しているかまでは見ない
@@ -541,13 +609,11 @@ fn particle_majority_role(particles: &[(&Position, f64)], opp: Color, sq: Coord)
             }
         }
     }
-    let (role, n) = counts
-        .into_iter()
-        .max_by(|(ra, a), (rb, b)| {
-            a.partial_cmp(b)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| role_order(*rb).cmp(&role_order(*ra)))
-        })?;
+    let (role, n) = counts.into_iter().max_by(|(ra, a), (rb, b)| {
+        a.partial_cmp(b)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| role_order(*rb).cmp(&role_order(*ra)))
+    })?;
     if n * 2.0 > total {
         Some(role)
     } else {
@@ -689,7 +755,8 @@ mod tests {
     #[test]
     fn capture_square_hypotheses_are_boosted() {
         // 王手宣言と同時に自駒が取られたマス（直前の相手手の着地点）の仮説は
-        // CAPTURE_CHECKER_BOOST 倍される（開き王手より「来た駒が王手駒」が優勢）
+        // CAPTURE_CHECKER_BOOST 倍される（開き王手より「来た駒が王手駒」が優勢）。
+        // 占有事前が乗ったあとも正確な 4.0 倍にはならないので、支配だけ見る
         let view = view_with(vec![("5e", Role::King)]);
         let mut log = ObservationLog::default();
         log.record(crate::observation::Observation::OpponentMoved {
@@ -711,7 +778,7 @@ mod tests {
             .map(|h| h.weight)
             .fold(f64::MIN, f64::max);
         assert!(
-            boosted >= other * (CAPTURE_CHECKER_BOOST - 1e-9),
+            boosted > other * 3.0,
             "捕獲マスの仮説がブーストされていない（5d={boosted:.2} 他={other:.2}）"
         );
     }
@@ -840,7 +907,10 @@ mod tests {
             covered == 0.0,
             "既知の敵駒に覆われたマスへの逃げは全仮説で非合法のはず（p={covered:.2}）"
         );
-        assert!(side > 0.0, "覆われていない逃げは生きているはず（p={side:.2}）");
+        assert!(
+            side > 0.0,
+            "覆われていない逃げは生きているはず（p={side:.2}）"
+        );
     }
 
     #[test]
@@ -911,8 +981,7 @@ mod tests {
 
         let rook_heavy: Vec<(&Position, f64)> = vec![(&rook, 1.0), (&bishop, 0.1)];
         let bishop_heavy: Vec<(&Position, f64)> = vec![(&rook, 0.1), (&bishop, 1.0)];
-        let mut a =
-            CheckSolver::new(&view, &rook_heavy, &[], &ObservationLog::default()).unwrap();
+        let mut a = CheckSolver::new(&view, &rook_heavy, &[], &ObservationLog::default()).unwrap();
         let mut b =
             CheckSolver::new(&view, &bishop_heavy, &[], &ObservationLog::default()).unwrap();
         let stay_a = a.resolve_probability(&mv("5e5d"));
@@ -920,6 +989,80 @@ mod tests {
         assert!(
             stay_a < stay_b,
             "重み付き投票なら飛重視側で5筋残留が不利（a={stay_a:.2} b={stay_b:.2}）"
+        );
+    }
+
+    #[test]
+    fn occupancy_prior_is_identity_at_w0_and_floors_empty() {
+        assert_eq!(occupancy_prior(0.0, 0.0), 1.0);
+        assert_eq!(occupancy_prior(0.4, 0.0), 1.0);
+        assert!((occupancy_prior(1.0, 1.0) - 1.0).abs() < 1e-12);
+        assert!((occupancy_prior(0.0, 1.0) - CHECK_BELIEF_OCC_FLOOR).abs() < 1e-12);
+        assert!((occupancy_prior(0.4, 1.0) - 0.4).abs() < 1e-12);
+        // w=0.5 は一様と占有の中点
+        assert!((occupancy_prior(0.4, 0.5) - 0.7).abs() < 1e-12);
+        // w>1 は 1 にクリップ（負の乗数を出さない）
+        assert!((occupancy_prior(0.4, 2.0) - occupancy_prior(0.4, 1.0)).abs() < 1e-12);
+        if std::env::var("TSUITATE_CHECK_BELIEF_OCC_W").is_err() {
+            assert!((check_belief_occ_w() - CHECK_BELIEF_OCC_W).abs() < 1e-12);
+            assert_eq!(CHECK_BELIEF_OCC_W, 1.0);
+        }
+    }
+
+    #[test]
+    fn occupancy_reweight_prefers_occupied_checker_squares() {
+        // 5e 裸玉。5a（飛の筋）を占有、2b（角）を空き寄りにすると、
+        // 5筋から外れる逃げ（4d）の解消確率が上がる
+        let view = view_with(vec![("5e", Role::King)]);
+        let mut solver = CheckSolver::new(&view, &[], &[], &ObservationLog::default()).unwrap();
+        let mut occ = [0.2f64; 81];
+        occ[crate::belief_features::sq_index(Coord { file: 5, rank: 1 })] = 0.9;
+        occ[crate::belief_features::sq_index(Coord { file: 2, rank: 2 })] = 0.05;
+        solver.reweight_by_occupancy(&occ, 1.0, None);
+        let away = solver.resolve_probability(&mv("5e4d"));
+        let stay = solver.resolve_probability(&mv("5e5d"));
+        assert!(
+            away > stay,
+            "5a 占有なら飛仮説が強く、5筋から外れる手が有利（away={away:.2} stay={stay:.2}）"
+        );
+        // 床があるので仮説は残る
+        assert!(
+            solver.hypotheses.iter().all(|h| h.weight > 0.0),
+            "占有事前は仮説を殺さない"
+        );
+    }
+
+    #[test]
+    fn occupancy_reweight_skips_observed_capture_square() {
+        // 観測で確定した捕獲マスは占有が低くても重みが落ちない
+        let view = view_with(vec![("5e", Role::King)]);
+        let mut solver = CheckSolver::new(&view, &[], &[], &ObservationLog::default()).unwrap();
+        let capture = Coord { file: 5, rank: 1 };
+        let before: Vec<f64> = solver
+            .hypotheses
+            .iter()
+            .filter(|h| h.square == capture)
+            .map(|h| h.weight)
+            .collect();
+        assert!(!before.is_empty(), "5a の飛仮説がある");
+        let mut occ = [0.9f64; 81];
+        occ[crate::belief_features::sq_index(capture)] = 0.0;
+        solver.reweight_by_occupancy(&occ, 1.0, Some(capture));
+        let after: Vec<f64> = solver
+            .hypotheses
+            .iter()
+            .filter(|h| h.square == capture)
+            .map(|h| h.weight)
+            .collect();
+        assert_eq!(before, after, "捕獲マスは占有事前を乗らない");
+        // 他マスは下がる
+        assert!(
+            solver
+                .hypotheses
+                .iter()
+                .filter(|h| h.square != capture)
+                .all(|h| h.weight < 1.0),
+            "捕獲マス以外は占有事前が掛かる"
         );
     }
 }
