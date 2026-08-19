@@ -84,9 +84,10 @@ fn king_prior_w() -> f64 {
 /// **空きマスに王手駒は居ない**という必要条件は占有較正（対数損失 0.36 /
 /// AUC 0.89）で粒子より当たる。仮説重みへ ` (1−w)+w·p_occ ` を掛ける。
 /// 床 `CHECK_BELIEF_OCC_FLOOR` で仮説を殺さない（健全性: 真の王手駒を
-/// ネットが空きと見ても列挙から落とさない）。捕獲マスブーストの後・
-/// 粒子投票の**前**に掛ける。直前の捕獲マスは観測で占有確定なので乗せず、
-/// 粒子投票は上書きできる。
+/// ネットが空きと見ても列挙から落とさない）。粒子が王手を投票できるときは
+/// 掛けない（乗算だと床×投票が幻の高占有仮説に負ける）。ブラインドのとき
+/// だけ、捕獲マスブーストの後に掛ける。直前の捕獲マスは観測で占有確定
+/// なので乗らない。
 /// 凍結版はこの名前を知らないので `-f env=` は候補側にだけ効く。
 fn check_belief_occ_w() -> f64 {
     static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -114,6 +115,12 @@ fn occupancy_prior(p_occ: f64, w: f64) -> f64 {
     let w = w.min(1.0);
     let p = p_occ.clamp(CHECK_BELIEF_OCC_FLOOR, 1.0);
     (1.0 - w) + w * p
+}
+
+/// 粒子のうち自玉が王手されているものが1つでもあれば投票できる。
+/// 占有事前はこのとき掛けない（投票と乗算で喧嘩するため）
+fn particles_vote_check(particles: &[(&Position, f64)], my_color: Color) -> bool {
+    particles.iter().any(|(pos, _)| pos.in_check(my_color))
 }
 
 /// 粒子投票の強さ（全粒子が一致した仮説は一様仮説の 1+PARTICLE_VOTE_W 倍）
@@ -250,16 +257,18 @@ impl CheckSolver {
                 }
             }
         }
-        // 信念ネット占有を仮説の事前にする（捕獲マスブーストの後、
-        // 粒子投票より前。直前の捕獲マスは観測で占有確定なので乗せず、
-        // 粒子投票はどちらも上書きできる）。
+        solver.vote_by_particles(particles);
+        // 信念ネット占有は**粒子が王手を投票できないときだけ**事前にする。
+        // 乗算を投票の前に置くと、床 0.05 × 投票9倍 = 0.45 が占有1.0の幻仮説に
+        // 負け、段階②の「王手中の再重み付けは有害」と同じ形になる
+        // （700ms×3試行で kakutori 注目手 1/3→0/3）。直前の捕獲マスは
+        // 観測で占有確定なので乗らない。
         let occ_w = check_belief_occ_w();
-        if occ_w > 0.0 {
+        if occ_w > 0.0 && !particles_vote_check(particles, my_color) {
             let ctx = crate::belief_features::BeliefContext::from_log(my_color, log);
             let occ = crate::belief_nn::board_occupancy(&ctx);
             solver.reweight_by_occupancy(&occ, occ_w, last_opp_capture);
         }
-        solver.vote_by_particles(particles);
         for foul in fouls_this_turn {
             solver.observe_foul(foul);
         }
@@ -1007,6 +1016,7 @@ mod tests {
             assert!((check_belief_occ_w() - CHECK_BELIEF_OCC_W).abs() < 1e-12);
             assert_eq!(CHECK_BELIEF_OCC_W, 1.0);
         }
+        assert!(!particles_vote_check(&[], Color::Sente));
     }
 
     #[test]
