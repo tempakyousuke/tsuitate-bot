@@ -301,4 +301,68 @@ mod tests {
         let stale = stale_king_foul_dests(&log, Color::Sente, 11);
         assert!(stale.is_empty());
     }
+
+    /// 視聴棋譜: 4八玉が 3七玉 で反則したあと、相手桂が 4五→3七→2九成 と通過し
+    /// 2九で成桂を取り返した局面。3七では何も取っておらず玉も受理されていないので、
+    /// 原因の桂が盤上から消えても汚名は残る。
+    #[test]
+    fn 桂が3七を通過して2九で取られても3七の汚名は消えない() {
+        let mut log = ObservationLog::default();
+        log.record(Observation::MyMove {
+            move_number: 1,
+            usi: "7g7f".into(),
+            captured: None,
+        });
+        log.record(Observation::OpponentMoved {
+            move_number: 2,
+            captured_my_piece_at: None,
+        });
+        log.record(Observation::MyMove {
+            move_number: 3,
+            usi: "5i4h".into(),
+            captured: None,
+        });
+        log.record(Observation::OpponentMoved {
+            move_number: 4,
+            captured_my_piece_at: None,
+        });
+        log.record(Observation::MyMove {
+            move_number: 5,
+            usi: "3g3f".into(),
+            captured: None,
+        });
+        log.record(Observation::OpponentMoved {
+            move_number: 6,
+            captured_my_piece_at: None,
+        });
+        log.record(Observation::MyFoul {
+            move_number: 7,
+            usi: "4h3g".into(),
+        });
+        log.record(Observation::MyMove {
+            move_number: 7,
+            usi: "4g4f".into(),
+            captured: None,
+        });
+        log.record(Observation::OpponentMoved {
+            move_number: 8,
+            captured_my_piece_at: None,
+        });
+        log.record(Observation::MyMove {
+            move_number: 9,
+            usi: "4f4e".into(),
+            captured: None,
+        });
+        log.record(Observation::OpponentMoved {
+            move_number: 10,
+            captured_my_piece_at: Some("2i".into()),
+        });
+        log.record(Observation::MyMove {
+            move_number: 11,
+            usi: "2h2i".into(),
+            captured: Some(Role::Promotedknight),
+        });
+        let stale = stale_king_foul_dests(&log, Color::Sente, 13);
+        assert_eq!(stale, HashSet::from([sq("3g")]));
+    }
 }
