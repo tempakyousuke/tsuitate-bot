@@ -1,4 +1,4 @@
-*scenario ply=96 target=7f8g desc=アリーナ自己対局 1787109835984-arena-4 の97手目（bot=Sente）: 被王手（王手駒 8gHorse）で 7f8g（王手駒 Horse（価値8）を価値5の駒で取れた・取り返しなし）のに玉を 6i5h と逃げた。反則 0 回（）。K=8
+*scenario ply=96 target=7f8g scores=6i5h:7,6i6h:6,6i7i:4,7g7h:9,4h7h:2,6i7h:3,7g8g:3,7f8g:3,4h5h:5,5i5h:5,5i6h:5,4h6h:5,P*7h:0,P*8g:0,P*7i:0 bad=4h7h,P*7h,P*8g,P*7i desc=アリーナ自己対局 1787109835984-arena-4 の97手目（bot=Sente）: 被王手（王手駒 8gHorse）で 7f8g（王手駒 Horse（価値8）を価値5の駒で取れた・取り返しなし）のに玉を 6i5h と逃げた。反則 0 回（）。K=8
 棋戦：arena
 手合割：平手
 先手：先手
