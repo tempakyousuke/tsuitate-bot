@@ -133,6 +133,13 @@ const PARTICLE_VOTE_W: f64 = 8.0;
 /// 凍結版はこの名前を知らない）
 const CAPTURE_CHECKER_BOOST: f64 = 4.0;
 
+/// 開き王手の幾何学判定による仮説除去（`prune_infeasible_discovered_checks`）。
+/// `TSUITATE_CHECK_CAPTURE_PRUNE=0` で無効（切り戻し用。凍結版はこの名前を知らない）
+fn capture_prune_enabled() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("TSUITATE_CHECK_CAPTURE_PRUNE").map_or(true, |v| v != "0"))
+}
+
 fn capture_checker_boost() -> f64 {
     static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *W.get_or_init(|| {
@@ -251,6 +258,11 @@ impl CheckSolver {
             })
             .flatten();
         if let Some(sq) = last_opp_capture {
+            // 捕獲マス以外の仮説は「開き王手」としてしか成立しない。自駒配置だけで
+            // 開き王手が幾何学的に不可能な仮説は**除去**する（健全な演繹）
+            if capture_prune_enabled() {
+                solver.prune_infeasible_discovered_checks(sq);
+            }
             for h in &mut solver.hypotheses {
                 if h.square == sq {
                     h.weight *= capture_checker_boost();
@@ -321,6 +333,119 @@ impl CheckSolver {
                     }
                 }
             }
+        }
+    }
+
+    /// **捕獲＋王手の開き王手判定**（2026-08-19、arena-check-flee02 が発端。
+    /// ユーザー指摘「6七で取られたことは分かっているのだから同銀を調べるべき」）。
+    ///
+    /// 直前の相手手が自駒を S で取り、同時に王手宣言が出たなら、王手駒は
+    /// (a) S へ来た駒そのもの、または (b) その駒が出て行った元マス O を通る線上の
+    /// 飛び駒（開き王手）のどちらか。(b) は自駒の配置だけで可否が決まる:
+    /// 仮説 Q（≠S）は、玉–Q が直線で、その間の全マスに自駒がなく、S 自身が
+    /// その間に無く（来た駒が自ら線を塞ぐ）、間のどこかのマス O から S へ
+    /// 何らかの駒種で動ける（隣接・桂跳び・自駒に遮られない直線）ときだけ残す。
+    /// 隣接からの攻撃・桂・金銀などの非飛び駒の仮説は「前の手番から既に
+    /// 王手だった」ことになるので不可（自分の直前の手は合法 = 王手ではなかった）。
+    ///
+    /// flee02 の実測: 玉6八・銀7八・桂5八・歩5七/8六で、6七の捕獲＋王手の
+    /// 非6七仮説が 18% 残っていた（CAPTURE_CHECKER_BOOST ×4 は弱めるだけ）。
+    /// 残り反則1回の foul_cost=60 では p_legal 0.82 の同銀（gain 14.7）が
+    /// 0.989 の玉逃げ（1.26）と僅差になり 2〜3/10 で逃げていた。除去すれば
+    /// 同銀は（隠れた飛車のピンを除き）確実に解消する手になる。
+    /// 全仮説が消える場合は何もしない（健全性の最後の砦）。
+    /// `TSUITATE_CHECK_CAPTURE_PRUNE=0` で無効（切り戻し用）
+    fn prune_infeasible_discovered_checks(&mut self, s: Coord) {
+        let king = self
+            .base
+            .king_square(self.my_color)
+            .expect("new で確認済み");
+        let my = self.my_color;
+        let own_at = |c: Coord| self.base.piece_at(c).is_some_and(|p| p.color == my);
+        let on_board = |c: Coord| (1..=9).contains(&c.file) && (1..=9).contains(&c.rank);
+        // O から S へ何らかの相手駒が1手で動けるか（駒種不問の幾何学判定）
+        let opp_knight_dr: i8 = if my.other() == Color::Sente { -2 } else { 2 };
+        let reachable = |o: Coord| -> bool {
+            let df = s.file - o.file;
+            let dr = s.rank - o.rank;
+            if df == 0 && dr == 0 {
+                return false;
+            }
+            if df.abs() <= 1 && dr.abs() <= 1 {
+                return true; // 隣接（玉・金・銀・成駒など）
+            }
+            if df.abs() == 1 && dr == opp_knight_dr {
+                return true; // 桂
+            }
+            if df == 0 || dr == 0 || df.abs() == dr.abs() {
+                // 直線（飛・角・香・竜・馬）: 間に自駒が無ければ可
+                let sf = df.signum();
+                let sr = dr.signum();
+                let mut c = Coord {
+                    file: o.file + sf,
+                    rank: o.rank + sr,
+                };
+                while c != s {
+                    if own_at(c) {
+                        return false;
+                    }
+                    c = Coord {
+                        file: c.file + sf,
+                        rank: c.rank + sr,
+                    };
+                }
+                return true;
+            }
+            false
+        };
+        let feasible = |q: Coord| -> bool {
+            if q == s {
+                return true;
+            }
+            let df = q.file - king.file;
+            let dr = q.rank - king.rank;
+            if !(df == 0 || dr == 0 || df.abs() == dr.abs()) {
+                return false; // 直線上にない（桂など）= 開き王手になりえない
+            }
+            if df.abs().max(dr.abs()) < 2 {
+                return false; // 隣接 = 前の手番から王手だったことになる
+            }
+            let sf = df.signum();
+            let sr = dr.signum();
+            let mut between = vec![];
+            let mut c = Coord {
+                file: king.file + sf,
+                rank: king.rank + sr,
+            };
+            while c != q {
+                if !on_board(c) {
+                    return false;
+                }
+                between.push(c);
+                c = Coord {
+                    file: c.file + sf,
+                    rank: c.rank + sr,
+                };
+            }
+            // 間に自駒があれば遮られる。来た駒が間にいれば自ら塞ぐ
+            if between.iter().any(|&b| own_at(b) || b == s) {
+                return false;
+            }
+            between.iter().any(|&o| reachable(o))
+        };
+        let kept: Vec<Hypothesis> = self
+            .hypotheses
+            .iter()
+            .filter(|h| feasible(h.square))
+            .map(|h| Hypothesis {
+                square: h.square,
+                role: h.role,
+                weight: h.weight,
+            })
+            .collect();
+        if !kept.is_empty() {
+            self.hypotheses = kept;
+            self.threat_cache = vec![None; self.hypotheses.len()];
         }
     }
 
@@ -790,6 +915,58 @@ mod tests {
             boosted > other * 3.0,
             "捕獲マスの仮説がブーストされていない（5d={boosted:.2} 他={other:.2}）"
         );
+    }
+
+    /// 開き王手が自駒配置上不可能なら、捕獲マス以外の仮説は除去される
+    /// （arena-check-flee02 の幾何: 玉6八・銀7八・桂5八・歩5七/8六、6七で捕獲＋王手）
+    #[test]
+    fn capture_check_prunes_geometrically_impossible_discovered_checks() {
+        let view = view_with(vec![
+            ("6h", Role::King),
+            ("7h", Role::Silver),
+            ("5h", Role::Knight),
+            ("5g", Role::Pawn),
+            ("8f", Role::Pawn),
+        ]);
+        let mut log = ObservationLog::default();
+        log.record(crate::observation::Observation::OpponentMoved {
+            move_number: 112,
+            captured_my_piece_at: Some("6g".into()),
+        });
+        let solver = CheckSolver::new(&view, &[], &[], &log).unwrap();
+        let s = Coord { file: 6, rank: 7 };
+        assert!(
+            solver.hypotheses.iter().all(|h| h.square == s),
+            "6七以外の仮説が残っている: {:?}",
+            solver
+                .hypotheses
+                .iter()
+                .filter(|h| h.square != s)
+                .map(|h| (h.square, h.role))
+                .collect::<Vec<_>>()
+        );
+        // 7八の銀で6七を取る手は（仮説上）確実に解消する
+        let mv = crate::shogi::parse_usi("7h6g").unwrap();
+        let mut solver = solver;
+        assert!((solver.resolve_probability(&mv) - 1.0).abs() < 1e-9);
+    }
+
+    /// 開き王手が可能な幾何では捕獲マス以外の仮説が残る（裸玉5五、5四で捕獲＋
+    /// 王手: 4四から来た駒が斜線 1一–5五 を開けた、等）。同じ線上（5一の飛）は
+    /// 来た駒が自ら塞ぐので残らない
+    #[test]
+    fn capture_check_keeps_feasible_discovered_checks() {
+        let view = view_with(vec![("5e", Role::King)]);
+        let mut log = ObservationLog::default();
+        log.record(crate::observation::Observation::OpponentMoved {
+            move_number: 10,
+            captured_my_piece_at: Some("5d".into()),
+        });
+        let solver = CheckSolver::new(&view, &[], &[], &log).unwrap();
+        let has = |f: i8, r: i8| solver.hypotheses.iter().any(|h| h.square == Coord { file: f, rank: r });
+        assert!(has(1, 1), "1一の角（4四経由の開き王手）は残るべき");
+        assert!(!has(5, 1), "5一の飛は来た駒（5四）が自ら塞ぐので残らない");
+        assert!(!has(4, 4), "隣接 4四 は前の手番から王手だったことになるので残らない");
     }
 
     #[test]
