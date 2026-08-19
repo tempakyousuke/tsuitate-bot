@@ -2,9 +2,9 @@
   "games": 200,
   "candidate": "estimator",
   "baselines": "estimator_v14",
-  "match_seed": 20260816,
+  "match_seed": 20260817,
   "shards": 8,
   "oracle": "",
   "clock": "",
-  "env": "TSUITATE_LAST_FOUL_GUARD_2=0 TSUITATE_LAST_FOUL_GUARD_3=0"
+  "env": ""
 }
