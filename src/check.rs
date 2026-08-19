@@ -76,7 +76,7 @@ fn king_prior_w() -> f64 {
 }
 
 /// 信念ネット占有による王手駒仮説の事前（`TSUITATE_CHECK_BELIEF_OCC_W`、
-/// 既定 **1.0**、0 で従来挙動 = 切り戻しノブ）。
+/// 既定 **0** = 無効、作業点 1.0）。
 ///
 /// 仮説は自玉へ利きうる全（マス,駒種）なので、空きマスの幻仮説が生存すると
 /// 正しい捕獲の `resolve_probability` が薄まる（kakutori の残ギャップ）。
@@ -100,8 +100,8 @@ fn check_belief_occ_w() -> f64 {
     })
 }
 
-/// 占有事前の既定。0 で従来（一様仮説）へ切り戻し
-const CHECK_BELIEF_OCC_W: f64 = 1.0;
+/// 占有事前の既定。0 で従来（一様仮説）。1.0 は作業点（env でオン）
+const CHECK_BELIEF_OCC_W: f64 = 0.0;
 /// ネットが空きと見ても仮説を残す床（健全性）
 const CHECK_BELIEF_OCC_FLOOR: f64 = 0.05;
 
@@ -1014,7 +1014,7 @@ mod tests {
         assert!((occupancy_prior(0.4, 2.0) - occupancy_prior(0.4, 1.0)).abs() < 1e-12);
         if std::env::var("TSUITATE_CHECK_BELIEF_OCC_W").is_err() {
             assert!((check_belief_occ_w() - CHECK_BELIEF_OCC_W).abs() < 1e-12);
-            assert_eq!(CHECK_BELIEF_OCC_W, 1.0);
+            assert_eq!(CHECK_BELIEF_OCC_W, 0.0);
         }
         assert!(!particles_vote_check(&[], Color::Sente));
     }
