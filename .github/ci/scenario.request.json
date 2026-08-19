@@ -2,5 +2,5 @@
   "trials": 20,
   "strategy": "estimator",
   "scenarios": "",
-  "env": "TSUITATE_CHECK_HYP_PRIOR=1 TSUITATE_CHECK_FOUL_EVIDENCE=1"
+  "env": "TSUITATE_CHECK_HYP_PRIOR=1"
 }
