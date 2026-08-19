@@ -7279,7 +7279,7 @@ fn last_foul_guard_2() -> f64 {
     })
 }
 
-const LAST_FOUL_GUARD_2: f64 = 0.0;
+const LAST_FOUL_GUARD_2: f64 = 36.0;
 
 /// 残り反則3回の床（`TSUITATE_LAST_FOUL_GUARD_3`、既定 0。env 作業点は 16）。
 /// 既定の急峻化は残り3回で約3.1点。凍結版はこの名前を知らない。
@@ -7294,7 +7294,7 @@ fn last_foul_guard_3() -> f64 {
     })
 }
 
-const LAST_FOUL_GUARD_3: f64 = 0.0;
+const LAST_FOUL_GUARD_3: f64 = 16.0;
 
 /// 残り反則予算に応じた反則コストの床。残り1→2→3 の順に見る。
 /// 詰みスケール（〜1000×q）はどの床でも通る。
@@ -10604,13 +10604,14 @@ pub(crate) mod tests {
             && std::env::var("TSUITATE_LAST_FOUL_GUARD_3").is_err()
         {
             assert!((apply_foul_budget_floors(1.0, 5.0) - LAST_FOUL_GUARD).abs() < 1e-12);
-            // 2・3回の床は既定 0（材料コストはそのまま）
-            assert!((apply_foul_budget_floors(2.0, 5.0) - 5.0).abs() < 1e-12);
-            assert!((apply_foul_budget_floors(3.0, 3.0) - 3.0).abs() < 1e-12);
+            // 残り2・3回にも床を敷く（計測中の作業点。既定値そのものを検査する）
+            assert!((apply_foul_budget_floors(2.0, 5.0) - LAST_FOUL_GUARD_2).abs() < 1e-12);
+            assert!((apply_foul_budget_floors(3.0, 3.0) - LAST_FOUL_GUARD_3).abs() < 1e-12);
+            // 残り4回以上は床なし（材料コストのまま）
             assert!((apply_foul_budget_floors(4.0, 2.0) - 2.0).abs() < 1e-12);
+            // 詰みスケールはどの床も通る
             assert!((apply_foul_budget_floors(1.0, 1000.0) - 1000.0).abs() < 1e-12);
-            assert_eq!(LAST_FOUL_GUARD_2, 0.0);
-            assert_eq!(LAST_FOUL_GUARD_3, 0.0);
+            assert!((apply_foul_budget_floors(2.0, 1000.0) - 1000.0).abs() < 1e-12);
         }
         assert!((EvalParams::default().taint_occ_legal_w - 0.0).abs() < 1e-12);
     }
