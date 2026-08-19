@@ -2,5 +2,6 @@
   "trials": 20,
   "strategy": "estimator",
   "scenarios": "kakutori king-evade dragon-check-drop recap-dragon",
-  "env": ""
+  "env": "",
+  "note": "safety-only mix ecdfa17"
 }
