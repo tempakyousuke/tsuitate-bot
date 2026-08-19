@@ -57,7 +57,7 @@
   - `TSUITATE_VALUE_NN_W` / `TSUITATE_CAPTURE_BET_VAR_W` / `TSUITATE_CHECKER_REMOVAL_W`
     — v11 のみ。**v11 を基準にした w スイープでは基準側も反応する**
   - `TSUITATE_MATE_*_W` / `TSUITATE_KING_HOLE_W` / `TSUITATE_TAINT_KING_FIX` /
-    `TSUITATE_KING_REPEAT_FOUL_W` はどの凍結版も読まない（＝候補側だけに効く）
+    `TSUITATE_KING_REPEAT_FOUL_W` / `TSUITATE_KING_PARTICLE_LEGAL_W` はどの凍結版も読まない（＝候補側だけに効く）
   - `TSUITATE_KING_CAND_ATTACK_W` / `_CHECK_W` / `_ATTACK_GATE` /
     `TSUITATE_LANDING_SUPPORT_W` / `TSUITATE_KING_PROX_EXCLUDE_SELF` /
     `TSUITATE_KING_BELIEF_PROX_W` / `TSUITATE_CHECK_SAFE_RESOLVE` —
@@ -368,6 +368,20 @@
     「反則マスを覚える系統」と同じ結論。再訪の本丸は粒子／玉隣接の利き
     信念で、再訪専用項は足さない。機構と env は残す（`=0.8` で再試行可）。
     初回計測 Arena #320/#321 は占有事前既定 1.0 が混入していたので使わない
+  - `TSUITATE_KING_PARTICLE_LEGAL_W`（既定 **1.0**、0 で従来の prior ブレンド）—
+    **玉の手の p_legal を厳密粒子の合法割合へ寄せる**（v15 候補、2026-08-19）。
+    玉再訪割引が 3七型で矛盾したので、同じ層を粒子側で持つ: `is_legal` が
+    「今もそのマスが利かれているか」を答える。原因駒が動いた粒子では行き先が
+    自然に復活し、初回の飛び込みも同じ経路で減る。
+    王手中の 6a5b 型は `check_king_gain_mean` の平均化から除外されるので
+    capture gain が残る。粒子が非合法と言っているのに prior=0.73 / 退化ブレンドで
+    p_legal が持ち上がると、その gain が逃げ手を上回る（king-evade のオラクル錨でも
+    6a5b・6a7b が先に出る残ギャップ）。taint / 粒子ゼロでは発火しない
+    （recap-dragon のブラインド取り返しは不変）。非玉の手は触らない
+    （kakutori は CheckSolver のまま）。凍結版はこの名前を知らない。
+    CheckSolver の粒子投票は **実際に自玉を攻撃している駒だけ**に制限した
+    （遮蔽された飛などが (マス,駒種) だけで投票して真の王手駒を薄めていた）。
+    アリーナ未計測。`=0` で切り戻し
   - `TSUITATE_ESCAPE_COVER_W`（既定 0 = 無効）— **逃げマス被覆**の凸ボーナス
     （2026-07-29、対人局レビュー human-play-review-2026-07-29 の N*6四が発端）。
     粒子上の相手玉の隣接マスのうち未被覆の逃げ先が残り U 個のとき w×1/(1+U) を
@@ -1455,7 +1469,11 @@
   仮説重み × 占有（床 0.05）。**粒子が投票できるときは掛けない**
   （乗算が投票を上書きする実測あり）。ブラインドだけ・捕獲マスは乗らない。
   既定 1.0 で PR #8 に入ったが vs v14 で負け越しが見えたため既定 0 へ戻した
-  （機構は残す。凍結版は知らない）
+  （機構は残す。凍結版は知らない）。
+  **粒子投票は実際に自玉を攻撃している駒だけ**（2026-08-19）: 旧実装は
+  (マス,駒種) が居るだけで投票し、遮蔽された飛などが真の王手駒を薄めていた。
+  玉の行き先合法性は `TSUITATE_KING_PARTICLE_LEGAL_W`（既定 1.0）で
+  厳密粒子の `is_legal` 割合を p_legal に使う。
 - `strategy.rs` — `Strategy` trait。`heuristic`（前進＋乱数の旧実装）と
   `estimator`（粒子加重平均で候補手を評価: 駒得期待値・反則確率×急峻な反則コスト・
   取られリスク・王周辺の利き圧力・王手/詰みボーナス・駒探し/王探しの情報利得・

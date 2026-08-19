@@ -7166,6 +7166,48 @@ fn king_repeat_foul_w() -> f64 {
 /// 玉行き先の再訪割引。既定 0（作業点は 0.8）。
 const KING_REPEAT_FOUL_W: f64 = 0.0;
 
+/// 玉の手の p_legal を、厳密粒子の合法割合へ寄せる
+/// （`TSUITATE_KING_PARTICLE_LEGAL_W`、既定 **1.0**。0 で従来の
+/// prior ブレンドのまま）。
+///
+/// v15 候補（2026-08-19）。玉再訪割引（マス記憶）が 3七型で人間判断と
+/// 矛盾したので、同じ層を粒子側で持つ: 粒子が「今もそのマスが利かれているか」
+/// を is_legal で答える。原因駒が動いた粒子では行き先が自然に復活し、
+/// 初回の飛び込み（再訪の 90/94）も同じ経路で減る。
+///
+/// 王手中の 6a5b 型（直前の捕獲マスへの玉捕獲）は
+/// `check_king_gain_mean` の平均化から除外されるので capture gain が残る。
+/// 粒子が「支え付きで非合法」と言っているのに prior=0.73 / 退化ブレンドで
+/// p_legal が 0.4 まで持ち上がると、その gain が逃げ手を上回る
+/// （king-evade のオラクル錨でも 6a5b・6a7b が先に出る残ギャップ）。
+/// taint / 粒子ゼロでは発火しない（recap-dragon のブラインド取り返しは不変）。
+/// 非玉の手は触らない（kakutori の捕獲プローブは CheckSolver のまま）。
+/// 凍結版はこの名前を知らないので `-f env=` は候補側にだけ効く。
+fn king_particle_legal_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_KING_PARTICLE_LEGAL_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(KING_PARTICLE_LEGAL_W)
+    })
+}
+
+/// 玉の手の粒子合法割合ミックス。既定 1.0（作業点=既定。0 で切り戻し）。
+const KING_PARTICLE_LEGAL_W: f64 = 1.0;
+
+/// ブレンド済み p_legal と粒子の合法割合 `legal/n` を w で混ぜる。
+/// w=0 または粒子質量 0 ならブレンド側のまま。w≥1 なら粒子割合そのもの。
+fn mix_king_particle_legal(blended: f64, legal: f64, n: f64, w: f64) -> f64 {
+    if w <= 0.0 || n <= 0.0 {
+        return blended;
+    }
+    let frac = (legal / n).clamp(0.0, 1.0);
+    let w = w.min(1.0);
+    (1.0 - w) * blended + w * frac
+}
+
 /// 玉の手が汚名のある行き先なら `1-w`、それ以外は 1。
 fn king_repeat_legal_factor(
     mv: &ShogiMove,
@@ -8577,6 +8619,19 @@ fn evaluate(
     } else {
         (legal + prior * w) / (n + w)
     };
+    // 玉の行き先合法性は粒子の is_legal が利きを見ている。prior_legal は
+    // 経路の空きマスだけで 1マス玉移動は常に 1.0、王手中の CheckSolver は
+    // 仮説1枚盤で支えを無視して玉捕獲を過大評価する。退化時は
+    // prior_weight_degen がこの誤った事前をさらに信じる。
+    // 厳密粒子が居る玉の手だけ、粒子の合法割合を w で混ぜる
+    // （taint は p_legal に使わない既存規約のまま）。
+    if king_particle_legal_w() > 0.0 && !particles_are_taint && n > 0.0 {
+        if matches!(*mv, ShogiMove::Board { from, .. } if Some(from) == king_square(view)) {
+            let mixed = mix_king_particle_legal(p_legal, legal, n, king_particle_legal_w());
+            crate::hits::flag("king_particle_legal", (mixed - p_legal).abs() > 0.02);
+            p_legal = mixed;
+        }
+    }
     // taint 占有合意で打ちの反則確率を締める（`taint_occ_legal_w`）。
     // 打ちマスが埋まっていれば必ず反則なので、合意占有率をそのまま反則確率に
     // 使える。**安全方向のみ**（min）: 空きマスの打ちを押し上げはしない
@@ -10171,6 +10226,21 @@ pub(crate) mod tests {
             king_repeat_legal_factor(&king_to_stale, Some(king), &stale, 1.5),
             0.0
         );
+    }
+
+    /// 玉の手の粒子合法割合ミックス: w=1 なら粒子の legal/n そのもの、
+    /// w=0 や粒子ゼロはブレンド側を残す。退化ブレンドで持ち上がった
+    /// p_legal を、全員非合法の粒子が 0 へ落とせる。
+    #[test]
+    fn mix_king_particle_legal_prefers_particle_fraction() {
+        let blended = 0.45; // prior=0.73・退化 w が大きいときの玉捕獲
+        assert_eq!(mix_king_particle_legal(blended, 0.0, 8.0, 1.0), 0.0);
+        assert_eq!(mix_king_particle_legal(blended, 8.0, 8.0, 1.0), 1.0);
+        assert!((mix_king_particle_legal(blended, 4.0, 8.0, 1.0) - 0.5).abs() < 1e-12);
+        assert_eq!(mix_king_particle_legal(blended, 0.0, 8.0, 0.0), blended);
+        assert_eq!(mix_king_particle_legal(blended, 0.0, 0.0, 1.0), blended);
+        assert!((mix_king_particle_legal(blended, 0.0, 8.0, 0.5) - 0.5 * blended).abs() < 1e-12);
+        assert_eq!(mix_king_particle_legal(blended, 0.0, 8.0, 2.0), 0.0);
     }
 
     #[test]
@@ -12223,6 +12293,10 @@ pub(crate) mod tests {
         if std::env::var("TSUITATE_KING_BELIEF_PROX_W").is_err() {
             assert!((king_belief_prox_w() - KING_BELIEF_PROX_W).abs() < 1e-12);
             assert_eq!(KING_BELIEF_PROX_W, 0.0);
+        }
+        if std::env::var("TSUITATE_KING_PARTICLE_LEGAL_W").is_err() {
+            assert!((king_particle_legal_w() - KING_PARTICLE_LEGAL_W).abs() < 1e-12);
+            assert_eq!(KING_PARTICLE_LEGAL_W, 1.0);
         }
         if std::env::var("TSUITATE_KING_PROX_EXCLUDE_SELF").is_err() {
             assert!(king_prox_exclude_self());

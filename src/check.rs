@@ -341,9 +341,18 @@ impl CheckSolver {
     }
 
     /// 粒子中の実際の王手駒に投票させる（粒子が健全なら仮説が鋭くなる）。
-    /// ソフト救済の粒子は重みぶんだけ薄く投票する
+    /// ソフト救済の粒子は重みぶんだけ薄く投票する。
+    ///
+    /// **その駒が粒子上で自玉を攻撃していること**を要求する（2026-08-19）:
+    /// 旧実装は (マス, 駒種) が居るだけで投票していた。王手していない駒
+    /// （遮蔽された飛・別の駒が王手しているときの同居駒）まで仮説を押し上げ、
+    /// 真の王手駒の `resolve_probability` が薄まる。enumerate は自駒だけの盤で
+    /// 「利きうる」を列挙するので、粒子上の遮蔽はこちらで見る。
     fn vote_by_particles(&mut self, particles: &[(&Position, f64)]) {
         let opp = self.my_color.other();
+        let Some(king) = self.base.king_square(self.my_color) else {
+            return;
+        };
         let mut voters = 0.0f64;
         let mut votes: Vec<f64> = vec![0.0; self.hypotheses.len()];
         for (pos, w) in particles {
@@ -355,9 +364,8 @@ impl CheckSolver {
                 if pos
                     .piece_at(h.square)
                     .is_some_and(|p| p.color == opp && p.role == h.role)
+                    && pos.attacks(h.square, king)
                 {
-                    // 粒子上でその駒が実際に王を攻撃しているかまでは見ない
-                    // （enumerate 済みの仮説は自駒配置的に攻撃可能）
                     votes[i] += w;
                 }
             }
@@ -758,6 +766,59 @@ mod tests {
         assert!(
             solver.hypotheses.iter().any(|h| h.square == sq),
             "既知の敵駒マス 5d にも王手駒仮説が必要"
+        );
+    }
+
+    #[test]
+    fn vote_ignores_blocked_piece_at_hypothesis_square() {
+        // 5e 玉。5d 金が王手、5a 飛は金に遮られて王を攻撃していない。
+        // 旧実装は (5a, 飛) が居るだけで飛仮説に投票し、真の王手駒（5d 金）を
+        // 薄めていた。攻撃している駒だけが投票する。
+        let view = view_with(vec![("5e", Role::King)]);
+        let mut particle = Position::empty(Color::Sente);
+        particle.set(
+            Coord { file: 5, rank: 5 },
+            Some(crate::shogi::Piece {
+                color: Color::Sente,
+                role: Role::King,
+            }),
+        );
+        particle.set(
+            Coord { file: 5, rank: 4 },
+            Some(crate::shogi::Piece {
+                color: Color::Gote,
+                role: Role::Gold,
+            }),
+        );
+        particle.set(
+            Coord { file: 5, rank: 1 },
+            Some(crate::shogi::Piece {
+                color: Color::Gote,
+                role: Role::Rook,
+            }),
+        );
+        assert!(particle.in_check(Color::Sente));
+        assert!(particle.attacks(Coord { file: 5, rank: 4 }, Coord { file: 5, rank: 5 }));
+        assert!(!particle.attacks(Coord { file: 5, rank: 1 }, Coord { file: 5, rank: 5 }));
+        let particles = [(&particle, 1.0)];
+        let solver = CheckSolver::new(&view, &particles, &[], &ObservationLog::default()).unwrap();
+        let gold_sq = Coord { file: 5, rank: 4 };
+        let rook_sq = Coord { file: 5, rank: 1 };
+        let gold_w = solver
+            .hypotheses
+            .iter()
+            .filter(|h| h.square == gold_sq && h.role == Role::Gold)
+            .map(|h| h.weight)
+            .fold(0.0_f64, f64::max);
+        let rook_w = solver
+            .hypotheses
+            .iter()
+            .filter(|h| h.square == rook_sq && h.role == Role::Rook)
+            .map(|h| h.weight)
+            .fold(0.0_f64, f64::max);
+        assert!(
+            gold_w > rook_w * 5.0,
+            "王手している 5d 金が投票で飛び、遮蔽された 5a 飛は投票しない（金={gold_w:.2} 飛={rook_w:.2}）"
         );
     }
 
