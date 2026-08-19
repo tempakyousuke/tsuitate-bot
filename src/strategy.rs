@@ -20,7 +20,7 @@ use crate::check::CheckSolver;
 use crate::estimator::{opp_reply_weights, Estimator, EPS_INFO};
 use crate::likelihood::{particle_features, particle_log_weight, ParticleCtx, FITTED_THETA};
 use crate::model::GameModel;
-use crate::observation::{Observation, ObservationLog};
+use crate::observation::{stale_king_foul_dests, Observation, ObservationLog};
 use crate::opening::OpeningBook;
 use rand::rngs::StdRng;
 use rand::SeedableRng;
@@ -5852,6 +5852,14 @@ impl Strategy for EstimatorStrategy {
         let rng = &mut self.rng;
         // 王手中の玉の手の gain 平均化判定用（check_king_gain_mean の doc 参照）
         let my_king = king_square(view);
+        // 過去手番の玉反則行き先（`king_repeat_foul_w`）。同手番は foul_tried。
+        let repeat_w = king_repeat_foul_w();
+        let stale_king_dests = (repeat_w > 0.0)
+            .then(|| stale_king_foul_dests(log, view.your_color, view.move_number))
+            .unwrap_or_default();
+        if crate::hits::enabled() {
+            crate::hits::flag("king_repeat_stale", !stale_king_dests.is_empty());
+        }
         let is_king_move =
             |mv: &ShogiMove| matches!(*mv, ShogiMove::Board { from, .. } if Some(from) == my_king);
         // 平均化の対象となる玉の手（直前に自駒が取られたマスへの玉捕獲は
@@ -5910,6 +5918,10 @@ impl Strategy for EstimatorStrategy {
                 king_threats.as_ref(),
                 belief_occ_board.as_ref(),
             );
+            // 過去手番で玉が反則した行き先への再訪（`king_repeat_foul_w`）。
+            // p_legal を安全方向に落とすだけ。gain 内の課税は anchor_move の
+            // 教訓で反則経済を壊すので使わない。
+            out.p_legal *= king_repeat_legal_factor(&mv, my_king, &stale_king_dests, repeat_w);
             // 王手中: 仮説条件付きの「王手駒の除去期待値」（check.rs::removal_term）。
             // 王手駒のマスを取る手は受理された未来で脅威ごと駒を排除し、玉逃げ等の
             // 解消手は王手駒を盤に残す。この差は粒子が真の王手駒を外している局面
@@ -7123,6 +7135,50 @@ fn eval_weight_cap() -> f64 {
             .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
             .unwrap_or(1.0)
     })
+}
+
+/// 過去手番で玉が反則した行き先への再訪割引（`TSUITATE_KING_REPEAT_FOUL_W`、
+/// 既定 0 = 無効。env 作業点は 0.8）。
+///
+/// 一つの対局の中で同じ玉移動の反則を繰り返すのは、原因だった相手駒が
+/// 動いた・無くなった・飛角の利きが遮られた、という観測が無いのに同じ
+/// マスへ玉を出すこと。同手番の同一 USI は `foul_tried` 済みで、ここは
+/// **手番をまたいだ行き先**だけ。`p_legal *= (1-w)` の安全方向のみ。
+/// 解除は観測できたときだけ（そのマスで取った / 玉がそこへ受理された）。
+/// 王手中も有効（行き先が過去に失敗した逃げは、CheckSolver の仮説が
+/// 薄くても再試行しない）。玉の逃げ全体を割り引く第1版
+/// （`check_king_prior`）とは違い、汚名のあるマスだけが対象。
+/// 凍結版はこの名前を知らない。
+fn king_repeat_foul_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_KING_REPEAT_FOUL_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(KING_REPEAT_FOUL_W)
+    })
+}
+
+/// 玉行き先の再訪割引。既定 0（作業点は 0.8）。
+const KING_REPEAT_FOUL_W: f64 = 0.0;
+
+/// 玉の手が汚名のある行き先なら `1-w`、それ以外は 1。
+fn king_repeat_legal_factor(
+    mv: &ShogiMove,
+    king: Option<Coord>,
+    stale: &HashSet<Coord>,
+    w: f64,
+) -> f64 {
+    if w <= 0.0 {
+        return 1.0;
+    }
+    match *mv {
+        ShogiMove::Board { from, to, .. } if Some(from) == king && stale.contains(&to) => {
+            (1.0 - w).clamp(0.0, 1.0)
+        }
+        _ => 1.0,
+    }
 }
 
 /// 残り反則1回（次の反則で即負け）のときの反則コストの床
@@ -10019,7 +10075,7 @@ pub(crate) fn escape_cover_value(pos: &Position, owner: Color, by: Color) -> f64
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use super::*;
     use crate::protocol::{ClockState, FoulCounts, GameStatus, VisiblePiece};
@@ -10062,6 +10118,56 @@ pub(crate) mod tests {
         assert_eq!(endgame_push(160, -10.0), 0.0);
         // 手数で単調増加
         assert!(endgame_push(100, 8.0) < endgame_push(160, 8.0));
+    }
+
+    #[test]
+    fn king_repeat_legal_factor_は汚名マスの玉手だけを割り引く() {
+        let king = Coord { file: 5, rank: 9 };
+        let dest = Coord { file: 5, rank: 8 };
+        let other = Coord { file: 4, rank: 9 };
+        let stale = HashSet::from([dest]);
+        let king_to_stale = ShogiMove::Board {
+            from: king,
+            to: dest,
+            promote: false,
+        };
+        let king_elsewhere = ShogiMove::Board {
+            from: king,
+            to: other,
+            promote: false,
+        };
+        let pawn = ShogiMove::Board {
+            from: Coord { file: 7, rank: 7 },
+            to: dest,
+            promote: false,
+        };
+        let drop = ShogiMove::Drop {
+            role: Role::Gold,
+            to: dest,
+        };
+        assert!(
+            (king_repeat_legal_factor(&king_to_stale, Some(king), &stale, 0.8) - 0.2).abs() < 1e-12
+        );
+        assert_eq!(
+            king_repeat_legal_factor(&king_elsewhere, Some(king), &stale, 0.8),
+            1.0
+        );
+        assert_eq!(
+            king_repeat_legal_factor(&pawn, Some(king), &stale, 0.8),
+            1.0
+        );
+        assert_eq!(
+            king_repeat_legal_factor(&drop, Some(king), &stale, 0.8),
+            1.0
+        );
+        assert_eq!(
+            king_repeat_legal_factor(&king_to_stale, Some(king), &stale, 0.0),
+            1.0
+        );
+        assert_eq!(
+            king_repeat_legal_factor(&king_to_stale, Some(king), &stale, 1.5),
+            0.0
+        );
     }
 
     #[test]

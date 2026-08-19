@@ -19,7 +19,7 @@ use tsuitate_bot::board::Coord;
 use tsuitate_bot::check::CheckSolver;
 use tsuitate_bot::mate::{drop_mate, mate_in_1};
 use tsuitate_bot::model::GameModel;
-use tsuitate_bot::observation::{Observation, ObservationLog};
+use tsuitate_bot::observation::{stale_king_foul_dests, Observation, ObservationLog};
 use tsuitate_bot::protocol::{
     ClockState, Color, FoulCounts, FoulRecord, GameEndPayload, GameStatus, PlayerView, Role,
 };
@@ -563,6 +563,12 @@ fn main() {
     // 防げる範囲の上限を測る診断
     let mut total_occupancy_fouls = 0u32;
     let mut total_repeat_avoidable = 0u32;
+    // 玉移動反則の行き先再訪（`TSUITATE_KING_REPEAT_FOUL_W` の理論上限）。
+    // 同手番の同一 USI は foul_tried 済みなので、項が狙うのは手番をまたいだ
+    // 汚名マス（解除証拠なし）だけ。raw は同手番の再試行も含む参照値
+    let mut total_king_move_fouls = 0u32;
+    let mut total_king_repeat_dest = 0u32;
+    let mut total_king_stale_repeat = 0u32;
     // 無意味な往復: bot が指した後の**自陣形**（盤上の自駒＋持ち駒）が、
     // その対局で既に出現していた回数。ついたてでは自分側は完全既知なので
     // ノイズゼロで測れる。「何も起きていないのに同じ形へ戻った」= 手番を
@@ -651,6 +657,32 @@ fn main() {
                         known_risky_squares.insert(sq);
                     }
                 }
+            }
+        }
+        {
+            let mut seen_king_dests: HashSet<Coord> = HashSet::new();
+            let mut prefix = ObservationLog::default();
+            for obs in &rec.observations {
+                if let Observation::MyFoul { move_number, usi } = obs {
+                    if let Some(ShogiMove::Board { from, to, .. }) = parse_usi(usi) {
+                        let idx = (*move_number as usize).saturating_sub(1);
+                        if positions.get(idx).is_some_and(|pos| {
+                            pos.piece_at(from)
+                                .is_some_and(|p| p.color == bot && p.role == Role::King)
+                        }) {
+                            total_king_move_fouls += 1;
+                            if seen_king_dests.contains(&to) {
+                                total_king_repeat_dest += 1;
+                            }
+                            let stale = stale_king_foul_dests(&prefix, bot, *move_number);
+                            if stale.contains(&to) {
+                                total_king_stale_repeat += 1;
+                            }
+                            seen_king_dests.insert(to);
+                        }
+                    }
+                }
+                prefix.record(obs.clone());
             }
         }
         // 駒の損得: 各手の捕獲を追い、直後の取り返しをペアにする
@@ -1132,6 +1164,11 @@ fn main() {
     if total_occupancy_fouls > 0 {
         println!(
             "占有マス反則（打ちマス/経路封鎖）の再訪率: {total_repeat_avoidable}/{total_occupancy_fouls}（同一局内で過去の占有反則マスと一致。反則マスを覚える対策の理論上限）"
+        );
+    }
+    if total_king_move_fouls > 0 {
+        println!(
+            "玉移動反則の行き先再訪: {total_king_repeat_dest}/{total_king_move_fouls}（同一局内で既に同じ to へ玉反則。同手番の再試行含む） / うち手番またぎ汚名マス {total_king_stale_repeat}（解除証拠なし。KING_REPEAT_FOUL_W の発火上限）"
         );
     }
     if total_bot_moves > 0 {

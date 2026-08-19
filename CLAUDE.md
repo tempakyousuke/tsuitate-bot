@@ -56,8 +56,8 @@
     — v7 以降（版により差あり）
   - `TSUITATE_VALUE_NN_W` / `TSUITATE_CAPTURE_BET_VAR_W` / `TSUITATE_CHECKER_REMOVAL_W`
     — v11 のみ。**v11 を基準にした w スイープでは基準側も反応する**
-  - `TSUITATE_MATE_*_W` / `TSUITATE_KING_HOLE_W` / `TSUITATE_TAINT_KING_FIX` は
-    どの凍結版も読まない（＝候補側だけに効く）
+  - `TSUITATE_MATE_*_W` / `TSUITATE_KING_HOLE_W` / `TSUITATE_TAINT_KING_FIX` /
+    `TSUITATE_KING_REPEAT_FOUL_W` はどの凍結版も読まない（＝候補側だけに効く）
   - `TSUITATE_KING_CAND_ATTACK_W` / `_CHECK_W` / `_ATTACK_GATE` /
     `TSUITATE_LANDING_SUPPORT_W` / `TSUITATE_KING_PROX_EXCLUDE_SELF` /
     `TSUITATE_KING_BELIEF_PROX_W` / `TSUITATE_CHECK_SAFE_RESOLVE` —
@@ -222,7 +222,8 @@
   （CIでは常時有効で artifact `arena-records` に上がる。真実の全手順つきなので
   そのまま analyze にかけられる）。
   game:end の全公開棋譜をリプレイし、反則の原因分類（王手解消失敗/飛び込み/経路封鎖/打ちマス）・
-  駒得収支・只取られ・損な交換・取り返し逃し・詰み逃しを集計する。
+  駒得収支・只取られ・損な交換・取り返し逃し・詰み逃し・**玉移動反則の行き先再訪**
+  （同一局で既に同じ `to` へ玉反則した回数。`KING_REPEAT_FOUL_W` の発火上限）を集計する。
   **被詰めろオラクル**（2026-07-25）: 相手番の各局面で相手に一手詰めが存在したかを
   数える。相手が実際に詰みを見つけたかに依らないので、**相手が詰みを実行して
   こない環境（アリーナの凍結版同士は互いに玉位置が見えない）でも自玉の受けの
@@ -329,6 +330,19 @@
     ではなく、制約推論の事前だけを動かす。凍結版はこの名前を知らないので
     `-f env=` は候補側にだけ効く。**アリーナ未計測**（採否は vs v14 の
     ガントレット。切り戻しは `=0`）
+  - `TSUITATE_KING_REPEAT_FOUL_W`（既定 **0** = 無効、作業点 0.8）—
+    **過去手番で玉が反則した行き先への再訪割引**（v15 候補、2026-08-19）。
+    一つの対局の中で同じ玉移動の反則を繰り返すのは、原因だった相手駒が
+    動いた・無くなった・飛角の利きが遮られた、という観測が無いのに同じ
+    マスへ玉を出すこと。同手番の同一 USI は `foul_tried` が既に除外する。
+    ここは**手番をまたいだ行き先**だけを `p_legal *= (1−w)` で安全方向に
+    落とす（gain 内の広い課税は `anchor_move` / `drop_probe_repeat_gate`
+    で反則経済を壊した）。解除は観測できたときだけ: ①そのマスで駒を取った
+    ②玉がそこへ受理された。相手の静かな移動や飛角の路線遮断は観測できない
+    ので解除しない。王手中も有効（汚名マスの逃げだけ。玉逃げ全体を
+    割り引いた `check_king_prior` 第1版とは違う）。kakutori の角捕獲や
+    king-evade の同手番 5b/7b/6b 連発は発火しない。凍結版はこの名前を
+    知らない。診断は `bin/analyze` の「玉移動反則の行き先再訪」
   - `TSUITATE_ESCAPE_COVER_W`（既定 0 = 無効）— **逃げマス被覆**の凸ボーナス
     （2026-07-29、対人局レビュー human-play-review-2026-07-29 の N*6四が発端）。
     粒子上の相手玉の隣接マスのうち未被覆の逃げ先が残り U 個のとき w×1/(1+U) を
