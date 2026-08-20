@@ -3759,8 +3759,10 @@ pub struct EvalParams {
     /// **自玉近傍の敵駒の排除**（2026-08-20、arena-recap01 が発端。ユーザー
     /// 「リスクを恐れすぎて逆にリスクを作っている。玉の近くの敵駒を排除する
     /// ことに加点する項を作っていい」）。粒子上で自玉のチェビシェフ距離 ≤2 に
-    /// いる相手駒を取る手へ、交換価値とは別に w × (距離1: 1.0 / 距離2: 0.5)
-    /// を加点（粒子重み付きなので占有確率が暗黙に掛かる）。`defender_capture_w`
+    /// いる相手駒を取る手へ、交換価値とは別に
+    /// w × 距離(1:1.0/2:0.5) × 駒種危険度(歩香桂0.25/金銀成小駒0.75/大駒1.0)
+    /// × 観測裏付け(あり1.0/なし0.5) を加点（codex 相談 2026-08-20 の3係数化。
+    /// 粒子重み付きなので占有確率も暗黙に掛かる）。`defender_capture_w`
     /// （相手玉の守り駒）の自玉側の鏡像。王手中は無効（CheckSolver の領分）。
     /// `TSUITATE_OWN_ZONE_CAPTURE_W` で上書き可・SPSA対応。凍結版は知らない
     pub own_zone_capture_w: f64,
@@ -4578,10 +4580,12 @@ impl EvalParams {
             hi: 1.0,
         },
         ParamSpec {
-            // 自玉近傍（距離≤2）の敵駒を取る手への加点。0 = 無効
+            // 自玉近傍（距離≤2）の敵駒を取る手への加点。0 = 無効。
+            // hi は3係数化（dist×role×backed、最大でも 1.0×1.0×1.0）後の実効値
+            // で決めてある: w=16 で大駒@距離1 が 16、成駒@距離2 が 6
             name: "own_zone_capture_w",
             lo: 0.0,
-            hi: 6.0,
+            hi: 16.0,
         },
     ];
 
@@ -5768,8 +5772,8 @@ impl Strategy for EstimatorStrategy {
             (params.hand_option_w != 0.0 && !view.you_in_check).then(|| hand_option_context(view));
 
         // 相手駒の占有が観測で裏付けられたマス（`material_degen_q0` の
-        // 「裏付け無し捕獲だけ縮める」ゲート／`hand_asset_w` の仕事判定。
-        // 決定点ごとに1回）
+        // 「裏付け無し捕獲だけ縮める」ゲート／`hand_asset_w` の仕事判定／
+        // `own_zone_capture_w` の裏付け係数。決定点ごとに1回）
         let opp_occ_backed = (params.material_degen_q0 > 0.0
             || params.own_zone_capture_w > 0.0
             || hand_asset_w() > 0.0
@@ -8467,10 +8471,13 @@ fn evaluate(
                         Some(Role::Bishop | Role::Rook | Role::Horse | Role::Dragon) => 1.0,
                         _ => 0.0,
                     };
+                    // None は呼び出しゲート（choose の opp_occ_backed 計算条件に
+                    // own_zone_capture_w > 0 を含めてある）の取りこぼしなので、
+                    // 安全側 = 裏付け無し扱いに落とす（幻の駒の排除に満額を払わない）
+                    debug_assert!(opp_occ_backed.is_some(), "own_zone_capture_w > 0 なのに opp_occ_backed が None");
                     let backed_mult = match opp_occ_backed {
                         Some(backed) if backed[crate::belief_features::sq_index(to)] => 1.0,
-                        Some(_) => 0.5,
-                        None => 1.0,
+                        _ => 0.5,
                     };
                     let bonus =
                         params.own_zone_capture_w * dist_mult * role_mult * backed_mult;
