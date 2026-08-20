@@ -12,7 +12,7 @@ use crate::board::Coord;
 use crate::protocol::{Color, Role};
 use crate::shogi::{Position, ShogiMove};
 
-pub const OPP_MOVE_FEATURES: usize = 25;
+pub const OPP_MOVE_FEATURES: usize = 26;
 
 pub const FEATURE_NAMES: [&str; OPP_MOVE_FEATURES] = [
     "advance",          // 前進量（段）
@@ -66,6 +66,12 @@ pub const FEATURE_NAMES: [&str; OPP_MOVE_FEATURES] = [
     // 注: en_prise_flee × from_home の明示的交互作用列（26次元目）も試したが、
     // 逆に bishop×home セルの反実仮想が悪化し tokin-bet の占有信念も後退した
     // （2026-07-24、ブランチ履歴 a7d245b 参照）ため不採用
+    "gives_check", // 相手玉（mover の敵 = このモデルを回している側）へ王手を
+    // 掛ける手（2026-08-20）。王手の32.4%が打ちなのにモデルは約5%しか
+    // 与えない（arena-check-foul02 の診断）のは、この特徴量が無く
+    // 「王手文脈での打ち・犠打の条件付き分布」を表現できないため。
+    // 標本化側の一律補正（CHECK_DROP_EXPLAIN_W/CHECK_DROP_TARGET）は
+    // 条件付き分布を歪めて v14 戦で負けたので、NN 自身に学ばせる
 ];
 
 /// 駒種特化ブロック（末尾10特徴量）。one-hotは成る前の駒種（unpromote）で
@@ -278,6 +284,7 @@ pub fn opp_move_features(
     let hang = hangs_on_landing(pos, next, mv, mover);
     let pt = piece_type_features(pos, mv, mover);
     let en_prise = moved_from_known_attacked(pos, mv, mover, known_squares);
+    let gives_check = next.in_check(mover.other());
     [
         advance_of(mv, mover),
         (promotes && minor) as u8 as f64,
@@ -304,6 +311,7 @@ pub fn opp_move_features(
         pt[9],
         f64::from(my_foul_count_last_turn),
         en_prise as u8 as f64,
+        gives_check as u8 as f64,
     ]
 }
 

@@ -23,6 +23,7 @@ pub mod observation;
 pub mod opening;
 pub mod opp_move_features;
 pub mod opp_move_nn;
+pub mod opp_move_nn_v25;
 pub mod protocol;
 pub mod record;
 pub mod scenario_core;

@@ -2431,7 +2431,10 @@ fn sample_opp_move(
         next.play_unchecked(&mv);
         // 分母（total_mass）には全合法手の重みが要るが、王手判定はクラス判定に
         // しか使わないので capture_ok の短絡で省く（in_check は比較的重い）
-        let in_chk = capture_ok && next.in_check(my_color);
+        // gives_check は NN の26特徴量目にもなったので全候補で計算する
+        // （従来は capture_ok の短絡で省いていた）
+        let checks_me = next.in_check(my_color);
+        let in_chk = capture_ok && checks_me;
         let consistent = capture_ok && gives_check.is_none_or(|gc| in_chk == gc);
         let threat_known = newly_threatens(pos, &next, &mv, known_squares);
         let threat_home = newly_threatens(pos, &next, &mv, &homes);
@@ -2456,6 +2459,7 @@ fn sample_opp_move(
             foul_count_this_turn,
             my_foul_count_last_turn,
             moved_from_known_attacked(pos, &mv, opp, known_squares),
+            checks_me,
         ) * capture_reveal_factor(pos, &mv, opp, reveal_w);
         // **王手の説明としての打ちの補正**（2026-08-20、arena-check-foul02 が
         // 発端。ユーザー指摘「6三桂打には と金の紐がある」で hang 犯人説が
@@ -2763,6 +2767,7 @@ pub fn opp_reply_weights(
             0,
             my_foul_count_this_turn,
             moved_from_known_attacked(pos, &mv, opp, known_squares),
+            next.in_check(my_color),
         );
         if let ShogiMove::Board { to, .. } = mv {
             let captures_mine = pos.piece_at(to).is_some_and(|p| p.color == my_color);
@@ -2886,6 +2891,7 @@ fn opp_move_weight(
     foul_count_this_turn: u32,
     my_foul_count_last_turn: u32,
     en_prise_flee: bool,
+    gives_check: bool,
 ) -> f64 {
     let (advance, is_drop, promotes) = match *mv {
         ShogiMove::Board { from, to, promote } => {
@@ -2924,6 +2930,7 @@ fn opp_move_weight(
         pt[9],
         f64::from(my_foul_count_last_turn),
         en_prise_flee as u8 as f64,
+        gives_check as u8 as f64,
     ];
     // クランプ: NNは訓練データの分布から外れた入力（リプレイの仮説探索中に
     // 現れる、実戦ではまれな特徴量の組み合わせ）に対して極端なlogitを出しうる
@@ -4249,6 +4256,7 @@ mod tests {
                 pt[9],
                 f64::from(my_foul_count_last_turn),
                 moved_from_known_attacked(&pos, &mv, mover, &known_squares) as u8 as f64,
+                next.in_check(mover.other()) as u8 as f64,
             ];
 
             let shared_features = opp_move_features::opp_move_features(

@@ -2585,7 +2585,7 @@ fn opp_move_weight(
     // （旧線形モデルは係数が小さく手作りなので自然に有界だった）。診断で
     // 反則中の王手駒探索（kakutori.kif）の粒子再生成コストが2〜3倍以上に
     // 悪化する事例を確認したため、外挿時の暴走を防ぐ安全弁として導入
-    let s = crate::opp_move_nn::opp_move_nn_forward(&features).clamp(-15.0, 15.0);
+    let s = crate::opp_move_nn_v25::opp_move_nn_forward25(&features).clamp(-15.0, 15.0);
     s.exp()
 }
 
