@@ -135,6 +135,13 @@ const CAPTURE_CHECKER_BOOST: f64 = 4.0;
 
 /// 開き王手の幾何学判定による仮説除去（`prune_infeasible_discovered_checks`）。
 /// `TSUITATE_CHECK_CAPTURE_PRUNE=0` で無効（切り戻し用。凍結版はこの名前を知らない）
+/// 玉の行き先 cap（`known_covered_king_move_cap`）の有効化。
+/// `TSUITATE_CHECK_KING_COVER_CAP=0` で無効（凍結版はこの名前を知らない）
+fn king_cover_cap_enabled() -> bool {
+    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *W.get_or_init(|| std::env::var("TSUITATE_CHECK_KING_COVER_CAP").map_or(true, |v| v != "0"))
+}
+
 fn capture_prune_enabled() -> bool {
     static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *W.get_or_init(|| std::env::var("TSUITATE_CHECK_CAPTURE_PRUNE").map_or(true, |v| v != "0"))
@@ -150,6 +157,14 @@ fn capture_checker_boost() -> f64 {
             .unwrap_or(CAPTURE_CHECKER_BOOST)
     })
 }
+
+/// 既知敵駒の「まだそこに居る」確率の減衰（未説明の相手手1つあたり）。
+/// `known_covered_king_move_cap` の stay_prob = これ^未説明手数
+const KNOWN_STAY_PER_UNACC: f64 = 0.8;
+
+/// 玉の行き先 cap の下限（ゼロにはしない: 近似駒種が間違っていて
+/// 実は安全な逃げ場である可能性を残す）
+const KING_COVER_CAP_FLOOR: f64 = 0.05;
 
 /// 残存脅威（threat_of）の重み: 王手駒に攻撃されている自駒の交換価値に掛ける係数
 const THREAT_MATERIAL_W: f64 = 0.5;
@@ -169,6 +184,9 @@ pub struct CheckSolver {
     hypotheses: Vec<Hypothesis>,
     /// 仮説ごとの残存脅威（threat_of）の遅延キャッシュ。hypotheses と同じ並び
     threat_cache: Vec<Option<f64>>,
+    /// base に載せた既知敵駒のマスと確信度（stay_prob × role_conf）。
+    /// `known_covered_king_move_cap` が玉の行き先の被覆判定に使う
+    known_loaded: Vec<(Coord, f64)>,
 }
 
 impl CheckSolver {
@@ -203,12 +221,13 @@ impl CheckSolver {
         // **直近8手以内**の新鮮な情報に限定する: 古いマスは駒が動いて陳腐化しやすく、
         // 幻の駒が合法な逃げ場を塞ぐ害が実測で上回った（vs v5 アブレーション 2026-07-10）。
         // 駒種は不明なので粒子の多数決、なければ成駒の最頻・金動き（と金）で近似する
-        for sq in known_enemy_squares(log, view.move_number.saturating_sub(8)) {
+        let mut known_loaded: Vec<(Coord, f64)> = vec![];
+        for (sq, unacc) in known_enemy_squares(log, view.move_number.saturating_sub(8)) {
             if base.piece_at(sq).is_some() {
                 continue;
             }
-            let role =
-                particle_majority_role(particles, my_color.other(), sq).unwrap_or(Role::Tokin);
+            let majority = particle_majority_role(particles, my_color.other(), sq);
+            let role = majority.unwrap_or(Role::Tokin);
             base.set(
                 sq,
                 Some(crate::shogi::Piece {
@@ -220,7 +239,14 @@ impl CheckSolver {
             // 仮説列挙を壊すので載せない
             if base.in_check(my_color) {
                 base.set(sq, None);
+                continue;
             }
+            // 玉の行き先 cap 用の確信度: 駒がまだそこに居る確率
+            // （未説明の相手手1つごとに 0.8 倍）× 駒種近似の確信度
+            // （粒子多数決が出たら 1.0、fallback の と金なら 0.7）
+            let stay = KNOWN_STAY_PER_UNACC.powi(unacc as i32);
+            let role_conf = if majority.is_some() { 1.0 } else { 0.7 };
+            known_loaded.push((sq, stay * role_conf));
         }
 
         let mut solver = CheckSolver {
@@ -228,6 +254,7 @@ impl CheckSolver {
             my_color,
             hypotheses: vec![],
             threat_cache: vec![],
+            known_loaded,
         };
         solver.enumerate(&opponent_role_counts(view, log));
         if solver.hypotheses.is_empty() {
@@ -447,6 +474,43 @@ impl CheckSolver {
             self.hypotheses = kept;
             self.threat_cache = vec![None; self.hypotheses.len()];
         }
+    }
+
+    /// **既知敵駒がカバーする玉の行き先の p_legal 上限**（2026-08-20、
+    /// arena-check-foul02 が発端。codex 設計相談）。粒子の合法性投票は
+    /// 「既知マスの駒はもう動いた」と信じて玉逃げの p_legal を 0.7 に保つが、
+    /// CheckSolver は base に載せた既知敵駒でその行き先が塞がっていることを
+    /// 知っている。玉の Board 移動で行き先が既知敵駒の利きに入っているとき、
+    /// `1 − stay_prob×role_conf`（下限 KING_COVER_CAP_FLOOR）を返す。
+    /// **min 専用**（呼び出し側が p_legal = min(p_legal, cap) する。押し上げない）。
+    /// 一律の玉割引（3シード全て悪化）と違い、既知敵駒が具体的に利いている
+    /// 行き先だけが対象。候補の削除もしない（CHECK_SAFE_RESOLVE の教訓）。
+    /// `TSUITATE_CHECK_KING_COVER_CAP=0` で無効（切り戻し用）
+    pub fn known_covered_king_move_cap(&self, mv: &ShogiMove) -> Option<f64> {
+        if !king_cover_cap_enabled() {
+            return None;
+        }
+        let ShogiMove::Board { from, to, .. } = *mv else {
+            return None;
+        };
+        if self.base.king_square(self.my_color) != Some(from) {
+            return None;
+        }
+        let opp = self.my_color.other();
+        let strength = self
+            .known_loaded
+            .iter()
+            .filter(|(sq, _)| {
+                *sq != to
+                    && self.base.piece_at(*sq).is_some_and(|p| p.color == opp)
+                    && self.base.attacks(*sq, to)
+            })
+            .map(|(_, conf)| *conf)
+            .fold(0.0f64, f64::max);
+        if strength <= 0.0 {
+            return None;
+        }
+        Some((1.0 - strength).max(KING_COVER_CAP_FLOOR))
     }
 
     /// 信念ネット占有で仮説重みを再配分する。同じマスの駒種仮説は同じ
@@ -695,8 +759,34 @@ impl CheckSolver {
 
 /// 位置が既知の敵駒のマス: 自駒が取られたマス（敵駒がそこへ来た事実）のうち、
 /// その後に自分が取り返しておらず、かつ since_move 手目以降の新しいもの
-fn known_enemy_squares(log: &ObservationLog, since_move: u32) -> Vec<Coord> {
+/// 既知の敵駒マスの鮮度上限: **未説明の相手手数**（2026-08-20、arena-check-foul02
+/// が発端。ユーザーの推論「相手の手のうち捕獲観測つきの手は着手駒のマスが
+/// 判明するので、確定駒が動けた機会は『説明のつかない手』の数だけ」の実装）。
+/// 従来は経過8手の窓だけで、13手目に取られた5三の と金（4二/5二/6二の
+/// 逃げ場を全部カバー）が24手目の被王手で見えず、玉逃げ3連発の反則を
+/// 生んでいた。実際には13手目以降の相手の手5つのうち3つは捕獲観測つき =
+/// 5三の駒は動いていないと分かる。
+/// `TSUITATE_CHECK_KNOWN_UNACC` で上書き（負の値で無効 = 従来の8手窓のみ。
+/// 凍結版はこの名前を知らない）。経過8手窓との OR なので従来より知識は
+/// 増える方向にしか動かない
+const KNOWN_UNACCOUNTED_LIMIT: i64 = 2;
+
+fn known_unaccounted_limit() -> i64 {
+    static W: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("TSUITATE_CHECK_KNOWN_UNACC")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(KNOWN_UNACCOUNTED_LIMIT)
+    })
+}
+
+fn known_enemy_squares(log: &ObservationLog, since_move: u32) -> Vec<(Coord, usize)> {
     let mut map: HashMap<Coord, u32> = HashMap::new();
+    // 相手の「説明のつかない手」（捕獲観測なしの OpponentMoved）の手数列。
+    // 捕獲つきの手は着手駒がそのマスへ動いたと確定するので、他の確定駒が
+    // 動いた可能性を残さない
+    let mut unaccounted: Vec<u32> = vec![];
     for e in log.events() {
         match e {
             crate::observation::Observation::OpponentMoved {
@@ -706,6 +796,12 @@ fn known_enemy_squares(log: &ObservationLog, since_move: u32) -> Vec<Coord> {
                 if let Some(c) = crate::board::parse_usi_square(sq) {
                     map.insert(c, *move_number);
                 }
+            }
+            crate::observation::Observation::OpponentMoved {
+                move_number,
+                captured_my_piece_at: None,
+            } => {
+                unaccounted.push(*move_number);
             }
             crate::observation::Observation::MyMove {
                 usi,
@@ -719,12 +815,24 @@ fn known_enemy_squares(log: &ObservationLog, since_move: u32) -> Vec<Coord> {
             _ => {}
         }
     }
-    let mut out: Vec<Coord> = map
+    let unacc_limit = known_unaccounted_limit();
+    let mut out: Vec<(Coord, usize)> = map
         .into_iter()
-        .filter(|(_, mn)| *mn >= since_move)
-        .map(|(c, _)| c)
+        .filter_map(|(c, mn)| {
+            // 取られてから後の未説明の相手手数（stay_prob の減衰にも使う）
+            let n = unaccounted.iter().filter(|&&u| u > mn).count();
+            if mn >= since_move {
+                return Some((c, n)); // 従来の直近8手窓
+            }
+            if unacc_limit < 0 {
+                return None; // ノブ無効 = 従来挙動
+            }
+            // 未説明手数が上限以下なら、確定駒がそこから動けた機会は少ない
+            // = まだ知識として使う
+            (n as i64 <= unacc_limit).then_some((c, n))
+        })
         .collect();
-    out.sort_by_key(|c| (c.file, c.rank));
+    out.sort_by_key(|(c, _)| (c.file, c.rank));
     out
 }
 

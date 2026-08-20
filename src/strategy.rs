@@ -5965,6 +5965,19 @@ impl Strategy for EstimatorStrategy {
             // p_legal を安全方向に落とすだけ。gain 内の課税は anchor_move の
             // 教訓で反則経済を壊すので使わない。
             out.p_legal *= king_repeat_legal_factor(&mv, my_king, &stale_king_dests, repeat_w);
+            // 王手中: 既知敵駒（未説明手数込みの known_enemy_squares）が
+            // カバーする玉の行き先は p_legal を min で締める。粒子の合法性
+            // 投票が「既知マスの駒はもう動いた」と信じて玉逃げを 0.7 に保ち、
+            // 反則を積む（arena-check-foul02: 5三のと金が 4二/5二/6二 を全部
+            // カバーしているのに玉逃げ3連発）。min 専用・玉の Board 移動のみ
+            if view.you_in_check {
+                if let Some(cap) = check_solver
+                    .as_ref()
+                    .and_then(|s| s.known_covered_king_move_cap(&mv))
+                {
+                    out.p_legal = out.p_legal.min(cap);
+                }
+            }
             // 王手中: 仮説条件付きの「王手駒の除去期待値」（check.rs::removal_term）。
             // 王手駒のマスを取る手は受理された未来で脅威ごと駒を排除し、玉逃げ等の
             // 解消手は王手駒を盤に残す。この差は粒子が真の王手駒を外している局面
