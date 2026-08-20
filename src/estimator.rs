@@ -2411,6 +2411,8 @@ fn sample_opp_move(
     let mut total_mass = 0.0f64;
     // 取る手の露見コスト（env は毎回読まずに手番ごとに1回だけ）
     let reveal_w = capture_reveal_cost_w();
+    // 王手の説明としての打ちの過小評価の補正（doc は check_drop_explain_w 参照）
+    let drop_explain = check_drop_explain_w();
     for mv in pos.legal_moves() {
         // 取られたマスとの整合（取りがなかったなら自駒のあるマスへは来ていない）
         let to_capture = match mv {
@@ -2429,8 +2431,8 @@ fn sample_opp_move(
         next.play_unchecked(&mv);
         // 分母（total_mass）には全合法手の重みが要るが、王手判定はクラス判定に
         // しか使わないので capture_ok の短絡で省く（in_check は比較的重い）
-        let consistent =
-            capture_ok && gives_check.is_none_or(|gc| next.in_check(my_color) == gc);
+        let in_chk = capture_ok && next.in_check(my_color);
+        let consistent = capture_ok && gives_check.is_none_or(|gc| in_chk == gc);
         let threat_known = newly_threatens(pos, &next, &mv, known_squares);
         let threat_home = newly_threatens(pos, &next, &mv, &homes);
         let (is_king, flee) = match mv {
@@ -2455,6 +2457,24 @@ fn sample_opp_move(
             my_foul_count_last_turn,
             moved_from_known_attacked(pos, &mv, opp, known_squares),
         ) * capture_reveal_factor(pos, &mv, opp, reveal_w);
+        // **王手の説明としての打ちの補正**（2026-08-20、arena-check-foul02 が
+        // 発端。ユーザー指摘「6三桂打には と金の紐がある」で hang 犯人説が
+        // 崩れ、真因は is_drop の基礎ペナルティと判明）: opp_move NN には
+        // 「王手を掛ける手か」の特徴量が無く、教師の基礎率（打ち21.7%）だけが
+        // 効いて、王手文脈でも打ちを 20〜56 倍沈める（foul02 実測: N*6c 0.2% vs
+        // と金移動 8.4%×3）。実データでは**王手の32.4%が打ち**（アリーナ真実
+        // 104局・447王手）なので、王手宣言を説明する打ち候補の重みを倍率で
+        // 起こす（opp_capture_reveal_w と同じ標本化側の補正。応手予測
+        // opp_reply_weights には掛けない）
+        let w = if drop_explain != 1.0
+            && gives_check == Some(true)
+            && in_chk
+            && matches!(mv, ShogiMove::Drop { .. })
+        {
+            w * drop_explain
+        } else {
+            w
+        };
         total_mass += w;
         if consistent {
             let mut g = w * guide_boost_factor(pos, &next, &mv, guide, opp);
@@ -2559,6 +2579,21 @@ const PREDICT_RECAPTURE_BOOST: f64 = 8.0;
 /// 2手読みの応手予測（`predict_opp_reply`）には掛けない: そちらは
 /// PREDICT_RECAPTURE_BOOST で取り返しを強く優先している側で、F3
 /// （2手読みが取り返しを過小評価する）を悪化させるため
+/// **王手の説明としての打ちの倍率**（`TSUITATE_CHECK_DROP_EXPLAIN_W`、
+/// 既定 7.0、1.0 で従来挙動 = 切り戻しノブ）。較正: 実データの P(打ち|王手) =
+/// 32.4% に対しモデルは約5%（foul02 実測）で、倍率7で約27%まで戻る。
+/// 凍結版はこの名前を知らない
+fn check_drop_explain_w() -> f64 {
+    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("TSUITATE_CHECK_DROP_EXPLAIN_W")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &f64| v.is_finite() && *v > 0.0)
+            .unwrap_or(7.0)
+    })
+}
+
 fn capture_reveal_cost_w() -> f64 {
     std::env::var("TSUITATE_OPP_CAPTURE_REVEAL_W")
         .ok()
@@ -3553,6 +3588,83 @@ mod tests {
         est.king_cands = Some([Coord { file: 9, rank: 1 }].into_iter().collect());
         est.apply_constraint(&c);
         assert_eq!(est.mut_rescued(), 0);
+    }
+
+    /// 診断（実行は --ignored、RECORDS_DIR に jsonl）: 真実の対局記録で
+    /// 「王手を掛けた手のうち打ちの割合」を数える。opp_move NN の is_drop
+    /// 基礎ペナルティが王手文脈で過大かの較正データ
+    #[test]
+    #[ignore]
+    fn check_move_drop_rate() {
+        let dir = std::env::var("RECORDS_DIR").expect("RECORDS_DIR を指定");
+        let mut checks = 0u32;
+        let mut drop_checks = 0u32;
+        let mut moves_total = 0u32;
+        let mut drops_total = 0u32;
+        for entry in std::fs::read_dir(&dir).expect("dir") {
+            let path = entry.unwrap().path();
+            if path.extension().is_none_or(|e| e != "jsonl") {
+                continue;
+            }
+            let Some(end) = crate::truth_replay::load_end(&path.to_string_lossy()) else {
+                continue;
+            };
+            let mut pos = Position::initial();
+            for m in &end.moves {
+                let Some(mv) = crate::shogi::parse_usi(&m.usi) else { break };
+                if !pos.is_legal(&mv) {
+                    break;
+                }
+                let is_drop = matches!(mv, ShogiMove::Drop { .. });
+                pos.play_unchecked(&mv);
+                moves_total += 1;
+                if is_drop {
+                    drops_total += 1;
+                }
+                if pos.in_check(pos.turn()) {
+                    checks += 1;
+                    if is_drop {
+                        drop_checks += 1;
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "全着手 {moves_total}（打ち {drops_total} = {:.1}%）/ 王手 {checks}（打ち {drop_checks} = {:.1}%）",
+            100.0 * drops_total as f64 / moves_total as f64,
+            100.0 * drop_checks as f64 / checks as f64
+        );
+    }
+
+    /// 診断（arena-check-foul02、実行は --ignored）: 真実の22手目局面で
+    /// 先手の王手を掛ける手それぞれの opp_move NN 重みを出す。
+    /// 「6三桂打がなぜ 0.6% しかないか」の切り分け用
+    #[test]
+    #[ignore]
+    fn foul02_check_move_weights() {
+        let sc = crate::scenario_core::load_scenario("arena-check-foul02", Some(22), None, None)
+            .expect("load");
+        let rep = crate::scenario_core::replay(&sc.kifu, 22);
+        let pos = rep.pos.clone();
+        assert_eq!(pos.turn(), Color::Sente);
+        // 後手（bot）視点: 取ったマス・触れたマス
+        let me = Color::Gote;
+        let weights = opp_reply_weights(&pos, me, &[], &[], 0);
+        let mut checks: Vec<(String, f64)> = vec![];
+        let mut total = 0.0;
+        for (mv, w) in &weights {
+            total += w;
+            let mut next = pos.clone();
+            next.play_unchecked(mv);
+            if next.in_check(me) {
+                checks.push((mv.to_usi(), *w));
+            }
+        }
+        checks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        eprintln!("全合法手の重み合計 {total:.3}");
+        for (usi, w) in &checks {
+            eprintln!("  王手 {usi}: w={w:.4} ({:.1}%)", 100.0 * w / total);
+        }
     }
 
     #[test]
