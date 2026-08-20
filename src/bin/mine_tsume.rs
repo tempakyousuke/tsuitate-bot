@@ -96,11 +96,27 @@ struct Candidate {
     origin: String,
 }
 
-/// 決定点の真の局面から、攻め方（手番側）視点のついたて詰将棋の問題を作る
+/// 決定点の真の局面から、攻め方（手番側）視点のついたて詰将棋の問題を作る。
+///
+/// 玉方の駒を玉だけにすると、消えた駒が塞いでいた利きが通って**初形で王手**に
+/// なることがある（攻め方の手番なのに王手 = 詰将棋として不正。サイト側の
+/// 盤面検証も ERR_OPPOSITE_CHECK で弾く）。そういう局面は問題にしない
 fn question_from(pos: &Position, attacker: Color) -> Option<Value> {
     let defender = attacker.other();
     let king = pos.king_square(defender)?;
     let flip = attacker == Color::Gote;
+
+    // 攻め方の駒（玉を除く）と玉方の玉だけを残した盤で王手になっていないか
+    let reduced = pos.retain_pieces(|_, piece| {
+        if piece.color == attacker {
+            piece.role != Role::King
+        } else {
+            piece.role == Role::King
+        }
+    });
+    if reduced.in_check(defender) {
+        return None;
+    }
 
     let mut board: Vec<(u8, u8, &'static str, &'static str)> = Vec::new();
     for piece in pos.pieces_of(attacker) {
@@ -490,6 +506,25 @@ mod tests {
                 && p["file"] == json!(2)
                 && p["rank"] == json!(8)
         }));
+    }
+
+    /// 玉方の駒を落としたことで玉が王手にさらされる局面は問題にしない
+    #[test]
+    fn positions_already_in_check_after_reduction_are_rejected() {
+        let mut pos = Position::initial();
+        // ▲7六歩 △3四歩 ▲2二角成 …ではなく、後手の駒を落とすと角の利きが
+        // 玉に通る形を直接作る: 先手角を5五へ、後手玉は5一のまま。
+        // 平手初形では 5五角は 5一玉へ縦に利かないので、角道が通る斜めに置く
+        for usi in ["7g7f", "3c3d"] {
+            pos.play_unchecked(&tsuitate_bot::shogi::parse_usi(usi).unwrap());
+        }
+        // ここまでは角が 8八 にいて玉に利かないので問題になる
+        assert!(question_from(&pos, Color::Sente).is_some());
+
+        // ▲8八角×3三成: 3三の馬は 4二 を通って 5一玉へ利く。
+        // 玉方の駒（4二金など）を落とすと初形で王手になってしまう
+        pos.play_unchecked(&tsuitate_bot::shogi::parse_usi("8h3c+").unwrap());
+        assert!(question_from(&pos, Color::Sente).is_none());
     }
 
     #[test]

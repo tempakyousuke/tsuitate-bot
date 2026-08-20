@@ -305,6 +305,25 @@ impl Position {
         })
     }
 
+    /// 盤上の駒を絞った局面を作る（`keep` が false の駒は盤から消える）。
+    /// 持ち駒・手番・手数はそのまま引き継ぐ。
+    ///
+    /// 実戦の局面からついたて詰将棋の問題を作るとき（`bin/mine_tsume`）に使う:
+    /// 玉方の駒は玉だけ残して他は全部「玉方の持ち駒」扱いにするので、
+    /// **消したことで玉が王手にさらされていないか**をこの局面で確かめる必要がある
+    /// （攻め方の手番なのに既に王手＝詰将棋として不正な問題になる）
+    pub fn retain_pieces(&self, keep: impl Fn(Coord, Piece) -> bool) -> Position {
+        let mut next = self.clone();
+        for (i, slot) in next.board.iter_mut().enumerate() {
+            if let Some(piece) = *slot {
+                if !keep(index_sq(i), piece) {
+                    *slot = None;
+                }
+            }
+        }
+        next
+    }
+
     /// マス sq が by 側の駒に利いているか（sq から逆引きで走査）
     pub fn is_attacked(&self, sq: Coord, by: Color) -> bool {
         #[cfg(feature = "effect-profile")]
