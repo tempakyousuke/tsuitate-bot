@@ -1,4 +1,4 @@
-*scenario ply=23 fouls=4a4b,4a5b,5a4b target=7b6c desc=アリーナ自己対局 1787110799807-arena-23 の24手目（bot=Gote）: 被王手（王手駒 6cKnight）で反則 6 回（4a4b 4a5b 5a4b 5a6b 5a5b 3a4b）のあと 7b6c を指した。K=1｜反則後サブ状態 f3（4a4b 4a5b 5a4b の反則後）
+*scenario ply=23 fouls=4a4b,4a5b,5a4b target=7b6c scores=5a6b:4,5a5b:0,3a4b:0,G*5b:0,N*5b:0,P*5b:0,P*5c:0,N*5c:0,G*5c:0,N*5d:0,P*5d:0,G*5d:0,P*5e:0,G*5e:0,N*5e:0,7b6c:10 bad=5a5b,3a4b,G*5b,N*5b,P*5b,P*5c,N*5c,G*5c,N*5d,P*5d,G*5d,P*5e,G*5e,N*5e desc=アリーナ自己対局 1787110799807-arena-23 の24手目（bot=Gote）: 被王手（王手駒 6cKnight）で反則 6 回（4a4b 4a5b 5a4b 5a6b 5a5b 3a4b）のあと 7b6c を指した。K=1｜反則後サブ状態 f3（4a4b 4a5b 5a4b の反則後）
 棋戦：arena
 手合割：平手
 先手：先手
