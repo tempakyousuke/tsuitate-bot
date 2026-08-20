@@ -3764,7 +3764,10 @@ pub struct EvalParams {
     /// × 観測裏付け(あり1.0/なし0.5) を加点（codex 相談 2026-08-20 の3係数化。
     /// 粒子重み付きなので占有確率も暗黙に掛かる）。`defender_capture_w`
     /// （相手玉の守り駒）の自玉側の鏡像。王手中は無効（CheckSolver の領分）。
-    /// `TSUITATE_OWN_ZONE_CAPTURE_W` で上書き可・SPSA対応。凍結版は知らない
+    /// **既定 10.0**（2026-08-20 採用。確定 suite +0.158・アリーナ2シードで
+    /// vs v13 57.2%/vs v14 56.2% と両基準対照超え）。
+    /// `TSUITATE_OWN_ZONE_CAPTURE_W` で上書き可（0 で切り戻し）・SPSA対応。
+    /// 凍結版は知らない
     pub own_zone_capture_w: f64,
     /// **taint 粒子の占有合意で打ちの反則確率を下げる**（2026-08-03、ユーザー指摘の
     /// 38手目 `S*4g` が発端）。厳密粒子が全滅した決定では `p_legal` が
@@ -4085,7 +4088,7 @@ impl Default for EvalParams {
             foul_occ_attack_w: 2.0,
             // 材料の退化ゲート。既定 0（2026-08-10: 正しい捕獲まで殺す）
             material_degen_q0: 0.0,
-            own_zone_capture_w: 0.0,
+            own_zone_capture_w: 10.0,
             depth2_check_pen: 0.178,
             depth2_recap_discount: 0.7612,
             // 反則経済の新項（2026-07-16、オラクル測定で36ptの伸びしろを確認後に追加）。
