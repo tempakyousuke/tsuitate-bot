@@ -263,6 +263,9 @@ pub struct CandidateScore {
     /// gain から引かれた盤上駒の減価（board_discount_w × 盤上の自駒の価値合計。V5）。
     /// 正の値 = そのぶん gain が減っている。これも見るのは差
     pub board_discount: f64,
+    /// gain に加算された自玉近傍の敵駒排除ボーナス
+    /// （own_zone_capture_w。粒子加重平均、内訳表示用）
+    pub own_zone: f64,
 }
 
 /// 前進を好むヒューリスティック＋乱数（従来実装）
@@ -3513,6 +3516,9 @@ struct EvalOut {
     hand_option: f64,
     /// gain から引かれた盤上駒の減価（V5。正の値。内訳表示用）
     board_discount: f64,
+    /// gain に加算された自玉近傍の敵駒排除ボーナス（own_zone_capture_w。
+    /// 粒子加重平均、内訳表示用）
+    own_zone: f64,
     /// 打ちプローブの反則情報価値（drop_probe_w）。反則の失敗枝の期待値なので
     /// gain には含めず、combine_score の外側（(1−p_legal) 側）で加算する
     foul_probe: f64,
@@ -5765,6 +5771,7 @@ impl Strategy for EstimatorStrategy {
         // 「裏付け無し捕獲だけ縮める」ゲート／`hand_asset_w` の仕事判定。
         // 決定点ごとに1回）
         let opp_occ_backed = (params.material_degen_q0 > 0.0
+            || params.own_zone_capture_w > 0.0
             || hand_asset_w() > 0.0
             || promote_far_w() > 0.0
             || unbacked_camp_w() > 0.0
@@ -6805,6 +6812,7 @@ impl Strategy for EstimatorStrategy {
                 depth2,
                 checker_removal: out.checker_removal,
                 capture_bet_penalty: out.capture_bet_penalty,
+                own_zone: out.own_zone,
                 mate_threat: out.mate_threat,
                 mate_risk: out.mate_risk,
                 king_holes: out.king_holes,
@@ -8310,6 +8318,8 @@ fn evaluate(
     let mut capture_hits = 0.0f64;
     // 捕獲価値の重み付き和（賭け分散ペナルティの stake = E[捕獲価値|hit] 用）
     let mut capture_value_sum = 0.0f64;
+    // 自玉近傍の敵駒排除ボーナスの粒子加重和（own_zone_capture_w の内訳表示用）
+    let mut own_zone_sum = 0.0f64;
     // 王手になった粒子の重み。王探しの情報利得（判定が割れるほど価値）に使う
     let mut check_hits = 0.0f64;
     // 詰みになった粒子の重み。加点はループ後に凸ゲート（mate_gate_q0）を通す
@@ -8428,13 +8438,44 @@ fn evaluate(
         // 取る手は、交換価値とは別に「自陣の脅威が1枚減る」価値を持つ（arena-recap01:
         // 1二で角を取られた直後、飛車で取り返せば自玉3一の隣接圏から敵駒が消える
         // のに、幻の紐（1五の香 52%）へのリスクが勝って 3五歩。取り返さなかった
-        // 成駒が30手後の詰みの材料になった）。距離1は満額、距離2は半額。王手中は無効
+        // 成駒が30手後の詰みの材料になった）。王手中は無効。
+        // 係数3つ（codex 相談 2026-08-20 の改良: 初版の定額 w=10 は suite +0.12 だが
+        // 隣接の歩を取る手にも飛車級の別価値を与えていた）:
+        // - 距離: 1 は満額 / 2 は半額
+        // - 駒種の危険度: 生の歩香桂 0.25 / 金銀・成小駒 0.75 / 飛角竜馬 1.0
+        //   （近いだけの香と玉頭のと金を区別する）
+        // - 観測裏付け: 着地マスの相手駒が観測で裏付けられていなければ 0.5
+        //   （幻の駒の排除に満額を払わない。opp_occupancy_evidence と共通）
         if params.own_zone_capture_w != 0.0 && !view.you_in_check && captured_value > 0.0 {
             if let (ShogiMove::Board { to, .. }, Some(mk)) = (*mv, pos.king_square(me)) {
-                match cheb(to, mk) {
-                    1 => v += params.own_zone_capture_w,
-                    2 => v += 0.5 * params.own_zone_capture_w,
-                    _ => {}
+                let dist_mult = match cheb(to, mk) {
+                    1 => 1.0,
+                    2 => 0.5,
+                    _ => 0.0,
+                };
+                if dist_mult > 0.0 {
+                    let role_mult = match pos.piece_at(to).map(|p| p.role) {
+                        Some(Role::Pawn | Role::Lance | Role::Knight) => 0.25,
+                        Some(
+                            Role::Silver
+                            | Role::Gold
+                            | Role::Tokin
+                            | Role::Promotedlance
+                            | Role::Promotedknight
+                            | Role::Promotedsilver,
+                        ) => 0.75,
+                        Some(Role::Bishop | Role::Rook | Role::Horse | Role::Dragon) => 1.0,
+                        _ => 0.0,
+                    };
+                    let backed_mult = match opp_occ_backed {
+                        Some(backed) if backed[crate::belief_features::sq_index(to)] => 1.0,
+                        Some(_) => 0.5,
+                        None => 1.0,
+                    };
+                    let bonus =
+                        params.own_zone_capture_w * dist_mult * role_mult * backed_mult;
+                    v += bonus;
+                    own_zone_sum += w * bonus;
                 }
             }
         }
@@ -9440,6 +9481,7 @@ fn evaluate(
         mate_risk,
         king_holes,
         value_nn: value_nn_term,
+        own_zone: if legal > 0.0 { own_zone_sum / legal } else { 0.0 },
         capture_value: if legal > 0.0 {
             capture_value_sum / legal
         } else {

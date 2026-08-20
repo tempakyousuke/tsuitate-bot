@@ -45,6 +45,9 @@ fn main() {
                     if c.king_holes != 0.0 {
                         s.push_str(&format!(" 玉穴=-{:.3}", c.king_holes));
                     }
+                    if c.own_zone != 0.0 {
+                        s.push_str(&format!(" 玉圏排除={:+.3}", c.own_zone));
+                    }
                     // 常時出す内訳（CandidateScore にあるのに表示していなかった）。
                     // gain の差がどこから来ているかは、これが無いと env の
                     // アブレーションで1項ずつ潰すしかない
