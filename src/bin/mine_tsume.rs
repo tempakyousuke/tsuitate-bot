@@ -27,14 +27,20 @@
 //!
 //! ## 問題の作り方
 //!
-//! ある決定点（手番側 = 攻め方）で、盤上に残すのは**攻め方の駒と玉方の玉だけ**。
-//! 玉方の残りの駒は、ついたて詰将棋の慣習どおり全部「玉方の持ち駒」になる
-//! （ソルバー側が盤上と攻め方持ち駒の残りから自動算出する）。つまり実戦の
-//! 局面そのものではなく、そこから作った独立した問題になる。攻め方の玉は
-//! 詰将棋では置かないので落とす。
+//! ある決定点（手番側 = 攻め方）の**実戦の局面をそのまま**問題にする。盤上の駒は
+//! 両者とも全部残し、攻め方の持ち駒もそのまま渡す。玉方の持ち駒は
+//! 「全駒 − 盤上 − 攻め方持ち駒」でソルバー側が自動算出するので、結果として
+//! 実戦の玉方の持ち駒と一致する（＝局面が完全に復元される）。
+//!
+//! **攻め方の玉も落とさない**（双玉）。自玉があると駒が動かせない（ピン）・
+//! 逆王手が受けの手段になる、といった実戦特有の制約がそのまま効くため、
+//! 詰将棋の慣習で玉を外すより問題として味が出る。ソルバーもサイトも双玉を
+//! 扱える（ソルバーの `generate_legal_moves` は自玉があれば自殺手を除外し、
+//! 自玉がなければ擬似合法手をそのまま返す）。
 //!
 //! 玉方が攻め方になる局面（後手番）は、盤面を180度回して先手番に直す
-//! （ソルバーは攻め方 = 先手を前提にしている）。
+//! （ソルバーは攻め方 = 先手を前提にしている）。駒の向きも回転で入れ替わるので、
+//! 色のラベルを差し替えるだけでよい。
 
 use std::collections::HashSet;
 use std::io::Write;
@@ -98,41 +104,27 @@ struct Candidate {
 
 /// 決定点の真の局面から、攻め方（手番側）視点のついたて詰将棋の問題を作る。
 ///
-/// 玉方の駒を玉だけにすると、消えた駒が塞いでいた利きが通って**初形で王手**に
-/// なることがある（攻め方の手番なのに王手 = 詰将棋として不正。サイト側の
-/// 盤面検証も ERR_OPPOSITE_CHECK で弾く）。そういう局面は問題にしない
+/// 盤上の駒は両者とも全部残す（双玉）。玉方の持ち駒はソルバー側が
+/// 「全駒 − 盤上 − 攻め方持ち駒」で自動算出するため JSON には入れない
 fn question_from(pos: &Position, attacker: Color) -> Option<Value> {
     let defender = attacker.other();
-    let king = pos.king_square(defender)?;
+    pos.king_square(defender)?;
+    // 実戦の局面なら手番が回ってきた時点で相手玉が王手になっていることはない
+    // （攻め方の手番なのに王手＝詰将棋として不正で、サイト側の盤面検証も
+    // ERR_OPPOSITE_CHECK で弾く）。壊れた棋譜由来のデータへの保険
+    if pos.in_check(defender) {
+        return None;
+    }
     let flip = attacker == Color::Gote;
 
-    // 攻め方の駒（玉を除く）と玉方の玉だけを残した盤で王手になっていないか
-    let reduced = pos.retain_pieces(|_, piece| {
-        if piece.color == attacker {
-            piece.role != Role::King
-        } else {
-            piece.role == Role::King
-        }
-    });
-    if reduced.in_check(defender) {
-        return None;
-    }
-
     let mut board: Vec<(u8, u8, &'static str, &'static str)> = Vec::new();
-    for piece in pos.pieces_of(attacker) {
-        // 攻め方の玉は詰将棋では盤に置かない
-        if piece.role == Role::King {
-            continue;
+    for (color, label) in [(attacker, "sente"), (defender, "gote")] {
+        for piece in pos.pieces_of(color) {
+            let coord = parse_usi_square(&piece.square)?;
+            let (file, rank) = orient(coord, flip);
+            board.push((file, rank, label, role_kind(piece.role)));
         }
-        let coord = parse_usi_square(&piece.square)?;
-        let (file, rank) = orient(coord, flip);
-        board.push((file, rank, "sente", role_kind(piece.role)));
     }
-    if board.is_empty() {
-        return None;
-    }
-    let (kf, kr) = orient(king, flip);
-    board.push((kf, kr, "gote", "king"));
     board.sort_by_key(|&(file, rank, color, _)| (file, rank, color));
 
     let hands = pos.hand_map(attacker);
@@ -472,20 +464,36 @@ fn write_out(path: Option<&str>, value: &Value) {
 mod tests {
     use super::*;
 
-    /// 初期局面の先手視点: 攻め方の玉は落とし、玉方は玉だけが残る
+    /// 実戦の局面をそのまま問題にする（盤上の駒は両者とも全部残す＝双玉）
     #[test]
-    fn sente_question_keeps_own_pieces_and_enemy_king_only() {
+    fn question_keeps_the_whole_position() {
         let pos = Position::initial();
         let q = question_from(&pos, Color::Sente).expect("問題が作れる");
         let board = q["board"].as_array().unwrap();
-        let gote: Vec<&Value> = board.iter().filter(|p| p["color"] == json!("gote")).collect();
-        assert_eq!(gote.len(), 1, "玉方は玉だけ");
-        assert_eq!(gote[0]["kind"], json!("king"));
-        assert_eq!(gote[0]["file"], json!(5));
-        assert_eq!(gote[0]["rank"], json!(1));
-        // 先手の駒 20 枚 - 玉 1 枚
-        assert_eq!(board.len() - 1, 19);
-        assert!(board.iter().all(|p| p["color"] == json!("gote") || p["kind"] != json!("king")));
+        assert_eq!(board.len(), 40, "平手初期局面の全駒");
+        assert_eq!(board.iter().filter(|p| p["color"] == json!("gote")).count(), 20);
+        // 攻め方の玉も残す（双玉。ピンや逆王手といった実戦の制約がそのまま効く）
+        assert!(board.iter().any(|p| p["color"] == json!("sente") && p["kind"] == json!("king")));
+        assert!(board.iter().any(|p| p["color"] == json!("gote") && p["kind"] == json!("king")));
+    }
+
+    /// 玉方の持ち駒は JSON に入れない（ソルバーが残り駒から自動算出し、
+    /// 実戦の玉方の持ち駒と一致する）
+    #[test]
+    fn defender_hand_is_left_to_the_solver() {
+        let mut pos = Position::initial();
+        // ▲7六歩 △3四歩 ▲2二角成（後手の角を取る）
+        for usi in ["7g7f", "3c3d", "8h2b+"] {
+            pos.play_unchecked(&tsuitate_bot::shogi::parse_usi(usi).unwrap());
+        }
+        // 後手番なので攻め方は後手。攻め方（後手）の持ち駒は空
+        let q = question_from(&pos, Color::Gote).expect("問題が作れる");
+        assert_eq!(q["sente_hand"].as_array().unwrap().len(), 0);
+
+        // 先手を攻め方にすると、取った角が攻め方の持ち駒として入る
+        pos.play_unchecked(&tsuitate_bot::shogi::parse_usi("3a2b").unwrap());
+        let q = question_from(&pos, Color::Sente).expect("問題が作れる");
+        assert_eq!(q["sente_hand"], json!([{ "kind": "bishop", "count": 1 }]));
     }
 
     /// 後手視点は盤面を180度回して「攻め方 = 先手」に直す
@@ -494,12 +502,14 @@ mod tests {
         let pos = Position::initial();
         let q = question_from(&pos, Color::Gote).expect("問題が作れる");
         let board = q["board"].as_array().unwrap();
-        let gote: Vec<&Value> = board.iter().filter(|p| p["color"] == json!("gote")).collect();
-        assert_eq!(gote.len(), 1);
-        // 先手玉 5九 → 180度回して 5一
-        assert_eq!(gote[0]["file"], json!(5));
-        assert_eq!(gote[0]["rank"], json!(1));
-        // 後手の飛車 8二 → 2八
+        // 先手玉 5九 → 180度回して 5一の「玉方の玉」になる
+        assert!(board.iter().any(|p| {
+            p["color"] == json!("gote")
+                && p["kind"] == json!("king")
+                && p["file"] == json!(5)
+                && p["rank"] == json!(1)
+        }));
+        // 後手の飛車 8二 → 2八の「攻め方の飛車」
         assert!(board.iter().any(|p| {
             p["color"] == json!("sente")
                 && p["kind"] == json!("rook")
@@ -508,23 +518,21 @@ mod tests {
         }));
     }
 
-    /// 玉方の駒を落としたことで玉が王手にさらされる局面は問題にしない
+    /// 手番側の相手が既に王手を受けている局面は問題にしない
+    /// （攻め方の手番なのに王手＝詰将棋として不正）
     #[test]
-    fn positions_already_in_check_after_reduction_are_rejected() {
+    fn positions_with_the_defender_already_in_check_are_rejected() {
         let mut pos = Position::initial();
-        // ▲7六歩 △3四歩 ▲2二角成 …ではなく、後手の駒を落とすと角の利きが
-        // 玉に通る形を直接作る: 先手角を5五へ、後手玉は5一のまま。
-        // 平手初形では 5五角は 5一玉へ縦に利かないので、角道が通る斜めに置く
         for usi in ["7g7f", "3c3d"] {
             pos.play_unchecked(&tsuitate_bot::shogi::parse_usi(usi).unwrap());
         }
-        // ここまでは角が 8八 にいて玉に利かないので問題になる
         assert!(question_from(&pos, Color::Sente).is_some());
 
-        // ▲8八角×3三成: 3三の馬は 4二 を通って 5一玉へ利く。
-        // 玉方の駒（4二金など）を落とすと初形で王手になってしまう
+        // ▲8八角×3三成: 3三の馬が 4二（空きマス）を通って 5一玉に王手
         pos.play_unchecked(&tsuitate_bot::shogi::parse_usi("8h3c+").unwrap());
         assert!(question_from(&pos, Color::Sente).is_none());
+        // 逆に後手を攻め方とみなす分には（先手玉は王手されていないので）問題になる
+        assert!(question_from(&pos, Color::Gote).is_some());
     }
 
     #[test]
@@ -534,15 +542,13 @@ mod tests {
         let b = question_from(&pos, Color::Sente).unwrap();
         assert_eq!(signature_of(&a), signature_of(&b));
         // 平手初期局面は点対称なので、後手視点を180度回すと先手視点と一致する
-        let mirrored = question_from(&pos, Color::Gote).unwrap();
-        assert_eq!(signature_of(&a), signature_of(&mirrored));
+        assert_eq!(signature_of(&a), signature_of(&question_from(&pos, Color::Gote).unwrap()));
 
-        // 問題は「攻め方の駒 + 玉方の玉」だけなので、攻め方の駒が動けば別問題になる。
-        // 逆に玉方の駒だけが動いた局面は同じ署名になり、重複として落ちる（狙いどおり）
+        // 局面をそのまま問題にするので、どちらの駒が動いても別問題になる
         let mut moved = pos.clone();
         moved.play_unchecked(&tsuitate_bot::shogi::parse_usi("7g7f").unwrap());
         assert_ne!(signature_of(&a), signature_of(&question_from(&moved, Color::Sente).unwrap()));
-        assert_eq!(signature_of(&a), signature_of(&question_from(&moved, Color::Gote).unwrap()));
+        assert_ne!(signature_of(&a), signature_of(&question_from(&moved, Color::Gote).unwrap()));
     }
 
     #[test]
