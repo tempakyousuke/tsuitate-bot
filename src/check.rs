@@ -166,6 +166,35 @@ const KNOWN_STAY_PER_UNACC: f64 = 0.8;
 /// 実は安全な逃げ場である可能性を残す）
 const KING_COVER_CAP_FLOOR: f64 = 0.05;
 
+/// 玉の手の反則が「既知敵駒のカバー」以外で説明される確率
+/// （observe_foul のカバー確信度ベイズ更新の分母）
+const KING_FOUL_ALT: f64 = 0.3;
+
+/// **歩いて来るしかない王手仮説の初期重み**（2026-08-20、arena-check-foul02 の
+/// ユーザー推論「紐なしのと金が来ている想定は普通しない。持ち駒で打てる王手の
+/// 方が尤もらしい」の実装）。仮説 (マス, 駒種) が
+/// (a) 打てる（生駒 かつ 相手が取った自駒にその駒種がある = 持ち駒上界 > 0）
+/// (b) 既知敵駒マスから1手で来られる（近似駒種の利き先）
+/// (c) 既知敵駒マスそのもの（駒種近似の別候補）
+/// のどれでもないとき、初期重みを 1.0 でなくこの値にする。
+/// 健全性は保たれる（仮説は消さない、重みだけ）。
+/// **既定 1.0 = 無効**（foul02 の実測で逆効果: 「打てる角」の4二仮説が相対的に
+/// 膨らみ、4二の重複プローブ 3a4b が増えて反則 42→47。打ち仮説と歩き仮説の
+/// 比率だけでは確かめの経済は改善しない）。env スイープ経路として残す。
+/// `TSUITATE_CHECK_WALKIN_DISCOUNT` で上書き（1.0 = 従来挙動）
+const CHECK_WALKIN_DISCOUNT: f64 = 1.0;
+
+fn check_walkin_discount() -> f64 {
+    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("TSUITATE_CHECK_WALKIN_DISCOUNT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|v: &f64| v.is_finite() && *v > 0.0 && *v <= 1.0)
+            .unwrap_or(CHECK_WALKIN_DISCOUNT)
+    })
+}
+
 /// 残存脅威（threat_of）の重み: 王手駒に攻撃されている自駒の交換価値に掛ける係数
 const THREAT_MATERIAL_W: f64 = 0.5;
 /// 残存脅威の重み: 自玉の隣接マス1つへの利き（逃げ場を縛り続ける圧力）の価値
@@ -256,7 +285,12 @@ impl CheckSolver {
             threat_cache: vec![],
             known_loaded,
         };
-        solver.enumerate(&opponent_role_counts(view, log));
+        // 相手の持ち駒の上界（取られた自駒の駒種。打ち王手の尤もらしさ判定用）
+        let mut opp_hand_possible: HashMap<Role, i32> = HashMap::new();
+        for (_, role) in GameModel::from_log(my_color, log).lost_pieces() {
+            *opp_hand_possible.entry(unpromote_role(*role)).or_default() += 1;
+        }
+        solver.enumerate(&opponent_role_counts(view, log), &opp_hand_possible);
         if solver.hypotheses.is_empty() {
             return None;
         }
@@ -323,12 +357,15 @@ impl CheckSolver {
     /// 取られた直後の王手なのに、taint 粒子の多数決が5二を非王手駒と近似して
     /// 仮説が列挙されなかった）。健全性（真の王手駒を仮説から落とさない）を
     /// 優先し、近似駒種は他の仮説の判定時の遮蔽・利き被覆にだけ使う
-    fn enumerate(&mut self, opp_counts: &HashMap<Role, i32>) {
+    fn enumerate(&mut self, opp_counts: &HashMap<Role, i32>, opp_hand_possible: &HashMap<Role, i32>) {
         let opp = self.my_color.other();
         let king = self
             .base
             .king_square(self.my_color)
             .expect("new で確認済み");
+        let walkin = check_walkin_discount();
+        // 既知敵駒マスと、その近似駒種が1手で行けるマス（尤もらしさ判定用）
+        let known_sqs: Vec<Coord> = self.known_loaded.iter().map(|(sq, _)| *sq).collect();
         for file in 1..=9i8 {
             for rank in 1..=9i8 {
                 let sq = Coord { file, rank };
@@ -352,10 +389,21 @@ impl CheckSolver {
                     let checks = self.base.in_check(self.my_color);
                     self.base.set(sq, existing);
                     if checks {
+                        // 尤もらしさ: 打てる王手・既知駒の1手圏・既知マス自身は
+                        // 満額、それ以外（どこかから歩いて来た駒）は割引
+                        let droppable = role == unpromote_role(role)
+                            && role != Role::King
+                            && opp_hand_possible.get(&role).copied().unwrap_or(0) > 0
+                            && existing.is_none();
+                        let plausible = droppable
+                            || known_sqs.contains(&sq)
+                            || known_sqs
+                                .iter()
+                                .any(|&k| k != sq && self.base.attacks(k, sq));
                         self.hypotheses.push(Hypothesis {
                             square: sq,
                             role,
-                            weight: 1.0,
+                            weight: if plausible { 1.0 } else { walkin },
                         });
                     }
                 }
@@ -583,6 +631,29 @@ impl CheckSolver {
             if self.legal_under(i, foul) {
                 let prior = self.single_hyp_legal_prior(foul, self.hypotheses[i].square);
                 self.hypotheses[i].weight *= UNEXPLAINED_FOUL_DECAY.max(1.0 - prior);
+            }
+        }
+        // **玉の手の反則は既知敵駒のカバーの正の証拠**（2026-08-20、
+        // arena-check-foul02 の「3反則で済むはず」への詰め）。玉が行き先 D で
+        // 反則した説明は「D が敵の利きに覆われている」で、D を覆う既知敵駒の
+        // 「まだそこに居る」確信度をベイズ更新する。同じ駒が覆う他のマス
+        // （5三のと金なら 4二/5二/6二 全部）の cap も同時に締まるのが要点:
+        // 玉6二の反則の後に玉4二を試す無駄が消える。
+        // P(玉の反則 | カバー無し) = KING_FOUL_ALT（別の説明 = 王手駒が D を
+        // 攻撃している等）
+        if king_cover_cap_enabled() {
+            if let ShogiMove::Board { from, to, .. } = *foul {
+                if self.base.king_square(self.my_color) == Some(from) {
+                    let opp = self.my_color.other();
+                    for (sq, conf) in self.known_loaded.iter_mut() {
+                        if *sq != to
+                            && self.base.piece_at(*sq).is_some_and(|p| p.color == opp)
+                            && self.base.attacks(*sq, to)
+                        {
+                            *conf = *conf / (*conf + KING_FOUL_ALT * (1.0 - *conf));
+                        }
+                    }
+                }
             }
         }
     }

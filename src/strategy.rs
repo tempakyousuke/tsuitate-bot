@@ -5562,6 +5562,16 @@ impl Strategy for EstimatorStrategy {
         let push = endgame_push(view.move_number, material_lead(view));
         let params = {
             let mut p = self.params.clone();
+            // **王手中の反則が積もるほど事前（CheckSolver）を信じる**
+            // （2026-08-20、arena-check-foul02。同一手番の各反則は「粒子の
+            // 合法性投票がこの決定で外れている」直接の証拠なので、p_legal
+            // ブレンドの prior_weight を反則数に比例して増やす。反則0では
+            // 従来と同一挙動。`TSUITATE_CHECK_FOUL_PRIOR_BOOST=0` で無効）
+            if view.you_in_check && !foul_tried.is_empty() {
+                let f = 1.0 + check_foul_prior_boost() * foul_tried.len() as f64;
+                p.prior_weight *= f;
+                p.prior_weight_degen *= f;
+            }
             if push > 0.0 {
                 p.check_bonus *= 1.0 + push;
                 p.attack_w *= 1.0 + push;
@@ -7148,6 +7158,19 @@ const BLIND_KING_ATTACK_W: f64 = 2.0;
 /// taint フォールバックを評価本体へ広げる案は**別途200局で不採用**になっている
 /// （taint は物理制約を緩めた盤面なので、その 7a に駒がいる保証すら無い）
 const BLIND_RECAPTURE_W: f64 = 1.0;
+
+/// 王手中の反則1回あたりの prior_weight 倍率の増分
+/// （`TSUITATE_CHECK_FOUL_PRIOR_BOOST`、既定 3.0、0 で従来挙動）
+fn check_foul_prior_boost() -> f64 {
+    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("TSUITATE_CHECK_FOUL_PRIOR_BOOST")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|v: &f64| v.is_finite() && *v >= 0.0)
+            .unwrap_or(3.0)
+    })
+}
 
 fn blind_recapture_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
