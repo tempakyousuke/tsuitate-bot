@@ -15,6 +15,12 @@
   （**採点前の suite 差は信じない**。指標穴の実証3例あり）
 
 反則後サブブロック（`### N手目（…の反則後）`）は foul_blocks.FOUL_MAP で対応づける。
+
+**単一決定点の eval**（eval の stem と同名の `scenarios/<stem>.kif` がある場合、
+例 `evals/arena-check-foul02.eval.md`）: TRIAL 行のうち scenario 名が `<stem>`
+（→ `## ply+1手目`）と `<stem>f<k>`（→ `fouls=` 末尾 USI の反則後ブロック）の
+ものだけを対応づける。quest31 の同じ手目のブロックへ流れ込む取り違え
+（2026-08-20 に実際に起きた）を防ぐため、それ以外の scenario は無視する。
 """
 
 import argparse
@@ -26,6 +32,42 @@ import subprocess
 from foul_blocks import block_key
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
+SCN = ROOT / "scenarios"
+
+
+def _header_directive(path, name):
+    head = path.read_text(encoding="utf-8").split("\n", 1)[0]
+    m = re.search(rf"(?:^|\s){name}=(\S+)", head)
+    return m.group(1) if m else None
+
+
+def single_decision_block_key(stem):
+    """単一決定点 eval のブロック対応（scenario 名 -> ブロックキー | None）。
+    `scenarios/<stem>.kif` が無ければ None を返す（= 従来の foul_blocks 経路）。
+    sync_eval.single_decision_map の逆向き（TRIAL の scenario 名から引く）"""
+    base = SCN / f"{stem}.kif"
+    if not base.exists():
+        return None
+    num = int(_header_directive(base, "ply")) + 1
+    subs = {}
+    for p in SCN.glob(f"{stem}f*.kif"):
+        fouls = _header_directive(p, "fouls")
+        if fouls:
+            subs[p.stem] = fouls.split(",")[-1]
+
+    def lookup(scenario, eval_blocks):
+        if scenario == stem:
+            return (num, None)
+        usi = subs.get(scenario)
+        if usi is None:
+            return None
+        # eval 側のサブブロック見出し（和名(USI)）を USI で探す
+        for key in eval_blocks:
+            if key[1] is not None and key[0] == num and f"({usi})" in key[1]:
+                return key
+        return None
+
+    return lookup
 
 SEC = re.compile(r"^## (\d+)手目")
 SUB = re.compile(r"^### (\d+)手目（(.+?)の反則後）")
@@ -108,6 +150,8 @@ def main():
     args = ap.parse_args()
 
     blocks = parse_blocks(args.eval_path)
+    # 単一決定点 eval（stem と同名の kif がある）なら専用の対応。取り違え防止
+    single = single_decision_block_key(args.eval_path.name.split(".")[0])
     counts = collections.Counter()
     where = {}
     for d in args.dirs:
@@ -119,7 +163,11 @@ def main():
                 scenario, usi = c[1], c[3]
                 if usi in ("resign", "foul_limit"):
                     continue
-                key = block_key(scenario)
+                key = (
+                    single(scenario, blocks.keys())
+                    if single
+                    else block_key(scenario)
+                )
                 if key is None or usi in blocks.get(key, set()):
                     continue
                 counts[(key, usi)] += 1
