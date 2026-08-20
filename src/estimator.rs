@@ -2580,8 +2580,12 @@ const PREDICT_RECAPTURE_BOOST: f64 = 8.0;
 /// PREDICT_RECAPTURE_BOOST で取り返しを強く優先している側で、F3
 /// （2手読みが取り返しを過小評価する）を悪化させるため
 /// **王手の説明としての打ちの倍率**（`TSUITATE_CHECK_DROP_EXPLAIN_W`、
-/// 既定 7.0、1.0 で従来挙動 = 切り戻しノブ）。較正: 実データの P(打ち|王手) =
-/// 32.4% に対しモデルは約5%（foul02 実測）で、倍率7で約27%まで戻る。
+/// **既定 1.0 = 無効**、env で有効化）。較正: 実データの P(打ち|王手) = 32.4% に
+/// 対しモデルは約5%（foul02 実測）で、倍率7で約27%まで戻る。
+/// **倍率7は不採用**（2026-08-20 ユーザー判断「対照に負ける場合は採用できない」:
+/// suite +0.051・kakutori 11→14/20・mate-net 1→8/20 と機構は良いが、アリーナが
+/// vs v13 60.4%（+4.6）/ **vs v14 47.6%（−7.2、seed2 43.3%）** と最強基準に
+/// 負け側。倍率3の再計測で v14 の後退が消えるかを判定中）。
 /// 凍結版はこの名前を知らない
 fn check_drop_explain_w() -> f64 {
     static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
@@ -2590,7 +2594,7 @@ fn check_drop_explain_w() -> f64 {
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|v: &f64| v.is_finite() && *v > 0.0)
-            .unwrap_or(7.0)
+            .unwrap_or(1.0)
     })
 }
 
