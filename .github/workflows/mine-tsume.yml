@@ -1,0 +1,312 @@
+name: Mine tsume
+
+# 自己対局の棋譜から「詰めチャレ」（サイト tsuitate の /tsume-challenge）の
+# 問題を掘り、取り込みJSONを artifact として出す。
+#
+# 入力は2通り:
+#   1. arena_run_id を指定 … 既存の Arena 実行の `arena-records-*` を使う
+#      （強さの検証で回したついでの棋譜を再利用する。追加の対局コストゼロ）
+#   2. arena_run_id が空 … このワークフローが自分で自己対局してから掘る
+#      （問題を増やすことだけが目的のとき）
+#
+# 採掘はソルバー（tsuitate-solver）を1問ずつ spawn するので対局より重い。
+# 「棋譜の分割 → 並列採掘 → 統合」の3段に分けてある（arena.yml と同じ流儀）。
+#
+# timeout_secs は「実行時間」と「長手数の問題が採れるか」のトレードオフ。
+# ほとんどの候補は詰みなしと一瞬で分かるが、詰みのある長手数の問題ほど時間を食う。
+# 実測（2026-08-20、59局）: 20秒だと11〜15手詰の4問を取り逃し、34問→30問になった。
+# 難しい問題ほど詰めチャレでは価値が高いので、既定は余裕を持たせてある。
+#
+# 出来上がった tsume-puzzles.json を artifact から落として、サイトの
+# /admin/tsume-challenge に貼り付ければ取り込める。
+on:
+  workflow_dispatch:
+    inputs:
+      arena_run_id:
+        description: "既存 Arena 実行のID（空ならこのワークフローが自己対局する）"
+        required: false
+        default: ""
+      games:
+        description: "自己対局する場合の対局数（全シャード合計）"
+        required: false
+        default: "200"
+      candidate:
+        description: "自己対局の候補戦略"
+        required: false
+        default: "estimator"
+      baseline:
+        description: "自己対局の基準戦略"
+        required: false
+        default: "estimator_v14"
+      clock:
+        description: "自己対局の時計（初期秒+加算秒）。既定は本番相当"
+        required: false
+        default: "300+3"
+      selfplay_shards:
+        description: "自己対局の分割数"
+        required: false
+        default: "4"
+      mine_shards:
+        description: "採掘の分割数（棋譜ファイルをこの数に分けて並列に解く）"
+        required: false
+        default: "4"
+      skip_plies:
+        description: "この手数までの局面は無視する（序盤は詰まない）"
+        required: false
+        default: "40"
+      min_depth:
+        description: "採用する詰み手数の下限"
+        required: false
+        default: "3"
+      max_depth:
+        description: "採用する詰み手数の上限"
+        required: false
+        default: "15"
+      timeout_secs:
+        description: "ソルバーの1問あたりのタイムアウト（秒）。長手数の問題ほどここで取り逃す"
+        required: false
+        default: "60"
+      memory_limit_mb:
+        description: "ソルバーのピークRSS上限（MB）"
+        required: false
+        default: "2000"
+      max_candidates:
+        description: "シャードごとにソルバーへ投げる候補数の上限（0=無制限）"
+        required: false
+        default: "0"
+      allow_second:
+        description: "余詰めのある問題も採用する"
+        required: false
+        default: "false"
+      source:
+        description: "取り込み元識別子（サイトの upsert キー。変えると別問題として登録される）"
+        required: false
+        default: "selfplay"
+      solver_ref:
+        description: "tsuitate-solver の ref"
+        required: false
+        default: "main"
+
+permissions:
+  contents: read
+  # 別の実行の artifact を落とすのに必要
+  actions: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      selfplay_shards: ${{ steps.split.outputs.selfplay_shards }}
+      mine_shards: ${{ steps.split.outputs.mine_shards }}
+      games_per_shard: ${{ steps.split.outputs.games_per_shard }}
+    steps:
+      - id: split
+        env:
+          GAMES: ${{ inputs.games }}
+          SELFPLAY_SHARDS: ${{ inputs.selfplay_shards }}
+          MINE_SHARDS: ${{ inputs.mine_shards }}
+        run: |
+          set -euo pipefail
+          per=$(( (GAMES + SELFPLAY_SHARDS - 1) / SELFPLAY_SHARDS ))
+          per=$(( per + per % 2 ))   # 先後を揃えるため偶数化
+          {
+            echo "selfplay_shards=$(jq -n -c "[range(0; ${SELFPLAY_SHARDS})]")"
+            echo "mine_shards=$(jq -n -c "[range(0; ${MINE_SHARDS})]")"
+            echo "games_per_shard=${per}"
+          } >> "$GITHUB_OUTPUT"
+
+  # arena_run_id が空のときだけ自分で対局する
+  selfplay:
+    needs: plan
+    if: inputs.arena_run_id == ''
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.selfplay_shards) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run selfplay shard
+        env:
+          ARENA_RECORD_DIR: arena-records
+          ARENA_CLOCK: ${{ inputs.clock }}
+        run: |
+          set -euo pipefail
+          case "$ARENA_CLOCK" in
+            [0-9]*+[0-9]*)
+              export ARENA_FISCHER_INITIAL_MS=$(( ${ARENA_CLOCK%%+*} * 1000 ))
+              export ARENA_FISCHER_INCREMENT_MS=$(( ${ARENA_CLOCK##*+} * 1000 ))
+              ;;
+            *) echo "無視（初期秒+加算秒 の形式のみ）: ${ARENA_CLOCK}" ;;
+          esac
+          cargo run --release --bin arena -- \
+            "${{ needs.plan.outputs.games_per_shard }}" \
+            "${{ inputs.candidate }}" \
+            "${{ inputs.baseline }}"
+
+      # arena.yml と同じ名前にしておく（採掘側はどちらの出どころでも同じ扱いで拾える）
+      - name: Upload game records
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: arena-records-mine-s${{ matrix.shard }}
+          path: arena-records/
+          if-no-files-found: ignore
+
+  mine:
+    needs: [plan, selfplay]
+    # selfplay は arena_run_id 指定時にスキップされるので always() で判定する
+    if: always() && needs.plan.result == 'success' && needs.selfplay.result != 'failure'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.mine_shards) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout solver
+        uses: actions/checkout@v4
+        with:
+          repository: tempakyousuke/tsuitate-solver
+          ref: ${{ inputs.solver_ref }}
+          path: solver
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # bot 本体とソルバーは別ワークスペース。両方キャッシュする
+          workspaces: |
+            .
+            solver/src-tauri
+
+      - name: Download records (this run)
+        if: inputs.arena_run_id == ''
+        uses: actions/download-artifact@v4
+        with:
+          # merge-multiple は使わない: 記録のファイル名は「時刻-arena-連番」なので
+          # シャードをまたぐと衝突し得る。artifact ごとのサブディレクトリに分ける
+          pattern: arena-records-*
+          path: records-in
+
+      - name: Download records (existing arena run)
+        if: inputs.arena_run_id != ''
+        uses: actions/download-artifact@v4
+        with:
+          pattern: arena-records-*
+          path: records-in
+          run-id: ${{ inputs.arena_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          cargo build --release --bin mine_tsume
+          # GUI 依存（webkit2gtk 等）を避けて CLI だけ作る
+          cargo build --release --bin tsuitate-solver-cli --no-default-features \
+            --manifest-path solver/src-tauri/Cargo.toml
+
+      - name: Mine shard
+        env:
+          SHARD: ${{ matrix.shard }}
+          MINE_SHARDS: ${{ inputs.mine_shards }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob globstar
+          files=(records-in/**/*.jsonl)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "棋譜が1件もありません（オラクル有効の Arena 実行は記録を出しません）" >&2
+            echo '{"source":"${{ inputs.source }}","puzzles":[]}' > tsume-shard.json
+            exit 0
+          fi
+          # パスでソートしてから N 個おきに取る（シャード間で重複しない決定的な分割）
+          mapfile -t sorted < <(printf '%s\n' "${files[@]}" | sort)
+          mine=()
+          for i in "${!sorted[@]}"; do
+            if [ $(( i % MINE_SHARDS )) -eq "$SHARD" ]; then mine+=("${sorted[$i]}"); fi
+          done
+          echo "このシャードの棋譜: ${#mine[@]} / ${#sorted[@]} 局"
+          if [ ${#mine[@]} -eq 0 ]; then
+            echo '{"source":"${{ inputs.source }}","puzzles":[]}' > tsume-shard.json
+            exit 0
+          fi
+          allow_second=""
+          if [ "${{ inputs.allow_second }}" = "true" ]; then allow_second="--allow-second"; fi
+          ./target/release/mine_tsume "${mine[@]}" \
+            --solver solver/src-tauri/target/release/tsuitate-solver-cli \
+            --source "${{ inputs.source }}" \
+            --skip-plies "${{ inputs.skip_plies }}" \
+            --min-depth "${{ inputs.min_depth }}" \
+            --max-depth "${{ inputs.max_depth }}" \
+            --timeout-secs "${{ inputs.timeout_secs }}" \
+            --memory-limit-mb "${{ inputs.memory_limit_mb }}" \
+            --max-candidates "${{ inputs.max_candidates }}" \
+            --jobs "$(nproc)" \
+            $allow_second \
+            --out tsume-shard.json
+
+      - name: Upload shard puzzles
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsume-shard-${{ matrix.shard }}
+          path: tsume-shard.json
+          if-no-files-found: ignore
+
+  collect:
+    needs: [plan, mine]
+    # 一部のシャードが落ちても、取れたぶんだけで取り込みJSONを作る
+    if: always() && needs.mine.result != 'skipped'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: tsume-shard-*
+          path: shards
+          # 落ちたシャードがあっても続ける
+          merge-multiple: false
+
+      - name: Merge shards
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          parts=(shards/*/tsume-shard.json)
+          if [ ${#parts[@]} -eq 0 ]; then
+            echo "採掘結果の artifact が1つもありません" >&2
+            echo '{"source":"${{ inputs.source }}","puzzles":[]}' > tsume-puzzles.json
+            echo "## 採掘結果: 0問（シャードの出力なし）" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # シャードをまたぐ重複は sourceId（盤面の署名）で落とす
+          jq -s --arg source "${{ inputs.source }}" '
+            { source: $source,
+              puzzles: (map(.puzzles) | add | unique_by(.sourceId)) }
+          ' "${parts[@]}" > tsume-puzzles.json
+
+          total=$(jq '.puzzles | length' tsume-puzzles.json)
+          {
+            echo "## 採掘結果: **${total}問**"
+            echo ""
+            if [ "$total" -gt 0 ]; then
+              echo "| 詰み手数 | 問題数 | 推定レート（最小〜最大） |"
+              echo "|---|---|---|"
+              jq -r '
+                .puzzles | group_by(.depth) | sort_by(.[0].depth)[] |
+                "| \(.[0].depth)手詰 | \(length) | \(map(.rating) | min)〜\(map(.rating) | max) |"
+              ' tsume-puzzles.json
+              echo ""
+              echo "推定レート全体: $(jq -r '[.puzzles[].rating] | "\(min)〜\(max)（中央値 \(sort | .[length/2|floor])）"' tsume-puzzles.json)"
+            fi
+            echo ""
+            echo "artifact \`tsume-puzzles\` の tsume-puzzles.json をサイトの \`/admin/tsume-challenge\` に貼り付けて取り込みます。"
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload puzzles
+        uses: actions/upload-artifact@v4
+        with:
+          name: tsume-puzzles
+          path: tsume-puzzles.json
