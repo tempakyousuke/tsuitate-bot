@@ -247,6 +247,23 @@
   `scenarios/` 形式の kif を書き出す（`*scenario ply= target= desc=` 付き、
   flee の target は最安の捕獲手）。粒子を回さないので一瞬。採掘した12件は
   `scenarios/arena-check-*.kif`（scenarios/README.md）
+- `cargo run --release --bin mine_tsume -- <records/ or *.jsonl...> [--solver <path>] [--out <path>]`
+  — **ついたて詰将棋の問題の採掘**（サイトの「詰めチャレ」の問題生成）。記録の
+  真実を再生し、各決定点で手番側を攻め方とみなして「攻め方の駒 + 玉方の玉」だけを
+  残した問題を作り、ソルバーCLI（`--shortest --find-second --estimate-rating`）に
+  かけて詰みがあるものだけを残す。出力はサイトの `/admin/tsume-challenge` に
+  貼り付ける取り込みJSON（レート推定値と特徴量つき）。
+  - 玉方の残り駒は全部「玉方の持ち駒」になる（ついたて詰将棋の慣習）。攻め方の
+    玉は詰将棋では置かないので落とす。後手番の局面は盤面を180度回して先手番に直す
+  - 問題は攻め方の駒と玉方の玉だけで決まるので、**玉方の駒だけが動いた別局面は
+    同じ問題**になる。署名（正規化JSONの SHA-256）で重複を落とし、`sourceId` として
+    取り込みの upsert キーにもする
+  - 主なオプション: `--skip-plies N`（既定20。序盤は詰まないので飛ばす）/
+    `--min-depth` `--max-depth`（既定 3〜15）/ `--jobs N`（ソルバーの並列数）/
+    `--allow-second`（余詰めのある問題も採用。既定は捨てる）/
+    `--dump-candidates <path>`（ソルバーを呼ばず候補だけ書き出す）
+  - 実測（2026-08-20、`records/` の59局・`--skip-plies 40 --jobs 4 --timeout-secs 20`）:
+    候補1690件・所要3分42秒で**31問**採用（3手詰14 / 5〜15手詰17、推定レート 966〜2381）
 - `cargo run --release --bin king_cands -- <kif> [開始手目] [終了手目]` — 各決定点で
   `deduce::opp_king_candidates` が何マスまで絞れているか・真の玉を含んでいるか
   （健全性）を一覧する（2026-08-13）。**粒子を回さないので一瞬で終わる**ので、
