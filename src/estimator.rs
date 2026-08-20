@@ -2484,6 +2484,36 @@ fn sample_opp_move(
             candidates.push((mv, w, g));
         }
     }
+    // **王手の説明の打ちシェアを目標へ較正**（check_drop_target の doc 参照）。
+    // candidates はこの時点で「観測と整合する手」= 王手制約があるときは
+    // 王手を説明する手の全量なので、打ちシェア s を測って不足分だけ
+    // 打ち候補をブーストできる。s ≥ 目標なら何もしない（安全方向のみ）
+    let target = check_drop_target();
+    if target > 0.0 && gives_check == Some(true) && !candidates.is_empty() {
+        let total: f64 = candidates.iter().map(|(_, w, _)| *w).sum();
+        let drops: f64 = candidates
+            .iter()
+            .filter(|(mv, _, _)| matches!(mv, ShogiMove::Drop { .. }))
+            .map(|(_, w, _)| *w)
+            .sum();
+        if total > 0.0 && drops > 0.0 && drops < total {
+            let s = drops / total;
+            if s < target {
+                // オッズ比で倍率を出す: m×drops/(total−drops+m×drops) = target
+                let m = ((target / (1.0 - target)) / (s / (1.0 - s)))
+                    .min(CHECK_DROP_TARGET_MAX_BOOST);
+                if m > 1.0 {
+                    for (mv, w, g) in candidates.iter_mut() {
+                        if matches!(mv, ShogiMove::Drop { .. }) {
+                            total_mass += (m - 1.0) * *w;
+                            *w *= m;
+                            *g *= m;
+                        }
+                    }
+                }
+            }
+        }
+    }
     // 選択はガイド後の提案分布 g から。補正はクラス内確率の比 p/g で払う
     let idx = weighted_choice_idx(candidates.iter().map(|(_, _, g)| *g), rng)?;
     let class_mass: f64 = candidates.iter().map(|(_, w, _)| w).sum();
@@ -2597,6 +2627,28 @@ fn check_drop_explain_w() -> f64 {
             .unwrap_or(1.0)
     })
 }
+
+/// **王手の説明の打ちシェアの目標値**（`TSUITATE_CHECK_DROP_TARGET`、
+/// 既定 0 = 無効。0.32 で実データ較正）。固定倍率版（CHECK_DROP_EXPLAIN_W=7）の
+/// 失敗（2026-08-20 実測: v14 戦で打ちマス反則 +48・経路封鎖 +42・駒得収支
+/// −504 = 打ちが既に十分表現されている局面まで×7して占有信念が壊れた）への
+/// 対応: 粒子ごとに「王手を説明する候補の打ちシェア s」を測り、目標に
+/// 届く分だけ動的にブーストする（s≥目標なら倍率1 = 何もしない。
+/// foul02 のような s≈5% の局面だけ ≈6.5 倍）。倍率の上限は
+/// CHECK_DROP_TARGET_MAX_BOOST。凍結版はこの名前を知らない
+fn check_drop_target() -> f64 {
+    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("TSUITATE_CHECK_DROP_TARGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &f64| v.is_finite() && *v >= 0.0 && *v < 1.0)
+            .unwrap_or(0.0)
+    })
+}
+
+/// 動的ブーストの倍率上限（過小シェアの局面でも青天井にしない）
+const CHECK_DROP_TARGET_MAX_BOOST: f64 = 8.0;
 
 fn capture_reveal_cost_w() -> f64 {
     std::env::var("TSUITATE_OPP_CAPTURE_REVEAL_W")
