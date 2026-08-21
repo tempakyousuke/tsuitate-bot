@@ -1,4 +1,4 @@
-*scenario ply=63 target=6d6e scores=G*6i:1,G*5h:1,S*5h:1,S*4h:1,S*6h:1,G*6h:1,G*4h:1,G*4i:1,G*1b:0,G*2b:0,S*1b:0,G*2d:0,S*2b:0,G*3c:0,S*1d:0,6d6e:6,P*2b:2,P*2h:7,P*4h:5,2c2d:2,5c5d:0,8a7c:2,G*6f:2,S*3h:2,S*5g:2,2c3c:0,S*3i:0,P*4f:6,3d3e:6,G*5g:1,4e5d:8,7d7e:6 bad=G*6i,G*5h,S*5h,S*4h,S*6h,G*6h,G*4h,G*4i,G*1b,G*2b,S*1b,G*2d,S*2b,G*3c,S*1d,P*2b,2c2d,5c5d,8a7c,G*6f,S*3h,S*5g,2c3c,S*3i,G*5g desc=64手目（後手番）。明確な良手が少ない局面＝価値の低くない手でやり過ごす。実戦の4六歩打（候補外）も大いにある。候補内で唯一のありは6五歩
+*scenario ply=63 target=6d6e scores=G*6i:1,G*5h:1,S*5h:1,S*4h:1,S*6h:1,G*6h:1,G*4h:1,G*4i:1,G*1b:0,G*2b:0,S*1b:0,G*2d:0,S*2b:0,G*3c:0,S*1d:0,6d6e:6,P*2b:2,P*2h:7,P*4h:5,2c2d:2,5c5d:0,8a7c:2,G*6f:2,S*3h:2,S*5g:2,2c3c:0,S*3i:0,P*4f:6,3d3e:6,G*5g:1,4e5d:8,7d7e:6,6b5b:2 bad=G*6i,G*5h,S*5h,S*4h,S*6h,G*6h,G*4h,G*4i,G*1b,G*2b,S*1b,G*2d,S*2b,G*3c,S*1d,P*2b,2c2d,5c5d,8a7c,G*6f,S*3h,S*5g,2c3c,S*3i,G*5g,6b5b desc=64手目（後手番）。明確な良手が少ない局面＝価値の低くない手でやり過ごす。実戦の4六歩打（候補外）も大いにある。候補内で唯一のありは6五歩
 棋戦：Shogi Quest
 手合割：平手
 先手：yukarisama(1952)
