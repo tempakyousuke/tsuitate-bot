@@ -2376,7 +2376,10 @@ fn gen_nonpromote() -> bool {
 /// 成りの付加価値は生き残った分岐（threat / promo 実現）でだけ実現させる
 fn promo_risk_prerole() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_PROMO_RISK_PREROLE").is_ok_and(|v| v == "1"))
+    // p2f-true-value ブランチ: 既定 on（env "0" で切り戻し）。
+    // stale_threat_w=1.0 との3点セット検証（quest31 4七歩成クラスタの
+    // 「幻の当たり相殺」を剥がして本来の価値で立たせる）
+    *V.get_or_init(|| std::env::var("TSUITATE_PROMO_RISK_PREROLE").map_or(true, |v| v == "1"))
 }
 
 /// 捕獲直後の手戻り免除・退避加点（`TSUITATE_CAPTURE_RETREAT_W`、既定 0。
@@ -2402,8 +2405,8 @@ fn capture_retreat_w() -> f64 {
     })
 }
 
-/// 捕獲直後の手戻り免除。既定 0（env 作業点は 0.16）。
-const CAPTURE_RETREAT_W: f64 = 0.0;
+/// 捕獲直後の手戻り免除。p2f-true-value ブランチ: 既定 0.08（3点セット検証）。
+const CAPTURE_RETREAT_W: f64 = 0.08;
 
 /// V1（利き数）のノブ。**既定は両方 無効**（＝従来の二値の利き判定）。
 ///
@@ -7200,7 +7203,9 @@ fn stale_threat_w() -> f64 {
             .ok()
             .and_then(|v| v.parse().ok())
             .filter(|v: &f64| v.is_finite() && (0.0..=1.0).contains(v))
-            .unwrap_or(0.0)
+            // p2f-true-value ブランチ: 既定 1.0（env "0" で切り戻し）。
+            // PREROLE+CAPTURE_RETREAT との3点セット検証
+            .unwrap_or(1.0)
     })
 }
 
@@ -11734,13 +11739,14 @@ pub(crate) mod tests {
         );
     }
 
-    /// 捕獲直後の手戻り免除ノブは既定 0 = 無効（作業点 0.08 は env で有効化）。
+    /// 捕獲直後の手戻り免除ノブの既定は定数と一致する
+    /// （p2f-true-value ブランチ: 既定 0.08）。
     #[test]
     fn capture_retreat_w_default_off() {
         let w = std::env::var("TSUITATE_CAPTURE_RETREAT_W").ok();
         if w.is_none() {
             assert!((capture_retreat_w() - CAPTURE_RETREAT_W).abs() < 1e-12);
-            assert_eq!(CAPTURE_RETREAT_W, 0.0);
+            assert_eq!(CAPTURE_RETREAT_W, 0.08);
         }
     }
 
@@ -12243,13 +12249,15 @@ pub(crate) mod tests {
         }
     }
 
+    /// GEN は既定 off のまま。PREROLE は p2f-true-value ブランチで既定 on
+    /// （env "0" で切り戻し可能なことも検査）。
     #[test]
     fn gen_nonpromote_and_prerole_default_off() {
         if std::env::var("TSUITATE_GEN_NONPROMOTE").is_err() {
             assert!(!gen_nonpromote());
         }
         if std::env::var("TSUITATE_PROMO_RISK_PREROLE").is_err() {
-            assert!(!promo_risk_prerole());
+            assert!(promo_risk_prerole());
         }
     }
 
