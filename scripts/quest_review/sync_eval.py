@@ -5,6 +5,9 @@
 
 - `scores=` は採点済み（? 以外）の全候補 `USI:点` を列挙
 - `bad=` は score <= BAD_THRESHOLD の手（従来の不合格計との互換表示用）
+- シナリオ名のプレフィックスは eval の stem から foul_blocks.PREFIX_BY_EVAL で引く
+  （quest_20260731 → quest31-m、quest_0809 → quest0809-m。未登録ならエラーで止まる。
+  `EVAL_SCENARIO_PREFIX` env で上書き可）
 - 反則後ブロック（`### N手目（…の反則後）`）は foul_blocks.FOUL_MAP のシナリオへ対応
 - **単一決定点の eval**（eval の stem と同名の `scenarios/<stem>.kif` がある場合、
   例 `evals/arena-check-foul01.eval.md`）: `## N手目` は N == ply+1 のときだけ
@@ -18,7 +21,7 @@ import pathlib
 import re
 import sys
 
-from foul_blocks import scenario_for
+from foul_blocks import PREFIX_BY_EVAL, eval_stem, prefix_for_eval, scenario_for
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCN = ROOT / "scenarios"
@@ -103,9 +106,17 @@ def main() -> None:
     eval_path = pathlib.Path(
         sys.argv[1] if len(sys.argv) > 1 else ROOT / "evals" / "quest_20260731.eval.md"
     )
-    prefix = os.environ.get("EVAL_SCENARIO_PREFIX", "quest31-m")
     blocks = parse_eval(eval_path)
-    single = single_decision_map(eval_path.name.split(".")[0])
+    single = single_decision_map(eval_stem(eval_path))
+    # プレフィックスは eval の stem から引く（foul_blocks.PREFIX_BY_EVAL）。
+    # 未登録の eval を黙って quest31-m へ流すと別棋譜のシナリオを上書きするので止める
+    prefix = os.environ.get("EVAL_SCENARIO_PREFIX") or prefix_for_eval(eval_path)
+    if single is None and prefix is None:
+        sys.exit(
+            f"{eval_path.name}: シナリオ名プレフィックスが未登録です。"
+            f" scripts/quest_review/foul_blocks.py の PREFIX_BY_EVAL に"
+            f" {eval_stem(eval_path)!r} を足してください（登録済み: {sorted(PREFIX_BY_EVAL)}）"
+        )
     changed = 0
     for (num, sub), entries in sorted(blocks.items(), key=lambda kv: (kv[0][0], kv[0][1] or "")):
         name = single((num, sub)) if single else scenario_for((num, sub), prefix)

@@ -405,6 +405,11 @@ pub struct Estimator {
     /// 相手手の事前分布の threat_known 特徴量に使う。idx は制約列上の位置
     my_capture_idx: Vec<usize>,
     my_capture_sq: Vec<Coord>,
+    /// 相手が自駒を取ったマス（= 相手の駒がそこに来たことを自分が知っている
+    /// ＝相手側の**露見駒**）。相手手の事前分布の「露見歩の継続前進」補正
+    /// （`opp_pawn_intent_factor`）に使う。idx は制約列上の位置
+    opp_capture_idx: Vec<usize>,
+    opp_capture_sq: Vec<Coord>,
     /// 自分の手が触れたマス（from/to）。初期配置から動いていない自駒
     /// （相手が推論で狙ってくる = threat_home 特徴量）の判定に使う
     my_touched_idx: Vec<usize>,
@@ -518,6 +523,8 @@ impl Estimator {
             constraints: vec![],
             my_capture_idx: vec![],
             my_capture_sq: vec![],
+            opp_capture_idx: vec![],
+            opp_capture_sq: vec![],
             my_touched_idx: vec![],
             my_touched_sq: vec![],
             cursor: 0,
@@ -746,9 +753,21 @@ impl Estimator {
             // in_check_at[idx] = この制約を処理する直前の被王手状態
             self.in_check_at.push(self.in_check);
             match &constraint {
-                Constraint::OppMove { gives_check, .. } => {
+                Constraint::OppMove {
+                    gives_check,
+                    captured_at,
+                    ..
+                } => {
                     self.in_check = *gives_check;
                     self.pending_opp_foul_count = 0;
+                    // 相手が自駒を取ったマス = 相手の露見駒の位置
+                    // （この制約を適用する粒子の標本化では「まだ知らない」ので、
+                    // idx はこの制約の位置。partition_point(|j| j < i) で
+                    // 「i より前の露見」だけが渡る）
+                    if let Some(sq) = captured_at {
+                        self.opp_capture_idx.push(self.constraints.len());
+                        self.opp_capture_sq.push(*sq);
+                    }
                 }
                 Constraint::MyMove { .. } => {
                     self.in_check = false;
@@ -905,6 +924,7 @@ impl Estimator {
                     *my_foul_count,
                     &self.my_capture_sq,
                     &self.my_touched_sq,
+                    &self.opp_capture_sq,
                     &Guide::default(),
                     belief.as_ref().map(|b| (b, live_w)),
                     &mut self.rng,
@@ -1122,6 +1142,7 @@ impl Estimator {
                 *my_foul_count,
                 &self.my_capture_sq,
                 &self.my_touched_sq,
+                &self.opp_capture_sq,
                 &Guide::default(),
                 belief.as_ref().map(|b| (b, guide_w)),
                 &mut self.rng,
@@ -1205,6 +1226,7 @@ impl Estimator {
                     *my_foul_count,
                     &self.my_capture_sq,
                     &self.my_touched_sq,
+                    &self.opp_capture_sq,
                     &Guide::default(),
                     None,
                     &mut self.rng,
@@ -1327,6 +1349,7 @@ impl Estimator {
                     }
                     let k = self.my_capture_idx.partition_point(|&j| j < i);
                     let t = self.my_touched_idx.partition_point(|&j| j < i);
+                    let r = self.opp_capture_idx.partition_point(|&j| j < i);
                     let guide = self.build_guide(i, upto, current);
                     match sample_opp_move(
                         &mut pos,
@@ -1337,6 +1360,7 @@ impl Estimator {
                         *my_foul_count,
                         &self.my_capture_sq[..k],
                         &self.my_touched_sq[..t],
+                        &self.opp_capture_sq[..r],
                         &guide,
                         belief.as_ref().filter(|_| i >= belief_from).map(|b| (b, guide_w)),
                         &mut self.rng,
@@ -1687,6 +1711,7 @@ impl Estimator {
                     // この時点までに自分が駒を取ったマス／触れたマス
                     let k = self.my_capture_idx.partition_point(|&j| j < i);
                     let t = self.my_touched_idx.partition_point(|&j| j < i);
+                    let r = self.opp_capture_idx.partition_point(|&j| j < i);
                     let guide = self.build_guide(i, n, None);
                     match sample_opp_move(
                         &mut pos,
@@ -1697,6 +1722,7 @@ impl Estimator {
                         *my_foul_count,
                         &self.my_capture_sq[..k],
                         &self.my_touched_sq[..t],
+                        &self.opp_capture_sq[..r],
                         &guide,
                         belief.as_ref().filter(|_| i >= belief_from).map(|b| (b, guide_w)),
                         &mut self.rng,
@@ -2371,6 +2397,9 @@ fn newly_threatens(pos: &Position, next: &Position, mv: &ShogiMove, targets: &[C
 /// - known_squares: 自分が駒を取ったマス（相手は自駒がそこで死んだことを知っている）
 /// - my_touched: 自分の手が触れたマス（初期配置のまま動いていない自駒の判定用。
 ///   相手はそれらを推論で狙ってくる = 飛車頭への歩打ち等）
+/// - opp_revealed: 相手が自駒を取ったマス（この決定点より前のもの）。粒子上で
+///   そこに相手の歩が立っていれば「露見歩」= 意図を持って前進してきた駒
+///   （`opp_pawn_intent_factor`）
 /// - guide: 制約後読みガイド（若返り・リプレイ用）。該当手を GUIDE_BOOST 倍した
 ///   提案分布から選ぶ。マスクはしない（成功しうる素の経路を提案の台から消すと
 ///   補正が定義できない）
@@ -2384,6 +2413,7 @@ fn sample_opp_move(
     my_foul_count_last_turn: u32,
     known_squares: &[Coord],
     my_touched: &[Coord],
+    opp_revealed: &[Coord],
     guide: &Guide,
     belief: Option<(&BeliefPrior, f64)>,
     rng: &mut StdRng,
@@ -2392,6 +2422,7 @@ fn sample_opp_move(
     if pos.turn() != opp {
         return None;
     }
+    let intent = opp_pawn_intent_w();
     // 初期配置から動いていない自駒のマス（粒子内の実配置と突き合わせる）
     let initial = Position::initial();
     let homes: Vec<Coord> = initial
@@ -2460,7 +2491,8 @@ fn sample_opp_move(
             my_foul_count_last_turn,
             moved_from_known_attacked(pos, &mv, opp, known_squares),
             checks_me,
-        ) * capture_reveal_factor(pos, &mv, opp, reveal_w);
+        ) * capture_reveal_factor(pos, &mv, opp, reveal_w)
+            * opp_pawn_intent_factor(pos, &mv, opp, opp_revealed, &intent);
         // **王手の説明としての打ちの補正**（2026-08-20、arena-check-foul02 が
         // 発端。ユーザー指摘「6三桂打には と金の紐がある」で hang 犯人説が
         // 崩れ、真因は is_drop の基礎ペナルティと判明）: opp_move NN には
@@ -2653,6 +2685,115 @@ fn check_drop_target() -> f64 {
 
 /// 動的ブーストの倍率上限（過小シェアの局面でも青天井にしない）
 const CHECK_DROP_TARGET_MAX_BOOST: f64 = 8.0;
+
+/// **露見歩の継続前進**の事前補正（2026-08-22、quest_0809 36手目の 2三玉が発端）。
+/// opp_move NN は歩の前進を `hang_minor`（相手の利きがあるマスへの紐なし着地）で
+/// 割り引くが、「その歩は捕獲で位置が露見している＝意図を持って動いている駒」
+/// という情報は特徴量に無く、`bin/pawn_push_probe`（対人83局・4.2万行）で
+/// 系統的な過小が出た（即時前進率 vs NN 質量）:
+/// - 露見歩（そこで駒を取った）: 12.7% vs 6.9%（人間の手番 14.6% vs 5.0% = 2.9倍）
+/// - 次の1手で成れる歩: 49.4% vs 26.3%（4手以内 80.5%）
+/// - 飛の真後ろにいる歩: 28.3% vs 14.7%（露見なら 46.7% vs 24.7%）
+/// - 香の真後ろは逆に低い（露見 2.4% vs 4.2%）ので補正しない
+/// 36手目の後手粒子は「1五で取った歩が 1四→1三成」の世界線に 2.0% しか
+/// 置いておらず（人間は未説明2手＝最短手数ちょうどで五分と見る）、
+/// 2三玉（玉プローブ）の価値がそもそも立たない。
+///
+/// 3係数を歩の前進（Board かつ動かす駒が歩）の素の重みに掛ける（opp_capture_reveal_w
+/// と同じ標本化側の事前補正。応手予測 opp_reply_weights には掛けない）:
+/// `TSUITATE_OPP_PAWN_REVEALED_W`（露見マスに立つ歩の前進）・
+/// `TSUITATE_OPP_PAWN_PROMO_W`（成る歩）・`TSUITATE_OPP_PAWN_ROOK_FRONT_W`
+/// （飛・龍の真後ろ＝間が空き）。既定はすべて 1.0 = 従来挙動。凍結版は知らない
+struct OppPawnIntentW {
+    revealed: f64,
+    promo: f64,
+    rook_front: f64,
+}
+
+impl OppPawnIntentW {
+    fn is_noop(&self) -> bool {
+        self.revealed == 1.0 && self.promo == 1.0 && self.rook_front == 1.0
+    }
+}
+
+fn opp_pawn_intent_w() -> OppPawnIntentW {
+    static W: std::sync::OnceLock<(f64, f64, f64)> = std::sync::OnceLock::new();
+    let read = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(1.0)
+    };
+    let (revealed, promo, rook_front) = *W.get_or_init(|| {
+        (
+            read("TSUITATE_OPP_PAWN_REVEALED_W"),
+            read("TSUITATE_OPP_PAWN_PROMO_W"),
+            read("TSUITATE_OPP_PAWN_ROOK_FRONT_W"),
+        )
+    });
+    OppPawnIntentW {
+        revealed,
+        promo,
+        rook_front,
+    }
+}
+
+/// `mv` が相手（opp）の歩の前進なら、該当する係数の積を返す（それ以外は 1.0）
+fn opp_pawn_intent_factor(
+    pos: &Position,
+    mv: &ShogiMove,
+    opp: Color,
+    opp_revealed: &[Coord],
+    w: &OppPawnIntentW,
+) -> f64 {
+    if w.is_noop() {
+        return 1.0;
+    }
+    let ShogiMove::Board { from, promote, .. } = *mv else {
+        return 1.0;
+    };
+    if !pos.piece_at(from).is_some_and(|p| p.color == opp && p.role == Role::Pawn) {
+        return 1.0;
+    }
+    let mut f = 1.0;
+    // 露見歩の同定は**二歩の規則**で筋ごとに行う: 相手が (file, r0) で自駒を取り、
+    // 今その筋の r0 以遠（相手から見て前方）に相手の未成の歩がいるなら、それは
+    // 同じ歩（同じ筋に未成の歩は1枚しか居られない。取られて打ち直された場合だけ
+    // 例外で、稀）。マス一致だけだと 1五で取った歩が 1四へ進んだ瞬間に
+    // 「露見」が外れ、人間の「あの歩が来ている」という推論と食い違う
+    let forward = |a: Coord, b: Coord| match opp {
+        Color::Sente => a.rank <= b.rank,
+        Color::Gote => a.rank >= b.rank,
+    };
+    if opp_revealed
+        .iter()
+        .any(|&s| s.file == from.file && forward(from, s))
+    {
+        f *= w.revealed;
+    }
+    if promote {
+        f *= w.promo;
+    }
+    if w.rook_front != 1.0 {
+        // 真後ろの直線（間は空き）に自分（opp）の飛・龍がいるか
+        let dr: i8 = match opp {
+            Color::Sente => 1,
+            Color::Gote => -1,
+        };
+        let mut r = from.rank + dr;
+        while (1..=9).contains(&r) {
+            if let Some(p) = pos.piece_at(Coord { file: from.file, rank: r }) {
+                if p.color == opp && matches!(p.role, Role::Rook | Role::Dragon) {
+                    f *= w.rook_front;
+                }
+                break;
+            }
+            r += dr;
+        }
+    }
+    f
+}
 
 fn capture_reveal_cost_w() -> f64 {
     std::env::var("TSUITATE_OPP_CAPTURE_REVEAL_W")
@@ -4005,6 +4146,7 @@ mod tests {
                 0,
                 &[],
                 &[],
+                &[],
                 &Guide::default(),
                 None,
                 &mut rng,
@@ -4033,6 +4175,7 @@ mod tests {
                 Some(false),
                 0,
                 0,
+                &[],
                 &[],
                 &[],
                 &wanted,
@@ -4091,6 +4234,7 @@ mod tests {
                 0,
                 &[],
                 &[],
+                &[],
                 &Guide::default(),
                 None,
                 &mut rng,
@@ -4113,6 +4257,7 @@ mod tests {
                 Some(false),
                 0,
                 0,
+                &[],
                 &[],
                 &[],
                 &Guide::default(),

@@ -59,7 +59,13 @@
 3. **同期**: `python3 scripts/quest_review/sync_eval.py [evalパス]`
    シナリオの `scores=`（採点全量）と `bad=`（**2点以下**）を更新する。
    反則後ブロックとシナリオの対応は `scripts/quest_review/foul_blocks.py` の
-   FOUL_MAP に登録する（sync_eval / append_unscored / rerank_eval の共有表）
+   FOUL_MAP に登録する（sync_eval / append_unscored / rerank_eval の共有表）。
+   **表は棋譜（eval）ごと**で、eval 名 → シナリオ名プレフィックスの対応
+   `PREFIX_BY_EVAL`（quest_20260731 → quest31-m、quest_0809 → quest0809-m）から
+   引く。未登録の eval へ掛けるとエラーで止まる（別棋譜の同じ手目の
+   シナリオを上書きしないため）。新しい棋譜を始めるときは PREFIX_BY_EVAL に
+   1行足し、最初のシナリオ群は `eval_to_scenarios.py <eval> <archive の元棋譜>
+   <プレフィックス> <開始> <終了>` で生成する
 4. **計測**: `bin/scenario` が不合格計と並べて「平均得点 x.xx/10」を表示。
    SPSA は `TUNE_OBJECTIVE=scenario_score`（score = 平均得点/10 の
    シナリオ平均。試行シードは 0..trials の固定列で f+/f− は共通乱数ペア）
