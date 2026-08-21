@@ -2361,10 +2361,11 @@ fn gen_nonpromote() -> bool {
     *V.get_or_init(|| std::env::var("TSUITATE_GEN_NONPROMOTE").is_ok_and(|v| v == "1"))
 }
 
-/// 成る手の取られリスクを**成る前の駒価値**で数えるか（既定は無効 =
-/// 成った後の駒種で数える。`TSUITATE_PROMO_RISK_PREROLE=1` で有効。
-/// 2026-08-09 に採否保留・既定0で確定）。
-/// 凍結版はこの名前を知らない。
+/// 成る手の取られリスクを**成る前の駒価値**で数えるか（**既定 on** =
+/// 2026-08-21 採用。`TSUITATE_PROMO_RISK_PREROLE=0` で従来挙動 = 切り戻しノブ。
+/// 2026-08-09 の保留は GEN_NONPROMOTE 込みの計測で、単体+capture_retreat の
+/// 2点は suite 1008→939 / 5.293→5.531・アリーナ対照同等以上で採用）。
+/// **v14 はこの名前を読む**（v13 以前は知らない）。
 ///
 /// GEN_NONPROMOTE の初回計測（2026-08-08）で露呈した歪みへの対応:
 /// 4七歩成（quest31-m016/018/020/024/026/028 の本命・従来20/20）が不成の
@@ -2376,12 +2377,15 @@ fn gen_nonpromote() -> bool {
 /// 成りの付加価値は生き残った分岐（threat / promo 実現）でだけ実現させる
 fn promo_risk_prerole() -> bool {
     static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_PROMO_RISK_PREROLE").is_ok_and(|v| v == "1"))
+    // 2026-08-21 に既定 on で採用（env "0" で切り戻し）。quest31 4七歩成
+    // クラスタの「幻の threat 加点 × 過大リスクの相殺」を剥がして本来の価値
+    //（歩取り＋と金、リスクは歩価格）で立たせる。capture_retreat_w=0.08 が対
+    //（m024「取って逃げる」回帰を塞ぐ）。確定計測は CLAUDE.md 参照
+    *V.get_or_init(|| std::env::var("TSUITATE_PROMO_RISK_PREROLE").map_or(true, |v| v == "1"))
 }
 
-/// 捕獲直後の手戻り免除・退避加点（`TSUITATE_CAPTURE_RETREAT_W`、既定 0。
-/// GEN_NONPROMOTE+PREROLE コンボ計測時の作業点は 0.08。m024 の rank 差
-/// 0.43 が残ったため env 作業点は 0.16）。
+/// 捕獲直後の手戻り免除・退避加点（`TSUITATE_CAPTURE_RETREAT_W`、
+/// **既定 0.08** = 2026-08-21 に PREROLE と対で採用。`0` で従来挙動）。
 ///
 /// 直前に受理された手が**駒を取った移動**で、今手がその厳密な逆（from/to 入替）
 /// かつ**不成**なら「取って逃げる」なので `backtrack_penalty` を免除し、
@@ -2390,7 +2394,7 @@ fn promo_risk_prerole() -> bool {
 /// 成りを除外する理由: 捕獲→成り返り（例: 3二角成）は退避でなく再突入で、
 /// 加点すると quest31-m087/m089 の 4a3b+（0点）が銀不成を押しのける
 /// （実測: w=0.08 で両シナリオ 5.6→0）。発端 m024 の 3b4b は不成。
-/// 粒子不要（観測の captured のみ）。凍結版はこの名前を知らない。
+/// 粒子不要（観測の captured のみ）。**v14 はこの名前を読む**（v13 以前は知らない）。
 fn capture_retreat_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -2402,8 +2406,8 @@ fn capture_retreat_w() -> f64 {
     })
 }
 
-/// 捕獲直後の手戻り免除。既定 0（env 作業点は 0.16）。
-const CAPTURE_RETREAT_W: f64 = 0.0;
+/// 捕獲直後の手戻り免除。2026-08-21 に既定 0.08 で採用（PREROLE の対）。
+const CAPTURE_RETREAT_W: f64 = 0.08;
 
 /// V1（利き数）のノブ。**既定は両方 無効**（＝従来の二値の利き判定）。
 ///
@@ -11734,13 +11738,13 @@ pub(crate) mod tests {
         );
     }
 
-    /// 捕獲直後の手戻り免除ノブは既定 0 = 無効（作業点 0.08 は env で有効化）。
+    /// 捕獲直後の手戻り免除ノブの既定は定数と一致する（2026-08-21 採用: 0.08）。
     #[test]
     fn capture_retreat_w_default_off() {
         let w = std::env::var("TSUITATE_CAPTURE_RETREAT_W").ok();
         if w.is_none() {
             assert!((capture_retreat_w() - CAPTURE_RETREAT_W).abs() < 1e-12);
-            assert_eq!(CAPTURE_RETREAT_W, 0.0);
+            assert_eq!(CAPTURE_RETREAT_W, 0.08);
         }
     }
 
@@ -12243,13 +12247,14 @@ pub(crate) mod tests {
         }
     }
 
+    /// GEN は既定 off のまま。PREROLE は 2026-08-21 に既定 on で採用。
     #[test]
     fn gen_nonpromote_and_prerole_default_off() {
         if std::env::var("TSUITATE_GEN_NONPROMOTE").is_err() {
             assert!(!gen_nonpromote());
         }
         if std::env::var("TSUITATE_PROMO_RISK_PREROLE").is_err() {
-            assert!(!promo_risk_prerole());
+            assert!(promo_risk_prerole());
         }
     }
 

@@ -1,4 +1,4 @@
-*scenario ply=81 fouls=5d6d,5d4e,4c4d,7b6c,5d5c,6e6d target=5d6c desc=アリーナ自己対局 1787112448805-arena-39 の82手目（bot=Gote）: 被王手（王手駒 4fKnight）で反則 6 回（5d6d 5d4e 4c4d 7b6c 5d5c 6e6d）のあと 5d6c を指した。K=2｜反則後サブ状態 f6（5d6d 5d4e 4c4d 7b6c 5d5c 6e6d の反則後）
+*scenario ply=81 fouls=5d6d,5d4e,4c4d,7b6c,5d5c,6e6d target=5d6c scores=5d4d:2,5d6c:10,3g3f:0,5a5c:0,3g2g:0,P*3f:0,6a5b:0,4a5b:0,5a5b:0,9c9d:0,7c7d:0,8c8d:0,6e6f:0,2c2d:0,5e5f:0 bad=5d4d,3g3f,5a5c,3g2g,P*3f,6a5b,4a5b,5a5b,9c9d,7c7d,8c8d,6e6f,2c2d,5e5f desc=アリーナ自己対局 1787112448805-arena-39 の82手目（bot=Gote）: 被王手（王手駒 4fKnight）で反則 6 回（5d6d 5d4e 4c4d 7b6c 5d5c 6e6d）のあと 5d6c を指した。K=2｜反則後サブ状態 f6（5d6d 5d4e 4c4d 7b6c 5d5c 6e6d の反則後）
 棋戦：arena
 手合割：平手
 先手：先手
