@@ -226,7 +226,7 @@ fn bench_legal_moves(pos: &Position) -> f64 {
 }
 
 fn bench_opp_move_nn() -> f64 {
-    let f = [0.3f64; 25];
+    let f = [0.3f64; 26];
     let reps = 200_000;
     let started = Instant::now();
     let mut sink = 0.0;
