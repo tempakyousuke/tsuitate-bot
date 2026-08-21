@@ -5784,11 +5784,22 @@ impl Strategy for EstimatorStrategy {
         let hand_option: Option<HandOption> =
             (params.hand_option_w != 0.0 && !view.you_in_check).then(|| hand_option_context(view));
 
+        // 未裏付け大駒への新規 threat の鮮度（`stale_threat_w`）。1.0 = 減衰なし
+        let stale_freshness = {
+            let w = stale_threat_w();
+            if w > 0.0 {
+                let u = unaccounted_opp_moves(log);
+                (1.0 - w) + w * 0.8f64.powi(u.min(60) as i32)
+            } else {
+                1.0
+            }
+        };
         // 相手駒の占有が観測で裏付けられたマス（`material_degen_q0` の
         // 「裏付け無し捕獲だけ縮める」ゲート／`hand_asset_w` の仕事判定／
-        // `own_zone_capture_w` の裏付け係数。決定点ごとに1回）
+        // `own_zone_capture_w` の裏付け係数／`stale_threat_w`。決定点ごとに1回）
         let opp_occ_backed = (params.material_degen_q0 > 0.0
             || params.own_zone_capture_w > 0.0
+            || stale_threat_w() > 0.0
             || hand_asset_w() > 0.0
             || promote_far_w() > 0.0
             || unbacked_camp_w() > 0.0
@@ -5967,6 +5978,7 @@ impl Strategy for EstimatorStrategy {
                 &own_attack,
                 &contested_squares,
                 opp_occ_backed.as_ref(),
+                stale_freshness,
                 hand_asset_kings.as_ref(),
                 king_threats.as_ref(),
                 belief_occ_board.as_ref(),
@@ -7172,6 +7184,43 @@ fn check_foul_prior_boost() -> f64 {
     })
 }
 
+/// **未裏付け大駒への新規 threat の鮮度減衰**（`TSUITATE_STALE_THREAT_W`、
+/// 既定 0 = 無効。2026-08-21、codex 設計相談。quest31 の P*2f/P*2g 濫発が発端 =
+/// ユーザー指摘「もう飛車は動かされてる可能性が高い」）。
+/// threat_value の対象が飛角（成り込み）で、その現在マスが観測裏付け
+/// （opp_occupancy_evidence）に無いとき、**着手で新たに増えた threat 増分だけ**を
+/// freshness = (1−w) + w×0.8^未説明手数 で薄める。既存 threat の基準値・
+/// 裏付けありの大駒・小駒は満額のまま（blind_home の失敗 = 安全方向の
+/// 課税による合法悪手への押し出し、とは介入面が違う: これは「根拠の古い
+/// 成功報酬を満額払わない」）。凍結版はこの名前を知らない
+fn stale_threat_w() -> f64 {
+    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *W.get_or_init(|| {
+        std::env::var("TSUITATE_STALE_THREAT_W")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &f64| v.is_finite() && (0.0..=1.0).contains(v))
+            .unwrap_or(0.0)
+    })
+}
+
+/// 未説明の相手手数（捕獲観測のない OpponentMoved の数 = その駒が動けた機会）。
+/// check.rs の KNOWN_STAY_PER_UNACC と同じ尺度
+fn unaccounted_opp_moves(log: &ObservationLog) -> u32 {
+    log.events()
+        .iter()
+        .filter(|e| {
+            matches!(
+                e,
+                Observation::OpponentMoved {
+                    captured_my_piece_at: None,
+                    ..
+                }
+            )
+        })
+        .count() as u32
+}
+
 fn blind_recapture_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
@@ -8343,6 +8392,8 @@ fn evaluate(
     // 相手駒の占有が観測で裏付けられたマス（`material_degen_q0` /
     // `hand_asset_w`）。None ならノブ無効時（choose が渡さない）
     opp_occ_backed: Option<&[bool; 81]>,
+    // 未裏付け大駒への新規 threat の鮮度（`stale_threat_w`。1.0 = 減衰なし）
+    stale_freshness: f64,
     // 持ち駒資産損（`hand_asset_w`）の玉候補。Some のときだけ項が有効
     // （choose が「w≠0・王手中でない」のゲートを掛けて渡す）
     hand_asset_kings: Option<&std::collections::BTreeSet<Coord>>,
@@ -8619,7 +8670,12 @@ fn evaluate(
 
         // 自分が敵駒に当たりを付けている価値（露出リスクの鏡像）。
         // 1手読みでは見えない「次の駒得」を作る手（大駒の頭への歩打ち等）に価値を与える
-        v += params.threat_w * threat_value(&next, me);
+        v += params.threat_w
+            * if stale_freshness < 1.0 {
+                threat_value_stale(pos, &next, me, opp_occ_backed, stale_freshness)
+            } else {
+                threat_value(&next, me)
+            };
 
         // 王の安全度と攻撃圧力（利き走査が重いので少数の粒子でだけ測って平均する）
         if pressure_n < pressure_samples {
@@ -9811,6 +9867,63 @@ fn big_home_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
 /// （取りの準備）に一切の価値が付かず、単独駒での投機的な捕獲にしか勝ち目がない
 /// （quest31-m021: 4一の金（と信じている駒）へ3二とで利きを足す手が、
 /// 単騎の 4一と に 2.2 点負ける）
+/// threat_value の**鮮度減衰版**（`stale_threat_w` 有効時のみ。doc は
+/// stale_threat_w 参照）。対象駒ごとに「着手で新たに増えた threat 増分」
+/// created = max(0, after − before) を計算し、対象が**観測裏付けのない
+/// 飛角（成駒込み）**のときだけ effective = after − (1−freshness)×created と
+/// する。既存 threat の基準値は沈めない・当たりを外す手を免税しない・
+/// 全候補の gain を負側へ平行移動しない（threat-value-delta の失敗回避）
+fn threat_value_stale(
+    pos: &Position,
+    next: &Position,
+    me: Color,
+    backed: Option<&[bool; 81]>,
+    freshness: f64,
+) -> f64 {
+    let opp = me.other();
+    let by_count = threat_by_count();
+    let gain_on = |b: &Position, sq: Coord, role: Role| -> f64 {
+        if !b.is_attacked(sq, me) {
+            return 0.0;
+        }
+        let defended = if by_count {
+            b.attack_count(sq, opp) >= b.attack_count(sq, me)
+        } else {
+            b.is_attacked(sq, opp)
+        };
+        exchange_value(role) * if defended { 0.45 } else { 1.0 }
+    };
+    let mut best = 0.0f64;
+    for (sq, piece) in next.pieces() {
+        if piece.color != opp || piece.role == Role::King {
+            continue;
+        }
+        let after = gain_on(next, sq, piece.role);
+        if after <= 0.0 {
+            continue;
+        }
+        let is_major = matches!(unpromote_role(piece.role), Role::Rook | Role::Bishop);
+        let backed_here = backed.is_some_and(|b| b[crate::belief_features::sq_index(sq)]);
+        let eff = if is_major && !backed_here {
+            // 相手駒は自分の着手中は動かないので、同じマスの同じ駒が before
+            let before = if pos
+                .piece_at(sq)
+                .is_some_and(|p| p.color == opp && p.role == piece.role)
+            {
+                gain_on(pos, sq, piece.role)
+            } else {
+                0.0
+            };
+            let created = (after - before).max(0.0);
+            after - (1.0 - freshness) * created
+        } else {
+            after
+        };
+        best = best.max(eff);
+    }
+    best
+}
+
 fn threat_value(pos: &Position, me: Color) -> f64 {
     let opp = me.other();
     let by_count = threat_by_count();
