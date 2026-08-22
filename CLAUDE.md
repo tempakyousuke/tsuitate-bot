@@ -289,8 +289,15 @@
     分割して並列に解き、`collect` ジョブが `sourceId`（盤面の署名）で重複を
     落として1つの取り込みJSONにまとめる。ソルバーは `tempakyousuke/tsuitate-solver`
     を checkout して `--no-default-features`（GUI 依存なし）でビルドする。
-    成果物は artifact `tsume-puzzles` の `tsume-puzzles.json` で、サイトの
-    `/admin/tsume-challenge` に貼り付けて取り込む
+    成果物は artifact `tsume-puzzles` の `tsume-puzzles.json`。
+    **毎日 09:00 UTC（18:00 JST）に自動実行される**（既定は自己対局160局＝実測
+    0.62問/局 で概ね100問/日）。取り込みは**サイト側の日次 cron が artifact を
+    取りにくる**（tsuitate の `docs/operations.md`「詰めチャレ問題の日次取り込み」）
+    ので、このワークフローは artifact を置くところまで。手で確認したいときは
+    artifact を落として `/admin/tsume-challenge` に貼り付ければ同じ経路を通る。
+    **schedule では `workflow_dispatch` の `default:` が効かない**（`inputs.*` が
+    空文字になる）ため、実効値はワークフロー冒頭の `env` ブロックで決めている。
+    パラメータを足すときは `inputs` と `env` の両方に足すこと
   - `timeout_secs` は「実行時間」と「長手数の問題が採れるか」のトレードオフ。
     ほとんどの候補は詰みなしと一瞬で分かるが、**詰みのある長手数の問題ほど時間を食う**。
     実測（59局を4分割）: 20秒だと11〜15手詰の4問を取り逃して 34問→30問になった。

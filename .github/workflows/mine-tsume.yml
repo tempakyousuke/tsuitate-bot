@@ -3,11 +3,19 @@ name: Mine tsume
 # 自己対局の棋譜から「詰めチャレ」（サイト tsuitate の /tsume-challenge）の
 # 問題を掘り、取り込みJSONを artifact として出す。
 #
+# 毎日 09:00 UTC（18:00 JST）に自動実行される。既定は自己対局160局からの採掘で、
+# 実測 0.62問/局 なので概ね100問/日。**取り込みはサイト側の日次 cron が artifact を
+# 取りにくる**（tsuitate の docs/operations.md）ので、ここは artifact を置くだけ。
+#
 # 入力は2通り:
 #   1. arena_run_id を指定 … 既存の Arena 実行の `arena-records-*` を使う
 #      （強さの検証で回したついでの棋譜を再利用する。追加の対局コストゼロ）
 #   2. arena_run_id が空 … このワークフローが自分で自己対局してから掘る
-#      （問題を増やすことだけが目的のとき）
+#      （問題を増やすことだけが目的のとき。schedule 実行はこちら）
+#
+# **schedule では workflow_dispatch の default: が効かない**（inputs.* が空文字に
+# なる）ので、実効値は下の env ブロックで決めている。パラメータを足すときは
+# inputs と env の両方に足すこと。
 #
 # 採掘はソルバー（tsuitate-solver）を1問ずつ spawn するので対局より重い。
 # 「棋譜の分割 → 並列採掘 → 統合」の3段に分けてある（arena.yml と同じ流儀）。
@@ -17,9 +25,13 @@ name: Mine tsume
 # 実測（2026-08-20、59局）: 20秒だと11〜15手詰の4問を取り逃し、34問→30問になった。
 # 難しい問題ほど詰めチャレでは価値が高いので、既定は余裕を持たせてある。
 #
-# 出来上がった tsume-puzzles.json を artifact から落として、サイトの
-# /admin/tsume-challenge に貼り付ければ取り込める。
+# 手で確認したいときは、出来上がった tsume-puzzles.json を artifact から落として
+# サイトの /admin/tsume-challenge に貼り付ければよい（日次 cron と同じ経路を通る）。
 on:
+  # 毎日の自動採掘。成果物は artifact に置くだけで、本番への取り込みは
+  # サーバー側の日次 cron が拾う（tsuitate の docs/operations.md）
+  schedule:
+    - cron: "0 9 * * *" # 09:00 UTC = 18:00 JST
   workflow_dispatch:
     inputs:
       arena_run_id:
@@ -87,6 +99,27 @@ on:
         required: false
         default: "main"
 
+# schedule では workflow_dispatch の default: が効かず inputs.* は空文字になる。
+# 実効値をここで1か所に決め、以降のジョブは env.* を読む
+# （job レベルの if: だけは env を参照できないので inputs.arena_run_id のまま。
+#  schedule では空＝自己対局、という意図どおりの分岐になる）。
+env:
+  GAMES: ${{ inputs.games || '160' }}
+  CANDIDATE: ${{ inputs.candidate || 'estimator' }}
+  BASELINE: ${{ inputs.baseline || 'estimator_v14' }}
+  CLOCK: ${{ inputs.clock || '300+3' }}
+  SELFPLAY_SHARDS: ${{ inputs.selfplay_shards || '8' }}
+  MINE_SHARDS: ${{ inputs.mine_shards || '4' }}
+  SKIP_PLIES: ${{ inputs.skip_plies || '40' }}
+  MIN_DEPTH: ${{ inputs.min_depth || '3' }}
+  MAX_DEPTH: ${{ inputs.max_depth || '15' }}
+  TIMEOUT_SECS: ${{ inputs.timeout_secs || '60' }}
+  MEMORY_LIMIT_MB: ${{ inputs.memory_limit_mb || '2000' }}
+  MAX_CANDIDATES: ${{ inputs.max_candidates || '0' }}
+  ALLOW_SECOND: ${{ inputs.allow_second || 'false' }}
+  SOURCE: ${{ inputs.source || 'selfplay' }}
+  SOLVER_REF: ${{ inputs.solver_ref || 'main' }}
+
 permissions:
   contents: read
   # 別の実行の artifact を落とすのに必要
@@ -102,9 +135,9 @@ jobs:
     steps:
       - id: split
         env:
-          GAMES: ${{ inputs.games }}
-          SELFPLAY_SHARDS: ${{ inputs.selfplay_shards }}
-          MINE_SHARDS: ${{ inputs.mine_shards }}
+          GAMES: ${{ env.GAMES }}
+          SELFPLAY_SHARDS: ${{ env.SELFPLAY_SHARDS }}
+          MINE_SHARDS: ${{ env.MINE_SHARDS }}
         run: |
           set -euo pipefail
           per=$(( (GAMES + SELFPLAY_SHARDS - 1) / SELFPLAY_SHARDS ))
@@ -132,7 +165,7 @@ jobs:
       - name: Run selfplay shard
         env:
           ARENA_RECORD_DIR: arena-records
-          ARENA_CLOCK: ${{ inputs.clock }}
+          ARENA_CLOCK: ${{ env.CLOCK }}
         run: |
           set -euo pipefail
           case "$ARENA_CLOCK" in
@@ -144,8 +177,8 @@ jobs:
           esac
           cargo run --release --bin arena -- \
             "${{ needs.plan.outputs.games_per_shard }}" \
-            "${{ inputs.candidate }}" \
-            "${{ inputs.baseline }}"
+            "${{ env.CANDIDATE }}" \
+            "${{ env.BASELINE }}"
 
       # arena.yml と同じ名前にしておく（採掘側はどちらの出どころでも同じ扱いで拾える）
       - name: Upload game records
@@ -172,7 +205,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: tempakyousuke/tsuitate-solver
-          ref: ${{ inputs.solver_ref }}
+          ref: ${{ env.SOLVER_REF }}
           path: solver
 
       - uses: dtolnay/rust-toolchain@stable
@@ -212,14 +245,14 @@ jobs:
       - name: Mine shard
         env:
           SHARD: ${{ matrix.shard }}
-          MINE_SHARDS: ${{ inputs.mine_shards }}
+          MINE_SHARDS: ${{ env.MINE_SHARDS }}
         run: |
           set -euo pipefail
           shopt -s nullglob globstar
           files=(records-in/**/*.jsonl)
           if [ ${#files[@]} -eq 0 ]; then
             echo "棋譜が1件もありません（オラクル有効の Arena 実行は記録を出しません）" >&2
-            echo '{"source":"${{ inputs.source }}","puzzles":[]}' > tsume-shard.json
+            echo '{"source":"${{ env.SOURCE }}","puzzles":[]}' > tsume-shard.json
             exit 0
           fi
           # パスでソートしてから N 個おきに取る（シャード間で重複しない決定的な分割）
@@ -230,20 +263,20 @@ jobs:
           done
           echo "このシャードの棋譜: ${#mine[@]} / ${#sorted[@]} 局"
           if [ ${#mine[@]} -eq 0 ]; then
-            echo '{"source":"${{ inputs.source }}","puzzles":[]}' > tsume-shard.json
+            echo '{"source":"${{ env.SOURCE }}","puzzles":[]}' > tsume-shard.json
             exit 0
           fi
           allow_second=""
-          if [ "${{ inputs.allow_second }}" = "true" ]; then allow_second="--allow-second"; fi
+          if [ "${{ env.ALLOW_SECOND }}" = "true" ]; then allow_second="--allow-second"; fi
           ./target/release/mine_tsume "${mine[@]}" \
             --solver solver/src-tauri/target/release/tsuitate-solver-cli \
-            --source "${{ inputs.source }}" \
-            --skip-plies "${{ inputs.skip_plies }}" \
-            --min-depth "${{ inputs.min_depth }}" \
-            --max-depth "${{ inputs.max_depth }}" \
-            --timeout-secs "${{ inputs.timeout_secs }}" \
-            --memory-limit-mb "${{ inputs.memory_limit_mb }}" \
-            --max-candidates "${{ inputs.max_candidates }}" \
+            --source "${{ env.SOURCE }}" \
+            --skip-plies "${{ env.SKIP_PLIES }}" \
+            --min-depth "${{ env.MIN_DEPTH }}" \
+            --max-depth "${{ env.MAX_DEPTH }}" \
+            --timeout-secs "${{ env.TIMEOUT_SECS }}" \
+            --memory-limit-mb "${{ env.MEMORY_LIMIT_MB }}" \
+            --max-candidates "${{ env.MAX_CANDIDATES }}" \
             --jobs "$(nproc)" \
             $allow_second \
             --out tsume-shard.json
@@ -276,12 +309,12 @@ jobs:
           parts=(shards/*/tsume-shard.json)
           if [ ${#parts[@]} -eq 0 ]; then
             echo "採掘結果の artifact が1つもありません" >&2
-            echo '{"source":"${{ inputs.source }}","puzzles":[]}' > tsume-puzzles.json
+            echo '{"source":"${{ env.SOURCE }}","puzzles":[]}' > tsume-puzzles.json
             echo "## 採掘結果: 0問（シャードの出力なし）" >> "$GITHUB_STEP_SUMMARY"
             exit 0
           fi
           # シャードをまたぐ重複は sourceId（盤面の署名）で落とす
-          jq -s --arg source "${{ inputs.source }}" '
+          jq -s --arg source "${{ env.SOURCE }}" '
             { source: $source,
               puzzles: (map(.puzzles) | add | unique_by(.sourceId)) }
           ' "${parts[@]}" > tsume-puzzles.json
