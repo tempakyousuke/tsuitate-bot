@@ -386,6 +386,9 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
     let mut cover_tally: Vec<[f64; 4]> = vec![[0.0; 4]; diag_sqs.len()];
     // マスごとの「そこにいる相手駒の駒種」の重み質量（捕獲期待値の内訳）
     let mut occ_tally: Vec<HashMap<String, f64>> = vec![HashMap::new(); diag_sqs.len()];
+    /// 由来タグの集計（`shogi::Anchors`。`TSUITATE_KING_PROBE_W` 等が 0 なら
+    /// 追跡自体しないので「裏付けなし 100%」になる）
+    let mut anchor_tally: Vec<HashMap<String, f64>> = vec![HashMap::new(); diag_sqs.len()];
     // 同（taint 粒子。厳密が全滅した決定点ではこちらが評価の実体になる）
     let mut taint_occ_tally: Vec<HashMap<String, f64>> = vec![HashMap::new(); diag_sqs.len()];
     // taint 粒子だけでの同集計（strategy.rs の taint_particles/taint_square_coverage
@@ -491,6 +494,14 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
                     None => "空".to_string(),
                 };
                 *occ_tally[i].entry(key).or_insert(0.0) += w;
+                // **由来タグ**（`shogi::Anchors`）: そのマスの駒が観測に
+                // 裏付けられているか（age = 観測確定後の未観測な移動回数）。
+                // プローブ系の項が幻でなく本物に反応しているかの直接測定
+                let akey = match pp.anchors().age_at(*sq) {
+                    Some(age) => format!("age{age}"),
+                    None => "裏付けなし".to_string(),
+                };
+                *anchor_tally[i].entry(akey).or_insert(0.0) += w;
             }
         }
         // taint 粒子だけの被覆度集計（strategy.rs の taint_particles/
@@ -643,6 +654,17 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
                 "{name} の駒種ビリーフ（厳密粒子。真実={truth_occ}）: {}",
                 show_occ(&occ_tally[i], strict_mass)
             );
+            let backed: f64 = anchor_tally[i]
+                .iter()
+                .filter(|(k, _)| *k != "裏付けなし")
+                .map(|(_, v)| v)
+                .sum();
+            if backed > 0.0 {
+                println!(
+                    "{name} の由来タグ（観測に裏付けられた駒か。age=観測確定後の未観測な移動回数）: {}",
+                    show_occ(&anchor_tally[i], strict_mass)
+                );
+            }
         }
         if taint_cover_mass > 0.0 {
             println!(

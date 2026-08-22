@@ -3027,6 +3027,17 @@ fn sample_opp_move_split(
     let guide_mass: f64 = candidates.iter().map(|(_, _, g)| g).sum();
     let (chosen, w_c, g_c) = &candidates[idx];
     pos.play_unchecked(chosen);
+    // **由来タグ**（`shogi::Anchors`）: 「S で自駒が取られた」という観測は、
+    // 相手駒が今 S にいることを確定させる（全粒子で一致する唯一の位置情報）。
+    // 以後この駒が動くたびに play_unchecked が age を1つ進めるので、
+    // 「観測から何回の推測を経た位置か」が粒子ごとに追跡できる
+    // 消費者（プローブ系）がいるときだけ追跡する。既定ではアンカーは空のまま
+    // なので、評価側の併合キーも従来と同一 = 既定挙動は変わらない
+    if crate::strategy::anchors_needed() {
+        if let Some(sq) = captured_at {
+            pos.pin_anchor(sq);
+        }
+    }
     // weighted_choice_idx が成功した時点で class_mass > 0、total_mass ≥ class_mass
     let r = (class_mass / total_mass).min(1.0);
     Some((r.ln(), (w_c / class_mass).ln() - (g_c / guide_mass).ln()))

@@ -6980,7 +6980,18 @@ fn stratified_sample<'a>(
         }
         let lw = log_weights.get(i).copied().unwrap_or(0.0);
         let miss = info_miss.get(i).copied().unwrap_or(0);
-        match seen.entry(pos.fingerprint()) {
+        // **由来タグを見るときは併合キーにも混ぜる**（codex 指摘 2026-08-22）:
+        // 物理指紋は盤・持ち駒・手番だけなので、「観測に裏付けられた駒がそこに
+        // いる粒子」と「同じ盤面だが幻として置かれた粒子」が併合され、先に来た
+        // 方のアンカー表で代表されてしまう（実測: quest_0809-m036 で本物の
+        // プローブ信号が 26% まで薄まっていた）。物理指紋そのものは真実照合・
+        // 尤度フィットが依存しているので変えない
+        let key = if anchors_needed() {
+            pos.fingerprint() ^ pos.anchors().fingerprint()
+        } else {
+            pos.fingerprint()
+        };
+        match seen.entry(key) {
             std::collections::hash_map::Entry::Vacant(e) => {
                 let logl =
                     particle_log_weight(&particle_features(pos, my_color, ctx), &FITTED_THETA);
@@ -9634,28 +9645,21 @@ fn evaluate(
         + match (probe_ctx, *mv) {
             (Some(ctx), ShogiMove::Board { from, to, .. }) if n > 0.0 => {
                 let budget_frac = f64::from(10u32.saturating_sub(view.fouls.you)) / 10.0;
-                // **凸ゲート**（drop_probe_w と同形。2026-08-22 の実測で必須と判明）:
-                // 質量に線形だと「5% の粒子がそこに駒を見ている」だけで玉が動き出す
-                // （w=3 の実測: quest31 m015/m017/m019/m057 で 5i6h（未採点の玉の手）が
-                // 15〜20/20、suite の未採点 45→209、アリーナ vs v13 40.4%）。
-                // p_mass を1つ余分に掛けて実効 p_mass² にすると、確信の低いプローブが
-                // 二乗で沈み「居そうなときだけ確かめる」人間の使い分けになる
+                // **凸ゲートは掛けない**（由来タグ導入後。codex 指摘 2026-08-22）:
+                // drop_probe_w の p_occ² は「確信が低いマスを探らない」ためだが、
+                // ここでは**由来タグ**（観測に裏付けられた駒か）が判別を担う。
+                // 質量ゲートを重ねると age 減衰と合わせて実効二乗になり、本物の
+                // 信号まで 7 倍沈む（実測: quest_0809-m036 のプローブ寄与が
+                // 期待 1.8 に対し 0.046 まで落ちていた）。
+                // 幻の抑制は anchor_weight が 0 を返すことで既に効いている
                 if Some(from) == ctx.my_king {
                     if king_probe_mass > 0.0 && !ctx.stale_king_dests.contains(&to) {
-                        ctx.king_probe_w
-                            * (king_probe_val / n)
-                            * (king_probe_mass / n)
-                            * budget_frac
-                            * budget_frac
+                        ctx.king_probe_w * (king_probe_val / n) * budget_frac * budget_frac
                     } else {
                         0.0
                     }
                 } else if path_probe_mass > 0.0 {
-                    ctx.path_probe_w
-                        * (path_probe_val / n)
-                        * (path_probe_mass / n)
-                        * budget_frac
-                        * budget_frac
+                    ctx.path_probe_w * (path_probe_val / n) * budget_frac * budget_frac
                 } else {
                     0.0
                 }
@@ -10188,6 +10192,31 @@ fn my_nonking_attacks(pos: &Position, sq: Coord, me: Color) -> bool {
         .any(|(from, p)| p.color == me && p.role != Role::King && pos.attacks(from, sq))
 }
 
+/// **由来タグによる重み**（`shogi::Anchors`、2026-08-22）: 反則の原因駒が
+/// 「観測に裏付けられた駒」なら age に応じた重み、裏付けの無い幻なら 0。
+///
+/// これが無いと、プローブ系の項は**幻の大駒に最も強く反応する**（実測:
+/// quest31-m017 の 6八 へ利く幻の寄与は quest_0809-m036 の本物のと金の7倍。
+/// 質量も駒価値も幻の方が大きく、凸ゲートでは分離できなかった）
+fn anchor_weight(pos: &Position, at: Coord) -> f64 {
+    match pos.anchors().age_at(at) {
+        Some(age) => probe_anchor_decay().powi(i32::from(age)),
+        None => 0.0,
+    }
+}
+
+/// 由来タグ（`shogi::Anchors`）を追跡する必要があるか。**消費者がいるときだけ
+/// 追跡する**ので、既定（プローブ系がすべて 0）ではアンカーは常に空になり、
+/// 粒子の重複除去キーも従来と同一 = 既定挙動が変わらない
+pub(crate) fn anchors_needed() -> bool {
+    king_probe_w() > 0.0 || path_probe_w() > 0.0
+}
+
+fn probe_anchor_decay() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| probe_env("TSUITATE_PROBE_ANCHOR_DECAY", 0.5).clamp(0.0, 1.0))
+}
+
 /// 原因駒 a（マス at）の回収価値: 交換価値 ＋ a が当てている自駒（玉以外）の
 /// 最大交換価値 × 0.5（脅威の解消。CheckSolver の removal_term と同じ考え方）
 fn recovery_value(pos: &Position, at: Coord, role: Role, me: Color) -> f64 {
@@ -10206,7 +10235,9 @@ fn king_probe_material(pos: &Position, k: Coord, me: Color) -> Option<f64> {
     pos.pieces()
         .filter(|(sq, p)| p.color == opp && pos.attacks(*sq, k))
         .filter(|(sq, _)| my_nonking_attacks(pos, *sq, me))
-        .map(|(sq, p)| recovery_value(pos, sq, p.role, me))
+        // 由来タグ: 観測に裏付けられた駒だけを数える（幻は 0）
+        .map(|(sq, p)| anchor_weight(pos, sq) * recovery_value(pos, sq, p.role, me))
+        .filter(|v| *v > 0.0)
         .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v))))
 }
 
@@ -10228,7 +10259,8 @@ fn path_probe_material(pos: &Position, from: Coord, to: Coord, me: Color) -> Opt
         };
         if let Some(p) = pos.piece_at(sq) {
             if p.color == opp && my_nonking_attacks(pos, sq, me) {
-                return Some(recovery_value(pos, sq, p.role, me));
+                let v = anchor_weight(pos, sq) * recovery_value(pos, sq, p.role, me);
+                return (v > 0.0).then_some(v);
             }
             return None;
         }
