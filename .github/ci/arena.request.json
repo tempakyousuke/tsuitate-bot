@@ -4,7 +4,7 @@
   "baselines": "estimator_v14",
   "match_seed": 20260822,
   "shards": 4,
-  "oracle": "nofoul",
+  "oracle": "",
   "clock": "",
-  "env": ""
+  "env": "TSUITATE_PROBE_PLAN_W=1"
 }
