@@ -218,6 +218,7 @@ mod tests {
             hand_option: 0.0,
             board_discount: 0.0,
             own_zone: 0.0,
+            probe_plan: 0.0,
         }
     }
 

@@ -15,4 +15,5 @@
 | `improvement-plan-2026-07-26-yaneuraou.md` | 計画 | 上記調査の実行計画。項目1（思考予算）は実測で「ノブではない」と確定 |
 | `improvement-plan-2026-08-02-quest31.md` | 計画 | F1（幻の詰み）は `mate_gate_q0` として採用。F2（未観測駒への捕獲賭け、m021）は未解決。m015 の 2二歩打（F2 とは別工事の反則の情報価値）は `drop_probe_w` として採用 |
 | `quest_20260731.md` | 経緯 | 採点の一次資料は `evals/quest_20260731.eval.md`。本文は語彙判定の記録 |
+| `improvement-plan-2026-08-22-probe-planning.md` | 計画 | ターン内の反則プローブ計画。プロトタイプ実装済み（既定0）・計測未実施 |
 | `tsuitate-viewer-webhook-bot.md` | 運用 | `webhook_bot` の現行手順。既定戦略は凍結版 `estimator_v10` |

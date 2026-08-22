@@ -266,6 +266,9 @@ pub struct CandidateScore {
     /// gain に加算された自玉近傍の敵駒排除ボーナス
     /// （own_zone_capture_w。粒子加重平均、内訳表示用）
     pub own_zone: f64,
+    /// ターン内の反則プローブ計画の値（`probe_plan_w`）。
+    /// score に加算済みの内訳（combine_score の外側）。既定 0 = 無効
+    pub probe_plan: f64,
 }
 
 /// 前進を好むヒューリスティック＋乱数（従来実装）
@@ -3526,11 +3529,16 @@ struct EvalOut {
     /// 打ちプローブの反則情報価値（drop_probe_w）。反則の失敗枝の期待値なので
     /// gain には含めず、combine_score の外側（(1−p_legal) 側）で加算する
     foul_probe: f64,
+    /// ターン内の反則プローブ計画の値（`probe_plan_w`）。
+    /// `evaluate` は常に 0 を返し、全候補の静的評価が揃ったあとに
+    /// choose() の計画段階が書き込む（他候補との比較が要るため）。
+    /// foul_probe と同じ層 = combine_score の外側
+    probe_plan: f64,
 }
 
 impl EvalOut {
     fn score(&self) -> f64 {
-        combine_score(self.gain, self.p_legal, self.foul_cost) + self.foul_probe
+        combine_score(self.gain, self.p_legal, self.foul_cost) + self.foul_probe + self.probe_plan
     }
 }
 
@@ -6790,6 +6798,127 @@ impl Strategy for EstimatorStrategy {
         // gain 内の静的リスク項の depth2_replace 分を実測の期待損失で
         // 置き換えて（一致するなら無変化）、最終式を適用し直す
         scored.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+
+        // 1.5段目: ターン内の反則プローブ計画（`probe_plan_w`、既定 0 = 無効）。
+        // 反則しても手番は変わらないので、反則は「純損」ではなく
+        // 「1枠を払って信念を更新し、次の手を選び直す権利」。その価値を
+        // 「m が非合法」で条件付けた事後で全候補を評価し直して測る。
+        // 設計は docs/improvement-plan-2026-08-22-probe-planning.md
+        let plan_w = probe_plan_w();
+        let fouls_left_now = 10u32.saturating_sub(view.fouls.you);
+        // 王手中は p_legal の出所が CheckSolver の仮説分布なので条件付けも
+        // そちらでやるべき（別工事）。taint 評価は合法性の証拠に使えない。
+        let plan_on = plan_w > 0.0
+            && !view.you_in_check
+            && !eval_taint
+            && !sample.is_empty()
+            && fouls_left_now >= probe_plan_min_left()
+            && scored.len() >= 2;
+        if crate::hits::enabled() {
+            crate::hits::flag("プローブ計画の前提充足", plan_on);
+        }
+        if plan_on {
+            let probe_k = probe_plan_k().min(scored.len());
+            let cont_m = probe_plan_m().min(scored.len());
+            let min_mass = probe_plan_min_mass();
+            let min_foul = probe_plan_min_foul();
+            // 何も学ばずに指す次善手の値（自分自身を除いた最大）。
+            // scored は静的スコア降順なので先頭2件で決まる
+            let (top0, top1) = (scored[0].4, scored[1].4);
+            // None = 計画段階が評価しなかった候補（ゲートで落ちた）。
+            // Some(0.0) は「評価したうえで価値ゼロ」= supersede の対象になる
+            let mut plans: Vec<Option<f64>> = vec![None; scored.len()];
+            for i in 0..probe_k {
+                let p_foul = 1.0 - scored[i].2.p_legal;
+                if p_foul < min_foul {
+                    continue;
+                }
+                let Some((idx, scale, frac)) = condition_on_foul(eval_pool, &scored[i].1) else {
+                    continue;
+                };
+                // 反則質量が 0 か 1 に張り付く = 全粒子が同意していて、
+                // 反則するかどうかで信念は動かない（買える情報が無い）
+                if frac < min_mass || frac > 1.0 - min_mass {
+                    continue;
+                }
+                let sub: Vec<(&Position, f64)> =
+                    idx.iter().map(|&pi| (eval_pool[pi].0, eval_pool[pi].1 * scale)).collect();
+                let mut sub_cache: Vec<Option<[f64; crate::value_features::VALUE_FEATURES]>> =
+                    idx.iter().map(|&pi| nn_state_cache[pi]).collect();
+                // 事後での最良の次手（反則した手自身は foul_tried で消えるので除く）
+                let mut best_after = f64::NEG_INFINITY;
+                for j in 0..cont_m {
+                    if j == i {
+                        continue;
+                    }
+                    let prior_j = prior_legal(view, &scored[j].1, opp_board_n);
+                    let out_j = evaluate(
+                        view,
+                        &scored[j].1,
+                        &sub,
+                        false,
+                        &sub,
+                        prior_j,
+                        &known,
+                        &params,
+                        budget,
+                        &mut sub_cache,
+                        blind_recapture,
+                        blind_home.as_ref(),
+                        blind_belief,
+                        taint_occ_board.as_ref(),
+                        opp_king_w.as_ref(),
+                        drop_hit_expo_before,
+                        promo_pot_before,
+                        major_path_before,
+                        promo_prox.as_ref(),
+                        turn_foul_occ.as_ref(),
+                        hand_option.as_ref(),
+                        &my_drop_foul_squares,
+                        &own_attack,
+                        &contested_squares,
+                        opp_occ_backed.as_ref(),
+                        stale_freshness,
+                        hand_asset_kings.as_ref(),
+                        king_threats.as_ref(),
+                        belief_occ_board.as_ref(),
+                    );
+                    // adjust（タイブレーク・手戻り減点等）は条件付け前の値を流用する
+                    // （非王手・厳密粒子ありの決定では粒子にほぼ依存しない）
+                    best_after = best_after.max(out_j.score() + scored[j].3);
+                }
+                if !best_after.is_finite() {
+                    continue;
+                }
+                let base = if i == 0 { top1 } else { top0 };
+                plans[i] = Some(probe_plan_value(
+                    plan_w,
+                    p_foul,
+                    best_after,
+                    base,
+                    probe_plan_signed(),
+                ));
+            }
+            let merge = probe_plan_merge();
+            for (s, plan) in scored.iter_mut().zip(plans) {
+                let Some(plan) = plan else { continue };
+                match merge {
+                    // 既定: 手作りの drop_probe_w を下回らせない（同じ情報の
+                    // 二重計上も避ける）。計画は「手作りが届かない所」で効く
+                    ProbePlanMerge::Max => {
+                        s.2.probe_plan = (plan - s.2.foul_probe).max(0.0);
+                    }
+                    ProbePlanMerge::Replace => {
+                        s.2.foul_probe = 0.0;
+                        s.2.probe_plan = plan;
+                    }
+                    ProbePlanMerge::Add => s.2.probe_plan = plan,
+                }
+                s.4 = s.2.score() + s.3;
+            }
+            scored.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap_or(std::cmp::Ordering::Equal));
+        }
+
         // **争点への利き足し**の予約枠（`adds_focal_attacker` の doc 参照）。
         // 静的スコアでは必ず沈むので、上位N本の足切りとは別枠で読む機会を作る。
         // 王手中は CheckSolver の領分なので予約しない
@@ -6841,7 +6970,10 @@ impl Strategy for EstimatorStrategy {
                 let gain2 = out.gain + relief.min(max_relief);
                 (
                     gain2,
-                    combine_score(gain2, out.p_legal, out.foul_cost) + out.foul_probe + adjust,
+                    combine_score(gain2, out.p_legal, out.foul_cost)
+                        + out.foul_probe
+                        + out.probe_plan
+                        + adjust,
                 )
             } else {
                 (out.gain, score)
@@ -6859,6 +6991,7 @@ impl Strategy for EstimatorStrategy {
                 checker_removal: out.checker_removal,
                 capture_bet_penalty: out.capture_bet_penalty,
                 own_zone: out.own_zone,
+                probe_plan: out.probe_plan,
                 mate_threat: out.mate_threat,
                 mate_risk: out.mate_risk,
                 king_holes: out.king_holes,
@@ -7337,6 +7470,163 @@ fn last_foul_guard() -> f64 {
 
 /// `last_foul_guard` の既定値（2026-08-10 採用）。0 で従来挙動へ切り戻し
 const LAST_FOUL_GUARD: f64 = 60.0;
+
+// ── ターン内の反則プローブ計画（`probe_plan_w`。2026-08-22、既定 0 = 無効） ──
+//
+// 反則しても手番は変わらないので、1手番の正解は単一の手ではなく
+// 「A を試す → 反則なら B → 反則なら C」という適応的な決定木になる。
+// 現行の score は単発 argmax（= PIMC）なので「分からないから確かめる」を
+// スカラー1個（drop_probe_w / foul_probe）でしか近似できない。
+//
+//   V_after(m) = max_{m'≠m} score(m' | 「m は非合法」で条件付けた事後)
+//   V_base     = max_{m'≠m} score(m' | 現在の信念)      ← 何も学ばない場合
+//   probe_plan(m) = w × (1 − p_legal(m)) × max(0, V_after(m) − V_base)
+//
+// 事後は `evaluate` が既に粒子ごとに計算している `pos.is_legal(mv)` の分割
+// そのもので、追加の推論は要らない。設計と計測計画は
+// docs/improvement-plan-2026-08-22-probe-planning.md 参照。
+
+/// プローブ計画の重み（0 = 無効 = 従来挙動）
+fn probe_plan_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_PROBE_PLAN_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0)
+    })
+}
+
+fn probe_plan_usize(name: &'static str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+/// プローブとして検討する候補数（静的スコア上位）
+fn probe_plan_k() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| probe_plan_usize("TSUITATE_PROBE_PLAN_K", 6))
+}
+
+/// 事後で評価し直す継続候補数（静的スコア上位）
+fn probe_plan_m() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| probe_plan_usize("TSUITATE_PROBE_PLAN_M", 12))
+}
+
+/// 残り反則枠がこれ未満なら発火しない（買えない情報に値段はつかない。
+/// `drop_probe_repeat_gate` の打ち得スパムと同じ穴を塞ぐ）
+fn probe_plan_min_left() -> u32 {
+    static V: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_PROBE_PLAN_MIN_LEFT")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(4)
+    })
+}
+
+fn probe_plan_f64(name: &'static str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(default)
+}
+
+/// 反則質量がこの範囲外（両端）なら「全粒子が同意している」= 情報ゼロ
+fn probe_plan_min_mass() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| probe_plan_f64("TSUITATE_PROBE_PLAN_MIN_MASS", 0.05))
+}
+
+/// `1 − p_legal` がこれ未満なら発火しない（反則枝がほぼ無いので計画不要）
+fn probe_plan_min_foul() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| probe_plan_f64("TSUITATE_PROBE_PLAN_MIN_FOUL", 0.05))
+}
+
+/// 計画値と `drop_probe_w`（`foul_probe`）の合成方法。
+///
+/// drop_probe_w は「打ちマスの占有が確定 → 次手で回収」という、この計画の
+/// **特殊ケースをハードコードしたもの**なので、素朴に足すと同じ情報を二重に
+/// 数える（実測: quest31-m015 の `P*2b` は foul_probe +5.29 と計画 +4.70 が重なる）。
+/// 一方、置き換えると**手調整済みの挙動が落ちる**: 導出値は深さ2で打ち切り、
+/// かつ「最良の継続がどれだけ良くなるか」しか数えない**下界**なので、
+/// 実測でも手作り値のほうが強気だった（`replace` は tokin-bet の `P*8h` を
+/// 8/8 → 0/8、quest31-m015 の `P*2b` を 8/8 → 6/8 に落とす）。
+///
+/// 既定は `max` = 両者の大きいほう（既存の較正済み挙動を下回らせない安全側で、
+/// 計画は「手作りが届かない所」でだけ効く）。
+/// `TSUITATE_PROBE_PLAN_MERGE=replace` で純粋な導出値、`=add` で加算
+/// （二重計上。アブレーション用）。
+/// 計画は非王手でだけ走るので、`foul_probe` の王手中成分（gold_join）は
+/// ここでは常に 0 = 触るのは drop_probe 成分だけ。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbePlanMerge {
+    Max,
+    Replace,
+    Add,
+}
+
+fn probe_plan_merge() -> ProbePlanMerge {
+    static V: std::sync::OnceLock<ProbePlanMerge> = std::sync::OnceLock::new();
+    *V.get_or_init(
+        || match std::env::var("TSUITATE_PROBE_PLAN_MERGE").as_deref() {
+            Ok("replace") => ProbePlanMerge::Replace,
+            Ok("add") => ProbePlanMerge::Add,
+            _ => ProbePlanMerge::Max,
+        },
+    )
+}
+
+/// 負側（悪い知らせ）も加算するか。既定 false = 安全方向のみ
+/// （負側は foul_cost が既に払っているので二重計上になる）
+fn probe_plan_signed() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TSUITATE_PROBE_PLAN_SIGNED").is_ok_and(|v| v == "1"))
+}
+
+/// プローブ計画の値。`w × (1−p_legal) × (事後の最善 − 何も学ばない場合の次善)`。
+///
+/// 既定（`signed=false`）は**安全方向のみ**: 負側（条件付けたら悪い知らせだった）は
+/// `foul_cost` が既に払っているので二重計上になる。
+fn probe_plan_value(w: f64, p_foul: f64, best_after: f64, base: f64, signed: bool) -> f64 {
+    let mut delta = best_after - base;
+    if !signed {
+        delta = delta.max(0.0);
+    }
+    w * p_foul * delta
+}
+
+/// 「`mv` が非合法だった」で条件付けた事後粒子集合を作る。
+///
+/// 返すのは (元プールの添字, 事後の重み, 反則質量の割合)。重みは
+/// **元の総質量へ再正規化**する: 部分集合をそのまま `evaluate` へ渡すと
+/// `degen = 1 − n/eval_particles` が上がって `p_legal` が事前へ寄り、
+/// 「条件付け」が「粒子が枯れた」と誤解される。事後は質量の再正規化であって
+/// 証拠の減少ではない。
+fn condition_on_foul(pool: &[(&Position, f64)], mv: &ShogiMove) -> Option<(Vec<usize>, f64, f64)> {
+    let total: f64 = pool.iter().map(|(_, w)| w).sum();
+    if !(total > 0.0) {
+        return None;
+    }
+    let mut idx = vec![];
+    let mut mass = 0.0f64;
+    for (i, (pos, w)) in pool.iter().enumerate() {
+        if !pos.is_legal(mv) {
+            idx.push(i);
+            mass += w;
+        }
+    }
+    if idx.is_empty() || !(mass > 0.0) {
+        return None;
+    }
+    Some((idx, total / mass, mass / total))
+}
 
 /// 残り反則2回の床（`TSUITATE_LAST_FOUL_GUARD_2`、既定 0。env 作業点は 36）。
 /// 既定の急峻化は残り2回でも約5.4点。b939bd3 以降の「対v13 60%」向け
@@ -9598,6 +9888,7 @@ fn evaluate(
         hand_option: hand_option_pen,
         board_discount,
         foul_probe: foul_probe + gold_join,
+        probe_plan: 0.0,
     }
 }
 
@@ -13942,6 +14233,125 @@ pub(crate) mod tests {
             usi.starts_with("5i"),
             "王手中は玉移動を選ぶはず（選ばれた手: {usi}）"
         );
+    }
+
+    /// 事後（「この手は非合法だった」）は**質量を再正規化**する: 部分集合を
+    /// そのまま渡すと evaluate の degen が上がり、条件付けが「粒子が枯れた」と
+    /// 誤解されて p_legal が事前へ寄る（設計メモの罠1）
+    #[test]
+    fn condition_on_foul_renormalizes_mass() {
+        // 5五へ相手の歩を置いた粒子と置かない粒子。5五への打ちは前者でだけ反則
+        let mut occupied = Position::empty(Color::Sente);
+        occupied.set(
+            Coord { file: 5, rank: 9 },
+            Some(crate::shogi::Piece {
+                color: Color::Sente,
+                role: Role::King,
+            }),
+        );
+        occupied.set(
+            Coord { file: 1, rank: 1 },
+            Some(crate::shogi::Piece {
+                color: Color::Gote,
+                role: Role::King,
+            }),
+        );
+        let mut empty = occupied.clone();
+        occupied.set(
+            Coord { file: 5, rank: 5 },
+            Some(crate::shogi::Piece {
+                color: Color::Gote,
+                role: Role::Pawn,
+            }),
+        );
+        // 打つ駒は先手の持ち駒に要る
+        for pos in [&mut occupied, &mut empty] {
+            pos.set_hand(Color::Sente, Role::Silver, 1);
+        }
+        let mv = ShogiMove::Drop {
+            role: Role::Silver,
+            to: Coord { file: 5, rank: 5 },
+        };
+        assert!(!occupied.is_legal(&mv), "占有マスへの打ちは非合法");
+        assert!(empty.is_legal(&mv), "空きマスへの打ちは合法");
+
+        let pool: Vec<(&Position, f64)> = vec![(&occupied, 3.0), (&empty, 1.0)];
+        let (idx, scale, frac) = condition_on_foul(&pool, &mv).expect("事後がある");
+        assert_eq!(idx, vec![0], "非合法だった粒子だけが残る");
+        assert!((frac - 0.75).abs() < 1e-9, "frac={frac}");
+        // 再正規化: 事後の総質量は元の総質量（4.0）と等しい
+        let post: f64 = idx.iter().map(|&i| pool[i].1 * scale).sum();
+        assert!((post - 4.0).abs() < 1e-9, "post={post}");
+    }
+
+    #[test]
+    fn condition_on_foul_is_none_when_no_particle_refutes() {
+        let mut pos = Position::empty(Color::Sente);
+        pos.set(
+            Coord { file: 5, rank: 9 },
+            Some(crate::shogi::Piece {
+                color: Color::Sente,
+                role: Role::King,
+            }),
+        );
+        pos.set(
+            Coord { file: 1, rank: 1 },
+            Some(crate::shogi::Piece {
+                color: Color::Gote,
+                role: Role::King,
+            }),
+        );
+        pos.set_hand(Color::Sente, Role::Silver, 1);
+        let mv = ShogiMove::Drop {
+            role: Role::Silver,
+            to: Coord { file: 5, rank: 5 },
+        };
+        let pool: Vec<(&Position, f64)> = vec![(&pos, 1.0)];
+        // 全粒子が合法と言っている = 反則枝が無いので計画するものが無い
+        assert!(condition_on_foul(&pool, &mv).is_none());
+    }
+
+    /// 既定は安全方向のみ（負の delta は 0）。`signed` で両側になる
+    #[test]
+    fn probe_plan_value_is_safe_direction_by_default() {
+        // 事後の最善が次善より良い: 反則枝の確率ぶんだけ加点
+        let v = probe_plan_value(1.0, 0.5, 8.0, 6.0, false);
+        assert!((v - 1.0).abs() < 1e-9, "v={v}");
+        // 悪い知らせ: 既定では 0（foul_cost が既に払っている分の二重計上を避ける）
+        assert_eq!(probe_plan_value(1.0, 0.5, 4.0, 6.0, false), 0.0);
+        assert!(probe_plan_value(1.0, 0.5, 4.0, 6.0, true) < 0.0);
+        // 反則枝が薄いほど価値も薄い（線形）
+        let a = probe_plan_value(1.0, 0.2, 8.0, 6.0, false);
+        let b = probe_plan_value(1.0, 0.4, 8.0, 6.0, false);
+        assert!((b - 2.0 * a).abs() < 1e-9);
+    }
+
+    /// 計画値は combine_score の**外側**（foul_probe と同じ層）に載る
+    #[test]
+    fn probe_plan_rides_outside_combine_score() {
+        let mut out = EvalOut {
+            gain: 2.0,
+            risk_mean: 0.0,
+            p_legal: 0.5,
+            foul_cost: 1.0,
+            checker_removal: 0.0,
+            capture_bet_penalty: 0.0,
+            mate_threat: 0.0,
+            mate_risk: 0.0,
+            king_holes: 0.0,
+            value_nn: 0.0,
+            own_zone: 0.0,
+            capture_value: 0.0,
+            link: 0.0,
+            promo: 0.0,
+            hand_option: 0.0,
+            board_discount: 0.0,
+            foul_probe: 0.0,
+            probe_plan: 0.0,
+        };
+        let before = out.score();
+        out.probe_plan = 0.75;
+        assert!((out.score() - (before + 0.75)).abs() < 1e-9);
     }
 
     #[test]

@@ -48,6 +48,9 @@ fn main() {
                     if c.own_zone != 0.0 {
                         s.push_str(&format!(" 玉圏排除={:+.3}", c.own_zone));
                     }
+                    if c.probe_plan != 0.0 {
+                        s.push_str(&format!(" プローブ計画={:+.3}", c.probe_plan));
+                    }
                     // 常時出す内訳（CandidateScore にあるのに表示していなかった）。
                     // gain の差がどこから来ているかは、これが無いと env の
                     // アブレーションで1項ずつ潰すしかない
