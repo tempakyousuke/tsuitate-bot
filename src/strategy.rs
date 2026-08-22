@@ -9651,15 +9651,24 @@ fn evaluate(
                 // 質量ゲートを重ねると age 減衰と合わせて実効二乗になり、本物の
                 // 信号まで 7 倍沈む（実測: quest_0809-m036 のプローブ寄与が
                 // 期待 1.8 に対し 0.046 まで落ちていた）。
-                // 幻の抑制は anchor_weight が 0 を返すことで既に効いている
+                // 幻の抑制は anchor_weight が 0 を返すことで既に効いている。
+                //
+                // ただし **(1 − p) の情報価値は要る**（drop_probe_w と同じ経済。
+                // CLAUDE.md の教訓「反則1回で買えるのは情報であり、p_occ が高い
+                // マスに買う情報は無い」）。既に確信しているマスへ玉を出しても
+                // 学ぶことは無く、その駒は普通に取ればよい。これが無いと
+                // quest31-m057 で「94% の粒子が 5八 を塞いでいる」玉の手が
+                // score 37.9 まで跳ねた（2026-08-22 実測）
                 if Some(from) == ctx.my_king {
                     if king_probe_mass > 0.0 && !ctx.stale_king_dests.contains(&to) {
-                        ctx.king_probe_w * (king_probe_val / n) * budget_frac * budget_frac
+                        let info = 1.0 - (king_probe_mass / n).clamp(0.0, 1.0);
+                        ctx.king_probe_w * (king_probe_val / n) * info * budget_frac * budget_frac
                     } else {
                         0.0
                     }
                 } else if path_probe_mass > 0.0 {
-                    ctx.path_probe_w * (path_probe_val / n) * budget_frac * budget_frac
+                    let info = 1.0 - (path_probe_mass / n).clamp(0.0, 1.0);
+                    ctx.path_probe_w * (path_probe_val / n) * info * budget_frac * budget_frac
                 } else {
                     0.0
                 }
