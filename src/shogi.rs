@@ -155,6 +155,131 @@ pub enum Outcome {
     Stalemate { winner: Color },
 }
 
+/// 由来タグ（アンカー）のスロット数。アンカーは**観測で相手駒の位置が確定した
+/// 事象**（自駒が取られたマス）にだけ立つので同時に何枚も要らない。
+/// 8 なら1局の捕獲頻度に対して溢れはほぼ起きない（1スロット2バイト）
+pub const ANCHOR_SLOTS: usize = 8;
+/// age の上限（飽和加算。これ以上は「古い」でひとまとめ）
+pub const ANCHOR_AGE_MAX: u8 = 250;
+
+/// **駒の由来タグ**（2026-08-22、quest_0809 36手目 2三玉の診断が発端）。
+///
+/// ついたての粒子は「観測と整合するフル局面」でしかなく、盤上の相手駒が
+/// **観測に裏付けられた駒**（1五で自駒を取った歩 → その後 1四・1三成 と
+/// 2手だけ動いた）なのか、**サンプラが尤度のために置いただけの幻**（6八へ
+/// 利く飛車）なのかを区別できない。区別できないと「そこの駒を取りに行く」
+/// 系の評価項は幻に強く反応する（実測: 幻の寄与が本物の7倍）。
+///
+/// ここで持つのは二値の「本物/幻」ではなく **age = 観測で位置が確定してから
+/// その駒が行った未観測（サンプル）の移動回数**:
+/// - `age_at(sq) == Some(0)` — その粒子では「観測で確定したマスから一度も
+///   動いていない」駒。**「確実にそこにいる」という意味ではない**（動いた
+///   世界線は別の粒子が持っている）。確からしさは粒子集団の質量が表す
+/// - `Some(k)` — k 回ぶんの推測が乗った位置
+/// - `None` — 観測の裏付けが一度も無い駒（＝サンプラが尤度のために置いた幻）
+///
+/// 「経過手数」ではなく「その駒自身の移動回数」なのが要点: 経過手数は
+/// 「動く機会があったか」でしかなく、動いた／動かなかったの内訳は粒子集団の
+/// 質量が既に表しているので、経過手数で減衰させると二重に数えることになる
+/// （codex レビュー 2026-08-22）
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Anchors {
+    /// (マス index + 1。0 = 空スロット, age)。**新しく pin した順**に前詰め
+    /// （index 0 が最新）。退避は「age 最大 → 同点なら最も古い pin」で決める
+    slots: [(u8, u8); ANCHOR_SLOTS],
+}
+
+impl Anchors {
+    fn key(c: Coord) -> u8 {
+        sq_index(c) as u8 + 1
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.iter().all(|(s, _)| *s == 0)
+    }
+
+    /// マス c の駒の age（アンカーが無ければ None = 観測の裏付け無し）
+    pub fn age_at(&self, c: Coord) -> Option<u8> {
+        if self.is_empty() {
+            return None;
+        }
+        let k = Self::key(c);
+        self.slots
+            .iter()
+            .find(|(s, _)| *s == k)
+            .map(|(_, age)| *age)
+    }
+
+    /// 由来タグの指紋（粒子の**評価用**重複除去に混ぜる。物理指紋
+    /// `Position::fingerprint` は従来どおり盤・持ち駒・手番だけ）
+    pub fn fingerprint(&self) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for (s, age) in &self.slots {
+            for b in [*s, *age] {
+                h ^= u64::from(b);
+                h = h.wrapping_mul(0x100000001b3);
+            }
+        }
+        h
+    }
+
+    /// マス c を「今ここに相手駒がいる」と確定させる（age = 0）。
+    /// 満杯なら **age 最大（同点なら最も古い pin）** を捨てる。
+    /// 「age 最大」だけだと全部 age 0 のとき常に同じスロットが上書きされて
+    /// **最新のアンカーが消え続ける**（codex 指摘）
+    pub fn pin(&mut self, c: Coord) {
+        let k = Self::key(c);
+        // 同じマスの既存エントリは作り直す（重複を残さない）
+        self.clear_at(c);
+        // 前詰め（空きを後ろへ寄せる）
+        let mut kept: Vec<(u8, u8)> = self.slots.iter().copied().filter(|(s, _)| *s != 0).collect();
+        if kept.len() >= ANCHOR_SLOTS {
+            // age 最大、同点なら最も後ろ（＝最も古い pin）を捨てる
+            let victim = kept
+                .iter()
+                .enumerate()
+                .max_by_key(|(i, (_, age))| (*age, *i))
+                .map(|(i, _)| i)
+                .expect("kept は空でない");
+            kept.remove(victim);
+        }
+        self.slots = [(0, 0); ANCHOR_SLOTS];
+        self.slots[0] = (k, 0);
+        for (i, e) in kept.into_iter().enumerate() {
+            self.slots[i + 1] = e;
+        }
+    }
+
+    /// マス c のアンカーを捨てる（駒が取られた・別の駒に差し替えられた）
+    pub fn clear_at(&mut self, c: Coord) {
+        if self.is_empty() {
+            return;
+        }
+        let k = Self::key(c);
+        for slot in self.slots.iter_mut() {
+            if slot.0 == k {
+                *slot = (0, 0);
+            }
+        }
+    }
+
+    /// 盤上移動の反映: to にいた駒（取られた）のアンカーは消し、from の
+    /// アンカーは to へ移して age を1つ進める
+    fn on_move(&mut self, from: Coord, to: Coord) {
+        if self.is_empty() {
+            return; // 既定（アンカー未使用）の高速路
+        }
+        self.clear_at(to);
+        let kf = Self::key(from);
+        let kt = Self::key(to);
+        for slot in self.slots.iter_mut() {
+            if slot.0 == kf {
+                *slot = (kt, slot.1.saturating_add(1).min(ANCHOR_AGE_MAX));
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Position {
     board: [Option<Piece>; 81],
@@ -163,6 +288,10 @@ pub struct Position {
     turn: Color,
     /// 次に指す手の番号（初期局面で1、1手ごとに+1）。shogiops の moveNumber と同じ
     move_number: u32,
+    /// 駒の由来タグ（`Anchors` の doc）。`fingerprint()` には**含めない**
+    /// （粒子の重複除去は盤面・持ち駒・手番だけで行う従来どおりの規約）。
+    /// 審判（arena / shogi.rs の perft）は誰も pin しないので常に空 = 影響なし
+    anchors: Anchors,
 }
 
 fn color_index(color: Color) -> usize {
@@ -179,6 +308,7 @@ impl Position {
             hands: [[0; 7]; 2],
             turn: Color::Sente,
             move_number: 1,
+            anchors: Anchors::default(),
         };
         let back = [
             Role::Lance,
@@ -214,6 +344,7 @@ impl Position {
             hands: [[0; 7]; 2],
             turn,
             move_number: 1,
+            anchors: Anchors::default(),
         }
     }
 
@@ -233,8 +364,30 @@ impl Position {
         self.board[sq_index(c)]
     }
 
+    /// マスへ駒を直接置く（推定器の変異救済・玉投影など、指し手を介さない編集）。
+    /// **由来タグは捨てる**: 差し替えた駒に前の駒の観測裏付けを継がせない
     pub fn set(&mut self, c: Coord, piece: Option<Piece>) {
+        self.anchors.clear_at(c);
         self.board[sq_index(c)] = piece;
+    }
+
+    /// 指し手の適用で使う内部版（由来タグは `play_unchecked` 側が管理する）
+    fn put(&mut self, c: Coord, piece: Option<Piece>) {
+        self.board[sq_index(c)] = piece;
+    }
+
+    pub fn anchors(&self) -> &Anchors {
+        &self.anchors
+    }
+
+    /// 観測（自駒が取られたマス）で相手駒の位置が確定したことを記録する。
+    /// 呼ぶのは推定器だけ（審判・真実のリプレイは呼ばない）
+    pub fn pin_anchor(&mut self, c: Coord) {
+        debug_assert!(
+            self.piece_at(c).is_some(),
+            "pin_anchor: {c:?} に駒がない（捕獲観測の適用後に呼ぶこと）"
+        );
+        self.anchors.pin(c);
     }
 
     pub fn hand_count(&self, color: Color, role: Role) -> u8 {
@@ -497,20 +650,25 @@ impl Position {
                         self.hands[color_index(self.turn)][i] += 1;
                     }
                 }
-                self.set(from, None);
+                // 由来タグ: to にいた駒（取られた）は消え、from の駒は to へ
+                // 移って「未観測の移動」を1回積む（Anchors の doc）
+                self.anchors.on_move(from, to);
+                self.put(from, None);
                 let role = if promote {
                     promote_role(piece.role).unwrap_or(piece.role)
                 } else {
                     piece.role
                 };
-                self.set(to, Some(Piece { color: piece.color, role }));
+                self.put(to, Some(Piece { color: piece.color, role }));
                 captured
             }
             ShogiMove::Drop { role, to } => {
                 if let Some(i) = hand_index(role) {
                     self.hands[color_index(self.turn)][i] -= 1;
                 }
-                self.set(to, Some(Piece { color: self.turn, role }));
+                // 打ちは空きマスにしか置けないが、念のため由来タグは捨てる
+                self.anchors.clear_at(to);
+                self.put(to, Some(Piece { color: self.turn, role }));
                 None
             }
         };
@@ -830,5 +988,55 @@ mod tests {
         pos.set(Coord { file: 2, rank: 3 }, Some(Piece { color: Color::Sente, role: Role::Gold }));
         assert!(pos.in_check(Color::Gote));
         assert_eq!(pos.outcome(), Some(Outcome::Checkmate { winner: Color::Sente }));
+    }
+
+    /// 由来タグ（`Anchors`）: pin した駒を追いかけ、動くたびに age が増え、
+    /// 取られたら消える。指し手を介さない `set` は継承させない
+    #[test]
+    fn 由来タグは駒を追ってageを積み取られたら消える() {
+        let sq = |file: i8, rank: i8| Coord { file, rank };
+        let mut pos = Position::empty(Color::Sente);
+        pos.set(sq(1, 5), Some(Piece { color: Color::Sente, role: Role::Pawn }));
+        pos.set(sq(9, 9), Some(Piece { color: Color::Sente, role: Role::King }));
+        pos.set(sq(1, 1), Some(Piece { color: Color::Gote, role: Role::Lance }));
+        pos.set(sq(5, 1), Some(Piece { color: Color::Gote, role: Role::King }));
+        // 観測「1五で自駒が取られた」= その駒は今 1五 にいる
+        pos.pin_anchor(sq(1, 5));
+        assert_eq!(pos.anchors().age_at(sq(1, 5)), Some(0));
+        assert_eq!(pos.anchors().age_at(sq(1, 4)), None, "他のマスには付かない");
+
+        // 1五→1四（未観測の推測が1回）
+        pos.play_unchecked(&ShogiMove::Board { from: sq(1, 5), to: sq(1, 4), promote: false });
+        assert_eq!(pos.anchors().age_at(sq(1, 4)), Some(1));
+        assert_eq!(pos.anchors().age_at(sq(1, 5)), None);
+
+        // 相手の手番を挟んでも、その駒が動かなければ age は増えない
+        pos.play_unchecked(&ShogiMove::Board { from: sq(5, 1), to: sq(5, 2), promote: false });
+        assert_eq!(pos.anchors().age_at(sq(1, 4)), Some(1));
+
+        // 1四→1三成（2回目の推測）
+        pos.play_unchecked(&ShogiMove::Board { from: sq(1, 4), to: sq(1, 3), promote: true });
+        assert_eq!(pos.anchors().age_at(sq(1, 3)), Some(2));
+
+        // 追跡中の駒が取られたら由来タグも消える
+        pos.play_unchecked(&ShogiMove::Board { from: sq(1, 1), to: sq(1, 3), promote: false });
+        assert_eq!(pos.anchors().age_at(sq(1, 3)), None);
+
+        // set（変異救済・玉投影などの直接編集）は由来タグを継がせない
+        pos.pin_anchor(sq(1, 3));
+        assert_eq!(pos.anchors().age_at(sq(1, 3)), Some(0));
+        pos.set(sq(1, 3), Some(Piece { color: Color::Gote, role: Role::Gold }));
+        assert_eq!(pos.anchors().age_at(sq(1, 3)), None);
+    }
+
+    /// クローンは由来タグごと複製し、指紋（粒子の重複除去）には影響しない
+    #[test]
+    fn 由来タグは指紋に影響しない() {
+        let mut a = Position::initial();
+        let b = a.clone();
+        a.pin_anchor(Coord { file: 7, rank: 7 });
+        assert_eq!(a.fingerprint(), b.fingerprint(), "指紋は盤・持ち駒・手番だけ");
+        assert_eq!(a.clone().anchors().age_at(Coord { file: 7, rank: 7 }), Some(0));
+        assert!(b.anchors().is_empty(), "審判・真実リプレイは pin しないので空のまま");
     }
 }
