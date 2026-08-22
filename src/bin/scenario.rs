@@ -197,6 +197,17 @@ fn print_tally(sc: &Scenario, stats: &ChoiceStats, trials: u64) {
     if !sc.scores.is_empty() {
         let (mean, unscored) = stats.mean_score(&sc.scores);
         println!("平均得点: {mean:.2}/10（未採点の選択 {unscored}/{trials}）");
+        if stats.probe_trials() > 0 {
+            let (fm, fu) = stats.mean_score_first(&sc.scores);
+            println!(
+                "初手得点: {fm:.2}/10（最初に試みた手で採点。未採点 {fu}、反則を挟んだ試行 {}）",
+                stats.probe_trials()
+            );
+            println!("最初に試みた手の内訳:");
+            for (usi, n) in &stats.first_tally {
+                println!("  {usi}: {n}/{trials}");
+            }
+        }
     }
     println!("追加の反則の総数: {}", stats.total_fouls);
 }
@@ -919,8 +930,8 @@ fn run_suite(
     let total = loaded.len() as u64 * trials;
     let done = std::sync::atomic::AtomicU64::new(0);
     let next = std::sync::atomic::AtomicUsize::new(0);
-    // パーティションごとの結果: (統計, TSV行 = (グローバルindex, シード, 受理手, 反則数))
-    type Rows = Vec<(usize, u64, String, u32)>;
+    // パーティションごとの結果: (統計, TSV行 = (グローバルindex, シード, 受理手, 反則数, 初手))
+    type Rows = Vec<(usize, u64, String, u32, String)>;
     let results: Vec<std::sync::Mutex<Option<(Vec<ChoiceStats>, Rows)>>> =
         parts.iter().map(|_| std::sync::Mutex::new(None)).collect();
     let factory: &(dyn Fn(u64) -> Box<dyn strategy::Strategy + Send> + Sync) =
@@ -942,7 +953,14 @@ fn run_suite(
                         seed_base..seed_base + trials,
                         factory,
                         |il, seed, accepted, foul_seq| {
-                            rows.push((idxs[il], seed, accepted.to_string(), foul_seq.len() as u32));
+                            let first = foul_seq.first().map(String::as_str).unwrap_or(accepted);
+                            rows.push((
+                                idxs[il],
+                                seed,
+                                accepted.to_string(),
+                                foul_seq.len() as u32,
+                                first.to_string(),
+                            ));
                             let d = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                             eprint!("\r{d}/{total} 試行");
                         },
@@ -983,7 +1001,13 @@ fn run_suite(
             String::new()
         } else {
             let (mean, unscored) = stats.mean_score(&sc.scores);
-            format!(" 得点 {mean:.2}/10(未採点{unscored})")
+            let first_note = if stats.probe_trials() > 0 {
+                let (fm, fu) = stats.mean_score_first(&sc.scores);
+                format!(" 初手得点 {fm:.2}(未採点{fu})")
+            } else {
+                String::new()
+            };
+            format!(" 得点 {mean:.2}/10(未採点{unscored}){first_note}")
         };
         println!(
             "{:<12} {}手目 注目手 {:<6} {hits}/{trials}{bad_note}{score_note} 反則{} 他: {}",
@@ -997,8 +1021,12 @@ fn run_suite(
     if tsv {
         println!();
         all_rows.sort();
-        for (i, seed, accepted, fouls) in &all_rows {
-            println!("TRIAL\t{}\t{seed}\t{accepted}\t{fouls}", loaded[*i].0.name);
+        // 6列目 = 最初に試みた手（反則プローブの採点用。merge は無くても読める）
+        for (i, seed, accepted, fouls, first) in &all_rows {
+            println!(
+                "TRIAL\t{}\t{seed}\t{accepted}\t{fouls}\t{first}",
+                loaded[*i].0.name
+            );
         }
     }
 }
@@ -1008,9 +1036,12 @@ fn run_suite(
 /// 集計の意味論（target_hits / bad_hits / mean_score）は ChoiceStats を
 /// そのまま使うので suite と完全に一致する
 fn run_merge(files: &[String]) {
-    // シナリオ名 → (受理手カウント, 反則合計, 試行数)
-    let mut agg: std::collections::BTreeMap<String, (HashMap<String, u32>, u32, u32)> =
-        std::collections::BTreeMap::new();
+    // シナリオ名 → (受理手カウント, 反則合計, 試行数, 初手カウント)
+    #[allow(clippy::type_complexity)]
+    let mut agg: std::collections::BTreeMap<
+        String,
+        (HashMap<String, u32>, u32, u32, HashMap<String, u32>),
+    > = std::collections::BTreeMap::new();
     for f in files {
         let text = std::fs::read_to_string(f)
             .unwrap_or_else(|e| exit_usage(&format!("{f} を読めません: {e}")));
@@ -1028,10 +1059,13 @@ fn run_merge(files: &[String]) {
                 .trim()
                 .parse()
                 .unwrap_or_else(|_| exit_usage(&format!("TRIAL 行の反則数を読めません: {line}")));
+            // 6列目（初手）は 2026-08-22 以降の TSV にだけある。無ければ受理手
+            let first = cols.next().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(accepted);
             let e = agg.entry(name.to_string()).or_default();
             *e.0.entry(accepted.to_string()).or_insert(0) += 1;
             e.1 += fouls;
             e.2 += 1;
+            *e.3.entry(first.to_string()).or_insert(0) += 1;
         }
     }
     if agg.is_empty() {
@@ -1042,21 +1076,27 @@ fn run_merge(files: &[String]) {
     let mut score_sum = 0.0f64;
     let mut score_n = 0u32;
     let mut unscored_total = 0u32;
-    println!("| シナリオ | 手目 | 注目手 | 選択 | 不合格 | 得点/10 | 反則 | 他の選択 |");
-    println!("|---|---|---|---|---|---|---|---|");
-    for (sc_name, (tally, fouls, trials)) in &agg {
+    let mut first_sum = 0.0f64;
+    let mut first_n = 0u32;
+    let mut probe_total = 0u32;
+    println!("| シナリオ | 手目 | 注目手 | 選択 | 不合格 | 得点/10 | 初手得点 | 反則 | 他の選択 |");
+    println!("|---|---|---|---|---|---|---|---|---|");
+    for (sc_name, (tally, fouls, trials, first)) in &agg {
         let sc = match load_scenario(sc_name, None, None, None) {
             Ok(sc) => sc,
             Err(e) => {
-                println!("| {sc_name} | - | 読み込み失敗: {e} | - | - | - | - | - |");
+                println!("| {sc_name} | - | 読み込み失敗: {e} | - | - | - | - | - | - |");
                 continue;
             }
         };
         let mut tally: Vec<(String, u32)> = tally.clone().into_iter().collect();
         tally.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        let mut first_tally: Vec<(String, u32)> = first.clone().into_iter().collect();
+        first_tally.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         let stats = ChoiceStats {
             tally,
             total_fouls: *fouls,
+            first_tally,
         };
         let hits = stats.target_hits(&sc.target);
         let bad_cell = if sc.bad.is_empty() {
@@ -1076,6 +1116,22 @@ fn run_merge(files: &[String]) {
             unscored_total += unscored;
             format!("{mean:.2}(未採点{unscored})")
         };
+        // 初手得点（最初に試みた手で採点。反則プローブの意図を数える）。
+        // 反則を挟んだ試行が無ければ受理手の得点と同じなので "〃"
+        let first_cell = if sc.scores.is_empty() {
+            "-".to_string()
+        } else {
+            let (fm, fu) = stats.mean_score_first(&sc.scores);
+            first_sum += fm;
+            first_n += 1;
+            let probes = stats.probe_trials();
+            probe_total += probes;
+            if probes == 0 {
+                "〃".to_string()
+            } else {
+                format!("{fm:.2}(未採点{fu}、プローブ{probes})")
+            }
+        };
         let others: Vec<String> = stats
             .tally
             .iter()
@@ -1084,7 +1140,7 @@ fn run_merge(files: &[String]) {
             .map(|(usi, n)| format!("{usi}×{n}"))
             .collect();
         println!(
-            "| {} | {} | {} | {hits}/{trials} | {bad_cell} | {score_cell} | {} | {} |",
+            "| {} | {} | {} | {hits}/{trials} | {bad_cell} | {score_cell} | {first_cell} | {} | {} |",
             sc.name,
             sc.ply + 1,
             sc.target,
@@ -1100,6 +1156,12 @@ fn run_merge(files: &[String]) {
         println!(
             "**平均得点の全体平均: {:.3}/10（{score_n}件、未採点合計{unscored_total}）**",
             score_sum / f64::from(score_n)
+        );
+    }
+    if first_n > 0 {
+        println!(
+            "**初手得点の全体平均: {:.3}/10（{first_n}件、反則を挟んだ試行 {probe_total}）**",
+            first_sum / f64::from(first_n)
         );
     }
 }

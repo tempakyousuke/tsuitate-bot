@@ -399,6 +399,14 @@ pub struct ChoiceStats {
     /// (受理された手, 回数) を回数降順で
     pub tally: Vec<(String, u32)>,
     pub total_fouls: u32,
+    /// (**最初に試みた手**, 回数) を回数降順で。反則プローブ（quest_0809 36手目の
+    /// 2三玉 = 7点、32手目の 3一角 = 8点のような「反則で情報を買う手」）は
+    /// 受理手ではなく最初の試みに意図があり、eval も反則前ブロックに
+    /// 「実戦手（反則）」として採点している。受理手の採点（`tally`）だけだと
+    /// 「2三玉（反則）→ 1三香で回収」が反則前ブロックの 1三香 = 3 点で
+    /// 数えられてしまう。反則が無ければ `tally` と同じ。空なら旧データ
+    /// （TRIAL 行に初手列が無い）= `tally` で代用する
+    pub first_tally: Vec<(String, u32)>,
 }
 
 impl ChoiceStats {
@@ -426,10 +434,41 @@ impl ChoiceStats {
     /// 対応: 未採点の選択は数として見える化し、evals へ追記して判定を受ける）。
     /// "resign" / "foul_limit" は 0 点
     pub fn mean_score(&self, scores: &[(String, u8)]) -> (f64, u32) {
+        Self::mean_of(&self.tally, scores)
+    }
+
+    /// **初手得点**: 最初に試みた手（反則プローブを含む）の採点表による平均得点。
+    /// `first_tally` が空（旧データ）なら `tally` で代用
+    pub fn mean_score_first(&self, scores: &[(String, u8)]) -> (f64, u32) {
+        if self.first_tally.is_empty() {
+            Self::mean_of(&self.tally, scores)
+        } else {
+            Self::mean_of(&self.first_tally, scores)
+        }
+    }
+
+    /// 初手が受理手と異なる（= 反則を挟んだ）試行の回数
+    pub fn probe_trials(&self) -> u32 {
+        if self.first_tally.is_empty() {
+            return 0;
+        }
+        let total: u32 = self.first_tally.iter().map(|(_, n)| n).sum();
+        let same: u32 = self
+            .first_tally
+            .iter()
+            .map(|(u, n)| {
+                let acc = self.tally.iter().find(|(a, _)| a == u).map(|(_, m)| *m).unwrap_or(0);
+                (*n).min(acc)
+            })
+            .sum();
+        total.saturating_sub(same)
+    }
+
+    fn mean_of(tally: &[(String, u32)], scores: &[(String, u8)]) -> (f64, u32) {
         let mut sum = 0.0f64;
         let mut n = 0u32;
         let mut unscored = 0u32;
-        for (usi, count) in &self.tally {
+        for (usi, count) in tally {
             let pt = if usi == "resign" || usi == "foul_limit" {
                 Some(0.0)
             } else {
@@ -762,16 +801,25 @@ pub fn choice_trials(
     mut on_trial: impl FnMut(u64, &str, &[String]),
 ) -> ChoiceStats {
     let mut final_tally: HashMap<String, u32> = HashMap::new();
+    let mut first_map: HashMap<String, u32> = HashMap::new();
     let mut total_fouls = 0u32;
     for seed in 0..trials {
         let (accepted, foul_seq) = choice_trial_one(rep, seed, name);
         on_trial(seed, &accepted, &foul_seq);
+        let first = foul_seq.first().cloned().unwrap_or_else(|| accepted.clone());
+        *first_map.entry(first).or_insert(0) += 1;
         *final_tally.entry(accepted).or_insert(0) += 1;
         total_fouls += foul_seq.len() as u32;
     }
     let mut tally: Vec<_> = final_tally.into_iter().collect();
     tally.sort_by(|a, b| b.1.cmp(&a.1));
-    ChoiceStats { tally, total_fouls }
+    let mut first_tally: Vec<_> = first_map.into_iter().collect();
+    first_tally.sort_by(|a, b| b.1.cmp(&a.1));
+    ChoiceStats {
+        tally,
+        total_fouls,
+        first_tally,
+    }
 }
 
 /// 棋譜の同一性キー（バッチ実行のグループ化用）。指し手列と反則試行列が
@@ -830,6 +878,7 @@ pub fn choice_trials_batch_range_with(
     mut on_trial: impl FnMut(usize, u64, &str, &[String]),
 ) -> Vec<ChoiceStats> {
     let mut tallies: Vec<HashMap<String, u32>> = vec![HashMap::new(); items.len()];
+    let mut first_tallies: Vec<HashMap<String, u32>> = vec![HashMap::new(); items.len()];
     let mut fouls_total: Vec<u32> = vec![0; items.len()];
 
     // clone 対応か（戦略の構築だけなら安い。est は遅延構築なので空のまま）
@@ -856,6 +905,8 @@ pub fn choice_trials_batch_range_with(
         for seed in seeds.clone() {
             let mut record = |i: usize, accepted: String, foul_seq: Vec<String>| {
                 on_trial(i, seed, &accepted, &foul_seq);
+                let first = foul_seq.first().cloned().unwrap_or_else(|| accepted.clone());
+                *first_tallies[i].entry(first).or_insert(0) += 1;
                 *tallies[i].entry(accepted).or_insert(0) += 1;
                 fouls_total[i] += foul_seq.len() as u32;
             };
@@ -918,13 +969,17 @@ pub fn choice_trials_batch_range_with(
 
     tallies
         .into_iter()
+        .zip(first_tallies)
         .zip(fouls_total)
-        .map(|(t, f)| {
+        .map(|((t, ft), f)| {
             let mut tally: Vec<_> = t.into_iter().collect();
             tally.sort_by(|a, b| b.1.cmp(&a.1));
+            let mut first_tally: Vec<_> = ft.into_iter().collect();
+            first_tally.sort_by(|a, b| b.1.cmp(&a.1));
             ChoiceStats {
                 tally,
                 total_fouls: f,
+                first_tally,
             }
         })
         .collect()
@@ -1389,6 +1444,7 @@ mod tests {
     #[test]
     fn 不合格計はbadリストの手の回数だけ数える() {
         let stats = ChoiceStats {
+            first_tally: vec![],
             tally: vec![
                 ("7f7e".into(), 12),
                 ("P*9h".into(), 5),
