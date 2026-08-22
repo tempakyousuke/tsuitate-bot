@@ -2,9 +2,9 @@
   "games": 104,
   "candidate": "estimator",
   "baselines": "estimator_v14",
-  "match_seed": 20260822,
+  "match_seed": 20260823,
   "shards": 4,
-  "oracle": "nofoul",
+  "oracle": "",
   "clock": "",
-  "env": "TSUITATE_PROBE_PLAN_W=1"
+  "env": ""
 }
