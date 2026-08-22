@@ -1,4 +1,4 @@
-*scenario ply=36 target=3h2g scores=7g8f:3,9g9f:6,4h4i:2,3h4i:2,8g8f:3,6g6f:2,1g2e:5,7g6f:3,7f7e:3,4h5h:2,9i9h:2,4g4f:4,7h6i:2,7i6h:3,3g2g:2,3h2g:7 bad=4h4i,3h4i,6g6f,4h5h,9i9h,7h6i,3g2g desc=37手目（先手番）。最高点は2七銀（7点）。採点はevals/quest_0809.eval.md参照
+*scenario ply=36 target=3h2g scores=7g8f:3,9g9f:6,4h4i:2,3h4i:2,8g8f:3,6g6f:2,1g2e:6,7g6f:3,7f7e:3,4h5h:2,9i9h:2,4g4f:4,7h6i:2,7i6h:3,3g2g:2,3h2g:7 bad=4h4i,3h4i,6g6f,4h5h,9i9h,7h6i,3g2g desc=37手目（先手番）。最高点は2七銀（7点）。採点はevals/quest_0809.eval.md参照
 棋戦：Shogi Quest
 手合割：平手
 先手：お相手(1815)
