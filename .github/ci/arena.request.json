@@ -6,5 +6,5 @@
   "shards": 4,
   "oracle": "",
   "clock": "",
-  "env": ""
+  "env": "TSUITATE_PROBE_PLAN_W=1"
 }
