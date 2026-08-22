@@ -266,6 +266,15 @@ pub struct CandidateScore {
     /// gain に加算された自玉近傍の敵駒排除ボーナス
     /// （own_zone_capture_w。粒子加重平均、内訳表示用）
     pub own_zone: f64,
+    /// **プローブ影の監査**（`TSUITATE_PROBE_AUDIT=1`）: 玉/経路プローブを
+    /// **重み1で計算した値**（スコアには足さない）。「w をいくつにすれば
+    /// この候補が首位を取れたか」= w* = 首位との差 / この値、を後から出すため
+    pub probe_unit: f64,
+    /// プローブの反則質量（この手が違法だと言う粒子の割合。監査用）
+    pub probe_mass: f64,
+    /// 反則質量のうち**最大の回収先マス**が占める割合（原因駒の集中度。
+    /// 低いと「どの駒が原因か割れている」= 指し直しで取りに行けない）
+    pub probe_concentration: f64,
 }
 
 /// 前進を好むヒューリスティック＋乱数（従来実装）
@@ -3526,6 +3535,10 @@ struct EvalOut {
     /// 打ちプローブの反則情報価値（drop_probe_w）。反則の失敗枝の期待値なので
     /// gain には含めず、combine_score の外側（(1−p_legal) 側）で加算する
     foul_probe: f64,
+    /// 監査用（`CandidateScore::probe_unit` の doc）
+    probe_unit: f64,
+    probe_mass: f64,
+    probe_concentration: f64,
 }
 
 impl EvalOut {
@@ -5928,7 +5941,10 @@ impl Strategy for EstimatorStrategy {
         // 玉プローブ・経路プローブ・玉センサーのコンテキスト（`ProbeCtx` の doc）。
         // 王手中は無効（CheckSolver の領分）
         let probe_ctx: Option<ProbeCtx> = (!view.you_in_check
-            && (king_probe_w() > 0.0 || path_probe_w() > 0.0 || king_sensor_w() > 0.0))
+            && (king_probe_w() > 0.0
+                || path_probe_w() > 0.0
+                || king_sensor_w() > 0.0
+                || probe_audit()))
             .then(|| ProbeCtx {
                 my_king,
                 stale_king_dests: stale_king_foul_dests(log, view.your_color, view.move_number),
@@ -6874,6 +6890,9 @@ impl Strategy for EstimatorStrategy {
                 checker_removal: out.checker_removal,
                 capture_bet_penalty: out.capture_bet_penalty,
                 own_zone: out.own_zone,
+                probe_unit: out.probe_unit,
+                probe_mass: out.probe_mass,
+                probe_concentration: out.probe_concentration,
                 mate_threat: out.mate_threat,
                 mate_risk: out.mate_risk,
                 king_holes: out.king_holes,
@@ -6894,6 +6913,26 @@ impl Strategy for EstimatorStrategy {
                 .partial_cmp(&a.score)
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
+        // **プローブ影の監査**（`TSUITATE_PROBE_AUDIT=1`、codex 提案 2026-08-22）。
+        // 重み1のプローブ値 B と首位との差 Δ から「w* = Δ/B（この候補を首位に
+        // するのに必要な重み）」を出す。w* の分布を見れば「効果量が足りないだけ」
+        // なのか「そもそも良い候補が m036 しかない」のかが、アリーナを回さずに分かる
+        if probe_audit() {
+            if let Some(top) = ranking.first().map(|c| c.score) {
+                for c in &ranking {
+                    if c.probe_unit <= 0.0 {
+                        continue;
+                    }
+                    let gap = top - c.score;
+                    let w_star = if c.probe_unit > 0.0 { gap / c.probe_unit } else { f64::INFINITY };
+                    eprintln!(
+                        "PROBEAUDIT\t{}\t{}\t{:.4}\t{:.4}\t{:.2}\t{:.3}\t{:.3}",
+                        view.move_number, c.usi, gap, c.probe_unit, w_star, c.probe_mass,
+                        c.probe_concentration
+                    );
+                }
+            }
+        }
         // 評価項の発火率フック（TSUITATE_DBG_HITS=1 のときだけ）。
         // 「中立だった変更が効いていないのか発火していないのか」の切り分け用
         if crate::hits::enabled() {
@@ -8438,10 +8477,13 @@ fn evaluate(
 ) -> EvalOut {
     let me = view.your_color;
     let opp = me.other();
-    // 玉プローブ / 経路プローブの材料（反則枝の粒子だけが足す）
-    let mut king_probe_val = 0.0f64;
+    // 玉プローブ / 経路プローブの材料（反則枝の粒子だけが足す）。
+    // 回収先のマスごとに貯めて**最後に最大のマスだけ**を採る（codex 指摘。
+    // 反則は「どの駒が原因か」を教えないので、粒子ごとの最良を足すと
+    // 取りに行けない別マスの回収価値まで二重計上になる）
+    let mut king_probe_by_sq = [0.0f64; 81];
     let mut king_probe_mass = 0.0f64;
-    let mut path_probe_val = 0.0f64;
+    let mut path_probe_by_sq = [0.0f64; 81];
     let mut path_probe_mass = 0.0f64;
     let mut legal = 0.0f64;
     let mut value_sum = 0.0;
@@ -8499,19 +8541,37 @@ fn evaluate(
                     }
                 }
             }
-            // 玉プローブ / 経路プローブの材料（`ProbeCtx` の doc）
+            // 玉プローブ / 経路プローブの材料（`ProbeCtx` の doc）。
+            // **回収先のマスごとに集計する**（codex 指摘 2026-08-22）: 反則が
+            // 教えるのは「その行き先が違法」だけで**どの駒が原因か**ではない。
+            // 粒子ごとに最良の原因駒を選んで足すと、粒子 A が「4七の飛」・
+            // 粒子 B が「3三の角」と割れている場合に**両方の回収価値を計上**して
+            // しまうが、指し直しで取りに行けるのは1マスだけ
             if let (Some(ctx), ShogiMove::Board { from, to, .. }) = (probe_ctx, *mv) {
                 if !particles_are_taint {
                     if Some(from) == ctx.my_king {
-                        if ctx.king_probe_w > 0.0 {
-                            if let Some(v) = king_probe_material(pos, to, me) {
-                                king_probe_val += w * v;
+                        // 監査モードは w=0 でも材料を集める（スコアには足さない）
+                        if ctx.king_probe_w > 0.0 || probe_audit() {
+                            let mut hit = false;
+                            for (sq, p) in pos.pieces() {
+                                if p.color != opp || !pos.attacks(sq, to) {
+                                    continue;
+                                }
+                                let aw = anchor_weight(pos, sq);
+                                if aw <= 0.0 || !my_nonking_attacks(pos, sq, me) {
+                                    continue;
+                                }
+                                king_probe_by_sq[crate::belief_features::sq_index(sq)] +=
+                                    w * aw * recovery_value(pos, sq, p.role, me);
+                                hit = true;
+                            }
+                            if hit {
                                 king_probe_mass += w;
                             }
                         }
-                    } else if ctx.path_probe_w > 0.0 {
-                        if let Some(v) = path_probe_material(pos, from, to, me) {
-                            path_probe_val += w * v;
+                    } else if ctx.path_probe_w > 0.0 || probe_audit() {
+                        if let Some((sq, v)) = path_probe_material(pos, from, to, me) {
+                            path_probe_by_sq[crate::belief_features::sq_index(sq)] += w * v;
                             path_probe_mass += w;
                         }
                     }
@@ -9637,6 +9697,10 @@ fn evaluate(
     } else {
         0.0
     };
+    // 監査用（スコアには足さない。`CandidateScore::probe_unit` の doc）
+    let mut probe_unit = 0.0f64;
+    let mut probe_mass = 0.0f64;
+    let mut probe_concentration = 0.0f64;
     // 玉プローブ / 経路プローブ（`ProbeCtx` の doc）。全粒子質量 n で正規化するので
     // (1−p_legal) の重みを内包している。玉プローブは占有の凸ゲートを掛けない
     // （失うものが無い確かめ方なので「居そうなときだけ」の制約は要らない）が、
@@ -9659,16 +9723,28 @@ fn evaluate(
                 // 学ぶことは無く、その駒は普通に取ればよい。これが無いと
                 // quest31-m057 で「94% の粒子が 5八 を塞いでいる」玉の手が
                 // score 37.9 まで跳ねた（2026-08-22 実測）
+                let best = |acc: &[f64; 81]| acc.iter().copied().fold(0.0, f64::max);
                 if Some(from) == ctx.my_king {
                     if king_probe_mass > 0.0 && !ctx.stale_king_dests.contains(&to) {
                         let info = 1.0 - (king_probe_mass / n).clamp(0.0, 1.0);
-                        ctx.king_probe_w * (king_probe_val / n) * info * budget_frac * budget_frac
+                        let unit = (best(&king_probe_by_sq) / n) * info * budget_frac * budget_frac;
+                        probe_unit = unit;
+                        probe_mass = king_probe_mass / n;
+                        probe_concentration = if king_probe_mass > 0.0 {
+                            (best(&king_probe_by_sq) / king_probe_mass).min(1.0)
+                        } else {
+                            0.0
+                        };
+                        ctx.king_probe_w * unit
                     } else {
                         0.0
                     }
                 } else if path_probe_mass > 0.0 {
                     let info = 1.0 - (path_probe_mass / n).clamp(0.0, 1.0);
-                    ctx.path_probe_w * (path_probe_val / n) * info * budget_frac * budget_frac
+                    let unit = (best(&path_probe_by_sq) / n) * info * budget_frac * budget_frac;
+                    probe_unit = unit;
+                    probe_mass = path_probe_mass / n;
+                    ctx.path_probe_w * unit
                 } else {
                     0.0
                 }
@@ -9697,6 +9773,9 @@ fn evaluate(
         hand_option: hand_option_pen,
         board_discount,
         foul_probe: foul_probe + gold_join,
+        probe_unit,
+        probe_mass,
+        probe_concentration,
     }
 }
 
@@ -10218,7 +10297,15 @@ fn anchor_weight(pos: &Position, at: Coord) -> f64 {
 /// 追跡する**ので、既定（プローブ系がすべて 0）ではアンカーは常に空になり、
 /// 粒子の重複除去キーも従来と同一 = 既定挙動が変わらない
 pub(crate) fn anchors_needed() -> bool {
-    king_probe_w() > 0.0 || path_probe_w() > 0.0
+    king_probe_w() > 0.0 || path_probe_w() > 0.0 || probe_audit()
+}
+
+/// プローブ影の監査モード（`TSUITATE_PROBE_AUDIT=1`）。プローブ値を重み1で
+/// 計算して stderr へ出すが**スコアには足さない**ので、方策は
+/// 「由来タグ追跡だけオン」の対照のまま。`CandidateScore::probe_unit` の doc
+fn probe_audit() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| std::env::var("TSUITATE_PROBE_AUDIT").is_ok_and(|v| v == "1"))
 }
 
 fn probe_anchor_decay() -> f64 {
@@ -10226,15 +10313,30 @@ fn probe_anchor_decay() -> f64 {
     *V.get_or_init(|| probe_env("TSUITATE_PROBE_ANCHOR_DECAY", 0.5).clamp(0.0, 1.0))
 }
 
-/// 原因駒 a（マス at）の回収価値: 交換価値 ＋ a が当てている自駒（玉以外）の
-/// 最大交換価値 × 0.5（脅威の解消。CheckSolver の removal_term と同じ考え方）
+/// 原因駒 a（マス at）の回収価値。既定は**交換価値だけ**（codex 指摘 2026-08-22:
+/// 「a が当てている自駒の価値 × 0.5」は較正されておらず、その駒を除けば守りの
+/// 価値が丸ごと実現する前提になっている）。`TSUITATE_PROBE_THREAT_W` で
+/// 脅威解消ぶんを足せる（アブレーション用、既定 0）。
+///
+/// 反則しても手番は変わらないので相手の応手を挟まずに取りに行ける = 交換価値を
+/// 満額で見てよい。ただし `my_nonking_attacks` は幾何的な利きしか見ておらず
+/// ピン等で実際には取れない場合があるので、なお楽観側の見積もり
 fn recovery_value(pos: &Position, at: Coord, role: Role, me: Color) -> f64 {
+    let tw = probe_threat_w();
+    if tw <= 0.0 {
+        return exchange_value(role);
+    }
     let threatened = pos
         .pieces()
         .filter(|(sq, p)| p.color == me && p.role != Role::King && pos.attacks(at, *sq))
         .map(|(_, p)| exchange_value(p.role))
         .fold(0.0, f64::max);
-    exchange_value(role) + 0.5 * threatened
+    exchange_value(role) + tw * threatened
+}
+
+fn probe_threat_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| probe_env("TSUITATE_PROBE_THREAT_W", 0.0))
 }
 
 /// 玉プローブの材料: この粒子で玉の行き先 K に利いている敵駒のうち、自分が
@@ -10250,8 +10352,9 @@ fn king_probe_material(pos: &Position, k: Coord, me: Color) -> Option<f64> {
         .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v))))
 }
 
-/// 経路プローブの材料: from→to の経路を最初に塞ぐ敵駒を自分が当てていれば回収価値
-fn path_probe_material(pos: &Position, from: Coord, to: Coord, me: Color) -> Option<f64> {
+/// 経路プローブの材料: from→to の経路を最初に塞ぐ敵駒を自分が当てていれば
+/// (そのマス, 回収価値)
+fn path_probe_material(pos: &Position, from: Coord, to: Coord, me: Color) -> Option<(Coord, f64)> {
     let opp = me.other();
     let df = (to.file - from.file).signum();
     let dr = (to.rank - from.rank).signum();
@@ -10269,7 +10372,7 @@ fn path_probe_material(pos: &Position, from: Coord, to: Coord, me: Color) -> Opt
         if let Some(p) = pos.piece_at(sq) {
             if p.color == opp && my_nonking_attacks(pos, sq, me) {
                 let v = anchor_weight(pos, sq) * recovery_value(pos, sq, p.role, me);
-                return (v > 0.0).then_some(v);
+                return (v > 0.0).then_some((sq, v));
             }
             return None;
         }
