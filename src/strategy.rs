@@ -9634,14 +9634,28 @@ fn evaluate(
         + match (probe_ctx, *mv) {
             (Some(ctx), ShogiMove::Board { from, to, .. }) if n > 0.0 => {
                 let budget_frac = f64::from(10u32.saturating_sub(view.fouls.you)) / 10.0;
+                // **凸ゲート**（drop_probe_w と同形。2026-08-22 の実測で必須と判明）:
+                // 質量に線形だと「5% の粒子がそこに駒を見ている」だけで玉が動き出す
+                // （w=3 の実測: quest31 m015/m017/m019/m057 で 5i6h（未採点の玉の手）が
+                // 15〜20/20、suite の未採点 45→209、アリーナ vs v13 40.4%）。
+                // p_mass を1つ余分に掛けて実効 p_mass² にすると、確信の低いプローブが
+                // 二乗で沈み「居そうなときだけ確かめる」人間の使い分けになる
                 if Some(from) == ctx.my_king {
                     if king_probe_mass > 0.0 && !ctx.stale_king_dests.contains(&to) {
-                        ctx.king_probe_w * (king_probe_val / n) * budget_frac * budget_frac
+                        ctx.king_probe_w
+                            * (king_probe_val / n)
+                            * (king_probe_mass / n)
+                            * budget_frac
+                            * budget_frac
                     } else {
                         0.0
                     }
                 } else if path_probe_mass > 0.0 {
-                    ctx.path_probe_w * (path_probe_val / n) * budget_frac * budget_frac
+                    ctx.path_probe_w
+                        * (path_probe_val / n)
+                        * (path_probe_mass / n)
+                        * budget_frac
+                        * budget_frac
                 } else {
                     0.0
                 }
