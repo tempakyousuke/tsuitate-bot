@@ -2087,7 +2087,11 @@ impl Estimator {
         // 少数派の説明も試行される）。混合: `keep_fraction` の割合のリプレイだけ
         // 記憶を使い、残りは従来どおり役種なし（集団の説明が間違っていたときの
         // 補充経路を残す = 固執の保険。codex 提案 2026-08-22）
-        let memory: Vec<(usize, Coord, Role)> = if self.rng.gen_range(0.0..1.0f64) < keep_fraction() {
+        // 既定（keep_fraction()==0）では **rng を引かない**。引くと乱数列がずれて
+        // ノブ off でも粒子が変わる（既定挙動の同一性が壊れる）ので短絡が必須
+        let memory: Vec<(usize, Coord, Role)> = if keep_fraction() > 0.0
+            && self.rng.gen_range(0.0..1.0f64) < keep_fraction()
+        {
             let cidxs: Vec<usize> = self.capture_roles.iter().map(|(c, _, _)| *c).collect();
             cidxs
                 .into_iter()
