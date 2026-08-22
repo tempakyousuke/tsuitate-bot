@@ -118,6 +118,178 @@ const GUIDE_BOOST: f64 = 24.0;
 /// 効果未確認・コストありのため、検証済みの8へ戻す
 const GUIDE_HORIZON: usize = 8;
 
+/// 若返りの引き直しで捕獲の説明役種を持ち越す（`TSUITATE_REJUV_KEEP_CAPTURER`、
+/// 既定 0 = 従来挙動。`Estimator::explained_captures` の doc 参照）
+fn rejuv_keep_capturer() -> bool {
+    keep_fraction() > 0.0
+}
+
+/// 捕獲の説明役種の記憶で接近をブーストする後読み幅（制約数）。一般の
+/// GUIDE_HORIZON（8 = 相手4手）では「2三→2四→2五→x2六」＋別筋の歩の
+/// 2手のような複数の needle を同じ窓で通せず、飛び駒の1手説明が残る。
+/// 記憶由来の接近は対象が (役種, マス) 1組なので広げてもコストは小さい
+const CAPTURE_MEMORY_HORIZON: usize = 24;
+
+/// 捕獲の説明役種の記憶をガイドへ写す: 捕獲制約そのもの（cidx == i）には
+/// 「その役種で X に着地」（lands）を、その手前 GUIDE_HORIZON 制約以内の
+/// 相手決定点には「その役種が X へ近づく手」（approach_strong）を積む。
+/// 歩の「2四→2五→2六」のような多手経路は、捕獲の手番だけをブーストしても
+/// 歩が 2五 に居なければ成立しないので、手前の決定点から寄せる必要がある
+fn apply_capture_memory(guide: &mut Guide, memory: &[(usize, Coord, Role)], i: usize) {
+    for &(cidx, at, role) in memory {
+        if cidx == i {
+            guide.lands.push((at, role));
+            guide.approach_strong.push((role, at));
+        } else if i < cidx && cidx - i <= CAPTURE_MEMORY_HORIZON {
+            // 役種つきの接近（盤上移動）と、役種つきの「X へ利きを作る手」
+            // （打ちを含む = 「打ってから X を取る」経路）。役種を問わない
+            // attacks はこの捕獲由来のものだけ build_guide 側で積まない
+            guide.approach_strong.push((role, at));
+            guide.attacks_role.push((role, at));
+        }
+    }
+}
+
+/// 集団記憶（`Estimator::capture_roles`）から制約 i の捕獲の説明役種を1つ
+/// 確率的に引く（ヒストグラム比例。記憶が無いか無効なら None）。
+/// self の他フィールドを借りている最中にも呼べるよう自由関数にしてある
+fn sample_capture_role(
+    capture_roles: &[(usize, Coord, Vec<(Role, f64)>)],
+    i: usize,
+    rng: &mut StdRng,
+) -> Option<(Coord, Role)> {
+    if !rejuv_keep_capturer() {
+        return None;
+    }
+    let (_, at, hist) = capture_roles.iter().find(|(c, _, _)| *c == i)?;
+    let total: f64 = hist.iter().map(|(_, n)| n).sum();
+    if !(total > 0.0) {
+        return None;
+    }
+    let mut pick = rng.gen_range(0.0..1.0f64) * total;
+    for (role, n) in hist {
+        if pick < *n {
+            return Some((*at, *role));
+        }
+        pick -= n;
+    }
+    hist.last().map(|(role, _)| (*at, *role))
+}
+
+/// 実データの取り手事前（`bin/capturer_probe`、対人83局、成駒は元の駒種へ）。
+/// 取られた駒が歩なら歩条件付き、それ以外は全捕獲の分布
+fn capturer_prior(victim: Option<Role>) -> Vec<(Role, f64)> {
+    if victim == Some(Role::Pawn) {
+        vec![
+            (Role::Pawn, 0.579),
+            (Role::Knight, 0.140),
+            (Role::Bishop, 0.092),
+            (Role::Rook, 0.053),
+            (Role::Silver, 0.051),
+            (Role::Gold, 0.043),
+            (Role::King, 0.025),
+            (Role::Lance, 0.016),
+        ]
+    } else {
+        vec![
+            (Role::Pawn, 0.387),
+            (Role::Knight, 0.146),
+            (Role::Silver, 0.107),
+            (Role::Rook, 0.103),
+            (Role::Gold, 0.083),
+            (Role::Bishop, 0.075),
+            (Role::King, 0.059),
+            (Role::Lance, 0.041),
+        ]
+    }
+}
+
+/// 集団ヒストグラムを実データ事前へ縮める混合比（`TSUITATE_CAPTURE_PRIOR_LAMBDA`、
+/// 既定 0.3。0 で縮小なし）
+fn capture_prior_lambda() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_CAPTURE_PRIOR_LAMBDA")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (0.0..1.0).contains(v))
+            .unwrap_or(0.3)
+    })
+}
+
+/// ゼロ再生成のうち記憶を使う割合（`TSUITATE_REJUV_KEEP_CAPTURER` の値。
+/// `1` = 常に、`0.5` = 半分。若返りは常に粒子自身の履歴を使う）
+fn keep_fraction() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("TSUITATE_REJUV_KEEP_CAPTURER")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .map(|v| v.min(1.0))
+            .unwrap_or(0.0)
+    })
+}
+
+/// 再ベース点より前の決定点でも提案補正 ln(p/g) を積む（`TSUITATE_REGEN_KEEP_IS`、
+/// 既定: 記憶が有効なら on、無効なら off = 従来挙動。`1`/`0` で強制）
+fn regen_keep_is() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("TSUITATE_REGEN_KEEP_IS") {
+        Ok(v) => v != "0" && !v.is_empty(),
+        Err(_) => rejuv_keep_capturer(),
+    })
+}
+
+/// 診断: `TSUITATE_DEBUG_REJUV=1` で若返りの捕獲説明の持ち越し結果を stderr へ出す
+fn debug_rejuv() -> bool {
+    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("TSUITATE_DEBUG_REJUV").is_ok_and(|v| v == "1"))
+}
+
+/// 診断: `TSUITATE_DEBUG_REJUV_SQ=2f,2g` で指定したマスの相手駒種を
+/// 再生成・若返りの成功時に出す（`debug_rejuv` と併用）
+fn debug_squares_summary(pos: &Position, opp: Color) -> String {
+    static SQ: std::sync::OnceLock<Vec<Coord>> = std::sync::OnceLock::new();
+    let squares = SQ.get_or_init(|| {
+        std::env::var("TSUITATE_DEBUG_REJUV_SQ")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|s| crate::board::parse_usi_square(s.trim()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    });
+    squares
+        .iter()
+        .map(|&sq| {
+            let role = pos
+                .piece_at(sq)
+                .map(|p| {
+                    if p.color == opp {
+                        format!("{:?}", p.role)
+                    } else {
+                        "mine".to_string()
+                    }
+                })
+                .unwrap_or_else(|| "empty".to_string());
+            format!("{}{}={role}", sq.file, sq.rank)
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// 制約 c がマス at に触れるか（捕獲の説明役種を持ち越してよいかの判定）
+fn constraint_touches(c: &Constraint, at: Coord) -> bool {
+    match c {
+        Constraint::MyMove { mv, .. } | Constraint::MyFoul { mv } => match *mv {
+            ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to == at,
+        },
+        Constraint::OppMove { captured_at, .. } => *captured_at == Some(at),
+    }
+}
+
 /// 診断用: TSUITATE_DISABLE_DEFEND_GUIDE=1 で「MyFoul由来のガイド」
 /// （自玉移動反則→guide.attacks、打ちマス反則→guide.occupies）を
 /// まとめて無効化できる（速度差の切り分け専用。一時的なフラグ）
@@ -309,6 +481,15 @@ struct Guide {
     /// 歩打ちだけは打ち歩詰め（相手玉が見えないので自分からは判定不能）と
     /// いう別の反則理由がありうるため対象外にする
     occupies: Vec<Coord>,
+    /// 捕獲の説明役種の記憶（`rejuv_keep_capturer`）由来の接近: 「駒種 R を
+    /// 持つ駒が X へ近づく手」を `approach` より強く（GUIDE_BOOST）ブーストする。
+    /// 通常の approach が弱いのは「向かっているだけで確定ではない」からだが、
+    /// 記憶は粒子集団が観測整合のうえで採っていた説明なので強く信じてよい。
+    /// 歩の「2四→2五→2六」のような多手経路は ×3 では飛び駒の1手説明に負ける
+    approach_strong: Vec<(Role, Coord)>,
+    /// 同じく記憶由来: 「駒種 R の駒が X へ利きを作る手」（打ちを含む）を
+    /// GUIDE_BOOST。役種を問わない `attacks` の役種つき版
+    attacks_role: Vec<(Role, Coord)>,
 }
 
 impl Guide {
@@ -317,6 +498,8 @@ impl Guide {
             && self.attacks.is_empty()
             && self.approach.is_empty()
             && self.occupies.is_empty()
+            && self.approach_strong.is_empty()
+            && self.attacks_role.is_empty()
     }
 }
 
@@ -405,6 +588,18 @@ pub struct Estimator {
     /// 相手手の事前分布の threat_known 特徴量に使う。idx は制約列上の位置
     my_capture_idx: Vec<usize>,
     my_capture_sq: Vec<Coord>,
+    /// 相手が自駒を取ったマス（= 相手の駒がそこに来たことを自分が知っている
+    /// ＝相手側の**露見駒**）。相手手の事前分布の「露見歩の継続前進」補正
+    /// （`opp_pawn_intent_factor`）に使う。idx は制約列上の位置
+    opp_capture_idx: Vec<usize>,
+    opp_capture_sq: Vec<Coord>,
+    /// **捕獲の説明役種の集団記憶**（`rejuv_keep_capturer`）: 相手の捕獲制約
+    /// （制約 cidx、マス at）を適用した直後の厳密生存粒子が、そのマスの捕獲を
+    /// どの駒種（成りを剥がす）で説明していたかのヒストグラム。ゼロからの
+    /// 再生成（`replay_once`）は粒子の履歴を持たないので、これを提案分布の
+    /// lands/approach ガイドに渡す（役種はヒストグラムから確率的に引く =
+    /// 少数派の説明も提案され続ける。ブーストのみでマスクしない）
+    capture_roles: Vec<(usize, Coord, Vec<(Role, f64)>)>,
     /// 自分の手が触れたマス（from/to）。初期配置から動いていない自駒
     /// （相手が推論で狙ってくる = threat_home 特徴量）の判定に使う
     my_touched_idx: Vec<usize>,
@@ -518,6 +713,9 @@ impl Estimator {
             constraints: vec![],
             my_capture_idx: vec![],
             my_capture_sq: vec![],
+            opp_capture_idx: vec![],
+            opp_capture_sq: vec![],
+            capture_roles: vec![],
             my_touched_idx: vec![],
             my_touched_sq: vec![],
             cursor: 0,
@@ -746,9 +944,21 @@ impl Estimator {
             // in_check_at[idx] = この制約を処理する直前の被王手状態
             self.in_check_at.push(self.in_check);
             match &constraint {
-                Constraint::OppMove { gives_check, .. } => {
+                Constraint::OppMove {
+                    gives_check,
+                    captured_at,
+                    ..
+                } => {
                     self.in_check = *gives_check;
                     self.pending_opp_foul_count = 0;
+                    // 相手が自駒を取ったマス = 相手の露見駒の位置
+                    // （この制約を適用する粒子の標本化では「まだ知らない」ので、
+                    // idx はこの制約の位置。partition_point(|j| j < i) で
+                    // 「i より前の露見」だけが渡る）
+                    if let Some(sq) = captured_at {
+                        self.opp_capture_idx.push(self.constraints.len());
+                        self.opp_capture_sq.push(*sq);
+                    }
                 }
                 Constraint::MyMove { .. } => {
                     self.in_check = false;
@@ -905,6 +1115,7 @@ impl Estimator {
                     *my_foul_count,
                     &self.my_capture_sq,
                     &self.my_touched_sq,
+                    &self.opp_capture_sq,
                     &Guide::default(),
                     belief.as_ref().map(|b| (b, live_w)),
                     &mut self.rng,
@@ -919,6 +1130,71 @@ impl Estimator {
                 strict_dls.push(dlw);
             } else {
                 failed.push((backup, pen, lw, hist, taint));
+            }
+        }
+        // 捕獲の説明役種の集団記憶（doc は capture_roles フィールド参照）。
+        // 厳密生存粒子（若返り・再生成より前 = 観測と整合した「素の」説明）で
+        // 取る。生存ゼロなら記録しない（ブラインドの説明を記憶しても意味が薄い）
+        if rejuv_keep_capturer() {
+            if let Constraint::OppMove {
+                captured_at: Some(at),
+                ..
+            } = constraint
+            {
+                let opp = my_color.other();
+                // 粒子の重み（logw）で数える（分割粒子は重みが割られているので
+                // 頭数で数えると歪む。codex 指摘）。最大 logw 基準で正規化
+                let max_lw = surv_logw
+                    .iter()
+                    .zip(&surv_pen)
+                    .zip(&surv_taint)
+                    .filter(|((_, pen), taint)| **pen == 0 && **taint == 0)
+                    .map(|((&lw, _), _)| lw)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let mut hist_roles: Vec<(Role, f64)> = vec![];
+                for (((pos, pen), taint), lw) in surv_pos
+                    .iter()
+                    .zip(&surv_pen)
+                    .zip(&surv_taint)
+                    .zip(&surv_logw)
+                {
+                    if *pen != 0 || *taint != 0 {
+                        continue;
+                    }
+                    let Some(p) = pos.piece_at(*at).filter(|p| p.color == opp) else {
+                        continue;
+                    };
+                    let role = unpromote_role(p.role);
+                    let w = (lw - max_lw).exp();
+                    match hist_roles.iter_mut().find(|(r, _)| *r == role) {
+                        Some(e) => e.1 += w,
+                        None => hist_roles.push((role, w)),
+                    }
+                }
+                if !hist_roles.is_empty() {
+                    // 取られた駒種（実データの取り手事前の条件）は適用前の
+                    // スナップショットの自駒から分かる
+                    let victim = surv_hist
+                        .iter()
+                        .find_map(|h| h.back())
+                        .and_then(|s| s.pos.piece_at(*at))
+                        .filter(|p| p.color == my_color)
+                        .map(|p| unpromote_role(p.role));
+                    // 実データの事前へ縮める（λ 混合）。集団が 98% 歩でも角などの
+                    // 少数派が提案され続けるようにする（固執の保険）
+                    let lambda = capture_prior_lambda();
+                    if lambda > 0.0 {
+                        let total: f64 = hist_roles.iter().map(|(_, w)| w).sum();
+                        for (role, prior) in capturer_prior(victim) {
+                            let add = lambda / (1.0 - lambda) * total * prior;
+                            match hist_roles.iter_mut().find(|(r, _)| *r == role) {
+                                Some(e) => e.1 += add,
+                                None => hist_roles.push((role, add)),
+                            }
+                        }
+                    }
+                    self.capture_roles.push((cidx, *at, hist_roles));
+                }
             }
         }
         // 若返り（C-7 P2 / D3）: 厳密生存が薄いときは、棄却粒子を直近の
@@ -1122,6 +1398,7 @@ impl Estimator {
                 *my_foul_count,
                 &self.my_capture_sq,
                 &self.my_touched_sq,
+                &self.opp_capture_sq,
                 &Guide::default(),
                 belief.as_ref().map(|b| (b, guide_w)),
                 &mut self.rng,
@@ -1205,6 +1482,7 @@ impl Estimator {
                     *my_foul_count,
                     &self.my_capture_sq,
                     &self.my_touched_sq,
+                    &self.opp_capture_sq,
                     &Guide::default(),
                     None,
                     &mut self.rng,
@@ -1251,8 +1529,41 @@ impl Estimator {
                         continue;
                     }
                     attempts += 1;
+                    // 捕獲の説明役種の持ち越し（rejuv_keep_capturer）。棄却粒子
+                    // 自身の履歴から「巻き戻し区間の相手の捕獲を何の駒で説明して
+                    // いたか」を取り出し、引き直しの提案分布へ lands/approach で
+                    // 渡す（ブーストのみ・マスクなし = 後の制約が歩説を否定する
+                    // 局面では歩説の試行が落ちて別の説明が残る）
+                    let mut memory = if rejuv_keep_capturer() {
+                        self.explained_captures(&f.0, hist, snap.cidx, upto, current)
+                    } else {
+                        vec![]
+                    };
+                    // 粒子自身の履歴に無い捕獲（窓の外で起きた説明が巻き戻しで
+                    // 失われる場合など）は集団記憶から引いて補う
+                    if rejuv_keep_capturer() {
+                        for i in snap.cidx..upto {
+                            if memory.iter().any(|(c, _, _)| *c == i) {
+                                continue;
+                            }
+                            if let Some((at, role)) =
+                                sample_capture_role(&self.capture_roles, i, &mut self.rng)
+                            {
+                                if !current.is_some_and(|c| constraint_touches(c, at)) {
+                                    memory.push((i, at, role));
+                                }
+                            }
+                        }
+                    }
                     for _ in 0..REJUV_TRIES {
-                        if let Some(out) = self.replay_segment(snap, hist, upto, current) {
+                        if let Some(out) = self.replay_segment(snap, hist, upto, current, &memory) {
+                            if debug_rejuv() {
+                                eprintln!(
+                                    "[rejuv-done] upto={upto} from={} {}",
+                                    snap.cidx,
+                                    debug_squares_summary(&out.0, self.my_color.other())
+                                );
+                            }
                             repaired.push(out);
                             *slot = None;
                             break;
@@ -1280,6 +1591,7 @@ impl Estimator {
         hist: &VecDeque<Snap>,
         upto: usize,
         current: Option<&Constraint>,
+        memory: &[(usize, Coord, Role)],
     ) -> Option<Repaired> {
         let mut pos = snap.pos.clone();
         let mut lw = snap.logw;
@@ -1293,6 +1605,7 @@ impl Estimator {
         // wipe をまたぐエントリはエポック正規化済みなのでそのまま使える
         let mut new_hist: VecDeque<Snap> =
             hist.iter().filter(|s| s.cidx <= snap.cidx).cloned().collect();
+        let memory_cidx: Vec<usize> = memory.iter().map(|(c, _, _)| *c).collect();
         let end = upto + usize::from(current.is_some());
         for i in snap.cidx..end {
             let c: &Constraint = if i < upto {
@@ -1327,7 +1640,11 @@ impl Estimator {
                     }
                     let k = self.my_capture_idx.partition_point(|&j| j < i);
                     let t = self.my_touched_idx.partition_point(|&j| j < i);
-                    let guide = self.build_guide(i, upto, current);
+                    let r = self.opp_capture_idx.partition_point(|&j| j < i);
+                    let mut guide = self.build_guide(i, upto, current, &memory_cidx);
+                    // この決定点の捕獲を以前どの駒種で説明していたかを提案へ
+                    // 渡す（同じ駒種で着地する手と、その駒種が近づく手を優先）
+                    apply_capture_memory(&mut guide, memory, i);
                     match sample_opp_move(
                         &mut pos,
                         self.my_color,
@@ -1337,12 +1654,27 @@ impl Estimator {
                         *my_foul_count,
                         &self.my_capture_sq[..k],
                         &self.my_touched_sq[..t],
+                        &self.opp_capture_sq[..r],
                         &guide,
                         belief.as_ref().filter(|_| i >= belief_from).map(|b| (b, guide_w)),
                         &mut self.rng,
                     ) {
                         Some(dlw) => {
                             lw += dlw;
+                            if debug_rejuv() {
+                                for &(cidx, at, role) in memory {
+                                    if cidx == i {
+                                        let got = pos
+                                            .piece_at(at)
+                                            .filter(|p| p.color == self.my_color.other())
+                                            .map(|p| unpromote_role(p.role));
+                                        eprintln!(
+                                            "[rejuv] cidx={i} at={}{} memory={role:?} got={got:?} depth_from={}",
+                                            at.file, at.rank, snap.cidx
+                                        );
+                                    }
+                                }
+                            }
                             true
                         }
                         None => false,
@@ -1355,6 +1687,74 @@ impl Estimator {
             }
         }
         Some((pos, miss, lw, new_hist, taint))
+    }
+
+    /// **捕獲の説明役種の持ち越し**（2026-08-22、quest_0809 の「2六の歩を取った
+    /// 駒」が発端）: 棄却粒子は巻き戻し区間の相手の捕獲（OppMove captured_at=X）
+    /// を既に何かの駒種で説明しており、その説明はここまでの制約すべてと整合して
+    /// いた。若返りの引き直しでは X のガイドが役種を持たない（捕獲観測は駒種を
+    /// 明かさない）ため、1〜2手で X に届く飛び駒の説明が「2四→2五→2六」のような
+    /// 歩の多手経路を押しのけ、取った直後 98.6% だった「歩」が5手で「角 46%」へ
+    /// 劣化していた（実データ: 歩を取ったのは歩 58%・角 9%）。
+    /// 粒子自身の履歴（スナップショット窓と棄却時の局面）から、捕獲直後に X に
+    /// 立っていた相手駒の役種を取り出して返す。**固執の防止**: ①提案分布の
+    /// ブーストだけでマスクしない（後の制約が歩説を否定すれば歩説の試行が落ち、
+    /// 別の説明が残る）、②今回の失敗制約（current）が X に触れる証拠（X での
+    /// 自分の捕獲・X への着手・X での反則・X で取られた）なら説明そのものが
+    /// 疑わしいので持ち越さない
+    fn explained_captures(
+        &self,
+        rejected_pos: &Position,
+        hist: &VecDeque<Snap>,
+        from: usize,
+        upto: usize,
+        current: Option<&Constraint>,
+    ) -> Vec<(usize, Coord, Role)> {
+        let opp = self.my_color.other();
+        let mut out = vec![];
+        for i in from..upto {
+            let Constraint::OppMove {
+                captured_at: Some(at),
+                ..
+            } = &self.constraints[i]
+            else {
+                continue;
+            };
+            let at = *at;
+            if current.is_some_and(|c| constraint_touches(c, at)) {
+                continue;
+            }
+            // 自分が次の手でその捕獲駒を X で取り返していれば役種は観測で確定
+            // （codex 指摘: スナップショットには自駒が写るので拾えない）
+            let recaptured = self.constraints[i + 1..upto]
+                .iter()
+                .take_while(|c| !matches!(c, Constraint::OppMove { .. }))
+                .find_map(|c| match c {
+                    Constraint::MyMove {
+                        mv: ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. },
+                        captured: Some(role),
+                        ..
+                    } if *to == at => Some(unpromote_role(*role)),
+                    _ => None,
+                });
+            if let Some(role) = recaptured {
+                out.push((i, at, role));
+                continue;
+            }
+            // 制約 i の適用後の状態 = 次の相手決定点のスナップショット（無ければ
+            // 棄却時の局面 = 失敗した制約の適用前）
+            let after = hist
+                .iter()
+                .find(|s| s.cidx > i)
+                .map(|s| &s.pos)
+                .unwrap_or(rejected_pos);
+            if let Some(p) = after.piece_at(at) {
+                if p.color == opp {
+                    out.push((i, at, unpromote_role(p.role)));
+                }
+            }
+        }
+        out
     }
 
     /// 制約後読みガイド: 決定点 i の後（最大 GUIDE_HORIZON 制約先まで）から
@@ -1373,7 +1773,16 @@ impl Estimator {
     ///   残る理由は着地マスの占有がほぼ全て。王手中は「合駒のはずが実は違う
     ///   ラインだった」という別説明があるので除外する）→ occupies
     /// upto 位置には current（未登録の制約）が入る。None なら constraints のみ
-    fn build_guide(&self, i: usize, upto: usize, current: Option<&Constraint>) -> Guide {
+    /// `skip_attacks`: 捕獲の説明役種を記憶している制約 index。その捕獲由来の
+    /// 役種なし `attacks` は積まない（役種つきの `attacks_role` / `approach_strong`
+    /// に置き換わる）。同じマスに関わる**他の**証拠由来の attacks は残す
+    fn build_guide(
+        &self,
+        i: usize,
+        upto: usize,
+        current: Option<&Constraint>,
+        skip_attacks: &[usize],
+    ) -> Guide {
         let mut guide = Guide::default();
         // king_at は O(1) 参照（king_square_before の全体再走査版は廃止）。
         // i が未記録の最新位置なら self.my_king が正しい値
@@ -1402,7 +1811,11 @@ impl Estimator {
                 Constraint::OppMove {
                     captured_at: Some(at),
                     ..
-                } => guide.attacks.push(*at),
+                } => {
+                    if !skip_attacks.contains(&j) {
+                        guide.attacks.push(*at);
+                    }
+                }
                 Constraint::MyFoul {
                     mv: ShogiMove::Board { from, to, .. },
                 } if *from == king && !defend_guide_disabled() => {
@@ -1490,6 +1903,7 @@ impl Estimator {
             .zip(&self.phys_taint)
             .filter(|&(&m, &t)| m == 0 && t == 0)
             .count();
+        let strict_before_regen = strict;
         if strict < self.target {
             for _ in 0..self.regen_attempts {
                 if strict >= self.target || std::time::Instant::now() > regen_deadline {
@@ -1504,6 +1918,15 @@ impl Estimator {
                     strict += 1;
                 }
             }
+        }
+        if debug_rejuv() {
+            eprintln!(
+                "[replenish] cidx={} strict_before={} regenerated={} repaired_total={}",
+                self.constraints.len(),
+                strict_before_regen,
+                strict - strict_before_regen,
+                self.rejuv_repaired
+            );
         }
         let deadline = start + std::time::Duration::from_millis(self.empty_deadline_ms);
         while self.particles.is_empty() && std::time::Instant::now() < deadline {
@@ -1659,6 +2082,28 @@ impl Estimator {
             None => (Position::initial(), 0),
         };
         let mut lw = 0.0f64;
+        // 捕獲の説明役種の集団記憶を、このリプレイで使う役種として1回だけ引く
+        // （リプレイ内で一貫した説明にする。引き直しのたびに別の役種を引くので
+        // 少数派の説明も試行される）。混合: `keep_fraction` の割合のリプレイだけ
+        // 記憶を使い、残りは従来どおり役種なし（集団の説明が間違っていたときの
+        // 補充経路を残す = 固執の保険。codex 提案 2026-08-22）
+        // 既定（keep_fraction()==0）では **rng を引かない**。引くと乱数列がずれて
+        // ノブ off でも粒子が変わる（既定挙動の同一性が壊れる）ので短絡が必須
+        let memory: Vec<(usize, Coord, Role)> = if keep_fraction() > 0.0
+            && self.rng.gen_range(0.0..1.0f64) < keep_fraction()
+        {
+            let cidxs: Vec<usize> = self.capture_roles.iter().map(|(c, _, _)| *c).collect();
+            cidxs
+                .into_iter()
+                .filter_map(|c| {
+                    sample_capture_role(&self.capture_roles, c, &mut self.rng)
+                        .map(|(at, role)| (c, at, role))
+                })
+                .collect()
+        } else {
+            vec![]
+        };
+        let memory_cidx: Vec<usize> = memory.iter().map(|(c, _, _)| *c).collect();
         // 決定点スタック: (制約index, 適用前の局面, 適用前の対数重み, 再試行回数)
         let mut stack: Vec<(usize, Position, f64, u32)> = vec![];
         while i < n {
@@ -1687,8 +2132,12 @@ impl Estimator {
                     // この時点までに自分が駒を取ったマス／触れたマス
                     let k = self.my_capture_idx.partition_point(|&j| j < i);
                     let t = self.my_touched_idx.partition_point(|&j| j < i);
-                    let guide = self.build_guide(i, n, None);
-                    match sample_opp_move(
+                    let r = self.opp_capture_idx.partition_point(|&j| j < i);
+                    let mut guide = self.build_guide(i, n, None, &memory_cidx);
+                    // 捕獲の説明役種の集団記憶（ゼロ再生成は粒子の履歴を持たない
+                    // ので、捕獲時の生存集団のヒストグラムから引いた役種を提案へ）
+                    apply_capture_memory(&mut guide, &memory, i);
+                    match sample_opp_move_split(
                         &mut pos,
                         self.my_color,
                         *captured_at,
@@ -1697,16 +2146,22 @@ impl Estimator {
                         *my_foul_count,
                         &self.my_capture_sq[..k],
                         &self.my_touched_sq[..t],
+                        &self.opp_capture_sq[..r],
                         &guide,
                         belief.as_ref().filter(|_| i >= belief_from).map(|b| (b, guide_w)),
                         &mut self.rng,
                     ) {
-                        Some(dlw) => {
-                            // logw は再ベース点以降だけ課金する（リサンプリングで
+                        Some((log_obs, log_is)) => {
+                            // 観測尤度は再ベース点以降だけ課金する（リサンプリングで
                             // 0 に再ベースされた生存粒子とのスケール合わせ。
-                            // それ以前の質量は「集団の典型と同じ」とみなす近似）
+                            // それ以前の質量は「集団の典型と同じ」とみなす近似）。
+                            // 提案補正 ln(p/g) は常に積む（捨てるとガイドが
+                            // 再生成の分布を歪める。`regen_keep_is` が 0 なら
+                            // 従来どおり両方とも捨てる = 切り戻し用）
                             if i >= self.rebase_cidx {
-                                lw += dlw;
+                                lw += log_obs + log_is;
+                            } else if regen_keep_is() {
+                                lw += log_is;
                             }
                             true
                         }
@@ -1737,6 +2192,12 @@ impl Estimator {
                     break;
                 }
             }
+        }
+        if debug_rejuv() {
+            eprintln!(
+                "[regen-done] cidx={n} {}",
+                debug_squares_summary(&pos, self.my_color.other())
+            );
         }
         // スタックには全決定点の適用前状態が積まれている（成功時は pop されない）
         // ので、末尾 REJUV_SNAPSHOTS 件がそのまま若返り窓になる
@@ -2371,6 +2832,9 @@ fn newly_threatens(pos: &Position, next: &Position, mv: &ShogiMove, targets: &[C
 /// - known_squares: 自分が駒を取ったマス（相手は自駒がそこで死んだことを知っている）
 /// - my_touched: 自分の手が触れたマス（初期配置のまま動いていない自駒の判定用。
 ///   相手はそれらを推論で狙ってくる = 飛車頭への歩打ち等）
+/// - opp_revealed: 相手が自駒を取ったマス（この決定点より前のもの）。粒子上で
+///   そこに相手の歩が立っていれば「露見歩」= 意図を持って前進してきた駒
+///   （`opp_pawn_intent_factor`）
 /// - guide: 制約後読みガイド（若返り・リプレイ用）。該当手を GUIDE_BOOST 倍した
 ///   提案分布から選ぶ。マスクはしない（成功しうる素の経路を提案の台から消すと
 ///   補正が定義できない）
@@ -2384,14 +2848,52 @@ fn sample_opp_move(
     my_foul_count_last_turn: u32,
     known_squares: &[Coord],
     my_touched: &[Coord],
+    opp_revealed: &[Coord],
     guide: &Guide,
     belief: Option<(&BeliefPrior, f64)>,
     rng: &mut StdRng,
 ) -> Option<f64> {
+    sample_opp_move_split(
+        pos,
+        my_color,
+        captured_at,
+        gives_check,
+        foul_count_this_turn,
+        my_foul_count_last_turn,
+        known_squares,
+        my_touched,
+        opp_revealed,
+        guide,
+        belief,
+        rng,
+    )
+    .map(|(log_obs, log_is)| log_obs + log_is)
+}
+
+/// `sample_opp_move` の本体。対数重みの増分を **(観測尤度 ln r, 提案補正
+/// ln(p/g))** の2成分で返す。`replay_once` は再ベース点より前の観測尤度を
+/// 捨てる近似をするが、提案補正は捨ててはいけない（codex 指摘 2026-08-22:
+/// 捨てると ×24 のガイドが再生成の分布そのものを歪める）ので分けて返す
+#[allow(clippy::too_many_arguments)]
+fn sample_opp_move_split(
+    pos: &mut Position,
+    my_color: Color,
+    captured_at: Option<Coord>,
+    gives_check: Option<bool>,
+    foul_count_this_turn: u32,
+    my_foul_count_last_turn: u32,
+    known_squares: &[Coord],
+    my_touched: &[Coord],
+    opp_revealed: &[Coord],
+    guide: &Guide,
+    belief: Option<(&BeliefPrior, f64)>,
+    rng: &mut StdRng,
+) -> Option<(f64, f64)> {
     let opp = my_color.other();
     if pos.turn() != opp {
         return None;
     }
+    let intent = opp_pawn_intent_w();
     // 初期配置から動いていない自駒のマス（粒子内の実配置と突き合わせる）
     let initial = Position::initial();
     let homes: Vec<Coord> = initial
@@ -2460,7 +2962,8 @@ fn sample_opp_move(
             my_foul_count_last_turn,
             moved_from_known_attacked(pos, &mv, opp, known_squares),
             checks_me,
-        ) * capture_reveal_factor(pos, &mv, opp, reveal_w);
+        ) * capture_reveal_factor(pos, &mv, opp, reveal_w)
+            * opp_pawn_intent_factor(pos, &mv, opp, opp_revealed, &intent);
         // **王手の説明としての打ちの補正**（2026-08-20、arena-check-foul02 が
         // 発端。ユーザー指摘「6三桂打には と金の紐がある」で hang 犯人説が
         // 崩れ、真因は is_drop の基礎ペナルティと判明）: opp_move NN には
@@ -2526,7 +3029,7 @@ fn sample_opp_move(
     pos.play_unchecked(chosen);
     // weighted_choice_idx が成功した時点で class_mass > 0、total_mass ≥ class_mass
     let r = (class_mass / total_mass).min(1.0);
-    Some(r.ln() + (w_c / class_mass).ln() - (g_c / guide_mass).ln())
+    Some((r.ln(), (w_c / class_mass).ln() - (g_c / guide_mass).ln()))
 }
 
 /// 多段ガイドの接近ブースト倍率（GUIDE_BOOST より弱め。「向かっている」だけで
@@ -2561,11 +3064,15 @@ fn guide_boost_factor(pos: &Position, next: &Position, mv: &ShogiMove, guide: &G
     if guide.attacks.iter().any(|&sq| sq != to && next.attacks(to, sq)) {
         return GUIDE_BOOST;
     }
+    if guide
+        .attacks_role
+        .iter()
+        .any(|&(r, sq)| r == role && sq != to && next.attacks(to, sq))
+    {
+        return GUIDE_BOOST;
+    }
     if let Some(from) = from {
-        for &(r, target) in &guide.approach {
-            if r != role || target == to {
-                continue; // target==to は既に lands で処理済み（二重ブースト回避）
-            }
+        let approaches = |target: Coord| -> bool {
             let before = crate::deduce::distance_empty_board(role, mover, from, target, false)
                 .into_iter()
                 .chain(crate::deduce::distance_empty_board(
@@ -2576,10 +3083,20 @@ fn guide_boost_factor(pos: &Position, next: &Position, mv: &ShogiMove, guide: &G
                 .into_iter()
                 .chain(crate::deduce::distance_empty_board(role, mover, to, target, true))
                 .min();
-            if let (Some(b), Some(a)) = (before, after) {
-                if a < b {
-                    return GUIDE_APPROACH_BOOST;
-                }
+            matches!((before, after), (Some(b), Some(a)) if a < b)
+        };
+        // 記憶由来の接近は着地と同じ強さ（多手経路の needle を通すため）
+        for &(r, target) in &guide.approach_strong {
+            if r == role && target != to && approaches(target) {
+                return GUIDE_BOOST;
+            }
+        }
+        for &(r, target) in &guide.approach {
+            if r != role || target == to {
+                continue; // target==to は既に lands で処理済み（二重ブースト回避）
+            }
+            if approaches(target) {
+                return GUIDE_APPROACH_BOOST;
             }
         }
     }
@@ -2653,6 +3170,115 @@ fn check_drop_target() -> f64 {
 
 /// 動的ブーストの倍率上限（過小シェアの局面でも青天井にしない）
 const CHECK_DROP_TARGET_MAX_BOOST: f64 = 8.0;
+
+/// **露見歩の継続前進**の事前補正（2026-08-22、quest_0809 36手目の 2三玉が発端）。
+/// opp_move NN は歩の前進を `hang_minor`（相手の利きがあるマスへの紐なし着地）で
+/// 割り引くが、「その歩は捕獲で位置が露見している＝意図を持って動いている駒」
+/// という情報は特徴量に無く、`bin/pawn_push_probe`（対人83局・4.2万行）で
+/// 系統的な過小が出た（即時前進率 vs NN 質量）:
+/// - 露見歩（そこで駒を取った）: 12.7% vs 6.9%（人間の手番 14.6% vs 5.0% = 2.9倍）
+/// - 次の1手で成れる歩: 49.4% vs 26.3%（4手以内 80.5%）
+/// - 飛の真後ろにいる歩: 28.3% vs 14.7%（露見なら 46.7% vs 24.7%）
+/// - 香の真後ろは逆に低い（露見 2.4% vs 4.2%）ので補正しない
+/// 36手目の後手粒子は「1五で取った歩が 1四→1三成」の世界線に 2.0% しか
+/// 置いておらず（人間は未説明2手＝最短手数ちょうどで五分と見る）、
+/// 2三玉（玉プローブ）の価値がそもそも立たない。
+///
+/// 3係数を歩の前進（Board かつ動かす駒が歩）の素の重みに掛ける（opp_capture_reveal_w
+/// と同じ標本化側の事前補正。応手予測 opp_reply_weights には掛けない）:
+/// `TSUITATE_OPP_PAWN_REVEALED_W`（露見マスに立つ歩の前進）・
+/// `TSUITATE_OPP_PAWN_PROMO_W`（成る歩）・`TSUITATE_OPP_PAWN_ROOK_FRONT_W`
+/// （飛・龍の真後ろ＝間が空き）。既定はすべて 1.0 = 従来挙動。凍結版は知らない
+struct OppPawnIntentW {
+    revealed: f64,
+    promo: f64,
+    rook_front: f64,
+}
+
+impl OppPawnIntentW {
+    fn is_noop(&self) -> bool {
+        self.revealed == 1.0 && self.promo == 1.0 && self.rook_front == 1.0
+    }
+}
+
+fn opp_pawn_intent_w() -> OppPawnIntentW {
+    static W: std::sync::OnceLock<(f64, f64, f64)> = std::sync::OnceLock::new();
+    let read = |name: &str| {
+        std::env::var(name)
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(1.0)
+    };
+    let (revealed, promo, rook_front) = *W.get_or_init(|| {
+        (
+            read("TSUITATE_OPP_PAWN_REVEALED_W"),
+            read("TSUITATE_OPP_PAWN_PROMO_W"),
+            read("TSUITATE_OPP_PAWN_ROOK_FRONT_W"),
+        )
+    });
+    OppPawnIntentW {
+        revealed,
+        promo,
+        rook_front,
+    }
+}
+
+/// `mv` が相手（opp）の歩の前進なら、該当する係数の積を返す（それ以外は 1.0）
+fn opp_pawn_intent_factor(
+    pos: &Position,
+    mv: &ShogiMove,
+    opp: Color,
+    opp_revealed: &[Coord],
+    w: &OppPawnIntentW,
+) -> f64 {
+    if w.is_noop() {
+        return 1.0;
+    }
+    let ShogiMove::Board { from, promote, .. } = *mv else {
+        return 1.0;
+    };
+    if !pos.piece_at(from).is_some_and(|p| p.color == opp && p.role == Role::Pawn) {
+        return 1.0;
+    }
+    let mut f = 1.0;
+    // 露見歩の同定は**二歩の規則**で筋ごとに行う: 相手が (file, r0) で自駒を取り、
+    // 今その筋の r0 以遠（相手から見て前方）に相手の未成の歩がいるなら、それは
+    // 同じ歩（同じ筋に未成の歩は1枚しか居られない。取られて打ち直された場合だけ
+    // 例外で、稀）。マス一致だけだと 1五で取った歩が 1四へ進んだ瞬間に
+    // 「露見」が外れ、人間の「あの歩が来ている」という推論と食い違う
+    let forward = |a: Coord, b: Coord| match opp {
+        Color::Sente => a.rank <= b.rank,
+        Color::Gote => a.rank >= b.rank,
+    };
+    if opp_revealed
+        .iter()
+        .any(|&s| s.file == from.file && forward(from, s))
+    {
+        f *= w.revealed;
+    }
+    if promote {
+        f *= w.promo;
+    }
+    if w.rook_front != 1.0 {
+        // 真後ろの直線（間は空き）に自分（opp）の飛・龍がいるか
+        let dr: i8 = match opp {
+            Color::Sente => 1,
+            Color::Gote => -1,
+        };
+        let mut r = from.rank + dr;
+        while (1..=9).contains(&r) {
+            if let Some(p) = pos.piece_at(Coord { file: from.file, rank: r }) {
+                if p.color == opp && matches!(p.role, Role::Rook | Role::Dragon) {
+                    f *= w.rook_front;
+                }
+                break;
+            }
+            r += dr;
+        }
+    }
+    f
+}
 
 fn capture_reveal_cost_w() -> f64 {
     std::env::var("TSUITATE_OPP_CAPTURE_REVEAL_W")
@@ -3989,6 +4615,8 @@ mod tests {
             attacks: vec![],
             approach: vec![],
             occupies: vec![],
+            approach_strong: vec![],
+            attacks_role: vec![],
         };
         let n = 4000;
         // ガイドなしの素の選択頻度（大数近似で真の p_class）
@@ -4003,6 +4631,7 @@ mod tests {
                 Some(false),
                 0,
                 0,
+                &[],
                 &[],
                 &[],
                 &Guide::default(),
@@ -4033,6 +4662,7 @@ mod tests {
                 Some(false),
                 0,
                 0,
+                &[],
                 &[],
                 &[],
                 &wanted,
@@ -4091,6 +4721,7 @@ mod tests {
                 0,
                 &[],
                 &[],
+                &[],
                 &Guide::default(),
                 None,
                 &mut rng,
@@ -4113,6 +4744,7 @@ mod tests {
                 Some(false),
                 0,
                 0,
+                &[],
                 &[],
                 &[],
                 &Guide::default(),

@@ -34,7 +34,7 @@ import pathlib
 import re
 import sys
 
-from foul_blocks import DEFAULT_PREFIX, scenario_for
+from foul_blocks import DEFAULT_PREFIX, prefix_for_eval, scenario_for
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 
@@ -106,8 +106,12 @@ def main():
         "--exclude-ply", default="",
         help="除外する手目のカンマ区切り（例 148。平均が変わるので stderr にも出る）")
     parser.add_argument("--scenarios", type=pathlib.Path, default=ROOT / "scenarios")
-    parser.add_argument("--prefix", default=DEFAULT_PREFIX)
+    parser.add_argument(
+        "--prefix", default=None,
+        help="シナリオ名プレフィックス（既定は eval の stem から foul_blocks.PREFIX_BY_EVAL で引く）")
     args = parser.parse_args()
+    if args.prefix is None:
+        args.prefix = prefix_for_eval(args.eval_path) or DEFAULT_PREFIX
 
     excluded = {int(x) for x in args.exclude_ply.split(",") if x.strip()}
     by_block, all_scores = read_eval(args.eval_path)

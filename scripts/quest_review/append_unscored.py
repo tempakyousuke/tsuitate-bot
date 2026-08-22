@@ -15,6 +15,8 @@
   （**採点前の suite 差は信じない**。指標穴の実証3例あり）
 
 反則後サブブロック（`### N手目（…の反則後）`）は foul_blocks.FOUL_MAP で対応づける。
+シナリオ名プレフィックスは eval の stem から foul_blocks.PREFIX_BY_EVAL で引き、
+他の棋譜のシナリオ（quest31 と quest0809 は手目が重なる）の TRIAL 行は無視する。
 
 **単一決定点の eval**（eval の stem と同名の `scenarios/<stem>.kif` がある場合、
 例 `evals/arena-check-foul02.eval.md`）: TRIAL 行のうち scenario 名が `<stem>`
@@ -29,7 +31,7 @@ import pathlib
 import re
 import subprocess
 
-from foul_blocks import block_key
+from foul_blocks import PREFIX_BY_EVAL, block_key, eval_stem, prefix_for_eval
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCN = ROOT / "scenarios"
@@ -151,7 +153,15 @@ def main():
 
     blocks = parse_blocks(args.eval_path)
     # 単一決定点 eval（stem と同名の kif がある）なら専用の対応。取り違え防止
-    single = single_decision_block_key(args.eval_path.name.split(".")[0])
+    single = single_decision_block_key(eval_stem(args.eval_path))
+    # プレフィックスは eval の stem から引く。別棋譜の TRIAL 行は block_key が
+    # None を返して無視される（quest31 と quest0809 は同じ手目を持つので必須）
+    prefix = prefix_for_eval(args.eval_path)
+    if single is None and prefix is None:
+        raise SystemExit(
+            f"{args.eval_path.name}: シナリオ名プレフィックスが未登録です。"
+            f" foul_blocks.PREFIX_BY_EVAL に足してください（登録済み: {sorted(PREFIX_BY_EVAL)}）"
+        )
     counts = collections.Counter()
     where = {}
     for d in args.dirs:
@@ -166,7 +176,7 @@ def main():
                 key = (
                     single(scenario, blocks.keys())
                     if single
-                    else block_key(scenario)
+                    else block_key(scenario, prefix)
                 )
                 if key is None or usi in blocks.get(key, set()):
                     continue

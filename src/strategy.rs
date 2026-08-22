@@ -5925,6 +5925,20 @@ impl Strategy for EstimatorStrategy {
         let stale_king_dests = (repeat_w > 0.0)
             .then(|| stale_king_foul_dests(log, view.your_color, view.move_number))
             .unwrap_or_default();
+        // 玉プローブ・経路プローブ・玉センサーのコンテキスト（`ProbeCtx` の doc）。
+        // 王手中は無効（CheckSolver の領分）
+        let probe_ctx: Option<ProbeCtx> = (!view.you_in_check
+            && (king_probe_w() > 0.0 || path_probe_w() > 0.0 || king_sensor_w() > 0.0))
+            .then(|| ProbeCtx {
+                my_king,
+                stale_king_dests: stale_king_foul_dests(log, view.your_color, view.move_number),
+                revealed: opp_occupancy_evidence(view, log),
+                king_probe_w: king_probe_w(),
+                path_probe_w: path_probe_w(),
+                king_sensor_w: king_sensor_w(),
+                p_push: sensor_p_push(),
+                p_promo: sensor_p_promo(),
+            });
         if crate::hits::enabled() {
             crate::hits::flag("king_repeat_stale", !stale_king_dests.is_empty());
         }
@@ -5986,6 +6000,7 @@ impl Strategy for EstimatorStrategy {
                 hand_asset_kings.as_ref(),
                 king_threats.as_ref(),
                 belief_occ_board.as_ref(),
+                probe_ctx.as_ref(),
             );
             // 過去手番で玉が反則した行き先への再訪（`king_repeat_foul_w`）。
             // p_legal を安全方向に落とすだけ。gain 内の課税は anchor_move の
@@ -8406,9 +8421,17 @@ fn evaluate(
     // 信念ネットのマスごと占有（`belief_occ_cap_w`）。厳密粒子が居る決定でも
     // 裏付け無し捕獲の期待駒得をネット占有へ安全方向だけ寄せる。None なら無効
     belief_occ: Option<&[f64; 81]>,
+    // 玉プローブ・経路プローブ・玉センサー（`ProbeCtx` の doc）。choose() が
+    // 「いずれかの w≠0・王手中でない」のゲートを掛けて渡す
+    probe_ctx: Option<&ProbeCtx>,
 ) -> EvalOut {
     let me = view.your_color;
     let opp = me.other();
+    // 玉プローブ / 経路プローブの材料（反則枝の粒子だけが足す）
+    let mut king_probe_val = 0.0f64;
+    let mut king_probe_mass = 0.0f64;
+    let mut path_probe_val = 0.0f64;
+    let mut path_probe_mass = 0.0f64;
     let mut legal = 0.0f64;
     let mut value_sum = 0.0;
     let mut risk_sum = 0.0;
@@ -8465,6 +8488,24 @@ fn evaluate(
                     }
                 }
             }
+            // 玉プローブ / 経路プローブの材料（`ProbeCtx` の doc）
+            if let (Some(ctx), ShogiMove::Board { from, to, .. }) = (probe_ctx, *mv) {
+                if !particles_are_taint {
+                    if Some(from) == ctx.my_king {
+                        if ctx.king_probe_w > 0.0 {
+                            if let Some(v) = king_probe_material(pos, to, me) {
+                                king_probe_val += w * v;
+                                king_probe_mass += w;
+                            }
+                        }
+                    } else if ctx.path_probe_w > 0.0 {
+                        if let Some(v) = path_probe_material(pos, from, to, me) {
+                            path_probe_val += w * v;
+                            path_probe_mass += w;
+                        }
+                    }
+                }
+            }
             continue;
         }
         legal += w;
@@ -8487,6 +8528,15 @@ fn evaluate(
 
         let mut next = pos.clone();
         next.play_unchecked(mv);
+
+        // 玉センサー（`ProbeCtx` の doc）: 玉の手だけ、現在位置との差分
+        if let (Some(ctx), ShogiMove::Board { from, to, .. }) = (probe_ctx, *mv) {
+            if ctx.king_sensor_w > 0.0 && Some(from) == ctx.my_king && !particles_are_taint {
+                let after = king_sensor_value(&next, to, me, ctx);
+                let before = king_sensor_value(pos, from, me, ctx);
+                v += ctx.king_sensor_w * (after - before);
+            }
+        }
 
         // 王手・詰み。ついたて将棋では王手された側は王手駒の位置が見えず
         // 手探りの反則をしやすい（反則10回で負け）ので、王手自体が得点源。
@@ -9576,6 +9626,42 @@ fn evaluate(
     } else {
         0.0
     };
+    // 玉プローブ / 経路プローブ（`ProbeCtx` の doc）。全粒子質量 n で正規化するので
+    // (1−p_legal) の重みを内包している。玉プローブは占有の凸ゲートを掛けない
+    // （失うものが無い確かめ方なので「居そうなときだけ」の制約は要らない）が、
+    // 過去手番で玉が反則した行き先は価値ゼロ（再プローブ）
+    let foul_probe = foul_probe
+        + match (probe_ctx, *mv) {
+            (Some(ctx), ShogiMove::Board { from, to, .. }) if n > 0.0 => {
+                let budget_frac = f64::from(10u32.saturating_sub(view.fouls.you)) / 10.0;
+                // **凸ゲート**（drop_probe_w と同形。2026-08-22 の実測で必須と判明）:
+                // 質量に線形だと「5% の粒子がそこに駒を見ている」だけで玉が動き出す
+                // （w=3 の実測: quest31 m015/m017/m019/m057 で 5i6h（未採点の玉の手）が
+                // 15〜20/20、suite の未採点 45→209、アリーナ vs v13 40.4%）。
+                // p_mass を1つ余分に掛けて実効 p_mass² にすると、確信の低いプローブが
+                // 二乗で沈み「居そうなときだけ確かめる」人間の使い分けになる
+                if Some(from) == ctx.my_king {
+                    if king_probe_mass > 0.0 && !ctx.stale_king_dests.contains(&to) {
+                        ctx.king_probe_w
+                            * (king_probe_val / n)
+                            * (king_probe_mass / n)
+                            * budget_frac
+                            * budget_frac
+                    } else {
+                        0.0
+                    }
+                } else if path_probe_mass > 0.0 {
+                    ctx.path_probe_w
+                        * (path_probe_val / n)
+                        * (path_probe_mass / n)
+                        * budget_frac
+                        * budget_frac
+                } else {
+                    0.0
+                }
+            }
+            _ => 0.0,
+        };
     EvalOut {
         gain,
         risk_mean: if legal > 0.0 { risk_sum / legal } else { 0.0 },
@@ -10024,6 +10110,201 @@ fn own_attack_counts(view: &PlayerView) -> [u8; 81] {
         }
     }
     n
+}
+
+/// **反則枝の回収価値の一般化＋玉センサー**（案2、2026-08-22、quest_0809 36手目の
+/// 2三玉（玉プローブ、7点）が発端。ユーザー指摘「歩がすぐ前進してこなくても
+/// 2三に玉を置いておけば、王手が掛かった時点で成ってきたと判断できる」）。
+///
+/// 既存の `foul_probe`（drop_probe_w）は「打ちマスが埋まっていて自分の利きが
+/// 当たっている」反則枝だけに情報価値を付ける。同じ経済が玉の手と移動手にもある:
+/// - **玉プローブ**（`king_probe_w`）: 玉の行き先 K に利いている敵駒 a が原因で
+///   反則 → 「K に利く駒がいる」が確定。a のマスを自分の玉以外の駒が当てて
+///   いれば次手で回収できる（価値 = a の交換価値 ＋ a が自駒に当てている脅威の
+///   解消 × 0.5）。玉は取られないので、合法枝に mover リスクが無い = 失うもの
+///   の無い確かめ方（桂・香で 1三 を確かめると 1四 に歩が残る世界線で只取られ）
+/// - **経路プローブ**（`path_probe_w`）: 飛び駒の移動の経路を塞ぐ敵駒 b が原因で
+///   反則 → 「経路上に駒がいる」。b のマスを当てていれば回収（32手目 3一角 =
+///   経路 2二 のプローブ兼退避、8点）
+/// - **玉センサー**（`king_sensor_w`、gain 内・玉の手だけ・差分形）: 相手の
+///   **既知の歩**（捕獲で露見したマスと同じ筋でそこより前方 = 二歩則で同じ歩）
+///   の成り経路上のマス S が新しい玉位置への王手になり、かつ S を自分の玉以外の
+///   駒が当てているなら、成られた瞬間に**王手宣言で観測できて只取りできる**。
+///   価値 = P(S に到達) × (駒価値＋脅威解消×0.5)、P は較正値
+///   （`bin/pawn_push_probe`: 露見歩の前進 ≈0.3/手、次で成れる歩 ≈0.8）の積。
+///   現在の玉位置との差分で加点する（玉を動かさない手は 0）
+/// すべて王手中は無効・taint 粒子は無効。反則枝の項は `foul_probe` と同じく
+/// combine_score の外側に加え、残り反則予算 (fouls_left/10)² と玉反則の再訪
+/// ゲート（`stale_king_foul_dests`）を掛ける。凍結版はこれらの名前を知らない
+pub(crate) struct ProbeCtx {
+    pub(crate) my_king: Option<Coord>,
+    /// 過去手番で玉が反則した行き先（再プローブの価値ゼロ）
+    pub(crate) stale_king_dests: HashSet<Coord>,
+    /// 相手が自駒を取ったマス（露見歩の同定に使う）
+    pub(crate) revealed: [bool; 81],
+    pub(crate) king_probe_w: f64,
+    pub(crate) path_probe_w: f64,
+    pub(crate) king_sensor_w: f64,
+    pub(crate) p_push: f64,
+    pub(crate) p_promo: f64,
+}
+
+fn probe_env(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(default)
+}
+
+fn king_probe_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| probe_env("TSUITATE_KING_PROBE_W", 0.0))
+}
+
+fn path_probe_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| probe_env("TSUITATE_PATH_PROBE_W", 0.0))
+}
+
+fn king_sensor_w() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| probe_env("TSUITATE_KING_SENSOR_W", 0.0))
+}
+
+fn sensor_p_push() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| probe_env("TSUITATE_SENSOR_P_PUSH", 0.3).min(1.0))
+}
+
+fn sensor_p_promo() -> f64 {
+    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
+    *V.get_or_init(|| probe_env("TSUITATE_SENSOR_P_PROMO", 0.8).min(1.0))
+}
+
+/// 自分の玉以外の駒が sq へ利いているか（回収できるか）
+fn my_nonking_attacks(pos: &Position, sq: Coord, me: Color) -> bool {
+    pos.pieces()
+        .any(|(from, p)| p.color == me && p.role != Role::King && pos.attacks(from, sq))
+}
+
+/// 原因駒 a（マス at）の回収価値: 交換価値 ＋ a が当てている自駒（玉以外）の
+/// 最大交換価値 × 0.5（脅威の解消。CheckSolver の removal_term と同じ考え方）
+fn recovery_value(pos: &Position, at: Coord, role: Role, me: Color) -> f64 {
+    let threatened = pos
+        .pieces()
+        .filter(|(sq, p)| p.color == me && p.role != Role::King && pos.attacks(at, *sq))
+        .map(|(_, p)| exchange_value(p.role))
+        .fold(0.0, f64::max);
+    exchange_value(role) + 0.5 * threatened
+}
+
+/// 玉プローブの材料: この粒子で玉の行き先 K に利いている敵駒のうち、自分が
+/// 玉以外で当てているものの回収価値の最大値（無ければ None）
+fn king_probe_material(pos: &Position, k: Coord, me: Color) -> Option<f64> {
+    let opp = me.other();
+    pos.pieces()
+        .filter(|(sq, p)| p.color == opp && pos.attacks(*sq, k))
+        .filter(|(sq, _)| my_nonking_attacks(pos, *sq, me))
+        .map(|(sq, p)| recovery_value(pos, sq, p.role, me))
+        .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v))))
+}
+
+/// 経路プローブの材料: from→to の経路を最初に塞ぐ敵駒を自分が当てていれば回収価値
+fn path_probe_material(pos: &Position, from: Coord, to: Coord, me: Color) -> Option<f64> {
+    let opp = me.other();
+    let df = (to.file - from.file).signum();
+    let dr = (to.rank - from.rank).signum();
+    let sf = (to.file - from.file).abs();
+    let sr = (to.rank - from.rank).abs();
+    if sf != 0 && sr != 0 && sf != sr {
+        return None;
+    }
+    let n = sf.max(sr);
+    for i in 1..n {
+        let sq = Coord {
+            file: from.file + df * i,
+            rank: from.rank + dr * i,
+        };
+        if let Some(p) = pos.piece_at(sq) {
+            if p.color == opp && my_nonking_attacks(pos, sq, me) {
+                return Some(recovery_value(pos, sq, p.role, me));
+            }
+            return None;
+        }
+    }
+    None
+}
+
+/// 相手の歩 sq が「既知」か: 相手が自駒を取ったマスと同じ筋で、そこと同じか
+/// それより前方（相手から見て）にいる = 二歩則で同じ歩（estimator の
+/// `opp_pawn_intent_factor` と同じ同定）
+fn opp_pawn_is_known(sq: Coord, opp: Color, revealed: &[bool; 81]) -> bool {
+    (1..=9).any(|r| {
+        let s = Coord { file: sq.file, rank: r };
+        revealed[crate::belief_features::sq_index(s)]
+            && match opp {
+                Color::Sente => sq.rank <= r,
+                Color::Gote => sq.rank >= r,
+            }
+    })
+}
+
+fn in_zone_for(sq: Coord, c: Color) -> bool {
+    match c {
+        Color::Sente => sq.rank <= 3,
+        Color::Gote => sq.rank >= 7,
+    }
+}
+
+/// 玉センサーの価値（玉が k にいるとき）: 既知の相手の歩ごとに、成り経路上の
+/// マス S で「S の歩/と金が k へ王手 かつ 自分が S を玉以外で当てている」の
+/// うち P(到達)×回収価値が最大のものを足す
+fn king_sensor_value(pos: &Position, k: Coord, me: Color, ctx: &ProbeCtx) -> f64 {
+    let opp = me.other();
+    let dr: i8 = match opp {
+        Color::Sente => -1,
+        Color::Gote => 1,
+    };
+    let mut total = 0.0;
+    for (sq, p) in pos.pieces() {
+        if p.color != opp || p.role != Role::Pawn || !opp_pawn_is_known(sq, opp, &ctx.revealed) {
+            continue;
+        }
+        let mut best = 0.0f64;
+        let mut prob = 1.0;
+        let mut cur = sq;
+        for _ in 0..4 {
+            let s = Coord {
+                file: cur.file,
+                rank: cur.rank + dr,
+            };
+            if !(1..=9).contains(&s.rank) {
+                break;
+            }
+            // 自駒の上へは「取って」到達、相手駒なら止まる
+            let blocked_by_opp = pos.piece_at(s).is_some_and(|q| q.color == opp);
+            if blocked_by_opp {
+                break;
+            }
+            let promotes = in_zone_for(s, opp);
+            prob *= if promotes { ctx.p_promo } else { ctx.p_push };
+            // S に着いた駒が k へ利くか（成れば と金 = 金の利き）
+            let role = if promotes { Role::Tokin } else { Role::Pawn };
+            let mut probe = pos.clone();
+            probe.set(sq, None);
+            probe.set(s, Some(crate::shogi::Piece { color: opp, role }));
+            if probe.attacks(s, k) && my_nonking_attacks(&probe, s, me) {
+                best = best.max(prob * recovery_value(&probe, s, role, me));
+            }
+            if pos.piece_at(s).is_some() {
+                break; // 自駒を取ったところで経路は止まる
+            }
+            cur = s;
+        }
+        total += best;
+    }
+    total
 }
 
 /// 打ちプローブの再プローブ判定を「既に打って反則したマスか」で行うか
