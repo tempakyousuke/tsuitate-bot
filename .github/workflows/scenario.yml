@@ -44,6 +44,7 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
+      skip: ${{ steps.list.outputs.skip }}
       seeds: ${{ steps.list.outputs.seeds }}
       trials: ${{ steps.list.outputs.trials }}
       strategy: ${{ steps.list.outputs.strategy }}
@@ -68,8 +69,22 @@ jobs:
             extra_env="${IN_ENV:-}"
           else
             if [ ! -f "$req" ]; then
-              echo "push 起動なのに $req が無い" >&2
-              exit 1
+              # push の paths フィルタはファイルの削除にも一致するので、計測が
+              # 終わって $req を消す commit でもこのワークフローが起動する。
+              # 異常ではなく後片付けの正常系なので、赤い run を残さず全ジョブを
+              # スキップする（後続は if: needs.plan.outputs.skip != 'true'）。
+              echo "リクエストファイルが削除された push（後片付け）なので何もしない"
+              {
+                echo "skip=true"
+                # 後続ジョブは if: で止まるが、matrix の fromJSON が空文字で
+                # 落ちないよう妥当な形の既定値も置いておく（値は使われない）
+                echo "seeds=[0]"
+                echo "trials=0"
+                echo "strategy=estimator"
+                echo "scenarios="
+                echo "env="
+              } >> "$GITHUB_OUTPUT"
+              exit 0
             fi
             trials=$(jq -r '.trials // 20' "$req")
             strategy=$(jq -r '.strategy // "estimator"' "$req")
@@ -80,6 +95,7 @@ jobs:
             ' "$req")
             extra_env=$(jq -r '.env // ""' "$req")
           fi
+          echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "起動: event=$EVENT_NAME trials=$trials strategy=$strategy scenarios=$scenarios env=$extra_env"
           echo "seeds=$(jq -c -n --argjson n "${trials}" '[range(0; $n)]')" >> "$GITHUB_OUTPUT"
           echo "trials=$trials" >> "$GITHUB_OUTPUT"
@@ -93,6 +109,7 @@ jobs:
 
   shard:
     needs: plan
+    if: needs.plan.outputs.skip != 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -145,7 +162,12 @@ jobs:
 
   aggregate:
     needs: [plan, shard]
-    if: always()
+    # always() は skip した shard も待って走るので、skip 条件を明示しないと
+    # 「artifact が1つもありません」で赤くなる。plan 自体が落ちたとき
+    # （リクエスト JSON が壊れている等）も同じメッセージで二重に赤くなり
+    # 原因を見誤るので、plan の成功も条件に入れる。always() は
+    # 「一部シャードが失敗しても残りを合算する」ために残す。
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.skip != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5

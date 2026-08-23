@@ -31,6 +31,9 @@
   2. リクエストファイル: `.github/ci/arena.request.json` を書いてそのファイルを含む
   commit を push する（例は `arena.request.example.json`。エージェントが
   `gh` 無しで回す用。JSON のキーは手動起動の inputs と同じ）。
+  計測後にリクエストファイルを消す push も `paths` フィルタに一致して
+  起動するが、**plan が「削除された push」と判定して全ジョブをスキップ**
+  するので緑のまま終わる（後片付けで赤い run が残らない。scenario.yml も同様）。
   「基準 × シャード」の matrix に分割され（`-f shards=4` 既定。単一基準の
   200局も4ランナーに並列化される）、総合結果は **aggregate ジョブのサマリー**
   （および artifact `arena-combined`）に合算表で出る。シャード個別は
@@ -182,7 +185,8 @@
   （`.github/workflows/scenario.yml`。通常のコード push では走らない）:
   手動は `gh workflow run scenario.yml --ref <ブランチ> -f trials=20`。
   `gh` が使えないときは `.github/ci/scenario.request.json` を書いて push
-  （例は `scenario.request.example.json`）。
+  （例は `scenario.request.example.json`）。リクエストファイルの削除 push は
+  全ジョブがスキップされる（arena.yml と同じ）。
   **1シード=1ランナー**の matrix（trials=N でシード 0..N-1 の N ランナー。
   各ランナーは `suite 1 --seed-base <シード> --tsv` で全シナリオ1試行）で、
   ランナー内はチェーン共有＋グループ並列が効く。総合表は aggregate ジョブが
