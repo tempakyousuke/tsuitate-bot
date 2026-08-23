@@ -9,10 +9,13 @@ name: Test
 #   - ビルド警告ゼロの維持（`-D warnings`。凍結版の未使用コードは
 #     src/frozen/mod.rs 側で allow 済み）
 # 遅い検証（perft depth 4/5 = `-- --ignored`）と強さの判定は対象外。
+#
+# push は main のみ、他ブランチは pull_request で拾う（両方を全ブランチ対象に
+# すると PR ブランチへの push で2回走って無駄になる）。
 on:
   push:
     branches:
-      - "**"
+      - main
   pull_request:
   workflow_dispatch:
 
