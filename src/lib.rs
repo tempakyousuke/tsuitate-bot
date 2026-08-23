@@ -12,6 +12,11 @@ pub mod client;
 pub mod deduce;
 pub mod estimator;
 pub mod effect_profile;
+// 凍結版は生成時点のコピーなので、現行コードから見ると未使用の import や
+// 到達しない補助関数が残る（それを直さないのが「凍結後は編集しない」の意味）。
+// lint 属性は入れ子のモジュールへ伝播するのでここ1箇所で全版に効く
+// （版を足すたびに書き足す必要はない）。ビルドログは現行コードの警告だけになる
+#[allow(unused_imports, unused_variables, dead_code)]
 pub mod frozen;
 pub mod hits;
 pub mod kifu;

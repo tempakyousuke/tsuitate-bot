@@ -386,8 +386,8 @@ fn diagnose_particles(sc: &Scenario, rep: &Replayed, n_estimators: u64) {
     let mut cover_tally: Vec<[f64; 4]> = vec![[0.0; 4]; diag_sqs.len()];
     // マスごとの「そこにいる相手駒の駒種」の重み質量（捕獲期待値の内訳）
     let mut occ_tally: Vec<HashMap<String, f64>> = vec![HashMap::new(); diag_sqs.len()];
-    /// 由来タグの集計（`shogi::Anchors`。`TSUITATE_KING_PROBE_W` 等が 0 なら
-    /// 追跡自体しないので「裏付けなし 100%」になる）
+    // 由来タグの集計（`shogi::Anchors`。`TSUITATE_KING_PROBE_W` 等が 0 なら
+    // 追跡自体しないので「裏付けなし 100%」になる）
     let mut anchor_tally: Vec<HashMap<String, f64>> = vec![HashMap::new(); diag_sqs.len()];
     // 同（taint 粒子。厳密が全滅した決定点ではこちらが評価の実体になる）
     let mut taint_occ_tally: Vec<HashMap<String, f64>> = vec![HashMap::new(); diag_sqs.len()];
