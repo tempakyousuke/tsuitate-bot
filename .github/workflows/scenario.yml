@@ -163,8 +163,11 @@ jobs:
   aggregate:
     needs: [plan, shard]
     # always() は skip した shard も待って走るので、skip 条件を明示しないと
-    # 「artifact が1つもありません」で赤くなる
-    if: always() && needs.plan.outputs.skip != 'true'
+    # 「artifact が1つもありません」で赤くなる。plan 自体が落ちたとき
+    # （リクエスト JSON が壊れている等）も同じメッセージで二重に赤くなり
+    # 原因を見誤るので、plan の成功も条件に入れる。always() は
+    # 「一部シャードが失敗しても残りを合算する」ために残す。
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.skip != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
