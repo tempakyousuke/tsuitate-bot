@@ -60,7 +60,7 @@ jobs:
       clock: ${{ steps.split.outputs.clock }}
       env: ${{ steps.split.outputs.env }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - id: split
         env:
           EVENT_NAME: ${{ github.event_name }}
@@ -129,7 +129,7 @@ jobs:
         shard: ${{ fromJSON(needs.plan.outputs.shards) }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 

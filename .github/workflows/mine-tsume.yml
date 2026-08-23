@@ -158,7 +158,7 @@ jobs:
         shard: ${{ fromJSON(needs.plan.outputs.selfplay_shards) }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -199,10 +199,10 @@ jobs:
         shard: ${{ fromJSON(needs.plan.outputs.mine_shards) }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Checkout solver
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: tempakyousuke/tsuitate-solver
           ref: ${{ env.SOLVER_REF }}
