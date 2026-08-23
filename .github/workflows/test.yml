@@ -34,7 +34,7 @@ jobs:
       # ここに置けばテストのビルドにも警告ゼロが効く
       RUSTFLAGS: "-D warnings"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # **バージョンを固定する**。`@stable` だと rustc が新しい lint を足した日に
       # 無関係な PR の CI が落ちる（`-D warnings` と組み合わさるため）。
