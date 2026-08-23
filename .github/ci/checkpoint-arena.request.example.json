@@ -1,0 +1,26 @@
+{
+  "arena_run_id": "",
+  "deck_path": "checkpoint-arena/deck.json",
+  "opponent": "estimator_v14",
+  "checkpoints": 64,
+  "min_remaining": 20,
+  "extract_seed": 20260823,
+  "split": "dev",
+  "seeds": 1,
+  "budgets": "2000",
+  "shards": 4,
+  "experiments": [
+    { "label": "aa" },
+    {
+      "label": "anchor_move",
+      "candidate_env": "TSUITATE_ANCHOR_MOVE_W=0.6",
+      "known": -8.5
+    },
+    {
+      "label": "v13_vs_v12",
+      "candidate_strategy": "estimator_v13",
+      "control_strategy": "estimator_v12",
+      "known": 9.0
+    }
+  ]
+}

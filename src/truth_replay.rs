@@ -64,12 +64,48 @@ fn add_move_obs(
     }
 }
 
+/// 決定点の状態（`for_each_decision_full` が渡す）。
+/// checkpoint arena の抽出はここから「開始盤面・両者ログ・累積反則数・絶対手数」を取る
+pub struct DecisionState<'a> {
+    /// 真の局面（手番側がこれから指す時点）
+    pub pos: &'a Position,
+    /// 手番側
+    pub side: Color,
+    /// **両者**の観測列 [0]=先手, [1]=後手
+    pub logs: &'a [ObservationLog; 2],
+    /// 累積反則数 [0]=先手, [1]=後手（この決定点までに試した反則を含む）
+    pub fouls: &'a [u32; 2],
+    /// この決定点で手番側が既に試した反則の数。
+    /// **0 なら手番境界**（checkpoint arena v1 が採る唯一の checkpoint 種別）
+    pub fouls_this_turn: u32,
+    /// 絶対手数（受理された手の数）。`Position::move_number()` とは別に数える
+    pub plies: u32,
+    /// 決定点の通し番号（`end.moves` のインデックス）
+    pub decision_id: u64,
+}
+
 /// 決定点（手番側がこれから指す時点）ごとにコールバックを呼ぶ。
 /// 渡すのは (真の局面, 手番側, その側の観測列, 決定点の通し番号)。
 /// 棋譜が壊れていたら false を返す（呼び出し側はその局を丸ごと捨てること）。
 pub fn for_each_decision(
     end: &GameEndPayload,
     mut f: impl FnMut(&Position, Color, &ObservationLog, u64),
+) -> bool {
+    for_each_decision_full(end, |d| {
+        f(d.pos, d.side, &d.logs[side_idx(d.side)], d.decision_id)
+    })
+}
+
+/// `for_each_decision` の全量版: **両者**の観測列・累積反則数・絶対手数を渡す。
+/// 片側のログしか要らない学習データ生成は `for_each_decision` を使う。
+///
+/// checkpoint arena はここから状態を取るが、**デッキには KIF を保存する**
+/// （`scenario_core::replay` で復元でき、回帰局面をそのまま
+/// `bin/scenario ... diag` / `rank_probe` に流せるため）。
+/// 両者が同じ状態になることは checkpoint_arena 側のテストで検査する
+pub fn for_each_decision_full(
+    end: &GameEndPayload,
+    mut f: impl FnMut(DecisionState<'_>),
 ) -> bool {
     let mut pos = Position::initial();
     let mut logs = [ObservationLog::default(), ObservationLog::default()];
@@ -81,6 +117,7 @@ pub fn for_each_decision(
     for (decision_id, m) in end.moves.iter().enumerate() {
         let side = pos.turn();
         // 反則は着手より前に起きている（手番は変わらない）
+        let mut fouls_this_turn = 0u32;
         while foul_idx < fouls_sorted.len()
             && fouls_sorted[foul_idx].move_number == pos.move_number()
             && fouls_sorted[foul_idx].by_color == side
@@ -93,9 +130,18 @@ pub fn for_each_decision(
                 &mut fouls,
             );
             foul_idx += 1;
+            fouls_this_turn += 1;
         }
 
-        f(&pos, side, &logs[side_idx(side)], decision_id as u64);
+        f(DecisionState {
+            pos: &pos,
+            side,
+            logs: &logs,
+            fouls: &fouls,
+            fouls_this_turn,
+            plies: decision_id as u32,
+            decision_id: decision_id as u64,
+        });
 
         let Some(mv) = parse_usi(&m.usi) else {
             return false;
