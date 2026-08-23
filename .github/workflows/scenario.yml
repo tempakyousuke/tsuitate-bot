@@ -110,6 +110,7 @@ jobs:
           SCENARIO_EXTRA_ENV: ${{ needs.plan.outputs.env }}
           SCENARIO_ONLY: ${{ needs.plan.outputs.scenarios }}
         run: |
+          set -euo pipefail
           # 評価ノブ（TSUITATE_* のみ許可）。arena.yml と同じ規約
           for kv in $SCENARIO_EXTRA_ENV; do
             case "$kv" in
@@ -160,6 +161,7 @@ jobs:
 
       - name: Aggregate
         run: |
+          set -euo pipefail
           # download-artifact は v5 以降、pattern の一致が1件だけだと
           # artifact 名のサブディレクトリを作らず path 直下へ展開する
           # （trials=1 のとき）。両方の配置を拾うため ** で辿る。

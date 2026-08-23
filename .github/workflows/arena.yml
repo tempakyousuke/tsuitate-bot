@@ -149,6 +149,7 @@ jobs:
           ARENA_EXTRA_ENV: ${{ needs.plan.outputs.env }}
           ARENA_CLOCK: ${{ needs.plan.outputs.clock }}
         run: |
+          set -euo pipefail
           # 共通seed指定時はシャードごとにずらす（シャード間の対局重複を防ぎつつ、
           # 同じ入力なら版をまたいで同じ対局条件列になる）
           seed='${{ needs.plan.outputs.match_seed }}'

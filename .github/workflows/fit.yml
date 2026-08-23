@@ -48,6 +48,7 @@ jobs:
         env:
           FIT_MAX_POINTS_PER_GAME: ${{ inputs.max_points_per_game }}
         run: |
+          set -euo pipefail
           # sort で入力順を固定してから決定論的に無作為抽出（再現性）
           find training -name '*.jsonl' | sort | shuf --random-source=<(yes) -n ${{ inputs.max_games }} > files.txt
           echo "使用する対局数: $(wc -l < files.txt)"
