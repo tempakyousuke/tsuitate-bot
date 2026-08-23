@@ -1,0 +1,5 @@
+{
+  "trials": 1,
+  "strategy": "estimator",
+  "scenarios": "kakutori"
+}

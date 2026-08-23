@@ -1,0 +1,6 @@
+{
+  "games": 2,
+  "candidate": "estimator",
+  "baselines": "estimator_v14",
+  "shards": 1
+}
