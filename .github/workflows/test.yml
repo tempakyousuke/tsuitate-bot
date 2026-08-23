@@ -7,7 +7,7 @@ name: Test
 # ここは1分程度で終わる軽い検証だけを置く:
 #   - `cargo test`（候補手生成・プロトコル・エンジン・推定器・採点表の整合）
 #   - ビルド警告ゼロの維持（`-D warnings`。凍結版の未使用コードは
-#     src/frozen/mod.rs 側で allow 済み）
+#     src/lib.rs の `pub mod frozen;` 側で allow 済み）
 # 遅い検証（perft depth 4/5 = `-- --ignored`）と強さの判定は対象外。
 #
 # push は main のみ、他ブランチは pull_request で拾う（両方を全ブランチ対象に
@@ -19,22 +19,36 @@ on:
   pull_request:
   workflow_dispatch:
 
+# PR へ連続で push したとき、古い run は打ち切る
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      # **ジョブ全体に置く**こと。ステップ単位にすると cargo のフィンガープリントが
+      # 変わって build と test が別々にフルコンパイルされる（コールドキャッシュで2倍）。
+      # ここに置けばテストのビルドにも警告ゼロが効く
+      RUSTFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # **バージョンを固定する**。`@stable` だと rustc が新しい lint を足した日に
+      # 無関係な PR の CI が落ちる（`-D warnings` と組み合わさるため）。
+      # 上げるときは手元で `cargo build --all-targets` の警告ゼロを確認してから
+      # このバージョンを書き換える
+      - uses: dtolnay/rust-toolchain@1.92.0
 
       - uses: Swatinem/rust-cache@v2
 
       # テストのビルドも含めて警告ゼロを要求する（テスト専用の
-      # ヘルパが本体から呼ばれなくなった、といった腐りをここで捕まえる）
+      # ヘルパが本体から呼ばれなくなった、といった腐りをここで捕まえる）。
+      # `--locked` は Cargo.lock のドリフト（手元だけ更新されている）を弾く
       - name: Build (deny warnings)
-        run: cargo build --all-targets
-        env:
-          RUSTFLAGS: "-D warnings"
+        run: cargo build --all-targets --locked
 
       - name: Test
-        run: cargo test
+        run: cargo test --locked
