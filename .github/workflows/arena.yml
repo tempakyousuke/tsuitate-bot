@@ -208,7 +208,7 @@ jobs:
 
       - name: Upload result log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: arena-result-${{ matrix.baseline }}-s${{ matrix.shard }}
           path: |
@@ -218,7 +218,7 @@ jobs:
 
       - name: Upload game records
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: arena-records-${{ matrix.baseline }}-s${{ matrix.shard }}
           path: arena-records/
@@ -229,14 +229,23 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           pattern: arena-result-*
           path: shards
 
       - name: Aggregate shards
         run: |
-          cat shards/*/arena-summary.json > all.jsonl
+          # download-artifact は v5 以降、pattern の一致が1件だけだと
+          # artifact 名のサブディレクトリを作らず path 直下へ展開する
+          # （基準1つ × shards=1 のとき）。両方の配置を拾うため ** で辿る。
+          shopt -s nullglob globstar
+          parts=(shards/**/arena-summary.json)
+          if [ ${#parts[@]} -eq 0 ]; then
+            echo "arena-result-* の artifact が1つもありません（全シャードが失敗？）" >&2
+            exit 1
+          fi
+          cat "${parts[@]}" > all.jsonl
           jq -s '
             group_by(.baseline) | map(
               (map(.wins_a) | add) as $w |
@@ -284,7 +293,7 @@ jobs:
           cat "$GITHUB_STEP_SUMMARY"
 
       - name: Upload combined result
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: arena-combined
           path: |

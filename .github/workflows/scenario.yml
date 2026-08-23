@@ -137,7 +137,7 @@ jobs:
 
       - name: Upload result
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: scenario-shard-s${{ matrix.seed }}
           path: result.txt
@@ -153,14 +153,23 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           pattern: scenario-shard-*
           path: results
 
       - name: Aggregate
         run: |
-          cargo run --release --bin scenario -- merge results/*/result.txt | tee merged.md
+          # download-artifact は v5 以降、pattern の一致が1件だけだと
+          # artifact 名のサブディレクトリを作らず path 直下へ展開する
+          # （trials=1 のとき）。両方の配置を拾うため ** で辿る。
+          shopt -s nullglob globstar
+          parts=(results/**/result.txt)
+          if [ ${#parts[@]} -eq 0 ]; then
+            echo "scenario-shard-* の artifact が1つもありません（全シャードが失敗？）" >&2
+            exit 1
+          fi
+          cargo run --release --bin scenario -- merge "${parts[@]}" | tee merged.md
           {
             echo "## Scenario Suite（各 ${{ needs.plan.outputs.trials }} 試行 / 戦略 ${{ needs.plan.outputs.strategy }} / env '${{ needs.plan.outputs.env }}'）"
             echo ""
@@ -168,9 +177,9 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload combined result
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: scenario-combined
           path: |
             merged.md
-            results/*/result.txt
+            results/
