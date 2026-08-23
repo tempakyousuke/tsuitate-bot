@@ -102,13 +102,29 @@ impl Deck {
             .map_err(|e| format!("{} を書けません: {e}", path.display()))
     }
 
-    /// manifest の内容ハッシュ（JSONL へ記録して、比較する2本が同じデッキで
-    /// 走ったことを後から確認できるようにする）
-    pub fn hash(&self) -> String {
+    /// デッキの内容ハッシュ（JSONL へ記録して、比較する2本が同じデッキで
+    /// 走ったことを後から確認できるようにする）。
+    ///
+    /// **manifest だけでなく参照先 KIF のバイト列も含める**。manifest を据え置いたまま
+    /// KIF を差し替えると開始局面が変わるので、manifest だけの digest では
+    /// 「同じデッキで走った」ことの保証にならない（PR #20 レビュー指摘5）。
+    /// KIF を読めないときは Err を返す（黙って弱いハッシュにしない）。
+    pub fn hash(&self, dir: &Path) -> Result<String, String> {
         use sha2::{Digest, Sha256};
-        let canonical = serde_json::to_string(self).unwrap_or_default();
-        let digest = Sha256::digest(canonical.as_bytes());
-        digest.iter().take(8).map(|b| format!("{b:02x}")).collect()
+        let mut h = Sha256::new();
+        let canonical = serde_json::to_string(self)
+            .map_err(|e| format!("manifest を正規化できません: {e}"))?;
+        h.update(canonical.as_bytes());
+        for e in &self.entries {
+            let path = kif_path(dir, e);
+            let bytes = std::fs::read(&path)
+                .map_err(|err| format!("{} を読めません: {err}", path.display()))?;
+            // entry の同一性も混ぜる（同じ内容の KIF を別 ply で使う場合の区別）
+            h.update(e.id.as_bytes());
+            h.update(e.ply.to_le_bytes());
+            h.update(&bytes);
+        }
+        Ok(h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect())
     }
 
     pub fn entry(&self, id: &str) -> Option<&DeckEntry> {
@@ -485,6 +501,39 @@ mod tests {
         // 層化が効いている: 先手・後手の両方が入る
         assert!(a.iter().any(|(_, c)| c.side == Color::Sente));
         assert!(a.iter().any(|(_, c)| c.side == Color::Gote));
+    }
+
+    /// **deck_hash は参照先 KIF の内容まで含む**（PR #20 レビュー指摘5）。
+    /// manifest を据え置いたまま KIF を差し替えたら別のハッシュになること
+    #[test]
+    fn deck_hash_covers_kif_bytes() {
+        let dir = std::env::temp_dir().join(format!("ckhash-{}", std::process::id()));
+        let games = dir.join("games");
+        std::fs::create_dir_all(&games).unwrap();
+        let kif = "手合割：平手\n手数----指手---------消費時間--\n   1 ７六歩(77)\n";
+        std::fs::write(games.join("g.kif"), kif).unwrap();
+        let deck = Deck {
+            version: DECK_VERSION,
+            source: "test".into(),
+            opponent: "estimator_v14".into(),
+            min_remaining_plies: 20,
+            entries: vec![DeckEntry {
+                id: "g-ply1".into(),
+                kif: "games/g.kif".into(),
+                ply: 1,
+                split: "dev".into(),
+                tags: vec!["sente".into()],
+            }],
+        };
+        let before = deck.hash(&dir).expect("hash");
+        // manifest はそのまま、KIF だけ差し替える
+        std::fs::write(games.join("g.kif"), format!("{kif}   2 ３四歩(33)\n")).unwrap();
+        let after = deck.hash(&dir).expect("hash");
+        assert_ne!(before, after, "KIF が変わればハッシュも変わる");
+        // KIF が読めなければ黙って弱いハッシュにせずエラー
+        std::fs::remove_file(games.join("g.kif")).unwrap();
+        assert!(deck.hash(&dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// dev / validation は元対局単位で決まる（同じ棋譜が両方に出ない）

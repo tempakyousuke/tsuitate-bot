@@ -109,16 +109,32 @@ jobs:
         run: |
           set -euo pipefail
           req='.github/ci/checkpoint-arena.request.json'
-          # P0-b の既定セット: HEAD の env ノブだけで再現できる既知の負例と、
-          # 同一バイナリ内の凍結版どうしの正例（issue #19 の表）
+          # P0-b の既定セット。
+          #
+          # **`known` は既定では入れない**（PR #20 レビュー指摘2）。CLAUDE.md に
+          # 残っている −12.8 / −8.5 / −7.4 / −2.8pt は、いずれも
+          #   - 当時の main（その後たくさんの採用が入っている）を対照に、
+          #   - 別の対戦条件（vs v13 の3シード等）で
+          # 測った値で、このワークフローの条件（固定相手 estimator_v14・
+          # 途中局面からの継続・この予算）で測り直した値ではない。
+          # とくに `pr1combo` の −7.4pt は5つの新ノブ＋material_degen＋GEN/PREROLE/
+          # CAPTURE_RETREAT を全部入れた構成の値で、per-knob ablation は未実施
+          # （CLAUDE.md に明記）。2項だけに −7.4pt を付ける根拠は無い。
+          # 凍結版どうしも同様で、ここで測っているのは
+          #   (v13 vs 相手) − (v12 vs 相手)
+          # であって (v13 vs v12) ではない。非推移性のあるゲームなので別物。
+          #
+          # 較正したいときは、**同じ candidate / control / opponent / 予算で
+          # arena.yml を取り直して**、その差を `compare --known-arena-delta` へ渡す。
+          # ラベルは「何を測っているか」が分かる名前にしてある。
           default_experiments='[
             {"label":"aa"},
-            {"label":"repeat_gate","candidate_env":"TSUITATE_DROP_PROBE_REPEAT_GATE=1","known":-12.8},
-            {"label":"anchor_move","candidate_env":"TSUITATE_ANCHOR_MOVE_W=0.6","known":-8.5},
-            {"label":"pr1combo","candidate_env":"TSUITATE_HAND_ASSET_W=0.5,TSUITATE_KING_KNOWN_APPROACH_W=2","known":-7.4},
-            {"label":"pawn_head","candidate_env":"TSUITATE_EXPOSED_PAWN_HEAD_W=0.5","known":-2.8},
-            {"label":"v13_vs_v12","candidate_strategy":"estimator_v13","control_strategy":"estimator_v12","known":9.0},
-            {"label":"v14_vs_v10","candidate_strategy":"estimator_v14","control_strategy":"estimator_v10","known":16.0}
+            {"label":"repeat_gate","candidate_env":"TSUITATE_DROP_PROBE_REPEAT_GATE=1"},
+            {"label":"anchor_move","candidate_env":"TSUITATE_ANCHOR_MOVE_W=0.6"},
+            {"label":"pawn_head","candidate_env":"TSUITATE_EXPOSED_PAWN_HEAD_W=0.5"},
+            {"label":"pr1combo_full","candidate_env":"TSUITATE_HAND_ASSET_W=0.5,TSUITATE_KING_KNOWN_APPROACH_W=2,TSUITATE_LINK_ENDGAME_DAMPEN=40,TSUITATE_MATERIAL_DEGEN_Q0=0.3,TSUITATE_PROMOTE_FAR_W=1.0,TSUITATE_GEN_NONPROMOTE=1"},
+            {"label":"v13_v12_vs_opp","candidate_strategy":"estimator_v13","control_strategy":"estimator_v12"},
+            {"label":"v14_v10_vs_opp","candidate_strategy":"estimator_v14","control_strategy":"estimator_v10"}
           ]'
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             run_id="${IN_RUN_ID:-}"

@@ -110,10 +110,19 @@
   - `--shared-prewarm` は「同じバイナリ・同じ env・同じ推定器」のときだけ有効
     （それ以外は理由つきで無効化され、JSONL の `prewarm_shared` / `prewarm_reason` に残る）
   - `compare` は**元対局単位の cluster bootstrap**（seed を独立標本として数えない）・
-    分散成分 σ_b²/σ_w² と ICC・「元対局数 × seed 数」の MDE 表・層別 delta・
+    分散成分 σ_b²/σ_w² と ICC・「元対局数 × seed 数」の **MDE 表（α=0.05 / power=80% の
+    2.80·SE。CI 半幅 1.96·SE とは別物）**・非パラメトリックな power simulation・層別 delta・
     コスト分解・大きな回帰の再現コマンドを出す。**安全性の共同指標**
     （反則/局・被王手中反則・反則負け率・継続手数・手数上限率・終局理由・思考時間）も
-    同じペア差で出すが、**反則減だけで「強くなった」とは判定しない**
+    同じペア差で出すが、**反則減だけで「強くなった」とは判定しない**。
+    入力は厳格に検査する（schema・experiment・deck_hash・相手・予算・commit の一致、
+    arm 名、重複、checkpoint ごとの seed 数。不一致は失敗。`--allow-incomplete` で警告に落とす）
+  - **seed は 2 の倍数で取る**。arm 順が `(checkpoint 番号 + seed) % 2` なので、
+    同じ checkpoint の seed 0/1 は必ず逆順になり、**AB/BA の均衡が cluster の内側で閉じる**。
+    s=1 だと実行順効果が cluster 平均に残り、実測で分散が 5〜8倍違った
+  - **既知の arena 差を較正に使うときは、同じ candidate / control / opponent / 予算で
+    測り直した値だけを渡す**。CLAUDE.md に残っている −12.8 / −8.5 / −7.4pt は
+    当時の main・別の対戦条件で測った値なので流用できない（PR #20 レビュー指摘）
   - 実行は CI（`.github/workflows/checkpoint-arena.yml`、**通常のコード push では走らない**）。
     `gh workflow run checkpoint-arena.yml -f arena_run_id=<Arena実行ID> -f budgets="700 2000"`、
     `gh` が無ければ `.github/ci/checkpoint-arena.request.json` を置いて push（削除の push は
