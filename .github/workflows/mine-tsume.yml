@@ -183,7 +183,7 @@ jobs:
       # arena.yml と同じ名前にしておく（採掘側はどちらの出どころでも同じ扱いで拾える）
       - name: Upload game records
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: arena-records-mine-s${{ matrix.shard }}
           path: arena-records/
@@ -218,16 +218,18 @@ jobs:
 
       - name: Download records (this run)
         if: inputs.arena_run_id == ''
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           # merge-multiple は使わない: 記録のファイル名は「時刻-arena-連番」なので
           # シャードをまたぐと衝突し得る。artifact ごとのサブディレクトリに分ける
+          # （v5 以降は一致が1件だけだと path 直下へ展開されるが、その場合は
+          #  そもそも衝突しない。採掘側は records-in/**/*.jsonl で両方拾う）
           pattern: arena-records-*
           path: records-in
 
       - name: Download records (existing arena run)
         if: inputs.arena_run_id != ''
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           pattern: arena-records-*
           path: records-in
@@ -283,7 +285,7 @@ jobs:
 
       - name: Upload shard puzzles
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: tsume-shard-${{ matrix.shard }}
           path: tsume-shard.json
@@ -295,7 +297,7 @@ jobs:
     if: always() && needs.mine.result != 'skipped'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           pattern: tsume-shard-*
           path: shards
@@ -305,8 +307,11 @@ jobs:
       - name: Merge shards
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          parts=(shards/*/tsume-shard.json)
+          # download-artifact は v5 以降、pattern の一致が1件だけだと
+          # artifact 名のサブディレクトリを作らず path 直下へ展開する
+          # （mine_shards=1 や 1シャードだけ成功したとき）。両方の配置を拾う。
+          shopt -s nullglob globstar
+          parts=(shards/**/tsume-shard.json)
           if [ ${#parts[@]} -eq 0 ]; then
             echo "採掘結果の artifact が1つもありません" >&2
             echo '{"source":"${{ env.SOURCE }}","puzzles":[]}' > tsume-puzzles.json
@@ -339,7 +344,7 @@ jobs:
           cat "$GITHUB_STEP_SUMMARY"
 
       - name: Upload puzzles
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: tsume-puzzles
           path: tsume-puzzles.json
