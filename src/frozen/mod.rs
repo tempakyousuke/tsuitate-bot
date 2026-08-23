@@ -12,13 +12,26 @@
 //!   その時点のコピーを estimator_vN.rs として追加し strategy::make に登録する
 //! - ルールエンジン（shogi.rs / board.rs）と観測（observation.rs）は共有する
 //!   （ルールのバグ修正は全バージョンに反映されるべきなので）
+//!
+//! 凍結版は生成時点のコピーなので、現行コードから見ると未使用の import や
+//! 到達しない補助関数が残る（それを直さないのが「編集しない」の意味）。
+//! 警告はここで抑止して、ビルドログを現行コードの警告だけにする。
 
+#[allow(unused_imports, unused_variables, dead_code)]
 pub mod estimator_v6;
+#[allow(unused_imports, unused_variables, dead_code)]
 pub mod estimator_v7;
+#[allow(unused_imports, unused_variables, dead_code)]
 pub mod estimator_v8;
+#[allow(unused_imports, unused_variables, dead_code)]
 pub mod estimator_v9;
+#[allow(unused_imports, unused_variables, dead_code)]
 pub mod estimator_v10;
+#[allow(unused_imports, unused_variables, dead_code)]
 pub mod estimator_v11;
+#[allow(unused_imports, unused_variables, dead_code)]
 pub mod estimator_v12;
+#[allow(unused_imports, unused_variables, dead_code)]
 pub mod estimator_v13;
+#[allow(unused_imports, unused_variables, dead_code)]
 pub mod estimator_v14;

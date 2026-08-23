@@ -2520,6 +2520,7 @@ pub(crate) fn exchange_value(role: Role) -> f64 {
 
 /// 着手後の自駒の利き被覆マス数（自分に見える盤面だけの近似）。
 /// 相手の駒は見えないため飛び駒は自駒にだけ遮られる楽観値
+#[cfg(test)]
 fn coverage_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
     own_effects_after(view, mv, None, None, &EvalParams::default()).coverage
 }
@@ -3370,6 +3371,7 @@ fn promo_distance(
 /// 相手の駒が見えないので、やねうら王の「そこが空きか敵駒なら減点・味方の駒が
 /// あるなら加点」の区別はできない。**自駒が乗っているマスは穴に数えない**
 /// （壁として機能するため）という近似にする
+#[cfg(test)]
 fn king_holes_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
     own_effects_after(view, mv, None, None, &EvalParams::default()).king_holes
 }
@@ -10337,19 +10339,6 @@ fn recovery_value(pos: &Position, at: Coord, role: Role, me: Color) -> f64 {
 fn probe_threat_w() -> f64 {
     static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
     *V.get_or_init(|| probe_env("TSUITATE_PROBE_THREAT_W", 0.0))
-}
-
-/// 玉プローブの材料: この粒子で玉の行き先 K に利いている敵駒のうち、自分が
-/// 玉以外で当てているものの回収価値の最大値（無ければ None）
-fn king_probe_material(pos: &Position, k: Coord, me: Color) -> Option<f64> {
-    let opp = me.other();
-    pos.pieces()
-        .filter(|(sq, p)| p.color == opp && pos.attacks(*sq, k))
-        .filter(|(sq, _)| my_nonking_attacks(pos, *sq, me))
-        // 由来タグ: 観測に裏付けられた駒だけを数える（幻は 0）
-        .map(|(sq, p)| anchor_weight(pos, sq) * recovery_value(pos, sq, p.role, me))
-        .filter(|v| *v > 0.0)
-        .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v))))
 }
 
 /// 経路プローブの材料: from→to の経路を最初に塞ぐ敵駒を自分が当てていれば

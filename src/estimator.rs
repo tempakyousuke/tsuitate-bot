@@ -163,10 +163,11 @@ fn sample_capture_role(
     }
     let (_, at, hist) = capture_roles.iter().find(|(c, _, _)| *c == i)?;
     let total: f64 = hist.iter().map(|(_, n)| n).sum();
-    if !(total > 0.0) {
+    // NaN も弾く（`!(total > 0.0)` と等価。部分順序の否定比較は読みにくいので明示形にする）
+    if total.is_nan() || total <= 0.0 {
         return None;
     }
-    let mut pick = rng.gen_range(0.0..1.0f64) * total;
+    let mut pick = rng.random_range(0.0..1.0f64) * total;
     for (role, n) in hist {
         if pick < *n {
             return Some((*at, *role));
@@ -2090,7 +2091,7 @@ impl Estimator {
         // 既定（keep_fraction()==0）では **rng を引かない**。引くと乱数列がずれて
         // ノブ off でも粒子が変わる（既定挙動の同一性が壊れる）ので短絡が必須
         let memory: Vec<(usize, Coord, Role)> = if keep_fraction() > 0.0
-            && self.rng.gen_range(0.0..1.0f64) < keep_fraction()
+            && self.rng.random_range(0.0..1.0f64) < keep_fraction()
         {
             let cidxs: Vec<usize> = self.capture_roles.iter().map(|(c, _, _)| *c).collect();
             cidxs

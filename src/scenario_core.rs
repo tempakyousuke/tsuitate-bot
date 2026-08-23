@@ -718,7 +718,6 @@ pub struct KingBelief {
 
 /// 推定器を seeds 個ぶん構築して相手玉の位置ビリーフを集計する
 pub fn king_belief(rep: &Replayed, seeds: u64, scale: f64) -> KingBelief {
-    let side = rep.pos.turn();
     let ests: Vec<Estimator> = (0..seeds.max(1))
         .map(|seed| build_estimator(rep, seed, scale, |_, _| {}))
         .collect();
@@ -742,7 +741,7 @@ pub fn king_belief_from_refs(rep: &Replayed, ests: &[&Estimator], seeds: u64) ->
     let mut unique = 0u32;
     let mut strict_unique = 0u32;
     for est in ests {
-        for (pp, w, strict) in weighted_unique_particles(*est) {
+        for (pp, w, strict) in weighted_unique_particles(est) {
             unique += 1;
             if strict {
                 strict_unique += 1;
@@ -1108,7 +1107,7 @@ mod tests {
 
     /// 手動翻訳で検証済みだった USI 列とパーサーの出力が一致すること
     #[test]
-    fn keimaの棋譜はUSI列と反則が既知の正解に一致する() {
+    fn keimaの棋譜はusi列と反則が既知の正解に一致する() {
         let sc = load("keima");
         let expected = [
             "7g7f", "3a3b", "5g5f", "2b3a", "5f5e", "5a6b", "2h5h", "5c5d", "5i4h",
@@ -1125,7 +1124,7 @@ mod tests {
     }
 
     #[test]
-    fn kakunariの棋譜はUSI列と反則が既知の正解に一致する() {
+    fn kakunariの棋譜はusi列と反則が既知の正解に一致する() {
         let sc = load("kakunari");
         let expected = [
             "7g7f", "3a3b", "6i7h", "1c1d", "7h7g", "2b1c", "4i5h", "5a4b", "6g6f",

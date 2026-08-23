@@ -247,8 +247,10 @@ fn main() {
     show("    うち 敵歩の正面", unknown_pawn_head);
     show("    うち それ以外", unknown_other);
     println!(
-        "\n参考: モデルの重みは exposed_base={:.4} + exposed_known={:.4}×knownness\n\
-         　　　= 未知 {:.4} 〜 既知 {:.4}（比 {:.2}倍）",
+        concat!(
+            "\n参考: モデルの重みは exposed_base={:.4} + exposed_known={:.4}×knownness\n",
+            "　　　= 未知 {:.4} 〜 既知 {:.4}（比 {:.2}倍）"
+        ),
         0.4576,
         0.1659,
         0.4576,

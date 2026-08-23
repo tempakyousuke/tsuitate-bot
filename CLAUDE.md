@@ -7,7 +7,11 @@
 
 ## コマンド
 
-- `cargo test` — ユニットテスト（候補手生成・プロトコル・エンジン・推定器）
+- `cargo test` — ユニットテスト（候補手生成・プロトコル・エンジン・推定器）。
+  **push のたびに CI でも走る**（`.github/workflows/test.yml`。`cargo test` と
+  `RUSTFLAGS=-D warnings` のビルドだけの軽い門番で、強さの計測（arena/scenario）は
+  従来どおり手動起動）。凍結版の未使用 import / 未使用コードは `src/frozen/mod.rs` の
+  `#[allow(...)]` で抑止してあるので、警告が出るのは現行コードだけ
 - `cargo test --release -- --ignored` — 遅い検証（shogi.rs の perft depth 4/5）
 - `cargo run --release --bin arena -- [対局数] [候補] [基準1] [基準2] ...` — 戦略同士の対戦。
   基準を複数並べるとガントレット（候補が各基準と対局数ずつ対戦）。
@@ -2120,8 +2124,9 @@
   で生成し（estimator.rs/check.rs/strategy.rs を1ファイルへまとめ、テストと
   診断フックを落とす。**env は PINNED の4関数と `TSUITATE_CAND_THINK_BUDGET_MS`
   だけ落とし、他の `TSUITATE_*` は凍結時点の読み方のまま残る**）、
-  `frozen/mod.rs`・`strategy::make`/`make_seeded`・`arena.yml` の baselines
-  既定値へ登録する。**生成後は同一性確認**として、①スクリプトを再実行して
+  `frozen/mod.rs`（既存の版と同じく `#[allow(unused_imports, unused_variables,
+  dead_code)]` を付ける。凍結ファイル自体は編集しないので警告は mod 側で抑止する）・
+  `strategy::make`/`make_seeded`・`arena.yml` の baselines 既定値へ登録する。**生成後は同一性確認**として、①スクリプトを再実行して
   凍結ファイルと diff がコメント以外ゼロであること、②CI で
   `-f games=100 -f baselines=estimator_vN` が 50%±10 に入ることを確認する
   （挙動が同一である担保。ローカル `arena 20` は ±22pt で検出力がなく、

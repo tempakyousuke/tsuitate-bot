@@ -82,27 +82,6 @@ fn my_nonking_attacks(pos: &Position, sq: Coord, me: Color) -> bool {
         .any(|(from, p)| p.color == me && p.role != Role::King && pos.attacks(from, sq))
 }
 
-/// from→to の経路（直線）で最初に当たる駒のマス
-fn first_blocker(pos: &Position, from: Coord, to: Coord) -> Option<Coord> {
-    let df = (to.file - from.file).signum();
-    let dr = (to.rank - from.rank).signum();
-    let sf = (to.file - from.file).abs();
-    let sr = (to.rank - from.rank).abs();
-    if sf != 0 && sr != 0 && sf != sr {
-        return None;
-    }
-    for i in 1..sf.max(sr) {
-        let c = Coord {
-            file: from.file + df * i,
-            rank: from.rank + dr * i,
-        };
-        if pos.piece_at(c).is_some() {
-            return Some(c);
-        }
-    }
-    None
-}
-
 #[derive(Default, Clone)]
 struct Counts {
     decisions: u64,
@@ -279,14 +258,18 @@ fn main() {
         pct(c.with_king_move, c.decisions)
     );
     println!(
-        "  玉の行き先に「自分が当てている相手駒」がいる（由来タグ不問）\n\
-         　　　　　　　　　　　　　　　　　　  {:>6}  ({:.1}% / 全決定点)",
+        concat!(
+            "  玉の行き先に「自分が当てている相手駒」がいる（由来タグ不問）\n",
+            "　　　　　　　　　　　　　　　　　　  {:>6}  ({:.1}% / 全決定点)"
+        ),
         c.king_any,
         pct(c.king_any, c.decisions)
     );
     println!(
-        "  うち **由来タグ付き**（玉プローブが正しく発火しうる）\n\
-         　　　　　　　　　　　　　　　　　　  {:>6}  ({:.1}% / 全決定点、{:.1}% / 由来タグ不問)",
+        concat!(
+            "  うち **由来タグ付き**（玉プローブが正しく発火しうる）\n",
+            "　　　　　　　　　　　　　　　　　　  {:>6}  ({:.1}% / 全決定点、{:.1}% / 由来タグ不問)"
+        ),
         c.king_anchored,
         pct(c.king_anchored, c.decisions),
         pct(c.king_anchored, c.king_any)
