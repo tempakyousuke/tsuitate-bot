@@ -2202,8 +2202,9 @@
   診断フックを落とす。**env は PINNED の4関数と `TSUITATE_CAND_THINK_BUDGET_MS`
   だけ落とし、他の `TSUITATE_*` は凍結時点の読み方のまま残る**）、
   `frozen/mod.rs`・`strategy::make`/`make_seeded`・`arena.yml` の baselines
-  既定値へ登録する（**`checkpoint-arena.yml` の `opponent` 既定値と
-  `checkpoint-arena/deck.json` の `opponent` も同じチェックリストで更新する**。
+  既定値へ登録する（**`checkpoint-arena.yml` の `opponent` 既定値・
+  `checkpoint-arena/deck.json` の `opponent`・`bin/checkpoint_arena` の
+  `STRATEGY_SOURCES`（env 走査の対象一覧。手動更新）も同じチェックリストで更新する**。
   未使用 import / 未到達コードの警告は `lib.rs` の
   `pub mod frozen;` に付けた `#[allow(...)]` が版を問わず抑止するので、
   凍結ファイル側でもここでも何もしなくてよい）。**生成後は同一性確認**として、①スクリプトを再実行して
