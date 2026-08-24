@@ -154,6 +154,18 @@ fn summary_json(candidate: &str, baseline: &str, stats: &MatchStats) -> serde_js
 /// env を読む）。候補側だけ変えたいときはこちらを使う: 値は
 /// `StrategyConfig` として候補の instance にだけ渡り、プロセス env は動かない。
 /// **凍結版は config を尊重しない**ので、候補が凍結版のときは使えない。
+/// 実行時 cwd の HEAD（`ARENA_GAMES_JSON` の突き合わせ検査用）。
+/// git が無い環境では空文字（検査は「両方空なら一致」で通る）
+fn git_commit() -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
 fn cand_knobs() -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let Ok(spec) = std::env::var("ARENA_CAND_KNOBS") else {
@@ -351,6 +363,7 @@ fn main() {
                 ),
                 Some(seed) => {
                     let knobs = cand_knobs();
+                    let commit = git_commit();
                     let mut lines: Vec<String> = vec![];
                     for (opp_idx, (opp, stats)) in results.iter().enumerate() {
                         // 基準ごとのずらしは run_match_with_seeds の呼び出しと同じ式
@@ -362,6 +375,10 @@ fn main() {
                             lines.push(
                                 serde_json::json!({
                                     "schema": 1,
+                                    // **arm を突き合わせる前提の一部**。env アブレーション
+                                    // なら両 run で同じでなければならない（違うなら
+                                    // 測っているのは別 revision の差でもある）
+                                    "commit": commit,
                                     "candidate": candidate,
                                     "baseline": opp,
                                     "match_seed": match_seed_eff,

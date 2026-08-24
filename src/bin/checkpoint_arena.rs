@@ -2331,6 +2331,7 @@ fn cmd_compare(args: &Args) {
     if let Some(p) = args.get("json") {
         let summary = serde_json::json!({
             "schema": SUMMARY_SCHEMA,
+            "kind": "checkpoint-compare",
             "label": label,
             "pairs": paired.len(),
             "clusters": by_cluster.len(),
@@ -2416,6 +2417,16 @@ fn cmd_report(args: &Args) {
             serde_json::from_str(&text).unwrap_or_else(|e| die(&format!("{p}: {e}")));
         // **summary にも schema の契約を適用する**（PR #20 5回目レビュー指摘1）
         check_summary_schema(&v, p).unwrap_or_else(|e| die(&e));
+        // **arena-var の summary を混ぜない**。schema は同じ 3 でも中身の契約が
+        // 違うので、通すと全列 NaN の行が横断表に並ぶ（欠損が「測った 0」に見える）。
+        // `kind` が無いものは checkpoint 側（この欄より前に作られた summary）
+        if let Some(kind) = v["kind"].as_str() {
+            if kind != "checkpoint-compare" {
+                die(&format!(
+                    "{p}: kind={kind} は横断レポートの対象外です（checkpoint の compare が出した summary を渡してください）"
+                ));
+            }
+        }
         rows.push(v);
     }
     let mut out = String::new();
@@ -2509,6 +2520,7 @@ struct GameRow {
     think_ms_a: f64,
     think_ms_b: f64,
     moves_a: f64,
+    commit: String,
     cand_knobs: BTreeMap<String, String>,
     clock: String,
     budget: String,
@@ -2579,6 +2591,11 @@ fn parse_game_rows(paths: &[String], arm: &str) -> Vec<GameRow> {
                 think_ms_a: req_f("think_ms_a"),
                 think_ms_b: req_f("think_ms_b"),
                 moves_a: req_f("moves_a"),
+                commit: v
+                    .get("commit")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
                 cand_knobs: map("cand_knobs"),
                 clock: v.get("clock").map(|x| x.to_string()).unwrap_or_default(),
                 budget: v
@@ -2636,6 +2653,7 @@ fn assert_uniform(arm: &str, rows: &[GameRow]) {
         ));
     }
     uniq("clock", rows.iter().map(|r| r.clock.clone()).collect());
+    uniq("commit", rows.iter().map(|r| r.commit.clone()).collect());
     uniq(
         "cand_knobs",
         rows.iter().map(|r| fmt_env(&r.cand_knobs)).collect(),
@@ -2696,6 +2714,14 @@ fn cmd_arena_var(args: &Args) {
             "時計が違います: control={} / candidate={}",
             ctrl[0].clock, cand[0].clock
         ));
+    }
+    // **commit が違えば env アブレーションではない**（測っているのは
+    // ノブの差 + revision の差）。P3 の base/target 比較では正常なので警告に留める
+    if ctrl[0].commit != cand[0].commit {
+        eprintln!(
+            "警告: commit が違います（control={} / candidate={}）。\n                   ノブのアブレーションのつもりなら、同じ commit で取り直してください",
+            ctrl[0].commit, cand[0].commit
+        );
     }
     if fmt_env(&ctrl[0].cand_knobs) == fmt_env(&cand[0].cand_knobs)
         && ctrl[0].candidate == cand[0].candidate
@@ -2801,6 +2827,15 @@ fn cmd_arena_var(args: &Args) {
         ctrl[0].clock,
         cand[0].budget,
     ));
+    if ctrl[0].commit == cand[0].commit {
+        out.push_str(&format!("commit `{}`\n\n", ctrl[0].commit));
+    } else {
+        out.push_str(&format!(
+            "commit: control `{}` / candidate `{}`（**差分がエンジンに影響しないことは\
+             ハッシュでは分からない**ので diff を見て確認すること）\n\n",
+            ctrl[0].commit, cand[0].commit
+        ));
+    }
     out.push_str(&format!(
         "ペアになった対局 **{n} 局**（同じ `match_seed` の局ごとに突き合わせ）\n\n"
     ));
@@ -2896,6 +2931,8 @@ fn cmd_arena_var(args: &Args) {
             "candidate_knobs": cand[0].cand_knobs,
             "control_knobs": ctrl[0].cand_knobs,
             "opponent": ctrl[0].baseline,
+            "control_commit": ctrl[0].commit,
+            "candidate_commit": cand[0].commit,
             "clock": ctrl[0].clock,
             "think_budget_ms": cand[0].budget,
             "games": n,
@@ -2964,6 +3001,22 @@ mod tests {
         assert!((z_upper(0.5) - 0.0).abs() < 1e-6);
     }
 
+    /// **arena-var の summary を横断レポートへ混ぜない**（schema は同じでも
+    /// 契約が違うので、通すと全列 NaN の行が並ぶ）
+    #[test]
+    fn report_rejects_foreign_summary_kinds() {
+        let ck = serde_json::json!({ "schema": SUMMARY_SCHEMA, "kind": "checkpoint-compare" });
+        let av = serde_json::json!({ "schema": SUMMARY_SCHEMA, "kind": "arena-var" });
+        let legacy = serde_json::json!({ "schema": SUMMARY_SCHEMA });
+        let accepted = |v: &serde_json::Value| {
+            check_summary_schema(v, "x").is_ok()
+                && v["kind"].as_str().is_none_or(|k| k == "checkpoint-compare")
+        };
+        assert!(accepted(&ck));
+        assert!(accepted(&legacy), "kind が無い過去の summary は通す");
+        assert!(!accepted(&av));
+    }
+
     /// arena-var の土台。`variance` は n−1 の標本分散
     #[test]
     fn sample_variance_matches_hand_calc() {
@@ -2999,6 +3052,7 @@ mod tests {
             think_ms_a: 40_000.0,
             think_ms_b: 38_000.0,
             moves_a: 40.0,
+            commit: "deadbeef".into(),
             cand_knobs: BTreeMap::new(),
             clock: "[1000000,3000]".into(),
             budget: "2000".into(),
