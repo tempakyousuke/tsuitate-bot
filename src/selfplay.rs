@@ -67,6 +67,35 @@ pub enum GameResult {
     Draw,
 }
 
+/// 1対局ぶんの結果（**局ごとのペア差の分散を実測する**ため）。
+///
+/// 通常 arena の集計は勝敗の合計しか残さないので、「同じ `ARENA_MATCH_SEED` の
+/// 2本を局ごとに突き合わせたときの `Var(delta)`」が測れなかった。
+/// checkpoint arena の効率比（var·CPU秒）は arena 側のこの実測が無いと
+/// `Var(delta)=0.5` の仮定に乗ったままになる（issue #19 の P0 の残り）。
+///
+/// 突き合わせのキーは `(baseline, match_seed, game_no)`。`game_no` の偶奇で
+/// 先後が決まるので、同じ `match_seed` の2本では対局条件列が揃う。
+#[derive(Debug, Clone)]
+pub struct GameOutcome {
+    pub game_no: u32,
+    /// A が先手だったか（`game_no % 2 == 0`）
+    pub a_is_sente: bool,
+    /// A 視点のスコア（勝1 / 分0.5 / 負0）
+    pub score_a: f64,
+    pub reason: String,
+    pub plies: u32,
+    pub fouls_a: u32,
+    pub fouls_b: u32,
+    pub fouls_in_check_a: u32,
+    pub fouls_in_check_b: u32,
+    /// この対局での思考時間の合計（ms）。CPU コストの実測に使う
+    pub think_ms_a: f64,
+    pub think_ms_b: f64,
+    pub moves_a: u32,
+    pub moves_b: u32,
+}
+
 #[derive(Debug, Default)]
 pub struct MatchStats {
     pub games: u32,
@@ -98,6 +127,9 @@ pub struct MatchStats {
     /// None は未計測（1手も指していない）
     pub clock_min_ms_a: Option<i64>,
     pub clock_min_ms_b: Option<i64>,
+    /// 1局ごとの結果（`ARENA_GAMES_JSON` で書き出す）。スレッドに分散するので
+    /// 順序は `game_no` 昇順ではない（書き出し側で整列する）
+    pub per_game: Vec<GameOutcome>,
 }
 
 impl MatchStats {
@@ -142,6 +174,7 @@ impl MatchStats {
         self.clock_granted_ms_b += other.clock_granted_ms_b;
         self.clock_min_ms_a = min_opt(self.clock_min_ms_a, other.clock_min_ms_a);
         self.clock_min_ms_b = min_opt(self.clock_min_ms_b, other.clock_min_ms_b);
+        self.per_game.extend(other.per_game);
         self.games += other.games;
     }
 }
@@ -432,6 +465,7 @@ fn write_record(
 /// 1局ぶんの結果を stats に集計する
 fn record_game(
     stats: &mut MatchStats,
+    game_no: u32,
     a_is_sente: bool,
     players: [PlayerState; 2],
     result: GameResult,
@@ -444,6 +478,32 @@ fn record_game(
     } else {
         (gote, sente)
     };
+    // 局ごとの結果（ペア差の分散の実測用）。think_us は下で move されるので先に畳む
+    let sum_ms = |us: &[u64]| us.iter().sum::<u64>() as f64 / 1000.0;
+    stats.per_game.push(GameOutcome {
+        game_no,
+        a_is_sente,
+        score_a: match result {
+            GameResult::Draw => 0.5,
+            GameResult::Win(winner) => {
+                if (winner == Color::Sente) == a_is_sente {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+        },
+        reason: reason.to_string(),
+        plies,
+        fouls_a: pa.fouls,
+        fouls_b: pb.fouls,
+        fouls_in_check_a: pa.fouls_in_check,
+        fouls_in_check_b: pb.fouls_in_check,
+        think_ms_a: sum_ms(&pa.think_us),
+        think_ms_b: sum_ms(&pb.think_us),
+        moves_a: pa.think_us.len() as u32,
+        moves_b: pb.think_us.len() as u32,
+    });
     stats.fouls_a += pa.fouls as u64;
     stats.fouls_b += pb.fouls as u64;
     stats.fouls_in_check_a += pa.fouls_in_check as u64;
@@ -624,7 +684,7 @@ where
                         if let Some(dir) = record_dir {
                             write_record(dir, game_no, a_is_sente, &players, result, reason, truth);
                         }
-                        record_game(&mut local, a_is_sente, players, result, reason, plies);
+                        record_game(&mut local, game_no, a_is_sente, players, result, reason, plies);
                         game_no += threads as u32;
                     }
                     local

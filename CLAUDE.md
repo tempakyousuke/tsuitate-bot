@@ -40,6 +40,14 @@
   `arena-result-<基準>-s<n>` / `arena-records-<基準>-s<n>`。
   `-f match_seed=<数>` で対局条件列を決定論化できる（アブレーション比較用。
   同じ入力なら版をまたいで同じ条件列。シャード間は自動で+shardずらし）。
+  **`match_seed` 指定時は1行=1対局の記録 `arena-games.jsonl` も出る**
+  （`ARENA_GAMES_JSON`。artifact `arena-result-*` と `arena-combined` の
+  `all-games.jsonl`）。`-f pair_with=<対照のArena実行ID>` を付けると
+  aggregate ジョブが対照の記録を取ってきて
+  `checkpoint_arena arena-var` を回し、**局ごとのペア差**（Var・CI・MDE・
+  var·CPU秒・安全性の共同指標）をサマリーへ出す（issue #19 の P0。
+  対照と候補で match_seed / 局数 / shards / 相手 / 時計 をすべて揃え、
+  違うのは `cand_env` や `candidate` だけにすること）。
   baselines の既定値は凍結版を追加したら手動で更新すること。
   **アリーナの時計は既定 1000秒+3秒**（本番サイトの300秒+3秒より厚い）。
   `-f clock="300+3"` で本番相当に切り替えられる（審判側の設定。
@@ -92,12 +100,22 @@
   （粒子ガイド2種・prior_legal/最終p_legal直接制約2種）はいずれも
   有意な改善に届かなかった（docs/c8-direct-synthesis.md 参照）。この
   ギャップは今のところ埋まっていない
-- `cargo run --release --bin checkpoint_arena -- <extract|run|compare|report>` —
+- `cargo run --release --bin checkpoint_arena -- <extract|run|compare|report|arena-var>` —
   **checkpoint arena**（issue #19、2026-08-23 に P0 の計測経路として実装）。過去の
   実戦の途中局面から bot 同士で終局まで指し継ぎ、候補と対照を**同じ局面でブロック化**して
   比べる。位置づけは「通常 arena へ送る前に**明確な悪化**を安価に除外する破滅検出器」で、
   **採否は今までどおり arena.yml のガントレット**。較正が済むまで informational。
-  設計・実測・撤退判断は `docs/checkpoint-arena-p0.md`。要点:
+  設計・実測・撤退判断は `docs/checkpoint-arena-p0.md`。
+  **2026-08-24 の CI 規模実測（700ms・64局面×4seed・合計43 CPU時間）で、
+  この構成は破滅検出器として不合格**: 予算を 700ms へ揃えた通常 arena の
+  **−14.4pt [−27.9, −1.9]** を、checkpoint は **+8.0pt [+0.2, +16.0]** と
+  **逆向きに**報告した（反則/局も arena +1.37 の悪化 vs checkpoint −0.28 で逆）。
+  統計・分解能・予算のどれでもない（A/A は2本で +7.0/+0.0pt、偽陽性率は
+  n=64 で 4.5〜6.7% = 名目どおり、SE ±3.4〜4.7pt、700ms と 2000ms で
+  arena 側は一致）。**コスト優位も無い**（var·CPU秒 42 vs 31〜57 で互角）ので
+  issue #19 の撤退条件「通常 arena に明確なコスト優位が無い」に該当する。
+  一方 **v14 vs v10 級の大差 +24.2pt は正しく分離できる**ので配管は壊れていない。
+  較正点は1つなので「常に符号が逆」とは一般化しない。要点:
   - 裁定は `selfplay::play_continuation` = 通常 arena と**同じ関数**（MAX_PLIES・反則上限・
     王手/捕獲通知・終局判定を共有）。**時計は無効**（途中局面の残り時間は復元できない。
     本番相当で時間切れ0の実測があるので落としてよい）だが**思考時間は必ず記録する**
@@ -168,6 +186,14 @@
     `gh` が無ければ `.github/ci/checkpoint-arena.request.json` を置いて push（削除の push は
     全ジョブがスキップされる）。**デッキは arena 記録から作るのを既定にする**
     （局面分布が実際の対局分布と一致する。`arena_run_id` を渡せば追加の対局コストはゼロ）
+  - **`arena-var` は通常 arena 側の相方**（2026-08-24）。`ARENA_GAMES_JSON` が出す
+    1行=1対局の記録を2本ぶん受け取り、同じ `match_seed` の局ごとに
+    `delta = 候補 − 対照` を取って **`Var(ペア差)`**・CI・MDE・必要 N・
+    var·CPU秒・安全性の共同指標を出す。checkpoint 側の効率比はこの実測が
+    無いと `Var(delta)=0.5` の仮定に乗ったままで、**同じ実行が
+    `--known-arena-delta` に渡す既知値にもなる**。CI では `arena.yml` の
+    `-f pair_with=<対照のArena実行ID>` が候補側 run の中でこれを回す。
+    ガントレットの記録は `--baseline` で1マッチアップに絞る
 - `cargo run --release --bin tune -- [反復数] [評価あたり対局数] [基準...]` — 評価パラメータ
   （`strategy::EvalParams`）のSPSA自動チューニング。目的関数はアリーナのスコア率
   （引き分け=0.5勝）。**f+/f− は共通乱数法でペアリングされる**: 同じ対局シード列

@@ -7,5 +7,9 @@
   "oracle": "",
   "clock": "",
   "env": "",
-  "cand_env": ""
+  "cand_env": "",
+  "_pair_note": "pair_with に対照の Arena 実行IDを入れると、この run を候補として局ごとにペア集計する（aggregate ジョブが checkpoint_arena arena-var を回して Var(ペア差) と既知 arena 差を出す）。対照と候補は match_seed / 局数 / shards / 相手 / 時計 をすべて揃え、違うのは cand_env や candidate だけにすること。match_seed 必須。",
+  "pair_with": "",
+  "_reaggregate_note": "games_from_run_id に既存 Arena 実行IDを入れると、対局はやり直さずその run のシャード結果から集計とペア集計だけ回す（pair_with と併用）。集計側を直したときの当て直し用",
+  "games_from_run_id": ""
 }

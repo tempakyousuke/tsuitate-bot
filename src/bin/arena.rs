@@ -12,6 +12,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use tsuitate_bot::config;
+
 use tsuitate_bot::selfplay::{
     MatchStats, fischer_increment_ms, fischer_initial_ms, run_match_with, run_match_with_seeds,
     thread_count,
@@ -154,6 +156,18 @@ fn summary_json(candidate: &str, baseline: &str, stats: &MatchStats) -> serde_js
 /// env を読む）。候補側だけ変えたいときはこちらを使う: 値は
 /// `StrategyConfig` として候補の instance にだけ渡り、プロセス env は動かない。
 /// **凍結版は config を尊重しない**ので、候補が凍結版のときは使えない。
+/// 実行時 cwd の HEAD（`ARENA_GAMES_JSON` の突き合わせ検査用）。
+/// git が無い環境では空文字（検査は「両方空なら一致」で通る）
+fn git_commit() -> String {
+    std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default()
+}
+
 fn cand_knobs() -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let Ok(spec) = std::env::var("ARENA_CAND_KNOBS") else {
@@ -336,6 +350,80 @@ fn main() {
     // まとめた値だが、凍結版は last_ranking を作らないので実質候補側の統計
     if let Some(table) = tsuitate_bot::hits::dump() {
         println!("{table}");
+    }
+
+    // ARENA_GAMES_JSON: **1行=1対局**で書き出す（issue #19 の P0 の残り:
+    // 同じ ARENA_MATCH_SEED の2本を局ごとに突き合わせて Var(delta) を実測する）。
+    // 集計サマリー（ARENA_JSON）では勝敗の合計しか残らず、ペア差の分散が測れない。
+    // `match_seed` が無いと局ごとの対局条件が揃わない = ペアにならないので、
+    // そのときは何も書かずに理由を出す
+    if let Ok(path) = std::env::var("ARENA_GAMES_JSON") {
+        if !path.is_empty() {
+            match match_seed {
+                None => eprintln!(
+                    "ARENA_GAMES_JSON は ARENA_MATCH_SEED と併用してください\n                                  （局ごとの対局条件が揃わないとペア差になりません）"
+                ),
+                Some(seed) => {
+                    let knobs = cand_knobs();
+                    let commit = git_commit();
+                    let mut lines: Vec<String> = vec![];
+                    for (opp_idx, (opp, stats)) in results.iter().enumerate() {
+                        // 基準ごとのずらしは run_match_with_seeds の呼び出しと同じ式
+                        let match_seed_eff =
+                            seed ^ (opp_idx as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                        let mut games: Vec<&_> = stats.per_game.iter().collect();
+                        games.sort_by_key(|g| g.game_no);
+                        for g in games {
+                            lines.push(
+                                serde_json::json!({
+                                    // schema 2: **実効条件の指紋を必須にした**
+                                    // （PR #23 レビュー指摘2。名前と時計しか見ていないと、
+                                    //  同じ `estimator_v14` でも共通 env・共有モデル pin・
+                                    //  予算が違う2 run を「ペア」として受理してしまう）
+                                    "schema": 2,
+                                    // **arm を突き合わせる前提の一部**。env アブレーション
+                                    // なら両 run で同じでなければならない（違うなら
+                                    // 測っているのは別 revision の差でもある）
+                                    "commit": commit,
+                                    "candidate": candidate,
+                                    "baseline": opp,
+                                    "match_seed": match_seed_eff,
+                                    "game_no": g.game_no,
+                                    "a_is_sente": g.a_is_sente,
+                                    "score_a": g.score_a,
+                                    "reason": g.reason,
+                                    "plies": g.plies,
+                                    "fouls_a": g.fouls_a,
+                                    "fouls_b": g.fouls_b,
+                                    "fouls_in_check_a": g.fouls_in_check_a,
+                                    "fouls_in_check_b": g.fouls_in_check_b,
+                                    "think_ms_a": g.think_ms_a,
+                                    "think_ms_b": g.think_ms_b,
+                                    "moves_a": g.moves_a,
+                                    "moves_b": g.moves_b,
+                                    // **両側の実効予算**。片側だけだと 700ms と 2000ms の
+                                    // 2 run が「同じ条件のペア」として通る
+                                    "think_budget_ms_a": budget_of(&candidate, &candidate_config()),
+                                    "think_budget_ms_b": budget_of(opp, &config::ambient()),
+                                    "cand_knobs": knobs,
+                                    // 候補と固定相手の**実効挙動**の指紋（summary と同じ規約）
+                                    "cand_config": behavior_of(&candidate, &candidate_config()),
+                                    "baseline_behavior": behavior_of(opp, &config::ambient()),
+                                    // 両側に効くプロセス env（`-f env=`）。ここが違えば
+                                    // 固定相手の挙動も違う
+                                    "shared_env": process_env(),
+                                    "clock": [fischer_initial_ms(), fischer_increment_ms()],
+                                })
+                                .to_string(),
+                            );
+                        }
+                    }
+                    std::fs::write(&path, lines.join("\n") + "\n").unwrap_or_else(|e| {
+                        eprintln!("ARENA_GAMES_JSON を書き込めません（{path}）: {e}")
+                    });
+                }
+            }
+        }
     }
 
     // ARENA_JSON: 集計をJSONL（1行=1マッチアップ）で書き出す（CIのシャード集約用）
