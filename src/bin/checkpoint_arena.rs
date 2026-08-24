@@ -2490,18 +2490,40 @@ fn cmd_report(args: &Args) {
     if known.len() >= 2 {
         let k: Vec<f64> = known.iter().map(|v| f(v, "known_arena_delta_pt")).collect();
         let c: Vec<f64> = known.iter().map(|v| f(v, "delta_pt")).collect();
-        let agree = k.iter().zip(&c).filter(|(a, b)| a.signum() == b.signum()).count();
+        // **真値 0（A/A 等）は符号一致から外す**。`f64::signum(0.0)` は +1 を返すので、
+        // 数えると「正に振れた A/A」が符号一致にカウントされて甘い数字になる
+        let signed: Vec<(f64, f64)> = k
+            .iter()
+            .zip(&c)
+            .filter(|(a, _)| a.abs() > 1e-9)
+            .map(|(a, b)| (*a, *b))
+            .collect();
+        let zeros = k.len() - signed.len();
+        let agree = signed.iter().filter(|(a, b)| a.signum() == b.signum()).count();
         out.push_str(&format!(
-            "\n- 符号一致: {agree}/{}\n- 順位相関（スピアマン）: {:.3}\n",
-            k.len(),
+            "\n- 符号一致: {agree}/{}{}\n- 順位相関（スピアマン）: {:.3}\n",
+            signed.len(),
+            if zeros > 0 {
+                format!("（真値 0 の {zeros} 件は符号を持たないので除外）")
+            } else {
+                String::new()
+            },
             spearman(&k, &c)
         ));
-        // 重大悪化（既知 −8pt 以下）の見逃し = CI の上端が 0 を跨いだもの
+        // 重大悪化（既知 −8pt 以下）に何が起きたか。
+        // **「検出できなかった」と「逆符号で有意になった」を分ける**:
+        // 後者は「悪化していない」ではなく「改善している」と読める出力なので、
+        // ゲートとしては前者より明確に悪い（2026-08-24 の drop_probe_gate がこれ）
         let severe: Vec<&&serde_json::Value> = known.iter().filter(|v| f(v, "known_arena_delta_pt") <= -8.0).collect();
-        let missed = severe.iter().filter(|v| f(v, "ci_hi_pt") >= 0.0).count();
+        let opposite = severe.iter().filter(|v| f(v, "ci_lo_pt") > 0.0).count();
+        let inconclusive = severe
+            .iter()
+            .filter(|v| f(v, "ci_lo_pt") <= 0.0 && f(v, "ci_hi_pt") >= 0.0)
+            .count();
         out.push_str(&format!(
-            "- 重大悪化（既知 −8pt 以下）{} 件のうち、CI 上端が 0 を跨いで見逃したもの: {missed} 件\n",
-            severe.len()
+            "- 重大悪化（既知 −8pt 以下）{} 件: 検出 {} / 検出できず（CI が 0 を跨いだ）{inconclusive} / **逆符号で有意 {opposite}**\n",
+            severe.len(),
+            severe.len() - inconclusive - opposite,
         ));
     }
     print!("{out}");
