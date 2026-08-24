@@ -75,6 +75,20 @@ impl EnvSource {
         &self.vars
     }
 
+    /// 上書きを重ねた新しい source を返す（arm 固有ノブを共通設定へ載せる用）。
+    pub fn with_overrides<I, K, V>(&self, pairs: I) -> Self
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<String>,
+        V: Into<String>,
+    {
+        let mut vars = self.vars.clone();
+        for (k, v) in pairs {
+            vars.insert(k.into(), v.into());
+        }
+        Self { vars }
+    }
+
     /// 与えたキーのうち、戦略が実際に見るもの（[`STRATEGY_ENV_KEYS`]）だけ。
     /// 記録・検査用（未知のキーは戦略に影響しないので落とす）。
     pub fn strategy_keys(&self) -> BTreeMap<String, String> {

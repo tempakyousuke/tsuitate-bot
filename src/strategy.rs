@@ -185,6 +185,49 @@ pub fn make_seeded(name: &str, seed: u64) -> Option<Box<dyn Strategy + Send>> {
     }
 }
 
+/// **設定を尊重する戦略名か**（issue #21）。
+///
+/// 現行 estimator 系だけが [`crate::config::StrategyConfig`] を instance で持つ。
+/// 凍結版 v6〜v14 は凍結時点のコピーの中でプロセス env を直接読むので、
+/// config を渡しても**無視される**。取り違えを検出できるように名前で分ける。
+pub fn honors_config(name: &str) -> bool {
+    matches!(name, "estimator" | "estimator_rush")
+}
+
+/// 設定とシードを明示して作る（arena / checkpoint arena の arm 用）。
+///
+/// config を尊重しない戦略名（凍結版）では **None** を返す: プロセス env を
+/// 触らずに arm 固有のノブを渡せるのは現行 estimator だけで、凍結版に対して
+/// 「設定したつもり」になるのが PR #20 で見つかった事故そのものだから。
+pub fn make_seeded_with_config(
+    name: &str,
+    seed: u64,
+    config: Arc<crate::config::StrategyConfig>,
+) -> Option<Box<dyn Strategy + Send>> {
+    match name {
+        "estimator" => Some(Box::new(EstimatorStrategy::with_config(
+            config,
+            EvalParams::default(),
+            None,
+            Some(seed),
+        ))),
+        "estimator_rush" => {
+            // 定跡の読み込みも config のパスで行う
+            let idx = {
+                let _cfg = crate::config::scoped(&config);
+                OpeningBook::line_index("居飛車速攻")?
+            };
+            Some(Box::new(EstimatorStrategy::with_config(
+                config,
+                EvalParams::default(),
+                Some(idx),
+                Some(seed),
+            )))
+        }
+        _ => None,
+    }
+}
+
 pub fn make(name: &str) -> Option<Box<dyn Strategy + Send>> {
     match name {
         "heuristic" => Some(Box::new(Heuristic)),
