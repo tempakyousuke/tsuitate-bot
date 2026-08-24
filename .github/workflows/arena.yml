@@ -51,6 +51,10 @@ on:
         description: "対照にする Arena 実行ID（この run を候補として局ごとにペア集計する。**同じ match_seed / 局数 / shards / 相手 / 時計**で取った run を指すこと）"
         required: false
         default: ""
+      games_from_run_id:
+        description: "既存 Arena 実行の対局記録を候補として使う（対局はやり直さず集計とペア集計だけ回す）"
+        required: false
+        default: ""
   push:
     paths:
       - ".github/ci/arena.request.json"
@@ -70,6 +74,7 @@ jobs:
       env: ${{ steps.split.outputs.env }}
       cand_env: ${{ steps.split.outputs.cand_env }}
       pair_with: ${{ steps.split.outputs.pair_with }}
+      games_from: ${{ steps.split.outputs.games_from }}
     steps:
       - uses: actions/checkout@v5
       - id: split
@@ -85,6 +90,7 @@ jobs:
           IN_ENV: ${{ github.event.inputs.env }}
           IN_CAND_ENV: ${{ github.event.inputs.cand_env }}
           IN_PAIR_WITH: ${{ github.event.inputs.pair_with }}
+          IN_GAMES_FROM: ${{ github.event.inputs.games_from_run_id }}
         run: |
           set -euo pipefail
           default_baselines='estimator_v9 estimator_v10 estimator_v11 estimator_v12 estimator_v13 estimator_v14'
@@ -100,6 +106,7 @@ jobs:
             extra_env="${IN_ENV:-}"
             cand_env="${IN_CAND_ENV:-}"
             pair_with="${IN_PAIR_WITH:-}"
+            games_from="${IN_GAMES_FROM:-}"
           else
             if [ ! -f "$req" ]; then
               # push の paths フィルタはファイルの削除にも一致するので、計測が
@@ -121,6 +128,7 @@ jobs:
                 echo "env="
                 echo "cand_env="
                 echo "pair_with="
+                echo "games_from="
               } >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -139,9 +147,11 @@ jobs:
             extra_env=$(jq -r '.env // ""' "$req")
             cand_env=$(jq -r '.cand_env // ""' "$req")
             pair_with=$(jq -r '.pair_with // ""' "$req")
+            games_from=$(jq -r '.games_from_run_id // ""' "$req")
           fi
           # ペア集計は局ごとの突き合わせなので、match_seed が無いと成立しない
-          if [ -n "$pair_with" ] && [ -z "$match_seed" ]; then
+          # （`games_from` の再集計では元 run が match_seed 付きで回っていればよい）
+          if [ -n "$pair_with" ] && [ -z "$match_seed" ] && [ -z "$games_from" ]; then
             echo "pair_with は match_seed と併用してください（局ごとの条件が揃いません）" >&2
             exit 1
           fi
@@ -157,6 +167,7 @@ jobs:
           echo "oracle=$oracle" >> "$GITHUB_OUTPUT"
           echo "clock=$clock" >> "$GITHUB_OUTPUT"
           {
+            echo "games_from=$games_from"
             echo "pair_with=$pair_with"
             echo "cand_env=$cand_env"
             echo "env<<EOF"
@@ -166,7 +177,8 @@ jobs:
 
   arena:
     needs: plan
-    if: needs.plan.outputs.skip != 'true'
+    # `games_from_run_id` の再集計では対局をやり直さない
+    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.games_from == ''
     strategy:
       fail-fast: false
       matrix:
@@ -290,10 +302,25 @@ jobs:
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.skip != 'true'
     runs-on: ubuntu-latest
     steps:
+      # **checkout は必ず download より前**。actions/checkout はワークスペースを
+      # 掃除するので、後ろに置くと落とした artifact も集計の中間ファイルも消える
+      # （2026-08-24 に arena-var のペア集計がこれで落ちた）
+      - uses: actions/checkout@v5
+        if: needs.plan.outputs.pair_with != ''
       - uses: actions/download-artifact@v7
+        if: needs.plan.outputs.games_from == ''
         with:
           pattern: arena-result-*
           path: shards
+      # 再集計（`games_from_run_id`）: 対局はやり直さず、過去の run の
+      # シャード結果から集計とペア集計だけ回す
+      - uses: actions/download-artifact@v7
+        if: needs.plan.outputs.games_from != ''
+        with:
+          pattern: arena-result-*
+          path: shards
+          run-id: ${{ needs.plan.outputs.games_from }}
+          github-token: ${{ github.token }}
 
       - name: Aggregate shards
         run: |
@@ -373,8 +400,6 @@ jobs:
           path: control-run
           run-id: ${{ needs.plan.outputs.pair_with }}
           github-token: ${{ github.token }}
-      - uses: actions/checkout@v5
-        if: needs.plan.outputs.pair_with != ''
       - uses: dtolnay/rust-toolchain@stable
         if: needs.plan.outputs.pair_with != ''
       - uses: Swatinem/rust-cache@v2
@@ -393,6 +418,7 @@ jobs:
             --label "run${{ github.run_id }}-vs-${{ needs.plan.outputs.pair_with }}" \
             --markdown arena-var.md --json arena-var.json
           cat arena-var.md >> "$GITHUB_STEP_SUMMARY"
+          cat arena-var.md
 
       - name: Upload combined result
         uses: actions/upload-artifact@v6
