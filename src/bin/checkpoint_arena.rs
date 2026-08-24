@@ -38,7 +38,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use tsuitate_bot::checkpoint::{
-    Deck, DeckEntry, GameCandidates, candidates, kif_ending, phase_tag, restore,
+    Deck, DeckEntry, GameCandidates, candidates, kif_ending, phase_tag, restore, stable_game_id,
     split_of, stable_hash, stratified_pick,
 };
 use tsuitate_bot::kifu::kif_body;
@@ -122,6 +122,12 @@ impl Args {
     }
 }
 
+/// **実行時 cwd の HEAD** を返す（バイナリの revision ではない）。
+/// 同一バイナリ内の比較では十分だが、P3 の `--control-bin` / `--candidate-bin`
+/// で別 revision のバイナリを突き合わせるときは、これでは区別できない
+/// （両方とも同じ cwd の HEAD になる）。P3 に入る前に build-time revision
+/// （`env!` で埋め込む等）へ分ける必要がある（PR #20 追加レビュー指摘4）。
+/// それまでは compare の commit 混在チェックが安全弁として働く
 fn git_commit() -> String {
     std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
@@ -168,19 +174,38 @@ fn walk_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
-fn collect_record_files(specs: &[String]) -> Vec<PathBuf> {
-    let mut out = vec![];
+/// (安定した元対局 ID, ファイルパス)。ID は入力ルートからの相対パス由来なので、
+/// 複数ディレクトリに同名の JSONL があっても衝突しない（追加レビュー指摘5）
+fn collect_record_files(specs: &[String]) -> Vec<(String, PathBuf)> {
+    let mut files: Vec<(String, PathBuf)> = vec![];
     for spec in specs {
         let p = Path::new(spec);
         if p.is_dir() {
-            walk_jsonl(p, &mut out);
+            let mut found = vec![];
+            walk_jsonl(p, &mut found);
+            for f in found {
+                files.push((stable_game_id(p, &f), f));
+            }
         } else {
-            out.push(p.to_path_buf());
+            let root = p.parent().unwrap_or(Path::new("."));
+            files.push((stable_game_id(root, p), p.to_path_buf()));
         }
     }
-    out.sort();
-    out.dedup();
-    out
+    files.sort();
+    files.dedup();
+    // それでも同じ ID が出たら（同じファイルを別スペックで2回渡した等）即エラー。
+    // 黙って上書きすると別対局の状態が混ざる
+    let mut seen: HashMap<&str, &PathBuf> = HashMap::new();
+    for (id, path) in &files {
+        if let Some(prev) = seen.insert(id.as_str(), path) {
+            die(&format!(
+                "元対局 ID が衝突しています: {id}\n  {}\n  {}",
+                prev.display(),
+                path.display()
+            ));
+        }
+    }
+    files
 }
 
 fn cmd_extract(args: &Args) {
@@ -211,11 +236,8 @@ fn cmd_extract(args: &Args) {
     let mut games: Vec<GameCandidates> = vec![];
     let mut ends: HashMap<String, tsuitate_bot::protocol::GameEndPayload> = HashMap::new();
     let mut skipped = (0u32, 0u32, 0u32); // (記録不備, 棋譜破損, 適格ゼロ)
-    for path in &files {
-        let stem = path
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
+    for (stem, path) in &files {
+        let stem = stem.clone();
         let Some(end) = load_end(&path.to_string_lossy()) else {
             skipped.0 += 1;
             continue;
@@ -283,6 +305,7 @@ fn cmd_extract(args: &Args) {
             .unwrap_or_else(|e| die(&format!("{rel}: {e}")));
         entries.push(DeckEntry {
             id,
+            game: game_id.clone(),
             kif: rel,
             ply: cand.ply,
             split: split_of(game_id, dev_pct, seed).to_string(),
@@ -459,7 +482,7 @@ fn play_one_arm(
         "arm_order": arm_order,
         "checkpoint": entry.id,
         // 元対局（cluster bootstrap の統計単位）。1棋譜1checkpoint なら 1:1
-        "source_game": entry.id.rsplit_once("-ply").map(|(g, _)| g).unwrap_or(&entry.id),
+        "source_game": if entry.game.is_empty() { entry.id.as_str() } else { entry.game.as_str() },
         "seed": seed,
         "split": entry.split,
         "tags": entry.tags,
@@ -657,8 +680,19 @@ fn cmd_run(args: &Args) {
     );
     let deck = Deck::load(&deck_path).unwrap_or_else(|e| die(&e));
     let split = args.get("split").unwrap_or("dev").to_string();
-    let seeds: u64 = args.num("seeds", 1);
+    let seeds: u64 = args.num("seeds", 2);
     let seed_base: u64 = args.num("seed-base", 0);
+    // arm 順は (checkpoint 番号 + seed) % 2 なので、2k と 2k+1 が対になって
+    // 初めて AB/BA が cluster の内側で閉じる。奇数個だと実行順効果が
+    // cluster 平均に残り、compare 側も replicate を作れない（追加レビュー指摘3）
+    if seeds % 2 != 0 && !args.flag("allow-odd-seeds") {
+        die(&format!(
+            "--seeds は 2 の倍数にしてください（指定 {seeds}）。\n             承知のうえで奇数にするなら --allow-odd-seeds（compare は外挿表を出しません）"
+        ));
+    }
+    if seed_base % 2 != 0 && !args.flag("allow-odd-seeds") {
+        die(&format!("--seed-base は偶数にしてください（指定 {seed_base}）"));
+    }
     let jobs: usize = args.num("jobs", 1);
     let limit: usize = args.num("limit", 0);
     let experiment = args.get("experiment").unwrap_or("adhoc").to_string();
@@ -859,6 +893,8 @@ struct Row {
     think_budget: String,
     opponent: String,
     strategy: String,
+    /// 実効 env（`TSUITATE_*` のみ）。arm 内で一意であることを検査する
+    env: BTreeMap<String, String>,
     prewarm_shared: bool,
     metrics: BTreeMap<&'static str, f64>,
     prewarm_ms: f64,
@@ -957,6 +993,16 @@ fn parse_rows(paths: &[String]) -> Vec<Row> {
                 think_budget: req_s("think_budget_ms"),
                 opponent: req_s("opponent"),
                 strategy: req_s("strategy"),
+                env: v["env"]
+                    .as_object()
+                    .map(|m| {
+                        m.iter()
+                            .map(|(k, val)| {
+                                (k.clone(), val.as_str().unwrap_or_default().to_string())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 prewarm_shared: v["prewarm_shared"].as_bool().unwrap_or(false),
                 metrics,
                 prewarm_ms: req_f("prewarm_ms_me") + req_f("prewarm_ms_opp"),
@@ -974,7 +1020,11 @@ fn parse_rows(paths: &[String]) -> Vec<Row> {
 /// もっともらしい summary が出てしまっていた**。実験条件の一意性・重複・
 /// 期待件数を検査し、不一致や部分集計は失敗させる（`--allow-incomplete`
 /// を明示したときだけ警告に落として続行する）。
-fn validate_rows(rows: &[Row], allow_incomplete: bool) -> Vec<String> {
+fn validate_rows(
+    rows: &[Row],
+    allow_incomplete: bool,
+    expected_checkpoints: Option<&HashSet<String>>,
+) -> Vec<String> {
     let mut notes: Vec<String> = vec![];
     let fail = |msg: String, notes: &mut Vec<String>| {
         if allow_incomplete {
@@ -1005,6 +1055,30 @@ fn validate_rows(rows: &[Row], allow_incomplete: bool) -> Vec<String> {
         fail(format!("commit が混在しています: {}", v.join(", ")), &mut notes);
     }
 
+    // **arm 内では strategy と正規化 env が一意**であること（追加レビュー指摘4）。
+    // arm 間で違うのは正常だが、同じ arm のあるシャードだけ別 env / 別戦略で
+    // 走っていたら別物の集計になる。親プロセスから継承した TSUITATE_* の
+    // 混入もここで捕まる
+    for arm in ["control", "candidate"] {
+        let sigs: HashSet<String> = rows
+            .iter()
+            .filter(|r| r.arm == arm)
+            .map(|r| {
+                let env: Vec<String> =
+                    r.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                format!("{}|{}", r.strategy, env.join(" "))
+            })
+            .collect();
+        if sigs.len() > 1 {
+            let mut v: Vec<String> = sigs.into_iter().collect();
+            v.sort();
+            fail(
+                format!("arm={arm} 内で strategy / env が混在しています: {}", v.join(" || ")),
+                &mut notes,
+            );
+        }
+    }
+
     // 同じ (checkpoint, seed, arm) が2行あってはいけない（後勝ちで黙って上書きしない）
     let mut seen: HashSet<(String, u64, String)> = HashSet::new();
     for r in rows {
@@ -1024,6 +1098,33 @@ fn validate_rows(rows: &[Row], allow_incomplete: bool) -> Vec<String> {
         by_cp.entry(r.checkpoint.as_str()).or_default().insert(r.seed);
     }
     let expected: Option<&BTreeSet<u64>> = by_cp.values().max_by_key(|s| s.len());
+    // **デッキ側の期待 checkpoint 集合と突き合わせる**（追加レビュー指摘1）。
+    // 入力に現れた checkpoint 同士を比べるだけでは、shard の artifact が
+    // 丸ごと欠けたときに「全部揃っている」ように見えてしまう
+    if let Some(want) = expected_checkpoints {
+        let got: HashSet<&str> = by_cp.keys().copied().collect();
+        let missing: Vec<&String> = want.iter().filter(|c| !got.contains(c.as_str())).collect();
+        if !missing.is_empty() {
+            fail(
+                format!(
+                    "デッキにある checkpoint のうち {} 件が結果に出ていません（shard 欠落？）: {}",
+                    missing.len(),
+                    missing.iter().take(5).map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                ),
+                &mut notes,
+            );
+        }
+        let extra: Vec<&str> = got.iter().filter(|c| !want.contains(**c)).copied().collect();
+        if !extra.is_empty() {
+            fail(
+                format!(
+                    "デッキに無い checkpoint が結果に含まれています: {}",
+                    extra.iter().take(5).copied().collect::<Vec<_>>().join(", ")
+                ),
+                &mut notes,
+            );
+        }
+    }
     if let Some(expected) = expected {
         let short: Vec<&str> = by_cp
             .iter()
@@ -1051,26 +1152,35 @@ fn mean(v: &[f64]) -> f64 {
 
 /// 元対局（cluster）単位のブートストラップ。**seed を独立標本として数えない**:
 /// 再標本化するのは cluster で、cluster 内の値はまとめて出入りする
-fn cluster_bootstrap(clusters: &[Vec<f64>], b: usize, seed: u64) -> (f64, f64) {
-    use rand::{Rng, SeedableRng};
+fn cluster_bootstrap(clusters: &[Vec<f64>], b: usize, seed: u64, alpha: f64) -> (f64, f64) {
     if clusters.is_empty() {
         return (0.0, 0.0);
     }
     let means: Vec<f64> = clusters.iter().map(|c| mean(c)).collect();
+    bootstrap_ci_of_means(&means, b, seed, alpha)
+}
+
+/// cluster 平均の列から percentile bootstrap CI を作る（本番の判定規則そのもの）。
+/// **percentile は alpha に連動させる**（追加レビュー指摘2: `--alpha` を変えても
+/// 2.5/97.5% 固定だと、MDE の alpha と主 CI の alpha が食い違う）
+fn bootstrap_ci_of_means(means: &[f64], b: usize, seed: u64, alpha: f64) -> (f64, f64) {
+    use rand::{Rng, SeedableRng};
+    if means.is_empty() || b == 0 {
+        return (0.0, 0.0);
+    }
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let mut samples: Vec<f64> = Vec::with_capacity(b);
+    let mut buf = vec![0.0f64; means.len()];
     for _ in 0..b {
-        let m = mean(
-            &(0..means.len())
-                .map(|_| means[rng.random_range(0..means.len())])
-                .collect::<Vec<f64>>(),
-        );
-        samples.push(m);
+        for x in buf.iter_mut() {
+            *x = means[rng.random_range(0..means.len())];
+        }
+        samples.push(mean(&buf));
     }
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    let lo = samples[(b as f64 * 0.025) as usize];
-    let hi = samples[((b as f64 * 0.975) as usize).min(b - 1)];
-    (lo, hi)
+    let lo_i = ((b as f64) * (alpha / 2.0)) as usize;
+    let hi_i = (((b as f64) * (1.0 - alpha / 2.0)) as usize).min(b - 1);
+    (samples[lo_i.min(b - 1)], samples[hi_i])
 }
 
 /// 標準正規の上側確率 p に対応する分位点（Acklam の有理近似。
@@ -1130,18 +1240,21 @@ fn mde(se: f64, z_alpha: f64, z_beta: f64) -> f64 {
     (z_alpha + z_beta) * se
 }
 
-/// **非パラメトリックな power simulation**。
+/// **power simulation**: 本番と同じ判定規則（percentile cluster bootstrap CI が
+/// 0 を跨がないか）を、経験分布から再標本化したデータへ当てて検出力を測る。
 ///
-/// 元対局ごとの delta 平均を中心化した経験分布から n クラスタを復元抽出し、
-/// 効果量 delta を足して、実際に使う判定規則（平均 ± z_alpha·SE が 0 を跨がないか）を
-/// 当てる。正規近似では捉えられない離散性・同点だらけの分布の癖を含めて
-/// 検出力を測るためのもので、解析式（上の `mde`）とは独立の裏取りになる。
-fn power_simulation(
+/// 追加レビュー指摘2 の対応。初版は `mean ± z_alpha·sample_SE` の z 検定を
+/// 当てていたが、それは解析 MDE と同じ正規近似なので「独立の裏取り」にならず、
+/// 「離散・同点多数・n=16 で bootstrap CI が怪しい」という肝心の点も確かめられない。
+///
+/// `centered` は中心化した cluster（または replicate 畳み込み後の）平均の列。
+fn power_simulation_bootstrap(
     centered: &[f64],
     n: usize,
     delta: f64,
-    z_alpha: f64,
+    alpha: f64,
     sims: usize,
+    boot: usize,
     seed: u64,
 ) -> f64 {
     use rand::{Rng, SeedableRng};
@@ -1151,14 +1264,15 @@ fn power_simulation(
     let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
     let mut hits = 0usize;
     let mut sample = vec![0.0f64; n];
-    for _ in 0..sims {
+    for i in 0..sims {
         for x in sample.iter_mut() {
             *x = centered[rng.random_range(0..centered.len())] + delta;
         }
-        let m = mean(&sample);
-        let var = sample.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (n as f64 - 1.0);
-        let se = (var / n as f64).sqrt();
-        if se > 0.0 && (m.abs() - z_alpha * se) > 0.0 && m.signum() == delta.signum() {
+        let (lo, hi) = bootstrap_ci_of_means(&sample, boot, seed ^ (i as u64 + 1), alpha);
+        // 「効果を検出した」= CI が 0 を跨がず、かつ符号が真の効果と同じ
+        if lo > 0.0 && delta > 0.0 {
+            hits += 1;
+        } else if hi < 0.0 && delta < 0.0 {
             hits += 1;
         }
     }
@@ -1242,7 +1356,19 @@ fn cmd_compare(args: &Args) {
     if rows.is_empty() {
         die("行がありません");
     }
-    let validation_notes = validate_rows(&rows, allow_incomplete);
+    // `--deck` を渡すと、デッキ側の期待 checkpoint 集合と突き合わせる
+    // （shard 欠落の検出。CI は必ず渡す）
+    let expected: Option<HashSet<String>> = args.get("deck").map(|p| {
+        let path = PathBuf::from(p);
+        let deck = Deck::load(&path).unwrap_or_else(|e| die(&e));
+        let split = args.get("split").unwrap_or("all");
+        deck.entries
+            .iter()
+            .filter(|e| split == "all" || e.split == split)
+            .map(|e| e.id.clone())
+            .collect()
+    });
+    let validation_notes = validate_rows(&rows, allow_incomplete, expected.as_ref());
     let label = label.unwrap_or_else(|| rows[0].experiment.clone());
 
     // (checkpoint, seed) でペアにする
@@ -1272,15 +1398,48 @@ fn cmd_compare(args: &Args) {
     for p in &paired {
         by_cluster.entry(p.0.source_game.clone()).or_default().push(p);
     }
-    let cluster_deltas = |metric: &str| -> Vec<Vec<f64>> {
+    // cluster ごとの (seed, delta)。**seed は捨てない**: AB/BA を畳む replicate 化に要る
+    let cluster_deltas_seeded = |metric: &str| -> Vec<Vec<(u64, f64)>> {
         by_cluster
             .values()
             .map(|v| {
-                v.iter()
-                    .map(|(c, k)| k.metrics[metric] - c.metrics[metric])
-                    .collect()
+                let mut d: Vec<(u64, f64)> = v
+                    .iter()
+                    .map(|(c, k)| (c.seed, k.metrics[metric] - c.metrics[metric]))
+                    .collect();
+                d.sort_by_key(|(seed, _)| *seed);
+                d
             })
             .collect()
+    };
+    let cluster_deltas = |metric: &str| -> Vec<Vec<f64>> {
+        cluster_deltas_seeded(metric)
+            .into_iter()
+            .map(|v| v.into_iter().map(|(_, d)| d).collect())
+            .collect()
+    };
+
+    // **AB/BA を畳んだ replicate**（追加レビュー指摘3）。
+    //
+    // scheduler は arm 順を `(checkpoint 番号 + seed) % 2` で決めるので、同じ
+    // checkpoint の seed 2k と 2k+1 は必ず逆の arm 順になる = 実行順成分について
+    // **意図的に反相関**している。`σ_b² + σ_w²/s` は cluster 内残差が iid という
+    // 前提なので、その反相関をモデル化できない（まさに今回見つけた差が消える）。
+    // 連続する2 seed の平均を1 replicate として扱えば、replicate 間は iid と見なせる。
+    let fold_replicates = |seeded: &[Vec<(u64, f64)>]| -> Option<Vec<Vec<f64>>> {
+        let mut out = vec![];
+        for cluster in seeded {
+            // seed が 2k / 2k+1 の対で揃っていなければ畳めない
+            let mut by_rep: BTreeMap<u64, Vec<f64>> = BTreeMap::new();
+            for (seed, d) in cluster {
+                by_rep.entry(seed / 2).or_default().push(*d);
+            }
+            if by_rep.values().any(|v| v.len() != 2) {
+                return None;
+            }
+            out.push(by_rep.values().map(|v| mean(v)).collect::<Vec<f64>>());
+        }
+        Some(out)
     };
 
     let mut out = String::new();
@@ -1336,6 +1495,12 @@ fn cmd_compare(args: &Args) {
     let score_clusters = cluster_deltas("score");
     let n = score_clusters.len();
     let s = mean(&score_clusters.iter().map(|c| c.len() as f64).collect::<Vec<_>>()).max(1.0);
+    // 外挿に使う単位は **replicate**（AB/BA を畳んだもの）。畳めない設計
+    // （seed が奇数個 / 2k と 2k+1 が揃っていない）では外挿表も best_seeds も出さない
+    let score_reps = fold_replicates(&cluster_deltas_seeded("score"));
+    let reps_per_cluster = score_reps
+        .as_ref()
+        .map(|r| mean(&r.iter().map(|c| c.len() as f64).collect::<Vec<_>>()).max(1.0));
     // **SE は cluster 平均の標本分散から直接取る**（= cluster bootstrap と整合する）。
     // 分散成分から σ_b²/n + σ_w²/(n·s) で組み立てると、σ_b² が 0 にクリップされた
     // ときに MSW をそのまま使うことになり SE を過大評価する（実測で bootstrap CI の
@@ -1348,7 +1513,7 @@ fn cmd_compare(args: &Args) {
     let sw2 = s * (total_var - sb2);
     let icc = if total_var > 0.0 { sb2 / total_var } else { 0.0 };
     let d = mean(&score_clusters.iter().map(|c| mean(c)).collect::<Vec<f64>>());
-    let (lo, hi) = cluster_bootstrap(&score_clusters, boot, 20260823);
+    let (lo, hi) = cluster_bootstrap(&score_clusters, boot, 20260823, alpha);
     let ctrl_rate = mean(&paired.iter().map(|(c, _)| c.metrics["score"]).collect::<Vec<f64>>());
     let cand_rate = mean(&paired.iter().map(|(_, k)| k.metrics["score"]).collect::<Vec<f64>>());
     let improved = paired.iter().filter(|(c, k)| k.metrics["score"] > c.metrics["score"]).count();
@@ -1433,54 +1598,88 @@ fn cmd_compare(args: &Args) {
         "係数: CI 半幅 = {z_alpha:.2}·SE / **MDE = {:.2}·SE**\n\n",
         z_alpha + z_beta
     ));
-    out.push_str("| 元対局数 \\ seed | 1 | 2 | 3 | 5 |\n|---|---|---|---|---|\n");
-    for nn in [16usize, 32, 64, 128, 256] {
-        let cells: Vec<String> = [1usize, 2, 3, 5]
-            .iter()
-            .map(|&ss| {
-                let se = (sb2 / nn as f64 + sw2 / (nn as f64 * ss as f64)).sqrt();
-                format!(
-                    "MDE ±{:.1}pt<br>(CI半幅 ±{:.1}pt)",
-                    mde(se, z_alpha, z_beta) * 100.0,
-                    z_alpha * se * 100.0
-                )
-            })
-            .collect();
-        out.push_str(&format!("| {nn} | {} |\n", cells.join(" | ")));
+    match (&score_reps, reps_per_cluster) {
+        (Some(reps), Some(r)) if r >= 1.0 => {
+            // replicate（AB/BA を畳んだ 2 seed）単位で分散成分を取る。
+            // replicate 間なら iid と見なせるので 1/r の外挿が正当化される
+            let rep_total = cluster_mean_var(reps);
+            let (rb2_raw, _, _) = variance_components(reps);
+            let rb2 = rb2_raw.min(rep_total);
+            let rw2 = r * (rep_total - rb2);
+            out.push_str(&format!(
+                "単位は **replicate = 連続する2 seed の AB/BA 平均**（実測 {r:.0} replicate/元対局 = {:.0} seed）。\n",
+                r * 2.0
+            ));
+            out.push_str("replicate 間なら iid と見なせるので 1/r の外挿が正当化される（生の seed は arm 順で意図的に反相関しており、σ_w²/s の外挿は使えない）。\n\n");
+            if r < 1.5 {
+                out.push_str("**注意: 1元対局あたり replicate が1つしかないので replicate 間分散 σ_r² が同定できない**（0 と推定され、下表の seed 列は全部同じ値になる）。seed 数の効果を見るには **4 seed 以上**（= 2 replicate 以上）で取り直すこと。\n\n");
+            }
+            out.push_str("| 元対局数 \\ seed 数 | 2 | 4 | 6 | 10 |\n|---|---|---|---|---|\n");
+            for nn in [16usize, 32, 64, 128, 256] {
+                let cells: Vec<String> = [1usize, 2, 3, 5]
+                    .iter()
+                    .map(|&rr| {
+                        let se = (rb2 / nn as f64 + rw2 / (nn as f64 * rr as f64)).sqrt();
+                        format!(
+                            "MDE ±{:.1}pt<br>(CI半幅 ±{:.1}pt)",
+                            mde(se, z_alpha, z_beta) * 100.0,
+                            z_alpha * se * 100.0
+                        )
+                    })
+                    .collect();
+                out.push_str(&format!("| {nn} | {} |\n", cells.join(" | ")));
+            }
+        }
+        _ => {
+            out.push_str("**外挿表は出さない**: seed が AB/BA の対（2k と 2k+1）で揃っていないため replicate を作れない。生の seed は arm 順で意図的に反相関しているので `σ_b² + σ_w²/s` の外挿は前提を満たさない（追加レビュー指摘3）。**seed は 2 の倍数で取り直すこと**。\n\n");
+            out.push_str(&format!(
+                "この設計での実測値だけ: 元対局 {n} / seed {s:.0} / SE ±{:.1}pt / MDE ±{:.1}pt（{:.2}·SE）\n",
+                se * 100.0,
+                mde(se, z_alpha, z_beta) * 100.0,
+                z_alpha + z_beta
+            ));
+        }
     }
-    out.push_str(
-        "\nseed を増やしても減るのは cluster 内ノイズだけで、独立な元対局数は増えない。\n",
-    );
     if s < 1.5 {
-        out.push_str(
-            "\n**注意: seed 1 では cluster 内分散 σ_w² が同定できない**（0 と推定される）ため、\n             上表の seed 列は全部同じ値になり、ICC も 1.000 に張り付く。\n             seed 次元の効果を見るには `--seeds 2` 以上で取り直すこと。\n",
-        );
+        out.push_str("\n**注意: seed 1 では cluster 内分散が同定できず、AB/BA も cluster 内で閉じない**。seed は 2 の倍数で取り直すこと。\n");
     }
 
-    // ---- power simulation（解析式の裏取り） ----
-    // 経験分布から再標本化して、実際の判定規則の検出力を直接測る。
-    // 同点だらけ・離散という分布の癖は正規近似では出ないので、解析式と並べて読む
-    let cluster_means: Vec<f64> = score_clusters.iter().map(|c| mean(c)).collect();
-    let gm = mean(&cluster_means);
-    let centered: Vec<f64> = cluster_means.iter().map(|x| x - gm).collect();
-    let sims: usize = args.num("power-sims", 4000);
+    // ---- power simulation（本番の判定規則をそのまま当てる） ----
+    // 主結果と「重大悪化の見逃し」は percentile cluster bootstrap CI で判定している。
+    // simulation もその規則を使う（追加レビュー指摘2）。単位は外挿と同じ replicate、
+    // 畳めなければ cluster 平均そのまま（その旨を書く）
+    let (sim_units, sim_label): (Vec<f64>, &str) = match &score_reps {
+        Some(reps) => (reps.iter().map(|c| mean(c)).collect(), "replicate 畳み込み後の元対局平均"),
+        None => (
+            score_clusters.iter().map(|c| mean(c)).collect(),
+            "元対局平均（AB/BA 未畳み込み）",
+        ),
+    };
+    let gm = mean(&sim_units);
+    let centered: Vec<f64> = sim_units.iter().map(|x| x - gm).collect();
+    let sims: usize = args.num("power-sims", 600);
+    let sim_boot: usize = args.num("power-boot", 400);
     out.push_str(&format!(
-        "\n#### power simulation（元対局 delta の経験分布から再標本化、{sims} 回・seed {} のまま）\n\n",
-        s as usize
+        "\n#### power simulation（{sim_label}から再標本化、{sims} 回 × bootstrap {sim_boot} 回）\n\n"
+    ));
+    out.push_str(&format!(
+        "判定規則は**本番と同じ** percentile cluster bootstrap CI（alpha={alpha:.2}）が 0 を跨がないこと。\n\n"
     ));
     out.push_str("| 効果量 \\ 元対局数 | 16 | 32 | 64 | 128 |\n|---|---|---|---|---|\n");
     for pt in [5.0f64, 10.0, 15.0, 20.0, 25.0] {
         let cells: Vec<String> = [16usize, 32, 64, 128]
             .iter()
             .map(|&nn| {
-                let pw = power_simulation(&centered, nn, -pt / 100.0, z_alpha, sims, 20260823);
+                let pw = power_simulation_bootstrap(
+                    &centered, nn, -pt / 100.0, alpha, sims, sim_boot, 20260823,
+                );
                 format!("{:.0}%", pw * 100.0)
             })
             .collect();
         out.push_str(&format!("| −{pt:.0}pt | {} |\n", cells.join(" | ")));
     }
     out.push_str(&format!(
-        "\n（`power={:.0}%` を満たす最小の効果量が、その N での実効 MDE）\n",
+        "\n（`power={:.0}%` を満たす最小の効果量が、その N での実効 MDE。解析式の MDE と食い違うなら、離散性・同点の多さで bootstrap CI が正規近似からずれているということ）\n",
         power * 100.0
     ));
 
@@ -1492,42 +1691,58 @@ fn cmd_compare(args: &Args) {
     //   → SE²×コスト = (σ_b² + σ_w²/s)·s·(1ペアの CPU 秒)   … n に依らない
     // seed を増やすと σ_b² のぶんコストだけ増える（ICC>0 なら s は小さいほど良い）
     let cpu_per_pair = rows.iter().map(|r| r.total_ms).sum::<f64>() / 1000.0 / paired.len() as f64;
-    let var_cpu_at = |ss: f64| (sb2 + sw2 / ss) * ss * cpu_per_pair;
-    let var_cpu = var_cpu_at(s);
-    let best_s = [1.0f64, 2.0, 3.0, 5.0]
-        .into_iter()
-        .min_by(|a, b| var_cpu_at(*a).partial_cmp(&var_cpu_at(*b)).unwrap())
-        .unwrap_or(1.0);
+    // summary JSON 用（replicate が作れないときは None = 出さない）
+    let var_cpu_sec: Option<f64> = match (&score_reps, reps_per_cluster) {
+        (Some(reps), Some(r)) => {
+            let rep_total = cluster_mean_var(reps);
+            let (rb2_raw, _, _) = variance_components(reps);
+            let rb2 = rb2_raw.min(rep_total);
+            let rw2 = r * (rep_total - rb2);
+            Some((rb2 + rw2 / r) * r * 2.0 * cpu_per_pair)
+        }
+        _ => None,
+    };
     out.push_str("\n### CPU あたりの情報量（cluster 単位）\n\n");
-    out.push_str(&format!(
-        "1ペア（arm 2本）あたり {cpu_per_pair:.0} CPU秒 / 実測 seed 数 {s:.0} / σ_b² {sb2:.4} + σ_w²/s {:.4}\n\n",
-        sw2 / s
-    ));
-    out.push_str(&format!(
-        "**var·CPU秒 = (σ_b² + σ_w²/s)·s·1ペアCPU秒 = {var_cpu:.0}**（小さいほど効率がよい。n に依らない）\n\n"
-    ));
-    out.push_str("| seed 数 | 1 | 2 | 3 | 5 |\n|---|---|---|---|---|\n");
-    out.push_str(&format!(
-        "| var·CPU秒 | {:.0} | {:.0} | {:.0} | {:.0} |\n",
-        var_cpu_at(1.0),
-        var_cpu_at(2.0),
-        var_cpu_at(3.0),
-        var_cpu_at(5.0)
-    ));
-    if sb2 > 0.0 {
-        out.push_str(&format!(
-            "\nこの実測では **seed {best_s:.0} が最小**。σ_b² > 0 なので、\
-seed を増やすとコストは s 倍になる一方で独立情報は増えず、var·CPU秒 は単調に悪化する。\n"
-        ));
-    } else {
-        out.push_str(
-            "\nこの実測では σ_b² = 0（A/A では checkpoint ごとの系統差が存在しないので当然）なので、\
-seed 数は var·CPU秒 に中立。**実験時は σ_b² > 0 になるはずで、そのときは seed を増やすほど悪化する**。\n",
-        );
+    match (&score_reps, reps_per_cluster) {
+        (Some(reps), Some(r)) => {
+            // 単位は replicate（= 2 seed）。cost/replicate = 2 × 1ペアCPU秒
+            let rep_total = cluster_mean_var(reps);
+            let (rb2_raw, _, _) = variance_components(reps);
+            let rb2 = rb2_raw.min(rep_total);
+            let rw2 = r * (rep_total - rb2);
+            let cpu_per_rep = 2.0 * cpu_per_pair;
+            let var_cpu_at = |rr: f64| (rb2 + rw2 / rr) * rr * cpu_per_rep;
+            let var_cpu = var_cpu_at(r);
+            out.push_str(&format!(
+                "1ペア（arm 2本）あたり {cpu_per_pair:.0} CPU秒 / 1 replicate（2 seed）あたり {cpu_per_rep:.0} CPU秒 / 実測 {r:.0} replicate\n\n"
+            ));
+            out.push_str(&format!(
+                "**var·CPU秒 = (σ_b² + σ_r²/r)·r·(1 replicate の CPU秒) = {var_cpu:.0}**（小さいほど効率がよい。n に依らない）\n\n"
+            ));
+            out.push_str("| replicate 数（= seed÷2） | 1 | 2 | 3 | 5 |\n|---|---|---|---|---|\n");
+            out.push_str(&format!(
+                "| var·CPU秒 | {:.0} | {:.0} | {:.0} | {:.0} |\n",
+                var_cpu_at(1.0),
+                var_cpu_at(2.0),
+                var_cpu_at(3.0),
+                var_cpu_at(5.0)
+            ));
+            if rb2 > 0.0 {
+                out.push_str(
+                    "\nσ_b² > 0 なので replicate を増やすほど var·CPU秒 は悪化する（元対局数を増やすべき）。\n",
+                );
+            } else {
+                out.push_str("\nこの実測では σ_b² = 0 なので replicate 数は var·CPU秒 に中立。**実験時は σ_b² > 0 になるはずで、そのときは元対局数を増やすほうが効く**。\n");
+            }
+        }
+        _ => {
+            out.push_str(&format!(
+                "1ペア（arm 2本）あたり {cpu_per_pair:.0} CPU秒。\n\n"
+            ));
+            out.push_str("**var·CPU秒は出さない**: AB/BA を畳めない seed 構成なので、replicate 単位の分散が推定できない（追加レビュー指摘3）。\n");
+        }
     }
-    out.push_str(
-        "通常 arena と比べるときは、同じ「1ペアの delta 観測あたり」に揃えて比べること。\n",
-    );
+    out.push_str("\n通常 arena と比べるときは、arena 側も同じ `match_seed` の2本から局ごとのペア差の分散を実測して並べること（現状の参考値 183 は Var=0.5 の仮定に乗っている）。\n");
 
     // ---- 安全性の共同指標 ----
     out.push_str("\n### 安全性の共同指標（元対局単位のペア差）\n\n");
@@ -1535,7 +1750,7 @@ seed 数は var·CPU秒 に中立。**実験時は σ_b² > 0 になるはずで
     for (key, name) in METRICS.iter().skip(1) {
         let cl = cluster_deltas(key);
         let dd = mean(&cl.iter().map(|c| mean(c)).collect::<Vec<f64>>());
-        let (l, h) = cluster_bootstrap(&cl, boot.min(4000), 20260824);
+        let (l, h) = cluster_bootstrap(&cl, boot.min(4000), 20260824, alpha);
         let cv = mean(&paired.iter().map(|(c, _)| c.metrics[key]).collect::<Vec<f64>>());
         let kv = mean(&paired.iter().map(|(_, k)| k.metrics[key]).collect::<Vec<f64>>());
         out.push_str(&format!(
@@ -1657,8 +1872,8 @@ seed 数は var·CPU秒 に中立。**実験時は σ_b² > 0 になるはずで
             "cpu_hours": cpu_h,
             "cpu_sec_per_pair": cpu_per_pair,
             "var_cluster": sb2 + sw2 / s,
-            "var_cpu_sec": var_cpu,
-            "best_seeds": best_s,
+            "var_cpu_sec": var_cpu_sec,
+            "replicates_per_cluster": reps_per_cluster,
             "think_budget_ms": budgets.iter().copied().collect::<Vec<_>>().join(","),
             "commit": commits.iter().copied().collect::<Vec<_>>().join(","),
             "deck_hash": decks.iter().copied().collect::<Vec<_>>().join(","),
@@ -1824,10 +2039,11 @@ mod tests {
         assert!((n_ratio - 2.04).abs() < 0.05, "必要Nの比 = {n_ratio}");
     }
 
-    /// power simulation が解析式とおおむね一致する（両者は独立の経路）
+    /// power simulation は**本番と同じ percentile cluster bootstrap CI** を当てる。
+    /// 効果量 0 のとき偽陽性率が alpha 付近、大きい効果量では検出力が上がること
+    /// （解析式と同じ z 検定を当てていた初版は「独立の裏取り」になっていなかった）
     #[test]
-    fn power_simulation_matches_analytic_mde() {
-        // 平均0・SD 0.5 に近い離散分布（実測の cluster 平均に似せる）
+    fn power_simulation_uses_the_real_decision_rule() {
         let centered: Vec<f64> = (0..64)
             .map(|i| match i % 4 {
                 0 => -0.5,
@@ -1836,18 +2052,24 @@ mod tests {
                 _ => 0.25,
             })
             .collect();
-        let sd = {
-            let m = mean(&centered);
-            (centered.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (centered.len() as f64 - 1.0))
-                .sqrt()
-        };
-        let n = 64usize;
-        let se = sd / (n as f64).sqrt();
-        let za = z_two_sided(0.05);
-        let zb = z_upper(1.0 - 0.80);
-        let delta = mde(se, za, zb);
-        let pw = power_simulation(&centered, n, -delta, za, 4000, 7);
-        assert!((pw - 0.80).abs() < 0.06, "power = {pw}（目標 0.80）");
+        // 効果ゼロ → 棄却率は alpha 前後（percentile bootstrap は保守的に出やすい）
+        let fp = power_simulation_bootstrap(&centered, 64, 0.0, 0.05, 300, 300, 3);
+        assert!(fp < 0.12, "偽陽性率 {fp} が高すぎる");
+        // 大きい効果 → ほぼ必ず検出
+        let pw = power_simulation_bootstrap(&centered, 64, -0.25, 0.05, 300, 300, 3);
+        assert!(pw > 0.9, "検出力 {pw} が低すぎる");
+        // 単調性
+        let mid = power_simulation_bootstrap(&centered, 64, -0.10, 0.05, 300, 300, 3);
+        assert!(fp < mid && mid < pw, "fp {fp} / mid {mid} / pw {pw}");
+    }
+
+    /// bootstrap CI の percentile は alpha に連動する（alpha を広げれば CI は狭くなる）
+    #[test]
+    fn bootstrap_ci_follows_alpha() {
+        let means: Vec<f64> = (0..40).map(|i| (i as f64 - 20.0) / 40.0).collect();
+        let (lo95, hi95) = bootstrap_ci_of_means(&means, 2000, 1, 0.05);
+        let (lo50, hi50) = bootstrap_ci_of_means(&means, 2000, 1, 0.50);
+        assert!(hi95 - lo95 > hi50 - lo50, "alpha を広げれば CI は狭くなる");
     }
 
     /// cluster 平均の分散は cluster bootstrap と同じ対象を見ている

@@ -55,9 +55,9 @@ on:
         required: false
         default: "dev"
       seeds:
-        description: "checkpoint あたりの seed 数"
+        description: "checkpoint あたりの seed 数（**2 の倍数**。AB/BA が cluster 内で閉じる）"
         required: false
-        default: "1"
+        default: "2"
       budgets:
         description: "思考予算（ms。スペース区切りで複数指定すると直積になる）"
         required: false
@@ -144,7 +144,7 @@ jobs:
             min_remaining="${IN_MIN_REMAINING:-20}"
             extract_seed="${IN_EXTRACT_SEED:-20260823}"
             split="${IN_SPLIT:-dev}"
-            seeds="${IN_SEEDS:-1}"
+            seeds="${IN_SEEDS:-2}"
             budgets="${IN_BUDGETS:-2000}"
             shards="${IN_SHARDS:-4}"
             experiments="${IN_EXPERIMENTS:-}"
@@ -165,7 +165,7 @@ jobs:
                 echo "min_remaining=20"
                 echo "extract_seed=0"
                 echo "split=dev"
-                echo "seeds=1"
+                echo "seeds=2"
               } >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -176,13 +176,19 @@ jobs:
             min_remaining=$(jq -r '.min_remaining // 20' "$req")
             extract_seed=$(jq -r '.extract_seed // 20260823' "$req")
             split=$(jq -r '.split // "dev"' "$req")
-            seeds=$(jq -r '.seeds // 1' "$req")
+            seeds=$(jq -r '.seeds // 2' "$req")
             budgets=$(jq -r 'if (.budgets | type) == "array" then .budgets | join(" ") else (.budgets // "2000") end' "$req")
             shards=$(jq -r '.shards // 4' "$req")
             experiments=$(jq -c '.experiments // ""' "$req")
             [ "$experiments" = '""' ] && experiments=""
           fi
           [ -n "$experiments" ] || experiments="$default_experiments"
+          # seed は 2 の倍数（arm 順が (checkpoint 番号 + seed) % 2 なので、
+          # 2k と 2k+1 が対になって初めて AB/BA が cluster の内側で閉じる）
+          if [ $(( seeds % 2 )) -ne 0 ]; then
+            echo "seeds は 2 の倍数にしてください（指定値 ${seeds}）" >&2
+            exit 1
+          fi
           # 実験 × 予算の直積を matrix.include にする
           matrix=$(jq -c -n \
             --argjson exps "$experiments" \
@@ -332,23 +338,44 @@ jobs:
       - name: Compare and report
         env:
           MATRIX: ${{ needs.plan.outputs.matrix }}
+          SHARD_COUNT: ${{ needs.plan.outputs.shard_count }}
+          SPLIT: ${{ needs.plan.outputs.split }}
         run: |
           set -euo pipefail
           shopt -s nullglob
           cargo build --release --bin checkpoint_arena
           mkdir -p out
-          # 実験ごとにペア集計（シャードの JSONL は同じラベルでまとめて食わせる）
+          incomplete=0
+          # 実験ごとにペア集計。**shard が丸ごと欠けても検出できるように**
+          #   (a) label ごとの JSONL 本数が shard_count と一致するか
+          #   (b) 全 matrix label に summary が出たか
+          #   (c) デッキ側の期待 checkpoint 集合と一致するか（compare --deck）
+          # の3段で検査する（PR #20 追加レビュー指摘1）
           echo "$MATRIX" | jq -r '.include[] | [.label, (.known // "")] | @tsv' \
           | while IFS=$'\t' read -r label known; do
               files=(arms/arm-"$label"-s*.jsonl)
-              [ ${#files[@]} -gt 0 ] || continue
+              if [ ${#files[@]} -ne "$SHARD_COUNT" ]; then
+                echo "::error::${label}: shard が揃っていません（${#files[@]}/${SHARD_COUNT}）"
+                echo "$label ${#files[@]}/${SHARD_COUNT}" >> out/INCOMPLETE.txt
+                continue
+              fi
               args=()
               [ -n "$known" ] && args+=(--known-arena-delta "$known")
               ./target/release/checkpoint_arena compare "${files[@]}" \
                 --label "$label" \
+                --deck deck/deck.json --split "$SPLIT" \
                 --markdown "out/$label.md" \
-                --json "out/$label.summary.json" "${args[@]}" > /dev/null
+                --json "out/$label.summary.json" "${args[@]}" > /dev/null \
+                || { echo "::error::${label}: compare が失敗（整合性検査）"
+                     echo "$label compare-failed" >> out/INCOMPLETE.txt; }
             done
+          # 全 label に summary があるか
+          want=$(echo "$MATRIX" | jq -r '.include | length')
+          got=$(ls out/*.summary.json 2>/dev/null | wc -l)
+          if [ "$got" -ne "$want" ]; then
+            echo "::error::summary が揃っていません（${got}/${want}）"
+            echo "summaries ${got}/${want}" >> out/INCOMPLETE.txt
+          fi
           summaries=(out/*.summary.json)
           if [ ${#summaries[@]} -gt 0 ]; then
             ./target/release/checkpoint_arena report "${summaries[@]}" \
@@ -359,6 +386,16 @@ jobs:
             echo ""
             echo "採否は通常 arena（arena.yml）で決める。ここは較正用の計測。"
             echo ""
+            if [ -f out/INCOMPLETE.txt ]; then
+              echo "## :warning: 不完全な集計"
+              echo ""
+              echo '```'
+              cat out/INCOMPLETE.txt
+              echo '```'
+              echo ""
+              echo "**偏った部分集合なので、この run の数字は読まないこと。**"
+              echo ""
+            fi
             [ -f out/report.md ] && cat out/report.md
             for f in out/*.md; do
               [ "$f" = "out/report.md" ] && continue
@@ -366,6 +403,13 @@ jobs:
               cat "$f"
             done
           } >> "$GITHUB_STEP_SUMMARY"
+          # 部分集計は成果物としては残すが、ジョブは失敗させる
+          if [ -f out/INCOMPLETE.txt ]; then
+            mv out incomplete-out
+            mkdir -p out
+            mv incomplete-out out/incomplete
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v6
         if: always()

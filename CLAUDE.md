@@ -117,9 +117,20 @@
     同じペア差で出すが、**反則減だけで「強くなった」とは判定しない**。
     入力は厳格に検査する（schema・experiment・deck_hash・相手・予算・commit の一致、
     arm 名、重複、checkpoint ごとの seed 数。不一致は失敗。`--allow-incomplete` で警告に落とす）
-  - **seed は 2 の倍数で取る**。arm 順が `(checkpoint 番号 + seed) % 2` なので、
-    同じ checkpoint の seed 0/1 は必ず逆順になり、**AB/BA の均衡が cluster の内側で閉じる**。
-    s=1 だと実行順効果が cluster 平均に残り、実測で分散が 5〜8倍違った
+  - **seed は 2 の倍数で取る**（`run` は既定 2 で奇数を拒否）。arm 順が
+    `(checkpoint 番号 + seed) % 2` なので、同じ checkpoint の seed 2k/2k+1 は必ず逆順になり、
+    **AB/BA の均衡が cluster の内側で閉じる**。s=1 だと実行順効果が cluster 平均に残り、
+    実測で分散が 5〜8倍違った。**この反相関は意図した設計なので、統計側も
+    「連続する2 seed の AB/BA 平均 = 1 replicate」を単位にする**（生の seed を
+    独立標本として `σ_w²/s` で外挿してはいけない）。seed 数の効果を測るには
+    **4 seed 以上**（2 replicate 以上）が要る
+  - `compare` の power simulation は**本番と同じ percentile cluster bootstrap CI** を
+    当てる（正規近似の z 検定では解析 MDE と同じ経路になり裏取りにならない）。
+    主 CI の percentile も `--alpha` に連動する
+  - **shard 欠落の検出には `compare --deck <manifest> --split <split>` が要る**
+    （入力に現れた checkpoint 同士を比べるだけでは、artifact ごと欠けたときに
+    「揃っている」ように見える）。CI は必ず渡し、label ごとの JSONL 本数と
+    summary の数も検査して、欠けたら `INCOMPLETE.txt` を出してジョブを失敗させる
   - **既知の arena 差を較正に使うときは、同じ candidate / control / opponent / 予算で
     測り直した値だけを渡す**。CLAUDE.md に残っている −12.8 / −8.5 / −7.4pt は
     当時の main・別の対戦条件で測った値なので流用できない（PR #20 レビュー指摘）

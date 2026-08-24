@@ -52,6 +52,11 @@ pub struct Deck {
 pub struct DeckEntry {
     /// 例 "run123-game017-ply72"
     pub id: String,
+    /// 元対局の ID（cluster bootstrap の統計単位）。
+    /// **id から `-ply` で切り出すのではなく明示的に持つ**（元記録のパスに
+    /// `-ply` が含まれていても壊れないようにするため）
+    #[serde(default)]
+    pub game: String,
     /// manifest からの相対パス
     pub kif: String,
     /// 何手目まで再生するか（= その手を指す直前の手番境界）
@@ -251,6 +256,30 @@ pub fn candidates(end: &GameEndPayload, min_remaining_plies: u32) -> Option<Vec<
         });
     });
     if ok { Some(out) } else { None }
+}
+
+/// 記録ファイルのパスから**安定した元対局 ID** を作る。
+///
+/// file stem だけだと、複数ディレクトリ（CI では artifact ごとのサブディレクトリ）に
+/// 同名の JSONL があったときに衝突し、「前の対局から選んだ ply と後の対局の KIF」を
+/// 組み合わせた壊れた entry ができる（PR #20 追加レビュー指摘5）。
+/// `root` からの相対パスを使い、`[A-Za-z0-9_-]` 以外を `_` に落とす。
+pub fn stable_game_id(root: &Path, path: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    let rel = rel.with_extension("");
+    let raw = rel.to_string_lossy();
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            out.push(c);
+        } else if c == '-' {
+            // `-ply` の切り出しと紛らわしいので `-` も潰す（id の区切りは `-ply` だけ）
+            out.push('_');
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() { "unknown".into() } else { out }
 }
 
 /// 文字列の決定論的ハッシュ（FNV-1a → SplitMix64。デッキ抽出の決定論化用）
@@ -519,6 +548,7 @@ mod tests {
             min_remaining_plies: 20,
             entries: vec![DeckEntry {
                 id: "g-ply1".into(),
+                game: "g".into(),
                 kif: "games/g.kif".into(),
                 ply: 1,
                 split: "dev".into(),
@@ -534,6 +564,22 @@ mod tests {
         std::fs::remove_file(games.join("g.kif")).unwrap();
         assert!(deck.hash(&dir).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **同名ファイルが別ディレクトリにあっても ID が衝突しない**
+    /// （PR #20 追加レビュー指摘5: CI では artifact ごとのサブディレクトリに展開される）
+    #[test]
+    fn stable_game_id_distinguishes_same_stem_in_different_dirs() {
+        let root = Path::new("records-in");
+        let a = stable_game_id(root, Path::new("records-in/shard0/game-1.jsonl"));
+        let b = stable_game_id(root, Path::new("records-in/shard1/game-1.jsonl"));
+        assert_ne!(a, b, "同名 stem でもディレクトリが違えば別 ID");
+        // ファイル名として安全な文字だけ・`-ply` と紛れない
+        for id in [&a, &b] {
+            assert!(id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'), "{id}");
+        }
+        // 決定論的
+        assert_eq!(a, stable_game_id(root, Path::new("records-in/shard0/game-1.jsonl")));
     }
 
     /// dev / validation は元対局単位で決まる（同じ棋譜が両方に出ない）
