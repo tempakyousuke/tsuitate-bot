@@ -338,6 +338,62 @@ fn main() {
         println!("{table}");
     }
 
+    // ARENA_GAMES_JSON: **1行=1対局**で書き出す（issue #19 の P0 の残り:
+    // 同じ ARENA_MATCH_SEED の2本を局ごとに突き合わせて Var(delta) を実測する）。
+    // 集計サマリー（ARENA_JSON）では勝敗の合計しか残らず、ペア差の分散が測れない。
+    // `match_seed` が無いと局ごとの対局条件が揃わない = ペアにならないので、
+    // そのときは何も書かずに理由を出す
+    if let Ok(path) = std::env::var("ARENA_GAMES_JSON") {
+        if !path.is_empty() {
+            match match_seed {
+                None => eprintln!(
+                    "ARENA_GAMES_JSON は ARENA_MATCH_SEED と併用してください\n                                  （局ごとの対局条件が揃わないとペア差になりません）"
+                ),
+                Some(seed) => {
+                    let knobs = cand_knobs();
+                    let mut lines: Vec<String> = vec![];
+                    for (opp_idx, (opp, stats)) in results.iter().enumerate() {
+                        // 基準ごとのずらしは run_match_with_seeds の呼び出しと同じ式
+                        let match_seed_eff =
+                            seed ^ (opp_idx as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                        let mut games: Vec<&_> = stats.per_game.iter().collect();
+                        games.sort_by_key(|g| g.game_no);
+                        for g in games {
+                            lines.push(
+                                serde_json::json!({
+                                    "schema": 1,
+                                    "candidate": candidate,
+                                    "baseline": opp,
+                                    "match_seed": match_seed_eff,
+                                    "game_no": g.game_no,
+                                    "a_is_sente": g.a_is_sente,
+                                    "score_a": g.score_a,
+                                    "reason": g.reason,
+                                    "plies": g.plies,
+                                    "fouls_a": g.fouls_a,
+                                    "fouls_b": g.fouls_b,
+                                    "fouls_in_check_a": g.fouls_in_check_a,
+                                    "fouls_in_check_b": g.fouls_in_check_b,
+                                    "think_ms_a": g.think_ms_a,
+                                    "think_ms_b": g.think_ms_b,
+                                    "moves_a": g.moves_a,
+                                    "moves_b": g.moves_b,
+                                    "think_budget_ms_a": budget_of(&candidate, &candidate_config()),
+                                    "cand_knobs": knobs,
+                                    "clock": [fischer_initial_ms(), fischer_increment_ms()],
+                                })
+                                .to_string(),
+                            );
+                        }
+                    }
+                    std::fs::write(&path, lines.join("\n") + "\n").unwrap_or_else(|e| {
+                        eprintln!("ARENA_GAMES_JSON を書き込めません（{path}）: {e}")
+                    });
+                }
+            }
+        }
+    }
+
     // ARENA_JSON: 集計をJSONL（1行=1マッチアップ）で書き出す（CIのシャード集約用）
     if let Ok(path) = std::env::var("ARENA_JSON") {
         if !path.is_empty() {

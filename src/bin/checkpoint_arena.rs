@@ -250,7 +250,7 @@ fn assert_opponent_blind_to(opponent: &str, arm_env_keys: &[String], allow: bool
 
 
 fn usage() -> &'static str {
-    "usage: checkpoint_arena <extract|run|unit|pair|compare|report> [options]\n\
+    "usage: checkpoint_arena <extract|run|unit|pair|compare|report|arena-var> [options]\n\
      \n\
      extract --records <dir|file...> --out <dir> [--opponent NAME] [--min-remaining N]\n\
      \x20       [--limit N] [--seed N] [--dev-pct N]\n\
@@ -265,7 +265,10 @@ fn usage() -> &'static str {
      \x20    [--shared-prewarm] [--arm-order 0|1]\n\
      compare <arm.jsonl...> [--known-arena-delta PT] [--markdown OUT] [--json OUT]\n\
      \x20       [--boot N] [--label NAME]\n\
-     report <summary.json...> [--markdown OUT]"
+     report <summary.json...> [--markdown OUT]\n\
+     arena-var --control <games.jsonl...> --candidate <games.jsonl...>\n\
+     \x20         [--baseline NAME] [--label NAME] [--alpha 0.05] [--power 0.80] [--boot N]\n\
+     \x20         [--markdown OUT] [--json OUT] [--allow-incomplete]"
 }
 
 fn die(msg: &str) -> ! {
@@ -1774,6 +1777,16 @@ fn pct(x: f64) -> String {
     format!("{:+.1}pt", x * 100.0)
 }
 
+/// 差ではなく水準（スコア率など）。符号を付けない
+fn rate_pct(x: f64) -> String {
+    format!("{:.1}%", x * 100.0)
+}
+
+/// 幅（SE・MDE・CI 半幅）。`±` を付けて出すので符号は付けない
+fn width_pct(x: f64) -> String {
+    format!("{:.1}pt", x.abs() * 100.0)
+}
+
 #[allow(clippy::too_many_lines)]
 fn cmd_compare(args: &Args) {
     let paths: Vec<String> = {
@@ -2469,6 +2482,457 @@ fn cmd_report(args: &Args) {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// arena-var: 通常 arena の**局ごとのペア差**の分散を実測する
+// ---------------------------------------------------------------------------
+
+/// `ARENA_GAMES_JSON` の1行（1対局）。
+///
+/// **なぜ要るか**（issue #19 の P0 の残り）: checkpoint arena の効率
+/// （var·CPU秒）を「通常 arena の何倍か」と言うには、arena 側の
+/// `Var(delta)` を実測した値が要る。従来の参考値 183 は `Var(delta)=0.5`
+/// （＝ペアリングが全く効かない）の**仮定**に乗っていた。
+#[derive(Debug, Clone)]
+struct GameRow {
+    candidate: String,
+    baseline: String,
+    match_seed: u64,
+    game_no: u64,
+    a_is_sente: bool,
+    score_a: f64,
+    reason: String,
+    plies: f64,
+    fouls_a: f64,
+    fouls_b: f64,
+    fouls_in_check_a: f64,
+    think_ms_a: f64,
+    think_ms_b: f64,
+    moves_a: f64,
+    cand_knobs: BTreeMap<String, String>,
+    clock: String,
+    budget: String,
+}
+
+const GAME_ROW_SCHEMA: u64 = 1;
+
+fn parse_game_rows(paths: &[String], arm: &str) -> Vec<GameRow> {
+    let mut rows = vec![];
+    for p in paths {
+        let text = std::fs::read_to_string(p).unwrap_or_else(|e| die(&format!("{p}: {e}")));
+        for (ln, line) in text.lines().enumerate() {
+            if !line.trim().starts_with('{') {
+                continue;
+            }
+            let where_ = format!("{arm} {p}:{}", ln + 1);
+            let v: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|e| die(&format!("{where_}: JSON として読めません: {e}")));
+            let schema = v.get("schema").and_then(|x| x.as_u64()).unwrap_or(0);
+            if schema != GAME_ROW_SCHEMA {
+                die(&format!(
+                    "{where_}: schema {schema} は未対応（対応 {GAME_ROW_SCHEMA}）"
+                ));
+            }
+            let req_s = |k: &str| -> String {
+                v.get(k)
+                    .and_then(|x| x.as_str())
+                    .unwrap_or_else(|| die(&format!("{where_}: {k} がありません")))
+                    .to_string()
+            };
+            let req_f = |k: &str| -> f64 {
+                v.get(k)
+                    .and_then(|x| x.as_f64())
+                    .unwrap_or_else(|| die(&format!("{where_}: {k} がありません")))
+            };
+            let req_u = |k: &str| -> u64 {
+                v.get(k)
+                    .and_then(|x| x.as_u64())
+                    .unwrap_or_else(|| die(&format!("{where_}: {k} がありません")))
+            };
+            let map = |k: &str| -> BTreeMap<String, String> {
+                v.get(k)
+                    .and_then(|x| x.as_object())
+                    .map(|o| {
+                        o.iter()
+                            .map(|(k, v)| {
+                                (k.clone(), v.as_str().unwrap_or(&v.to_string()).to_string())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            rows.push(GameRow {
+                candidate: req_s("candidate"),
+                baseline: req_s("baseline"),
+                match_seed: req_u("match_seed"),
+                game_no: req_u("game_no"),
+                a_is_sente: v
+                    .get("a_is_sente")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or_else(|| die(&format!("{where_}: a_is_sente がありません"))),
+                score_a: req_f("score_a"),
+                reason: req_s("reason"),
+                plies: req_f("plies"),
+                fouls_a: req_f("fouls_a"),
+                fouls_b: req_f("fouls_b"),
+                fouls_in_check_a: req_f("fouls_in_check_a"),
+                think_ms_a: req_f("think_ms_a"),
+                think_ms_b: req_f("think_ms_b"),
+                moves_a: req_f("moves_a"),
+                cand_knobs: map("cand_knobs"),
+                clock: v.get("clock").map(|x| x.to_string()).unwrap_or_default(),
+                budget: v
+                    .get("think_budget_ms_a")
+                    .map(|x| x.to_string())
+                    .unwrap_or_default(),
+            });
+        }
+    }
+    if rows.is_empty() {
+        die(&format!("{arm}: 行が1件もありません"));
+    }
+    rows
+}
+
+/// 局ごとの指標（ペア差を取る前）。`METRICS` の arena 版
+fn game_metrics(r: &GameRow) -> BTreeMap<&'static str, f64> {
+    let mut m = BTreeMap::new();
+    m.insert("score", r.score_a);
+    m.insert("fouls_me", r.fouls_a);
+    m.insert("fouls_in_check_me", r.fouls_in_check_a);
+    m.insert(
+        "foul_limit_loss",
+        if r.reason == "foul_limit" && r.score_a == 0.0 { 1.0 } else { 0.0 },
+    );
+    m.insert("added_plies", r.plies);
+    m.insert(
+        "hit_max_plies",
+        if r.reason == "max_plies" { 1.0 } else { 0.0 },
+    );
+    m.insert("fouls_opp", r.fouls_b);
+    m.insert(
+        "think_avg_ms_me",
+        if r.moves_a > 0.0 { r.think_ms_a / r.moves_a } else { 0.0 },
+    );
+    m
+}
+
+/// arm 内で一意でなければならない属性を検査する
+fn assert_uniform(arm: &str, rows: &[GameRow]) {
+    let uniq = |name: &str, vals: BTreeSet<String>| {
+        if vals.len() > 1 {
+            die(&format!(
+                "{arm}: {name} が混在しています（{}）。別条件の run を混ぜないでください",
+                vals.into_iter().collect::<Vec<_>>().join(" / ")
+            ));
+        }
+    };
+    uniq("candidate", rows.iter().map(|r| r.candidate.clone()).collect());
+    let baselines: BTreeSet<String> = rows.iter().map(|r| r.baseline.clone()).collect();
+    if baselines.len() > 1 {
+        die(&format!(
+            "{arm}: 相手が混在しています（{}）。\n                         ガントレットの記録なら `--baseline <名前>` で1つに絞ってください\n                         （相手が違えば別のマッチアップなので、まとめてペアにはできません）",
+            baselines.into_iter().collect::<Vec<_>>().join(" / ")
+        ));
+    }
+    uniq("clock", rows.iter().map(|r| r.clock.clone()).collect());
+    uniq(
+        "cand_knobs",
+        rows.iter().map(|r| fmt_env(&r.cand_knobs)).collect(),
+    );
+    uniq("think_budget_ms", rows.iter().map(|r| r.budget.clone()).collect());
+    let mut seen = BTreeSet::new();
+    for r in rows {
+        let key = (r.baseline.clone(), r.match_seed, r.game_no);
+        if !seen.insert(key.clone()) {
+            die(&format!(
+                "{arm}: 同じ (baseline, match_seed, game_no) が2回あります: {key:?}\n            \
+                 （同じ shard の artifact を二重に渡していませんか）"
+            ));
+        }
+    }
+}
+
+fn cmd_arena_var(args: &Args) {
+    let control_paths = args.all("control");
+    let candidate_paths = args.all("candidate");
+    if control_paths.is_empty() || candidate_paths.is_empty() {
+        die("--control と --candidate に ARENA_GAMES_JSON の JSONL を指定してください");
+    }
+    let boot: usize = args.num("boot", 10000);
+    let alpha: f64 = args.num("alpha", 0.05);
+    let power: f64 = args.num("power", 0.80);
+    let allow_incomplete = args.flag("allow-incomplete");
+    let label = args.get("label").unwrap_or("arena-var").to_string();
+    let z_alpha = z_two_sided(alpha);
+    let z_beta = z_upper(1.0 - power);
+
+    // ガントレットの記録（相手が複数）から1つのマッチアップだけを取り出す
+    let only = args.get("baseline");
+    let filter = |mut rows: Vec<GameRow>, arm: &str| -> Vec<GameRow> {
+        if let Some(b) = only {
+            rows.retain(|r| r.baseline == b);
+            if rows.is_empty() {
+                die(&format!("{arm}: 相手 {b} の対局がありません"));
+            }
+        }
+        rows
+    };
+    let ctrl = filter(parse_game_rows(&control_paths, "control"), "control");
+    let cand = filter(parse_game_rows(&candidate_paths, "candidate"), "candidate");
+    assert_uniform("control", &ctrl);
+    assert_uniform("candidate", &cand);
+
+    // **同じ固定相手・同じ時計であること**。ここが違うと局面条件が揃わないので
+    // ペア差にならない（checkpoint arena 側の opponent 指紋検査と同じ趣旨）
+    if ctrl[0].baseline != cand[0].baseline {
+        die(&format!(
+            "相手が違います: control={} / candidate={}",
+            ctrl[0].baseline, cand[0].baseline
+        ));
+    }
+    if ctrl[0].clock != cand[0].clock {
+        die(&format!(
+            "時計が違います: control={} / candidate={}",
+            ctrl[0].clock, cand[0].clock
+        ));
+    }
+    if fmt_env(&ctrl[0].cand_knobs) == fmt_env(&cand[0].cand_knobs)
+        && ctrl[0].candidate == cand[0].candidate
+        && ctrl[0].budget == cand[0].budget
+    {
+        eprintln!(
+            "注意: control と candidate の設定が完全に同じです（A/A として読みます）"
+        );
+    }
+
+    let key = |r: &GameRow| (r.baseline.clone(), r.match_seed, r.game_no);
+    let ctrl_by: BTreeMap<_, _> = ctrl.iter().map(|r| (key(r), r)).collect();
+    let cand_by: BTreeMap<_, _> = cand.iter().map(|r| (key(r), r)).collect();
+    let only_ctrl: Vec<_> = ctrl_by.keys().filter(|k| !cand_by.contains_key(*k)).collect();
+    let only_cand: Vec<_> = cand_by.keys().filter(|k| !ctrl_by.contains_key(*k)).collect();
+    if !only_ctrl.is_empty() || !only_cand.is_empty() {
+        let msg = format!(
+            "ペアにならない対局があります（control のみ {} 局 / candidate のみ {} 局）。\n            \
+             同じ match_seed・同じ局数・同じ shard 構成で取り直してください",
+            only_ctrl.len(),
+            only_cand.len()
+        );
+        if allow_incomplete {
+            eprintln!("警告: {msg}");
+        } else {
+            die(&msg);
+        }
+    }
+    let keys: Vec<_> = ctrl_by
+        .keys()
+        .filter(|k| cand_by.contains_key(*k))
+        .cloned()
+        .collect();
+    if keys.is_empty() {
+        die("ペアになった対局が1件もありません");
+    }
+    // **先後が揃っているか**（game_no の偶奇で決まるので、揃わないなら
+    // 別々の対局条件列を突き合わせている）
+    for k in &keys {
+        if ctrl_by[k].a_is_sente != cand_by[k].a_is_sente {
+            die(&format!("{k:?}: 先後が食い違っています（別の条件列です）"));
+        }
+    }
+
+    let n = keys.len();
+    // 局ごとのペア差（cluster は無い = 1局1標本）
+    let mut deltas: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
+    let mut arm_means: BTreeMap<&'static str, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    for k in &keys {
+        let mc = game_metrics(ctrl_by[k]);
+        let mt = game_metrics(cand_by[k]);
+        for (name, _) in METRICS.iter().filter(|(n, _)| mc.contains_key(n)) {
+            let e = deltas.entry(name).or_default();
+            e.push(mt[name] - mc[name]);
+            let a = arm_means.entry(name).or_default();
+            a.0.push(mc[name]);
+            a.1.push(mt[name]);
+        }
+    }
+    let score = &deltas["score"];
+    let d_mean = mean(score);
+    let var_paired = variance(score);
+    let se = (var_paired / n as f64).sqrt();
+    let (lo, hi) = bootstrap_ci_of_means(score, boot, 20260824, alpha);
+    let mde_v = mde(se, z_alpha, z_beta);
+    // ペアリングが効いているか: 独立に取ったときの Var(delta) と比べる
+    let (ctrl_scores, cand_scores) = &arm_means["score"];
+    let var_indep = variance(ctrl_scores) + variance(cand_scores);
+
+    // CPU コスト。1ペア = 候補側1局 + 対照側1局。**思考時間の合計**で数える
+    // （checkpoint 側の total_ms は壁時計なので厳密には同尺度ではない。
+    //  思考が支配項なので比較には使えるが、注記つきで読むこと）
+    let cpu_per_pair: f64 = keys
+        .iter()
+        .map(|k| {
+            let c = ctrl_by[k];
+            let t = cand_by[k];
+            (c.think_ms_a + c.think_ms_b + t.think_ms_a + t.think_ms_b) / 1000.0
+        })
+        .sum::<f64>()
+        / n as f64;
+    let var_cpu = var_paired * cpu_per_pair;
+    let var_cpu_indep = var_indep * cpu_per_pair;
+    let var_cpu_assumed = 0.5 * cpu_per_pair;
+
+    let mut out = String::new();
+    out.push_str(&format!("## 通常 arena のペア差（{label}）\n\n"));
+    out.push_str(&format!(
+        "候補 `{}`{} / 対照 `{}`{} / 相手 `{}` / 時計 {} / 予算 {}\n\n",
+        cand[0].candidate,
+        if cand[0].cand_knobs.is_empty() {
+            String::new()
+        } else {
+            format!("（{}）", fmt_env(&cand[0].cand_knobs))
+        },
+        ctrl[0].candidate,
+        if ctrl[0].cand_knobs.is_empty() {
+            String::new()
+        } else {
+            format!("（{}）", fmt_env(&ctrl[0].cand_knobs))
+        },
+        ctrl[0].baseline,
+        ctrl[0].clock,
+        cand[0].budget,
+    ));
+    out.push_str(&format!(
+        "ペアになった対局 **{n} 局**（同じ `match_seed` の局ごとに突き合わせ）\n\n"
+    ));
+    out.push_str(&format!(
+        "| 項目 | 値 |\n|---|---:|\n\
+         | 候補のスコア率 | {} |\n\
+         | 対照のスコア率 | {} |\n\
+         | **ペア差（既知 arena 差）** | **{}** |\n\
+         | {:.0}% CI | [{}, {}] |\n\
+         | SE | ±{} |\n\
+         | MDE（α={alpha:.2} / power={:.0}%） | ±{} |\n\
+         | **Var(ペア差)** | **{var_paired:.4}** |\n\
+         | 参考: 独立と仮定した Var | {var_indep:.4} |\n\
+         | 参考: 従来の仮定 Var | 0.5000 |\n",
+        rate_pct(mean(cand_scores)),
+        rate_pct(mean(ctrl_scores)),
+        pct(d_mean),
+        (1.0 - alpha) * 100.0,
+        pct(lo),
+        pct(hi),
+        width_pct(se),
+        power * 100.0,
+        width_pct(mde_v),
+    ));
+    out.push_str(&format!(
+        "\n**同じ `match_seed` で局面条件を揃えるブロッキングの効き**: \
+         Var(ペア差) {var_paired:.4} vs 独立 {var_indep:.4} = {:.2} 倍\
+         （1.00 なら効いていない）。\n\n",
+        if var_indep > 0.0 { var_paired / var_indep } else { f64::NAN }
+    ));
+
+    out.push_str("### 必要 N（この Var での MDE）\n\n");
+    out.push_str("| 対局数 | 32 | 64 | 104 | 208 | 416 |\n|---|---|---|---|---|---|\n| MDE（±） |");
+    for nn in [32usize, 64, 104, 208, 416] {
+        out.push_str(&format!(
+            " {} |",
+            width_pct(mde((var_paired / nn as f64).sqrt(), z_alpha, z_beta))
+        ));
+    }
+    out.push_str("\n| CI 半幅（±） |");
+    for nn in [32usize, 64, 104, 208, 416] {
+        out.push_str(&format!(
+            " {} |",
+            width_pct(z_alpha * (var_paired / nn as f64).sqrt())
+        ));
+    }
+    out.push('\n');
+
+    out.push_str("\n### CPU あたりの情報量\n\n");
+    out.push_str(&format!(
+        "1ペア（候補1局＋対照1局）あたり **{cpu_per_pair:.0} CPU秒**（思考時間の合計）\n\n\
+         **var·CPU秒 = Var(ペア差) × 1ペアの CPU秒 = {var_cpu:.0}**\
+         （ペアリング無しなら {var_cpu_indep:.0} / 従来の仮定 Var=0.5 なら {var_cpu_assumed:.0}）\n\n\
+         checkpoint arena 側の `var·CPU秒` と直接比べる数字はこれ。\
+         **ただし checkpoint 側の `total_ms` は壁時計、こちらは思考時間の合計**なので、\
+         同尺度ではない（思考が支配項なので桁の比較には使えるが、\
+         数%の差を読まないこと）。\n"
+    ));
+
+    out.push_str("\n### 安全性の共同指標（ペア差）\n\n");
+    out.push_str("| 指標 | 対照 | 候補 | ペア差 | {} CI |\n|---|---:|---:|---:|---|\n");
+    let ci_label = format!("{:.0}%", (1.0 - alpha) * 100.0);
+    out = out.replace("{} CI", &format!("{ci_label} CI"));
+    for (name, jp) in METRICS {
+        let Some(d) = deltas.get(name) else { continue };
+        let (c, t) = &arm_means[name];
+        let (l, h) = bootstrap_ci_of_means(d, boot.min(4000), 20260824, alpha);
+        out.push_str(&format!(
+            "| {jp} | {:.3} | {:.3} | {:+.3} | [{:+.3}, {:+.3}] |\n",
+            mean(c),
+            mean(t),
+            mean(d),
+            l,
+            h
+        ));
+    }
+    out.push_str(
+        "\n反則減だけで「強くなった」とは判定しない（反則は意図的な情報獲得にもなりうる）。\
+         重大な悪化を止める用途に使う。\n",
+    );
+
+    println!("{out}");
+    if let Some(p) = args.get("markdown") {
+        std::fs::write(p, &out).unwrap_or_else(|e| die(&format!("{p}: {e}")));
+    }
+    if let Some(p) = args.get("json") {
+        let v = serde_json::json!({
+            "schema": SUMMARY_SCHEMA,
+            "kind": "arena-var",
+            "label": label,
+            "candidate": cand[0].candidate,
+            "control": ctrl[0].candidate,
+            "candidate_knobs": cand[0].cand_knobs,
+            "control_knobs": ctrl[0].cand_knobs,
+            "opponent": ctrl[0].baseline,
+            "clock": ctrl[0].clock,
+            "think_budget_ms": cand[0].budget,
+            "games": n,
+            "alpha": alpha,
+            "power": power,
+            // **これを checkpoint arena の --known-arena-delta へ渡す**
+            "arena_delta": d_mean,
+            "ci_low": lo,
+            "ci_high": hi,
+            "se": se,
+            "mde": mde_v,
+            "var_paired": var_paired,
+            "var_independent": var_indep,
+            "cpu_sec_per_pair": cpu_per_pair,
+            "var_cpu_sec": var_cpu,
+            "metrics": METRICS.iter().filter(|(n,_)| deltas.contains_key(n)).map(|(n, _)| {
+                (n.to_string(), serde_json::json!({
+                    "control": mean(&arm_means[n].0),
+                    "candidate": mean(&arm_means[n].1),
+                    "delta": mean(&deltas[n]),
+                }))
+            }).collect::<serde_json::Map<_, _>>(),
+        });
+        std::fs::write(p, serde_json::to_string_pretty(&v).unwrap())
+            .unwrap_or_else(|e| die(&format!("{p}: {e}")));
+    }
+}
+
+/// 標本分散（n−1）
+fn variance(v: &[f64]) -> f64 {
+    if v.len() < 2 {
+        return 0.0;
+    }
+    let m = mean(v);
+    v.iter().map(|x| (x - m).powi(2)).sum::<f64>() / (v.len() - 1) as f64
+}
+
 fn main() {
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.is_empty() {
@@ -2482,6 +2946,7 @@ fn main() {
         Some("pair") => cmd_pair(&args),
         Some("compare") => cmd_compare(&args),
         Some("report") => cmd_report(&args),
+        Some("arena-var") => cmd_arena_var(&args),
         other => die(&format!("未知のサブコマンド: {}", other.unwrap_or("(なし)"))),
     }
 }
@@ -2497,6 +2962,75 @@ mod tests {
         assert!((z_upper(0.20) - 0.841_621).abs() < 1e-4);
         assert!((z_upper(0.025) - 1.959_964).abs() < 1e-4);
         assert!((z_upper(0.5) - 0.0).abs() < 1e-6);
+    }
+
+    /// arena-var の土台。`variance` は n−1 の標本分散
+    #[test]
+    fn sample_variance_matches_hand_calc() {
+        assert!((variance(&[1.0, 0.0, 1.0, 0.0]) - 1.0 / 3.0).abs() < 1e-12);
+        assert_eq!(variance(&[0.5]), 0.0);
+        assert_eq!(variance(&[]), 0.0);
+        // 勝1/負0 が半々なら Var = 0.5·(n/(n−1))。n→∞ で 0.25
+        assert!((variance(&[1.0, 0.0]) - 0.5).abs() < 1e-12);
+    }
+
+    /// 同一入力どうしのペア差は厳密に 0（A/A の健全性）
+    #[test]
+    fn identical_arms_give_zero_paired_delta() {
+        let scores = [1.0f64, 0.0, 0.5, 1.0, 0.0];
+        let deltas: Vec<f64> = scores.iter().map(|s| s - s).collect();
+        assert_eq!(mean(&deltas), 0.0);
+        assert_eq!(variance(&deltas), 0.0);
+    }
+
+    fn game_row(reason: &str, score_a: f64) -> GameRow {
+        GameRow {
+            candidate: "estimator".into(),
+            baseline: "estimator_v14".into(),
+            match_seed: 1,
+            game_no: 0,
+            a_is_sente: true,
+            score_a,
+            reason: reason.into(),
+            plies: 100.0,
+            fouls_a: 6.0,
+            fouls_b: 5.0,
+            fouls_in_check_a: 1.0,
+            think_ms_a: 40_000.0,
+            think_ms_b: 38_000.0,
+            moves_a: 40.0,
+            cand_knobs: BTreeMap::new(),
+            clock: "[1000000,3000]".into(),
+            budget: "2000".into(),
+        }
+    }
+
+    /// **反則負け率は「反則で負けた」ときだけ 1**（相手の反則負けで勝った局を
+    /// 自分の反則負けに数えると、悪化と改善が同じ方向に出てゲートが壊れる）
+    #[test]
+    fn foul_limit_loss_counts_only_own_loss() {
+        let lost = game_metrics(&game_row("foul_limit", 0.0));
+        let won = game_metrics(&game_row("foul_limit", 1.0));
+        let mated = game_metrics(&game_row("checkmate", 0.0));
+        assert_eq!(lost["foul_limit_loss"], 1.0);
+        assert_eq!(won["foul_limit_loss"], 0.0);
+        assert_eq!(mated["foul_limit_loss"], 0.0);
+        assert_eq!(mated["hit_max_plies"], 0.0);
+        assert_eq!(game_metrics(&game_row("max_plies", 0.5))["hit_max_plies"], 1.0);
+        // 思考平均は「1手あたり」（局の長さで割らないと長い局に引っ張られる）
+        assert!((lost["think_avg_ms_me"] - 1000.0).abs() < 1e-9);
+    }
+
+    /// 局ごとの指標名は checkpoint 側（`METRICS`）の部分集合であること。
+    /// 名前がずれると `report` の横断表で arena 側の列だけ空になる
+    #[test]
+    fn arena_metric_names_are_a_subset_of_checkpoint_metrics() {
+        let m = game_metrics(&game_row("checkmate", 1.0));
+        let known: BTreeSet<&str> = METRICS.iter().map(|(n, _)| *n).collect();
+        for k in m.keys() {
+            assert!(known.contains(k), "{k} が METRICS にありません");
+        }
+        assert!(m.contains_key("score"));
     }
 
     /// **MDE は CI 半幅ではない**（PR #20 レビュー指摘1）。

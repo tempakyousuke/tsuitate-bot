@@ -47,6 +47,10 @@ on:
         description: "候補側だけに効かせる評価ノブ（同じ書式。config で渡すのでプロセス env は動かず凍結相手は既定のまま。候補が凍結版のときは使えない）"
         required: false
         default: ""
+      pair_with:
+        description: "対照にする Arena 実行ID（この run を候補として局ごとにペア集計する。**同じ match_seed / 局数 / shards / 相手 / 時計**で取った run を指すこと）"
+        required: false
+        default: ""
   push:
     paths:
       - ".github/ci/arena.request.json"
@@ -65,6 +69,7 @@ jobs:
       clock: ${{ steps.split.outputs.clock }}
       env: ${{ steps.split.outputs.env }}
       cand_env: ${{ steps.split.outputs.cand_env }}
+      pair_with: ${{ steps.split.outputs.pair_with }}
     steps:
       - uses: actions/checkout@v5
       - id: split
@@ -79,6 +84,7 @@ jobs:
           IN_CLOCK: ${{ github.event.inputs.clock }}
           IN_ENV: ${{ github.event.inputs.env }}
           IN_CAND_ENV: ${{ github.event.inputs.cand_env }}
+          IN_PAIR_WITH: ${{ github.event.inputs.pair_with }}
         run: |
           set -euo pipefail
           default_baselines='estimator_v9 estimator_v10 estimator_v11 estimator_v12 estimator_v13 estimator_v14'
@@ -93,6 +99,7 @@ jobs:
             clock="${IN_CLOCK:-}"
             extra_env="${IN_ENV:-}"
             cand_env="${IN_CAND_ENV:-}"
+            pair_with="${IN_PAIR_WITH:-}"
           else
             if [ ! -f "$req" ]; then
               # push の paths フィルタはファイルの削除にも一致するので、計測が
@@ -113,6 +120,7 @@ jobs:
                 echo "clock="
                 echo "env="
                 echo "cand_env="
+                echo "pair_with="
               } >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -130,6 +138,12 @@ jobs:
             clock=$(jq -r '.clock // ""' "$req")
             extra_env=$(jq -r '.env // ""' "$req")
             cand_env=$(jq -r '.cand_env // ""' "$req")
+            pair_with=$(jq -r '.pair_with // ""' "$req")
+          fi
+          # ペア集計は局ごとの突き合わせなので、match_seed が無いと成立しない
+          if [ -n "$pair_with" ] && [ -z "$match_seed" ]; then
+            echo "pair_with は match_seed と併用してください（局ごとの条件が揃いません）" >&2
+            exit 1
           fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "起動: event=$EVENT_NAME games=$games candidate=$candidate baselines=$baselines shards=$shards match_seed=$match_seed clock=$clock env=$extra_env cand_env=$cand_env"
@@ -143,6 +157,7 @@ jobs:
           echo "oracle=$oracle" >> "$GITHUB_OUTPUT"
           echo "clock=$clock" >> "$GITHUB_OUTPUT"
           {
+            echo "pair_with=$pair_with"
             echo "cand_env=$cand_env"
             echo "env<<EOF"
             echo "$extra_env"
@@ -171,6 +186,10 @@ jobs:
           # （オラクル有効時は selfplay 側が記録を自動で無効化する）
           ARENA_RECORD_DIR: arena-records
           ARENA_JSON: arena-summary.json
+          # **1行=1対局**の結果（issue #19 の P0: 同じ match_seed の2本を局ごとに
+          # 突き合わせて Var(ペア差) を実測する）。match_seed 未指定の run では
+          # 対局条件が揃わないので arena 側が書かずに理由を出す
+          ARENA_GAMES_JSON: arena-games.jsonl
           ARENA_ORACLE_A: ${{ needs.plan.outputs.oracle }}
           # 評価項の発火率（src/hits.rs）。中立だった変更が「効いていない」のか
           # 「そもそも発火していない」のかを切り分けるため常時集計する
@@ -250,6 +269,7 @@ jobs:
           path: |
             arena-result.txt
             arena-summary.json
+            arena-games.jsonl
             analyze-summary.txt
 
       - name: Upload game records
@@ -287,6 +307,13 @@ jobs:
             exit 1
           fi
           cat "${parts[@]}" > all.jsonl
+          # 1行=1対局の記録も1本にまとめる（arena-var のペア集計の入力。
+          # match_seed 未指定の run では arena が書かないので空でよい）
+          games=(shards/**/arena-games.jsonl)
+          if [ ${#games[@]} -gt 0 ]; then
+            cat "${games[@]}" > all-games.jsonl
+            echo "1行=1対局の記録: $(wc -l < all-games.jsonl) 局（arena-var 用）"
+          fi
           jq -s '
             group_by(.baseline) | map(
               (map(.wins_a) | add) as $w |
@@ -333,6 +360,40 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY"
 
+      # --- 局ごとのペア集計（issue #19 の P0）---------------------------------
+      # 対照の run を `pair_with` で指すと、この run を候補として
+      #   delta = 候補のスコア − 対照のスコア   （同じ match_seed の同じ局）
+      # を局ごとに取り、**Var(ペア差)** と既知 arena 差を出す。
+      # checkpoint arena の var·CPU秒 は、この実測が無いと Var=0.5 の仮定に乗る。
+      - name: Download control run games
+        if: needs.plan.outputs.pair_with != ''
+        uses: actions/download-artifact@v7
+        with:
+          name: arena-combined
+          path: control-run
+          run-id: ${{ needs.plan.outputs.pair_with }}
+          github-token: ${{ github.token }}
+      - uses: actions/checkout@v5
+        if: needs.plan.outputs.pair_with != ''
+      - uses: dtolnay/rust-toolchain@stable
+        if: needs.plan.outputs.pair_with != ''
+      - uses: Swatinem/rust-cache@v2
+        if: needs.plan.outputs.pair_with != ''
+      - name: Pair with control run
+        if: needs.plan.outputs.pair_with != ''
+        run: |
+          set -euo pipefail
+          if [ ! -s control-run/all-games.jsonl ]; then
+            echo "::error::対照 run ${{ needs.plan.outputs.pair_with }} に all-games.jsonl がありません（match_seed 無しで回した run か、この機能より前の run です）"
+            exit 1
+          fi
+          cargo run --release --bin checkpoint_arena -- arena-var \
+            --control control-run/all-games.jsonl \
+            --candidate all-games.jsonl \
+            --label "run${{ github.run_id }}-vs-${{ needs.plan.outputs.pair_with }}" \
+            --markdown arena-var.md --json arena-var.json
+          cat arena-var.md >> "$GITHUB_STEP_SUMMARY"
+
       - name: Upload combined result
         uses: actions/upload-artifact@v6
         with:
@@ -340,3 +401,6 @@ jobs:
           path: |
             combined.json
             all.jsonl
+            all-games.jsonl
+            arena-var.md
+            arena-var.json
