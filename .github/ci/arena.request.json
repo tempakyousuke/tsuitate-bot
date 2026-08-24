@@ -1,0 +1,10 @@
+{
+  "games": 104,
+  "candidate": "estimator",
+  "baselines": "estimator_v13 estimator_v14",
+  "match_seed": 20260815,
+  "shards": 4,
+  "oracle": "",
+  "clock": "",
+  "env": ""
+}
