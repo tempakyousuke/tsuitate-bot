@@ -55,9 +55,9 @@ on:
         required: false
         default: "dev"
       seeds:
-        description: "checkpoint あたりの seed 数（**2 の倍数**。AB/BA が cluster 内で閉じる）"
+        description: "checkpoint あたりの seed 数（**2 の倍数**。P0 は 4 以上 = 2 replicate 以上）"
         required: false
-        default: "2"
+        default: "4"
       budgets:
         description: "思考予算（ms。スペース区切りで複数指定すると直積になる）"
         required: false
@@ -153,7 +153,7 @@ jobs:
             min_remaining="${IN_MIN_REMAINING:-20}"
             extract_seed="${IN_EXTRACT_SEED:-20260823}"
             split="${IN_SPLIT:-dev}"
-            seeds="${IN_SEEDS:-2}"
+            seeds="${IN_SEEDS:-4}"
             budgets="${IN_BUDGETS:-2000}"
             shards="${IN_SHARDS:-4}"
             experiments="${IN_EXPERIMENTS:-}"
@@ -174,7 +174,7 @@ jobs:
                 echo "min_remaining=20"
                 echo "extract_seed=0"
                 echo "split=dev"
-                echo "seeds=2"
+                echo "seeds=4"
               } >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -185,7 +185,7 @@ jobs:
             min_remaining=$(jq -r '.min_remaining // 20' "$req")
             extract_seed=$(jq -r '.extract_seed // 20260823' "$req")
             split=$(jq -r '.split // "dev"' "$req")
-            seeds=$(jq -r '.seeds // 2' "$req")
+            seeds=$(jq -r '.seeds // 4' "$req")
             budgets=$(jq -r 'if (.budgets | type) == "array" then .budgets | join(" ") else (.budgets // "2000") end' "$req")
             shards=$(jq -r '.shards // 4' "$req")
             experiments=$(jq -c '.experiments // ""' "$req")

@@ -91,33 +91,54 @@ manifest へ `foul_tried` を明示的に保存し、MyFoul 観測・累積反�
 
 ## 使い方
 
+**いま実際に動く例だけを載せる**（PR #20 4回目レビュー指摘3）。
+env 実験（`--candidate-env`）は原則拒否になったので例から外してある。
+
 ```bash
 # デッキ抽出（arena 記録から。原則1棋譜1checkpoint・層化・手番境界のみ）
 cargo run --release --bin checkpoint_arena -- extract \
   --records records --out checkpoint-arena \
   --opponent estimator_v14 --min-remaining 20 --limit 64
 
-# 2つの arm を同一 runner で交互実行
+# A/A（同一設定の両 arm）。seed は 2 の倍数、seed 数の効果まで測るなら 4 以上
 cargo run --release --bin checkpoint_arena -- run checkpoint-arena/deck.json \
-  --split dev --seeds 1 --jobs 3 --experiment anchor_move \
-  --candidate-env TSUITATE_ANCHOR_MOVE_W=0.6 \
-  --jsonl out/anchor_move.jsonl
+  --split dev --seeds 4 --jobs 3 --experiment aa \
+  --jsonl out/aa.jsonl
 
-# ペア集計（cluster bootstrap / ICC / MDE / 安全性の共同指標）
-cargo run --release --bin checkpoint_arena -- compare out/anchor_move.jsonl \
-  --known-arena-delta -8.5 --markdown out/anchor_move.md --json out/anchor_move.summary.json
+# 凍結版どうし（env を使わないので相手への漏れが起きない）。
+# 測っているのは (v13 vs 相手) − (v12 vs 相手) であって v13 vs v12 ではない
+cargo run --release --bin checkpoint_arena -- run checkpoint-arena/deck.json \
+  --split dev --seeds 4 --jobs 3 --experiment v13_v12_vs_opp \
+  --control-strategy estimator_v12 --candidate-strategy estimator_v13 \
+  --jsonl out/v13_v12_vs_opp.jsonl
 
-# 実験横断（符号一致・順位相関・重大悪化の見逃し）
+# ペア集計（--deck は shard 欠落の検出に必要）
+cargo run --release --bin checkpoint_arena -- compare out/aa.jsonl \
+  --deck checkpoint-arena/deck.json --split dev \
+  --markdown out/aa.md --json out/aa.summary.json
+
+# 実験横断（既知値が2件以上あるときだけ符号一致・順位相関を出す）
 cargo run --release --bin checkpoint_arena -- report out/*.summary.json
 ```
 
-CI は `gh workflow run checkpoint-arena.yml -f arena_run_id=<Arena実行ID> -f budgets="700 2000"`、
+`--known-arena-delta` は、**同じ candidate / control / opponent / 予算で arena を
+取り直した差**にだけ付ける。CLAUDE.md に残っている過去の値は流用できない。
+
+CI は `gh workflow run checkpoint-arena.yml -f arena_run_id=<Arena実行ID> -f seeds=4`、
 `gh` が無いときは `.github/ci/checkpoint-arena.request.json` を置いて push
 （例は `checkpoint-arena.request.example.json`。削除の push は全ジョブがスキップされる）。
 
 **デッキは arena 記録から作るのを既定にする**。checkpoint の局面分布が実際の対局分布と
 一致するのが重要で、`arena_run_id` を渡せば強さの検証で回した棋譜をそのまま再利用できる
 （追加の対局コストゼロ。artifact の保持期間内の run に限る）。
+
+### 実行前に止まるもの
+
+- **arm ごとに値が違う `TSUITATE_*`**（原則拒否。監査済みの `CANDIDATE_ONLY_ENV` は現在空。
+  恒久対策は issue #21）
+- **奇数の `--seeds` / `--seed-base`**（AB/BA が cluster 内で閉じない）
+- **schema 1 の JSONL**（candidate env が固定相手にも効いていた時期の記録）
+- **手番境界でない checkpoint**、**デッキと食い違う結果**、**arm 内での strategy / env の混在**
 
 ## 指標
 
@@ -231,6 +252,11 @@ prewarm 50秒）に対し実測は 129秒・prewarm 29秒（23%）で、**継続
 
 ### A/A（同一設定の両 arm、交互実行）
 
+**この節の数字は schema 1 の記録から取ったもの**。A/A は arm 固有 env を使わないので
+env 漏れの影響は受けないが、現在の `compare` は schema 1 を集計に使えないよう弾くので、
+**同じ JSONL からの再集計はできない**（取り直しが要る）。値は当時の出力として残す。
+
+
 同一 env・同一戦略・同一 seed で、両 arm を同じスロットで背中合わせに、
 checkpoint ごとに AB/BA を均衡させて実行した。
 
@@ -321,6 +347,23 @@ n=64 で −10pt が 93%。
     `delta = 0` は type-I error 用の経路（CI が 0 を外した割合）へ分けた
 14. **`--alpha` に CI 計算を連動させた一方、ラベルは「95% CI」固定だった**。
     `(1−alpha)×100` から生成するようにした
+
+**4回目のレビュー**
+
+15. **env 漏れ検査が共有モジュール経由の読取を見落としていた**。v14 の凍結ファイルに
+    `TSUITATE_JOSEKI` の文字列は無いが、v14 が作る `crate::opening::OpeningBook` の
+    `load()` が読む。共有モジュールも走査対象に加えたうえで、
+    **arm 固有 env は原則拒否**（監査済みの `CANDIDATE_ONLY_ENV` は現在空）に変えた。
+    走査は「読まないことの証明」にはならない（動的な env 名もありうる）ので、
+    許可の根拠には使わない
+16. **schema を上げずに `opponent_env` を足していた**。修正前の JSONL も `schema: 1` で、
+    欠損時に空 map へフォールバックすると「相手 env は両 arm とも空で一致」と
+    解釈されて新しい検査を通ってしまう。**schema 2** へ上げ、`opponent_env` を
+    必須にし、schema 1 は集計から明示的に弾く
+17. **docs の実行例が現在の実装で動かなかった**（`--seeds 1` は拒否、
+    `--candidate-env TSUITATE_ANCHOR_MOVE_W` も拒否、`--known-arena-delta -8.5` は
+    撤回済みの値）。実際に動く A/A と凍結版比較の例へ差し替え、
+    既定 matrix の本数（7本 → 3本）と P0 の seed 条件（4 以上）も実装に合わせた
 
 ### ブロッキングの効き（CPU あたりの情報量）
 
@@ -435,14 +478,19 @@ replicate（2 seed の AB/BA 平均）を単位にして扱う。生の seed を
 
 ```bash
 gh workflow run checkpoint-arena.yml \
-  -f arena_run_id=<直近 Arena 実行のID> \
-  -f checkpoints=64 -f seeds=2 -f split=all -f shards=8 \
+  -f arena_run_id=32650371131 \
+  -f checkpoints=64 -f seeds=4 -f split=all -f shards=8 \
   -f budgets="700 2000"
 ```
 
-既定の実験セット（`plan` ジョブの `default_experiments`）は issue の表そのままで、
-HEAD の env ノブだけで再現できる既知の負例4本と、同一バイナリ内の凍結版どうしの正例2本、
-それに A/A を加えた7本。`budgets="700 2000"` で符号・順位が保たれるかの較正も同時に取れる。
+**`seeds` は 4 以上**（= 2 replicate 以上）。2 seed は AB/BA が cluster 内で閉じる
+最小構成だが replicate 間分散が同定できないので、P0 の完了条件は満たせない
+（workflow の既定も 4 にしてある）。
+
+既定の実験セット（`plan` ジョブの `default_experiments`）は **3本**:
+`aa` と、凍結版どうしの `v13_v12_vs_opp` / `v14_v10_vs_opp`。
+**env 実験は既定から外してある**（相手も同じノブを読むので比較が成立しない。
+恒久対策は issue #21）。
 
 残っている項目:
 
@@ -450,12 +498,10 @@ HEAD の env ノブだけで再現できる既知の負例4本と、同一バイ
       （候補 / 対照）を取り、局ごとのペア差の分散を直接測る。これが無いと
       「通常 arena の何倍効率がよいか」は決まらない（現在の参考値 183 は
       `Var(delta)=0.5` の仮定に乗っている）。**同じ実行が較正の既知値にもなる**
-      ので、ここは1回で2つ片づく
-- [ ] 64 checkpoint 以上・**seed は 4 以上の偶数**での empirical SE / ICC / MDE。
-      seed 1 では AB/BA が cluster 内で閉じず、seed 2（= 1 replicate）では
-      replicate 間分散 σ_r² が同定できないので、**seed 数の効果を測るには 4 seed 以上**が要る
+- [ ] 64 checkpoint 以上・**seed 4 以上**での empirical SE / ICC / MDE
 - [ ] 既知差の較正。**同じ candidate / control / opponent / 予算で arena を
-      取り直した差**だけを `--known-arena-delta` に渡す
+      取り直した差**だけを `--known-arena-delta` に渡す。
+      **env ノブを使う較正は issue #21 の完了待ち**
 - [ ] 700ms と 2000ms の符号・順位・副指標の方向の一致
 - [ ] **arena 記録から作ったデッキ**での再測定
       （[run 32650371131](https://github.com/tempakyousuke/tsuitate-bot/actions/runs/32650371131)

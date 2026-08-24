@@ -48,25 +48,60 @@ use tsuitate_bot::selfplay::{GameResult, StartState, play_continuation};
 use tsuitate_bot::strategy;
 use tsuitate_bot::truth_replay::{load_end, side_idx};
 
-const SCHEMA: u32 = 1;
+/// JSONL の行 schema。
+///
+/// **2 で `opponent_env` を必須にした**（PR #20 4回目レビュー指摘2）。
+/// schema 1 は candidate env が固定相手にも効いていた時期の記録で、
+/// `opponent_env` が無いため「相手の実効 env は両 arm とも空で一致」と
+/// 誤って解釈できてしまう。集計から明示的に弾く
+const SCHEMA: u32 = 2;
 
-/// 戦略ごとのソース（**compile-time に埋め込む**）。
+/// **共有モジュール**（凍結版も呼ぶ）。
+///
+/// 凍結版は `estimator.rs` / `check.rs` / `strategy.rs` を自己完結コピーにしている
+/// （`scripts/freeze_estimator.py` の `SRC`）が、それ以外は共有モジュールを呼ぶ。
+/// たとえば v14 は `crate::opening::OpeningBook` を作り、その `load()` が
+/// `TSUITATE_JOSEKI` を読む。**凍結ファイル自体にその文字列は無い**ので、
+/// 1ファイルだけを走査すると見落とす（PR #20 4回目レビュー指摘1）。
+const SHARED_SOURCES: &[&str] = &[
+    include_str!("../opening.rs"),
+    include_str!("../likelihood.rs"),
+    include_str!("../belief_nn.rs"),
+    include_str!("../belief_features.rs"),
+    include_str!("../king_belief_nn.rs"),
+    include_str!("../opp_move_nn.rs"),
+    include_str!("../opp_move_nn_v25.rs"),
+    include_str!("../opp_move_features.rs"),
+    include_str!("../value_nn.rs"),
+    include_str!("../value_features.rs"),
+    include_str!("../deduce.rs"),
+    include_str!("../mate.rs"),
+    include_str!("../model.rs"),
+    include_str!("../board.rs"),
+    include_str!("../shogi.rs"),
+    include_str!("../hits.rs"),
+    include_str!("../observation.rs"),
+];
+
+/// 戦略ごとの固有ソース（**compile-time に埋め込む**）。
 ///
 /// `TSUITATE_*` はプロセス全体に効くので、candidate arm にだけ env を渡したつもりでも
 /// **同じプロセスで作る相手（凍結版）にも効く**。凍結版は凍結時点で読んでいた env を
-/// 今も読むので、既定 matrix の env はほぼ全部 v14 が読む（PR #20 追加レビュー指摘1）。
-/// そうなると candidate arm は「candidate 設定の現行 vs **candidate 設定の v14**」に
-/// なり、control arm の「既定の現行 vs 既定の v14」と同じ固定相手で比べられていない。
+/// 今も読むので、env 実験のノブはほぼ全部 v14 が読む。
 ///
 /// ソースを埋め込んで env 名を走査すれば、この食い違いを**実行前に**検出できる
 /// （ハンドメンテの表と違って、凍結版を足しても勝手に追随する）。
 /// バイナリは数 MB 太るが、これは開発用ツールなので許容する。
+///
+/// **ただしこの走査は「読まないことの証明」にはならない**（共有依存は定跡以外にもあり、
+/// 動的な env 名の組み立ても原理的にありうる）。だから arm 固有 env は
+/// **原則拒否**（`CANDIDATE_ONLY_ENV` の監査済みキーだけ許可）にしてあり、
+/// 走査はその上の二次的な検査として使う。恒久対策は issue #21。
 const STRATEGY_SOURCES: &[(&str, &[&str])] = &[
     ("estimator", &[
         include_str!("../strategy.rs"),
         include_str!("../estimator.rs"),
         include_str!("../check.rs"),
-        include_str!("../shogi.rs"),
     ]),
     ("estimator_v6", &[include_str!("../frozen/estimator_v6.rs")]),
     ("estimator_v7", &[include_str!("../frozen/estimator_v7.rs")]),
@@ -79,13 +114,21 @@ const STRATEGY_SOURCES: &[(&str, &[&str])] = &[
     ("estimator_v14", &[include_str!("../frozen/estimator_v14.rs")]),
 ];
 
-/// 戦略 `name` が env `key` を読むか。**未知の戦略名は「読む」と見なす**
-/// （安全側。`estimator_rush` などソースを列挙していないものが該当）
+/// **arm ごとに違えてよいと監査済みの env**。
+///
+/// ここに載せてよいのは「どの凍結版も、共有依存を含めて読まない」ことを
+/// 人が確認したキーだけ。**現在は空**（issue #21 で凍結版が戦略 env を読まなくなるまで、
+/// 安全に arm 固有にできるキーは無い）。追加するときは根拠をここへ書くこと。
+const CANDIDATE_ONLY_ENV: &[&str] = &[];
+
+/// 戦略 `name` が env `key` を読むか。**未知の戦略名は「読む」と見なす**（安全側）。
+/// 固有ソースに加えて**共有モジュールも走査する**
 fn strategy_reads_env(name: &str, key: &str) -> bool {
-    match STRATEGY_SOURCES.iter().find(|(n, _)| *n == name) {
+    let own = match STRATEGY_SOURCES.iter().find(|(n, _)| *n == name) {
         Some((_, srcs)) => srcs.iter().any(|s| s.contains(key)),
-        None => true,
-    }
+        None => return true,
+    };
+    own || SHARED_SOURCES.iter().any(|s| s.contains(key))
 }
 
 /// 相手が読む env のうち、実効のプロセス env に設定されているものを列挙する。
@@ -96,21 +139,39 @@ fn opponent_effective_env(opponent: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// **arm ごとに違う env を相手が読んでいたら止める**（追加レビュー指摘1）。
-/// 両 arm で同じ値の env（`--budget-ms` 等）は相手にも等しく効くので問題ない
+/// **arm 固有 env は原則拒否**（PR #20 4回目レビュー指摘1）。
+///
+/// 走査による「相手が読む」検出は偽陰性がありうる（共有依存・動的な env 名）ので、
+/// 「読まないと検出されたから許可」ではなく「監査済みリストに載っているから許可」にする。
+/// 両 arm で同じ値の env（`--budget-ms` 等）は相手にも等しく効くので対象外。
 fn assert_opponent_blind_to(opponent: &str, arm_env_keys: &[String], allow: bool) -> Vec<String> {
-    let leaked: Vec<String> = arm_env_keys
+    let denied: Vec<String> = arm_env_keys
         .iter()
-        .filter(|k| strategy_reads_env(opponent, k))
+        .filter(|k| {
+            // 監査済みでも、走査で相手が読むと出たら拒否（リストの陳腐化対策）
+            !CANDIDATE_ONLY_ENV.contains(&k.as_str()) || strategy_reads_env(opponent, k)
+        })
         .cloned()
         .collect();
-    if !leaked.is_empty() && !allow {
+    if !denied.is_empty() && !allow {
+        let scanned: Vec<&str> = denied
+            .iter()
+            .filter(|k| strategy_reads_env(opponent, k))
+            .map(String::as_str)
+            .collect();
         die(&format!(
-            "相手 {opponent} が arm 固有の env を読みます: {}\n             これでは candidate arm と control arm で「同じ固定相手」になりません\n             （env はプロセス全体に効き、相手も同じプロセスで作られるため）。\n             相手が読まないノブだけを使うか、--allow-opponent-env で承知のうえ続行してください",
-            leaked.join(", ")
+            "arm 固有の env は原則拒否です: {}\n\
+             （うち相手 {opponent} が読むと検出できたもの: {}）\n\
+             env はプロセス全体に効き、相手も同じプロセスで作られるので、arm ごとに\n\
+             値が違うと candidate arm と control arm で「同じ固定相手」になりません。\n\
+             走査は読まないことの証明にならない（共有モジュール経由の読取など）ため、\n\
+             許可は監査済みの CANDIDATE_ONLY_ENV だけです（恒久対策は issue #21）。\n\
+             承知のうえで続行するなら --allow-opponent-env",
+            denied.join(", "),
+            if scanned.is_empty() { "なし".to_string() } else { scanned.join(", ") }
         ));
     }
-    leaked
+    denied
 }
 
 
@@ -1050,6 +1111,11 @@ fn parse_rows(paths: &[String]) -> Vec<Row> {
             let v: serde_json::Value = serde_json::from_str(line)
                 .unwrap_or_else(|e| die(&format!("{where_}: {e}")));
             let schema = v["schema"].as_u64().unwrap_or(0) as u32;
+            if schema == 1 {
+                die(&format!(
+                    "{where_}: schema 1 の記録は集計に使えません。\n                     candidate arm の env が固定相手にも効いていた時期のもので、\n                     相手の実効 env が記録されていないため「両 arm とも空で一致」と\n                     誤って解釈されます（PR #20）。取り直してください"
+                ));
+            }
             if schema != SCHEMA {
                 die(&format!("{where_}: schema {schema} は未対応（対応 {SCHEMA}）"));
             }
@@ -1113,14 +1179,12 @@ fn parse_rows(paths: &[String]) -> Vec<Row> {
                 strategy: req_s("strategy"),
                 opponent_env: v["opponent_env"]
                     .as_object()
-                    .map(|m| {
-                        m.iter()
-                            .map(|(k, val)| {
-                                (k.clone(), val.as_str().unwrap_or_default().to_string())
-                            })
-                            .collect()
+                    .unwrap_or_else(|| {
+                        die(&format!("{where_}: 必須の object opponent_env がありません"))
                     })
-                    .unwrap_or_default(),
+                    .iter()
+                    .map(|(k, val)| (k.clone(), val.as_str().unwrap_or_default().to_string()))
+                    .collect(),
                 env: v["env"]
                     .as_object()
                     .map(|m| {
@@ -2281,19 +2345,36 @@ mod tests {
         assert!(strategy_reads_env("estimator_v14", "TSUITATE_ANCHOR_MOVE_W"));
         assert!(strategy_reads_env("estimator_v14", "TSUITATE_DROP_PROBE_REPEAT_GATE"));
         assert!(strategy_reads_env("estimator_v14", "TSUITATE_HAND_ASSET_W"));
-        // v14 は生成時に落とされる名前は読まない
-        assert!(!strategy_reads_env("estimator_v14", "TSUITATE_KING_SENSOR_W"));
         // 未知の戦略名は安全側（読むと見なす）
         assert!(strategy_reads_env("estimator_rush", "TSUITATE_ANCHOR_MOVE_W"));
     }
 
-    /// bootstrap CI の percentile は alpha に連動する（alpha を広げれば CI は狭くなる）
+    /// **共有モジュール経由の読取も検出する**（PR #20 4回目レビュー指摘1）。
+    /// v14 の凍結ファイルに `TSUITATE_JOSEKI` の文字列は無いが、
+    /// v14 が作る `crate::opening::OpeningBook` の `load()` が読む
     #[test]
-    fn bootstrap_ci_follows_alpha() {
-        let means: Vec<f64> = (0..40).map(|i| (i as f64 - 20.0) / 40.0).collect();
-        let (lo95, hi95) = bootstrap_ci_of_means(&means, 2000, 1, 0.05);
-        let (lo50, hi50) = bootstrap_ci_of_means(&means, 2000, 1, 0.50);
-        assert!(hi95 - lo95 > hi50 - lo50, "alpha を広げれば CI は狭くなる");
+    fn detects_env_read_through_shared_modules() {
+        assert!(
+            !include_str!("../frozen/estimator_v14.rs").contains("TSUITATE_JOSEKI"),
+            "前提: 凍結ファイル自体にはこの文字列が無い（あるならテストの意味が変わる）"
+        );
+        assert!(
+            strategy_reads_env("estimator_v14", "TSUITATE_JOSEKI"),
+            "共有 opening.rs 経由の読取を見落としている"
+        );
+    }
+
+    /// **arm 固有 env は原則拒否**（監査済みリストが空なので今は全部拒否）。
+    /// 走査で「読まない」と出ても許可しない = 偽陰性で通してしまわない
+    #[test]
+    fn arm_specific_env_is_denied_by_default() {
+        // どの凍結版も読まないであろう架空のキーでも拒否される
+        let keys = vec!["TSUITATE_NOT_READ_BY_ANYONE_XYZ".to_string()];
+        assert!(!strategy_reads_env("estimator_v14", "TSUITATE_NOT_READ_BY_ANYONE_XYZ"));
+        // allow=true のときだけ通る（拒否リストは返る）
+        let denied = assert_opponent_blind_to("estimator_v14", &keys, true);
+        assert_eq!(denied, keys, "監査済みリストに無いので拒否対象として返る");
+        assert!(CANDIDATE_ONLY_ENV.is_empty(), "issue #21 まで許可キーは無い");
     }
 
     /// cluster 平均の分散は cluster bootstrap と同じ対象を見ている

@@ -136,12 +136,19 @@
     当時の main・別の対戦条件で測った値なので流用できない（PR #20 レビュー指摘）
   - **env ノブは候補側だけに効かせられない**。`TSUITATE_*` はプロセス全体に効き、
     相手（凍結版）も同じプロセスで作られるので、arm ごとに値が違う env を相手が
-    読むと「同じ固定相手」で比べられない（arena.yml と同じ罠）。**既定 matrix から
-    env 実験は外してある**。`run`/`unit`/`pair` は相手のソースを compile-time に
-    埋め込んで env 名を走査し、実行前に止める（`--allow-opponent-env` で続行可）。
+    読むと「同じ固定相手」で比べられない（arena.yml と同じ罠）。**arm 固有 env は
+    原則拒否**（監査済みの `CANDIDATE_ONLY_ENV` は現在空。恒久対策は issue #21）で、
+    **既定 matrix からも env 実験は外してある**。ソース走査（凍結版＋**共有モジュール**。
+    v14 は `TSUITATE_JOSEKI` を凍結ファイルでなく `opening.rs` 経由で読む）は
+    二次的な検査で、「読まないことの証明」には使わない。
     両 arm に同じ値を渡す `--budget-ms` は対象外
+  - **seed は 4 以上の偶数**が P0 の条件（2 seed は AB/BA が閉じる最小構成だが
+    replicate 間分散が同定できない）。`compare` は replicate が1つのとき
+    seed 数の外挿を出さない
+  - JSONL の schema は **2**。schema 1（candidate env が固定相手にも効いていた時期）は
+    集計から明示的に弾く
   - 実行は CI（`.github/workflows/checkpoint-arena.yml`、**通常のコード push では走らない**）。
-    `gh workflow run checkpoint-arena.yml -f arena_run_id=<Arena実行ID> -f budgets="700 2000"`、
+    `gh workflow run checkpoint-arena.yml -f arena_run_id=<Arena実行ID> -f seeds=4`、
     `gh` が無ければ `.github/ci/checkpoint-arena.request.json` を置いて push（削除の push は
     全ジョブがスキップされる）。**デッキは arena 記録から作るのを既定にする**
     （局面分布が実際の対局分布と一致する。`arena_run_id` を渡せば追加の対局コストはゼロ）
