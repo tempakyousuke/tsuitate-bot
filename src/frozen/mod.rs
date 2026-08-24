@@ -172,7 +172,7 @@ pub const SHARED_MODEL_PINS: &[(&str, &str, &str, &str)] = &[
     ),
     (
         "src/value_nn_v22.rs",
-        "b72953e2fd82900294c380bf6f1ea4e05752b8e6036ada8ebba63b7cab11d1ab",
+        "7d89a8ae23c07b99d7ef37405ca113a6ca2420d0f4fc40f389ac0b0b4204b42f",
         "value_nn_v22",
         include_str!("../value_nn_v22.rs"),
     ),
