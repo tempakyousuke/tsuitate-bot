@@ -159,7 +159,10 @@ struct PlayerState {
     fouls: u32,
     fouls_in_check: u32,
     foul_tried: HashSet<String>,
-    clock_ms: i64,
+    /// None = 時計なし（checkpoint arena の継続対局）。時間切れ終局が存在せず、
+    /// フィッシャー加算もしない。**思考時間の記録（think_us）は時計の有無に
+    /// 依らず必ず取る**（「遅くなったが勝率が上がった」偽の改善を弾くため）
+    clock_ms: Option<i64>,
     /// この対局で支給された持ち時間（初期＋加算の累計）
     clock_granted_ms: u64,
     /// 残り時間の最小値（時間切れまでの余裕の実測）
@@ -209,15 +212,20 @@ pub struct GameTruth {
 }
 
 /// oracle[先手, 後手]: 診断用。Some の側は該当する反則手が「候補から外して
-/// 指し直し」になり、反則カウント・観測は発生しない（OracleMode 参照）
+/// 指し直し」になり、反則カウント・観測は発生しない（OracleMode 参照）。
+///
+/// `start` は開始局面と**絶対手数**（通常の対局は `Position::initial()` と 0、
+/// checkpoint arena は途中局面とそこまでの手数）。両者の観測ログ・反則数・
+/// `foul_tried` は `players` 側が持っているので、ここでは受け取らない。
+/// MAX_PLIES・反則上限・王手/捕獲通知・終局判定は開始点に依らず共通
 fn play_game_with_oracle(
     players: &mut [PlayerState; 2],
     game_no: u32,
     oracle: [Option<OracleMode>; 2],
+    start: (Position, u32),
 ) -> (GameResult, &'static str, u32, GameTruth) {
-    let mut pos = Position::initial();
+    let (mut pos, mut plies) = start;
     let idx = |c: Color| if c == Color::Sente { 0usize } else { 1usize };
-    let mut plies = 0u32;
     let mut truth = GameTruth {
         moves: vec![],
         foul_attempts: vec![],
@@ -229,7 +237,12 @@ fn play_game_with_oracle(
         }
         let side = pos.turn();
         let fouls = [players[0].fouls, players[1].fouls];
-        let clocks_ms = [players[0].clock_ms, players[1].clock_ms];
+        // 時計なし（clock_ms = None）でも view の残り時間は必要なので初期値を見せる。
+        // 戦略側は clocks を読まない（読むのは bridge.rs の表示だけ）
+        let clocks_ms = [
+            players[0].clock_ms.unwrap_or_else(fischer_initial_ms),
+            players[1].clock_ms.unwrap_or_else(fischer_initial_ms),
+        ];
         let view = make_view(&pos, side, &fouls, &clocks_ms, game_no);
 
         let mover = &mut players[idx(side)];
@@ -237,13 +250,16 @@ fn play_game_with_oracle(
         let choice = mover.strategy.choose(&view, &mover.log, &mover.foul_tried);
         let elapsed = started.elapsed();
         mover.think_us.push(elapsed.as_micros() as u64);
-        mover.clock_ms -= elapsed.as_millis() as i64;
-        mover.clock_min_ms = Some(match mover.clock_min_ms {
-            Some(m) => m.min(mover.clock_ms),
-            None => mover.clock_ms,
-        });
-        if mover.clock_ms <= 0 {
-            return (GameResult::Win(side.other()), "timeout", plies, truth);
+        if let Some(clock_ms) = mover.clock_ms.as_mut() {
+            *clock_ms -= elapsed.as_millis() as i64;
+            let now = *clock_ms;
+            mover.clock_min_ms = Some(match mover.clock_min_ms {
+                Some(m) => m.min(now),
+                None => now,
+            });
+            if now <= 0 {
+                return (GameResult::Win(side.other()), "timeout", plies, truth);
+            }
         }
         let Some(usi) = choice else {
             return (GameResult::Win(side.other()), "resign", plies, truth);
@@ -306,8 +322,10 @@ fn play_game_with_oracle(
         let captured = pos.play_unchecked(&mv);
         plies += 1;
         players[idx(side)].foul_tried.clear();
-        players[idx(side)].clock_ms += fischer_increment_ms();
-        players[idx(side)].clock_granted_ms += fischer_increment_ms() as u64;
+        if let Some(clock_ms) = players[idx(side)].clock_ms.as_mut() {
+            *clock_ms += fischer_increment_ms();
+            players[idx(side)].clock_granted_ms += fischer_increment_ms() as u64;
+        }
 
         // 通知（game-room.ts と同じ内容・同じ moveNumber 規約 = 適用後の値）
         let move_number = pos.move_number();
@@ -572,7 +590,7 @@ where
                             fouls: 0,
                             fouls_in_check: 0,
                             foul_tried: HashSet::new(),
-                            clock_ms: fischer_initial_ms(),
+                            clock_ms: Some(fischer_initial_ms()),
                             clock_granted_ms: fischer_initial_ms() as u64,
                             clock_min_ms: None,
                             think_us: Vec::new(),
@@ -597,8 +615,12 @@ where
                         } else {
                             [None, oracle_a]
                         };
-                        let (result, reason, plies, truth) =
-                            play_game_with_oracle(&mut players, game_no, oracle);
+                        let (result, reason, plies, truth) = play_game_with_oracle(
+                            &mut players,
+                            game_no,
+                            oracle,
+                            (Position::initial(), 0),
+                        );
                         if let Some(dir) = record_dir {
                             write_record(dir, game_no, a_is_sente, &players, result, reason, truth);
                         }
@@ -618,6 +640,97 @@ where
     });
     stats.games = games;
     stats
+}
+
+/// 継続対局の開始状態（checkpoint arena）。
+///
+/// **v1 は手番境界のみ**を扱う: 「直前の受理手が完了し、次の手番がまだ反則を
+/// 一度も試していない時点」。同一手番内の反則後 checkpoint を扱うようになったら
+/// `foul_tried` をここへ明示的に足すこと（`check_foul_prior_boost` が
+/// `foul_tried.len()` を読むので、復元漏れは評価そのものを変える）。
+pub struct StartState {
+    /// 真実の盤面と開始手番
+    pub pos: Position,
+    /// 両者の観測ログ [0]=先手, [1]=後手
+    pub logs: [ObservationLog; 2],
+    /// ここまでの累積反則数（反則負けの上限 MAX_FOULS は累計で判定される）
+    pub fouls: [u32; 2],
+    /// 絶対手数（MAX_PLIES の判定に使う）
+    pub plies: u32,
+}
+
+/// 継続対局の結果。反則・思考時間は「継続で増えたぶん」と「累計」を分けて返す
+pub struct ContinuationOutcome {
+    pub result: GameResult,
+    pub reason: &'static str,
+    /// 終局時点の**絶対**手数
+    pub plies: u32,
+    /// 継続で増えた手数
+    pub added_plies: u32,
+    /// 終局時点の累積反則数
+    pub fouls: [u32; 2],
+    /// 継続で増えた反則数
+    pub added_fouls: [u32; 2],
+    /// 継続で増えた反則のうち王手を受けている局面だったもの
+    pub added_fouls_in_check: [u32; 2],
+    /// 継続中の1手ごとの思考時間（マイクロ秒）
+    pub think_us: [Vec<u64>; 2],
+    pub truth: GameTruth,
+}
+
+/// 途中局面から終局まで指し継ぐ（checkpoint arena）。
+///
+/// 裁定は通常の対局と同じ関数（`play_game_with_oracle`）を通るので、
+/// MAX_PLIES・反則上限・王手/捕獲通知・終局判定は arena と共有される。
+/// **時計は無効**（`clock_ms = None`）: 途中局面からの残り時間は復元できず、
+/// 本番相当 300秒+3秒・100局で時間切れ0の実測があるため落としてよい。
+/// ただし思考時間は必ず記録する。
+///
+/// `strategies` は **prewarm 済み**のものを渡すこと（prewarm のコストを
+/// 継続対局のコストと分けて計測するため、ここでは prewarm しない）。
+pub fn play_continuation(
+    strategies: [Box<dyn Strategy>; 2],
+    start: StartState,
+    game_no: u32,
+) -> ContinuationOutcome {
+    let StartState {
+        pos,
+        logs,
+        fouls,
+        plies: start_plies,
+    } = start;
+    let [log_s, log_g] = logs;
+    let new_player = |strategy: Box<dyn Strategy>, log: ObservationLog, fouls: u32| PlayerState {
+        strategy,
+        log,
+        fouls,
+        fouls_in_check: 0,
+        foul_tried: HashSet::new(),
+        clock_ms: None,
+        clock_granted_ms: 0,
+        clock_min_ms: None,
+        think_us: Vec::new(),
+        chosen: Vec::new(),
+    };
+    let [strat_s, strat_g] = strategies;
+    let mut players = [
+        new_player(strat_s, log_s, fouls[0]),
+        new_player(strat_g, log_g, fouls[1]),
+    ];
+    let (result, reason, plies, truth) =
+        play_game_with_oracle(&mut players, game_no, [None, None], (pos, start_plies));
+    let [p0, p1] = players;
+    ContinuationOutcome {
+        result,
+        reason,
+        plies,
+        added_plies: plies - start_plies,
+        fouls: [p0.fouls, p1.fouls],
+        added_fouls: [p0.fouls - fouls[0], p1.fouls - fouls[1]],
+        added_fouls_in_check: [p0.fouls_in_check, p1.fouls_in_check],
+        think_us: [p0.think_us, p1.think_us],
+        truth,
+    }
 }
 
 #[cfg(test)]
@@ -641,6 +754,52 @@ mod tests {
         fn name(&self) -> &'static str {
             "resigner"
         }
+    }
+
+    /// 初期局面を「開始状態」として `play_continuation` に渡した継続対局が、
+    /// 通常の初期局面からの selfplay と同じ裁定になる（checkpoint arena が
+    /// arena と裁定を共有していることの回帰テスト）。
+    ///
+    /// 推定器は壁時計デッドラインで打ち切るので手順のバイト一致は要求できない。
+    /// ここでは裁定そのもの（決定論的な戦略なら同じ結果になること）を確かめる
+    #[test]
+    fn continuation_from_initial_matches_normal_selfplay() {
+        let start = StartState {
+            pos: Position::initial(),
+            logs: [ObservationLog::default(), ObservationLog::default()],
+            fouls: [0, 0],
+            plies: 0,
+        };
+        let out = play_continuation([Box::new(Resigner), Box::new(Resigner)], start, 0);
+        // 先手が即投了 = 後手の勝ち。通常の selfplay と同じ裁定
+        assert_eq!(out.result, GameResult::Win(Color::Gote));
+        assert_eq!(out.reason, "resign");
+        assert_eq!(out.plies, 0);
+        assert_eq!(out.added_plies, 0);
+
+        let stats = run_match_with(1, &|| Box::new(Resigner), &|| Box::new(Resigner));
+        assert_eq!(stats.resign, 1);
+        assert_eq!(stats.wins_b, 1, "先手（A）が投了して B の勝ち");
+    }
+
+    /// 継続対局は開始時点の累積反則数を引き継ぎ、絶対手数で MAX_PLIES を判定する
+    #[test]
+    fn continuation_carries_absolute_counters() {
+        let mut pos = Position::initial();
+        for usi in ["7g7f", "3c3d"] {
+            pos.play_unchecked(&parse_usi(usi).unwrap());
+        }
+        let start = StartState {
+            pos,
+            logs: [ObservationLog::default(), ObservationLog::default()],
+            fouls: [3, 4],
+            plies: 2,
+        };
+        let out = play_continuation([Box::new(Resigner), Box::new(Resigner)], start, 0);
+        assert_eq!(out.fouls, [3, 4], "反則数は引き継ぐ");
+        assert_eq!(out.added_fouls, [0, 0]);
+        assert_eq!(out.plies, 2, "絶対手数は引き継ぐ");
+        assert_eq!(out.added_plies, 0);
     }
 
     /// 同じ match_seed なら、スレッド数や実行順に関係なく

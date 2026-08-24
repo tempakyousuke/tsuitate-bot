@@ -1,0 +1,437 @@
+name: Checkpoint arena
+
+# **issue #19 の P0**: 過去の実戦の途中局面から bot 同士で指し継ぎ、候補設定と
+# 対照設定を同じ局面でブロック化して比べる（checkpoint arena）。
+#
+# 位置づけは「通常 arena へ送る前に明確な悪化を安価に除外する破滅検出器」で、
+# **較正が済むまで informational**。最終採否は今までどおり arena.yml。
+#
+# 起動は arena.yml / scenario.yml と同じ2通り（通常のコード push では走らない）:
+#   1. Actions UI / `gh workflow run checkpoint-arena.yml -f ...`
+#   2. `.github/ci/checkpoint-arena.request.json` を含む push
+#      （リクエストファイルを消す push は plan が「削除された push」と判定して
+#        全ジョブをスキップするので、後片付けで赤い run は残らない）
+#
+# デッキは2通りで用意する:
+#   1. `arena_run_id` … 既存 Arena 実行の `arena-records-*` から抽出する
+#      （強さの検証で回した棋譜の再利用。**この経路を既定にする** =
+#        checkpoint の局面分布が実際の対局分布と一致する）
+#   2. 空 … リポジトリにコミット済みの `deck_path` を使う（固定デッキ）
+#
+# 実験は `experiments`（JSON 配列）で複数まとめて回す。各要素:
+#   {"label":"v13_v12_vs_opp",
+#    "candidate_strategy":"estimator_v13", "control_strategy":"estimator_v12"}
+# `budgets` の各値と直積になる（700ms / 2000ms の較正用）。
+#
+# **`candidate_env` / `control_env` は現在すべて失敗する予約フィールド**。
+# `TSUITATE_*` はプロセス全体に効き、相手（凍結版）も同じプロセスで作られるので、
+# arm ごとに値が違う env は原則拒否になっている（監査済みの CANDIDATE_ONLY_ENV は
+# 現在空。恒久対策は issue #21）。ソース走査は二次的な検査で、
+# 「相手が読まない」ことの証明には使わない。
+#
+# `known`（既知の通常 arena 差）も、**同じ candidate / control / opponent / 予算で
+# arena.yml を取り直した値**にだけ付ける。CLAUDE.md に残っている過去の値は流用できない。
+on:
+  workflow_dispatch:
+    inputs:
+      arena_run_id:
+        description: "デッキ抽出元の Arena 実行ID（空ならリポジトリの deck_path を使う）"
+        required: false
+        default: ""
+      deck_path:
+        description: "コミット済みデッキの manifest"
+        required: false
+        default: "checkpoint-arena/deck.json"
+      opponent:
+        description: "継続対局の相手（凍結版。凍結版を足したらここも更新する）"
+        required: false
+        default: "estimator_v14"
+      checkpoints:
+        description: "抽出する checkpoint 数（原則1棋譜1件）"
+        required: false
+        default: "64"
+      min_remaining:
+        description: "元対局がその局面から続いた最低手数（決着済み局面を除く）"
+        required: false
+        default: "20"
+      extract_seed:
+        description: "抽出の決定論シード"
+        required: false
+        default: "20260823"
+      split:
+        description: "使う split（dev / validation / all）"
+        required: false
+        default: "dev"
+      seeds:
+        description: "checkpoint あたりの seed 数（**2 の倍数**。P0 は 4 以上 = 2 replicate 以上）"
+        required: false
+        default: "4"
+      budgets:
+        description: "思考予算（ms。スペース区切りで複数指定すると直積になる）"
+        required: false
+        default: "2000"
+      shards:
+        description: "checkpoint の分割数（並列ランナー数）"
+        required: false
+        default: "4"
+      experiments:
+        description: "実験の JSON 配列（label / candidate_env / control_env / candidate_strategy / control_strategy / known）"
+        required: false
+        default: ""
+  push:
+    paths:
+      - ".github/ci/checkpoint-arena.request.json"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.split.outputs.skip }}
+      matrix: ${{ steps.split.outputs.matrix }}
+      shards: ${{ steps.split.outputs.shards }}
+      shard_count: ${{ steps.split.outputs.shard_count }}
+      arena_run_id: ${{ steps.split.outputs.arena_run_id }}
+      deck_path: ${{ steps.split.outputs.deck_path }}
+      opponent: ${{ steps.split.outputs.opponent }}
+      checkpoints: ${{ steps.split.outputs.checkpoints }}
+      min_remaining: ${{ steps.split.outputs.min_remaining }}
+      extract_seed: ${{ steps.split.outputs.extract_seed }}
+      split: ${{ steps.split.outputs.split }}
+      seeds: ${{ steps.split.outputs.seeds }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: split
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IN_RUN_ID: ${{ github.event.inputs.arena_run_id }}
+          IN_DECK: ${{ github.event.inputs.deck_path }}
+          IN_OPPONENT: ${{ github.event.inputs.opponent }}
+          IN_CHECKPOINTS: ${{ github.event.inputs.checkpoints }}
+          IN_MIN_REMAINING: ${{ github.event.inputs.min_remaining }}
+          IN_EXTRACT_SEED: ${{ github.event.inputs.extract_seed }}
+          IN_SPLIT: ${{ github.event.inputs.split }}
+          IN_SEEDS: ${{ github.event.inputs.seeds }}
+          IN_BUDGETS: ${{ github.event.inputs.budgets }}
+          IN_SHARDS: ${{ github.event.inputs.shards }}
+          IN_EXPERIMENTS: ${{ github.event.inputs.experiments }}
+        run: |
+          set -euo pipefail
+          req='.github/ci/checkpoint-arena.request.json'
+          # P0-b の既定セット。
+          #
+          # **env 実験は既定から外してある**（PR #20 追加レビュー指摘1）。
+          # `TSUITATE_*` はプロセス全体に効き、相手（凍結版）も同じプロセスで
+          # 作られるので、candidate arm にだけノブを渡したつもりでも
+          #   candidate: 候補設定の現行 vs **候補設定の v14**
+          #   control  : 既定の現行     vs 既定の v14
+          # となって「同じ固定相手」で比べられない。しかも既定 matrix で使いたい
+          # ノブ（DROP_PROBE_REPEAT_GATE / ANCHOR_MOVE_W / EXPOSED_PAWN_HEAD_W /
+          # HAND_ASSET_W / KING_KNOWN_APPROACH_W / LINK_ENDGAME_DAMPEN /
+          # MATERIAL_DEGEN_Q0 / PROMOTE_FAR_W / GEN_NONPROMOTE）は
+          # **全部 src/frozen/estimator_v14.rs が読む**（確認済み）。
+          # checkpoint_arena はこれを実行前に検出して止める（相手のソースを
+          # compile-time に埋め込んで env 名を走査する）。
+          #
+          # 候補側だけにノブを効かせる経路（現行 strategy だけが読む alias、
+          # または評価パラメータのインスタンス注入）ができるまでは、
+          # 既定は「相手も候補も env なし」で成立する実験だけにする。
+          # 手で `experiments` を渡して `--allow-opponent-env` 相当を使う場合は、
+          # 「候補単体の効果」ではないことを承知のうえで読むこと。
+          #
+          # `known` も既定では入れない: CLAUDE.md に残っている
+          # −12.8 / −8.5 / −7.4 / −2.8pt は当時の main・別の対戦条件で測った値で、
+          # このワークフローの条件で測り直した値ではない。較正したいときは
+          # 同じ candidate / control / opponent / 予算で arena.yml を取り直して
+          # `compare --known-arena-delta` へ渡す。
+          #
+          # 凍結版どうしの実験がここで測るのは
+          #   (v13 vs 相手) − (v12 vs 相手)
+          # であって (v13 vs v12) ではない（非推移性があるので別物）。
+          # ラベルもそう読めるようにしてある。
+          default_experiments='[
+            {"label":"aa"},
+            {"label":"v13_v12_vs_opp","candidate_strategy":"estimator_v13","control_strategy":"estimator_v12"},
+            {"label":"v14_v10_vs_opp","candidate_strategy":"estimator_v14","control_strategy":"estimator_v10"}
+          ]'
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            run_id="${IN_RUN_ID:-}"
+            deck="${IN_DECK:-checkpoint-arena/deck.json}"
+            opponent="${IN_OPPONENT:-estimator_v14}"
+            checkpoints="${IN_CHECKPOINTS:-64}"
+            min_remaining="${IN_MIN_REMAINING:-20}"
+            extract_seed="${IN_EXTRACT_SEED:-20260823}"
+            split="${IN_SPLIT:-dev}"
+            seeds="${IN_SEEDS:-4}"
+            budgets="${IN_BUDGETS:-2000}"
+            shards="${IN_SHARDS:-4}"
+            experiments="${IN_EXPERIMENTS:-}"
+          else
+            if [ ! -f "$req" ]; then
+              # push の paths フィルタは削除にも一致する。計測後に $req を消す
+              # commit は後片付けの正常系なので、赤い run を残さず全部スキップ
+              echo "リクエストファイルが削除された push（後片付け）なので何もしない"
+              {
+                echo "skip=true"
+                echo 'matrix={"include":[]}'
+                echo "shards=[0]"
+                echo "shard_count=1"
+                echo "arena_run_id="
+                echo "deck_path=checkpoint-arena/deck.json"
+                echo "opponent=estimator_v14"
+                echo "checkpoints=0"
+                echo "min_remaining=20"
+                echo "extract_seed=0"
+                echo "split=dev"
+                echo "seeds=4"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            run_id=$(jq -r '.arena_run_id // ""' "$req")
+            deck=$(jq -r '.deck_path // "checkpoint-arena/deck.json"' "$req")
+            opponent=$(jq -r '.opponent // "estimator_v14"' "$req")
+            checkpoints=$(jq -r '.checkpoints // 64' "$req")
+            min_remaining=$(jq -r '.min_remaining // 20' "$req")
+            extract_seed=$(jq -r '.extract_seed // 20260823' "$req")
+            split=$(jq -r '.split // "dev"' "$req")
+            seeds=$(jq -r '.seeds // 4' "$req")
+            budgets=$(jq -r 'if (.budgets | type) == "array" then .budgets | join(" ") else (.budgets // "2000") end' "$req")
+            shards=$(jq -r '.shards // 4' "$req")
+            experiments=$(jq -c '.experiments // ""' "$req")
+            [ "$experiments" = '""' ] && experiments=""
+          fi
+          [ -n "$experiments" ] || experiments="$default_experiments"
+          # seed は 2 の倍数（arm 順が (checkpoint 番号 + seed) % 2 なので、
+          # 2k と 2k+1 が対になって初めて AB/BA が cluster の内側で閉じる）
+          if [ $(( seeds % 2 )) -ne 0 ]; then
+            echo "seeds は 2 の倍数にしてください（指定値 ${seeds}）" >&2
+            exit 1
+          fi
+          # 実験 × 予算の直積を matrix.include にする
+          matrix=$(jq -c -n \
+            --argjson exps "$experiments" \
+            --arg budgets "$budgets" \
+            '{include: [ $exps[] as $e | ($budgets | split(" ") | map(select(length>0)))[] as $b |
+               {
+                 label: ($e.label + "-" + $b),
+                 candidate_env: ($e.candidate_env // ""),
+                 control_env: ($e.control_env // ""),
+                 candidate_strategy: ($e.candidate_strategy // "estimator"),
+                 control_strategy: ($e.control_strategy // "estimator"),
+                 known: (($e.known // "") | tostring),
+                 budget: $b
+               } ]}')
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "shards=$(jq -n -c "[range(0; ${shards})]")" >> "$GITHUB_OUTPUT"
+          echo "shard_count=${shards}" >> "$GITHUB_OUTPUT"
+          {
+            echo "arena_run_id=$run_id"
+            echo "deck_path=$deck"
+            echo "opponent=$opponent"
+            echo "checkpoints=$checkpoints"
+            echo "min_remaining=$min_remaining"
+            echo "extract_seed=$extract_seed"
+            echo "split=$split"
+            echo "seeds=$seeds"
+          } >> "$GITHUB_OUTPUT"
+          echo "実験 $(jq '.include | length' <<<"$matrix") 本 × シャード ${shards}"
+
+  deck:
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Download arena records
+        if: needs.plan.outputs.arena_run_id != ''
+        uses: actions/download-artifact@v7
+        with:
+          pattern: arena-records-*
+          path: records-in
+          run-id: ${{ needs.plan.outputs.arena_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Build deck
+        run: |
+          set -euo pipefail
+          if [ -n "${{ needs.plan.outputs.arena_run_id }}" ]; then
+            cargo run --release --bin checkpoint_arena -- extract \
+              --records records-in \
+              --out deck \
+              --source "arena run ${{ needs.plan.outputs.arena_run_id }}" \
+              --opponent "${{ needs.plan.outputs.opponent }}" \
+              --min-remaining "${{ needs.plan.outputs.min_remaining }}" \
+              --limit "${{ needs.plan.outputs.checkpoints }}" \
+              --seed "${{ needs.plan.outputs.extract_seed }}" \
+              | tee deck-summary.txt
+          else
+            src='${{ needs.plan.outputs.deck_path }}'
+            if [ ! -f "$src" ]; then
+              echo "デッキ $src がありません（arena_run_id を指定するか、デッキをコミットしてください）" >&2
+              exit 1
+            fi
+            mkdir -p deck
+            cp -r "$(dirname "$src")"/* deck/
+            echo "コミット済みデッキ $src を使用" | tee deck-summary.txt
+          fi
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          cat deck-summary.txt >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: checkpoint-deck
+          path: deck/
+
+  run:
+    needs: [plan, deck]
+    if: needs.plan.outputs.skip != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        exp: ${{ fromJSON(needs.plan.outputs.matrix).include }}
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v7
+        with:
+          name: checkpoint-deck
+          path: deck
+
+      - name: Run arms
+        run: |
+          set -euo pipefail
+          cargo build --release --bin checkpoint_arena
+          # 両 arm を同じジョブ・同じスロットで交互に走らせる（control をキャッシュ
+          # しない = 機械負荷を揃える）。jobs はランナーのコア数から取る
+          jobs=$(( $(nproc) - 1 )); [ "$jobs" -ge 1 ] || jobs=1
+          ./target/release/checkpoint_arena run deck/deck.json \
+            --split "${{ needs.plan.outputs.split }}" \
+            --seeds "${{ needs.plan.outputs.seeds }}" \
+            --shards "${{ needs.plan.outputs.shard_count }}" --shard "${{ matrix.shard }}" \
+            --jobs "$jobs" \
+            --experiment "${{ matrix.exp.label }}" \
+            --opponent "${{ needs.plan.outputs.opponent }}" \
+            --control-strategy "${{ matrix.exp.control_strategy }}" \
+            --candidate-strategy "${{ matrix.exp.candidate_strategy }}" \
+            --control-env "${{ matrix.exp.control_env }}" \
+            --candidate-env "${{ matrix.exp.candidate_env }}" \
+            --budget-ms "${{ matrix.exp.budget }}" \
+            --jsonl "arm-${{ matrix.exp.label }}-s${{ matrix.shard }}.jsonl"
+
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: ckarena-${{ matrix.exp.label }}-s${{ matrix.shard }}
+          path: arm-*.jsonl
+          if-no-files-found: ignore
+
+  aggregate:
+    needs: [plan, deck, run]
+    # 一部シャードが落ちても残りを合算する。plan 自体の失敗と
+    # スキップは除く（artifact ゼロで二重に赤くなるのを避ける）
+    if: always() && needs.plan.result == 'success' && needs.deck.result == 'success' && needs.plan.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: ckarena-*
+          path: arms
+          merge-multiple: true
+      - uses: actions/download-artifact@v7
+        with:
+          name: checkpoint-deck
+          path: deck
+
+      - name: Compare and report
+        env:
+          MATRIX: ${{ needs.plan.outputs.matrix }}
+          SHARD_COUNT: ${{ needs.plan.outputs.shard_count }}
+          SPLIT: ${{ needs.plan.outputs.split }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          cargo build --release --bin checkpoint_arena
+          mkdir -p out
+          incomplete=0
+          # 実験ごとにペア集計。**shard が丸ごと欠けても検出できるように**
+          #   (a) label ごとの JSONL 本数が shard_count と一致するか
+          #   (b) 全 matrix label に summary が出たか
+          #   (c) デッキ側の期待 checkpoint 集合と一致するか（compare --deck）
+          # の3段で検査する（PR #20 追加レビュー指摘1）
+          echo "$MATRIX" | jq -r '.include[] | [.label, (.known // "")] | @tsv' \
+          | while IFS=$'\t' read -r label known; do
+              files=(arms/arm-"$label"-s*.jsonl)
+              if [ ${#files[@]} -ne "$SHARD_COUNT" ]; then
+                echo "::error::${label}: shard が揃っていません（${#files[@]}/${SHARD_COUNT}）"
+                echo "$label ${#files[@]}/${SHARD_COUNT}" >> out/INCOMPLETE.txt
+                continue
+              fi
+              args=()
+              [ -n "$known" ] && args+=(--known-arena-delta "$known")
+              ./target/release/checkpoint_arena compare "${files[@]}" \
+                --label "$label" \
+                --deck deck/deck.json --split "$SPLIT" \
+                --markdown "out/$label.md" \
+                --json "out/$label.summary.json" "${args[@]}" > /dev/null \
+                || { echo "::error::${label}: compare が失敗（整合性検査）"
+                     echo "$label compare-failed" >> out/INCOMPLETE.txt; }
+            done
+          # 全 label に summary があるか
+          want=$(echo "$MATRIX" | jq -r '.include | length')
+          got=$(ls out/*.summary.json 2>/dev/null | wc -l)
+          if [ "$got" -ne "$want" ]; then
+            echo "::error::summary が揃っていません（${got}/${want}）"
+            echo "summaries ${got}/${want}" >> out/INCOMPLETE.txt
+          fi
+          summaries=(out/*.summary.json)
+          if [ ${#summaries[@]} -gt 0 ]; then
+            ./target/release/checkpoint_arena report "${summaries[@]}" \
+              --markdown out/report.md > /dev/null
+          fi
+          {
+            echo "# checkpoint arena（informational）"
+            echo ""
+            echo "採否は通常 arena（arena.yml）で決める。ここは較正用の計測。"
+            echo ""
+            if [ -f out/INCOMPLETE.txt ]; then
+              echo "## :warning: 不完全な集計"
+              echo ""
+              echo '```'
+              cat out/INCOMPLETE.txt
+              echo '```'
+              echo ""
+              echo "**偏った部分集合なので、この run の数字は読まないこと。**"
+              echo ""
+            fi
+            [ -f out/report.md ] && cat out/report.md
+            for f in out/*.md; do
+              [ "$f" = "out/report.md" ] && continue
+              echo ""
+              cat "$f"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+          # 部分集計は成果物としては残すが、ジョブは失敗させる
+          if [ -f out/INCOMPLETE.txt ]; then
+            mv out incomplete-out
+            mkdir -p out
+            mv incomplete-out out/incomplete
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: checkpoint-arena-combined
+          path: |
+            out/
+            arms/

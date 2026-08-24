@@ -8,6 +8,7 @@ pub mod belief_nn;
 pub mod board;
 pub mod bridge;
 pub mod check;
+pub mod checkpoint;
 pub mod client;
 pub mod deduce;
 pub mod estimator;

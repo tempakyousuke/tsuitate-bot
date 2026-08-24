@@ -83,6 +83,76 @@
   （粒子ガイド2種・prior_legal/最終p_legal直接制約2種）はいずれも
   有意な改善に届かなかった（docs/c8-direct-synthesis.md 参照）。この
   ギャップは今のところ埋まっていない
+- `cargo run --release --bin checkpoint_arena -- <extract|run|compare|report>` —
+  **checkpoint arena**（issue #19、2026-08-23 に P0 の計測経路として実装）。過去の
+  実戦の途中局面から bot 同士で終局まで指し継ぎ、候補と対照を**同じ局面でブロック化**して
+  比べる。位置づけは「通常 arena へ送る前に**明確な悪化**を安価に除外する破滅検出器」で、
+  **採否は今までどおり arena.yml のガントレット**。較正が済むまで informational。
+  設計・実測・撤退判断は `docs/checkpoint-arena-p0.md`。要点:
+  - 裁定は `selfplay::play_continuation` = 通常 arena と**同じ関数**（MAX_PLIES・反則上限・
+    王手/捕獲通知・終局判定を共有）。**時計は無効**（途中局面の残り時間は復元できない。
+    本番相当で時間切れ0の実測があるので落としてよい）だが**思考時間は必ず記録する**
+  - **v1 の checkpoint は手番境界のみ**（その手番でまだ反則を試していない時点）。
+    `foul_tried` は仕様上必ず空になる。`foul_tried.len()` は `check_foul_prior_boost` が
+    読むので、反則後 checkpoint を扱うなら manifest へ明示的に保存すること
+  - デッキは **manifest（JSON）＋元 KIF**。復元は `scenario_core::replay`、抽出は
+    `truth_replay::for_each_decision_full`。両経路が同じ状態を作ることは
+    `cargo test kif_roundtrip` が常時検査する。KIF なので回帰した checkpoint を
+    そのまま `bin/scenario <path>.kif diag` / `bin/rank_probe <path>.kif <ply>` へ流せる
+  - 適格条件: 手番境界・初手を除く・元対局がそこから `--min-remaining`（既定20）手以上
+    続いた・終局済み/記録不備/時間切れ局を除く・**原則1棋譜1checkpoint**。層化は
+    先後 / 早中盤(ply 0〜49)・中盤(50〜89)・終盤(90〜) / 通常・被王手 / 反則0・あり /
+    元対局の結末（優劣の粗い代理）。dev/validation は**元対局単位**で割る
+  - **control をキャッシュしない**。両 arm は同じジョブ・同じスロットで背中合わせに走らせ、
+    checkpoint ごとに AB/BA を均衡させる（`compare` が「先に走った arm − 後」の実行順効果を出す）。
+    env は `OnceLock` なので arm ごとに**子プロセス**（`unit`）として起動する。
+    `--control-bin` / `--candidate-bin` を分ければそのまま base/target 二重ビルドにも使える
+  - `--shared-prewarm` は「同じバイナリ・同じ env・同じ推定器」のときだけ有効
+    （それ以外は理由つきで無効化され、JSONL の `prewarm_shared` / `prewarm_reason` に残る）
+  - `compare` は**元対局単位の cluster bootstrap**（seed を独立標本として数えない）・
+    分散成分 σ_b²/σ_w² と ICC・「元対局数 × seed 数」の **MDE 表（α=0.05 / power=80% の
+    2.80·SE。CI 半幅 1.96·SE とは別物）**・非パラメトリックな power simulation・層別 delta・
+    コスト分解・大きな回帰の再現コマンドを出す。**安全性の共同指標**
+    （反則/局・被王手中反則・反則負け率・継続手数・手数上限率・終局理由・思考時間）も
+    同じペア差で出すが、**反則減だけで「強くなった」とは判定しない**。
+    入力は厳格に検査する（schema・experiment・deck_hash・相手・予算・commit の一致、
+    arm 名、重複、checkpoint ごとの seed 数。不一致は失敗。`--allow-incomplete` で警告に落とす）
+  - **seed は 2 の倍数で取る**（`run` は既定 2 で奇数を拒否）。arm 順が
+    `(checkpoint 番号 + seed) % 2` なので、同じ checkpoint の seed 2k/2k+1 は必ず逆順になり、
+    **AB/BA の均衡が cluster の内側で閉じる**。s=1 だと実行順効果が cluster 平均に残り、
+    実測で分散が 5〜8倍違った。**この反相関は意図した設計なので、統計側も
+    「連続する2 seed の AB/BA 平均 = 1 replicate」を単位にする**（生の seed を
+    独立標本として `σ_w²/s` で外挿してはいけない）。seed 数の効果を測るには
+    **4 seed 以上**（2 replicate 以上）が要る
+  - `compare` の power simulation は**本番と同じ percentile cluster bootstrap CI** を
+    当てる（正規近似の z 検定では解析 MDE と同じ経路になり裏取りにならない）。
+    主 CI の percentile も `--alpha` に連動する
+  - **shard 欠落の検出には `compare --deck <manifest> --split <split>` が要る**
+    （入力に現れた checkpoint 同士を比べるだけでは、artifact ごと欠けたときに
+    「揃っている」ように見える）。CI は必ず渡し、label ごとの JSONL 本数と
+    summary の数も検査して、欠けたら `INCOMPLETE.txt` を出してジョブを失敗させる
+  - **既知の arena 差を較正に使うときは、同じ candidate / control / opponent / 予算で
+    測り直した値だけを渡す**。CLAUDE.md に残っている −12.8 / −8.5 / −7.4pt は
+    当時の main・別の対戦条件で測った値なので流用できない（PR #20 レビュー指摘）
+  - **env ノブは候補側だけに効かせられない**。`TSUITATE_*` はプロセス全体に効き、
+    相手（凍結版）も同じプロセスで作られるので、arm ごとに値が違う env を相手が
+    読むと「同じ固定相手」で比べられない（arena.yml と同じ罠）。**arm 固有 env は
+    原則拒否**（監査済みの `CANDIDATE_ONLY_ENV` は現在空。恒久対策は issue #21）で、
+    **既定 matrix からも env 実験は外してある**。ソース走査（凍結版＋**共有モジュール**。
+    v14 は `TSUITATE_JOSEKI` を凍結ファイルでなく `opening.rs` 経由で読む）は
+    二次的な検査で、「読まないことの証明」には使わない。
+    両 arm に同じ値を渡す `--budget-ms` は対象外
+  - **seed は 4 以上の偶数**が P0 の条件（2 seed は AB/BA が閉じる最小構成だが
+    replicate 間分散が同定できない）。`compare` は replicate が1つのとき
+    seed 数の外挿を出さない
+  - JSONL の schema は **2**。schema 1（candidate env が固定相手にも効いていた時期）は
+    集計から明示的に弾く。**`compare` の summary JSON も同じ契約**で、
+    `report` が schema 1 の summary を拒否する（撤回済みの数字が横断表へ戻らないように）
+  - 実行は CI（`.github/workflows/checkpoint-arena.yml`、**通常のコード push では走らない**）。
+    `gh workflow run checkpoint-arena.yml -f arena_run_id=<Arena実行ID> -f seeds=4`、
+    `gh` が無ければ `.github/ci/checkpoint-arena.request.json` を置いて push（削除の push は
+    全ジョブがスキップされる）。**デッキは arena 記録から作るのを既定にする**
+    （局面分布が実際の対局分布と一致する。`arena_run_id` を渡せば追加の対局コストはゼロ）
 - `cargo run --release --bin tune -- [反復数] [評価あたり対局数] [基準...]` — 評価パラメータ
   （`strategy::EvalParams`）のSPSA自動チューニング。目的関数はアリーナのスコア率
   （引き分け=0.5勝）。**f+/f− は共通乱数法でペアリングされる**: 同じ対局シード列
@@ -2132,7 +2202,10 @@
   診断フックを落とす。**env は PINNED の4関数と `TSUITATE_CAND_THINK_BUDGET_MS`
   だけ落とし、他の `TSUITATE_*` は凍結時点の読み方のまま残る**）、
   `frozen/mod.rs`・`strategy::make`/`make_seeded`・`arena.yml` の baselines
-  既定値へ登録する（未使用 import / 未到達コードの警告は `lib.rs` の
+  既定値へ登録する（**`checkpoint-arena.yml` の `opponent` 既定値・
+  `checkpoint-arena/deck.json` の `opponent`・`bin/checkpoint_arena` の
+  `STRATEGY_SOURCES`（env 走査の対象一覧。手動更新）も同じチェックリストで更新する**。
+  未使用 import / 未到達コードの警告は `lib.rs` の
   `pub mod frozen;` に付けた `#[allow(...)]` が版を問わず抑止するので、
   凍結ファイル側でもここでも何もしなくてよい）。**生成後は同一性確認**として、①スクリプトを再実行して
   凍結ファイルと diff がコメント以外ゼロであること、②CI で
