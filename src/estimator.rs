@@ -208,60 +208,30 @@ fn capturer_prior(victim: Option<Role>) -> Vec<(Role, f64)> {
 /// 集団ヒストグラムを実データ事前へ縮める混合比（`TSUITATE_CAPTURE_PRIOR_LAMBDA`、
 /// 既定 0.3。0 で縮小なし）
 fn capture_prior_lambda() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_CAPTURE_PRIOR_LAMBDA")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && (0.0..1.0).contains(v))
-            .unwrap_or(0.3)
-    })
+    crate::config::current(|c| c.estimator.capture_prior_lambda)
 }
 
 /// ゼロ再生成のうち記憶を使う割合（`TSUITATE_REJUV_KEEP_CAPTURER` の値。
 /// `1` = 常に、`0.5` = 半分。若返りは常に粒子自身の履歴を使う）
 fn keep_fraction() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_REJUV_KEEP_CAPTURER")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .map(|v| v.min(1.0))
-            .unwrap_or(0.0)
-    })
+    crate::config::current(|c| c.estimator.keep_fraction)
 }
 
 /// 再ベース点より前の決定点でも提案補正 ln(p/g) を積む（`TSUITATE_REGEN_KEEP_IS`、
 /// 既定: 記憶が有効なら on、無効なら off = 従来挙動。`1`/`0` で強制）
 fn regen_keep_is() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| match std::env::var("TSUITATE_REGEN_KEEP_IS") {
-        Ok(v) => v != "0" && !v.is_empty(),
-        Err(_) => rejuv_keep_capturer(),
-    })
+    crate::config::current(|c| c.estimator.regen_keep_is)
 }
 
 /// 診断: `TSUITATE_DEBUG_REJUV=1` で若返りの捕獲説明の持ち越し結果を stderr へ出す
 fn debug_rejuv() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("TSUITATE_DEBUG_REJUV").is_ok_and(|v| v == "1"))
+    crate::config::current(|c| c.estimator.debug_rejuv)
 }
 
 /// 診断: `TSUITATE_DEBUG_REJUV_SQ=2f,2g` で指定したマスの相手駒種を
 /// 再生成・若返りの成功時に出す（`debug_rejuv` と併用）
 fn debug_squares_summary(pos: &Position, opp: Color) -> String {
-    static SQ: std::sync::OnceLock<Vec<Coord>> = std::sync::OnceLock::new();
-    let squares = SQ.get_or_init(|| {
-        std::env::var("TSUITATE_DEBUG_REJUV_SQ")
-            .ok()
-            .map(|v| {
-                v.split(',')
-                    .filter_map(|s| crate::board::parse_usi_square(s.trim()))
-                    .collect()
-            })
-            .unwrap_or_default()
-    });
+    let squares = crate::config::current(|c| c.estimator.debug_rejuv_squares.clone());
     squares
         .iter()
         .map(|&sq| {
@@ -295,8 +265,7 @@ fn constraint_touches(c: &Constraint, at: Coord) -> bool {
 /// （自玉移動反則→guide.attacks、打ちマス反則→guide.occupies）を
 /// まとめて無効化できる（速度差の切り分け専用。一時的なフラグ）
 fn defend_guide_disabled() -> bool {
-    static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("TSUITATE_DISABLE_DEFEND_GUIDE").is_ok_and(|v| v == "1"))
+    crate::config::current(|c| c.estimator.defend_guide_disabled)
 }
 
 /// 信念ネット（NN段階②）の prior を提案分布へ効かせる強さ。
@@ -308,17 +277,15 @@ fn defend_guide_disabled() -> bool {
 /// - `TSUITATE_BELIEF_LIVE_W`: 毎ターンの制約適用（生存粒子が必ず通る道）
 /// - `TSUITATE_BELIEF_GUIDE_W`: リプレイ・若返り・ソフト救済（再生成の道）
 fn belief_live_w() -> f64 {
-    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *W.get_or_init(|| env_f64("TSUITATE_BELIEF_LIVE_W"))
+    crate::config::current(|c| c.estimator.belief_live_w)
 }
 
 fn belief_guide_w() -> f64 {
-    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *W.get_or_init(|| env_f64("TSUITATE_BELIEF_GUIDE_W"))
+    crate::config::current(|c| c.estimator.belief_guide_w)
 }
 
-fn env_f64(name: &str) -> f64 {
-    std::env::var(name)
+fn env_f64(src: &crate::config::EnvSource, name: &str) -> f64 {
+    src.var(name)
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -345,13 +312,7 @@ const BELIEF_LOGIT_CLIP: f64 = 4.0;
 /// **軌跡全体を今の信念へ寄せた粒子のほうが、評価が見る最終配置として正しい**
 /// —— という読み。既定は実測の良かった「制限なし」にする
 fn belief_span() -> usize {
-    static SPAN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *SPAN.get_or_init(|| {
-        std::env::var("TSUITATE_BELIEF_SPAN")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0)
-    })
+    crate::config::current(|c| c.estimator.belief_span)
 }
 
 /// 決定点ごとに1回だけ計算する、マスごとの占有ロジット（信念ネットの出力）。
@@ -694,14 +655,8 @@ impl Estimator {
             logw: vec![0.0; target],
             hist: vec![VecDeque::new(); target],
             phys_taint: vec![0; target],
-            eps_phys: std::env::var("TSUITATE_EPS_PHYS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(EPS_PHYS_DEFAULT),
-            mut_attempts: std::env::var("TSUITATE_MUT_RESCUE")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(MUT_RESCUE_ATTEMPTS_DEFAULT),
+            eps_phys: crate::config::current(|c| c.estimator.eps_phys),
+            mut_attempts: crate::config::current(|c| c.estimator.mut_attempts),
             mut_rescued: 0,
             king_cands: None,
             king_cands_at: usize::MAX,
@@ -730,8 +685,7 @@ impl Estimator {
             graveyard: vec![],
             rejuv_repaired: 0,
             revived: 0,
-            debug_fail: std::env::var("TSUITATE_FILTER_DEBUG")
-                .is_ok_and(|v| v == "1")
+            debug_fail: crate::config::current(|c| c.estimator.filter_debug)
                 .then(std::collections::HashMap::new),
             my_king: Position::initial()
                 .king_square(my_color)
@@ -2261,10 +2215,7 @@ fn foul_consistent(pos: &Position, my_color: Color, mv: &ShogiMove) -> bool {
 /// を優先し、②同条件なら着手先から遠い駒。**除くだけ**（足さない）ので
 /// 幻の駒得は減る方向にしか動かない
 fn taint_multiset_repair() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_TAINT_MULTISET_REPAIR").is_ok_and(|v| v == "1")
-    })
+    crate::config::current(|c| c.estimator.taint_multiset_repair)
 }
 
 /// 相手側の盤上から駒種 role（生駒基準）の1枚を「居る根拠が薄い順」に除く
@@ -3151,14 +3102,7 @@ const PREDICT_RECAPTURE_BOOST: f64 = 8.0;
 /// 負け側。倍率3の再計測で v14 の後退が消えるかを判定中）。
 /// 凍結版はこの名前を知らない
 fn check_drop_explain_w() -> f64 {
-    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *W.get_or_init(|| {
-        std::env::var("TSUITATE_CHECK_DROP_EXPLAIN_W")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|v: &f64| v.is_finite() && *v > 0.0)
-            .unwrap_or(1.0)
-    })
+    crate::config::current(|c| c.estimator.check_drop_explain_w)
 }
 
 /// **王手の説明の打ちシェアの目標値**（`TSUITATE_CHECK_DROP_TARGET`、
@@ -3170,14 +3114,7 @@ fn check_drop_explain_w() -> f64 {
 /// foul02 のような s≈5% の局面だけ ≈6.5 倍）。倍率の上限は
 /// CHECK_DROP_TARGET_MAX_BOOST。凍結版はこの名前を知らない
 fn check_drop_target() -> f64 {
-    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *W.get_or_init(|| {
-        std::env::var("TSUITATE_CHECK_DROP_TARGET")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|v: &f64| v.is_finite() && *v >= 0.0 && *v < 1.0)
-            .unwrap_or(0.0)
-    })
+    crate::config::current(|c| c.estimator.check_drop_target)
 }
 
 /// 動的ブーストの倍率上限（過小シェアの局面でも青天井にしない）
@@ -3214,21 +3151,7 @@ impl OppPawnIntentW {
 }
 
 fn opp_pawn_intent_w() -> OppPawnIntentW {
-    static W: std::sync::OnceLock<(f64, f64, f64)> = std::sync::OnceLock::new();
-    let read = |name: &str| {
-        std::env::var(name)
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .unwrap_or(1.0)
-    };
-    let (revealed, promo, rook_front) = *W.get_or_init(|| {
-        (
-            read("TSUITATE_OPP_PAWN_REVEALED_W"),
-            read("TSUITATE_OPP_PAWN_PROMO_W"),
-            read("TSUITATE_OPP_PAWN_ROOK_FRONT_W"),
-        )
-    });
+    let (revealed, promo, rook_front) = crate::config::current(|c| c.estimator.opp_pawn_intent);
     OppPawnIntentW {
         revealed,
         promo,
@@ -3293,11 +3216,7 @@ fn opp_pawn_intent_factor(
 }
 
 fn capture_reveal_cost_w() -> f64 {
-    std::env::var("TSUITATE_OPP_CAPTURE_REVEAL_W")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| v.is_finite() && *v >= 0.0)
-        .unwrap_or(OPP_CAPTURE_REVEAL_W_DEFAULT)
+    crate::config::current(|c| c.estimator.capture_reveal_cost_w)
 }
 
 /// 既定 0.2（2026-08-03 採用）。ペア3シード×200局 vs v13 で
@@ -3593,14 +3512,7 @@ fn opp_move_weight(
 /// この系統の誤りに一括で効くかを1つのスカラーで測れる。
 /// 凍結版はこの名前を知らないので `-f env=` は候補側にだけ効く
 fn opp_move_temp() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_OPP_MOVE_TEMP")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .unwrap_or(1.0)
-    })
+    crate::config::current(|c| c.estimator.opp_move_temp)
 }
 
 fn weighted_choice<R: Rng>(candidates: &[(ShogiMove, f64)], rng: &mut R) -> Option<ShogiMove> {
@@ -3800,6 +3712,143 @@ fn synth_particle_once(my_color: Color, model: &GameModel, rng: &mut StdRng) -> 
         }
     }
     Some(pos)
+}
+
+
+/// **推定器側の設定**（issue #21）。詳細は [`crate::strategy::StrategyKnobs`]。
+#[derive(Clone, Debug, PartialEq)]
+pub struct EstimatorKnobs {
+    /// `capture_prior_lambda()` の解決値。
+    pub capture_prior_lambda: f64,
+    /// `keep_fraction()` の解決値。
+    pub keep_fraction: f64,
+    /// `debug_rejuv()` の解決値。
+    pub debug_rejuv: bool,
+    /// `defend_guide_disabled()` の解決値。
+    pub defend_guide_disabled: bool,
+    /// `belief_live_w()` の解決値。
+    pub belief_live_w: f64,
+    /// `belief_guide_w()` の解決値。
+    pub belief_guide_w: f64,
+    /// `belief_span()` の解決値。
+    pub belief_span: usize,
+    /// `taint_multiset_repair()` の解決値。
+    pub taint_multiset_repair: bool,
+    /// `check_drop_explain_w()` の解決値。
+    pub check_drop_explain_w: f64,
+    /// `check_drop_target()` の解決値。
+    pub check_drop_target: f64,
+    /// `opp_move_temp()` の解決値。
+    pub opp_move_temp: f64,
+    /// `regen_keep_is()` の解決値（未指定なら記憶が有効かどうかに従う）。
+    pub regen_keep_is: bool,
+    /// `capture_reveal_cost_w()` の解決値。
+    pub capture_reveal_cost_w: f64,
+    /// `opp_pawn_intent_w()` の解決値（revealed, promo, rook_front）。
+    pub opp_pawn_intent: (f64, f64, f64),
+    /// `debug_squares_summary()` が出すマス（`TSUITATE_DEBUG_REJUV_SQ`）。
+    pub debug_rejuv_squares: Vec<Coord>,
+    /// `Estimator` の物理制約の緩和率（`TSUITATE_EPS_PHYS`）。
+    pub eps_phys: f64,
+    /// 変異救済の試行回数（`TSUITATE_MUT_RESCUE`）。
+    pub mut_attempts: usize,
+    /// 粒子フィルタの棄却理由を数える（`TSUITATE_FILTER_DEBUG=1`）。
+    pub filter_debug: bool,
+}
+
+impl EstimatorKnobs {
+    pub(crate) fn from_source(src: &crate::config::EnvSource) -> Self {
+        let keep_fraction = {
+            src.var("TSUITATE_REJUV_KEEP_CAPTURER")
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .map(|v| v.min(1.0))
+                .unwrap_or(0.0)
+        };
+        let opp_pawn = |name: &str| {
+            src.var(name)
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v > 0.0)
+                .unwrap_or(1.0)
+        };
+        EstimatorKnobs {
+            capture_prior_lambda: { src.var("TSUITATE_CAPTURE_PRIOR_LAMBDA")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (0.0..1.0).contains(v))
+            .unwrap_or(0.3) },
+            keep_fraction: { src.var("TSUITATE_REJUV_KEEP_CAPTURER")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .map(|v| v.min(1.0))
+            .unwrap_or(0.0) },
+            debug_rejuv: { src.var("TSUITATE_DEBUG_REJUV").is_ok_and(|v| v == "1") },
+            defend_guide_disabled: { src.var("TSUITATE_DISABLE_DEFEND_GUIDE").is_ok_and(|v| v == "1") },
+            belief_live_w: { env_f64(src, "TSUITATE_BELIEF_LIVE_W") },
+            belief_guide_w: { env_f64(src, "TSUITATE_BELIEF_GUIDE_W") },
+            belief_span: { src.var("TSUITATE_BELIEF_SPAN")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0) },
+            taint_multiset_repair: { src.var("TSUITATE_TAINT_MULTISET_REPAIR").is_ok_and(|v| v == "1") },
+            check_drop_explain_w: { src.var("TSUITATE_CHECK_DROP_EXPLAIN_W")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &f64| v.is_finite() && *v > 0.0)
+            .unwrap_or(1.0) },
+            check_drop_target: { src.var("TSUITATE_CHECK_DROP_TARGET")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &f64| v.is_finite() && *v >= 0.0 && *v < 1.0)
+            .unwrap_or(0.0) },
+            opp_move_temp: { src.var("TSUITATE_OPP_MOVE_TEMP")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(1.0) },
+            regen_keep_is: match src.var("TSUITATE_REGEN_KEEP_IS") {
+                Ok(v) => v != "0" && !v.is_empty(),
+                // 既定は「記憶が有効なら on」。keep_fraction > 0 が
+                // `rejuv_keep_capturer()` の定義そのもの
+                Err(_) => keep_fraction > 0.0,
+            },
+            capture_reveal_cost_w: {
+                src.var("TSUITATE_OPP_CAPTURE_REVEAL_W")
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .filter(|v| v.is_finite() && *v >= 0.0)
+                    .unwrap_or(OPP_CAPTURE_REVEAL_W_DEFAULT)
+            },
+            opp_pawn_intent: (
+                opp_pawn("TSUITATE_OPP_PAWN_REVEALED_W"),
+                opp_pawn("TSUITATE_OPP_PAWN_PROMO_W"),
+                opp_pawn("TSUITATE_OPP_PAWN_ROOK_FRONT_W"),
+            ),
+            debug_rejuv_squares: src
+                .var("TSUITATE_DEBUG_REJUV_SQ")
+                .ok()
+                .map(|v| {
+                    v.split(',')
+                        .filter_map(|s| crate::board::parse_usi_square(s.trim()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            eps_phys: src
+                .var("TSUITATE_EPS_PHYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(EPS_PHYS_DEFAULT),
+            mut_attempts: src
+                .var("TSUITATE_MUT_RESCUE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(MUT_RESCUE_ATTEMPTS_DEFAULT),
+            filter_debug: src.var("TSUITATE_FILTER_DEBUG").is_ok_and(|v| v == "1"),
+        }
+    }
 }
 
 #[cfg(test)]

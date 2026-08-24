@@ -66,13 +66,7 @@ const KING_CAPTURE_LEGAL_PRIOR: f64 = 0.73;
 /// `TSUITATE_CHECK_KING_PRIOR_W` で上書き可（切り戻し・スイープ用。
 /// 凍結版はこの名前を知らないので -f env= は候補側にだけ効く）
 fn king_prior_w() -> f64 {
-    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *W.get_or_init(|| {
-        std::env::var("TSUITATE_CHECK_KING_PRIOR_W")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1.0)
-    })
+    crate::config::current(|c| c.check.king_prior_w)
 }
 
 /// 信念ネット占有による王手駒仮説の事前（`TSUITATE_CHECK_BELIEF_OCC_W`、
@@ -90,14 +84,7 @@ fn king_prior_w() -> f64 {
 /// なので乗らない。
 /// 凍結版はこの名前を知らないので `-f env=` は候補側にだけ効く。
 fn check_belief_occ_w() -> f64 {
-    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *W.get_or_init(|| {
-        std::env::var("TSUITATE_CHECK_BELIEF_OCC_W")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|v: &f64| v.is_finite() && *v >= 0.0)
-            .unwrap_or(CHECK_BELIEF_OCC_W)
-    })
+    crate::config::current(|c| c.check.check_belief_occ_w)
 }
 
 /// 占有事前の既定。0 で従来（一様仮説）。1.0 は作業点（env でオン）
@@ -138,24 +125,15 @@ const CAPTURE_CHECKER_BOOST: f64 = 4.0;
 /// 玉の行き先 cap（`known_covered_king_move_cap`）の有効化。
 /// `TSUITATE_CHECK_KING_COVER_CAP=0` で無効（凍結版はこの名前を知らない）
 fn king_cover_cap_enabled() -> bool {
-    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *W.get_or_init(|| std::env::var("TSUITATE_CHECK_KING_COVER_CAP").map_or(true, |v| v != "0"))
+    crate::config::current(|c| c.check.king_cover_cap_enabled)
 }
 
 fn capture_prune_enabled() -> bool {
-    static W: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *W.get_or_init(|| std::env::var("TSUITATE_CHECK_CAPTURE_PRUNE").map_or(true, |v| v != "0"))
+    crate::config::current(|c| c.check.capture_prune_enabled)
 }
 
 fn capture_checker_boost() -> f64 {
-    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *W.get_or_init(|| {
-        std::env::var("TSUITATE_CHECK_CAPTURE_BOOST")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|v: &f64| v.is_finite() && *v >= 1.0)
-            .unwrap_or(CAPTURE_CHECKER_BOOST)
-    })
+    crate::config::current(|c| c.check.capture_checker_boost)
 }
 
 /// 既知敵駒の「まだそこに居る」確率の減衰（未説明の相手手1つあたり）。
@@ -185,14 +163,7 @@ const KING_FOUL_ALT: f64 = 0.3;
 const CHECK_WALKIN_DISCOUNT: f64 = 1.0;
 
 fn check_walkin_discount() -> f64 {
-    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *W.get_or_init(|| {
-        std::env::var("TSUITATE_CHECK_WALKIN_DISCOUNT")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|v: &f64| v.is_finite() && *v > 0.0 && *v <= 1.0)
-            .unwrap_or(CHECK_WALKIN_DISCOUNT)
-    })
+    crate::config::current(|c| c.check.check_walkin_discount)
 }
 
 /// 残存脅威（threat_of）の重み: 王手駒に攻撃されている自駒の交換価値に掛ける係数
@@ -843,13 +814,7 @@ impl CheckSolver {
 const KNOWN_UNACCOUNTED_LIMIT: i64 = 2;
 
 fn known_unaccounted_limit() -> i64 {
-    static W: std::sync::OnceLock<i64> = std::sync::OnceLock::new();
-    *W.get_or_init(|| {
-        std::env::var("TSUITATE_CHECK_KNOWN_UNACC")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(KNOWN_UNACCOUNTED_LIMIT)
-    })
+    crate::config::current(|c| c.check.known_unaccounted_limit)
 }
 
 fn known_enemy_squares(log: &ObservationLog, since_move: u32) -> Vec<(Coord, usize)> {
@@ -973,6 +938,58 @@ fn opponent_role_counts(view: &PlayerView, log: &ObservationLog) -> HashMap<Role
         *counts.entry(unpromote_role(role)).or_default() -= n as i32;
     }
     counts
+}
+
+
+/// **CheckSolver の設定**（issue #21）。詳細は [`crate::strategy::StrategyKnobs`]。
+#[derive(Clone, Debug, PartialEq)]
+pub struct CheckKnobs {
+    /// `king_prior_w()` の解決値。
+    pub king_prior_w: f64,
+    /// `check_belief_occ_w()` の解決値。
+    pub check_belief_occ_w: f64,
+    /// `king_cover_cap_enabled()` の解決値。
+    pub king_cover_cap_enabled: bool,
+    /// `capture_prune_enabled()` の解決値。
+    pub capture_prune_enabled: bool,
+    /// `capture_checker_boost()` の解決値。
+    pub capture_checker_boost: f64,
+    /// `check_walkin_discount()` の解決値。
+    pub check_walkin_discount: f64,
+    /// `known_unaccounted_limit()` の解決値。
+    pub known_unaccounted_limit: i64,
+}
+
+impl CheckKnobs {
+    pub(crate) fn from_source(src: &crate::config::EnvSource) -> Self {
+        CheckKnobs {
+            king_prior_w: { src.var("TSUITATE_CHECK_KING_PRIOR_W")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1.0) },
+            check_belief_occ_w: { src.var("TSUITATE_CHECK_BELIEF_OCC_W")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|v: &f64| v.is_finite() && *v >= 0.0)
+            .unwrap_or(CHECK_BELIEF_OCC_W) },
+            king_cover_cap_enabled: { src.var("TSUITATE_CHECK_KING_COVER_CAP").map_or(true, |v| v != "0") },
+            capture_prune_enabled: { src.var("TSUITATE_CHECK_CAPTURE_PRUNE").map_or(true, |v| v != "0") },
+            capture_checker_boost: { src.var("TSUITATE_CHECK_CAPTURE_BOOST")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|v: &f64| v.is_finite() && *v >= 1.0)
+            .unwrap_or(CAPTURE_CHECKER_BOOST) },
+            check_walkin_discount: { src.var("TSUITATE_CHECK_WALKIN_DISCOUNT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|v: &f64| v.is_finite() && *v > 0.0 && *v <= 1.0)
+            .unwrap_or(CHECK_WALKIN_DISCOUNT) },
+            known_unaccounted_limit: { src.var("TSUITATE_CHECK_KNOWN_UNACC")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(KNOWN_UNACCOUNTED_LIMIT) },
+        }
+    }
 }
 
 #[cfg(test)]

@@ -10,6 +10,7 @@ pub mod bridge;
 pub mod check;
 pub mod checkpoint;
 pub mod client;
+pub mod config;
 pub mod deduce;
 pub mod estimator;
 pub mod effect_profile;
