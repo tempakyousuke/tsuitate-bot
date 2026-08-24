@@ -1,12 +1,12 @@
 {
-  "_why": "issue #19 の P0: run 32723624182（700ms・64局面×4seed×4実験）の再集計。対局はやり直さず compare / report をログへ出す。known は通常 arena のペア（対照 32721832218 / 候補 32726853966）の arena-var が出てから付け直す",
+  "_why": "issue #19 の P0: run 32723624182 を known 付きで再集計する。drop_probe_gate の既知 arena 差は同条件で測り直した -16.3pt（対照 32721832218 / 候補 32726853966、104局・match_seed=20260824・2000ms・vs v14）。偽陽性率（delta=0）の行も出る",
   "arms_from_run_id": "32723624182",
   "split": "all",
   "seeds": 4,
   "budgets": "700",
   "shards": 8,
   "experiments": [
-    { "label": "aa" },
+    { "label": "aa", "known": 0 },
     {
       "label": "v13_v12_vs_opp",
       "candidate_strategy": "estimator_v13",
@@ -19,7 +19,8 @@
     },
     {
       "label": "drop_probe_gate",
-      "candidate_env": "TSUITATE_DROP_PROBE_REPEAT_GATE=1"
+      "candidate_env": "TSUITATE_DROP_PROBE_REPEAT_GATE=1",
+      "known": -16.3
     }
   ]
 }
