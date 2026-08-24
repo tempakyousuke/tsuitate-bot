@@ -26,6 +26,7 @@
 | デッキ | `checkpoint.rs` | manifest（JSON）＋元 KIF。復元は `scenario_core::replay` |
 | CLI | `bin/checkpoint_arena` | `extract` / `run` / `unit` / `pair` / `compare` / `report` |
 | CI | `.github/workflows/checkpoint-arena.yml` | 手動起動のみ。通常の push では走らない |
+| 通常 arena 側のペア差 | `bin/arena` の `ARENA_GAMES_JSON` ＋ `bin/checkpoint_arena arena-var` | 同じ `match_seed` の2本を**局ごとに**突き合わせて `Var(ペア差)`・既知 arena 差・var·CPU秒 を出す |
 
 ### v1 は手番境界に限定
 
@@ -124,6 +125,41 @@ cargo run --release --bin checkpoint_arena -- report out/*.summary.json
 
 `--known-arena-delta` は、**同じ candidate / control / opponent / 予算で arena を
 取り直した差**にだけ付ける。CLAUDE.md に残っている過去の値は流用できない。
+
+### 通常 arena 側の Var と既知差（1回のペアで両方そろう）
+
+「checkpoint arena は通常 arena の何倍効率がよいか」は、arena 側の
+`Var(ペア差)` を実測しないと決まらない（従来の参考値 183 は
+`Var(delta)=0.5` = **ペアリングが全く効かない**という仮定に乗っていた）。
+同じ実行が較正の既知値（`--known-arena-delta` に渡す値）にもなる。
+
+`bin/arena` は `ARENA_GAMES_JSON` で**1行=1対局**の JSONL を書く
+（突き合わせのキーは `(baseline, match_seed, game_no)` なので
+`ARENA_MATCH_SEED` と併用しないと書かずに理由を出す）。
+
+```bash
+# 対照
+ARENA_MATCH_SEED=20260824 ARENA_GAMES_JSON=control.jsonl \
+  cargo run --release --bin arena -- 104 estimator estimator_v14
+# 候補（違うのはノブだけ。相手・時計・局数・match_seed は揃える）
+ARENA_MATCH_SEED=20260824 ARENA_GAMES_JSON=cand.jsonl \
+  ARENA_CAND_KNOBS=TSUITATE_DROP_PROBE_REPEAT_GATE=1 \
+  cargo run --release --bin arena -- 104 estimator estimator_v14
+# 局ごとのペア集計
+cargo run --release --bin checkpoint_arena -- arena-var \
+  --control control.jsonl --candidate cand.jsonl --json arena-var.json
+```
+
+CI では **`arena.yml` の `pair_with`** に対照の実行IDを入れると、候補側の run の
+aggregate ジョブが対照の `all-games.jsonl` を取ってきて `arena-var` を回す
+（`match_seed` 必須。相手・局数・shards・時計はすべて揃えること）。
+ガントレットの記録は `--baseline` で1マッチアップに絞る。
+
+`arena-var` が止めるもの: ペアにならない対局（`--allow-incomplete` で警告に落とせる）・
+先後の食い違い・相手や時計の混在・同じ `(baseline, match_seed, game_no)` の重複行。
+安全性の共同指標は checkpoint 側の `METRICS` と**同じ名前**で出す
+（名前がずれると横断表の列が空になるのでテストで検査する）。
+反則負け率は「**自分が**反則で負けた」ときだけ数える。
 
 CI は `gh workflow run checkpoint-arena.yml -f arena_run_id=<Arena実行ID> -f seeds=4`、
 `gh` が無いときは `.github/ci/checkpoint-arena.request.json` を置いて push
@@ -539,14 +575,27 @@ gh workflow run checkpoint-arena.yml \
       （候補 / 対照）を取り、局ごとのペア差の分散を直接測る。これが無いと
       「通常 arena の何倍効率がよいか」は決まらない（現在の参考値 183 は
       `Var(delta)=0.5` の仮定に乗っている）。**同じ実行が較正の既知値にもなる**
+      → 計測経路は実装済み（`ARENA_GAMES_JSON` / `arena-var` / `pair_with`）。
+      対照 [run 32721832218](https://github.com/tempakyousuke/tsuitate-bot/actions/runs/32721832218)
+      （104局 vs v14・`match_seed=20260824`・2000ms）を起動済み、候補側は
+      `cand_env=TSUITATE_DROP_PROBE_REPEAT_GATE=1` で続けて回す
 - [ ] 64 checkpoint 以上・**seed 4 以上**での empirical SE / ICC / MDE
+      → 段階1（700ms）を
+      [run 32723624182](https://github.com/tempakyousuke/tsuitate-bot/actions/runs/32723624182)
+      で起動済み（64 checkpoint × 4 seed × 4実験 × 8シャード、
+      デッキは arena run 32697854659 の記録から）
 - [ ] 既知差の較正。**同じ candidate / control / opponent / 予算で arena を
       取り直した差**だけを `--known-arena-delta` に渡す。
-      **env ノブを使う較正は issue #21 の完了待ち**
+      **issue #21 の完了（PR #22）で env ノブの較正が可能になった**
+      （ノブはプロセス env でなく config で渡るので、固定相手は arm によらず既定値）。
+      段階1では `drop_probe_gate`（`TSUITATE_DROP_PROBE_REPEAT_GATE=1`）を回している
 - [ ] 700ms と 2000ms の符号・順位・副指標の方向の一致
-- [ ] **arena 記録から作ったデッキ**での再測定
-      （[run 32650371131](https://github.com/tempakyousuke/tsuitate-bot/actions/runs/32650371131)
-      の `arena-records-*` が使える）
+      → **段階的に回す**（2026-08-24 ユーザー判断）: まず 700ms を回し、
+      A/A が 0 中心か・符号と順位が筋の通るものかを見てから 2000ms を回す。
+      無駄撃ちが少ない代わりに、700ms 単独では「2000ms の強さ」を主張できない
+- [ ] **arena 記録から作ったデッキ**での再測定 → 段階1が
+      [run 32697854659](https://github.com/tempakyousuke/tsuitate-bot/actions/runs/32697854659)
+      の `arena-records-*`（保持期限 2026-11-22）から抽出したデッキで回っている
 
 ## 撤退判断
 
