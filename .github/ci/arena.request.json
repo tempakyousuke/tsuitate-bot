@@ -1,5 +1,5 @@
 {
-  "_why": "issue #19 の P0 / PR #23 レビュー指摘1: 較正を成立させるため、通常 arena を checkpoint と同じ 700ms で取り直す（対照側）。env はプロセス全体に効くので候補・固定相手の両方が 700ms になり、checkpoint の --budget-ms 700 と同じ条件になる。次に同条件 + cand_env で候補側を回し pair_with で突き合わせる",
+  "_why": "issue #19 の P0 / PR #23 レビュー指摘1: 較正のやり直し（候補側・700ms）。対照は run 32739641854（同条件・cand_env なし、vs v14 52.9%±9.6・思考平均 418ms・時間切れ0）。pair_with で局ごとに突き合わせ、checkpoint 700ms と同じ estimand の既知 arena 差を出す",
   "games": 104,
   "candidate": "estimator",
   "baselines": "estimator_v14",
@@ -8,6 +8,6 @@
   "oracle": "",
   "clock": "",
   "env": "TSUITATE_THINK_BUDGET_MS=700",
-  "cand_env": "",
-  "pair_with": ""
+  "cand_env": "TSUITATE_DROP_PROBE_REPEAT_GATE=1",
+  "pair_with": "32739641854"
 }
