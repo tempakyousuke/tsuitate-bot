@@ -48,13 +48,35 @@ use tsuitate_bot::selfplay::{GameResult, StartState, play_continuation};
 use tsuitate_bot::strategy;
 use tsuitate_bot::truth_replay::{load_end, side_idx};
 
-/// JSONL の行 schema。
+/// JSONL の**行** schema。
 ///
 /// **2 で `opponent_env` を必須にした**（PR #20 4回目レビュー指摘2）。
 /// schema 1 は candidate env が固定相手にも効いていた時期の記録で、
 /// `opponent_env` が無いため「相手の実効 env は両 arm とも空で一致」と
 /// 誤って解釈できてしまう。集計から明示的に弾く
-const SCHEMA: u32 = 2;
+const ROW_SCHEMA: u32 = 2;
+
+/// `compare` が出す **summary JSON** の schema。行 schema とは別に持つ
+/// （両者は独立に進化しうる）。`report` もこれを検査して schema 1 を拒否する
+/// —— さもないと、汚染済み JSONL から既に作られた summary を再 compare せずに
+/// 横断表・符号一致・順位相関へ流し込めてしまう（PR #20 5回目レビュー指摘1）
+const SUMMARY_SCHEMA: u32 = 2;
+
+/// summary JSON の schema を検査する（`report` 用。テストできるよう関数に分けてある）
+fn check_summary_schema(v: &serde_json::Value, where_: &str) -> Result<(), String> {
+    let schema = v["schema"].as_u64().unwrap_or(0) as u32;
+    if schema == 1 {
+        return Err(format!(
+            "{where_}: schema 1 の summary は使えません。\n             candidate arm の env が固定相手にも効いていた時期の JSONL から作られたもので、\n             撤回済みの delta・既知差が横断表へ再び混入します（PR #20）。\n             取り直した JSONL から compare し直してください"
+        ));
+    }
+    if schema != SUMMARY_SCHEMA {
+        return Err(format!(
+            "{where_}: summary schema {schema} は未対応（対応 {SUMMARY_SCHEMA}）"
+        ));
+    }
+    Ok(())
+}
 
 /// **共有モジュール**（凍結版も呼ぶ）。
 ///
@@ -618,7 +640,7 @@ fn play_one_arm(
         .filter(|(k, _)| k.starts_with("TSUITATE_"))
         .collect();
     let line = serde_json::json!({
-        "schema": SCHEMA,
+        "schema": ROW_SCHEMA,
         "experiment": experiment,
         "arm": arm.label,
         "arm_order": arm_order,
@@ -1116,8 +1138,8 @@ fn parse_rows(paths: &[String]) -> Vec<Row> {
                     "{where_}: schema 1 の記録は集計に使えません。\n                     candidate arm の env が固定相手にも効いていた時期のもので、\n                     相手の実効 env が記録されていないため「両 arm とも空で一致」と\n                     誤って解釈されます（PR #20）。取り直してください"
                 ));
             }
-            if schema != SCHEMA {
-                die(&format!("{where_}: schema {schema} は未対応（対応 {SCHEMA}）"));
+            if schema != ROW_SCHEMA {
+                die(&format!("{where_}: schema {schema} は未対応（対応 {ROW_SCHEMA}）"));
             }
             let req_f = |k: &str| -> f64 {
                 v[k].as_f64()
@@ -2116,7 +2138,7 @@ fn cmd_compare(args: &Args) {
     }
     if let Some(p) = args.get("json") {
         let summary = serde_json::json!({
-            "schema": SCHEMA,
+            "schema": SUMMARY_SCHEMA,
             "label": label,
             "pairs": paired.len(),
             "clusters": by_cluster.len(),
@@ -2198,7 +2220,11 @@ fn cmd_report(args: &Args) {
     let mut rows: Vec<serde_json::Value> = vec![];
     for p in &paths {
         let text = std::fs::read_to_string(p).unwrap_or_else(|e| die(&format!("{p}: {e}")));
-        rows.push(serde_json::from_str(&text).unwrap_or_else(|e| die(&format!("{p}: {e}"))));
+        let v: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or_else(|e| die(&format!("{p}: {e}")));
+        // **summary にも schema の契約を適用する**（PR #20 5回目レビュー指摘1）
+        check_summary_schema(&v, p).unwrap_or_else(|e| die(&e));
+        rows.push(v);
     }
     let mut out = String::new();
     out.push_str("## checkpoint arena 横断レポート\n\n");
@@ -2375,6 +2401,31 @@ mod tests {
         let denied = assert_opponent_blind_to("estimator_v14", &keys, true);
         assert_eq!(denied, keys, "監査済みリストに無いので拒否対象として返る");
         assert!(CANDIDATE_ONLY_ENV.is_empty(), "issue #21 まで許可キーは無い");
+    }
+
+    /// bootstrap CI の percentile は alpha に連動する（alpha を広げれば CI は狭くなる）。
+    /// 以前のレビューで実際に見つかった回帰（2.5/97.5% 固定）のテスト
+    #[test]
+    fn bootstrap_ci_follows_alpha() {
+        let means: Vec<f64> = (0..40).map(|i| (i as f64 - 20.0) / 40.0).collect();
+        let (lo95, hi95) = bootstrap_ci_of_means(&means, 2000, 1, 0.05);
+        let (lo50, hi50) = bootstrap_ci_of_means(&means, 2000, 1, 0.50);
+        assert!(hi95 - lo95 > hi50 - lo50, "alpha を広げれば CI は狭くなる");
+    }
+
+    /// **summary JSON にも schema の契約を適用する**（PR #20 5回目レビュー指摘1）。
+    /// `compare` が schema 1 の JSONL を拒否しても、そこから既に作られた
+    /// summary を `report` が受理してしまうと、撤回済みの数字が横断表へ戻る
+    #[test]
+    fn report_rejects_schema1_summary() {
+        let legacy = serde_json::json!({ "schema": 1, "label": "old", "delta_pt": -6.2 });
+        let err = check_summary_schema(&legacy, "old.summary.json").unwrap_err();
+        assert!(err.contains("schema 1"), "{err}");
+        let current = serde_json::json!({ "schema": SUMMARY_SCHEMA, "label": "new" });
+        assert!(check_summary_schema(&current, "new.summary.json").is_ok());
+        // schema が無い / 未知の値も拒否
+        assert!(check_summary_schema(&serde_json::json!({}), "x").is_err());
+        assert!(check_summary_schema(&serde_json::json!({"schema": 99}), "x").is_err());
     }
 
     /// cluster 平均の分散は cluster bootstrap と同じ対象を見ている

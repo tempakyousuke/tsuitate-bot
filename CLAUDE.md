@@ -146,7 +146,8 @@
     replicate 間分散が同定できない）。`compare` は replicate が1つのとき
     seed 数の外挿を出さない
   - JSONL の schema は **2**。schema 1（candidate env が固定相手にも効いていた時期）は
-    集計から明示的に弾く
+    集計から明示的に弾く。**`compare` の summary JSON も同じ契約**で、
+    `report` が schema 1 の summary を拒否する（撤回済みの数字が横断表へ戻らないように）
   - 実行は CI（`.github/workflows/checkpoint-arena.yml`、**通常のコード push では走らない**）。
     `gh workflow run checkpoint-arena.yml -f arena_run_id=<Arena実行ID> -f seeds=4`、
     `gh` が無ければ `.github/ci/checkpoint-arena.request.json` を置いて push（削除の push は

@@ -19,10 +19,18 @@ name: Checkpoint arena
 #   2. 空 … リポジトリにコミット済みの `deck_path` を使う（固定デッキ）
 #
 # 実験は `experiments`（JSON 配列）で複数まとめて回す。各要素:
-#   {"label":"anchor_move", "candidate_env":"TSUITATE_ANCHOR_MOVE_W=0.6",
-#    "control_env":"", "candidate_strategy":"estimator", "control_strategy":"estimator",
-#    "known": -8.5}
+#   {"label":"v13_v12_vs_opp",
+#    "candidate_strategy":"estimator_v13", "control_strategy":"estimator_v12"}
 # `budgets` の各値と直積になる（700ms / 2000ms の較正用）。
+#
+# **`candidate_env` / `control_env` は現在すべて失敗する予約フィールド**。
+# `TSUITATE_*` はプロセス全体に効き、相手（凍結版）も同じプロセスで作られるので、
+# arm ごとに値が違う env は原則拒否になっている（監査済みの CANDIDATE_ONLY_ENV は
+# 現在空。恒久対策は issue #21）。ソース走査は二次的な検査で、
+# 「相手が読まない」ことの証明には使わない。
+#
+# `known`（既知の通常 arena 差）も、**同じ candidate / control / opponent / 予算で
+# arena.yml を取り直した値**にだけ付ける。CLAUDE.md に残っている過去の値は流用できない。
 on:
   workflow_dispatch:
     inputs:

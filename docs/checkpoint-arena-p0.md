@@ -159,9 +159,18 @@ CI は `gh workflow run checkpoint-arena.yml -f arena_run_id=<Arena実行ID> -f 
 ### env ノブを候補側だけに効かせられない
 
 `TSUITATE_*` は `OnceLock` でプロセス全体に効き、相手（凍結版）も同じプロセスで
-作られる。**arm ごとに値が違う env を相手が読むなら、その比較は成立しない**ので、
-`run` / `unit` / `pair` は実行前に検出して止める（相手のソースを compile-time に
-埋め込んで env 名を走査する。`--allow-opponent-env` で承知のうえ続行可）。
+作られる。**arm ごとに値が違う env があると、その比較は成立しない**。
+
+そこで **arm 固有 env は原則拒否**にしてある。通るのは監査済みの
+`CANDIDATE_ONLY_ENV` に載せたキーだけで、**現在は空**（恒久対策は issue #21）。
+`--allow-opponent-env` で承知のうえ続行はできるが、その run は
+「同じ固定相手どうしの比較」ではない。
+
+凍結版＋共有モジュールのソースを compile-time に埋め込んで env 名を走査する検査も
+あるが、これは**二次的なもの**（監査済みリストが陳腐化したときに拒否するため）で、
+**「相手が読まない」ことの証明には使わない**。共有依存は定跡以外にもあり、
+動的な env 名の組み立ても原理的にありうるため。`STRATEGY_SOURCES` への凍結版追加は手動。
+
 JSONL には相手の実効 env も残し、`compare` が両 arm で一致するかを検査する。
 
 両 arm に同じ値を渡す env（`--budget-ms` = `TSUITATE_THINK_BUDGET_MS`）は
@@ -365,6 +374,21 @@ n=64 で −10pt が 93%。
     撤回済みの値）。実際に動く A/A と凍結版比較の例へ差し替え、
     既定 matrix の本数（7本 → 3本）と P0 の seed 条件（4 以上）も実装に合わせた
 
+**5回目のレビュー**
+
+18. **`compare` は schema 1 の JSONL を拒否するのに、`report` は schema 1 の
+    summary を受理していた**。汚染済み JSONL から既に作られた `*.summary.json` を
+    再 compare せずに `report` へ渡せるので、撤回済みの delta・既知差が
+    横断表・符号一致・順位相関へ戻ってしまう。
+    行 schema（`ROW_SCHEMA`）と summary schema（`SUMMARY_SCHEMA`）を分け、
+    `report` も検査して schema 1 を拒否するようにした
+19. **docs と workflow のコメントが旧方式（走査で止める）のままだった**。
+    実装は「走査結果にかかわらず監査済み allowlist 以外は拒否」なので、
+    一次資料を現行規約へ統一した。workflow の `candidate_env` / `control_env` は
+    **現在すべて失敗する予約フィールド**である旨も明記した
+20. **`--alpha` 連動の回帰テストを、env テスト追加時に消してしまっていた**。
+    復元して env テスト2本と併存させた
+
 ### ブロッキングの効き（CPU あたりの情報量）
 
 「同じ検出力を得る CPU コスト」は **replicate（= AB/BA を畳んだ2 seed）単位**で数える
@@ -429,9 +453,12 @@ control arm は
 
 対策として入れたもの:
 
-- **相手のソースを compile-time に埋め込んで env 名を走査**し、arm ごとに値が違う
-  env を相手が読むなら**実行前に止める**（`--allow-opponent-env` で承知のうえ続行可）。
-  ハンドメンテの表と違い、凍結版を足しても勝手に追随する
+- **arm 固有 env を原則拒否**にした。通るのは監査済みの `CANDIDATE_ONLY_ENV`
+  （**現在は空**）だけで、`--allow-opponent-env` を明示したときだけ続行できる。
+  凍結版＋**共有モジュール**のソース走査は二次的な検査（リストの陳腐化対策）で、
+  「読まないことの証明」には使わない —— v14 は `TSUITATE_JOSEKI` を
+  凍結ファイルではなく共有 `opening.rs` 経由で読んでおり、
+  1ファイル走査では見落としていた
 - JSONL へ**相手の実効 env** を残し、`compare` が両 arm で一致するかを検査する
 - 子プロセスの `TSUITATE_*` を**一度すべて落としてから**意図した env だけ設定する
   （親から継承した値は全 shard で同じなので、arm 内一意性検査では捕まらなかった）
