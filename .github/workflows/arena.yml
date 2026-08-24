@@ -40,7 +40,11 @@ on:
         required: false
         default: ""
       env:
-        description: "評価ノブ（スペース区切りの TSUITATE_XXX=値。w スイープ用。例: TSUITATE_MATE_RISK_W=3。思考予算は TSUITATE_CAND_THINK_BUDGET_MS を使うこと）"
+        description: "評価ノブ（スペース区切りの TSUITATE_XXX=値。**両側に効く**。w スイープ用。例: TSUITATE_MATE_RISK_W=3）"
+        required: false
+        default: ""
+      cand_env:
+        description: "候補側だけに効かせる評価ノブ（同じ書式。config で渡すのでプロセス env は動かず凍結相手は既定のまま。候補が凍結版のときは使えない）"
         required: false
         default: ""
   push:
@@ -60,6 +64,7 @@ jobs:
       oracle: ${{ steps.split.outputs.oracle }}
       clock: ${{ steps.split.outputs.clock }}
       env: ${{ steps.split.outputs.env }}
+      cand_env: ${{ steps.split.outputs.cand_env }}
     steps:
       - uses: actions/checkout@v5
       - id: split
@@ -73,6 +78,7 @@ jobs:
           IN_ORACLE: ${{ github.event.inputs.oracle }}
           IN_CLOCK: ${{ github.event.inputs.clock }}
           IN_ENV: ${{ github.event.inputs.env }}
+          IN_CAND_ENV: ${{ github.event.inputs.cand_env }}
         run: |
           set -euo pipefail
           default_baselines='estimator_v9 estimator_v10 estimator_v11 estimator_v12 estimator_v13 estimator_v14'
@@ -86,6 +92,7 @@ jobs:
             oracle="${IN_ORACLE:-}"
             clock="${IN_CLOCK:-}"
             extra_env="${IN_ENV:-}"
+            cand_env="${IN_CAND_ENV:-}"
           else
             if [ ! -f "$req" ]; then
               # push の paths フィルタはファイルの削除にも一致するので、計測が
@@ -105,6 +112,7 @@ jobs:
                 echo "oracle="
                 echo "clock="
                 echo "env="
+                echo "cand_env="
               } >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -121,9 +129,10 @@ jobs:
             oracle=$(jq -r '.oracle // ""' "$req")
             clock=$(jq -r '.clock // ""' "$req")
             extra_env=$(jq -r '.env // ""' "$req")
+            cand_env=$(jq -r '.cand_env // ""' "$req")
           fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
-          echo "起動: event=$EVENT_NAME games=$games candidate=$candidate baselines=$baselines shards=$shards match_seed=$match_seed clock=$clock env=$extra_env"
+          echo "起動: event=$EVENT_NAME games=$games candidate=$candidate baselines=$baselines shards=$shards match_seed=$match_seed clock=$clock env=$extra_env cand_env=$cand_env"
           echo "baselines=$(echo "$baselines" | jq -R -c 'split(" ") | map(select(length > 0))')" >> "$GITHUB_OUTPUT"
           echo "shards=$(jq -n -c "[range(0; ${shards})]")" >> "$GITHUB_OUTPUT"
           per=$(( (games + shards - 1) / shards ))
@@ -134,6 +143,7 @@ jobs:
           echo "oracle=$oracle" >> "$GITHUB_OUTPUT"
           echo "clock=$clock" >> "$GITHUB_OUTPUT"
           {
+            echo "cand_env=$cand_env"
             echo "env<<EOF"
             echo "$extra_env"
             echo "EOF"
@@ -167,6 +177,7 @@ jobs:
           # （実測で思考時間への影響なし）
           TSUITATE_DBG_HITS: "1"
           ARENA_EXTRA_ENV: ${{ needs.plan.outputs.env }}
+          ARENA_CAND_ENV: ${{ needs.plan.outputs.cand_env }}
           ARENA_CLOCK: ${{ needs.plan.outputs.clock }}
         run: |
           set -euo pipefail
@@ -188,14 +199,18 @@ jobs:
           fi
           # 評価ノブ（TSUITATE_* のみ許可）。
           # 注意: env はプロセス全体に効き、凍結版も凍結時点で読んでいた env を読む
-          # （TSUITATE_THINK_BUDGET_MS は v6〜v11 全部、VALUE_NN_W 等は v11）。
-          # 候補側だけ予算を変えるには TSUITATE_CAND_THINK_BUDGET_MS を使う
+          # （TSUITATE_THINK_BUDGET_MS は v6〜v11 全部、VALUE_NN_W 等は v11。
+          # 一覧は frozen::env_keys_in_source で取れる）。
+          # **候補側だけに効かせたいときは cand_env（= ARENA_CAND_KNOBS）**:
+          # 値はプロセス env でなく StrategyConfig として候補 instance にだけ渡るので、
+          # env を読み続ける凍結相手は必ず既定値のまま動く（issue #21）
           for kv in $ARENA_EXTRA_ENV; do
             case "$kv" in
               TSUITATE_*=*) export "$kv" ;;
               *) echo "無視（TSUITATE_XXX=値 のみ許可）: ${kv}" ;;
             esac
           done
+          export ARENA_CAND_KNOBS="$ARENA_CAND_ENV"
           cargo run --release --bin arena -- \
             "${{ needs.plan.outputs.games_per_shard }}" \
             "${{ needs.plan.outputs.candidate }}" \

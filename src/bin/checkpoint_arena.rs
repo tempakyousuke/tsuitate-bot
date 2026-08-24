@@ -35,8 +35,11 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
+use tsuitate_bot::config;
+use tsuitate_bot::frozen;
 use tsuitate_bot::checkpoint::{
     Deck, DeckEntry, GameCandidates, candidates, kif_ending, phase_tag, restore, stable_game_id,
     split_of, stable_hash, stratified_pick,
@@ -53,21 +56,22 @@ use tsuitate_bot::truth_replay::{load_end, side_idx};
 /// **2 で `opponent_env` を必須にした**（PR #20 4回目レビュー指摘2）。
 /// schema 1 は candidate env が固定相手にも効いていた時期の記録で、
 /// `opponent_env` が無いため「相手の実効 env は両 arm とも空で一致」と
-/// 誤って解釈できてしまう。集計から明示的に弾く
-const ROW_SCHEMA: u32 = 2;
+/// 誤って解釈できてしまう。schema 2 は arm 固有ノブをプロセス env で
+/// 渡していた時期（＝相手にも効いていた）。どちらも集計から明示的に弾く
+const ROW_SCHEMA: u32 = 3;
 
 /// `compare` が出す **summary JSON** の schema。行 schema とは別に持つ
 /// （両者は独立に進化しうる）。`report` もこれを検査して schema 1 を拒否する
 /// —— さもないと、汚染済み JSONL から既に作られた summary を再 compare せずに
 /// 横断表・符号一致・順位相関へ流し込めてしまう（PR #20 5回目レビュー指摘1）
-const SUMMARY_SCHEMA: u32 = 2;
+const SUMMARY_SCHEMA: u32 = 3;
 
 /// summary JSON の schema を検査する（`report` 用。テストできるよう関数に分けてある）
 fn check_summary_schema(v: &serde_json::Value, where_: &str) -> Result<(), String> {
     let schema = v["schema"].as_u64().unwrap_or(0) as u32;
-    if schema == 1 {
+    if schema == 1 || schema == 2 {
         return Err(format!(
-            "{where_}: schema 1 の summary は使えません。\n             candidate arm の env が固定相手にも効いていた時期の JSONL から作られたもので、\n             撤回済みの delta・既知差が横断表へ再び混入します（PR #20）。\n             取り直した JSONL から compare し直してください"
+            "{where_}: schema {schema} の summary は使えません。\n             arm 固有の設定が固定相手にも効いていた時期の JSONL から作られたもので\n             （schema 1: 相手の実効 env が未記録 / schema 2: ノブをプロセス env で渡していた）、\n             撤回済みの delta・既知差が横断表へ再び混入します（PR #20 / issue #21）。\n             取り直した JSONL から compare し直してください"
         ));
     }
     if schema != SUMMARY_SCHEMA {
@@ -112,36 +116,26 @@ const SHARED_SOURCES: &[&str] = &[
 /// 今も読むので、env 実験のノブはほぼ全部 v14 が読む。
 ///
 /// ソースを埋め込んで env 名を走査すれば、この食い違いを**実行前に**検出できる。
-/// **この配列は手動で更新する**（凍結版を足したら `frozen/mod.rs` や arena.yml の
-/// baselines と同じチェックリストでここにも足すこと。勝手に追随はしない）。
-/// バイナリは数 MB 太るが、これは開発用ツールなので許容する。
+/// 凍結版のソースは `frozen::SOURCES`（**一箇所で管理**）から引くので、
+/// 版を足したときにここを更新し忘れることはない。現行 estimator の3ファイルだけ
+/// ここで埋め込む。バイナリは数 MB 太るが、これは開発用ツールなので許容する。
 ///
 /// **ただしこの走査は「読まないことの証明」にはならない**（共有依存は定跡以外にもあり、
-/// 動的な env 名の組み立ても原理的にありうる）。だから arm 固有 env は
-/// **原則拒否**（`CANDIDATE_ONLY_ENV` の監査済みキーだけ許可）にしてあり、
-/// 走査はその上の二次的な検査として使う。恒久対策は issue #21。
-const STRATEGY_SOURCES: &[(&str, &[&str])] = &[
-    ("estimator", &[
-        include_str!("../strategy.rs"),
-        include_str!("../estimator.rs"),
-        include_str!("../check.rs"),
-    ]),
-    ("estimator_v6", &[include_str!("../frozen/estimator_v6.rs")]),
-    ("estimator_v7", &[include_str!("../frozen/estimator_v7.rs")]),
-    ("estimator_v8", &[include_str!("../frozen/estimator_v8.rs")]),
-    ("estimator_v9", &[include_str!("../frozen/estimator_v9.rs")]),
-    ("estimator_v10", &[include_str!("../frozen/estimator_v10.rs")]),
-    ("estimator_v11", &[include_str!("../frozen/estimator_v11.rs")]),
-    ("estimator_v12", &[include_str!("../frozen/estimator_v12.rs")]),
-    ("estimator_v13", &[include_str!("../frozen/estimator_v13.rs")]),
-    ("estimator_v14", &[include_str!("../frozen/estimator_v14.rs")]),
-];
+/// 動的な env 名の組み立ても原理的にありうる）。issue #21 以後、arm 固有ノブは
+/// プロセス env を通らないのでこの走査に頼らずに済むが、**プロセス env に
+/// arm 固有の値を置く経路が復活したときの関門**として残してある。
+const STRATEGY_SOURCES: &[(&str, &[&str])] = &[("estimator", &[
+    include_str!("../strategy.rs"),
+    include_str!("../estimator.rs"),
+    include_str!("../check.rs"),
+])];
 
-/// **arm ごとに違えてよいと監査済みの env**。
+/// **プロセス env に置いてよい arm 固有キー**。
 ///
-/// ここに載せてよいのは「どの凍結版も、共有依存を含めて読まない」ことを
-/// 人が確認したキーだけ。**現在は空**（issue #21 で凍結版が戦略 env を読まなくなるまで、
-/// 安全に arm 固有にできるキーは無い）。追加するときは根拠をここへ書くこと。
+/// issue #21 以後、arm 固有のノブは**プロセス env ではなく config**
+/// （`--control-env` / `--candidate-env` → `StrategyConfig`）で渡すので、
+/// ここは空のままでよい。プロセス env に arm 固有の値を置くと、
+/// env を読み続ける既存の凍結版 v6〜v14 が arm ごとに違う設定になる。
 const CANDIDATE_ONLY_ENV: &[&str] = &[];
 
 /// 戦略 `name` が env `key` を読むか。**未知の戦略名は「読む」と見なす**（安全側）。
@@ -149,6 +143,11 @@ const CANDIDATE_ONLY_ENV: &[&str] = &[];
 fn strategy_reads_env(name: &str, key: &str) -> bool {
     let own = match STRATEGY_SOURCES.iter().find(|(n, _)| *n == name) {
         Some((_, srcs)) => srcs.iter().any(|s| s.contains(key)),
+        None if frozen::SOURCES.iter().any(|(_, n, _)| *n == name) => {
+            // 凍結版は自分のファイルの中で env を読む（`frozen::SOURCES` が一次資料）。
+            // 共有モジュール経由（定跡パス）も `env_keys_read_by` が含める
+            return frozen::env_keys_read_by(name).iter().any(|k| k == key);
+        }
         None => return true,
     };
     own || SHARED_SOURCES.iter().any(|s| s.contains(key))
@@ -162,7 +161,59 @@ fn opponent_effective_env(opponent: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// **arm 固有 env は原則拒否**（PR #20 4回目レビュー指摘1）。
+/// **相手の実効挙動の指紋**（PR #22 レビュー指摘4）。
+///
+/// 現行 `StrategyConfig` の指紋をそのまま使うと、凍結版は各ファイル内の
+/// 旧既定値・旧 env 読取規則で動くので**相手名に依らず同じ値**になり、
+/// 「相手の実効設定」を表さない。凍結版は版のソース・その版が読む env の
+/// 実効値・共有モデルの pin から作り、現行 estimator 系だけ config の指紋を使う。
+fn opponent_fingerprint(opponent: &str, ambient: &config::StrategyConfig) -> String {
+    let env: BTreeMap<String, String> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("TSUITATE_"))
+        .collect();
+    match frozen::behavior_fingerprint(opponent, &env) {
+        Some(fp) => fp,
+        // 現行 estimator 系は instance の config がそのまま実効設定
+        None => ambient.fingerprint(),
+    }
+}
+
+/// **arm 固有ノブが実際に効く戦略か**（issue #21）。
+///
+/// config を尊重するのは現行 estimator 系だけ。凍結版へノブを渡しても
+/// 黙って無視される（凍結版は自分のコピーの中でプロセス env を読む）ので、
+/// 「設定したつもり」で計測してしまう事故を起動時に止める。
+fn assert_arm_knobs_apply(arm_label: &str, strategy: &str, knobs: &BTreeMap<String, String>) {
+    if knobs.is_empty() {
+        return;
+    }
+    // **綴り間違い・無効値の関門**（PR #22 レビュー指摘2）。「設定したつもり」で
+    // 実効値が既定のまま完走するのを防ぐ
+    let check = config::check_overrides(&config::EnvSource::from_process(), knobs);
+    if !check.unknown.is_empty() {
+        die(&format!(
+            "arm={arm_label} のノブに戦略が読まないキーがあります（綴り間違い？）: {}",
+            check.unknown.join(", ")
+        ));
+    }
+    if !check.ineffective.is_empty() {
+        eprintln!(
+            "警告: arm={arm_label} の次のノブは実効値を変えませんでした\n                      （既定値と同じ値か、解釈できない・範囲外の値）: {}",
+            check.ineffective.join(", ")
+        );
+    }
+    if strategy::honors_config(strategy) {
+        return;
+    }
+    die(&format!(
+        "arm={arm_label} の戦略 {strategy} は config を尊重しないので、ノブ {} は無視されます。\n             \
+         凍結版へ設定を渡すことはできません（凍結版は凍結時点の env を読む）。\n             \
+         プロセス env で渡すと相手側にも効くため、それも安全ではありません（issue #21）。",
+        knobs.keys().cloned().collect::<Vec<_>>().join(", ")
+    ));
+}
+
+/// **arm 固有「env」は原則拒否**（PR #20 4回目レビュー指摘1）。
 ///
 /// 走査による「相手が読む」検出は偽陰性がありうる（共有依存・動的な env 名）ので、
 /// 「読まないと検出されたから許可」ではなく「監査済みリストに載っているから許可」にする。
@@ -300,7 +351,10 @@ fn git_commit() -> String {
 
 /// `K=V,K=V` / `K=V K=V` の両方を受ける（arena.yml の `-f env=` と同じ気分で書ける）。
 /// **`TSUITATE_*` だけ**を許可する（審判側の `ARENA_*` を arm ごとに変えると
-/// 裁定が arm 間でズレる）
+/// 裁定が arm 間でズレる）。
+///
+/// issue #21 以後、ここで解釈した値は**プロセス env ではなく
+/// `StrategyConfig`** として arm の戦略にだけ渡る
 fn parse_env(spec: Option<&str>) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     let Some(spec) = spec else { return out };
@@ -314,6 +368,14 @@ fn parse_env(spec: Option<&str>) -> BTreeMap<String, String> {
         out.insert(k.to_string(), v.to_string());
     }
     out
+}
+
+/// `parse_env` の逆（子プロセスへ `--knobs` で渡す）。
+fn fmt_env(env: &BTreeMap<String, String>) -> String {
+    env.iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 // ---------------------------------------------------------------------------
@@ -548,6 +610,21 @@ fn think_summary(us: &[u64]) -> (f64, f64, f64, f64) {
     (mean, at(95), at(99), *s.last().unwrap() as f64 / 1000.0)
 }
 
+/// 戦略を**設定を明示して**作る（issue #21）。config を尊重しない凍結版は
+/// 従来どおり `make_seeded`（凍結時点の env を読む）で作る。
+fn build_strategy(
+    name: &str,
+    seed: u64,
+    cfg: &Arc<config::StrategyConfig>,
+) -> Box<dyn strategy::Strategy> {
+    let built = if strategy::honors_config(name) {
+        strategy::make_seeded_with_config(name, seed, cfg.clone())
+    } else {
+        strategy::make_seeded(name, seed)
+    };
+    built.unwrap_or_else(|| die(&format!("未知の戦略名: {name}")))
+}
+
 /// 1 arm ぶんの継続対局。`prewarmed` があれば prewarm を省いて clone を使う
 /// （opt-in の prewarm 共有。共有条件は run 側で判定する）
 #[allow(clippy::too_many_arguments)]
@@ -562,12 +639,22 @@ fn play_one_arm(
     prewarmed: Option<&Prewarmed>,
     experiment: &str,
     prewarm_reason: &str,
+    arm_knobs: &BTreeMap<String, String>,
     arm_env_keys: &[String],
     allow_opponent_env: bool,
 ) -> UnitResult {
-    // 相手が arm 固有の env を読んでいないか（読んでいたら固定相手が arm ごとに変わる）
+    // プロセス env に arm 固有の値が残っていないか（残っていたら固定相手が arm ごとに変わる）
     let leaked = assert_opponent_blind_to(opponent, arm_env_keys, allow_opponent_env);
+    assert_arm_knobs_apply(&arm.label, &arm.strategy, arm_knobs);
     let opp_env = opponent_effective_env(opponent);
+    // **設定の境界（issue #21）**: 相手（固定）はプロセス env だけ、
+    // arm 側はそこへ arm 固有ノブを重ねたものを見る。プロセス env は
+    // 両 arm で同一なので、env を読み続ける凍結相手は arm によらず同じ
+    let base_source = config::EnvSource::from_process();
+    let opp_config = Arc::new(config::StrategyConfig::from_source(base_source.clone()));
+    let arm_config = Arc::new(config::StrategyConfig::from_source(
+        base_source.with_overrides(arm_knobs.clone()),
+    ));
     let start = restore(deck_dir, entry).unwrap_or_else(|e| die(&e));
     let me = start.pos.turn();
     let me_i = side_idx(me);
@@ -599,8 +686,11 @@ fn play_one_arm(
                 } else {
                     (opponent, seed_opp)
                 };
-                let mut strat = strategy::make_seeded(name, s)
-                    .unwrap_or_else(|| die(&format!("未知の戦略名: {name}")));
+                let mut strat = build_strategy(
+                    name,
+                    s,
+                    if i == me_i { &arm_config } else { &opp_config },
+                );
                 let view = make_view(&start.pos, color, &start.fouls);
                 let t = Instant::now();
                 strategy::prewarm_strategy(&mut *strat, &view, &start.logs[i]);
@@ -658,11 +748,16 @@ fn play_one_arm(
         "opponent": opponent,
         "strategy": arm.strategy,
         "env": env,
+        // arm 固有ノブ（config 経由。プロセス env は触っていない）と実効設定の指紋。
+        // **指紋は解決後の値から作る**ので、「未知のキーを足しただけ」では変わらない
+        "arm_knobs": arm_knobs,
+        "arm_config": arm_config.fingerprint(),
+        // 相手の**実効挙動**の指紋（凍結版は版のソース・読む env・共有モデル pin から作る）。
+        // 両 arm で一致していないと「同じ固定相手」ではない
+        "opponent_config": opponent_fingerprint(opponent, &opp_config),
         "commit": git_commit(),
         "deck_hash": deck.hash(deck_dir).unwrap_or_else(|e| die(&e)),
-        "think_budget_ms": std::env::var("TSUITATE_CAND_THINK_BUDGET_MS")
-            .or_else(|_| std::env::var("TSUITATE_THINK_BUDGET_MS"))
-            .unwrap_or_else(|_| "2000".into()),
+        "think_budget_ms": arm_config.think_budget_ms.to_string(),
         "prewarm_shared": shared,
         "prewarm_reason": prewarm_reason,
         // 相手が実際に読む env（両 arm で一致していないと「同じ固定相手」ではない）
@@ -723,9 +818,10 @@ fn cmd_unit(args: &Args) {
     let experiment = args.get("experiment").unwrap_or("adhoc").to_string();
     let reason = args.get("prewarm-reason").unwrap_or("").to_string();
     let arm_env_keys = split_keys(args.get("arm-env-keys"));
+    let knobs = parse_env(args.get("knobs"));
     let r = play_one_arm(
         &dir, &deck, &entry, seed, &arm, &opponent, order, None, &experiment, &reason,
-        &arm_env_keys, args.flag("allow-opponent-env"),
+        &knobs, &arm_env_keys, args.flag("allow-opponent-env"),
     );
     println!("{}", r.line);
 }
@@ -756,11 +852,18 @@ fn cmd_pair(args: &Args) {
         strategy: args.get("candidate-strategy").unwrap_or("estimator").to_string(),
     };
     let order: usize = args.num("arm-order", 0);
+    let control_knobs = parse_env(args.get("control-knobs"));
+    let candidate_knobs = parse_env(args.get("candidate-knobs"));
+    assert_arm_knobs_apply("control", &control.strategy, &control_knobs);
+    assert_arm_knobs_apply("candidate", &candidate.strategy, &candidate_knobs);
 
     // prewarm 共有（opt-in）: 両 arm の推定器と prewarm 設定が同じときだけ
     let shared = if args.flag("shared-prewarm") {
         if control.strategy != candidate.strategy {
             die("--shared-prewarm は両 arm の戦略が同じときだけ使えます（推定器が違うと共有できない）");
+        }
+        if control_knobs != candidate_knobs {
+            die("--shared-prewarm は両 arm のノブが同じときだけ使えます（prewarm 中に読む設定が違う）");
         }
         let start = restore(&dir, &entry).unwrap_or_else(|e| die(&e));
         let me_i = side_idx(start.pos.turn());
@@ -774,8 +877,13 @@ fn cmd_pair(args: &Args) {
             } else {
                 (opponent.as_str(), seed_opp)
             };
-            let mut strat = strategy::make_seeded(name, s)
-                .unwrap_or_else(|| die(&format!("未知の戦略名: {name}")));
+            let base = config::EnvSource::from_process();
+            let cfg = Arc::new(config::StrategyConfig::from_source(if i == me_i {
+                base.with_overrides(control_knobs.clone())
+            } else {
+                base
+            }));
+            let mut strat = build_strategy(name, s, &cfg);
             let view = make_view(&start.pos, color, &start.fouls);
             let t = Instant::now();
             strategy::prewarm_strategy(&mut *strat, &view, &start.logs[i]);
@@ -799,9 +907,10 @@ fn cmd_pair(args: &Args) {
     let arm_env_keys = split_keys(args.get("arm-env-keys"));
     let allow_opp_env = args.flag("allow-opponent-env");
     for (k, arm) in arms.iter().enumerate() {
+        let knobs = if arm.label == "control" { &control_knobs } else { &candidate_knobs };
         let r = play_one_arm(
             &dir, &deck, &entry, seed, arm, &opponent, k, shared.as_ref(), &experiment, &reason,
-            &arm_env_keys, allow_opp_env,
+            knobs, &arm_env_keys, allow_opp_env,
         );
         println!("{}", r.line);
     }
@@ -814,7 +923,10 @@ fn cmd_pair(args: &Args) {
 struct RunArm {
     label: String,
     strategy: String,
-    env: BTreeMap<String, String>,
+    /// **arm 固有の設定ノブ**（issue #21）。プロセス env ではなく
+    /// `--knobs` で子へ渡し、子は arm 側の `StrategyConfig` にだけ載せる。
+    /// 凍結相手はプロセス env（両 arm 共通）しか見ないので影響を受けない
+    knobs: BTreeMap<String, String>,
     bin: PathBuf,
 }
 
@@ -880,51 +992,48 @@ fn cmd_run(args: &Args) {
     let shared_prewarm = args.flag("shared-prewarm");
 
     let self_bin = std::env::current_exe().unwrap_or_else(|e| die(&format!("自分の実行ファイルが分かりません: {e}")));
-    let mut control_env = parse_env(args.get("control-env"));
-    let mut candidate_env = parse_env(args.get("candidate-env"));
+    // **arm 固有ノブは config で渡す**（issue #21）。子プロセスの env は
+    // 両 arm で完全に同じにするので、env を読み続ける凍結相手は arm によらず同じ
+    let control_knobs = parse_env(args.get("control-env"));
+    let candidate_knobs = parse_env(args.get("candidate-env"));
+    // 両 arm・両側に等しく効く共通設定だけを子の env に置く
+    // （凍結相手も `TSUITATE_THINK_BUDGET_MS` を読むので、予算はここで渡す）
+    let mut shared_env: BTreeMap<String, String> = BTreeMap::new();
     if let Some(b) = &budget {
-        // 両側・両 arm に同じ予算を渡す（凍結版も TSUITATE_THINK_BUDGET_MS を読む）
-        control_env.insert("TSUITATE_THINK_BUDGET_MS".into(), b.clone());
-        candidate_env.insert("TSUITATE_THINK_BUDGET_MS".into(), b.clone());
+        shared_env.insert("TSUITATE_THINK_BUDGET_MS".into(), b.clone());
     }
-    // **arm ごとに違う env のキー**（両 arm で同じ値のものは相手にも等しく効くので無害）。
-    // 相手がこれらを読むなら「同じ固定相手」で比べられていないので止める
-    let arm_env_keys: Vec<String> = {
-        let mut keys: BTreeSet<String> = BTreeSet::new();
-        for k in control_env.keys().chain(candidate_env.keys()) {
-            if control_env.get(k) != candidate_env.get(k) {
-                keys.insert(k.clone());
-            }
-        }
-        keys.into_iter().collect()
-    };
+    // プロセス env に arm 固有の値は置かないので、この一覧は常に空。
+    // 「置いてしまったら止める」検査だけ残す（回帰の関門）
+    let arm_env_keys: Vec<String> = vec![];
     let allow_opponent_env = args.flag("allow-opponent-env");
     assert_opponent_blind_to(&opponent, &arm_env_keys, allow_opponent_env);
 
     let control = RunArm {
         label: "control".into(),
         strategy: args.get("control-strategy").unwrap_or("estimator").to_string(),
-        env: control_env,
+        knobs: control_knobs,
         bin: args.get("control-bin").map(PathBuf::from).unwrap_or_else(|| self_bin.clone()),
     };
     let candidate = RunArm {
         label: "candidate".into(),
         strategy: args.get("candidate-strategy").unwrap_or("estimator").to_string(),
-        env: candidate_env,
+        knobs: candidate_knobs,
         bin: args.get("candidate-bin").map(PathBuf::from).unwrap_or_else(|| self_bin.clone()),
     };
+    assert_arm_knobs_apply("control", &control.strategy, &control.knobs);
+    assert_arm_knobs_apply("candidate", &candidate.strategy, &candidate.knobs);
 
     // prewarm 共有の可否（issue の厳しい共有条件）。理由を JSONL 側へ残せるよう
     // ここで判定して表示する
     let same_bin = control.bin == candidate.bin;
-    let same_env = control.env == candidate.env;
+    let same_knobs = control.knobs == candidate.knobs;
     let same_strategy = control.strategy == candidate.strategy;
     let share_reason = if !shared_prewarm {
         "opt-in されていない"
     } else if !same_bin {
         "base/target 別バイナリ"
-    } else if !same_env {
-        "arm ごとに異なるグローバル env / OnceLock"
+    } else if !same_knobs {
+        "arm ごとに異なる設定（prewarm 中に読む値が違う）"
     } else if !same_strategy {
         "推定器（戦略）が異なる"
     } else {
@@ -990,6 +1099,7 @@ fn cmd_run(args: &Args) {
             .map(|t| {
                 let (control, candidate, deck_path, experiment, opponent, done) =
                     (&control, &candidate, &deck_path, &experiment, &opponent, &done);
+                let shared_env = &shared_env;
                 let arm_env_keys = &arm_env_keys;
                 scope.spawn(move || {
                     let mut out: Vec<String> = vec![];
@@ -1016,10 +1126,12 @@ fn cmd_run(args: &Args) {
                             extra.extend([
                                 "--control-strategy".into(), control.strategy.clone(),
                                 "--candidate-strategy".into(), candidate.strategy.clone(),
+                                "--control-knobs".into(), fmt_env(&control.knobs),
+                                "--candidate-knobs".into(), fmt_env(&candidate.knobs),
                                 "--shared-prewarm".into(), "1".into(),
                                 "--arm-order".into(), order.to_string(),
                             ]);
-                            out.extend(run_child(&control.bin, "pair", deck_path, &extra, &control.env));
+                            out.extend(run_child(&control.bin, "pair", deck_path, &extra, shared_env));
                         } else {
                             // 同一 runner・同じスロットで背中合わせに走らせる
                             // （キャッシュした control と比べない = 機械負荷を揃える）
@@ -1033,9 +1145,10 @@ fn cmd_run(args: &Args) {
                                 extra.extend([
                                     "--arm".into(), arm.label.clone(),
                                     "--strategy".into(), arm.strategy.clone(),
+                                    "--knobs".into(), fmt_env(&arm.knobs),
                                     "--arm-order".into(), j.to_string(),
                                 ]);
-                                out.extend(run_child(&arm.bin, "unit", deck_path, &extra, &arm.env));
+                                out.extend(run_child(&arm.bin, "unit", deck_path, &extra, shared_env));
                             }
                         }
                         let n = done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -1097,6 +1210,12 @@ struct Row {
     env: BTreeMap<String, String>,
     /// **相手が実際に読む env**。両 arm で一致していないと「同じ固定相手」ではない
     opponent_env: BTreeMap<String, String>,
+    /// arm 固有の設定ノブ（config 経由。issue #21）。arm 内で一意であることを検査する
+    arm_knobs: BTreeMap<String, String>,
+    /// arm の実効設定の指紋。arm 内で一意であること
+    arm_config: String,
+    /// **相手の実効設定の指紋**。両 arm で一致していないと「同じ固定相手」ではない
+    opponent_config: String,
     prewarm_shared: bool,
     metrics: BTreeMap<&'static str, f64>,
     prewarm_ms: f64,
@@ -1137,6 +1256,11 @@ fn parse_rows(paths: &[String]) -> Vec<Row> {
             if schema == 1 {
                 die(&format!(
                     "{where_}: schema 1 の記録は集計に使えません。\n                     candidate arm の env が固定相手にも効いていた時期のもので、\n                     相手の実効 env が記録されていないため「両 arm とも空で一致」と\n                     誤って解釈されます（PR #20）。取り直してください"
+                ));
+            }
+            if schema == 2 {
+                die(&format!(
+                    "{where_}: schema 2 の記録は集計に使えません。\n                     arm 固有ノブをプロセス env で渡していた時期のもので、\n                     同じプロセスの凍結相手にも効いていました（issue #21）。取り直してください"
                 ));
             }
             if schema != ROW_SCHEMA {
@@ -1200,6 +1324,16 @@ fn parse_rows(paths: &[String]) -> Vec<Row> {
                 think_budget: req_s("think_budget_ms"),
                 opponent: req_s("opponent"),
                 strategy: req_s("strategy"),
+                arm_knobs: v["arm_knobs"]
+                    .as_object()
+                    .map(|o| {
+                        o.iter()
+                            .map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                arm_config: req_s("arm_config"),
+                opponent_config: req_s("opponent_config"),
                 opponent_env: v["opponent_env"]
                     .as_object()
                     .unwrap_or_else(|| {
@@ -1281,14 +1415,22 @@ fn validate_rows(
             .map(|r| {
                 let env: Vec<String> =
                     r.env.iter().map(|(k, v)| format!("{k}={v}")).collect();
-                format!("{}|{}", r.strategy, env.join(" "))
+                let knobs: Vec<String> =
+                    r.arm_knobs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                format!(
+                    "{}|{}|{}|{}",
+                    r.strategy,
+                    env.join(" "),
+                    knobs.join(" "),
+                    r.arm_config
+                )
             })
             .collect();
         if sigs.len() > 1 {
             let mut v: Vec<String> = sigs.into_iter().collect();
             v.sort();
             fail(
-                format!("arm={arm} 内で strategy / env が混在しています: {}", v.join(" || ")),
+                format!("arm={arm} 内で strategy / env / 設定が混在しています: {}", v.join(" || ")),
                 &mut notes,
             );
         }
@@ -1315,6 +1457,42 @@ fn validate_rows(
         fail(
             format!(
                 "相手の実効 env が arm 間で違います（同じ固定相手になっていません）: {}",
+                v.join(" || ")
+            ),
+            &mut notes,
+        );
+    }
+    // **ノブを渡したのに実効設定が動いていない**（PR #22 レビュー指摘2）。
+    // arm ごとのノブが違うのに arm_config が同じなら、綴り間違いか無効値で
+    // 「candidate == control」の実験を回したことになる
+    let arm_sig = |arm: &str| -> Option<(String, String)> {
+        rows.iter().find(|r| r.arm == arm).map(|r| {
+            let knobs: Vec<String> =
+                r.arm_knobs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            (knobs.join(" "), r.arm_config.clone())
+        })
+    };
+    if let (Some((ck, ccfg)), Some((tk, tcfg))) = (arm_sig("control"), arm_sig("candidate")) {
+        if ck != tk && ccfg == tcfg {
+            fail(
+                format!(
+                    "arm ごとのノブが違うのに実効設定が同じです（綴り間違い／無効値？）: \
+                     control [{ck}] vs candidate [{tk}]"
+                ),
+                &mut notes,
+            );
+        }
+    }
+
+    // **相手の実効設定の指紋**が両 arm で同じであること（issue #21）。
+    // 指紋は解決後の値から作るので、env の綴りが違っても実効が同じなら通る
+    let opp_cfgs: HashSet<&str> = rows.iter().map(|r| r.opponent_config.as_str()).collect();
+    if opp_cfgs.len() > 1 {
+        let mut v: Vec<&str> = opp_cfgs.into_iter().collect();
+        v.sort_unstable();
+        fail(
+            format!(
+                "相手の実効設定が arm 間で違います（同じ固定相手になっていません）: {}",
                 v.join(" || ")
             ),
             &mut notes,
@@ -2386,13 +2564,19 @@ mod tests {
             "前提: 凍結ファイル自体にはこの文字列が無い（あるならテストの意味が変わる）"
         );
         assert!(
+            // doc コメントの言及（backtick）ではなく、**文字列リテラル**が無いこと。
+            // 走査が拾うのはリテラルだけなので、これが無ければ機械的には見えない
+            !include_str!("../opening.rs").contains("\"TSUITATE_JOSEKI\""),
+            "前提: opening.rs にリテラルは無い（config 経由で解決するので走査では拾えない）"
+        );
+        assert!(
             strategy_reads_env("estimator_v14", "TSUITATE_JOSEKI"),
-            "共有 opening.rs 経由の読取を見落としている"
+            "共有 opening.rs 経由の読取を見落としている（frozen::SHARED_MODULE_ENV）"
         );
     }
 
-    /// **arm 固有 env は原則拒否**（監査済みリストが空なので今は全部拒否）。
-    /// 走査で「読まない」と出ても許可しない = 偽陰性で通してしまわない
+    /// **プロセス env に arm 固有の値を置くのは今も原則拒否**。
+    /// issue #21 でノブは config へ移したので、ここへ来るのは回帰したときだけ
     #[test]
     fn arm_specific_env_is_denied_by_default() {
         // どの凍結版も読まないであろう架空のキーでも拒否される
@@ -2401,7 +2585,61 @@ mod tests {
         // allow=true のときだけ通る（拒否リストは返る）
         let denied = assert_opponent_blind_to("estimator_v14", &keys, true);
         assert_eq!(denied, keys, "監査済みリストに無いので拒否対象として返る");
-        assert!(CANDIDATE_ONLY_ENV.is_empty(), "issue #21 まで許可キーは無い");
+        assert!(CANDIDATE_ONLY_ENV.is_empty(), "arm 固有ノブは config で渡すので空でよい");
+    }
+
+    /// **issue #21 の要点**: arm 固有ノブを config で渡しても、
+    /// 凍結相手の実効設定は動かない（プロセス env を触らないから）。
+    /// PR #20 で見つかった「candidate 用の env が v14 にも効く」の再発防止。
+    #[test]
+    fn arm_knobs_do_not_change_the_frozen_opponent() {
+        let key = "TSUITATE_HAND_ASSET_W";
+        // 前提: v14 はこのキーを読む（読まないキーでは検査の意味が無い）
+        assert!(strategy_reads_env("estimator_v14", key));
+
+        // **base は空にする**（呼び出し元の shell に同じキーが残っていると
+        //  上書きが no-op になってテストが env に左右される。PR #22 再レビュー P3）
+        let base = config::EnvSource::empty();
+        let opp = config::StrategyConfig::from_source(base.clone());
+        let arm = config::StrategyConfig::from_source(
+            base.with_overrides([(key.to_string(), "0.5".to_string())]),
+        );
+        assert_ne!(arm.fingerprint(), opp.fingerprint(), "候補側には効いている");
+        assert_eq!(arm.strategy.hand_asset_w, 0.5);
+
+        // **相手が読むのはプロセス env**で、それは arm config の構築で変わらない
+        // （ここだけは実際の env を見る必要がある。値そのものではなく不変性を見る）
+        let env_before = std::env::var(key).ok();
+        let opp_before =
+            config::StrategyConfig::from_source(config::EnvSource::from_process()).fingerprint();
+        let _ = config::StrategyConfig::from_source(
+            config::EnvSource::from_process()
+                .with_overrides([(key.to_string(), "0.5".to_string())]),
+        );
+        assert_eq!(std::env::var(key).ok(), env_before);
+        assert_eq!(
+            config::StrategyConfig::from_source(config::EnvSource::from_process()).fingerprint(),
+            opp_before,
+            "arm 固有ノブでプロセス env が変わってはいけない"
+        );
+    }
+
+    /// 凍結版は config を尊重しないので、ノブを渡す先として選べない
+    /// （黙って無視されるのを防ぐ）
+    #[test]
+    fn frozen_strategies_do_not_honor_config() {
+        assert!(strategy::honors_config("estimator"));
+        assert!(strategy::honors_config("estimator_rush"));
+        for (_, name, _) in frozen::SOURCES {
+            assert!(!strategy::honors_config(name), "{name}");
+            assert!(
+                strategy::make_seeded_with_config(name, 0, std::sync::Arc::new(
+                    config::StrategyConfig::defaults()
+                ))
+                .is_none(),
+                "{name} へ config を渡せてはいけない"
+            );
+        }
     }
 
     /// bootstrap CI の percentile は alpha に連動する（alpha を広げれば CI は狭くなる）。
@@ -2422,6 +2660,10 @@ mod tests {
         let legacy = serde_json::json!({ "schema": 1, "label": "old", "delta_pt": -6.2 });
         let err = check_summary_schema(&legacy, "old.summary.json").unwrap_err();
         assert!(err.contains("schema 1"), "{err}");
+        // schema 2（ノブをプロセス env で渡していた時期）も拒否する（issue #21）
+        let env_era = serde_json::json!({ "schema": 2, "label": "env", "delta_pt": 1.0 });
+        let err = check_summary_schema(&env_era, "env.summary.json").unwrap_err();
+        assert!(err.contains("schema 2"), "{err}");
         let current = serde_json::json!({ "schema": SUMMARY_SCHEMA, "label": "new" });
         assert!(check_summary_schema(&current, "new.summary.json").is_ok());
         // schema が無い / 未知の値も拒否

@@ -57,7 +57,16 @@
   `-f env="TSUITATE_MATE_RISK_W=3 TSUITATE_MATE_THREAT_W=4"` で評価ノブを渡せる
   （w スイープ用。`TSUITATE_*` のみ許可）。**env はプロセス全体に効くので
   「候補側だけ」になるのは、その凍結版が名前を知らないノブに限る**。
-  凍結版は**凍結時点で読んでいた env を今も読む**（実測 2026-07-26）:
+  **候補側だけに効かせたいときは `-f cand_env="K=V K=V"`**（リクエストファイルなら
+  `"cand_env"`。ローカルは env `ARENA_CAND_KNOBS`。issue #21、2026-08-24）:
+  値はプロセス env でなく `StrategyConfig` として候補 instance にだけ渡るので、
+  env を読み続ける凍結相手は必ず既定値のまま動く（凍結版を候補にしたときは
+  config を尊重しないので起動時にエラー）。**綴り間違い（戦略が読まないキー）は
+  起動時エラー、実効値が変わらなかったキーは警告**が出る（`config::check_overrides`）。
+  seed の扱いはノブの有無で変わらない（`make_with_config` が `Option<u64>` を素通し。
+  `Some(0)` へ落とすと候補だけ全対局が同じシードになる）。
+  凍結版は**凍結時点で読んでいた env を今も読む**（実測 2026-07-26。
+  一覧は `frozen::env_keys_in_source(name)` で機械的に取れる）:
   - `TSUITATE_THINK_BUDGET_MS` — **v6〜v11 の全凍結版が読む**。思考予算の
     スイープを `-f env=` でやると両側の予算が動いて比較にならない。候補側だけ
     予算を変えたい場合は現行 `strategy.rs` だけが知る新しい名前を足すこと
@@ -134,20 +143,26 @@
   - **既知の arena 差を較正に使うときは、同じ candidate / control / opponent / 予算で
     測り直した値だけを渡す**。CLAUDE.md に残っている −12.8 / −8.5 / −7.4pt は
     当時の main・別の対戦条件で測った値なので流用できない（PR #20 レビュー指摘）
-  - **env ノブは候補側だけに効かせられない**。`TSUITATE_*` はプロセス全体に効き、
-    相手（凍結版）も同じプロセスで作られるので、arm ごとに値が違う env を相手が
-    読むと「同じ固定相手」で比べられない（arena.yml と同じ罠）。**arm 固有 env は
-    原則拒否**（監査済みの `CANDIDATE_ONLY_ENV` は現在空。恒久対策は issue #21）で、
-    **既定 matrix からも env 実験は外してある**。ソース走査（凍結版＋**共有モジュール**。
-    v14 は `TSUITATE_JOSEKI` を凍結ファイルでなく `opening.rs` 経由で読む）は
-    二次的な検査で、「読まないことの証明」には使わない。
-    両 arm に同じ値を渡す `--budget-ms` は対象外
+  - **arm 固有ノブは config で渡す**（issue #21、2026-08-24 に解消）。
+    `--control-env` / `--candidate-env` は名前に反して**プロセス env を触らない**:
+    値は `StrategyConfig` として arm の戦略にだけ渡るので、env を読み続ける
+    凍結相手は arm によらず既定値のまま動く。候補戦略が凍結版のときはノブを
+    渡せない（config を尊重せず黙って無視するので起動時に止まる）。
+    両 arm に同じ値を渡す `--budget-ms` は従来どおり子プロセスの env。
+    **較正が済むまで既定 matrix からは env 実験を外したまま**にしてある。
+    JSONL に `arm_knobs` / `arm_config` / `opponent_config` を残し、`compare` は
+    「相手の実効設定が両 arm で一致」を指紋で検査する。`opponent_config` は
+    **凍結版なら `frozen::behavior_fingerprint`**（版のソース・その版が読む env の
+    実効値・共有モデルの pin から作る）で、現行 config の指紋ではない。
+    綴り間違いのノブは起動時エラー、「ノブが違うのに実効設定が同じ」は
+    `compare` が止める
   - **seed は 4 以上の偶数**が P0 の条件（2 seed は AB/BA が閉じる最小構成だが
     replicate 間分散が同定できない）。`compare` は replicate が1つのとき
     seed 数の外挿を出さない
-  - JSONL の schema は **2**。schema 1（candidate env が固定相手にも効いていた時期）は
-    集計から明示的に弾く。**`compare` の summary JSON も同じ契約**で、
-    `report` が schema 1 の summary を拒否する（撤回済みの数字が横断表へ戻らないように）
+  - JSONL の schema は **3**。schema 1（相手の実効 env が未記録）と
+    schema 2（arm 固有ノブをプロセス env で渡していた時期）は集計から明示的に弾く。
+    **`compare` の summary JSON も同じ契約**で、`report` が schema 1/2 の summary を
+    拒否する（撤回済みの数字が横断表へ戻らないように）
   - 実行は CI（`.github/workflows/checkpoint-arena.yml`、**通常のコード push では走らない**）。
     `gh workflow run checkpoint-arena.yml -f arena_run_id=<Arena実行ID> -f seeds=4`、
     `gh` が無ければ `.github/ci/checkpoint-arena.request.json` を置いて push（削除の push は
@@ -180,7 +195,8 @@
   TUNE_PARAMS で数次元に絞って使い、採用判定は従来どおり CI ガントレット**。
   運用手順は `scenarios/README.md` の「SPSAチューニング（シナリオ目的）」。
   両モード共通で、調整対象ノブの `TSUITATE_*` env が立っていると起動時にエラーになる
-  （env が摂動を潰して勾配が死ぬ罠の検査）
+  （env が摂動を潰して勾配が死ぬ罠の検査）。SPSA は `EvalParams` を直接渡すので
+  config を経由しない（`apply_param_overrides(params, &EnvSource)` が上書きを当てる）
 - **粒子尤度のフィット**（`.github/workflows/fit.yml`、CIのみで実行する）:
   `gh workflow run fit.yml -f run_ids="<arena実行のrun ID...>" -f max_games=600`。
   過去アリーナの `arena-records`（観測列＋真実）を教師に、粒子群の中で真の局面を
@@ -270,7 +286,9 @@
   （実測: 対照比の不合格計の差は平均−0.31±2.21/件で系統差なし）。
   `-f scenarios="kakutori keima"` で対象を絞れる。
   `-f env="TSUITATE_XXX=値"` で評価ノブを渡せる（arena.yml と同じ規約。
-  既定0で入れた項の回帰確認に要る）。注意: 試行はシード同一でも壁時計ベースの
+  既定0で入れた項の回帰確認に要る）。**プロセス env なので、同じプロセスで作る
+  凍結版にも効く**（scenario は対照も候補も同じプロセスなので、版比較は
+  `-f env=` ではなく同一コミットのペア計測で行う。設定境界は `src/config.rs`）。注意: 試行はシード同一でも壁時計ベースの
   予算スケールで揺れるため、10試行の±2〜3件差はノイズ。版比較は20試行×両版で
 - `cd scenario-gui` → `npm run tauri dev` — シナリオデバッグ GUI（Tauri）。
   `.kif` の取り込み・任意 ply までの再生・先後視点切り替え・候補手分析
@@ -1903,6 +1921,26 @@
 コールバック（Socket.IOスレッド）→ mpsc チャネル → 単一メインループ、の一方向。
 状態（対局ID・反則済みの手・観測履歴）はメインループだけが触る。
 
+- `config.rs` — **設定境界**（issue #21、2026-08-24）。`TSUITATE_*` は
+  CLI・サーバー等の構成境界で**一度だけ**解釈し、以後は strategy instance が持つ
+  `StrategyConfig`（147 個のノブ＋思考予算＋定跡パス）だけを見る。
+  評価・推定の実装は深い呼び出しの奥から定数を引くので、`config::scoped` で
+  **スレッドローカルに設置**する（`EstimatorStrategy` の choose / prewarm /
+  oracle_anchor の入口）。設置しない経路（診断バイナリ・GUI・凍結版）は
+  `ambient()`＝プロセス env 由来に落ちるので移行前と同じ挙動。
+  - **候補側だけノブを変えてもプロセス env は動かない**ので、env を読み続ける
+    既存の凍結版 v6〜v14 は候補ノブに反応しない（PR #20 で見つかった事故の恒久対策）
+  - `OnceLock` のプロセス全体キャッシュを使わないので、arena / scenario の
+    スレッド並列でも arm ごとの値が混ざらない
+  - `fingerprint()` は**解決後の値**の sha256（未知のキーや既定値と同じ指定では
+    変わらない）。checkpoint arena が「相手の実効設定が両 arm で一致」を検査するのに使う
+  - `STRATEGY_ENV_KEYS` が戦略が読むキーの全量。ソース走査との突き合わせを
+    `cargo test` が常時検査するので、ノブを足して config を通し忘れると落ちる
+  - 設計と凍結境界の分類は `docs/frozen-hermetic-boundary.md`。
+    **既定挙動の同一性**は ①移行した96ノブの解決式が旧アクセサと文字列一致
+    ②arena run 32697854659（104局×2・`match_seed=20260815`）で
+    vs v13 56.7%±9.5 / vs v14 50.0%±9.6・反則/局 6.01〜6.24・
+    思考平均 1204〜1232ms・時間切れ0 と直前の記録帯に収まること、の2段で確認
 - `protocol.rs` — サイト側イベント契約の serde 版。**真実は tsuitate リポジトリの
   `src/lib/shared/events.ts` / `game-types.ts`**。サイト側の契約が変わったらここを追随させる
 - `board.rs` — 「自分の駒だけを考慮した」候補手生成。tsuitate の `src/lib/shared/move-hints.ts` の移植。
@@ -2117,7 +2155,29 @@
   ただし **vs v12 が 52.0%±6.9 で、過去の凍結時の相場（+7〜11pt）に届かないので
   v13 としては凍結していない**（凍結版を増やすと以後の改善判定が鈍るため）。
   粒子数・読み幅は `SearchBudget`（`TSUITATE_THINK_BUDGET_MS` 由来）に比例
-- `frozen/` — アリーナ比較の基準となる凍結版戦略（
+- `frozen/` — アリーナ比較の基準となる凍結版戦略。
+  `SOURCES`（凍結版ソースの**一箇所管理**。監査とガードが引く）/
+  `env_keys_in_source(name)`（その版が読む env）/ `versions_using(module)`
+  （共有モジュールを呼ぶ版）/ `SHARED_MODEL_PINS`（共有モデルの sha256）を持つ。
+  **共有モデルを更新すると、それを呼ぶ凍結版の挙動が変わる**:
+  `likelihood.rs` / `value_features.rs` / `opp_move_features.rs` / `opening.rs` /
+  `joseki.json` は v12〜v14、`belief_nn.rs` / `belief_features.rs` は v13/v14、
+  `king_belief_nn.rs` は v14。**NN の重みは固定コピーへ移した**
+  （`opp_move_nn_v25.rs` / `value_nn_v22.rs`。再学習しても凍結版は動かない）。
+  実際に **2026-08-21 の value NN 再学習（commit 387f0ac）は v12〜v14 の挙動を
+  変えている**（当時は検知の仕組みが無く、ガントレット値もこの前後で厳密には
+  比較できない）。**2026-08-24 のユーザー判断で「再学習前へ戻さず、現在の
+  v12〜v14 の挙動を基準として pin」**とし、`value_nn_v22.rs`（切り出し時点の
+  `value_nn.rs` と数値完全一致）へ向けた。
+  残りの共有依存は `SHARED_MODEL_PINS` の sha256 が変わるとテストが落ち、
+  影響する凍結版を名指しするので、(a) 固定コピーを作る (b) 承知でハッシュを更新し
+  再計測を記録する、のどちらかを必ず選ぶことになる。
+  `versions_using(module)` / `env_keys_read_by(name)`（共有モジュール経由の env 込み）/
+  `behavior_fingerprint(name, env)`（版・env・共有 pin から作る実効挙動の指紋）で
+  機械可読に取れる。
+  v9〜v11 は NN の重みを凍結ファイルへコピーしているので影響しない。
+  **v15 以降は実行時 env を読まない**（`HERMETIC_FROM`）。
+  各版の内容（
   `estimator_v6` = ソフト粒子（reinvigoration）・2手読み（応手サンプル・gain再構築）・
   交換価値是正・利き被覆/と金/王探し項・アンチドロー・思考予算スケール・
   SPSA第2ラウンド収束点（2026-07-14 凍結。200局×4基準で確定、
@@ -2199,12 +2259,16 @@
   凍結後は編集しない。改善が確定したら
   `python3 scripts/freeze_estimator.py <N> <日付> "<差分の要約>" > src/frozen/estimator_vN.rs`
   で生成し（estimator.rs/check.rs/strategy.rs を1ファイルへまとめ、テストと
-  診断フックを落とす。**env は PINNED の4関数と `TSUITATE_CAND_THINK_BUDGET_MS`
-  だけ落とし、他の `TSUITATE_*` は凍結時点の読み方のまま残る**）、
-  `frozen/mod.rs`・`strategy::make`/`make_seeded`・`arena.yml` の baselines
-  既定値へ登録する（**`checkpoint-arena.yml` の `opponent` 既定値・
-  `checkpoint-arena/deck.json` の `opponent`・`bin/checkpoint_arena` の
-  `STRATEGY_SOURCES`（env 走査の対象一覧。手動更新）も同じチェックリストで更新する**。
+  診断フックを落とす。**v15 以降は実行時 env を一切読まない**（issue #21）:
+  ノブのアクセサは凍結ファイル自身の `frozen_config()`（空の `EnvSource` から
+  解決＝凍結時点の既定値）を引き、`ambient()` は `frozen_defaults()` へ差し替わる。
+  生成物に `env::var(` が残ったら生成時に失敗し、`frozen/mod.rs` のテストも落ちる。
+  思考予算は `EstimatorVN::with_budget_ms(seed, ms)` で明示的に渡す）、
+  `frozen/mod.rs` の `pub mod` と **`SOURCES`**・`strategy::make`/`make_seeded`・
+  `arena.yml` の baselines 既定値へ登録する（**`checkpoint-arena.yml` の
+  `opponent` 既定値・`checkpoint-arena/deck.json` の `opponent` も同じ
+  チェックリストで更新する**。`bin/checkpoint_arena` は `frozen::SOURCES` を
+  引くので、そちらの手動更新はもう要らない。
   未使用 import / 未到達コードの警告は `lib.rs` の
   `pub mod frozen;` に付けた `#[allow(...)]` が版を問わず抑止するので、
   凍結ファイル側でもここでも何もしなくてよい）。**生成後は同一性確認**として、①スクリプトを再実行して

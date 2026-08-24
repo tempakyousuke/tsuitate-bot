@@ -92,7 +92,8 @@ manifest へ `foul_tried` を明示的に保存し、MyFoul 観測・累積反�
 ## 使い方
 
 **いま実際に動く例だけを載せる**（PR #20 4回目レビュー指摘3）。
-env 実験（`--candidate-env`）は原則拒否になったので例から外してある。
+env 実験（`--candidate-env`）は issue #21 で安全に渡せるようになったが、
+較正が済むまで既定 matrix からは外してある。
 
 ```bash
 # デッキ抽出（arena 記録から。原則1棋譜1checkpoint・層化・手番境界のみ）
@@ -137,7 +138,8 @@ CI は `gh workflow run checkpoint-arena.yml -f arena_run_id=<Arena実行ID> -f 
 - **arm ごとに値が違う `TSUITATE_*`**（原則拒否。監査済みの `CANDIDATE_ONLY_ENV` は現在空。
   恒久対策は issue #21）
 - **奇数の `--seeds` / `--seed-base`**（AB/BA が cluster 内で閉じない）
-- **schema 1 の JSONL**（candidate env が固定相手にも効いていた時期の記録）
+- **schema 1 / 2 の JSONL**（arm 固有の設定が固定相手にも効いていた時期の記録。
+  schema 1 は相手の実効 env が未記録、schema 2 はノブをプロセス env で渡していた）
 - **手番境界でない checkpoint**、**デッキと食い違う結果**、**arm 内での strategy / env の混在**
 
 ## 指標
@@ -156,25 +158,29 @@ CI は `gh workflow run checkpoint-arena.yml -f arena_run_id=<Arena実行ID> -f 
 統計単位は反則イベントではなく**元対局**。反則は意図的な情報獲得にもなりうるので、
 **反則減だけで「強くなった」とは判定しない**（重大な悪化を止める用途に使う）。
 
-### env ノブを候補側だけに効かせられない
+### arm 固有ノブは config で渡す（issue #21 で解消）
 
-`TSUITATE_*` は `OnceLock` でプロセス全体に効き、相手（凍結版）も同じプロセスで
-作られる。**arm ごとに値が違う env があると、その比較は成立しない**。
+**当初の制約**: `TSUITATE_*` は `OnceLock` でプロセス全体に効き、相手（凍結版）も
+同じプロセスで作られるので、arm ごとに値が違う env があるとその比較は成立しなかった。
+既定 matrix で使いたいノブは全部 `estimator_v14` が読む（確認済み）ため、
+arm 固有 env は原則拒否にしていた。
 
-そこで **arm 固有 env は原則拒否**にしてある。通るのは監査済みの
-`CANDIDATE_ONLY_ENV` に載せたキーだけで、**現在は空**（恒久対策は issue #21）。
-`--allow-opponent-env` で承知のうえ続行はできるが、その run は
-「同じ固定相手どうしの比較」ではない。
+**issue #21 以後**: `--control-env` / `--candidate-env` は**プロセス env を触らない**。
+値は `crate::config::StrategyConfig` として arm の戦略にだけ渡り、
+env を読み続ける凍結相手は arm によらず既定値のまま動く
+（`run_child` は親から継承した `TSUITATE_*` も落とす）。設計は
+`docs/frozen-hermetic-boundary.md`。
 
-凍結版＋共有モジュールのソースを compile-time に埋め込んで env 名を走査する検査も
-あるが、これは**二次的なもの**（監査済みリストが陳腐化したときに拒否するため）で、
-**「相手が読まない」ことの証明には使わない**。共有依存は定跡以外にもあり、
-動的な env 名の組み立ても原理的にありうるため。`STRATEGY_SOURCES` への凍結版追加は手動。
-
-JSONL には相手の実効 env も残し、`compare` が両 arm で一致するかを検査する。
-
-両 arm に同じ値を渡す env（`--budget-ms` = `TSUITATE_THINK_BUDGET_MS`）は
-相手にも等しく効くので対象外。
+- **候補戦略が凍結版のときはノブを渡せない**（凍結版は config を尊重せず黙って
+  無視するので、`assert_arm_knobs_apply` が起動時に止める）
+- 両 arm に同じ値を渡す設定（`--budget-ms` = `TSUITATE_THINK_BUDGET_MS`）は
+  相手にも等しく効かせたいので、従来どおり子プロセスの env で渡す
+- JSONL には `arm_knobs`（arm 固有ノブ）・`arm_config`・`opponent_config`
+  （実効設定の sha256 指紋）を残し、`compare` が
+  「相手の実効設定が両 arm で一致」を**指紋で**検査する
+- プロセス env に arm 固有の値を置く経路が復活したときのために、
+  `assert_opponent_blind_to` と凍結版ソースの env 走査（`frozen::SOURCES` 経由）は
+  関門として残してある
 
 ## デッキ
 
@@ -388,6 +394,14 @@ n=64 で −10pt が 93%。
     **現在すべて失敗する予約フィールド**である旨も明記した
 20. **`--alpha` 連動の回帰テストを、env テスト追加時に消してしまっていた**。
     復元して env テスト2本と併存させた
+
+### issue #21（恒久対策）で変わったこと
+
+21. **arm 固有ノブがプロセス env でなく config で渡るようになった**（上記
+    「arm 固有ノブは config で渡す」）。行 schema・summary schema は **3**。
+    schema 2 の記録は集計から弾く（ノブをプロセス env で渡していた時期のもの）
+22. **凍結版ソースの表が二重管理だった**。`frozen::SOURCES` へ一本化し、
+    `checkpoint_arena` はそれを引くだけにした（版を足したときの更新漏れが起きない）
 
 ### ブロッキングの効き（CPU あたりの情報量）
 

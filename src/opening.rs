@@ -12,7 +12,7 @@
 //! ラインは知識として手で登録する（所有者の定跡を反映する場所）。
 //! 先手視点で書き、後手用は点対称にミラーする。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rand::Rng;
 
@@ -35,14 +35,31 @@ const BUILTIN_LINES: [&[&str]; 4] = [
     &["5i6h", "7i7h", "6h7i", "5g5f"],
 ];
 
-/// 定跡ラインの読み込み（プロセス内で1回だけ）。
-/// TSUITATE_JOSEKI（既定 joseki.json）の {"lines":[{"name","moves":[usi...]}]} を読む。
-/// パースできない手を含むラインは警告してスキップする
+/// 定跡ラインの読み込み（**パスごとに**1回だけ）。
+/// パスは strategy instance の設定（`crate::config`、既定 `joseki.json`。
+/// 構成境界で `TSUITATE_JOSEKI` を解釈したもの）から取る。
+/// パースできない手を含むラインは警告してスキップする。
+///
+/// **パスをキーにする**のが issue #21 の要点: 定跡は「凍結後に変わりうる
+/// 共有データ」なので、arm ごとに別のファイルを指せないと隔離できない。
+/// 読み込み結果はプロセス寿命ぶん保持する（プロセスあたり高々数本）
 fn load() -> &'static (Vec<String>, Vec<Vec<String>>) {
-    static LOADED: std::sync::OnceLock<(Vec<String>, Vec<Vec<String>>)> =
-        std::sync::OnceLock::new();
-    LOADED.get_or_init(|| {
-        let path = std::env::var("TSUITATE_JOSEKI").unwrap_or_else(|_| "joseki.json".into());
+    static LOADED: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, &'static (Vec<String>, Vec<Vec<String>>)>>,
+    > = std::sync::OnceLock::new();
+    let path = crate::config::current(|c| c.joseki_path.clone());
+    let cache = LOADED.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut cache = cache.lock().expect("定跡キャッシュの Mutex");
+    if let Some(hit) = cache.get(path.as_str()) {
+        return hit;
+    }
+    let loaded: &'static (Vec<String>, Vec<Vec<String>>) = Box::leak(Box::new(load_path(&path)));
+    cache.insert(path, loaded);
+    loaded
+}
+
+fn load_path(path: &str) -> (Vec<String>, Vec<Vec<String>>) {
+    {
         if let Ok(content) = std::fs::read_to_string(&path) {
             match serde_json::from_str::<serde_json::Value>(&content) {
                 Ok(v) => {
@@ -79,7 +96,7 @@ fn load() -> &'static (Vec<String>, Vec<Vec<String>>) {
                 .map(|l| l.iter().map(|s| s.to_string()).collect())
                 .collect(),
         )
-    })
+    }
 }
 
 fn lines() -> &'static Vec<Vec<String>> {

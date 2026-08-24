@@ -6649,7 +6649,7 @@ fn evaluate(
                 crate::value_features::VALUE_FEATURES + crate::value_features::TRANSITION_FEATURES];
             f[..crate::value_features::VALUE_FEATURES].copy_from_slice(state);
             f[crate::value_features::VALUE_FEATURES..].copy_from_slice(&trans);
-            nn_sum += w * crate::value_nn::value_nn_forward(&f);
+            nn_sum += w * crate::value_nn_v22::value_nn_forward_v22(&f);
             nn_w_sum += w;
             nn_n += 1;
         }

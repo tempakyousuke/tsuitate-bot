@@ -16,4 +16,5 @@
 | `improvement-plan-2026-08-02-quest31.md` | 計画 | F1（幻の詰み）は `mate_gate_q0` として採用。F2（未観測駒への捕獲賭け、m021）は未解決。m015 の 2二歩打（F2 とは別工事の反則の情報価値）は `drop_probe_w` として採用 |
 | `quest_20260731.md` | 経緯 | 採点の一次資料は `evals/quest_20260731.eval.md`。本文は語彙判定の記録 |
 | `checkpoint-arena-p0.md` | 計画/記録 | 2026-08-23。issue #19 の P0。実装と計測経路は入った。続行/縮小/撤退の判断は「撤退判断」節 |
+| `frozen-hermetic-boundary.md` | 設計/運用 | 2026-08-24。issue #21。設定境界（`config.rs`）・凍結境界の分類・ガードの一覧。**共有モデルの更新で v12〜v14 が動く**ことの記録も |
 | `tsuitate-viewer-webhook-bot.md` | 運用 | `webhook_bot` の現行手順。既定戦略は凍結版 `estimator_v10` |

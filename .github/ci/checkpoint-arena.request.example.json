@@ -9,7 +9,7 @@
   "seeds": 4,
   "budgets": "700",
   "shards": 4,
-  "_env_note": "TSUITATE_* はプロセス全体に効き、相手（凍結版）も同じプロセスで作られる。既定 matrix で使いたいノブは全部 estimator_v14 が読むので、candidate_env を使うと『同じ固定相手』で比べられない。checkpoint_arena は実行前に検出して止める。",
+  "_env_note": "candidate_env / control_env は arm 固有の設定ノブ（issue #21）。プロセス env ではなく StrategyConfig として arm の戦略にだけ渡るので、env を読み続ける凍結相手は arm によらず既定値のまま動く。候補戦略が凍結版のときは渡せない（config を尊重しないので起動時に止まる）。較正が済むまで既定 matrix には入れない。",
   "_known_note": "known は「同じ candidate / control / opponent / 予算で arena.yml を取り直した差」だけに付ける。CLAUDE.md の -12.8 / -8.5 / -7.4pt などは流用できない。",
   "_seeds_note": "seed は 2 の倍数（AB/BA が cluster 内で閉じる）。seed 数の効果まで測るなら 4 以上（= 2 replicate 以上）。",
   "experiments": [

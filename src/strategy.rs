@@ -8,6 +8,7 @@
 //! - `estimator_v6` … `estimator_v14`: `frozen/` の凍結版（アリーナの基準）
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use rand::Rng;
@@ -184,6 +185,67 @@ pub fn make_seeded(name: &str, seed: u64) -> Option<Box<dyn Strategy + Send>> {
     }
 }
 
+/// **設定を尊重する戦略名か**（issue #21）。
+///
+/// 現行 estimator 系だけが [`crate::config::StrategyConfig`] を instance で持つ。
+/// 凍結版 v6〜v14 は凍結時点のコピーの中でプロセス env を直接読むので、
+/// config を渡しても**無視される**。取り違えを検出できるように名前で分ける。
+pub fn honors_config(name: &str) -> bool {
+    matches!(name, "estimator" | "estimator_rush")
+}
+
+/// 設定とシードを明示して作る（arena / checkpoint arena の arm 用）。
+///
+/// config を尊重しない戦略名（凍結版）では **None** を返す: プロセス env を
+/// 触らずに arm 固有のノブを渡せるのは現行 estimator だけで、凍結版に対して
+/// 「設定したつもり」になるのが PR #20 で見つかった事故そのものだから。
+pub fn make_seeded_with_config(
+    name: &str,
+    seed: u64,
+    config: Arc<crate::config::StrategyConfig>,
+) -> Option<Box<dyn Strategy + Send>> {
+    make_with_config(name, Some(seed), config)
+}
+
+/// [`make_seeded_with_config`] の **seed 任意**版。
+///
+/// `seed: None` は `make` と同じくエントロピー由来（対局ごとに違う乱数）。
+/// **ノブの有無で乱数条件が変わってはいけない**ので、共通乱数法を使わない
+/// 経路（`ARENA_MATCH_SEED` 未指定の通常アリーナ）はここを通すこと
+/// —— `Some(0)` に落とすと全対局で候補が同じシードになり、対照との比較が
+/// ノブ以外の理由で崩れる（PR #22 レビュー指摘1）。
+pub fn make_with_config(
+    name: &str,
+    seed: Option<u64>,
+    config: Arc<crate::config::StrategyConfig>,
+) -> Option<Box<dyn Strategy + Send>> {
+    Some(Box::new(estimator_with_config(name, seed, config)?))
+}
+
+/// [`make_with_config`] の実体（テストが seed の扱いを直接見られるよう
+/// boxing の手前で切ってある）。
+fn estimator_with_config(
+    name: &str,
+    seed: Option<u64>,
+    config: Arc<crate::config::StrategyConfig>,
+) -> Option<EstimatorStrategy> {
+    let book_line = match name {
+        "estimator" => None,
+        // 定跡の読み込みも config のパスで行う
+        "estimator_rush" => {
+            let _cfg = crate::config::scoped(&config);
+            Some(OpeningBook::line_index("居飛車速攻")?)
+        }
+        _ => return None,
+    };
+    Some(EstimatorStrategy::with_config(
+        config,
+        EvalParams::default(),
+        book_line,
+        seed,
+    ))
+}
+
 pub fn make(name: &str) -> Option<Box<dyn Strategy + Send>> {
     match name {
         "heuristic" => Some(Box::new(Heuristic)),
@@ -357,43 +419,34 @@ const EVAL_PARTICLES: usize = 192;
 /// もう強さの調整ノブではない。候補側だけ変える版比較・スイープには
 /// `TSUITATE_CAND_THINK_BUDGET_MS` を使う（v6〜v11 と v14 以降の凍結版はこの名前を
 /// 知らない。**v12 / v13 は凍結時に持ち込んでいて読む**）。
-const DEFAULT_THINK_BUDGET_MS: u64 = 2000;
+pub(crate) const DEFAULT_THINK_BUDGET_MS: u64 = 2000;
+
+// 予算の解決は `crate::config::StrategyConfig::from_source`
+// （`TSUITATE_CAND_THINK_BUDGET_MS` > `TSUITATE_THINK_BUDGET_MS` > 既定値）。
+// **凍結版 v6〜v11 / v12・v13 は自分のコピーの中で env を読む**ので、
+// プロセス env で予算を渡すと相手側の予算まで動く。候補側だけ変えたいときは
+// config（`StrategyConfig::think_budget_ms`）で渡すこと（issue #21）
 /// スケール1.0の基準予算。v5 までの暗黙の実測上限（p99 ≒ 900ms）
 const REFERENCE_BUDGET_MS: f64 = 900.0;
 
-/// 思考予算（ms）。`TSUITATE_CAND_THINK_BUDGET_MS` > `TSUITATE_THINK_BUDGET_MS` > 既定値。
-///
-/// **`TSUITATE_THINK_BUDGET_MS` は凍結版（`frozen/estimator_v6..v11`）も読む**ので、
-/// アリーナの `-f env=` で渡すと**両側の予算が動いて比較にならない**。
-/// 候補側だけ予算を変えたいとき（予算-強さ曲線の測定、時間配分の検証。
-/// docs/improvement-plan-2026-07-26-yaneuraou.md 項目1）は
-/// `TSUITATE_CAND_THINK_BUDGET_MS` を使う: 凍結スクリプトがこの名前を落とすので
-/// 凍結版は既定（または `TSUITATE_THINK_BUDGET_MS`）のまま残る。
-/// **例外は v12 / v13**（凍結時にこの行ごと持ち込んでいて読む。凍結後は
-/// 編集しない方針なのでそのまま。v12/v13 相手のスイープでは基準側も動く）
-fn think_budget_ms() -> u64 {
-    for name in ["TSUITATE_CAND_THINK_BUDGET_MS", "TSUITATE_THINK_BUDGET_MS"] {
-        if let Some(ms) = std::env::var(name).ok().and_then(|v| v.parse().ok()) {
-            return ms;
-        }
-    }
-    DEFAULT_THINK_BUDGET_MS
+/// taint 粒子の玉位置を `deduce::opp_king_candidates` の候補集合へ引き戻すか
+/// （既定 on、`TSUITATE_TAINT_KING_FIX=0` で従来挙動）
+fn taint_king_fix() -> bool {
+    crate::config::current(|c| c.strategy.taint_king_fix)
 }
 
 /// taint 粒子の玉を移設するとき、移設先に空きマスを優先するか（既定 on、
 /// `TSUITATE_TAINT_KING_EMPTY=0` で従来挙動）。従来は候補マスの駒と無条件に
 /// 入れ替えていたため、玉位置を直すたびに別の駒が根拠なく飛んでいた
 fn taint_king_prefer_empty() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| !std::env::var("TSUITATE_TAINT_KING_EMPTY").is_ok_and(|v| v == "0"))
+    crate::config::current(|c| c.strategy.taint_king_prefer_empty)
 }
 
 /// 厳密粒子が全滅した決定で、評価本体（`expected`）を taint 粒子へ落とすか。
 /// 既定は無効（従来挙動）。`TSUITATE_EVAL_TAINT_FALLBACK=1` で有効。
 /// 凍結版はこの名前を知らないので候補側にだけ効く
 fn eval_taint_fallback() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_EVAL_TAINT_FALLBACK").is_ok_and(|v| v == "1"))
+    crate::config::current(|c| c.strategy.eval_taint_fallback)
 }
 
 /// taint フォールバック中の**攻め項の倍率**（`TSUITATE_EVAL_TAINT_ATTACK`、
@@ -408,14 +461,7 @@ fn eval_taint_fallback() -> bool {
 /// v2-bottleneck-is-king-belief、blind_attack_survive_w と同じ構図）ので、
 /// 供給チャネルを材料・リスク側に限定する。1.0 で従来のフォールバック相当
 fn eval_taint_attack_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_EVAL_TAINT_ATTACK")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
-            .unwrap_or(0.0)
-    })
+    crate::config::current(|c| c.strategy.eval_taint_attack_w)
 }
 
 /// 終盤の紐減衰（`TSUITATE_LINK_ENDGAME_DAMPEN`、既定 0。
@@ -428,14 +474,7 @@ fn eval_taint_attack_w() -> f64 {
 /// （v12）まで消すのは困る。厳密粒子が生きている決定では紐を触らず、
 /// taint の玉位置に紐の働きが引っ張られるブラインド終盤だけ減衰する。
 fn link_endgame_dampen() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_LINK_ENDGAME_DAMPEN")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(LINK_ENDGAME_DAMPEN)
-    })
+    crate::config::current(|c| c.strategy.link_endgame_dampen)
 }
 
 /// ブラインド終盤の紐減衰の既定。0 = 無効（env 作業点は 40）。
@@ -460,14 +499,7 @@ const LINK_ENDGAME_DAMPEN_MIN_MOVE: u32 = 110;
 /// env 有効時の手数窓は quest31 終盤向け作業点（汎化根拠なし・既定オフ）。
 /// 凍結版はこの名前を知らない。
 fn hand_asset_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_HAND_ASSET_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(HAND_ASSET_W)
-    })
+    crate::config::current(|c| c.strategy.hand_asset_w)
 }
 
 /// 金銀桂＋敵陣以外の大駒打ち＋自陣歩の無目的打ち課税。既定 0
@@ -484,14 +516,7 @@ const HAND_ASSET_MIN_MOVE: u32 = 110;
 /// **王手中も有効**（m099 は王手逃げの序列問題。CheckSolver は解消確率だけ）。
 /// 粒子不要。そのマス自体を取る手は対象外。凍結版はこの名前を知らない。
 fn king_known_approach_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_KING_KNOWN_APPROACH_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(KING_KNOWN_APPROACH_W)
-    })
+    crate::config::current(|c| c.strategy.king_known_approach_w)
 }
 
 /// 玉の既知脅威接近。既定 0（2026-08-12 に PR#1 の −7.4pt 容疑で確定。
@@ -514,14 +539,7 @@ const KING_KNOWN_APPROACH_MIN_MOVE: u32 = 90;
 /// 観測裏付けのある捕獲成は対象外。王手中無効・粒子不要。
 /// 凍結版はこの名前を知らない。
 fn promote_far_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_PROMOTE_FAR_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(PROMOTE_FAR_W)
-    })
+    crate::config::current(|c| c.strategy.promote_far_w)
 }
 
 /// 大駒成りの遠方ペナルティ。既定 0（env 作業点は 2.5。PR#1 計測時は 1.0）。
@@ -537,14 +555,7 @@ const PROMOTE_FAR_MIN_MOVE: u32 = 80;
 /// **盤上の入口段**（先手3段・後手7段 = 5f5g+ 型）も加点しない。打ちは残す。
 /// 王手中無効・粒子不要。凍結版はこの名前を知らない。
 fn king_file_pawn_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_KING_FILE_PAWN_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(KING_FILE_PAWN_W)
-    })
+    crate::config::current(|c| c.strategy.king_file_pawn_w)
 }
 
 const KING_FILE_PAWN_W: f64 = 0.0;
@@ -560,14 +571,7 @@ const KING_FILE_PAWN_W: f64 = 0.0;
 /// を 8g8f の仮4点へ逃がさないため。玉筋が読めていないときは 0。
 /// 王手中無効・粒子不要。凍結版はこの名前を知らない。
 fn king_file_pawn_mid_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_KING_FILE_PAWN_MID_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(KING_FILE_PAWN_MID_W)
-    })
+    crate::config::current(|c| c.strategy.king_file_pawn_mid_w)
 }
 
 const KING_FILE_PAWN_MID_W: f64 = 0.0;
@@ -585,14 +589,7 @@ const KING_FILE_PAWN_MID_MAX_MOVE: u32 = 86;
 /// 8a9b が CheckSolver の p_legal で首位のまま）。king-evade は
 /// 手数 125 未満なので手数ゲートで守る。粒子不要。凍結版はこの名前を知らない。
 fn king_endgame_flee_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_KING_ENDGAME_FLEE_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(KING_ENDGAME_FLEE_W)
-    })
+    crate::config::current(|c| c.strategy.king_endgame_flee_w)
 }
 
 const KING_ENDGAME_FLEE_W: f64 = 0.0;
@@ -609,14 +606,7 @@ const KING_ENDGAME_FLEE_MIN_MOVE: u32 = 125;
 /// に足す。盤上の金移動なので打ち反則スパムにはならない。非王手の寄りは
 /// m138 の未採点 8c8b へ逃げるので対象外。粒子不要。凍結版はこの名前を知らない。
 fn gold_join_king_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_GOLD_JOIN_KING_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(GOLD_JOIN_KING_W)
-    })
+    crate::config::current(|c| c.strategy.gold_join_king_w)
 }
 
 const GOLD_JOIN_KING_W: f64 = 0.0;
@@ -632,14 +622,7 @@ const GOLD_JOIN_KING_MIN_MOVE: u32 = 125;
 /// だけでは 5f5g+ を沈められない。王手中は `gold_join` / CheckSolver の領分。
 /// 粒子不要。凍結版はこの名前を知らない。
 fn gold_king_file_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_GOLD_KING_FILE_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(GOLD_KING_FILE_W)
-    })
+    crate::config::current(|c| c.strategy.gold_king_file_w)
 }
 
 const GOLD_KING_FILE_W: f64 = 0.0;
@@ -659,14 +642,7 @@ const GOLD_KING_FILE_MIN_MOVE: u32 = 125;
 /// 手数 137 以降の 8e7g+（m138 = 4点）は `knight_endgame_promo_w` の加点側。
 /// 序中盤の 4d3b+ は min で守る。王手中無効・粒子不要。凍結版はこの名前を知らない。
 fn knight_late_promo_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_KNIGHT_LATE_PROMO_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(KNIGHT_LATE_PROMO_W)
-    })
+    crate::config::current(|c| c.strategy.knight_late_promo_w)
 }
 
 const KNIGHT_LATE_PROMO_W: f64 = 0.0;
@@ -685,14 +661,7 @@ const KNIGHT_LATE_NONPROMO_MIN_MOVE: u32 = 110;
 /// P*4g へ逃げるので、採点済みの受け皿を押し上げる。不成は加点しない
 /// （eval に無い 8e7g 不成へ逃げるため）。王手中無効・粒子不要。
 fn knight_endgame_promo_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_KNIGHT_ENDGAME_PROMO_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(KNIGHT_ENDGAME_PROMO_W)
-    })
+    crate::config::current(|c| c.strategy.knight_endgame_promo_w)
 }
 
 const KNIGHT_ENDGAME_PROMO_W: f64 = 0.0;
@@ -708,14 +677,7 @@ const KNIGHT_ENDGAME_PROMO_MIN_MOVE: u32 = 137;
 /// 6.40→1.60 に壊した（`da1a869`）。敵陣進入は `knight_late_promo` の
 /// 課税側。王手中無効・粒子不要。
 fn knight_camp_exit_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_KNIGHT_CAMP_EXIT_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(KNIGHT_CAMP_EXIT_W)
-    })
+    crate::config::current(|c| c.strategy.knight_camp_exit_w)
 }
 
 const KNIGHT_CAMP_EXIT_W: f64 = 0.0;
@@ -728,14 +690,7 @@ const KNIGHT_CAMP_EXIT_MIN_MOVE: u32 = 120;
 /// 発端は quest31-m106 の 7c6d（後手・自陣3段目→中段、8点）vs 8e7g+（2点）。
 /// 桂成課税と対で、吊るされた銀を進める側を押し上げる。王手中無効・粒子不要。
 fn silver_camp_exit_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_SILVER_CAMP_EXIT_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(SILVER_CAMP_EXIT_W)
-    })
+    crate::config::current(|c| c.strategy.silver_camp_exit_w)
 }
 
 const SILVER_CAMP_EXIT_W: f64 = 0.0;
@@ -746,14 +701,7 @@ const SILVER_CAMP_EXIT_MIN_MOVE: u32 = 100;
 /// gain に足す。m101 で G*8c / G*8a（0点）を玉筋として押し上げ
 /// 2.40→0.80 に回帰したため既定オフ。env から試せる。銀は対象外。
 fn king_file_gold_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_KING_FILE_GOLD_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(KING_FILE_GOLD_W)
-    })
+    crate::config::current(|c| c.strategy.king_file_gold_w)
 }
 
 const KING_FILE_GOLD_W: f64 = 0.0;
@@ -767,14 +715,7 @@ const KING_FILE_GOLD_W: f64 = 0.0;
 /// 玉筋滞在・大駒の筋空け・相手最奥段（2a1a の香取り）・裏付け捕獲。
 /// 王手中無効・粒子不要。
 fn tokin_file_drift_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_TOKIN_FILE_DRIFT_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(TOKIN_FILE_DRIFT_W)
-    })
+    crate::config::current(|c| c.strategy.tokin_file_drift_w)
 }
 
 /// と金の玉筋逸れの既定。接近免税なしでも 4g5h / P*2b へ逃げるだけで、
@@ -794,14 +735,7 @@ const TOKIN_FILE_DRIFT_W: f64 = 0.0;
 /// 手持ちゲートを外す（m138 の 5f5g+ = 0 点。金は盤上にいる）。
 /// 歩打ちは垂れ歩保護のため除外。王手中無効・粒子不要。
 fn pawn_offfile_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_PAWN_OFFFILE_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(PAWN_OFFFILE_W)
-    })
+    crate::config::current(|c| c.strategy.pawn_offfile_w)
 }
 
 /// 終盤の歩成り課税の既定。手数 125 以降・金銀手持ち・成りのみ。
@@ -824,14 +758,7 @@ const PAWN_OFFFILE_FORCE_MIN_MOVE: u32 = 137;
 /// recap-dragon（裏付け）と玉隣の成り捕獲（amount=0）は残る。
 /// 王手中無効・粒子不要（捕獲期待値は evaluate が出した値を外側で削る）。
 fn far_major_promo_capture_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(FAR_MAJOR_PROMO_CAPTURE_W)
-    })
+    crate::config::current(|c| c.strategy.far_major_promo_capture_w)
 }
 
 /// 遠方の大駒成り捕獲キャンセルの既定。複合フル suite で 4a3b+ は減らず
@@ -846,14 +773,7 @@ const FAR_MAJOR_PROMO_CAPTURE_W: f64 = 0.0;
 /// 区別できないので **手数 40 以降だけ** 掛ける（3i3h は 27 手目）。
 /// 王手中は無効（m086 の 7a7b は 8 点の受け）。
 fn own_camp_idle_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_OWN_CAMP_IDLE_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(OWN_CAMP_IDLE_W)
-    })
+    crate::config::current(|c| c.strategy.own_camp_idle_w)
 }
 
 const OWN_CAMP_IDLE_W: f64 = 0.0;
@@ -872,14 +792,7 @@ const OWN_CAMP_IDLE_MIN_MOVE: u32 = 40;
 /// 序盤の角の横移動はアリーナの攻め手段）。
 /// 凍結版はこの名前を知らない。
 fn bishop_retreat_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_BISHOP_RETREAT_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(BISHOP_RETREAT_W)
-    })
+    crate::config::current(|c| c.strategy.bishop_retreat_w)
 }
 
 const BISHOP_RETREAT_W: f64 = 0.0;
@@ -894,14 +807,7 @@ const BISHOP_RETREAT_MIN_MOVE: u32 = 50;
 /// 7c6b（逆方向・未収載の仮4点）へ逃避した。打ちは HAND_ASSET の領分。
 /// 王手中無効・粒子不要。
 fn endgame_camp_general_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_ENDGAME_CAMP_GENERAL_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(ENDGAME_CAMP_GENERAL_W)
-    })
+    crate::config::current(|c| c.strategy.endgame_camp_general_w)
 }
 
 const ENDGAME_CAMP_GENERAL_W: f64 = 0.0;
@@ -921,14 +827,7 @@ const ENDGAME_CAMP_GENERAL_MIN_MOVE: u32 = 125;
 /// KING_ADJ 側。大駒の幻成り込みは 80 手以降だけ課税）。
 /// 凍結版はこの名前を知らない。
 fn unbacked_camp_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_UNBACKED_CAMP_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(UNBACKED_CAMP_W)
-    })
+    crate::config::current(|c| c.strategy.unbacked_camp_w)
 }
 
 const UNBACKED_CAMP_W: f64 = 0.0;
@@ -947,14 +846,7 @@ const UNBACKED_CAMP_MIN_MOVE: u32 = 80;
 /// （recap-dragon）。と金・歩・桂・香は対象外（2c3b の銀取り・4七歩成）。
 /// 凍結版はこの名前を知らない。
 fn unbacked_gs_capture_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_UNBACKED_GS_CAPTURE_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(UNBACKED_GS_CAPTURE_W)
-    })
+    crate::config::current(|c| c.strategy.unbacked_gs_capture_w)
 }
 
 /// 金銀の裏付け無し捕獲をキャンセルする既定（2026-08-13。m081 の 6c6b）。
@@ -984,14 +876,7 @@ const UNBACKED_GS_CAPTURE_MIN_MOVE: u32 = 80;
 /// `unbacked_gs_capture_w`。王手中無効・裏付けマスは満額。
 /// 凍結版はこの名前を知らない。
 fn belief_occ_cap_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_BELIEF_OCC_CAP_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(BELIEF_OCC_CAP_W)
-    })
+    crate::config::current(|c| c.strategy.belief_occ_cap_w)
 }
 
 const BELIEF_OCC_CAP_W: f64 = 0.0;
@@ -1025,14 +910,7 @@ fn belief_occ_cap_shrink(capture_ev: f64, p_hit: f64, p_occ: f64, w: f64) -> f64
 /// 同筋の別マスへ動ける駒（3h4g が候補に載っている）なら加点しない。
 /// 3h2i は 2 筋なので m046 の受け皿は残る。
 fn home_gold_attack_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_HOME_GOLD_ATTACK_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(HOME_GOLD_ATTACK_W)
-    })
+    crate::config::current(|c| c.strategy.home_gold_attack_w)
 }
 
 const HOME_GOLD_ATTACK_W: f64 = 0.0;
@@ -1044,14 +922,7 @@ const HOME_GOLD_MIN_MOVE: u32 = 44;
 /// 発端は quest31-m021 の 2c3b。実測で玉筋が読めていないと中央値が端に寄り
 /// 2c1c（1点）を 5/5 で選んだため既定オフ。`king_files_focused` ゲート付き。
 fn tokin_approach_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_TOKIN_APPROACH_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(TOKIN_APPROACH_W)
-    })
+    crate::config::current(|c| c.strategy.tokin_approach_w)
 }
 
 const TOKIN_APPROACH_W: f64 = 0.0;
@@ -1071,14 +942,7 @@ const TOKIN_APPROACH_W: f64 = 0.0;
 /// **手数 `KING_ADJ_HEAVY_MIN_MOVE` 以降**（m021 の 3a4a は残す）。
 /// 凍結版はこの名前を知らない。
 fn king_adj_heavy_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_KING_ADJ_HEAVY_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(KING_ADJ_HEAVY_W)
-    })
+    crate::config::current(|c| c.strategy.king_adj_heavy_w)
 }
 
 /// 玉隣の高い駒進入課税の既定（2026-08-13。m021 の 3a4a 対策）。
@@ -1097,14 +961,7 @@ const KING_ADJ_HEAVY_MIN_MOVE: u32 = 20;
 /// 不成が無いので発火しない。強制成り（行き所のない駒）は対象外。
 /// 王手中無効・粒子不要。凍結版はこの名前を知らない。
 fn own_camp_minor_promo_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_OWN_CAMP_MINOR_PROMO_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(OWN_CAMP_MINOR_PROMO_W)
-    })
+    crate::config::current(|c| c.strategy.own_camp_minor_promo_w)
 }
 
 const OWN_CAMP_MINOR_PROMO_W: f64 = 0.0;
@@ -1139,14 +996,7 @@ const OWN_CAMP_MINOR_PROMO_W: f64 = 0.0;
 /// 局面で発火し、5.9 構成のアリーナ合算 54.0% vs 対照 56.3% に入っていた）。
 /// 2026-08-19 に estimator_v14 として凍結（suite 5.197、vs v13 200局 60.0%）。
 fn king_cand_attack_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_KING_CAND_ATTACK_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(KING_CAND_ATTACK_W)
-    })
+    crate::config::current(|c| c.strategy.king_cand_attack_w)
 }
 
 /// 玉候補接近ボーナスの既定（2026-08-13 作業点）。0 で切り戻し
@@ -1158,14 +1008,7 @@ const KING_CAND_ATTACK_W: f64 = 4.0;
 /// 「その駒が実際に玉候補へ利くか」を `blind_king_attack` で測って加点する
 /// （分布は候補集合上の一様分布 = 粒子不要）
 fn king_cand_check_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_KING_CAND_CHECK_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(KING_CAND_CHECK_W)
-    })
+    crate::config::current(|c| c.strategy.king_cand_check_w)
 }
 
 /// 玉候補へ利く手の加点既定（2026-08-13 作業点）
@@ -1175,13 +1018,7 @@ const KING_CAND_CHECK_W: f64 = 1.0;
 /// 既定 20）。これを超えると候補が盤の半分に散っていて近接度が
 /// 「敵陣へ前進」以上の情報を持たない
 fn king_cand_attack_gate() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_KING_CAND_ATTACK_GATE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(20)
-    })
+    crate::config::current(|c| c.strategy.king_cand_attack_gate)
 }
 
 /// 着手後に着地マスを守っている自駒の枚数（着手駒自身は自分のマスを守れないので
@@ -1206,14 +1043,7 @@ fn landing_def(view: &PlayerView, mv: &ShogiMove, own_attack: &[u8; 81]) -> f64 
 /// 回帰では支え枚数が +0.60点あるが、**独立した加算項にすると玉から遠い
 /// 「支えのある無意味なマス」まで加点する**ので接近側へ掛ける
 fn landing_support_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_LANDING_SUPPORT_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(LANDING_SUPPORT_W)
-    })
+    crate::config::current(|c| c.strategy.landing_support_w)
 }
 
 /// 接近ボーナスの支えゲート既定（2026-08-13 作業点。m145 の裸の金打ち対策）
@@ -1243,14 +1073,7 @@ const LANDING_SUPPORT_W: f64 = 0.7;
 /// 対照 56.3% で不採用。安全解消ゲート不合格のあと接近束ごと既定オンに
 /// していたが、アリーナを下げる側の項を既定に残さない。
 fn king_belief_prox_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_KING_BELIEF_PROX_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(KING_BELIEF_PROX_W)
-    })
+    crate::config::current(|c| c.strategy.king_belief_prox_w)
 }
 
 /// 玉位置ネット接近ボーナスの既定。0 = 無効（env 作業点は 5.0。粒子版は不発）
@@ -1259,8 +1082,7 @@ const KING_BELIEF_PROX_W: f64 = 0.0;
 /// `promote_far_w` の課税を**全駒種**へ広げるか（`TSUITATE_PROMOTE_FAR_ALL=1`、
 /// 既定 0 = 角・飛だけ）。課税額は着手駒の交換価値で頭打ちにする
 fn promote_far_all() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_PROMOTE_FAR_ALL").is_ok_and(|v| v == "1"))
+    crate::config::current(|c| c.strategy.promote_far_all)
 }
 
 /// `king_cand_attack_w` を**厳密粒子ゼロの決定だけ**に限るか
@@ -1268,8 +1090,7 @@ fn promote_far_all() -> bool {
 /// 厳密粒子が生きている決定では駒得・攻め圧力が情報を持つので、
 /// 玉候補の幾何だけで引っ張る必要は薄い、という仮説の検証用
 fn king_cand_attack_blind_only() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_KING_CAND_ATTACK_BLIND").is_ok_and(|v| v == "1"))
+    crate::config::current(|c| c.strategy.king_cand_attack_blind_only)
 }
 
 /// 成って王手する手の露見ペナルティ（`TSUITATE_PROMOTE_CHECK_REVEAL_W`、
@@ -1290,14 +1111,7 @@ fn king_cand_attack_blind_only() -> bool {
 /// 同じ USI でも終盤は既知玉への寄せ）。下限は序中盤の成る王手（相手の
 /// 解消反則を誘う手）を潰さないため。凍結版はこの名前を知らない。
 fn promote_check_reveal_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_PROMOTE_CHECK_REVEAL_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(PROMOTE_CHECK_REVEAL_W)
-    })
+    crate::config::current(|c| c.strategy.promote_check_reveal_w)
 }
 
 /// 成る王手の露見ペナルティ。既定 0（env 作業点は 1.2。局面フェーズ依存の
@@ -1332,14 +1146,7 @@ const PROMOTE_CHECK_REVEAL_MAX_MOVE: u32 = 102;
 /// 厳密粒子ゼロのブラインド決定でも効く。王手中は無効。
 /// 凍結版はこの名前を知らない。
 fn nonpromote_check_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_NONPROMOTE_CHECK_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.0)
-    })
+    crate::config::current(|c| c.strategy.nonpromote_check_w)
 }
 
 /// 双子を作る駒種（`TSUITATE_NONPROMOTE_CHECK_ROLES`、既定 `minor` =
@@ -1354,15 +1161,12 @@ fn nonpromote_check_w() -> f64 {
 /// 別の手を指される」（成=10）。どちらになるかは「成った駒がそこで
 /// 生き残れるか」で決まり、ブラインド決定では観測から判定できない。
 /// 歩を含めた合計は −57.9/146件、銀桂香だけなら +11.7 と符号が逆になる
-fn nonpromote_check_roles() -> &'static str {
-    static V: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    V.get_or_init(|| {
-        std::env::var("TSUITATE_NONPROMOTE_CHECK_ROLES").unwrap_or_else(|_| "minor".into())
-    })
+fn nonpromote_check_roles() -> String {
+    crate::config::current(|c| c.strategy.nonpromote_check_roles.clone())
 }
 
 fn nonpromote_check_role_ok(role: Role) -> bool {
-    match nonpromote_check_roles() {
+    match nonpromote_check_roles().as_str() {
         "all" => true,
         "silver" => role == Role::Silver,
         _ => matches!(role, Role::Silver | Role::Knight | Role::Lance),
@@ -1371,14 +1175,7 @@ fn nonpromote_check_role_ok(role: Role) -> bool {
 
 /// 双子を作る最小の王手確率（`TSUITATE_NONPROMOTE_CHECK_P`、既定 0.2）。
 fn nonpromote_check_p() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_NONPROMOTE_CHECK_P")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v > 0.0)
-            .unwrap_or(0.2)
-    })
+    crate::config::current(|c| c.strategy.nonpromote_check_p)
 }
 
 /// 成ることで**新たに**玉へ利きが生じる確率（不成では生じない分だけ）。
@@ -2297,8 +2094,7 @@ fn drop_has_hand_asset_work(
 /// 玉以外の手はそのまま: 駒を差し出す手の駒損は実在のコストで、王手駒捕獲の
 /// 価値は removal_term（仮説条件付き期待値）が持つ
 fn check_king_gain_mean() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_CHECK_KING_GAIN_MEAN").map_or(true, |v| v != "0"))
+    crate::config::current(|c| c.strategy.check_king_gain_mean)
 }
 
 /// 王手中に「ほぼ確実な解消手」があるのに低い p の手を選んで反則するのを止める
@@ -2312,8 +2108,7 @@ fn check_king_gain_mean() -> bool {
 /// `p_max-0.25` 未満として捨てていた。有効時は王手駒捕獲と玉の手を残す。
 /// 凍結版はこの名前を知らない。
 fn check_safe_resolve_enabled() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_CHECK_SAFE_RESOLVE").is_ok_and(|v| v != "0"))
+    crate::config::current(|c| c.strategy.check_safe_resolve_enabled)
 }
 
 const CHECK_SAFE_RESOLVE_PMAX: f64 = 0.70;
@@ -2361,13 +2156,11 @@ fn gen_nonpromote_for(role: Role) -> bool {
 
 /// `TSUITATE_GEN_NONPROMOTE=minor`（銀桂香だけ不成を生成）か
 fn gen_nonpromote_minor() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_GEN_NONPROMOTE").is_ok_and(|v| v == "minor"))
+    crate::config::current(|c| c.strategy.gen_nonpromote_minor)
 }
 
 fn gen_nonpromote() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_GEN_NONPROMOTE").is_ok_and(|v| v == "1"))
+    crate::config::current(|c| c.strategy.gen_nonpromote)
 }
 
 /// 成る手の取られリスクを**成る前の駒価値**で数えるか（**既定 on** =
@@ -2385,12 +2178,7 @@ fn gen_nonpromote() -> bool {
 /// 成/不成のリスク差は本来ほぼゼロ: リスクは「持ち込んだ駒」の価値で数え、
 /// 成りの付加価値は生き残った分岐（threat / promo 実現）でだけ実現させる
 fn promo_risk_prerole() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    // 2026-08-21 に既定 on で採用（env "0" で切り戻し）。quest31 4七歩成
-    // クラスタの「幻の threat 加点 × 過大リスクの相殺」を剥がして本来の価値
-    //（歩取り＋と金、リスクは歩価格）で立たせる。capture_retreat_w=0.08 が対
-    //（m024「取って逃げる」回帰を塞ぐ）。確定計測は CLAUDE.md 参照
-    *V.get_or_init(|| std::env::var("TSUITATE_PROMO_RISK_PREROLE").map_or(true, |v| v == "1"))
+    crate::config::current(|c| c.strategy.promo_risk_prerole)
 }
 
 /// 捕獲直後の手戻り免除・退避加点（`TSUITATE_CAPTURE_RETREAT_W`、
@@ -2405,14 +2193,7 @@ fn promo_risk_prerole() -> bool {
 /// （実測: w=0.08 で両シナリオ 5.6→0）。発端 m024 の 3b4b は不成。
 /// 粒子不要（観測の captured のみ）。**v14 はこの名前を読む**（v13 以前は知らない）。
 fn capture_retreat_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_CAPTURE_RETREAT_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(CAPTURE_RETREAT_W)
-    })
+    crate::config::current(|c| c.strategy.capture_retreat_w)
 }
 
 /// 捕獲直後の手戻り免除。2026-08-21 に既定 0.08 で採用（PREROLE の対）。
@@ -2427,13 +2208,11 @@ const CAPTURE_RETREAT_W: f64 = 0.08;
 /// `attack_count` 自体は V3（予防的な紐）・V2（距離重み）で使えるので残す。
 /// `TSUITATE_V1_PRESSURE=1` / `TSUITATE_V1_DEFENDED=1` で再度有効化できる
 fn v1_pressure_multiplicity() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_V1_PRESSURE").is_ok_and(|v| v == "1"))
+    crate::config::current(|c| c.strategy.v1_pressure_multiplicity)
 }
 
 fn v1_defended_by_count() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_V1_DEFENDED").is_ok_and(|v| v == "1"))
+    crate::config::current(|c| c.strategy.v1_defended_by_count)
 }
 
 /// 思考予算に比例して各種の粒子数・読み幅を決める
@@ -2520,6 +2299,490 @@ pub(crate) fn exchange_value(role: Role) -> f64 {
 
 /// 着手後の自駒の利き被覆マス数（自分に見える盤面だけの近似）。
 /// 相手の駒は見えないため飛び駒は自駒にだけ遮られる楽観値
+
+/// **評価側の設定**（issue #21）。`TSUITATE_*` を構成境界で一度だけ解釈した
+/// 結果で、strategy instance が [`crate::config::StrategyConfig`] として持つ。
+///
+/// フィールドは同名のアクセサ関数と1対1で、既定値・検証（範囲クリップ）は
+/// アクセサの doc コメントに残してある。**プロセス env は読まない**ので、
+/// 候補へノブを渡しても同じプロセスの凍結相手には効かない。
+#[derive(Clone, Debug, PartialEq)]
+pub struct StrategyKnobs {
+    /// `taint_king_prefer_empty()` の解決値。
+    pub taint_king_prefer_empty: bool,
+    /// `eval_taint_fallback()` の解決値。
+    pub eval_taint_fallback: bool,
+    /// `eval_taint_attack_w()` の解決値。
+    pub eval_taint_attack_w: f64,
+    /// `link_endgame_dampen()` の解決値。
+    pub link_endgame_dampen: f64,
+    /// `hand_asset_w()` の解決値。
+    pub hand_asset_w: f64,
+    /// `king_known_approach_w()` の解決値。
+    pub king_known_approach_w: f64,
+    /// `promote_far_w()` の解決値。
+    pub promote_far_w: f64,
+    /// `king_file_pawn_w()` の解決値。
+    pub king_file_pawn_w: f64,
+    /// `king_file_pawn_mid_w()` の解決値。
+    pub king_file_pawn_mid_w: f64,
+    /// `king_endgame_flee_w()` の解決値。
+    pub king_endgame_flee_w: f64,
+    /// `gold_join_king_w()` の解決値。
+    pub gold_join_king_w: f64,
+    /// `gold_king_file_w()` の解決値。
+    pub gold_king_file_w: f64,
+    /// `knight_late_promo_w()` の解決値。
+    pub knight_late_promo_w: f64,
+    /// `knight_endgame_promo_w()` の解決値。
+    pub knight_endgame_promo_w: f64,
+    /// `knight_camp_exit_w()` の解決値。
+    pub knight_camp_exit_w: f64,
+    /// `silver_camp_exit_w()` の解決値。
+    pub silver_camp_exit_w: f64,
+    /// `king_file_gold_w()` の解決値。
+    pub king_file_gold_w: f64,
+    /// `tokin_file_drift_w()` の解決値。
+    pub tokin_file_drift_w: f64,
+    /// `pawn_offfile_w()` の解決値。
+    pub pawn_offfile_w: f64,
+    /// `far_major_promo_capture_w()` の解決値。
+    pub far_major_promo_capture_w: f64,
+    /// `own_camp_idle_w()` の解決値。
+    pub own_camp_idle_w: f64,
+    /// `bishop_retreat_w()` の解決値。
+    pub bishop_retreat_w: f64,
+    /// `endgame_camp_general_w()` の解決値。
+    pub endgame_camp_general_w: f64,
+    /// `unbacked_camp_w()` の解決値。
+    pub unbacked_camp_w: f64,
+    /// `unbacked_gs_capture_w()` の解決値。
+    pub unbacked_gs_capture_w: f64,
+    /// `belief_occ_cap_w()` の解決値。
+    pub belief_occ_cap_w: f64,
+    /// `home_gold_attack_w()` の解決値。
+    pub home_gold_attack_w: f64,
+    /// `tokin_approach_w()` の解決値。
+    pub tokin_approach_w: f64,
+    /// `king_adj_heavy_w()` の解決値。
+    pub king_adj_heavy_w: f64,
+    /// `own_camp_minor_promo_w()` の解決値。
+    pub own_camp_minor_promo_w: f64,
+    /// `king_cand_attack_w()` の解決値。
+    pub king_cand_attack_w: f64,
+    /// `king_cand_check_w()` の解決値。
+    pub king_cand_check_w: f64,
+    /// `king_cand_attack_gate()` の解決値。
+    pub king_cand_attack_gate: usize,
+    /// `landing_support_w()` の解決値。
+    pub landing_support_w: f64,
+    /// `king_belief_prox_w()` の解決値。
+    pub king_belief_prox_w: f64,
+    /// `promote_far_all()` の解決値。
+    pub promote_far_all: bool,
+    /// `king_cand_attack_blind_only()` の解決値。
+    pub king_cand_attack_blind_only: bool,
+    /// `promote_check_reveal_w()` の解決値。
+    pub promote_check_reveal_w: f64,
+    /// `nonpromote_check_w()` の解決値。
+    pub nonpromote_check_w: f64,
+    /// `nonpromote_check_p()` の解決値。
+    pub nonpromote_check_p: f64,
+    /// `check_king_gain_mean()` の解決値。
+    pub check_king_gain_mean: bool,
+    /// `check_safe_resolve_enabled()` の解決値。
+    pub check_safe_resolve_enabled: bool,
+    /// `gen_nonpromote_minor()` の解決値。
+    pub gen_nonpromote_minor: bool,
+    /// `gen_nonpromote()` の解決値。
+    pub gen_nonpromote: bool,
+    /// `promo_risk_prerole()` の解決値。
+    pub promo_risk_prerole: bool,
+    /// `capture_retreat_w()` の解決値。
+    pub capture_retreat_w: f64,
+    /// `v1_pressure_multiplicity()` の解決値。
+    pub v1_pressure_multiplicity: bool,
+    /// `v1_defended_by_count()` の解決値。
+    pub v1_defended_by_count: bool,
+    /// `drop_hit_all_ranks()` の解決値。
+    pub drop_hit_all_ranks: bool,
+    /// `promo_decay()` の解決値。
+    pub promo_decay: f64,
+    /// `promo_realized_floor()` の解決値。
+    pub promo_realized_floor: f64,
+    /// `king_prox_exclude_self()` の解決値。
+    pub king_prox_exclude_self: bool,
+    /// `check_foul_prior_boost()` の解決値。
+    pub check_foul_prior_boost: f64,
+    /// `stale_threat_w()` の解決値。
+    pub stale_threat_w: f64,
+    /// `blind_recapture_w()` の解決値。
+    pub blind_recapture_w: f64,
+    /// `blind_home_risk_w()` の解決値。
+    pub blind_home_risk_w: f64,
+    /// `eval_weight_cap()` の解決値。
+    pub eval_weight_cap: f64,
+    /// `king_repeat_foul_w()` の解決値。
+    pub king_repeat_foul_w: f64,
+    /// `last_foul_guard()` の解決値。
+    pub last_foul_guard: f64,
+    /// `last_foul_guard_2()` の解決値。
+    pub last_foul_guard_2: f64,
+    /// `last_foul_guard_3()` の解決値。
+    pub last_foul_guard_3: f64,
+    /// `blind_home_drop_occ_w()` の解決値。
+    pub blind_home_drop_occ_w: f64,
+    /// `blind_home_floor()` の解決値。
+    pub blind_home_floor: f64,
+    /// `blind_home_lambda()` の解決値。
+    pub blind_home_lambda: f64,
+    /// `belief_gain_w()` の解決値。
+    pub belief_gain_w: f64,
+    /// `king_net_w()` の解決値。
+    pub king_net_w: f64,
+    /// `king_net_proj()` の解決値。
+    pub king_net_proj: bool,
+    /// `king_probe_w()` の解決値。
+    pub king_probe_w: f64,
+    /// `path_probe_w()` の解決値。
+    pub path_probe_w: f64,
+    /// `king_sensor_w()` の解決値。
+    pub king_sensor_w: f64,
+    /// `sensor_p_push()` の解決値。
+    pub sensor_p_push: f64,
+    /// `sensor_p_promo()` の解決値。
+    pub sensor_p_promo: f64,
+    /// `probe_audit()` の解決値。
+    pub probe_audit: bool,
+    /// `probe_anchor_decay()` の解決値。
+    pub probe_anchor_decay: f64,
+    /// `probe_threat_w()` の解決値。
+    pub probe_threat_w: f64,
+    /// `drop_probe_repeat_gate()` の解決値。
+    pub drop_probe_repeat_gate: bool,
+    /// `depth2_focal_k()` の解決値。
+    pub depth2_focal_k: usize,
+    /// `threat_by_count()` の解決値。
+    pub threat_by_count: bool,
+    /// `nonpromote_check_roles()` の解決値。
+    pub nonpromote_check_roles: String,
+    /// `taint_king_fix()` の解決値。
+    pub taint_king_fix: bool,
+    /// 局所被覆度リスクを有効化する（`TSUITATE_ENABLE_HANG_RISK`）。
+    pub enable_hang_risk: bool,
+    /// 王手解消の診断出力（`TSUITATE_DEBUG_CHECK`）。
+    pub debug_check: bool,
+}
+
+impl StrategyKnobs {
+    pub(crate) fn from_source(src: &crate::config::EnvSource) -> Self {
+        StrategyKnobs {
+            taint_king_prefer_empty: { !src.var("TSUITATE_TAINT_KING_EMPTY").is_ok_and(|v| v == "0") },
+            eval_taint_fallback: { src.var("TSUITATE_EVAL_TAINT_FALLBACK").is_ok_and(|v| v == "1") },
+            eval_taint_attack_w: { src.var("TSUITATE_EVAL_TAINT_ATTACK")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+            .unwrap_or(0.0) },
+            link_endgame_dampen: { src.var("TSUITATE_LINK_ENDGAME_DAMPEN")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(LINK_ENDGAME_DAMPEN) },
+            hand_asset_w: { src.var("TSUITATE_HAND_ASSET_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(HAND_ASSET_W) },
+            king_known_approach_w: { src.var("TSUITATE_KING_KNOWN_APPROACH_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(KING_KNOWN_APPROACH_W) },
+            promote_far_w: { src.var("TSUITATE_PROMOTE_FAR_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(PROMOTE_FAR_W) },
+            king_file_pawn_w: { src.var("TSUITATE_KING_FILE_PAWN_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(KING_FILE_PAWN_W) },
+            king_file_pawn_mid_w: { src.var("TSUITATE_KING_FILE_PAWN_MID_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(KING_FILE_PAWN_MID_W) },
+            king_endgame_flee_w: { src.var("TSUITATE_KING_ENDGAME_FLEE_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(KING_ENDGAME_FLEE_W) },
+            gold_join_king_w: { src.var("TSUITATE_GOLD_JOIN_KING_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(GOLD_JOIN_KING_W) },
+            gold_king_file_w: { src.var("TSUITATE_GOLD_KING_FILE_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(GOLD_KING_FILE_W) },
+            knight_late_promo_w: { src.var("TSUITATE_KNIGHT_LATE_PROMO_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(KNIGHT_LATE_PROMO_W) },
+            knight_endgame_promo_w: { src.var("TSUITATE_KNIGHT_ENDGAME_PROMO_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(KNIGHT_ENDGAME_PROMO_W) },
+            knight_camp_exit_w: { src.var("TSUITATE_KNIGHT_CAMP_EXIT_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(KNIGHT_CAMP_EXIT_W) },
+            silver_camp_exit_w: { src.var("TSUITATE_SILVER_CAMP_EXIT_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(SILVER_CAMP_EXIT_W) },
+            king_file_gold_w: { src.var("TSUITATE_KING_FILE_GOLD_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(KING_FILE_GOLD_W) },
+            tokin_file_drift_w: { src.var("TSUITATE_TOKIN_FILE_DRIFT_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(TOKIN_FILE_DRIFT_W) },
+            pawn_offfile_w: { src.var("TSUITATE_PAWN_OFFFILE_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(PAWN_OFFFILE_W) },
+            far_major_promo_capture_w: { src.var("TSUITATE_FAR_MAJOR_PROMO_CAPTURE_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(FAR_MAJOR_PROMO_CAPTURE_W) },
+            own_camp_idle_w: { src.var("TSUITATE_OWN_CAMP_IDLE_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(OWN_CAMP_IDLE_W) },
+            bishop_retreat_w: { src.var("TSUITATE_BISHOP_RETREAT_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(BISHOP_RETREAT_W) },
+            endgame_camp_general_w: { src.var("TSUITATE_ENDGAME_CAMP_GENERAL_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(ENDGAME_CAMP_GENERAL_W) },
+            unbacked_camp_w: { src.var("TSUITATE_UNBACKED_CAMP_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(UNBACKED_CAMP_W) },
+            unbacked_gs_capture_w: { src.var("TSUITATE_UNBACKED_GS_CAPTURE_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(UNBACKED_GS_CAPTURE_W) },
+            belief_occ_cap_w: { src.var("TSUITATE_BELIEF_OCC_CAP_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(BELIEF_OCC_CAP_W) },
+            home_gold_attack_w: { src.var("TSUITATE_HOME_GOLD_ATTACK_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(HOME_GOLD_ATTACK_W) },
+            tokin_approach_w: { src.var("TSUITATE_TOKIN_APPROACH_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(TOKIN_APPROACH_W) },
+            king_adj_heavy_w: { src.var("TSUITATE_KING_ADJ_HEAVY_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(KING_ADJ_HEAVY_W) },
+            own_camp_minor_promo_w: { src.var("TSUITATE_OWN_CAMP_MINOR_PROMO_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(OWN_CAMP_MINOR_PROMO_W) },
+            king_cand_attack_w: { src.var("TSUITATE_KING_CAND_ATTACK_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(KING_CAND_ATTACK_W) },
+            king_cand_check_w: { src.var("TSUITATE_KING_CAND_CHECK_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(KING_CAND_CHECK_W) },
+            king_cand_attack_gate: { src.var("TSUITATE_KING_CAND_ATTACK_GATE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(20) },
+            landing_support_w: { src.var("TSUITATE_LANDING_SUPPORT_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(LANDING_SUPPORT_W) },
+            king_belief_prox_w: { src.var("TSUITATE_KING_BELIEF_PROX_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(KING_BELIEF_PROX_W) },
+            promote_far_all: { src.var("TSUITATE_PROMOTE_FAR_ALL").is_ok_and(|v| v == "1") },
+            king_cand_attack_blind_only: { src.var("TSUITATE_KING_CAND_ATTACK_BLIND").is_ok_and(|v| v == "1") },
+            promote_check_reveal_w: { src.var("TSUITATE_PROMOTE_CHECK_REVEAL_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(PROMOTE_CHECK_REVEAL_W) },
+            nonpromote_check_w: { src.var("TSUITATE_NONPROMOTE_CHECK_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0) },
+            nonpromote_check_p: { src.var("TSUITATE_NONPROMOTE_CHECK_P")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .unwrap_or(0.2) },
+            check_king_gain_mean: { src.var("TSUITATE_CHECK_KING_GAIN_MEAN").map_or(true, |v| v != "0") },
+            check_safe_resolve_enabled: { src.var("TSUITATE_CHECK_SAFE_RESOLVE").is_ok_and(|v| v != "0") },
+            gen_nonpromote_minor: { src.var("TSUITATE_GEN_NONPROMOTE").is_ok_and(|v| v == "minor") },
+            gen_nonpromote: { src.var("TSUITATE_GEN_NONPROMOTE").is_ok_and(|v| v == "1") },
+            promo_risk_prerole: { src.var("TSUITATE_PROMO_RISK_PREROLE").map_or(true, |v| v == "1") },
+            capture_retreat_w: { src.var("TSUITATE_CAPTURE_RETREAT_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(CAPTURE_RETREAT_W) },
+            v1_pressure_multiplicity: { src.var("TSUITATE_V1_PRESSURE").is_ok_and(|v| v == "1") },
+            v1_defended_by_count: { src.var("TSUITATE_V1_DEFENDED").is_ok_and(|v| v == "1") },
+            drop_hit_all_ranks: { !src.var("TSUITATE_DROP_HIT_ALL_RANKS").is_ok_and(|v| v == "0") },
+            promo_decay: { src.var("TSUITATE_PROMO_DECAY")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| (0.1..=1.0).contains(v))
+            .unwrap_or(PROMO_POTENTIAL_DECAY) },
+            promo_realized_floor: { src.var("TSUITATE_PROMO_REALIZED_FLOOR")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| (0.0..=1.0).contains(v))
+            .unwrap_or(0.0) },
+            king_prox_exclude_self: { src.var("TSUITATE_KING_PROX_EXCLUDE_SELF")
+            .ok()
+            .map(|v| v != "0")
+            .unwrap_or(true) },
+            check_foul_prior_boost: { src.var("TSUITATE_CHECK_FOUL_PRIOR_BOOST")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .filter(|v: &f64| v.is_finite() && *v >= 0.0)
+            .unwrap_or(3.0) },
+            stale_threat_w: { src.var("TSUITATE_STALE_THREAT_W")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|v: &f64| v.is_finite() && (0.0..=1.0).contains(v))
+            .unwrap_or(0.0) },
+            blind_recapture_w: { src.var("TSUITATE_BLIND_RECAPTURE_W")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(BLIND_RECAPTURE_W) },
+            blind_home_risk_w: { src.var("TSUITATE_BLIND_HOME_RISK_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0) },
+            eval_weight_cap: { src.var("TSUITATE_EVAL_WEIGHT_CAP")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+            .unwrap_or(1.0) },
+            king_repeat_foul_w: { src.var("TSUITATE_KING_REPEAT_FOUL_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(KING_REPEAT_FOUL_W) },
+            last_foul_guard: { src.var("TSUITATE_LAST_FOUL_GUARD")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(LAST_FOUL_GUARD) },
+            last_foul_guard_2: { src.var("TSUITATE_LAST_FOUL_GUARD_2")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(LAST_FOUL_GUARD_2) },
+            last_foul_guard_3: { src.var("TSUITATE_LAST_FOUL_GUARD_3")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(LAST_FOUL_GUARD_3) },
+            blind_home_drop_occ_w: { src.var("TSUITATE_BLIND_HOME_DROP_OCC_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+            .unwrap_or(0.0) },
+            blind_home_floor: { src.var("TSUITATE_BLIND_HOME_FLOOR")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
+            .unwrap_or(0.2) },
+            blind_home_lambda: { src.var("TSUITATE_BLIND_HOME_LAMBDA")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.045) },
+            belief_gain_w: { src.var("TSUITATE_BELIEF_GAIN_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .unwrap_or(0.0) },
+            king_net_w: { src.var("TSUITATE_KING_NET_W")
+            .ok()
+            .and_then(|v| v.parse::<f64>().ok())
+            .filter(|v| v.is_finite())
+            .map(|v| v.clamp(0.0, 1.0))
+            .unwrap_or(0.0) },
+            king_net_proj: { !src.var("TSUITATE_KING_NET_PROJ").is_ok_and(|v| v == "0") },
+            king_probe_w: { probe_env(src, "TSUITATE_KING_PROBE_W", 0.0) },
+            path_probe_w: { probe_env(src, "TSUITATE_PATH_PROBE_W", 0.0) },
+            king_sensor_w: { probe_env(src, "TSUITATE_KING_SENSOR_W", 0.0) },
+            sensor_p_push: { probe_env(src, "TSUITATE_SENSOR_P_PUSH", 0.3).min(1.0) },
+            sensor_p_promo: { probe_env(src, "TSUITATE_SENSOR_P_PROMO", 0.8).min(1.0) },
+            probe_audit: { src.var("TSUITATE_PROBE_AUDIT").is_ok_and(|v| v == "1") },
+            probe_anchor_decay: { probe_env(src, "TSUITATE_PROBE_ANCHOR_DECAY", 0.5).clamp(0.0, 1.0) },
+            probe_threat_w: { probe_env(src, "TSUITATE_PROBE_THREAT_W", 0.0) },
+            drop_probe_repeat_gate: { src.var("TSUITATE_DROP_PROBE_REPEAT_GATE").is_ok_and(|v| v == "1") },
+            depth2_focal_k: { src.var("TSUITATE_DEPTH2_FOCAL_K")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0) },
+            threat_by_count: { src.var("TSUITATE_THREAT_BY_COUNT").is_ok_and(|v| v == "1") },
+            nonpromote_check_roles: {
+                src.var("TSUITATE_NONPROMOTE_CHECK_ROLES")
+                    .unwrap_or_else(|_| "minor".into())
+            },
+            taint_king_fix: !src.var("TSUITATE_TAINT_KING_FIX").is_ok_and(|v| v == "0"),
+            enable_hang_risk: src.var("TSUITATE_ENABLE_HANG_RISK").is_ok(),
+            debug_check: src.var("TSUITATE_DEBUG_CHECK").is_ok(),
+        }
+    }
+}
+
 #[cfg(test)]
 fn coverage_after(view: &PlayerView, mv: &ShogiMove) -> f64 {
     own_effects_after(view, mv, None, None, &EvalParams::default()).coverage
@@ -2864,8 +3127,7 @@ fn drop_hit_exposure(pieces: &[VisiblePiece], me: Color) -> f64 {
 /// 打ち当て露出を**全段**で数えるか（既定 on、`TSUITATE_DROP_HIT_ALL_RANKS=0` で
 /// 旧挙動 = 敵陣の大駒のみ）。`drop_hit_exposure` の doc 参照
 fn drop_hit_all_ranks() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| !std::env::var("TSUITATE_DROP_HIT_ALL_RANKS").is_ok_and(|v| v == "0"))
+    crate::config::current(|c| c.strategy.drop_hit_all_ranks)
 }
 
 /// 成りポテンシャルの手数減衰（既定: 1手遠いごとに半減）。
@@ -2874,14 +3136,7 @@ fn drop_hit_all_ranks() -> bool {
 /// 通常将棋の感覚より高い生存率（緩い減衰）が正当化されうる
 /// （「静かな準備の手の複数手先の価値」2026-08-06）
 fn promo_decay() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_PROMO_DECAY")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| (0.1..=1.0).contains(v))
-            .unwrap_or(PROMO_POTENTIAL_DECAY)
-    })
+    crate::config::current(|c| c.strategy.promo_decay)
 }
 /// 成りポテンシャルの手数減衰の既定値
 const PROMO_POTENTIAL_DECAY: f64 = 0.5;
@@ -2971,14 +3226,7 @@ fn promo_potential(
 
 /// 実現済みの成りの prox 床（`TSUITATE_PROMO_REALIZED_FLOOR`、既定 0 = 床なし）
 fn promo_realized_floor() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_PROMO_REALIZED_FLOOR")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| (0.0..=1.0).contains(v))
-            .unwrap_or(0.0)
-    })
+    crate::config::current(|c| c.strategy.promo_realized_floor)
 }
 
 /// 残存する相手駒（玉除く）の平均交換価値（`foul_occ_attack_w` の素材）。
@@ -3043,13 +3291,7 @@ fn promo_king_prox_map(w: f64, cands: &std::collections::BTreeSet<Coord>) -> Opt
 /// 接近ボーナスを既定オンにしたので、距離0を残すと P*5b 型が最大加点を
 /// 受ける。v13 以前の凍結版はこの名前を知らない（v14 は読む）。
 fn king_prox_exclude_self() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_KING_PROX_EXCLUDE_SELF")
-            .ok()
-            .map(|v| v != "0")
-            .unwrap_or(true)
-    })
+    crate::config::current(|c| c.strategy.king_prox_exclude_self)
 }
 
 fn king_cand_prox_map(cands: &std::collections::BTreeSet<Coord>) -> [f64; 81] {
@@ -4790,6 +5032,10 @@ pub struct EstimatorStrategy {
     last_debug: Option<serde_json::Value>,
     /// 直近の choose 時点の全候補評価（スコア降順、scenario-gui 用）
     last_ranking: Option<Vec<CandidateScore>>,
+    /// **この instance の設定**（issue #21）。trait メソッドの入口で
+    /// `crate::config::scoped` に設置するので、同じプロセスの別 instance
+    /// （凍結相手・別 arm の候補）とは混ざらない
+    config: Arc<crate::config::StrategyConfig>,
 }
 
 impl EstimatorStrategy {
@@ -4812,19 +5058,32 @@ impl EstimatorStrategy {
         Self::with_params_line_seed(params, book_line, None)
     }
 
-    /// シードつきで作る（SPSA の f+/f− 評価で対局条件を揃える共通乱数法用）
+    /// シードつきで作る（SPSA の f+/f− 評価で対局条件を揃える共通乱数法用）。
+    /// 設定は ambient（プロセス env を一度だけ解釈したもの）を使う。
     pub fn with_params_line_seed(
         params: EvalParams,
         book_line: Option<usize>,
         seed: Option<u64>,
     ) -> Self {
-        let params = apply_env_param_overrides(params);
+        Self::with_config(crate::config::ambient(), params, book_line, seed)
+    }
+
+    /// **設定を明示して作る**（issue #21 の入口）。arena / checkpoint arena が
+    /// arm ごとに別の設定を渡すのはここ。プロセス env は触らないので、
+    /// 同じプロセスで走る凍結相手は既定値のまま動く。
+    pub fn with_config(
+        config: Arc<crate::config::StrategyConfig>,
+        params: EvalParams,
+        book_line: Option<usize>,
+        seed: Option<u64>,
+    ) -> Self {
+        let params = apply_param_overrides(params, &config.source);
         EstimatorStrategy {
             est: None,
             book: None,
             book_line,
             params,
-            budget: SearchBudget::from_ms(think_budget_ms()),
+            budget: SearchBudget::from_ms(config.think_budget_ms),
             seed,
             rng: match seed {
                 Some(s) => StdRng::seed_from_u64(s ^ 0xA5A5_5A5A_DEAD_BEEF),
@@ -4832,7 +5091,18 @@ impl EstimatorStrategy {
             },
             last_debug: None,
             last_ranking: None,
+            config,
         }
+    }
+
+    /// この instance の設定（記録・検査用）。
+    pub fn config(&self) -> &Arc<crate::config::StrategyConfig> {
+        &self.config
+    }
+
+    /// 注入されたシード（None = エントロピー由来）。テスト・診断用。
+    pub fn seed(&self) -> Option<u64> {
+        self.seed
     }
 }
 
@@ -4841,8 +5111,15 @@ impl EstimatorStrategy {
 /// いればそちらを優先する。bin/tune はこの関数で「調整対象ノブが env に
 /// 潰されていないか」を起動時に検査する
 pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
+    apply_param_overrides(params, &crate::config::current_config().source)
+}
+
+/// `EvalParams` の上書きを **config から** 当てる（issue #21）。
+/// env はここでは読まない: 呼び出し側が [`crate::config::EnvSource`] を
+/// 明示的に渡すので、候補と凍結相手へ別々の値を安全に与えられる。
+pub fn apply_param_overrides(params: EvalParams, src: &crate::config::EnvSource) -> EvalParams {
     // 実現成りの固定バイアス（既存SPSA項のスイープ・切り戻し用）
-    let params = match std::env::var("TSUITATE_PROMOTE_BIAS")
+    let params = match src.var("TSUITATE_PROMOTE_BIAS")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite())
@@ -4855,7 +5132,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
     };
     // valueネット重みの運用ノブ（デプロイ時の切り戻し・アブレーション用）。
     // SPSA（with_params 経由）でも env が設定されていればそちらを優先する
-    let params = match std::env::var("TSUITATE_VALUE_NN_W")
+    let params = match src.var("TSUITATE_VALUE_NN_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
     {
@@ -4866,7 +5143,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 除去期待値項の運用ノブ（w スイープ・切り戻し用）
-    let params = match std::env::var("TSUITATE_CHECKER_REMOVAL_W")
+    let params = match src.var("TSUITATE_CHECKER_REMOVAL_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
     {
@@ -4877,7 +5154,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 捕獲賭け分散ペナルティの運用ノブ（w スイープ・切り戻し用）
-    let params = match std::env::var("TSUITATE_CAPTURE_BET_VAR_W")
+    let params = match src.var("TSUITATE_CAPTURE_BET_VAR_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
     {
@@ -4888,7 +5165,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 詰めろ生成ボーナスの運用ノブ（w スイープ・切り戻し用）
-    let params = match std::env::var("TSUITATE_MATE_THREAT_W")
+    let params = match src.var("TSUITATE_MATE_THREAT_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
     {
@@ -4899,7 +5176,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 被詰めろペナルティの運用ノブ（w スイープ・切り戻し用）
-    let params = match std::env::var("TSUITATE_MATE_RISK_W")
+    let params = match src.var("TSUITATE_MATE_RISK_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
     {
@@ -4910,7 +5187,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 自玉8近傍の穴の運用ノブ（w スイープ・切り戻し用）
-    let params = match std::env::var("TSUITATE_KING_HOLE_W")
+    let params = match src.var("TSUITATE_KING_HOLE_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
     {
@@ -4921,7 +5198,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 予防的な紐（V3）の運用ノブ（w スイープ・切り戻し用。0 で従来挙動）
-    let params = match std::env::var("TSUITATE_LINK_W")
+    let params = match src.var("TSUITATE_LINK_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
     {
@@ -4932,7 +5209,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 紐の働き重み付け（V3 の拡張）の運用ノブ（w スイープ・切り戻し用）
-    let params = match std::env::var("TSUITATE_LINK_WORK_W")
+    let params = match src.var("TSUITATE_LINK_WORK_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
@@ -4943,7 +5220,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         },
         None => params,
     };
-    let params = match std::env::var("TSUITATE_LINK_WORK_REF")
+    let params = match src.var("TSUITATE_LINK_WORK_REF")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v > 0.0)
@@ -4955,7 +5232,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 王手の強さ（解消手数Kによる値付け）の運用ノブ（w スイープ・切り戻し用）
-    let params = match std::env::var("TSUITATE_CHECK_STRENGTH_W")
+    let params = match src.var("TSUITATE_CHECK_STRENGTH_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite())
@@ -4970,7 +5247,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
     // 運用ノブ。既定 0.0622 は実測（直接王手の53〜56%が即取られ）に対して
     // 過小の疑いがあり、quest31-m021 の 4一と（幻の金への王手込み突進）の
     // スイープ用に env を開ける
-    let params = match std::env::var("TSUITATE_MOVER_CHECK_EXTRA")
+    let params = match src.var("TSUITATE_MOVER_CHECK_EXTRA")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -4982,7 +5259,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 大駒の成り道（0 で従来挙動）
-    let params = match std::env::var("TSUITATE_MAJOR_PROMO_PATH_W")
+    let params = match src.var("TSUITATE_MAJOR_PROMO_PATH_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -4994,7 +5271,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 錨外し（0 で従来挙動）
-    let params = match std::env::var("TSUITATE_ANCHOR_MOVE_W")
+    let params = match src.var("TSUITATE_ANCHOR_MOVE_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5006,7 +5283,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // ブラインド玉攻め加点の生存割引（0 で従来挙動）
-    let params = match std::env::var("TSUITATE_BLIND_ATTACK_SURVIVE_W")
+    let params = match src.var("TSUITATE_BLIND_ATTACK_SURVIVE_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5018,7 +5295,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 鉢合わせ（敵歩の正面。0 で従来挙動）
-    let params = match std::env::var("TSUITATE_EXPOSED_PAWN_HEAD_W")
+    let params = match src.var("TSUITATE_EXPOSED_PAWN_HEAD_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5032,7 +5309,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
     // 位置を知られている駒の当たり重み（既定 0.1659。較正の実測は
     // 「知られている駒は知られていない駒の 6.6〜7.9倍取られる」= 大幅に不足。
     // 既定は変えずスイープ経路だけ用意する。bin/collision_probe 参照）
-    let params = match std::env::var("TSUITATE_EXPOSED_KNOWN")
+    let params = match src.var("TSUITATE_EXPOSED_KNOWN")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5044,7 +5321,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 当たっている自駒の複数枚計上（0 で従来の max）
-    let params = match std::env::var("TSUITATE_EXPOSED_MULTI_W")
+    let params = match src.var("TSUITATE_EXPOSED_MULTI_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5056,7 +5333,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // taint 占有合意による打ちの反則回避（0 で従来挙動）
-    let params = match std::env::var("TSUITATE_TAINT_OCC_LEGAL_W")
+    let params = match src.var("TSUITATE_TAINT_OCC_LEGAL_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5071,7 +5348,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
     // 固有の守備範囲が「正当な継続手」（quest31-m073 の 4二成桂→5二成桂）と
     // 重なっている疑いがあり、膠着側は backtrack_penalty / repeat_penalty_w が
     // 上位互換でカバーする
-    let params = match std::env::var("TSUITATE_SHUFFLE_PENALTY")
+    let params = match src.var("TSUITATE_SHUFFLE_PENALTY")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5083,7 +5360,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 打ち反則で確定した駒への当たり（0 で従来挙動）
-    let params = match std::env::var("TSUITATE_FOUL_OCC_ATTACK_W")
+    let params = match src.var("TSUITATE_FOUL_OCC_ATTACK_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5095,7 +5372,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 材料の退化ゲート（0 で従来挙動）
-    let params = match std::env::var("TSUITATE_MATERIAL_DEGEN_Q0")
+    let params = match src.var("TSUITATE_MATERIAL_DEGEN_Q0")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5107,7 +5384,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 自玉近傍の敵駒の排除（0 で従来挙動）
-    let params = match std::env::var("TSUITATE_OWN_ZONE_CAPTURE_W")
+    let params = match src.var("TSUITATE_OWN_ZONE_CAPTURE_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5119,7 +5396,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 成りポテンシャルの敵玉近接重み（0 で従来挙動）
-    let params = match std::env::var("TSUITATE_PROMO_KING_PROX")
+    let params = match src.var("TSUITATE_PROMO_KING_PROX")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
@@ -5131,7 +5408,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 玉で取る手の露見実効価値（0 で従来挙動）
-    let params = match std::env::var("TSUITATE_KING_CAPTURE_REVEAL")
+    let params = match src.var("TSUITATE_KING_CAPTURE_REVEAL")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5143,7 +5420,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 2手読みの楽観置き換えの上限（F3。0 で従来挙動）
-    let params = match std::env::var("TSUITATE_DEPTH2_OPTIMISM_CAP")
+    let params = match src.var("TSUITATE_DEPTH2_OPTIMISM_CAP")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5155,7 +5432,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 打ちプローブの反則情報価値（w スイープ・切り戻し用。0 で従来挙動）
-    let params = match std::env::var("TSUITATE_DROP_PROBE_W")
+    let params = match src.var("TSUITATE_DROP_PROBE_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5167,7 +5444,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 玉隣接への無支え進入ペナルティ（w スイープ・切り戻し用。0 で従来挙動）
-    let params = match std::env::var("TSUITATE_KING_ADJ_ENTRY_W")
+    let params = match src.var("TSUITATE_KING_ADJ_ENTRY_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5179,7 +5456,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 幻の詰みゲート（w スイープ・切り戻し用。0 で従来挙動）
-    let params = match std::env::var("TSUITATE_MATE_GATE_Q0")
+    let params = match src.var("TSUITATE_MATE_GATE_Q0")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5191,7 +5468,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 構想の読み（自分の手 → 自分の次の手）の運用ノブ（0 で従来挙動）
-    let params = match std::env::var("TSUITATE_PLAN_W")
+    let params = match src.var("TSUITATE_PLAN_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5203,7 +5480,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 同じ自陣形への往復の累積減点（0 で従来挙動）
-    let params = match std::env::var("TSUITATE_REPEAT_PENALTY_W")
+    let params = match src.var("TSUITATE_REPEAT_PENALTY_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5215,7 +5492,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 玉距離重み付き利き（V2）の運用ノブ（w スイープ用。0 で従来挙動）
-    let params = match std::env::var("TSUITATE_EFFECT_OWN_W")
+    let params = match src.var("TSUITATE_EFFECT_OWN_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite())
@@ -5226,7 +5503,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         },
         None => params,
     };
-    let params = match std::env::var("TSUITATE_EFFECT_OPP_W")
+    let params = match src.var("TSUITATE_EFFECT_OPP_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite())
@@ -5239,7 +5516,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
     };
     // 盤上駒の減価（V5）の運用ノブ（w スイープ用。0 で従来挙動。
     // やねうら王の比率は 0.102。負の値も許す＝持ち駒より盤上を好む側）
-    let params = match std::env::var("TSUITATE_BOARD_DISCOUNT_W")
+    let params = match src.var("TSUITATE_BOARD_DISCOUNT_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite())
@@ -5251,7 +5528,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 逃げマス被覆（凸）の運用ノブ（w スイープ用。0 で従来挙動）
-    let params = match std::env::var("TSUITATE_ESCAPE_COVER_W")
+    let params = match src.var("TSUITATE_ESCAPE_COVER_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5263,7 +5540,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 守り駒捕獲ボーナスの運用ノブ（w スイープ用。0 で従来挙動）
-    let params = match std::env::var("TSUITATE_DEFENDER_CAPTURE_W")
+    let params = match src.var("TSUITATE_DEFENDER_CAPTURE_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5275,7 +5552,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 打ち当て露出の運用ノブ（w スイープ用。0 で従来挙動）
-    let params = match std::env::var("TSUITATE_DROP_HIT_EVAC_W")
+    let params = match src.var("TSUITATE_DROP_HIT_EVAC_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5287,7 +5564,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 成りポテンシャルの運用ノブ（w スイープ用。0 で従来挙動）
-    let params = match std::env::var("TSUITATE_PROMO_POTENTIAL_W")
+    let params = match src.var("TSUITATE_PROMO_POTENTIAL_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5299,7 +5576,7 @@ pub fn apply_env_param_overrides(params: EvalParams) -> EvalParams {
         None => params,
     };
     // 持ち駒オプション価値の運用ノブ（w スイープ用。0 で従来挙動）
-    let params = match std::env::var("TSUITATE_HAND_OPTION_W")
+    let params = match src.var("TSUITATE_HAND_OPTION_W")
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -5325,6 +5602,7 @@ impl Strategy for EstimatorStrategy {
     }
 
     fn prewarm(&mut self, view: &PlayerView, log: &ObservationLog) {
+        let _cfg = crate::config::scoped(&self.config);
         let budget = self.budget;
         let seed = self.seed;
         let est = self.est.get_or_insert_with(|| match seed {
@@ -5340,6 +5618,7 @@ impl Strategy for EstimatorStrategy {
         log_prefix: &ObservationLog,
         truth: &Position,
     ) -> bool {
+        let _cfg = crate::config::scoped(&self.config);
         let budget = self.budget;
         let seed = self.seed;
         let est = self.est.get_or_insert_with(|| match seed {
@@ -5356,6 +5635,10 @@ impl Strategy for EstimatorStrategy {
         log: &ObservationLog,
         foul_tried: &HashSet<String>,
     ) -> Option<String> {
+        // この instance の設定をこのスレッドへ設置する（issue #21）。
+        // 評価・推定の実装は深い呼び出しの奥から定数を引くので、引数で
+        // 引き回す代わりに入口で設置し、抜けるときに元へ戻す
+        let _cfg = crate::config::scoped(&self.config);
         let budget = self.budget;
         let seed = self.seed;
         // 定跡・候補ゼロで早期 return したとき前の手番のランキングが残らないように
@@ -5482,7 +5765,7 @@ impl Strategy for EstimatorStrategy {
                 pool.truncate(TAINT_POOL_CAP);
             }
             // 切り戻し・アブレーション用ノブ（既定は有効）
-            if std::env::var("TSUITATE_TAINT_KING_FIX").is_ok_and(|v| v == "0") {
+            if !taint_king_fix() {
                 pool.iter().map(|&(p, w)| (p.clone(), w)).collect()
             } else {
                 let cands = crate::deduce::opp_king_candidates(view.your_color, log);
@@ -5642,8 +5925,8 @@ impl Strategy for EstimatorStrategy {
         // 実測とも整合）。局所被覆度は玉位置と違い複数駒の相対位置が同時に
         // 正しくないと当たらない複合情報で、taint の単純な force_apply では
         // 再現できない（ユーザーの実践知見どおり）。再設計するまでは無効
-        let hang_risk_enabled = std::env::var("TSUITATE_ENABLE_HANG_RISK").is_ok();
-        let debug_check_enabled = std::env::var("TSUITATE_DEBUG_CHECK").is_ok();
+        let hang_risk_enabled = crate::config::current(|c| c.strategy.enable_hang_risk);
+        let debug_check_enabled = crate::config::current(|c| c.strategy.debug_check);
 
         // 詰めろ判定のプール: 厳密粒子があればそれ、全滅していれば taint 粒子。
         // 終盤のブラインド（＝詰めろが決まる局面）ほど厳密粒子は枯れているので、
@@ -7245,14 +7528,7 @@ const BLIND_RECAPTURE_W: f64 = 1.0;
 /// 王手中の反則1回あたりの prior_weight 倍率の増分
 /// （`TSUITATE_CHECK_FOUL_PRIOR_BOOST`、既定 3.0、0 で従来挙動）
 fn check_foul_prior_boost() -> f64 {
-    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *W.get_or_init(|| {
-        std::env::var("TSUITATE_CHECK_FOUL_PRIOR_BOOST")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .filter(|v: &f64| v.is_finite() && *v >= 0.0)
-            .unwrap_or(3.0)
-    })
+    crate::config::current(|c| c.strategy.check_foul_prior_boost)
 }
 
 /// **未裏付け大駒への新規 threat の鮮度減衰**（`TSUITATE_STALE_THREAT_W`、
@@ -7265,14 +7541,7 @@ fn check_foul_prior_boost() -> f64 {
 /// 課税による合法悪手への押し出し、とは介入面が違う: これは「根拠の古い
 /// 成功報酬を満額払わない」）。凍結版はこの名前を知らない
 fn stale_threat_w() -> f64 {
-    static W: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *W.get_or_init(|| {
-        std::env::var("TSUITATE_STALE_THREAT_W")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|v: &f64| v.is_finite() && (0.0..=1.0).contains(v))
-            .unwrap_or(0.0)
-    })
+    crate::config::current(|c| c.strategy.stale_threat_w)
 }
 
 /// 未説明の相手手数（捕獲観測のない OpponentMoved の数 = その駒が動けた機会）。
@@ -7293,13 +7562,7 @@ fn unaccounted_opp_moves(log: &ObservationLog) -> u32 {
 }
 
 fn blind_recapture_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_BLIND_RECAPTURE_W")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(BLIND_RECAPTURE_W)
-    })
+    crate::config::current(|c| c.strategy.blind_recapture_w)
 }
 
 /// ブラインド進入リスク（`TSUITATE_BLIND_HOME_RISK_W`、既定 0 = 無効）の重み。
@@ -7309,14 +7572,7 @@ fn blind_recapture_w() -> f64 {
 /// リスク −3.2〜−6.4 で沈むのにブラインド seed ではリスク 0 で 16 位。
 /// 2026-08-09 ユーザー指摘が発端）
 fn blind_home_risk_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_BLIND_HOME_RISK_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.0)
-    })
+    crate::config::current(|c| c.strategy.blind_home_risk_w)
 }
 
 /// 評価サンプルで**1指紋が持てる重みの上限シェア**
@@ -7327,14 +7583,7 @@ fn blind_home_risk_w() -> f64 {
 /// 複製数は崩壊前のリサンプリングの遺物で独立な証拠ではない。
 /// 推奨 0.4〜0.6。凍結版はこの名前を知らない
 fn eval_weight_cap() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_EVAL_WEIGHT_CAP")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
-            .unwrap_or(1.0)
-    })
+    crate::config::current(|c| c.strategy.eval_weight_cap)
 }
 
 /// 過去手番で玉が反則した行き先への再訪割引（`TSUITATE_KING_REPEAT_FOUL_W`、
@@ -7353,14 +7602,7 @@ fn eval_weight_cap() -> f64 {
 /// （`check_king_prior`）とは違い、汚名のあるマスだけが対象。
 /// 凍結版はこの名前を知らない。
 fn king_repeat_foul_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_KING_REPEAT_FOUL_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(KING_REPEAT_FOUL_W)
-    })
+    crate::config::current(|c| c.strategy.king_repeat_foul_w)
 }
 
 /// 玉行き先の再訪割引。既定 0（作業点は 0.8）。
@@ -7392,14 +7634,7 @@ fn king_repeat_legal_factor(
 /// 57.1% vs 対照 51.8%（+5.3pt、3シード全勝）・反則/局は対照水準
 /// （= 当時は残り2回以上のプローブ経済は不変）
 fn last_foul_guard() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_LAST_FOUL_GUARD")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(LAST_FOUL_GUARD)
-    })
+    crate::config::current(|c| c.strategy.last_foul_guard)
 }
 
 /// `last_foul_guard` の既定値（2026-08-10 採用）。0 で従来挙動へ切り戻し
@@ -7409,14 +7644,7 @@ const LAST_FOUL_GUARD: f64 = 60.0;
 /// 既定の急峻化は残り2回でも約5.4点。b939bd3 以降の「対v13 60%」向け
 /// 拡張なので既定オンにしない。凍結版はこの名前を知らない。
 fn last_foul_guard_2() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_LAST_FOUL_GUARD_2")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(LAST_FOUL_GUARD_2)
-    })
+    crate::config::current(|c| c.strategy.last_foul_guard_2)
 }
 
 const LAST_FOUL_GUARD_2: f64 = 0.0;
@@ -7424,14 +7652,7 @@ const LAST_FOUL_GUARD_2: f64 = 0.0;
 /// 残り反則3回の床（`TSUITATE_LAST_FOUL_GUARD_3`、既定 0。env 作業点は 16）。
 /// 既定の急峻化は残り3回で約3.1点。凍結版はこの名前を知らない。
 fn last_foul_guard_3() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_LAST_FOUL_GUARD_3")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(LAST_FOUL_GUARD_3)
-    })
+    crate::config::current(|c| c.strategy.last_foul_guard_3)
 }
 
 const LAST_FOUL_GUARD_3: f64 = 0.0;
@@ -7458,14 +7679,7 @@ fn apply_foul_budget_floors(fouls_left: f64, mut foul_cost: f64) -> f64 {
 /// codex 相談（2026-08-09）で「占有反則と受理後リスクの二重課税を避けつつ
 /// まず (b) 占有割引から」と助言された実装順
 fn blind_home_drop_occ_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_BLIND_HOME_DROP_OCC_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
-            .unwrap_or(0.0)
-    })
+    crate::config::current(|c| c.strategy.blind_home_drop_occ_w)
 }
 
 /// home 残存の**鮮度減衰**のパラメータ（codex 相談 2026-08-09 の推奨形:
@@ -7475,25 +7689,11 @@ fn blind_home_drop_occ_w() -> f64 {
 /// （1三角成の香の取り返しのような隅の物理を保つ）。
 /// `TSUITATE_BLIND_HOME_FLOOR` / `TSUITATE_BLIND_HOME_LAMBDA` でスイープ可
 fn blind_home_floor() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_BLIND_HOME_FLOOR")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v))
-            .unwrap_or(0.2)
-    })
+    crate::config::current(|c| c.strategy.blind_home_floor)
 }
 
 fn blind_home_lambda() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_BLIND_HOME_LAMBDA")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.045)
-    })
+    crate::config::current(|c| c.strategy.blind_home_lambda)
 }
 
 /// マス上の home 駒の鮮度（そこにまだ居る確率の近似）。role は擬似粒子で
@@ -7739,14 +7939,7 @@ fn blind_recapture_target(view: &PlayerView, log: &ObservationLog) -> Option<(Co
 /// **既存粒子の再重み付けでもない**（nn-particle-likelihood で飽和済み）。
 /// 「粒子が1つも無いときに信念を供給する」チャネルに限定する
 fn belief_gain_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_BELIEF_GAIN_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite() && *v >= 0.0)
-            .unwrap_or(0.0)
-    })
+    crate::config::current(|c| c.strategy.belief_gain_w)
 }
 
 /// 玉位置ネット（king_belief_nn = 候補集合内 softmax のカテゴリカル分布）を
@@ -7761,15 +7954,7 @@ fn belief_gain_w() -> f64 {
 /// 供給先は `blind_king_dist`（taint 粒子の玉位置分布とのブレンド）:
 /// p = (1−λ)·p_taint + λ·p_net。taint が空でもネットだけで供給できる
 fn king_net_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_KING_NET_W")
-            .ok()
-            .and_then(|v| v.parse::<f64>().ok())
-            .filter(|v| v.is_finite())
-            .map(|v| v.clamp(0.0, 1.0))
-            .unwrap_or(0.0)
-    })
+    crate::config::current(|c| c.strategy.king_net_w)
 }
 
 /// 玉位置ネットで taint 粒子の玉移設先を選ぶ（`project_taint_kings` の誘導）。
@@ -7785,8 +7970,7 @@ fn king_net_w() -> f64 {
 /// ブレンド（king_net_w）は単独中立・投影との複合では投影の利得を打ち消す
 /// （50.8%）ため既定0のまま
 fn king_net_proj() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| !std::env::var("TSUITATE_KING_NET_PROJ").is_ok_and(|v| v == "0"))
+    crate::config::current(|c| c.strategy.king_net_proj)
 }
 
 /// taint 玉位置分布とネット分布のブレンド: p = (1−λ)·p_taint + λ·p_net。
@@ -10243,8 +10427,8 @@ pub(crate) struct ProbeCtx {
     pub(crate) p_promo: f64,
 }
 
-fn probe_env(name: &str, default: f64) -> f64 {
-    std::env::var(name)
+fn probe_env(src: &crate::config::EnvSource, name: &str, default: f64) -> f64 {
+    src.var(name)
         .ok()
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
@@ -10252,28 +10436,23 @@ fn probe_env(name: &str, default: f64) -> f64 {
 }
 
 fn king_probe_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| probe_env("TSUITATE_KING_PROBE_W", 0.0))
+    crate::config::current(|c| c.strategy.king_probe_w)
 }
 
 fn path_probe_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| probe_env("TSUITATE_PATH_PROBE_W", 0.0))
+    crate::config::current(|c| c.strategy.path_probe_w)
 }
 
 fn king_sensor_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| probe_env("TSUITATE_KING_SENSOR_W", 0.0))
+    crate::config::current(|c| c.strategy.king_sensor_w)
 }
 
 fn sensor_p_push() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| probe_env("TSUITATE_SENSOR_P_PUSH", 0.3).min(1.0))
+    crate::config::current(|c| c.strategy.sensor_p_push)
 }
 
 fn sensor_p_promo() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| probe_env("TSUITATE_SENSOR_P_PROMO", 0.8).min(1.0))
+    crate::config::current(|c| c.strategy.sensor_p_promo)
 }
 
 /// 自分の玉以外の駒が sq へ利いているか（回収できるか）
@@ -10306,13 +10485,11 @@ pub(crate) fn anchors_needed() -> bool {
 /// 計算して stderr へ出すが**スコアには足さない**ので、方策は
 /// 「由来タグ追跡だけオン」の対照のまま。`CandidateScore::probe_unit` の doc
 fn probe_audit() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_PROBE_AUDIT").is_ok_and(|v| v == "1"))
+    crate::config::current(|c| c.strategy.probe_audit)
 }
 
 fn probe_anchor_decay() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| probe_env("TSUITATE_PROBE_ANCHOR_DECAY", 0.5).clamp(0.0, 1.0))
+    crate::config::current(|c| c.strategy.probe_anchor_decay)
 }
 
 /// 原因駒 a（マス at）の回収価値。既定は**交換価値だけ**（codex 指摘 2026-08-22:
@@ -10337,8 +10514,7 @@ fn recovery_value(pos: &Position, at: Coord, role: Role, me: Color) -> f64 {
 }
 
 fn probe_threat_w() -> f64 {
-    static V: std::sync::OnceLock<f64> = std::sync::OnceLock::new();
-    *V.get_or_init(|| probe_env("TSUITATE_PROBE_THREAT_W", 0.0))
+    crate::config::current(|c| c.strategy.probe_threat_w)
 }
 
 /// 経路プローブの材料: from→to の経路を最初に塞ぐ敵駒を自分が当てていれば
@@ -10444,20 +10620,13 @@ fn king_sensor_value(pos: &Position, k: Coord, me: Color, ctx: &ProbeCtx) -> f64
 /// （`TSUITATE_DROP_PROBE_REPEAT_GATE=1`、既定 off = 従来の `(1−p_occ)`）。
 /// `foul_probe` の doc 参照
 fn drop_probe_repeat_gate() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_DROP_PROBE_REPEAT_GATE").is_ok_and(|v| v == "1"))
+    crate::config::current(|c| c.strategy.drop_probe_repeat_gate)
 }
 
 /// 2手読みへ予約する「争点への利き足し」の本数（`TSUITATE_DEPTH2_FOCAL_K`、
 /// 既定 0 = 従来挙動）。`adds_focal_attacker` の doc 参照
 fn depth2_focal_k() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        std::env::var("TSUITATE_DEPTH2_FOCAL_K")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(0)
-    })
+    crate::config::current(|c| c.strategy.depth2_focal_k)
 }
 
 /// マス `sq` の「`by` 側から見た正面手前」= `by` の歩がそこから `sq` へ進めるマス。
@@ -10476,8 +10645,7 @@ fn pawn_front_of(sq: Coord, by: Color) -> Option<Coord> {
 /// `threat_value` の守り判定を枚数で行うか（既定 off = 従来の二値）。
 /// `threat_value` の doc 参照
 fn threat_by_count() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| std::env::var("TSUITATE_THREAT_BY_COUNT").is_ok_and(|v| v == "1"))
+    crate::config::current(|c| c.strategy.threat_by_count)
 }
 
 /// 着手駒（マス to にいる自駒）が次の相手番で取られるリスク。
@@ -10743,6 +10911,42 @@ pub(crate) mod tests {
     use std::collections::{HashMap, HashSet};
 
     use super::*;
+
+    /// **ノブの有無で乱数条件が変わってはいけない**（PR #22 レビュー指摘1）。
+    ///
+    /// config 付きの生成が seed を `Option` で受けないと、呼び出し側が
+    /// `seed.unwrap_or(0)` に落として「候補だけ全対局が同じシード」になり、
+    /// 対照との比較がノブ以外の理由で崩れる。
+    #[test]
+    fn config付き生成はseedの扱いを変えない() {
+        let base = std::sync::Arc::new(crate::config::StrategyConfig::defaults());
+        let knobbed = std::sync::Arc::new(crate::config::StrategyConfig::from_source(
+            crate::config::EnvSource::from_pairs([("TSUITATE_HAND_ASSET_W", "0.5")]),
+        ));
+        assert_ne!(base.fingerprint(), knobbed.fingerprint(), "前提: ノブは効いている");
+
+        for cfg in [&base, &knobbed] {
+            // seed 未指定はエントロピー由来のまま（Some(0) へ落ちない）
+            assert_eq!(
+                estimator_with_config("estimator", None, cfg.clone())
+                    .expect("estimator")
+                    .seed(),
+                None
+            );
+            // 指定したときはその値がそのまま入る
+            assert_eq!(
+                estimator_with_config("estimator", Some(7), cfg.clone())
+                    .expect("estimator")
+                    .seed(),
+                Some(7)
+            );
+        }
+        // 公開 API 同士の関係（make_seeded_with_config は Some(seed) 版）
+        assert!(make_with_config("estimator", None, base.clone()).is_some());
+        assert!(make_seeded_with_config("estimator", 7, base.clone()).is_some());
+        // 凍結版へは渡せない（黙って無視されるのを防ぐ）
+        assert!(make_with_config("estimator_v14", None, base).is_none());
+    }
     use crate::protocol::{ClockState, FoulCounts, GameStatus, VisiblePiece};
 
     pub(crate) fn minimal_view(pieces: Vec<VisiblePiece>, hand: HashMap<Role, u32>) -> PlayerView {
