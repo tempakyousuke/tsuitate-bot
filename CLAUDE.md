@@ -1929,7 +1929,11 @@
     変わらない）。checkpoint arena が「相手の実効設定が両 arm で一致」を検査するのに使う
   - `STRATEGY_ENV_KEYS` が戦略が読むキーの全量。ソース走査との突き合わせを
     `cargo test` が常時検査するので、ノブを足して config を通し忘れると落ちる
-  - 設計と凍結境界の分類は `docs/frozen-hermetic-boundary.md`
+  - 設計と凍結境界の分類は `docs/frozen-hermetic-boundary.md`。
+    **既定挙動の同一性**は ①移行した96ノブの解決式が旧アクセサと文字列一致
+    ②arena run 32697854659（104局×2・`match_seed=20260815`）で
+    vs v13 56.7%±9.5 / vs v14 50.0%±9.6・反則/局 6.01〜6.24・
+    思考平均 1204〜1232ms・時間切れ0 と直前の記録帯に収まること、の2段で確認
 - `protocol.rs` — サイト側イベント契約の serde 版。**真実は tsuitate リポジトリの
   `src/lib/shared/events.ts` / `game-types.ts`**。サイト側の契約が変わったらここを追随させる
 - `board.rs` — 「自分の駒だけを考慮した」候補手生成。tsuitate の `src/lib/shared/move-hints.ts` の移植。
