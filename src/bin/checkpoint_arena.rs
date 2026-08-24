@@ -2335,10 +2335,30 @@ fn cmd_compare(args: &Args) {
     }
 
     if let Some(k) = known {
+        // **真値 0（A/A）は符号を持たない**。`f64::signum(0.0)` は +1 を返すので
+        // 素直に比べると「正へ振れた A/A」まで「符号一致: はい」と出る
+        // （PR #23 2回目レビュー指摘2）。report 側の扱いに揃え、A/A は
+        // 「CI が 0 を含むか＝偽陽性か」で読む
+        let verdict = if k.abs() <= 1e-9 {
+            format!(
+                "A/A（真値 0）: CI [{}, {}] が 0 を{}",
+                pct(lo),
+                pct(hi),
+                if lo <= 0.0 && hi >= 0.0 {
+                    "含む＝偽陽性なし"
+                } else {
+                    "含まない＝**偽陽性**"
+                }
+            )
+        } else {
+            format!(
+                "符号一致: {}",
+                if (d * 100.0).signum() == k.signum() { "はい" } else { "いいえ" }
+            )
+        };
         out.push_str(&format!(
-            "\n### 較正\n\n既知の通常 arena 差 {k:+.1}pt に対し checkpoint delta {}（符号一致: {}）\n",
+            "\n### 較正\n\n既知の通常 arena 差 {k:+.1}pt に対し checkpoint delta {}（{verdict}）\n",
             pct(d),
-            if (d * 100.0).signum() == k.signum() { "はい" } else { "いいえ" }
         ));
     }
 
@@ -2597,90 +2617,111 @@ struct GameRow {
 /// 解釈されて検査を素通りする（PR #22 で schema 2 へ上げたのと同じ理由）
 const GAME_ROW_SCHEMA: u64 = 2;
 
+/// **ペア差の分散を同定するのに要る最小のペア数**。1ペアでは自由度が 0 で、
+/// n−1 の標本分散が定義できない（`variance` は 0 を返す）
+const MIN_ARENA_PAIRS: usize = 2;
+
+fn arena_var_pair_error(n: usize) -> String {
+    format!(
+        "ペアになった対局が {n} 局しかありません（最低 {MIN_ARENA_PAIRS} 局）。\n            \
+         1局では Var(ペア差) の自由度が 0 で、SE・MDE・CI が「完全に精密」に見えてしまいます。\n            \
+         同じ match_seed の記録が両 arm に揃っているか確認してください\n            \
+         （--allow-incomplete は欠損の許容であって、自由度は作れないので効きません）"
+    )
+}
+
+/// 1行=1局の JSONL を読む。**失敗は `die` でなく `Result`** で返す:
+/// プロセスごと落とすとパーサの抜け（欠損キーを空値で埋めていないか）を
+/// テストで検出できない（PR #23 2回目レビュー指摘3）
+fn parse_game_rows_text(text: &str, where_prefix: &str) -> Result<Vec<GameRow>, String> {
+    let mut rows = vec![];
+    for (ln, line) in text.lines().enumerate() {
+        if !line.trim().starts_with('{') {
+            continue;
+        }
+        let where_ = format!("{where_prefix}:{}", ln + 1);
+        let v: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| format!("{where_}: JSON として読めません: {e}"))?;
+        let schema = v.get("schema").and_then(|x| x.as_u64()).unwrap_or(0);
+        if schema != GAME_ROW_SCHEMA {
+            return Err(format!(
+                "{where_}: schema {schema} は未対応（対応 {GAME_ROW_SCHEMA}）"
+            ));
+        }
+        let miss = |k: &str| format!("{where_}: {k} がありません");
+        let req_s = |k: &str| -> Result<String, String> {
+            v.get(k)
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| miss(k))
+        };
+        let req_f = |k: &str| -> Result<f64, String> {
+            v.get(k).and_then(|x| x.as_f64()).ok_or_else(|| miss(k))
+        };
+        let req_u = |k: &str| -> Result<u64, String> {
+            v.get(k).and_then(|x| x.as_u64()).ok_or_else(|| miss(k))
+        };
+        // **欠損は空値で埋めずにエラー**（PR #23 レビュー指摘2）。
+        // null は「その戦略には概念が無い」の意味なので値として受ける
+        let req_json = |k: &str| -> Result<String, String> {
+            v.get(k).map(|x| x.to_string()).ok_or_else(|| miss(k))
+        };
+        // **map も欠損・object 以外はエラー**。`unwrap_or_default()` で空 map に
+        // 落とすと「両 run とも env 指定なしで一致」と読めてしまい、
+        // 実効条件の突き合わせが素通りする（PR #23 2回目レビュー指摘3）
+        let req_map = |k: &str| -> Result<BTreeMap<String, String>, String> {
+            let o = v
+                .get(k)
+                .ok_or_else(|| miss(k))?
+                .as_object()
+                .ok_or_else(|| format!("{where_}: {k} が object ではありません"))?;
+            Ok(o.iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        v.as_str().map(|s| s.to_string()).unwrap_or_else(|| v.to_string()),
+                    )
+                })
+                .collect())
+        };
+        rows.push(GameRow {
+            candidate: req_s("candidate")?,
+            baseline: req_s("baseline")?,
+            match_seed: req_u("match_seed")?,
+            game_no: req_u("game_no")?,
+            a_is_sente: v
+                .get("a_is_sente")
+                .and_then(|x| x.as_bool())
+                .ok_or_else(|| miss("a_is_sente"))?,
+            score_a: req_f("score_a")?,
+            reason: req_s("reason")?,
+            plies: req_f("plies")?,
+            fouls_a: req_f("fouls_a")?,
+            fouls_b: req_f("fouls_b")?,
+            fouls_in_check_a: req_f("fouls_in_check_a")?,
+            think_ms_a: req_f("think_ms_a")?,
+            think_ms_b: req_f("think_ms_b")?,
+            moves_a: req_f("moves_a")?,
+            commit: req_s("commit")?,
+            cand_knobs: req_map("cand_knobs")?,
+            clock: req_json("clock")?,
+            budget: req_json("think_budget_ms_a")?,
+            budget_opp: req_json("think_budget_ms_b")?,
+            cand_config: req_json("cand_config")?,
+            baseline_behavior: req_json("baseline_behavior")?,
+            shared_env: req_map("shared_env")?,
+        });
+    }
+    Ok(rows)
+}
+
 fn parse_game_rows(paths: &[String], arm: &str) -> Vec<GameRow> {
     let mut rows = vec![];
     for p in paths {
         let text = std::fs::read_to_string(p).unwrap_or_else(|e| die(&format!("{p}: {e}")));
-        for (ln, line) in text.lines().enumerate() {
-            if !line.trim().starts_with('{') {
-                continue;
-            }
-            let where_ = format!("{arm} {p}:{}", ln + 1);
-            let v: serde_json::Value = serde_json::from_str(line)
-                .unwrap_or_else(|e| die(&format!("{where_}: JSON として読めません: {e}")));
-            let schema = v.get("schema").and_then(|x| x.as_u64()).unwrap_or(0);
-            if schema != GAME_ROW_SCHEMA {
-                die(&format!(
-                    "{where_}: schema {schema} は未対応（対応 {GAME_ROW_SCHEMA}）"
-                ));
-            }
-            let req_s = |k: &str| -> String {
-                v.get(k)
-                    .and_then(|x| x.as_str())
-                    .unwrap_or_else(|| die(&format!("{where_}: {k} がありません")))
-                    .to_string()
-            };
-            let req_f = |k: &str| -> f64 {
-                v.get(k)
-                    .and_then(|x| x.as_f64())
-                    .unwrap_or_else(|| die(&format!("{where_}: {k} がありません")))
-            };
-            let req_u = |k: &str| -> u64 {
-                v.get(k)
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or_else(|| die(&format!("{where_}: {k} がありません")))
-            };
-            // **欠損は空値で埋めずにエラー**（PR #23 レビュー指摘2）。
-            // null は「その戦略には概念が無い」の意味なので値として受ける
-            let req_json = |k: &str| -> String {
-                v.get(k)
-                    .unwrap_or_else(|| die(&format!("{where_}: {k} がありません")))
-                    .to_string()
-            };
-            let map = |k: &str| -> BTreeMap<String, String> {
-                v.get(k)
-                    .and_then(|x| x.as_object())
-                    .map(|o| {
-                        o.iter()
-                            .map(|(k, v)| {
-                                (k.clone(), v.as_str().unwrap_or(&v.to_string()).to_string())
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            };
-            rows.push(GameRow {
-                candidate: req_s("candidate"),
-                baseline: req_s("baseline"),
-                match_seed: req_u("match_seed"),
-                game_no: req_u("game_no"),
-                a_is_sente: v
-                    .get("a_is_sente")
-                    .and_then(|x| x.as_bool())
-                    .unwrap_or_else(|| die(&format!("{where_}: a_is_sente がありません"))),
-                score_a: req_f("score_a"),
-                reason: req_s("reason"),
-                plies: req_f("plies"),
-                fouls_a: req_f("fouls_a"),
-                fouls_b: req_f("fouls_b"),
-                fouls_in_check_a: req_f("fouls_in_check_a"),
-                think_ms_a: req_f("think_ms_a"),
-                think_ms_b: req_f("think_ms_b"),
-                moves_a: req_f("moves_a"),
-                commit: v
-                    .get("commit")
-                    .and_then(|x| x.as_str())
-                    .unwrap_or_default()
-                    .to_string(),
-                cand_knobs: map("cand_knobs"),
-                clock: req_json("clock"),
-                budget: req_json("think_budget_ms_a"),
-                budget_opp: req_json("think_budget_ms_b"),
-                cand_config: req_json("cand_config"),
-                baseline_behavior: req_json("baseline_behavior"),
-                shared_env: map("shared_env"),
-            });
-        }
+        rows.extend(
+            parse_game_rows_text(&text, &format!("{arm} {p}")).unwrap_or_else(|e| die(&e)),
+        );
     }
     if rows.is_empty() {
         die(&format!("{arm}: 行が1件もありません"));
@@ -2834,12 +2875,25 @@ fn cmd_arena_var(args: &Args) {
             ctrl[0].commit, cand[0].commit
         );
     }
-    if fmt_env(&ctrl[0].cand_knobs) == fmt_env(&cand[0].cand_knobs)
-        && ctrl[0].candidate == cand[0].candidate
+    // **A/A かどうかは raw の指定でなく実効設定で判定する**（PR #23 2回目
+    // レビュー指摘2）。名前・raw knobs・候補側予算だけを見ていた版は、
+    // `cand_config` だけが違う2 run を「完全に同じ」と表示していた
+    let same_effective = ctrl[0].candidate == cand[0].candidate
+        && ctrl[0].cand_config == cand[0].cand_config
         && ctrl[0].budget == cand[0].budget
-    {
+        && ctrl[0].budget_opp == cand[0].budget_opp
+        && ctrl[0].commit == cand[0].commit;
+    if same_effective {
         eprintln!(
-            "注意: control と candidate の設定が完全に同じです（A/A として読みます）"
+            "注意: control と candidate の実効設定（config 指紋・予算・commit）が一致しています。\n                   A/A として読みます（差の期待値は 0）"
+        );
+    } else if fmt_env(&ctrl[0].cand_knobs) == fmt_env(&cand[0].cand_knobs)
+        && ctrl[0].candidate == cand[0].candidate
+    {
+        // raw の指定が同じなのに実効設定が違う = commit か config 解決が違う
+        eprintln!(
+            "注意: raw の候補指定は同じですが実効設定が違います（config 指紋 {} vs {} / commit {} vs {}）",
+            &ctrl[0].cand_config, &cand[0].cand_config, &ctrl[0].commit, &cand[0].commit
         );
     }
 
@@ -2866,8 +2920,12 @@ fn cmd_arena_var(args: &Args) {
         .filter(|k| cand_by.contains_key(*k))
         .cloned()
         .collect();
-    if keys.is_empty() {
-        die("ペアになった対局が1件もありません");
+    // **1ペアでは分散が同定できない**（PR #23 2回目レビュー指摘1）。
+    // `variance` は n<2 で 0 を返すので、そのまま流すと Var=0 / SE=0 /
+    // MDE=0 / CI=[観測値, 観測値] = 「完全に精密」と読める出力になる。
+    // 自由度は `--allow-incomplete` では作れないので override 対象にしない
+    if keys.len() < MIN_ARENA_PAIRS {
+        die(&arena_var_pair_error(keys.len()));
     }
     // **先後が揃っているか**（game_no の偶奇で決まるので、揃わないなら
     // 別々の対局条件列を突き合わせている）
@@ -3225,6 +3283,103 @@ mod tests {
             cand_config: "cfg".into(),
             baseline_behavior: "beh".into(),
             shared_env: BTreeMap::new(),
+        }
+    }
+
+    /// 実際の JSONL を通した parse の検査。**構造体を直接組み立てるテストでは
+    /// パーサの抜けを検出できない**（PR #23 2回目レビュー指摘3）
+    fn valid_row_json() -> serde_json::Value {
+        serde_json::json!({
+            "schema": GAME_ROW_SCHEMA,
+            "candidate": "estimator",
+            "baseline": "estimator_v14",
+            "match_seed": 20260815,
+            "game_no": 0,
+            "a_is_sente": true,
+            "score_a": 1.0,
+            "reason": "checkmate",
+            "plies": 100,
+            "fouls_a": 6,
+            "fouls_b": 5,
+            "fouls_in_check_a": 1,
+            "think_ms_a": 40000,
+            "think_ms_b": 38000,
+            "moves_a": 40,
+            "commit": "deadbeef",
+            "cand_knobs": { "TSUITATE_DROP_PROBE_REPEAT_GATE": "1" },
+            "clock": [1000000, 3000],
+            "think_budget_ms_a": 700,
+            "think_budget_ms_b": 700,
+            "cand_config": "abc123",
+            "baseline_behavior": "def456",
+            "shared_env": {},
+        })
+    }
+
+    #[test]
+    fn game_row_parser_requires_every_effective_condition() {
+        let ok = parse_game_rows_text(&valid_row_json().to_string(), "t").expect("正常行");
+        assert_eq!(ok.len(), 1);
+        assert_eq!(ok[0].cand_knobs["TSUITATE_DROP_PROBE_REPEAT_GATE"], "1");
+        assert_eq!(ok[0].budget_opp, "700");
+
+        // **欠損は空値で埋めない**。map 系（`unwrap_or_default()` だった）も含めて
+        // 全キーがエラーになること
+        for k in [
+            "candidate",
+            "baseline",
+            "match_seed",
+            "game_no",
+            "a_is_sente",
+            "score_a",
+            "reason",
+            "plies",
+            "fouls_a",
+            "fouls_b",
+            "fouls_in_check_a",
+            "think_ms_a",
+            "think_ms_b",
+            "moves_a",
+            "commit",
+            "cand_knobs",
+            "clock",
+            "think_budget_ms_a",
+            "think_budget_ms_b",
+            "cand_config",
+            "baseline_behavior",
+            "shared_env",
+        ] {
+            let mut v = valid_row_json();
+            v.as_object_mut().unwrap().remove(k);
+            let e = parse_game_rows_text(&v.to_string(), "t")
+                .expect_err(&format!("{k} の欠損はエラーになるべき"));
+            assert!(e.contains(k), "{k}: エラー文にキー名が無い: {e}");
+        }
+
+        // object でない env は「空 env」に落とさない
+        for k in ["cand_knobs", "shared_env"] {
+            let mut v = valid_row_json();
+            v[k] = serde_json::json!("TSUITATE_X=1");
+            let e = parse_game_rows_text(&v.to_string(), "t").expect_err("object 以外はエラー");
+            assert!(e.contains("object"), "{e}");
+        }
+
+        // schema 1 は集計から弾く
+        let mut old = valid_row_json();
+        old["schema"] = serde_json::json!(1);
+        assert!(parse_game_rows_text(&old.to_string(), "t").is_err());
+    }
+
+    /// **1ペアでは分散が同定できない**ので明示的に失敗させる
+    /// （Var=0 / SE=0 / MDE=0 を「完全に精密」と読ませない。2回目レビュー指摘1）
+    #[test]
+    fn arena_var_requires_at_least_two_pairs() {
+        assert_eq!(MIN_ARENA_PAIRS, 2);
+        assert_eq!(variance(&[0.5]), 0.0, "n<2 の分散は同定できない（0 は自由度 0 の産物）");
+        for n in [0usize, 1] {
+            let e = arena_var_pair_error(n);
+            assert!(e.contains(&n.to_string()));
+            assert!(e.contains("allow-incomplete"), "override できないことを書く");
         }
     }
 
