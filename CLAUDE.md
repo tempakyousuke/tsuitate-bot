@@ -57,10 +57,11 @@
   `-f env="TSUITATE_MATE_RISK_W=3 TSUITATE_MATE_THREAT_W=4"` で評価ノブを渡せる
   （w スイープ用。`TSUITATE_*` のみ許可）。**env はプロセス全体に効くので
   「候補側だけ」になるのは、その凍結版が名前を知らないノブに限る**。
-  **候補側だけに効かせたいときは `ARENA_CAND_KNOBS="K=V K=V"`**（issue #21、
-  2026-08-24）: 値はプロセス env でなく `StrategyConfig` として候補 instance に
-  だけ渡るので、env を読み続ける凍結相手は必ず既定値のまま動く（凍結版を
-  候補にしたときは config を尊重しないので起動時にエラー）。
+  **候補側だけに効かせたいときは `-f cand_env="K=V K=V"`**（リクエストファイルなら
+  `"cand_env"`。ローカルは env `ARENA_CAND_KNOBS`。issue #21、2026-08-24）:
+  値はプロセス env でなく `StrategyConfig` として候補 instance にだけ渡るので、
+  env を読み続ける凍結相手は必ず既定値のまま動く（凍結版を候補にしたときは
+  config を尊重しないので起動時にエラー）。
   凍結版は**凍結時点で読んでいた env を今も読む**（実測 2026-07-26。
   一覧は `frozen::env_keys_in_source(name)` で機械的に取れる）:
   - `TSUITATE_THINK_BUDGET_MS` — **v6〜v11 の全凍結版が読む**。思考予算の

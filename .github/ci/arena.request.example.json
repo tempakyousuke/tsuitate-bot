@@ -6,5 +6,6 @@
   "shards": 4,
   "oracle": "",
   "clock": "",
-  "env": ""
+  "env": "",
+  "cand_env": ""
 }
