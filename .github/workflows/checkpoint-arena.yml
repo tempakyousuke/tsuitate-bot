@@ -67,6 +67,10 @@ on:
         description: "checkpoint あたりの seed 数（**2 の倍数**。P0 は 4 以上 = 2 replicate 以上）"
         required: false
         default: "4"
+      seed_base:
+        description: "seed の開始値（**偶数**。同じデッキで独立にもう1本取る = A/A の再現性を見るのに使う）"
+        required: false
+        default: "0"
       budgets:
         description: "思考予算（ms。スペース区切りで複数指定すると直積になる）"
         required: false
@@ -103,6 +107,7 @@ jobs:
       extract_seed: ${{ steps.split.outputs.extract_seed }}
       split: ${{ steps.split.outputs.split }}
       seeds: ${{ steps.split.outputs.seeds }}
+      seed_base: ${{ steps.split.outputs.seed_base }}
       arms_from: ${{ steps.split.outputs.arms_from }}
     steps:
       - uses: actions/checkout@v5
@@ -117,6 +122,7 @@ jobs:
           IN_EXTRACT_SEED: ${{ github.event.inputs.extract_seed }}
           IN_SPLIT: ${{ github.event.inputs.split }}
           IN_SEEDS: ${{ github.event.inputs.seeds }}
+          IN_SEED_BASE: ${{ github.event.inputs.seed_base }}
           IN_BUDGETS: ${{ github.event.inputs.budgets }}
           IN_SHARDS: ${{ github.event.inputs.shards }}
           IN_EXPERIMENTS: ${{ github.event.inputs.experiments }}
@@ -159,6 +165,7 @@ jobs:
             extract_seed="${IN_EXTRACT_SEED:-20260823}"
             split="${IN_SPLIT:-dev}"
             seeds="${IN_SEEDS:-4}"
+            seed_base="${IN_SEED_BASE:-0}"
             budgets="${IN_BUDGETS:-2000}"
             shards="${IN_SHARDS:-4}"
             experiments="${IN_EXPERIMENTS:-}"
@@ -181,6 +188,7 @@ jobs:
                 echo "extract_seed=0"
                 echo "split=dev"
                 echo "seeds=4"
+                echo "seed_base=0"
                 echo "arms_from="
               } >> "$GITHUB_OUTPUT"
               exit 0
@@ -193,6 +201,7 @@ jobs:
             extract_seed=$(jq -r '.extract_seed // 20260823' "$req")
             split=$(jq -r '.split // "dev"' "$req")
             seeds=$(jq -r '.seeds // 4' "$req")
+            seed_base=$(jq -r '.seed_base // 0' "$req")
             budgets=$(jq -r 'if (.budgets | type) == "array" then .budgets | join(" ") else (.budgets // "2000") end' "$req")
             shards=$(jq -r '.shards // 4' "$req")
             experiments=$(jq -c '.experiments // ""' "$req")
@@ -204,6 +213,10 @@ jobs:
           # 2k と 2k+1 が対になって初めて AB/BA が cluster の内側で閉じる）
           if [ $(( seeds % 2 )) -ne 0 ]; then
             echo "seeds は 2 の倍数にしてください（指定値 ${seeds}）" >&2
+            exit 1
+          fi
+          if [ $(( seed_base % 2 )) -ne 0 ]; then
+            echo "seed_base は偶数にしてください（指定値 ${seed_base}）" >&2
             exit 1
           fi
           # 実験 × 予算の直積を matrix.include にする
@@ -233,6 +246,7 @@ jobs:
             echo "extract_seed=$extract_seed"
             echo "split=$split"
             echo "seeds=$seeds"
+            echo "seed_base=$seed_base"
             echo "arms_from=$arms_from"
           } >> "$GITHUB_OUTPUT"
           echo "実験 $(jq '.include | length' <<<"$matrix") 本 × シャード ${shards}"
@@ -316,6 +330,7 @@ jobs:
           ./target/release/checkpoint_arena run deck/deck.json \
             --split "${{ needs.plan.outputs.split }}" \
             --seeds "${{ needs.plan.outputs.seeds }}" \
+            --seed-base "${{ needs.plan.outputs.seed_base }}" \
             --shards "${{ needs.plan.outputs.shard_count }}" --shard "${{ matrix.shard }}" \
             --jobs "$jobs" \
             --experiment "${{ matrix.exp.label }}" \

@@ -23,5 +23,7 @@
     }
   ],
   "_reaggregate_note": "arms_from_run_id に過去の Checkpoint arena 実行IDを入れると、対局をやり直さず arm 記録とデッキだけ取ってきて compare / report を回す（known を後から付ける・集計側の修正を当て直す用）。deck / run ジョブは丸ごと飛ぶ。experiments は元の run と同じラベルを渡すこと",
-  "arms_from_run_id": ""
+  "arms_from_run_id": "",
+  "seed_base": 0,
+  "_seed_base_note": "seed の開始値（偶数）。同じデッキで seed をずらしてもう1本取ると、A/A が再現するか（系統バイアスか偶然か）が分かる"
 }

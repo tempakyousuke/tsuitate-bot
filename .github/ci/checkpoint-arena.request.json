@@ -1,29 +1,16 @@
 {
-  "_why": "issue #19 の P0: 横断レポートの数え方（真値0の除外・重大悪化の内訳・2点の順位相関は出さない）を直したうえで run 32723624182 を再集計する",
-  "arms_from_run_id": "32723624182",
+  "_why": "issue #19 の P0: A/A の再現性を見る2本目。1本目（run 32723624182、seed 0〜3）は A/A で +7.0pt [+0.2, +14.1] と 0 を外した。偽陽性率は n=64 で 5.0%（名目どおり）なので、bootstrap の甘さでは説明できない。同じデッキで seed 4〜7 を取り、+ 側に再現するなら候補 arm への系統バイアス、符号が反転するなら偶然",
+  "arena_run_id": "32697854659",
+  "opponent": "estimator_v14",
+  "checkpoints": 64,
+  "min_remaining": 20,
+  "extract_seed": 20260824,
   "split": "all",
   "seeds": 4,
+  "seed_base": 4,
   "budgets": "700",
   "shards": 8,
   "experiments": [
-    {
-      "label": "aa",
-      "known": 0
-    },
-    {
-      "label": "v13_v12_vs_opp",
-      "candidate_strategy": "estimator_v13",
-      "control_strategy": "estimator_v12"
-    },
-    {
-      "label": "v14_v10_vs_opp",
-      "candidate_strategy": "estimator_v14",
-      "control_strategy": "estimator_v10"
-    },
-    {
-      "label": "drop_probe_gate",
-      "candidate_env": "TSUITATE_DROP_PROBE_REPEAT_GATE=1",
-      "known": -16.3
-    }
+    { "label": "aa_seed4" }
   ]
 }
