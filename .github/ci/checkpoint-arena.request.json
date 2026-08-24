@@ -1,0 +1,31 @@
+{
+  "_why": "issue #19 の P0（CI 規模・段階1）。まず 700ms で 64 checkpoint × 4 seed × 4実験を回し、empirical SE / ICC / MDE と A/A の 0 中心・符号・順位を見る。2000ms は 700ms の結果を見てから回す（ユーザー判断 2026-08-24）",
+  "arena_run_id": "32697854659",
+  "deck_path": "checkpoint-arena/deck.json",
+  "opponent": "estimator_v14",
+  "checkpoints": 64,
+  "min_remaining": 20,
+  "extract_seed": 20260824,
+  "split": "all",
+  "seeds": 4,
+  "budgets": "700",
+  "shards": 8,
+  "_known_note": "drop_probe_gate の known（同条件の通常 arena 差）は、同じ commit・同じ相手・同じ予算で回している arena ペア（対照 run 32721832218 + 候補 run）の arena-var から取る。まだ出ていないのでここでは空にしてある",
+  "experiments": [
+    { "label": "aa" },
+    {
+      "label": "v13_v12_vs_opp",
+      "candidate_strategy": "estimator_v13",
+      "control_strategy": "estimator_v12"
+    },
+    {
+      "label": "v14_v10_vs_opp",
+      "candidate_strategy": "estimator_v14",
+      "control_strategy": "estimator_v10"
+    },
+    {
+      "label": "drop_probe_gate",
+      "candidate_env": "TSUITATE_DROP_PROBE_REPEAT_GATE=1"
+    }
+  ]
+}
