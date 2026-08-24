@@ -205,22 +205,40 @@ fn process_env() -> BTreeMap<String, String> {
 /// - config を尊重する現行 estimator 系 … 渡された instance config の指紋
 /// - 凍結版 … 版のソース・その版が読む env の実効値・共有モデルの pin
 /// - どちらでもない（`heuristic` など）… `null`（設定という概念が無い）
-fn behavior_of(
-    name: &str,
-    cfg: &tsuitate_bot::config::StrategyConfig,
-) -> Option<String> {
-    if strategy::honors_config(name) {
-        return Some(cfg.fingerprint());
-    }
-    tsuitate_bot::frozen::behavior_fingerprint(name, &process_env())
+fn behavior_of(name: &str, cfg: &tsuitate_bot::config::StrategyConfig) -> Option<String> {
+    behavior_of_with_env(name, cfg, &process_env())
 }
 
 /// **戦略 `name` の実効思考予算**。判定は [`behavior_of`] と同じ切り分け。
 fn budget_of(name: &str, cfg: &tsuitate_bot::config::StrategyConfig) -> Option<u64> {
+    budget_of_with_env(name, cfg, &process_env())
+}
+
+// 以下は**プロセス env を読まない純粋版**。凍結版が見る env を引数で受けるので、
+// テストが呼び出し元の shell に残った `TSUITATE_*` に左右されない
+// （PR #22 再レビュー P3。プロセス env をテスト内で set/remove すると
+//  並列テストと競合するので、注入する形にしてある）。
+
+fn behavior_of_with_env(
+    name: &str,
+    cfg: &tsuitate_bot::config::StrategyConfig,
+    env: &BTreeMap<String, String>,
+) -> Option<String> {
+    if strategy::honors_config(name) {
+        return Some(cfg.fingerprint());
+    }
+    tsuitate_bot::frozen::behavior_fingerprint(name, env)
+}
+
+fn budget_of_with_env(
+    name: &str,
+    cfg: &tsuitate_bot::config::StrategyConfig,
+    env: &BTreeMap<String, String>,
+) -> Option<u64> {
     if strategy::honors_config(name) {
         return Some(cfg.think_budget_ms);
     }
-    tsuitate_bot::frozen::effective_think_budget_ms(name, &process_env())
+    tsuitate_bot::frozen::effective_think_budget_ms(name, env)
 }
 
 /// 候補側の実効設定（プロセス env にノブを重ねたもの）。
@@ -382,21 +400,42 @@ mod tests {
             .into_iter()
             .collect(),
         );
+        // **凍結版が見る env は注入する**（呼び出し元の shell に
+        // TSUITATE_THINK_BUDGET_MS が残っていても結果が変わらないように）
+        let env = BTreeMap::new();
+        let budget = |n: &str| budget_of_with_env(n, &cand_cfg, &env);
+        let behavior = |n: &str| behavior_of_with_env(n, &cand_cfg, &env);
+
         // 現行 estimator 系は instance config がそのまま実効
-        assert_eq!(budget_of("estimator", &cand_cfg), Some(777));
-        assert!(behavior_of("estimator", &cand_cfg).is_some());
+        assert_eq!(budget("estimator"), Some(777));
+        assert!(behavior("estimator").is_some());
         // **凍結版は候補でも instance config を使わない**（版ごとの読み取り規則）。
-        // v14 は候補専用の名前を読まないので、プロセス env 未設定なら既定 2000
-        assert_eq!(budget_of("estimator_v14", &cand_cfg), Some(2000));
+        // v14 は候補専用の名前を読まないので、env 未設定なら既定 2000
+        assert_eq!(budget("estimator_v14"), Some(2000));
         assert_ne!(
-            behavior_of("estimator_v14", &cand_cfg),
-            behavior_of("estimator_v13", &cand_cfg),
+            behavior("estimator_v14"),
+            behavior("estimator_v13"),
             "版が違えば指紋も違う"
         );
-        assert_ne!(behavior_of("estimator_v14", &cand_cfg), behavior_of("estimator", &cand_cfg));
+        assert_ne!(behavior("estimator_v14"), behavior("estimator"));
         // 予算・設定の概念が無い戦略は null
-        assert_eq!(budget_of("heuristic", &cand_cfg), None);
-        assert_eq!(behavior_of("heuristic", &cand_cfg), None);
+        assert_eq!(budget("heuristic"), None);
+        assert_eq!(behavior("heuristic"), None);
+
+        // **凍結版は注入した env に従う**（共通の名前はどの版も読む）
+        let with_common: BTreeMap<String, String> =
+            [("TSUITATE_THINK_BUDGET_MS".to_string(), "555".to_string())]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            budget_of_with_env("estimator_v14", &cand_cfg, &with_common),
+            Some(555)
+        );
+        // 現行 estimator は instance config が優先（env には従わない）
+        assert_eq!(
+            budget_of_with_env("estimator", &cand_cfg, &with_common),
+            Some(777)
+        );
     }
 
     /// **`cand_env` の思考予算が候補の実効値として反映される**

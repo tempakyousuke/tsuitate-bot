@@ -2596,20 +2596,30 @@ mod tests {
         let key = "TSUITATE_HAND_ASSET_W";
         // 前提: v14 はこのキーを読む（読まないキーでは検査の意味が無い）
         assert!(strategy_reads_env("estimator_v14", key));
-        let before = std::env::var(key).ok();
 
-        let base = config::EnvSource::from_process();
+        // **base は空にする**（呼び出し元の shell に同じキーが残っていると
+        //  上書きが no-op になってテストが env に左右される。PR #22 再レビュー P3）
+        let base = config::EnvSource::empty();
         let opp = config::StrategyConfig::from_source(base.clone());
         let arm = config::StrategyConfig::from_source(
             base.with_overrides([(key.to_string(), "0.5".to_string())]),
         );
         assert_ne!(arm.fingerprint(), opp.fingerprint(), "候補側には効いている");
         assert_eq!(arm.strategy.hand_asset_w, 0.5);
-        // 相手が読むのはプロセス env で、それは変わっていない
-        assert_eq!(std::env::var(key).ok(), before);
+
+        // **相手が読むのはプロセス env**で、それは arm config の構築で変わらない
+        // （ここだけは実際の env を見る必要がある。値そのものではなく不変性を見る）
+        let env_before = std::env::var(key).ok();
+        let opp_before =
+            config::StrategyConfig::from_source(config::EnvSource::from_process()).fingerprint();
+        let _ = config::StrategyConfig::from_source(
+            config::EnvSource::from_process()
+                .with_overrides([(key.to_string(), "0.5".to_string())]),
+        );
+        assert_eq!(std::env::var(key).ok(), env_before);
         assert_eq!(
             config::StrategyConfig::from_source(config::EnvSource::from_process()).fingerprint(),
-            opp.fingerprint(),
+            opp_before,
             "arm 固有ノブでプロセス env が変わってはいけない"
         );
     }
