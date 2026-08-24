@@ -9,6 +9,9 @@
 //! 新戦略の合格条件は凍結版への勝ち越し。既定の対象は v9 以降（src/frozen/ 参照）。
 //! 引数を省略したときの戦略名は `heuristic`（本番既定の `estimator` ではない）。
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use tsuitate_bot::selfplay::{
     MatchStats, fischer_increment_ms, fischer_initial_ms, run_match_with, run_match_with_seeds,
     thread_count,
@@ -130,7 +133,69 @@ fn summary_json(candidate: &str, baseline: &str, stats: &MatchStats) -> serde_js
         "think_budget_ms_a": std::env::var("TSUITATE_CAND_THINK_BUDGET_MS")
             .or_else(|_| std::env::var("TSUITATE_THINK_BUDGET_MS"))
             .ok(),
+        // 候補側だけに効かせたノブと、両側の実効設定の指紋（issue #21）
+        "cand_knobs": cand_knobs(),
+        "cand_config": candidate_config().fingerprint(),
+        "baseline_config": tsuitate_bot::config::ambient().fingerprint(),
     })
+}
+
+/// **候補側だけに効かせるノブ**（`ARENA_CAND_KNOBS="K=V K=V"`、issue #21）。
+///
+/// `-f env=` はプロセス env なので**両側に効く**（凍結版は自分のコピーの中で
+/// env を読む）。候補側だけ変えたいときはこちらを使う: 値は
+/// `StrategyConfig` として候補の instance にだけ渡り、プロセス env は動かない。
+/// **凍結版は config を尊重しない**ので、候補が凍結版のときは使えない。
+fn cand_knobs() -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    let Ok(spec) = std::env::var("ARENA_CAND_KNOBS") else {
+        return out;
+    };
+    for token in spec.split([',', ' ', '\n']).filter(|s| !s.trim().is_empty()) {
+        let Some((k, v)) = token.trim().split_once('=') else {
+            eprintln!("ARENA_CAND_KNOBS の書式は K=V です: {token}");
+            std::process::exit(1);
+        };
+        if !k.starts_with("TSUITATE_") {
+            eprintln!("ARENA_CAND_KNOBS は TSUITATE_* だけ許可されます: {k}");
+            std::process::exit(1);
+        }
+        out.insert(k.to_string(), v.to_string());
+    }
+    out
+}
+
+/// 候補側の実効設定（プロセス env にノブを重ねたもの）。
+fn candidate_config() -> Arc<tsuitate_bot::config::StrategyConfig> {
+    use tsuitate_bot::config::{EnvSource, StrategyConfig};
+    static C: std::sync::OnceLock<Arc<StrategyConfig>> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        Arc::new(StrategyConfig::from_source(
+            EnvSource::from_process().with_overrides(cand_knobs()),
+        ))
+    })
+    .clone()
+}
+
+/// 候補側の戦略を作る（ノブがあれば config で渡す）。
+fn make_candidate(name: &str, seed: Option<u64>) -> Box<dyn strategy::Strategy + Send> {
+    let knobs = cand_knobs();
+    if knobs.is_empty() {
+        return match seed {
+            Some(s) => strategy::make_seeded(name, s),
+            None => strategy::make(name),
+        }
+        .expect("検証済みの戦略名");
+    }
+    if !strategy::honors_config(name) {
+        eprintln!(
+            "ARENA_CAND_KNOBS は {name} には渡せません（凍結版は config を尊重せず\n             \
+             凍結時点の env を読むため、黙って無視されます）"
+        );
+        std::process::exit(1);
+    }
+    strategy::make_seeded_with_config(name, seed.unwrap_or(0), candidate_config())
+        .expect("検証済みの戦略名")
 }
 
 fn main() {
@@ -171,12 +236,12 @@ fn main() {
                 games,
                 // 基準ごとにずらす（同じ基準に対してだけ同一条件列になる）
                 seed ^ (opp_idx as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
-                &|gs| strategy::make_seeded(&candidate, gs.seed).expect("検証済みの戦略名"),
+                &|gs| make_candidate(&candidate, Some(gs.seed)),
                 &|gs| strategy::make_seeded(opp, gs.seed).expect("検証済みの戦略名"),
             ),
             None => run_match_with(
                 games,
-                &|| strategy::make(&candidate).expect("検証済みの戦略名"),
+                &|| make_candidate(&candidate, None),
                 &|| strategy::make(opp).expect("検証済みの戦略名"),
             ),
         };

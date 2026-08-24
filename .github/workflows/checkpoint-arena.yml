@@ -23,11 +23,12 @@ name: Checkpoint arena
 #    "candidate_strategy":"estimator_v13", "control_strategy":"estimator_v12"}
 # `budgets` の各値と直積になる（700ms / 2000ms の較正用）。
 #
-# **`candidate_env` / `control_env` は現在すべて失敗する予約フィールド**。
-# `TSUITATE_*` はプロセス全体に効き、相手（凍結版）も同じプロセスで作られるので、
-# arm ごとに値が違う env は原則拒否になっている（監査済みの CANDIDATE_ONLY_ENV は
-# 現在空。恒久対策は issue #21）。ソース走査は二次的な検査で、
-# 「相手が読まない」ことの証明には使わない。
+# **`candidate_env` / `control_env` は arm 固有の設定ノブ**（issue #21 以後）。
+# 名前に反してプロセス env ではなく `StrategyConfig` として arm の戦略にだけ渡る
+# ので、env を読み続ける凍結相手（v6〜v14）は arm によらず既定値のまま動く。
+# 予算だけは両側・両 arm に等しく効かせるので、従来どおり子プロセスの env で渡す。
+# **候補戦略が凍結版のときはノブを渡せない**（凍結版は config を尊重せず、
+# 黙って無視されるので起動時に止まる）。
 #
 # `known`（既知の通常 arena 差）も、**同じ candidate / control / opponent / 予算で
 # arena.yml を取り直した値**にだけ付ける。CLAUDE.md に残っている過去の値は流用できない。
@@ -119,24 +120,14 @@ jobs:
           req='.github/ci/checkpoint-arena.request.json'
           # P0-b の既定セット。
           #
-          # **env 実験は既定から外してある**（PR #20 追加レビュー指摘1）。
-          # `TSUITATE_*` はプロセス全体に効き、相手（凍結版）も同じプロセスで
-          # 作られるので、candidate arm にだけノブを渡したつもりでも
-          #   candidate: 候補設定の現行 vs **候補設定の v14**
-          #   control  : 既定の現行     vs 既定の v14
-          # となって「同じ固定相手」で比べられない。しかも既定 matrix で使いたい
-          # ノブ（DROP_PROBE_REPEAT_GATE / ANCHOR_MOVE_W / EXPOSED_PAWN_HEAD_W /
-          # HAND_ASSET_W / KING_KNOWN_APPROACH_W / LINK_ENDGAME_DAMPEN /
-          # MATERIAL_DEGEN_Q0 / PROMOTE_FAR_W / GEN_NONPROMOTE）は
-          # **全部 src/frozen/estimator_v14.rs が読む**（確認済み）。
-          # checkpoint_arena はこれを実行前に検出して止める（相手のソースを
-          # compile-time に埋め込んで env 名を走査する）。
-          #
-          # 候補側だけにノブを効かせる経路（現行 strategy だけが読む alias、
-          # または評価パラメータのインスタンス注入）ができるまでは、
-          # 既定は「相手も候補も env なし」で成立する実験だけにする。
-          # 手で `experiments` を渡して `--allow-opponent-env` 相当を使う場合は、
-          # 「候補単体の効果」ではないことを承知のうえで読むこと。
+          # **env 実験は既定 matrix から外したまま**にしてある。
+          # issue #21 で「candidate arm のノブが同じプロセスの凍結相手にも効く」
+          # 問題自体は解消した（ノブはプロセス env でなく config で渡るので、
+          # 相手は arm によらず既定値）。それでも既定へ戻さないのは、
+          # P0 の較正がまだ済んでいない = 「checkpoint arena の delta が
+          # 通常 arena の delta とどう対応するか」の対応表が無いから。
+          # ノブ実験を回したいときは `experiments` へ
+          # `candidate_env` / `control_env` を明示して手で起動する。
           #
           # `known` も既定では入れない: CLAUDE.md に残っている
           # −12.8 / −8.5 / −7.4 / −2.8pt は当時の main・別の対戦条件で測った値で、

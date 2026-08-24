@@ -39,6 +39,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use tsuitate_bot::config;
+use tsuitate_bot::frozen;
 use tsuitate_bot::checkpoint::{
     Deck, DeckEntry, GameCandidates, candidates, kif_ending, phase_tag, restore, stable_game_id,
     split_of, stable_hash, stratified_pick,
@@ -114,30 +115,19 @@ const SHARED_SOURCES: &[&str] = &[
 /// 今も読むので、env 実験のノブはほぼ全部 v14 が読む。
 ///
 /// ソースを埋め込んで env 名を走査すれば、この食い違いを**実行前に**検出できる。
-/// **この配列は手動で更新する**（凍結版を足したら `frozen/mod.rs` や arena.yml の
-/// baselines と同じチェックリストでここにも足すこと。勝手に追随はしない）。
-/// バイナリは数 MB 太るが、これは開発用ツールなので許容する。
+/// 凍結版のソースは `frozen::SOURCES`（**一箇所で管理**）から引くので、
+/// 版を足したときにここを更新し忘れることはない。現行 estimator の3ファイルだけ
+/// ここで埋め込む。バイナリは数 MB 太るが、これは開発用ツールなので許容する。
 ///
 /// **ただしこの走査は「読まないことの証明」にはならない**（共有依存は定跡以外にもあり、
 /// 動的な env 名の組み立ても原理的にありうる）。だから arm 固有 env は
 /// **原則拒否**（`CANDIDATE_ONLY_ENV` の監査済みキーだけ許可）にしてあり、
 /// 走査はその上の二次的な検査として使う。恒久対策は issue #21。
-const STRATEGY_SOURCES: &[(&str, &[&str])] = &[
-    ("estimator", &[
-        include_str!("../strategy.rs"),
-        include_str!("../estimator.rs"),
-        include_str!("../check.rs"),
-    ]),
-    ("estimator_v6", &[include_str!("../frozen/estimator_v6.rs")]),
-    ("estimator_v7", &[include_str!("../frozen/estimator_v7.rs")]),
-    ("estimator_v8", &[include_str!("../frozen/estimator_v8.rs")]),
-    ("estimator_v9", &[include_str!("../frozen/estimator_v9.rs")]),
-    ("estimator_v10", &[include_str!("../frozen/estimator_v10.rs")]),
-    ("estimator_v11", &[include_str!("../frozen/estimator_v11.rs")]),
-    ("estimator_v12", &[include_str!("../frozen/estimator_v12.rs")]),
-    ("estimator_v13", &[include_str!("../frozen/estimator_v13.rs")]),
-    ("estimator_v14", &[include_str!("../frozen/estimator_v14.rs")]),
-];
+const STRATEGY_SOURCES: &[(&str, &[&str])] = &[("estimator", &[
+    include_str!("../strategy.rs"),
+    include_str!("../estimator.rs"),
+    include_str!("../check.rs"),
+])];
 
 /// **プロセス env に置いてよい arm 固有キー**。
 ///
@@ -152,6 +142,10 @@ const CANDIDATE_ONLY_ENV: &[&str] = &[];
 fn strategy_reads_env(name: &str, key: &str) -> bool {
     let own = match STRATEGY_SOURCES.iter().find(|(n, _)| *n == name) {
         Some((_, srcs)) => srcs.iter().any(|s| s.contains(key)),
+        None if frozen::SOURCES.iter().any(|(_, n, _)| *n == name) => {
+            // 凍結版は自分のファイルの中で env を読む（`frozen::SOURCES` が一次資料）
+            frozen::env_keys_in_source(name).iter().any(|k| k == key)
+        }
         None => return true,
     };
     own || SHARED_SOURCES.iter().any(|s| s.contains(key))
@@ -2560,7 +2554,7 @@ mod tests {
     fn frozen_strategies_do_not_honor_config() {
         assert!(strategy::honors_config("estimator"));
         assert!(strategy::honors_config("estimator_rush"));
-        for (name, _) in STRATEGY_SOURCES.iter().filter(|(n, _)| n.starts_with("estimator_v")) {
+        for (_, name, _) in frozen::SOURCES {
             assert!(!strategy::honors_config(name), "{name}");
             assert!(
                 strategy::make_seeded_with_config(name, 0, std::sync::Arc::new(

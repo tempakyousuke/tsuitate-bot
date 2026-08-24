@@ -186,6 +186,16 @@ pub fn current_config() -> Arc<StrategyConfig> {
     CURRENT.with(|c| c.borrow().clone())
 }
 
+/// **凍結版が使う既定 config**（issue #21）。env を一切見ない。
+///
+/// 新しい凍結版（v15 以降）は自分の実効設定を凍結時点のコピーとして持ち、
+/// 共有モジュール（`opening.rs` の定跡パス等）が引く config もこれに固定する。
+/// これで「凍結後に実行時 env で挙動が変わる」経路が無くなる。
+pub fn frozen_defaults() -> Arc<StrategyConfig> {
+    static F: OnceLock<Arc<StrategyConfig>> = OnceLock::new();
+    F.get_or_init(|| Arc::new(StrategyConfig::defaults())).clone()
+}
+
 /// [`scoped`] の戻り値。drop で元の config へ戻す。
 pub struct Scope(Option<Arc<StrategyConfig>>);
 
