@@ -56,7 +56,8 @@ use tsuitate_bot::truth_replay::{load_end, side_idx};
 /// **2 で `opponent_env` を必須にした**（PR #20 4回目レビュー指摘2）。
 /// schema 1 は candidate env が固定相手にも効いていた時期の記録で、
 /// `opponent_env` が無いため「相手の実効 env は両 arm とも空で一致」と
-/// 誤って解釈できてしまう。集計から明示的に弾く
+/// 誤って解釈できてしまう。schema 2 は arm 固有ノブをプロセス env で
+/// 渡していた時期（＝相手にも効いていた）。どちらも集計から明示的に弾く
 const ROW_SCHEMA: u32 = 3;
 
 /// `compare` が出す **summary JSON** の schema。行 schema とは別に持つ
@@ -120,9 +121,9 @@ const SHARED_SOURCES: &[&str] = &[
 /// ここで埋め込む。バイナリは数 MB 太るが、これは開発用ツールなので許容する。
 ///
 /// **ただしこの走査は「読まないことの証明」にはならない**（共有依存は定跡以外にもあり、
-/// 動的な env 名の組み立ても原理的にありうる）。だから arm 固有 env は
-/// **原則拒否**（`CANDIDATE_ONLY_ENV` の監査済みキーだけ許可）にしてあり、
-/// 走査はその上の二次的な検査として使う。恒久対策は issue #21。
+/// 動的な env 名の組み立ても原理的にありうる）。issue #21 以後、arm 固有ノブは
+/// プロセス env を通らないのでこの走査に頼らずに済むが、**プロセス env に
+/// arm 固有の値を置く経路が復活したときの関門**として残してある。
 const STRATEGY_SOURCES: &[(&str, &[&str])] = &[("estimator", &[
     include_str!("../strategy.rs"),
     include_str!("../estimator.rs"),
