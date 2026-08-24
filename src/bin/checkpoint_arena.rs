@@ -144,8 +144,9 @@ fn strategy_reads_env(name: &str, key: &str) -> bool {
     let own = match STRATEGY_SOURCES.iter().find(|(n, _)| *n == name) {
         Some((_, srcs)) => srcs.iter().any(|s| s.contains(key)),
         None if frozen::SOURCES.iter().any(|(_, n, _)| *n == name) => {
-            // 凍結版は自分のファイルの中で env を読む（`frozen::SOURCES` が一次資料）
-            frozen::env_keys_in_source(name).iter().any(|k| k == key)
+            // 凍結版は自分のファイルの中で env を読む（`frozen::SOURCES` が一次資料）。
+            // 共有モジュール経由（定跡パス）も `env_keys_read_by` が含める
+            return frozen::env_keys_read_by(name).iter().any(|k| k == key);
         }
         None => return true,
     };
@@ -160,13 +161,48 @@ fn opponent_effective_env(opponent: &str) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// **相手の実効挙動の指紋**（PR #22 レビュー指摘4）。
+///
+/// 現行 `StrategyConfig` の指紋をそのまま使うと、凍結版は各ファイル内の
+/// 旧既定値・旧 env 読取規則で動くので**相手名に依らず同じ値**になり、
+/// 「相手の実効設定」を表さない。凍結版は版のソース・その版が読む env の
+/// 実効値・共有モデルの pin から作り、現行 estimator 系だけ config の指紋を使う。
+fn opponent_fingerprint(opponent: &str, ambient: &config::StrategyConfig) -> String {
+    let env: BTreeMap<String, String> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("TSUITATE_"))
+        .collect();
+    match frozen::behavior_fingerprint(opponent, &env) {
+        Some(fp) => fp,
+        // 現行 estimator 系は instance の config がそのまま実効設定
+        None => ambient.fingerprint(),
+    }
+}
+
 /// **arm 固有ノブが実際に効く戦略か**（issue #21）。
 ///
 /// config を尊重するのは現行 estimator 系だけ。凍結版へノブを渡しても
 /// 黙って無視される（凍結版は自分のコピーの中でプロセス env を読む）ので、
 /// 「設定したつもり」で計測してしまう事故を起動時に止める。
 fn assert_arm_knobs_apply(arm_label: &str, strategy: &str, knobs: &BTreeMap<String, String>) {
-    if knobs.is_empty() || strategy::honors_config(strategy) {
+    if knobs.is_empty() {
+        return;
+    }
+    // **綴り間違い・無効値の関門**（PR #22 レビュー指摘2）。「設定したつもり」で
+    // 実効値が既定のまま完走するのを防ぐ
+    let check = config::check_overrides(&config::EnvSource::from_process(), knobs);
+    if !check.unknown.is_empty() {
+        die(&format!(
+            "arm={arm_label} のノブに戦略が読まないキーがあります（綴り間違い？）: {}",
+            check.unknown.join(", ")
+        ));
+    }
+    if !check.ineffective.is_empty() {
+        eprintln!(
+            "警告: arm={arm_label} の次のノブは実効値を変えませんでした\n                      （既定値と同じ値か、解釈できない・範囲外の値）: {}",
+            check.ineffective.join(", ")
+        );
+    }
+    if strategy::honors_config(strategy) {
         return;
     }
     die(&format!(
@@ -716,8 +752,9 @@ fn play_one_arm(
         // **指紋は解決後の値から作る**ので、「未知のキーを足しただけ」では変わらない
         "arm_knobs": arm_knobs,
         "arm_config": arm_config.fingerprint(),
-        // 相手の実効設定。両 arm で一致していないと「同じ固定相手」ではない
-        "opponent_config": opp_config.fingerprint(),
+        // 相手の**実効挙動**の指紋（凍結版は版のソース・読む env・共有モデル pin から作る）。
+        // 両 arm で一致していないと「同じ固定相手」ではない
+        "opponent_config": opponent_fingerprint(opponent, &opp_config),
         "commit": git_commit(),
         "deck_hash": deck.hash(deck_dir).unwrap_or_else(|e| die(&e)),
         "think_budget_ms": arm_config.think_budget_ms.to_string(),
@@ -1425,6 +1462,28 @@ fn validate_rows(
             &mut notes,
         );
     }
+    // **ノブを渡したのに実効設定が動いていない**（PR #22 レビュー指摘2）。
+    // arm ごとのノブが違うのに arm_config が同じなら、綴り間違いか無効値で
+    // 「candidate == control」の実験を回したことになる
+    let arm_sig = |arm: &str| -> Option<(String, String)> {
+        rows.iter().find(|r| r.arm == arm).map(|r| {
+            let knobs: Vec<String> =
+                r.arm_knobs.iter().map(|(k, v)| format!("{k}={v}")).collect();
+            (knobs.join(" "), r.arm_config.clone())
+        })
+    };
+    if let (Some((ck, ccfg)), Some((tk, tcfg))) = (arm_sig("control"), arm_sig("candidate")) {
+        if ck != tk && ccfg == tcfg {
+            fail(
+                format!(
+                    "arm ごとのノブが違うのに実効設定が同じです（綴り間違い／無効値？）: \
+                     control [{ck}] vs candidate [{tk}]"
+                ),
+                &mut notes,
+            );
+        }
+    }
+
     // **相手の実効設定の指紋**が両 arm で同じであること（issue #21）。
     // 指紋は解決後の値から作るので、env の綴りが違っても実効が同じなら通る
     let opp_cfgs: HashSet<&str> = rows.iter().map(|r| r.opponent_config.as_str()).collect();
@@ -2505,8 +2564,14 @@ mod tests {
             "前提: 凍結ファイル自体にはこの文字列が無い（あるならテストの意味が変わる）"
         );
         assert!(
+            // doc コメントの言及（backtick）ではなく、**文字列リテラル**が無いこと。
+            // 走査が拾うのはリテラルだけなので、これが無ければ機械的には見えない
+            !include_str!("../opening.rs").contains("\"TSUITATE_JOSEKI\""),
+            "前提: opening.rs にリテラルは無い（config 経由で解決するので走査では拾えない）"
+        );
+        assert!(
             strategy_reads_env("estimator_v14", "TSUITATE_JOSEKI"),
-            "共有 opening.rs 経由の読取を見落としている"
+            "共有 opening.rs 経由の読取を見落としている（frozen::SHARED_MODULE_ENV）"
         );
     }
 

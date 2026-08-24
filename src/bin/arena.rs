@@ -136,7 +136,10 @@ fn summary_json(candidate: &str, baseline: &str, stats: &MatchStats) -> serde_js
         // 候補側だけに効かせたノブと、両側の実効設定の指紋（issue #21）
         "cand_knobs": cand_knobs(),
         "cand_config": candidate_config().fingerprint(),
-        "baseline_config": tsuitate_bot::config::ambient().fingerprint(),
+        // **基準側の実効挙動**の指紋（凍結版は版のソース・その版が読む env の実効値・
+        // 共有モデルの pin から作る）。現行 config の指紋をそのまま入れると
+        // 全 baseline で同じ値になり、実効設定を表さない（PR #22 レビュー指摘4）
+        "baseline_behavior": baseline_fingerprint(baseline),
     })
 }
 
@@ -162,7 +165,37 @@ fn cand_knobs() -> BTreeMap<String, String> {
         }
         out.insert(k.to_string(), v.to_string());
     }
+    // **綴り間違い・無効値の関門**（PR #22 レビュー指摘2）。接頭辞だけ見ていると
+    // `TSUITATE_HAND_ASSET_WW=0.5` が通り、実効値は既定のままの実験が
+    // 正常完走してしまう
+    let check = tsuitate_bot::config::check_overrides(
+        &tsuitate_bot::config::EnvSource::from_process(),
+        &out,
+    );
+    if !check.unknown.is_empty() {
+        eprintln!(
+            "ARENA_CAND_KNOBS に戦略が読まないキーがあります（綴り間違い？）: {}",
+            check.unknown.join(", ")
+        );
+        std::process::exit(1);
+    }
+    if !check.ineffective.is_empty() {
+        eprintln!(
+            "警告: ARENA_CAND_KNOBS の次のキーは実効値を変えませんでした\n                      （既定値と同じ値か、解釈できない・範囲外の値）: {}",
+            check.ineffective.join(", ")
+        );
+    }
     out
+}
+
+/// **基準側の実効挙動**の指紋。凍結版は版のソース・その版が読む env の実効値・
+/// 共有モデルの pin から、現行 estimator 系は ambient config の指紋から作る。
+fn baseline_fingerprint(name: &str) -> String {
+    let env: BTreeMap<String, String> = std::env::vars()
+        .filter(|(k, _)| k.starts_with("TSUITATE_"))
+        .collect();
+    tsuitate_bot::frozen::behavior_fingerprint(name, &env)
+        .unwrap_or_else(|| tsuitate_bot::config::ambient().fingerprint())
 }
 
 /// 候補側の実効設定（プロセス env にノブを重ねたもの）。
@@ -194,8 +227,10 @@ fn make_candidate(name: &str, seed: Option<u64>) -> Box<dyn strategy::Strategy +
         );
         std::process::exit(1);
     }
-    strategy::make_seeded_with_config(name, seed.unwrap_or(0), candidate_config())
-        .expect("検証済みの戦略名")
+    // **seed は素通しする**。`seed.unwrap_or(0)` にすると ARENA_MATCH_SEED 未指定の
+    // 通常アリーナで候補が全局 seed 0 になり、「ノブの有無」で乱数条件まで変わって
+    // 対照との比較が崩れる（PR #22 レビュー指摘1）
+    strategy::make_with_config(name, seed, candidate_config()).expect("検証済みの戦略名")
 }
 
 fn main() {

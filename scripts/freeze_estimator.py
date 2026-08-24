@@ -106,6 +106,29 @@ fn frozen_config() -> &'static FrozenKnobs {
         }
     })
 }
+
+/// **凍結時点の定跡パス**（PR #22 レビュー指摘3）。
+///
+/// 共有 `opening.rs` は設置されている `StrategyConfig` からパスを引くので、
+/// `crate::config::StrategyConfig::defaults()` を設置すると
+/// **将来この既定を変えたときに凍結版まで追随してしまう**。ここで凍結時点の
+/// 値をリテラルとして持ち、それを設置する。
+/// 中身（`joseki.json` の内容）は `frozen::SHARED_MODEL_PINS` が content hash で
+/// 見張っており、編集すると影響する凍結版を名指しでテストが落ちる。
+const FROZEN_JOSEKI_PATH: &str = "{joseki}";
+
+/// この凍結版が共有モジュールへ設置する `StrategyConfig`。
+/// 実行時 env は見ず、定跡パスだけ凍結時点の値で上書きする。
+fn frozen_strategy_config() -> std::sync::Arc<crate::config::StrategyConfig> {
+    static C: std::sync::OnceLock<std::sync::Arc<crate::config::StrategyConfig>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        std::sync::Arc::new(crate::config::StrategyConfig::from_source(
+            crate::config::EnvSource::from_pairs([("TSUITATE_JOSEKI", FROZEN_JOSEKI_PATH)]),
+        ))
+    })
+    .clone()
+}
 """
 
 
@@ -177,15 +200,25 @@ def freeze_config(body: str) -> str:
     )
     if n_knob == 0:
         raise SystemExit("ノブのアクセサが見つからない（現行 strategy.rs の構造が変わった？）")
-    body, n_amb = re.subn(
-        r"crate::config::ambient\(\)", "crate::config::frozen_defaults()", body
-    )
+    body, n_amb = re.subn(r"crate::config::ambient\(\)", "frozen_strategy_config()", body)
     if n_amb != 1:
         raise SystemExit(f"ambient() の置換に失敗（{n_amb}件）")
     if "env::var(" in body:
         left = sorted(set(re.findall(r'"(TSUITATE_[A-Z0-9_]*)"', body)))
         raise SystemExit(f"凍結版に env::var が残っています（例: {left[:5]}）")
-    return body + FROZEN_CONFIG
+    return body + FROZEN_CONFIG.replace("{joseki}", frozen_joseki_path())
+
+
+def frozen_joseki_path() -> str:
+    """凍結時点の既定の定跡パス（src/config.rs から読む）。
+
+    生成物へリテラルとして埋めるので、後で既定を変えても既存の凍結版は動かない。
+    """
+    cfg = open("src/config.rs", encoding="utf-8").read()
+    m = re.search(r'\.var\("TSUITATE_JOSEKI"\)\s*\n?\s*\.unwrap_or_else\(\|_\| "([^"]+)"', cfg)
+    if not m:
+        raise SystemExit("src/config.rs から既定の定跡パスを読めません")
+    return m.group(1)
 
 
 def main() -> None:

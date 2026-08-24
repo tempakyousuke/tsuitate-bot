@@ -17,7 +17,7 @@
 | `StrategyConfig::fingerprint()` | **解決後の値**の sha256。未知のキーや既定値と同じ指定では変わらない |
 | `config::scoped(&cfg)` | この config をこのスレッドへ設置（`EstimatorStrategy` の `choose` / `prewarm` / `oracle_anchor` の入口） |
 | `config::ambient()` | プロセス env を一度だけ解釈した既定。config を設置しない経路（診断バイナリ・GUI）の互換 |
-| `config::frozen_defaults()` | env を一切見ない既定。**v15 以降の凍結版**が使う |
+| `config::check_overrides()` | 明示ノブの検査。戦略が読まないキー（綴り間違い）と、実効値が変わらなかったキーを返す |
 
 設置がスレッドローカル・スコープつきなのは、arena / scenario が対局をスレッド並列に
 回すから。`OnceLock` のプロセス全体キャッシュだと arm ごとの構築順で値が混ざる
@@ -49,29 +49,34 @@
 - `shogi.rs`（ルールエンジン）・`board.rs`（候補手生成）・`observation.rs`（観測）
 - `protocol.rs`（サイト契約）・`model.rs`・`deduce.rs`・`mate.rs`
 
-### 3.2 凍結すべきなのに共有しているもの（既知の負債）
+### 3.2 凍結版が依存する共有コード・モデル・データ
 
 凍結版が呼ぶモデル・特徴量は、更新するとその凍結版の**挙動が変わる**。
+すべて `SHARED_MODEL_PINS` で content hash を pin してある。
 
-| ファイル | 依存する凍結版 |
-| --- | --- |
-| `src/likelihood.rs`（尤度係数 `FITTED_THETA`） | v12 / v13 / v14 |
-| `src/value_nn.rs`（value ネットの重み） | v12 / v13 / v14 |
-| `src/value_features.rs` | v12 / v13 / v14 |
-| `src/belief_nn.rs` / `src/belief_features.rs` | v13 / v14 |
-| `src/king_belief_nn.rs` | v14 |
-| `src/opp_move_nn_v25.rs` / `src/opp_move_features.rs` | v12 / v13 / v14 |
-| `joseki.json`（実行時に読むデータ） | v12 / v13 / v14 |
+| ファイル | 依存する凍結版 | 種類 |
+| --- | --- | --- |
+| `src/opp_move_nn_v25.rs` | v12 / v13 / v14 | **固定コピー**（再学習しない） |
+| `src/value_nn_v22.rs` | v12 / v13 / v14 | **固定コピー**（再学習しない） |
+| `src/likelihood.rs`（尤度係数 `FITTED_THETA`） | v12 / v13 / v14 | 共有（pin のみ） |
+| `src/value_features.rs` / `src/opp_move_features.rs` | v12 / v13 / v14 | 共有（pin のみ） |
+| `src/belief_nn.rs` / `src/belief_features.rs` | v13 / v14 | 共有（pin のみ） |
+| `src/king_belief_nn.rs` | v14 | 共有（pin のみ） |
+| `src/opening.rs`（定跡の読み込み実装） | v12 / v13 / v14 | 共有（pin のみ） |
+| `joseki.json`（実行時に読むデータ） | v12 / v13 / v14 | 共有（pin のみ） |
 
 v9〜v11 は NN の重みを凍結ファイルへコピーしているので影響しない。
-opp_move NN は 2026-08-21 の再学習時に `opp_move_nn_v25.rs` という固定コピーを
-作って解決した（**先例**）。
 
 **実際に起きた事故**: 2026-08-21 の value NN 再学習（commit `387f0ac`）は
-v12〜v14 の挙動を変えている。当時は検知する仕組みが無く、CLAUDE.md の
-ガントレット値もこの前後で厳密には比較できない。**この PR では検知だけ入れて
-挙動は戻していない**（戻すと、再学習以後に測った基準値のほうが無効になる。
-どちらを取るかは計測の運用判断なので勝手に決めない）。
+v12〜v14 の挙動を変えている（当時は検知する仕組みが無かった）。
+opp_move NN は同じ再学習のときに `opp_move_nn_v25.rs` という固定コピーを作って
+解決していたが、value NN は共有のままだった。
+
+**対応（2026-08-24、ユーザー判断）**: 再学習前へは**戻さず**、
+**現在の v12〜v14 の挙動を基準として pin する**。戻すと再学習以後に測った
+基準値のほうが無効になるため。`src/value_nn_v22.rs` を切り出して v12〜v14 の
+呼び先をそちらへ向けた（数値は切り出し時点の `value_nn.rs` と完全に同一なので、
+この変更自体は挙動を変えない）。**以後の value NN 再学習で v12〜v14 は動かない**。
 
 ### 3.3 検知の仕組み
 
@@ -83,6 +88,13 @@ v12〜v14 の挙動を変えている。当時は検知する仕組みが無く�
 - `versions_using(module)` … 再学習の前に「何が動くか」を機械可読に出す
 - `SOURCES` / `env_keys_in_source(name)` … 凍結版が読む env の一覧
   （checkpoint arena の実行前検査がこれを使う。表は一箇所だけ）
+- `env_keys_read_by(name)` … **共有モジュール経由も含めた** env の一覧。
+  `opening.rs` は config から定跡パスを引くだけでリテラルを持たないので、
+  走査では拾えないぶんを `SHARED_MODULE_ENV` が明示する
+- `behavior_fingerprint(name, env)` … 相手の**実効挙動**の指紋。
+  版のソース sha256 ＋ その版が読む env の実効値 ＋ 共有モデルの pin から作る。
+  現行 `StrategyConfig` の指紋を「相手の設定」として記録すると、凍結版は
+  各ファイル内の旧既定値で動くので**相手名に依らず同じ値**になってしまう
 
 ## 4. 既存 v6〜v14 の扱い
 
@@ -101,9 +113,14 @@ v12〜v14 の挙動を変えている。当時は検知する仕組みが無く�
 1. `crate::config::current(|c| c.<節>.<名>)` → `frozen_config().<節>.<名>`
    （節ごとの Knobs 構造体と `from_source` は本文にコピーされるので、
    空の `EnvSource` から解決すれば**凍結時点の既定値**がそのまま出る）
-2. `crate::config::ambient()` → `crate::config::frozen_defaults()`
-   （共有モジュールが引く config も既定へ固定される）
+2. `crate::config::ambient()` → 生成物が持つ `frozen_strategy_config()`。
+   これは**凍結時点の定跡パスをリテラルで固定**した config
+   （`const FROZEN_JOSEKI_PATH`）を設置する。`StrategyConfig::defaults()` を
+   設置すると、将来この既定を変えたときに既存の凍結版まで追随してしまう
 3. 生成物に `env::var(` が残っていたら**生成時に失敗**
+
+定跡の**中身**（`joseki.json`）は `SHARED_MODEL_PINS` が content hash で見張る。
+編集すると影響する凍結版を名指しでテストが落ちる。
 
 思考予算はプロセス env ではなく `EstimatorVN::with_budget_ms(seed, ms)` で明示的に渡す。
 
@@ -119,13 +136,25 @@ v12〜v14 の挙動を変えている。当時は検知する仕組みが無く�
 
 | ツール | 両側に効かせる | 候補側だけに効かせる |
 | --- | --- | --- |
-| `bin/arena` | `TSUITATE_*`（プロセス env。`-f env=`） | **`ARENA_CAND_KNOBS="K=V K=V"`**（config。凍結版が候補のときは使えない） |
+| `bin/arena` | `TSUITATE_*`（プロセス env。`-f env=`） | **`-f cand_env=` / `ARENA_CAND_KNOBS="K=V K=V"`**（config。凍結版が候補のときは使えない） |
 | `bin/checkpoint_arena` | `--budget-ms`（子プロセスの env） | `--control-env` / `--candidate-env`（**config**。プロセス env は触らない） |
 | `bin/scenario` | `TSUITATE_*`（プロセス env） | 対照も候補も同じプロセスで作るので、版比較は `-f env=` ではなく同一コミットのペア計測で |
 | `bin/tune` | `TSUITATE_*` | SPSA は `EvalParams` を直接渡すので config を経由しない（調整対象ノブの env が立っていると起動時にエラー、は従来どおり） |
 
 **`-f env=` はプロセス全体に効く**（凍結版も読む）ので、
 「候補側だけ」を意図するときは上の右列を使うこと。
+
+明示的に渡したノブは `config::check_overrides` が検査する:
+
+- 戦略が読まないキー（`TSUITATE_HAND_ASSET_WW` のような綴り間違い）は**起動時エラー**
+- 実効値が変わらなかったキー（既定値と同じ値・解釈できない値・範囲外）は**警告**。
+  checkpoint arena の `compare` は「arm ごとのノブが違うのに `arm_config` が同じ」を
+  検出して止める（＝ candidate と control が実は同じ設定だった実験）
+
+**seed の扱いはノブの有無で変えない**。config 付きの生成 API は seed を
+`Option<u64>` で受ける（`make_with_config`）。`Some(0)` に落とすと
+`ARENA_MATCH_SEED` 未指定の通常アリーナで候補だけ全対局が同じシードになり、
+対照との比較がノブ以外の理由で崩れる。
 
 ## 7. 既定挙動の同一性確認
 
@@ -162,8 +191,14 @@ vs v13 **61.5%±9.4**（64-40）/ vs v14 **51.0%±9.6**（53-51）、反則/局 
 
 ## 8. 残っている穴
 
-- `joseki.json` は**パス**を config で固定できるが、**中身**は実行時に読む
-  ファイルのまま。定跡を更新すると v12〜v14 の序盤分布が変わる
-- 3.2 の共有モデルは検知するだけで、固定コピー化はしていない
-- v6〜v14 は引き続きプロセス env に反応する。両側に等しく効くぶんには
-  比較は壊れないが、**片側だけに効かせることはできない**
+- **v6〜v14 は引き続きプロセス env に反応する**。両側に等しく効くぶんには
+  比較は壊れないが、片側だけに効かせることはできない（hermetic 規約は v15 以降）
+- 共有モデル（`likelihood.rs` / `belief_nn.rs` / `king_belief_nn.rs` /
+  各 `*_features.rs` / `opening.rs` / `joseki.json`）は**検知するだけ**で、
+  固定コピー化はしていない。更新するときに影響する凍結版を見て、
+  固定コピーを作るか再計測を記録するかを選ぶ運用
+- `joseki.json` は**パスを凍結版が固定し、中身は content hash で見張る**が、
+  中身を変えたときに凍結版へ「凍結時点の定跡」を復元する仕組みは無い
+  （必要になったら固定コピーを作る）
+- `frozen::SOURCES` は凍結版ソース 2.6MB を `include_str!` でライブラリへ
+  埋め込むので、本番 bot のバイナリもそのぶん太る（監査の一元化とのトレードオフ）

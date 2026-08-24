@@ -204,28 +204,46 @@ pub fn make_seeded_with_config(
     seed: u64,
     config: Arc<crate::config::StrategyConfig>,
 ) -> Option<Box<dyn Strategy + Send>> {
-    match name {
-        "estimator" => Some(Box::new(EstimatorStrategy::with_config(
-            config,
-            EvalParams::default(),
-            None,
-            Some(seed),
-        ))),
+    make_with_config(name, Some(seed), config)
+}
+
+/// [`make_seeded_with_config`] の **seed 任意**版。
+///
+/// `seed: None` は `make` と同じくエントロピー由来（対局ごとに違う乱数）。
+/// **ノブの有無で乱数条件が変わってはいけない**ので、共通乱数法を使わない
+/// 経路（`ARENA_MATCH_SEED` 未指定の通常アリーナ）はここを通すこと
+/// —— `Some(0)` に落とすと全対局で候補が同じシードになり、対照との比較が
+/// ノブ以外の理由で崩れる（PR #22 レビュー指摘1）。
+pub fn make_with_config(
+    name: &str,
+    seed: Option<u64>,
+    config: Arc<crate::config::StrategyConfig>,
+) -> Option<Box<dyn Strategy + Send>> {
+    Some(Box::new(estimator_with_config(name, seed, config)?))
+}
+
+/// [`make_with_config`] の実体（テストが seed の扱いを直接見られるよう
+/// boxing の手前で切ってある）。
+fn estimator_with_config(
+    name: &str,
+    seed: Option<u64>,
+    config: Arc<crate::config::StrategyConfig>,
+) -> Option<EstimatorStrategy> {
+    let book_line = match name {
+        "estimator" => None,
+        // 定跡の読み込みも config のパスで行う
         "estimator_rush" => {
-            // 定跡の読み込みも config のパスで行う
-            let idx = {
-                let _cfg = crate::config::scoped(&config);
-                OpeningBook::line_index("居飛車速攻")?
-            };
-            Some(Box::new(EstimatorStrategy::with_config(
-                config,
-                EvalParams::default(),
-                Some(idx),
-                Some(seed),
-            )))
+            let _cfg = crate::config::scoped(&config);
+            Some(OpeningBook::line_index("居飛車速攻")?)
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some(EstimatorStrategy::with_config(
+        config,
+        EvalParams::default(),
+        book_line,
+        seed,
+    ))
 }
 
 pub fn make(name: &str) -> Option<Box<dyn Strategy + Send>> {
@@ -5080,6 +5098,11 @@ impl EstimatorStrategy {
     /// この instance の設定（記録・検査用）。
     pub fn config(&self) -> &Arc<crate::config::StrategyConfig> {
         &self.config
+    }
+
+    /// 注入されたシード（None = エントロピー由来）。テスト・診断用。
+    pub fn seed(&self) -> Option<u64> {
+        self.seed
     }
 }
 
@@ -10888,6 +10911,42 @@ pub(crate) mod tests {
     use std::collections::{HashMap, HashSet};
 
     use super::*;
+
+    /// **ノブの有無で乱数条件が変わってはいけない**（PR #22 レビュー指摘1）。
+    ///
+    /// config 付きの生成が seed を `Option` で受けないと、呼び出し側が
+    /// `seed.unwrap_or(0)` に落として「候補だけ全対局が同じシード」になり、
+    /// 対照との比較がノブ以外の理由で崩れる。
+    #[test]
+    fn config付き生成はseedの扱いを変えない() {
+        let base = std::sync::Arc::new(crate::config::StrategyConfig::defaults());
+        let knobbed = std::sync::Arc::new(crate::config::StrategyConfig::from_source(
+            crate::config::EnvSource::from_pairs([("TSUITATE_HAND_ASSET_W", "0.5")]),
+        ));
+        assert_ne!(base.fingerprint(), knobbed.fingerprint(), "前提: ノブは効いている");
+
+        for cfg in [&base, &knobbed] {
+            // seed 未指定はエントロピー由来のまま（Some(0) へ落ちない）
+            assert_eq!(
+                estimator_with_config("estimator", None, cfg.clone())
+                    .expect("estimator")
+                    .seed(),
+                None
+            );
+            // 指定したときはその値がそのまま入る
+            assert_eq!(
+                estimator_with_config("estimator", Some(7), cfg.clone())
+                    .expect("estimator")
+                    .seed(),
+                Some(7)
+            );
+        }
+        // 公開 API 同士の関係（make_seeded_with_config は Some(seed) 版）
+        assert!(make_with_config("estimator", None, base.clone()).is_some());
+        assert!(make_seeded_with_config("estimator", 7, base.clone()).is_some());
+        // 凍結版へは渡せない（黙って無視されるのを防ぐ）
+        assert!(make_with_config("estimator_v14", None, base).is_none());
+    }
     use crate::protocol::{ClockState, FoulCounts, GameStatus, VisiblePiece};
 
     pub(crate) fn minimal_view(pieces: Vec<VisiblePiece>, hand: HashMap<Role, u32>) -> PlayerView {

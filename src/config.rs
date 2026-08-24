@@ -18,8 +18,9 @@
 //! `choose` / `prewarm` / `oracle_anchor` が入口で設置する）。設置されて
 //! いない経路（診断バイナリ・GUI・凍結版 v6〜v14）は [`ambient`]
 //! （プロセス env を一度だけ解釈したもの）に落ちるので、**移行前と同じ挙動**
-//! になる。v15 以降の凍結版は自分で [`frozen_defaults`] を設置するので、
-//! 共有モジュール経由の設定まで env から切り離される。
+//! になる。v15 以降の凍結版は**凍結時点の値だけを持つ自前の config**
+//! （定跡パスもリテラルで固定）を設置するので、共有モジュール経由の設定まで
+//! env からも「将来の既定値の変更」からも切り離される。
 //!
 //! ## 監査
 //!
@@ -188,16 +189,6 @@ pub fn current_config() -> Arc<StrategyConfig> {
     CURRENT.with(|c| c.borrow().clone())
 }
 
-/// **凍結版が使う既定 config**（issue #21）。env を一切見ない。
-///
-/// 新しい凍結版（v15 以降）は自分の実効設定を凍結時点のコピーとして持ち、
-/// 共有モジュール（`opening.rs` の定跡パス等）が引く config もこれに固定する。
-/// これで「凍結後に実行時 env で挙動が変わる」経路が無くなる。
-pub fn frozen_defaults() -> Arc<StrategyConfig> {
-    static F: OnceLock<Arc<StrategyConfig>> = OnceLock::new();
-    F.get_or_init(|| Arc::new(StrategyConfig::defaults())).clone()
-}
-
 /// [`scoped`] の戻り値。drop で元の config へ戻す。
 pub struct Scope(Option<Arc<StrategyConfig>>);
 
@@ -217,6 +208,46 @@ impl Drop for Scope {
 pub fn scoped(cfg: &Arc<StrategyConfig>) -> Scope {
     let prev = CURRENT.with(|c| std::mem::replace(&mut *c.borrow_mut(), cfg.clone()));
     Scope(Some(prev))
+}
+
+/// 明示的に渡されたノブの検査結果（PR #22 レビュー指摘2）。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct KnobCheck {
+    /// 戦略が読まないキー（綴り間違い）。**エラーにすること**。
+    pub unknown: Vec<String>,
+    /// 与えたのに実効設定が変わらなかったキー（既定値と同じ値か、
+    /// 解釈できない・範囲外の値で既定へ戻ったか）。**警告して記録すること**。
+    pub ineffective: Vec<String>,
+}
+
+impl KnobCheck {
+    pub fn is_clean(&self) -> bool {
+        self.unknown.is_empty() && self.ineffective.is_empty()
+    }
+}
+
+/// 明示的なノブ指定を検査する。
+///
+/// `TSUITATE_` の接頭辞しか見ないと、`TSUITATE_HAND_ASSET_WW=0.5` のような
+/// 綴り間違いが黙って通り、**実効値は既定のまま**の実験が正常完走してしまう
+/// （「凍結版へ渡して設定したつもり」と同じ事故の別経路）。既知キーでも
+/// 解釈できない値は既定へ戻るので同じことが起きる。
+pub fn check_overrides(base: &EnvSource, overrides: &BTreeMap<String, String>) -> KnobCheck {
+    let mut out = KnobCheck::default();
+    let base_fp = StrategyConfig::from_source(base.clone()).fingerprint();
+    for (k, v) in overrides {
+        if !STRATEGY_ENV_KEYS.contains(&k.as_str()) {
+            out.unknown.push(k.clone());
+            continue;
+        }
+        // 1件ずつ載せて実効設定が動くかを見る（他のキーと打ち消し合っても
+        // 「このキーは効いた」と数えたいので、まとめてではなく個別に）
+        let one = base.with_overrides([(k.clone(), v.clone())]);
+        if StrategyConfig::from_source(one).fingerprint() == base_fp {
+            out.ineffective.push(k.clone());
+        }
+    }
+    out
 }
 
 /// 戦略の強さに関わる env キーの全量（監査・記録用）。
@@ -556,6 +587,34 @@ mod tests {
             assert_eq!(current(|c| c.strategy.hand_asset_w), 0.5);
         }
         assert_eq!(current(|c| c.strategy.hand_asset_w), 0.0);
+    }
+
+    /// 綴り間違い・解釈できない値を検出する（PR #22 レビュー指摘2）。
+    #[test]
+    fn ノブの綴り間違いと無効値を検出する() {
+        let base = EnvSource::empty();
+        let mk = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        // 綴り間違い（戦略が読まないキー）
+        let c = check_overrides(&base, &mk(&[("TSUITATE_HAND_ASSET_WW", "0.5")]));
+        assert_eq!(c.unknown, vec!["TSUITATE_HAND_ASSET_WW".to_string()]);
+        assert!(c.ineffective.is_empty());
+        // 解釈できない値 → 既定へ戻るので実効値が動かない
+        let c = check_overrides(&base, &mk(&[("TSUITATE_HAND_ASSET_W", "とても大きい")]));
+        assert!(c.unknown.is_empty());
+        assert_eq!(c.ineffective, vec!["TSUITATE_HAND_ASSET_W".to_string()]);
+        // 既定値と同じ値も「効かなかった」側（実験として無意味なので気づけるように）
+        let c = check_overrides(&base, &mk(&[("TSUITATE_HAND_ASSET_W", "0")]));
+        assert_eq!(c.ineffective, vec!["TSUITATE_HAND_ASSET_W".to_string()]);
+        // 効くノブは何も出ない
+        assert!(check_overrides(&base, &mk(&[("TSUITATE_HAND_ASSET_W", "0.5")])).is_clean());
+        // 範囲外（負値は filter で弾かれる）
+        let c = check_overrides(&base, &mk(&[("TSUITATE_HAND_ASSET_W", "-1")]));
+        assert_eq!(c.ineffective, vec!["TSUITATE_HAND_ASSET_W".to_string()]);
     }
 
     #[test]

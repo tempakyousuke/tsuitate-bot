@@ -40,6 +40,7 @@ pub mod strategy;
 pub mod truth_replay;
 pub mod value_features;
 pub mod value_nn;
+pub mod value_nn_v22;
 pub mod webhook_csa;
 pub mod webhook_hmac;
 pub mod webhook_protocol;

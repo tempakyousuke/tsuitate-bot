@@ -61,7 +61,10 @@
   `"cand_env"`。ローカルは env `ARENA_CAND_KNOBS`。issue #21、2026-08-24）:
   値はプロセス env でなく `StrategyConfig` として候補 instance にだけ渡るので、
   env を読み続ける凍結相手は必ず既定値のまま動く（凍結版を候補にしたときは
-  config を尊重しないので起動時にエラー）。
+  config を尊重しないので起動時にエラー）。**綴り間違い（戦略が読まないキー）は
+  起動時エラー、実効値が変わらなかったキーは警告**が出る（`config::check_overrides`）。
+  seed の扱いはノブの有無で変わらない（`make_with_config` が `Option<u64>` を素通し。
+  `Some(0)` へ落とすと候補だけ全対局が同じシードになる）。
   凍結版は**凍結時点で読んでいた env を今も読む**（実測 2026-07-26。
   一覧は `frozen::env_keys_in_source(name)` で機械的に取れる）:
   - `TSUITATE_THINK_BUDGET_MS` — **v6〜v11 の全凍結版が読む**。思考予算の
@@ -147,8 +150,12 @@
     渡せない（config を尊重せず黙って無視するので起動時に止まる）。
     両 arm に同じ値を渡す `--budget-ms` は従来どおり子プロセスの env。
     **較正が済むまで既定 matrix からは env 実験を外したまま**にしてある。
-    JSONL に `arm_knobs` / `arm_config` / `opponent_config`（実効設定の指紋）を残し、
-    `compare` は「相手の実効設定が両 arm で一致」を指紋で検査する
+    JSONL に `arm_knobs` / `arm_config` / `opponent_config` を残し、`compare` は
+    「相手の実効設定が両 arm で一致」を指紋で検査する。`opponent_config` は
+    **凍結版なら `frozen::behavior_fingerprint`**（版のソース・その版が読む env の
+    実効値・共有モデルの pin から作る）で、現行 config の指紋ではない。
+    綴り間違いのノブは起動時エラー、「ノブが違うのに実効設定が同じ」は
+    `compare` が止める
   - **seed は 4 以上の偶数**が P0 の条件（2 seed は AB/BA が閉じる最小構成だが
     replicate 間分散が同定できない）。`compare` は replicate が1つのとき
     seed 数の外挿を出さない
@@ -2153,14 +2160,21 @@
   `env_keys_in_source(name)`（その版が読む env）/ `versions_using(module)`
   （共有モジュールを呼ぶ版）/ `SHARED_MODEL_PINS`（共有モデルの sha256）を持つ。
   **共有モデルを更新すると、それを呼ぶ凍結版の挙動が変わる**:
-  `likelihood.rs` / `value_nn.rs` / `value_features.rs` は v12〜v14、
-  `belief_nn.rs` / `belief_features.rs` は v13/v14、`king_belief_nn.rs` は v14。
+  `likelihood.rs` / `value_features.rs` / `opp_move_features.rs` / `opening.rs` /
+  `joseki.json` は v12〜v14、`belief_nn.rs` / `belief_features.rs` は v13/v14、
+  `king_belief_nn.rs` は v14。**NN の重みは固定コピーへ移した**
+  （`opp_move_nn_v25.rs` / `value_nn_v22.rs`。再学習しても凍結版は動かない）。
   実際に **2026-08-21 の value NN 再学習（commit 387f0ac）は v12〜v14 の挙動を
   変えている**（当時は検知の仕組みが無く、ガントレット値もこの前後で厳密には
-  比較できない）。opp_move NN は同じ問題を `opp_move_nn_v25.rs` という固定コピーで
-  解決した先例。今は `SHARED_MODEL_PINS` の sha256 が変わるとテストが落ち、
+  比較できない）。**2026-08-24 のユーザー判断で「再学習前へ戻さず、現在の
+  v12〜v14 の挙動を基準として pin」**とし、`value_nn_v22.rs`（切り出し時点の
+  `value_nn.rs` と数値完全一致）へ向けた。
+  残りの共有依存は `SHARED_MODEL_PINS` の sha256 が変わるとテストが落ち、
   影響する凍結版を名指しするので、(a) 固定コピーを作る (b) 承知でハッシュを更新し
   再計測を記録する、のどちらかを必ず選ぶことになる。
+  `versions_using(module)` / `env_keys_read_by(name)`（共有モジュール経由の env 込み）/
+  `behavior_fingerprint(name, env)`（版・env・共有 pin から作る実効挙動の指紋）で
+  機械可読に取れる。
   v9〜v11 は NN の重みを凍結ファイルへコピーしているので影響しない。
   **v15 以降は実行時 env を読まない**（`HERMETIC_FROM`）。
   各版の内容（

@@ -56,6 +56,11 @@ pub fn env_keys_in_source(name: &str) -> Vec<String> {
     let Some((_, _, src)) = SOURCES.iter().find(|(_, n, _)| *n == name) else {
         return vec![];
     };
+    env_literals(src)
+}
+
+/// ソース中の `"TSUITATE_*"` 文字列リテラルを拾う。
+fn env_literals(src: &str) -> Vec<String> {
     let mut out: Vec<String> = vec![];
     for (i, _) in src.match_indices("\"TSUITATE_") {
         let rest = &src[i + 1..];
@@ -66,6 +71,73 @@ pub fn env_keys_in_source(name: &str) -> Vec<String> {
     out.sort();
     out.dedup();
     out
+}
+
+/// **共有モジュール経由で凍結版に効く env**。
+///
+/// 実装が `crate::config` を経由するので、モジュール本体には文字列リテラルが
+/// 無い（`opening.rs` は `config` が解決した `joseki_path` を読むだけ）。
+/// 走査では拾えないので明示する。
+const SHARED_MODULE_ENV: &[(&str, &[&str])] = &[("opening", &["TSUITATE_JOSEKI"])];
+
+/// 凍結版 `name` が**共有モジュール経由も含めて**読む env の一覧。
+///
+/// 凍結ファイル自身のリテラルだけを見ると、v12〜v14 が `opening.rs` 経由で
+/// 読む `TSUITATE_JOSEKI` を取りこぼす（PR #20 4回目レビューと同じ穴）。
+pub fn env_keys_read_by(name: &str) -> Vec<String> {
+    let mut out = env_keys_in_source(name);
+    for (_, _, module, src) in SHARED_MODEL_PINS {
+        if versions_using(module).contains(&name) {
+            out.extend(env_literals(src));
+        }
+    }
+    for (module, keys) in SHARED_MODULE_ENV {
+        if versions_using(module).contains(&name) {
+            out.extend(keys.iter().map(|k| k.to_string()));
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// 凍結版の**実効挙動の指紋**（PR #22 レビュー指摘4）。
+///
+/// 「相手の設定」を現行 `StrategyConfig` の指紋で記録すると、v6〜v14 は
+/// 各凍結ファイル内の旧既定値・旧 env 読取規則で動くので**相手名に依らず
+/// 同じ値**になり、実効設定を表さない。ここでは名前だけでは表せないものを混ぜる:
+///
+/// - 凍結版ソースの sha256（その版そのもの）
+/// - **その版が読む env の実効値**（共有モジュール経由を含む）
+/// - その版が呼ぶ共有モデル・データの pin ハッシュ
+///
+/// 凍結版でない名前（現行 estimator 系）は `None`。呼び出し側が
+/// instance の `StrategyConfig::fingerprint()` を使うこと。
+pub fn behavior_fingerprint(
+    name: &str,
+    env: &std::collections::BTreeMap<String, String>,
+) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let (_, _, src) = SOURCES.iter().find(|(_, n, _)| *n == name)?;
+    let mut h = Sha256::new();
+    h.update(name.as_bytes());
+    h.update(b"\x00");
+    h.update(sha256_hex(src).as_bytes());
+    for k in env_keys_read_by(name) {
+        h.update(b"\x00");
+        h.update(k.as_bytes());
+        h.update(b"=");
+        h.update(env.get(&k).map(String::as_str).unwrap_or("").as_bytes());
+    }
+    for (path, _, module, shared) in SHARED_MODEL_PINS {
+        if versions_using(module).contains(&name) {
+            h.update(b"\x00");
+            h.update(path.as_bytes());
+            h.update(b"=");
+            h.update(sha256_hex(shared).as_bytes());
+        }
+    }
+    Some(h.finalize().iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// **凍結版が呼ぶ共有モデル・特徴量モジュール**（issue #21 の依存監査）。
@@ -79,45 +151,70 @@ pub fn env_keys_in_source(name: &str) -> Vec<String> {
 /// 「どの凍結版の挙動が変わるか」を必ず一度は見ることになる。対応は2択:
 /// - 固定コピーを作って凍結版だけそちらを呼ばせる（`opp_move_nn_v25` 方式）
 /// - 変わることを承知でハッシュを更新し、影響する基準の再計測を記録する
-pub const SHARED_MODEL_PINS: &[(&str, &str, &str)] = &[
+pub const SHARED_MODEL_PINS: &[(&str, &str, &str, &str)] = &[
     (
         "src/likelihood.rs",
         "296d5ce86f6b89d6b433d82bb29cedf5921f8a78738646fa41a90dbfa38342fb",
+        "likelihood",
         include_str!("../likelihood.rs"),
     ),
     (
         "src/opp_move_nn_v25.rs",
         "3a1cf06b261f6253ecc95cae27b11d69eb05a3c8f345a82a3c09d530d82d2b90",
+        "opp_move_nn_v25",
         include_str!("../opp_move_nn_v25.rs"),
     ),
     (
         "src/opp_move_features.rs",
         "ba6a075b78120105c3b36e0043b1ed08ab84c45f29978b1e0caa8a67ed2024d4",
+        "opp_move_features",
         include_str!("../opp_move_features.rs"),
     ),
     (
-        "src/value_nn.rs",
-        "0f5cd0607856da01beee5fdbc007f3139e72674984d8faa7bc3341ca915f5341",
-        include_str!("../value_nn.rs"),
+        "src/value_nn_v22.rs",
+        "b72953e2fd82900294c380bf6f1ea4e05752b8e6036ada8ebba63b7cab11d1ab",
+        "value_nn_v22",
+        include_str!("../value_nn_v22.rs"),
     ),
     (
         "src/value_features.rs",
         "b309c5778792b06dd96fe0366a658c789ae018e4a88a42d0537a45726f211597",
+        "value_features",
         include_str!("../value_features.rs"),
     ),
     (
         "src/belief_nn.rs",
         "6a421d86c3881a0dcaee96d70ead71a32c9d2ce9a4ccdcaf9cd4d20b728562a9",
+        "belief_nn",
         include_str!("../belief_nn.rs"),
     ),
     (
         "src/belief_features.rs",
         "78a64579e94658861312603b87bbe174f345fd04013fe7224e37eb2a38df38fd",
+        "belief_features",
         include_str!("../belief_features.rs"),
+    ),
+    (
+        // **定跡の読み込み実装**。パスの解決規則やフォールバックを変えると
+        // 凍結版の序盤分布が変わる（この中の `TSUITATE_JOSEKI` が
+        // `env_keys_read_by` で凍結版の実効 env として拾われる）
+        "src/opening.rs",
+        "7eedcb135bbd977b85811401702a3e43c1969a968dab442c3388ef8fd87cee09",
+        "opening",
+        include_str!("../opening.rs"),
+    ),
+    (
+        // **定跡データ**。パスは凍結版が固定するが、中身は実行時に読むので
+        // ここで内容を pin する（編集すると v12〜v14 と v15 以降の序盤分布が変わる）
+        "joseki.json",
+        "5076b863f0c68d001df2405e63692b8475bba0386d4b32af1f6b0a5e3e8acaa8",
+        "opening",
+        include_str!("../../joseki.json"),
     ),
     (
         "src/king_belief_nn.rs",
         "dc8e4165ec0c5a78c4a8c44d2dceb3547f48179b747834455186a44c7815499d",
+        "king_belief_nn",
         include_str!("../king_belief_nn.rs"),
     ),
 ];
@@ -162,11 +259,8 @@ mod tests {
     /// 凍結版が呼ぶファイルの内容が変わったら、影響する基準を必ず見る。
     #[test]
     fn 共有モデルの更新は凍結版への影響つきで検知される() {
-        for (path, want, src) in SHARED_MODEL_PINS {
+        for (path, want, module, src) in SHARED_MODEL_PINS {
             let got = sha256_hex(src);
-            let module = path
-                .trim_start_matches("src/")
-                .trim_end_matches(".rs");
             let affected = versions_using(module);
             assert_eq!(
                 &got.as_str(),
@@ -184,17 +278,23 @@ mod tests {
     /// 依存の一覧が機械可読に出せる（再学習前のチェックリスト用）。
     #[test]
     fn 共有モジュールから影響する凍結版を引ける() {
-        assert_eq!(
-            versions_using("value_nn"),
-            vec!["estimator_v12", "estimator_v13", "estimator_v14"]
-        );
         assert_eq!(versions_using("king_belief_nn"), vec!["estimator_v14"]);
         // v9〜v11 は NN の重みを自分のファイルへコピーしているので影響しない
         assert!(versions_using("opp_move_nn").is_empty());
-        assert_eq!(
-            versions_using("opp_move_nn_v25"),
-            vec!["estimator_v12", "estimator_v13", "estimator_v14"]
-        );
+        for pinned in ["opp_move_nn_v25", "value_nn_v22"] {
+            assert_eq!(
+                versions_using(pinned),
+                vec!["estimator_v12", "estimator_v13", "estimator_v14"],
+                "{pinned}"
+            );
+        }
+        // **共有の生モジュールはもう凍結版から呼ばれない**（固定コピーへ移した）
+        for shared in ["value_nn", "opp_move_nn"] {
+            assert!(
+                versions_using(shared).is_empty(),
+                "{shared} を凍結版が直接呼んでいる（固定コピーへ向けること）"
+            );
+        }
     }
 
     /// **生成側のガード**（issue #21 の完了条件「freeze 生成時に env 読取漏れを
@@ -231,6 +331,48 @@ mod tests {
         // 3ファイル合計から test / drop 対象を引いた規模。半分以下なら打ち切り
         let lines = body.lines().count();
         assert!(lines > 12_000, "生成物が短すぎます（{lines} 行）");
+    }
+
+    /// **相手の実効挙動の指紋**は名前だけでは決まらない（PR #22 レビュー指摘4）。
+    #[test]
+    fn 凍結版の挙動指紋は版とenvと共有pinで決まる() {
+        use std::collections::BTreeMap;
+        let empty = BTreeMap::new();
+        let v13 = behavior_fingerprint("estimator_v13", &empty).expect("v13");
+        let v14 = behavior_fingerprint("estimator_v14", &empty).expect("v14");
+        assert_ne!(v13, v14, "版が違えば違う（現行 config の指紋は同じ値になる）");
+
+        // その版が読む env を変えると動く
+        let mut env = BTreeMap::new();
+        env.insert("TSUITATE_HAND_ASSET_W".to_string(), "0.5".to_string());
+        assert!(env_keys_read_by("estimator_v14").contains(&"TSUITATE_HAND_ASSET_W".to_string()));
+        assert_ne!(behavior_fingerprint("estimator_v14", &env).unwrap(), v14);
+
+        // **共有モジュール経由の env（定跡パス）も拾う**
+        assert!(
+            env_keys_read_by("estimator_v14").contains(&"TSUITATE_JOSEKI".to_string()),
+            "opening.rs 経由の TSUITATE_JOSEKI を取りこぼしている"
+        );
+        assert!(!env_keys_in_source("estimator_v14").contains(&"TSUITATE_JOSEKI".to_string()));
+        let mut jos = BTreeMap::new();
+        jos.insert("TSUITATE_JOSEKI".to_string(), "other.json".to_string());
+        assert_ne!(behavior_fingerprint("estimator_v14", &jos).unwrap(), v14);
+
+        // その版が読まない env では動かない
+        let mut other = BTreeMap::new();
+        other.insert("TSUITATE_KING_REPEAT_FOUL_W".to_string(), "0.8".to_string());
+        assert!(!env_keys_read_by("estimator_v14").contains(&"TSUITATE_KING_REPEAT_FOUL_W".to_string()));
+        assert_eq!(behavior_fingerprint("estimator_v14", &other).unwrap(), v14);
+
+        // 凍結版でない名前は None（呼び出し側が instance config の指紋を使う）
+        assert!(behavior_fingerprint("estimator", &empty).is_none());
+
+        // 共有モジュール経由の env は STRATEGY_ENV_KEYS にも載っていること
+        for (_, keys) in SHARED_MODULE_ENV {
+            for k in *keys {
+                assert!(crate::config::STRATEGY_ENV_KEYS.contains(k), "{k}");
+            }
+        }
     }
 
     /// v6〜v14 は env を読む「既知の負債」。一覧が取れることを担保する
