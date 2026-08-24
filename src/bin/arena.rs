@@ -131,16 +131,20 @@ fn summary_json(candidate: &str, baseline: &str, stats: &MatchStats) -> serde_js
         "fischer_initial_ms": fischer_initial_ms(),
         "fischer_increment_ms": fischer_increment_ms(),
         // **候補の実効予算**（数値）。`ARENA_CAND_KNOBS` はプロセス env を触らずに
-        // candidate_config へ重ねるので、env を読むと実際と食い違う
-        // （PR #22 再レビュー P2）。基準側は凍結版が読むプロセス env のまま
-        "think_budget_ms_a": candidate_config().think_budget_ms,
+        // candidate_config へ重ねるので env を読むと実際と食い違い、逆に候補が
+        // 凍結版のときは candidate_config が実効ではない（版ごとの規則で読む）。
+        // 予算の概念が無い heuristic は null（PR #22 再レビュー P2）
+        "think_budget_ms_a": budget_of(candidate, &candidate_config()),
         // 候補側だけに効かせたノブと、両側の実効設定の指紋（issue #21）
         "cand_knobs": cand_knobs(),
-        "cand_config": candidate_config().fingerprint(),
+        // **候補が config を尊重しない戦略のときは現行 config の指紋を入れない**
+        // （凍結版は自分のファイル内の規則で動くので実効設定ではない。
+        //  heuristic のように該当しない戦略は null）。PR #22 再レビュー P2
+        "cand_config": behavior_of(candidate, &candidate_config()),
         // **基準側の実効挙動**の指紋（凍結版は版のソース・その版が読む env の実効値・
         // 共有モデルの pin から作る）。現行 config の指紋をそのまま入れると
         // 全 baseline で同じ値になり、実効設定を表さない（PR #22 レビュー指摘4）
-        "baseline_behavior": baseline_fingerprint(baseline),
+        "baseline_behavior": behavior_of(baseline, &tsuitate_bot::config::ambient()),
     })
 }
 
@@ -189,14 +193,34 @@ fn cand_knobs() -> BTreeMap<String, String> {
     out
 }
 
-/// **基準側の実効挙動**の指紋。凍結版は版のソース・その版が読む env の実効値・
-/// 共有モデルの pin から、現行 estimator 系は ambient config の指紋から作る。
-fn baseline_fingerprint(name: &str) -> String {
-    let env: BTreeMap<String, String> = std::env::vars()
+/// プロセス env の `TSUITATE_*`（凍結版が読むのはこちら）。
+fn process_env() -> BTreeMap<String, String> {
+    std::env::vars()
         .filter(|(k, _)| k.starts_with("TSUITATE_"))
-        .collect();
-    tsuitate_bot::frozen::behavior_fingerprint(name, &env)
-        .unwrap_or_else(|| tsuitate_bot::config::ambient().fingerprint())
+        .collect()
+}
+
+/// **戦略 `name` の実効挙動**の指紋（PR #22 レビュー指摘4 / 再レビュー P2）。
+///
+/// - config を尊重する現行 estimator 系 … 渡された instance config の指紋
+/// - 凍結版 … 版のソース・その版が読む env の実効値・共有モデルの pin
+/// - どちらでもない（`heuristic` など）… `null`（設定という概念が無い）
+fn behavior_of(
+    name: &str,
+    cfg: &tsuitate_bot::config::StrategyConfig,
+) -> Option<String> {
+    if strategy::honors_config(name) {
+        return Some(cfg.fingerprint());
+    }
+    tsuitate_bot::frozen::behavior_fingerprint(name, &process_env())
+}
+
+/// **戦略 `name` の実効思考予算**。判定は [`behavior_of`] と同じ切り分け。
+fn budget_of(name: &str, cfg: &tsuitate_bot::config::StrategyConfig) -> Option<u64> {
+    if strategy::honors_config(name) {
+        return Some(cfg.think_budget_ms);
+    }
+    tsuitate_bot::frozen::effective_think_budget_ms(name, &process_env())
 }
 
 /// 候補側の実効設定（プロセス env にノブを重ねたもの）。
@@ -342,6 +366,38 @@ fn main() {
 mod tests {
     use super::*;
     use tsuitate_bot::config::EnvSource;
+
+    /// **記録は候補の種別に合った実効値になる**（PR #22 再レビュー P2 の適用範囲）。
+    ///
+    /// `summary_json` は任意の戦略を A 側に取れるので、候補が凍結版・heuristic の
+    /// ときに現行 estimator の config を記録すると嘘になる。
+    #[test]
+    fn 記録は候補の種別に合った実効値になる() {
+        let cand_cfg = candidate_config_from(
+            &EnvSource::empty(),
+            &[(
+                "TSUITATE_CAND_THINK_BUDGET_MS".to_string(),
+                "777".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        // 現行 estimator 系は instance config がそのまま実効
+        assert_eq!(budget_of("estimator", &cand_cfg), Some(777));
+        assert!(behavior_of("estimator", &cand_cfg).is_some());
+        // **凍結版は候補でも instance config を使わない**（版ごとの読み取り規則）。
+        // v14 は候補専用の名前を読まないので、プロセス env 未設定なら既定 2000
+        assert_eq!(budget_of("estimator_v14", &cand_cfg), Some(2000));
+        assert_ne!(
+            behavior_of("estimator_v14", &cand_cfg),
+            behavior_of("estimator_v13", &cand_cfg),
+            "版が違えば指紋も違う"
+        );
+        assert_ne!(behavior_of("estimator_v14", &cand_cfg), behavior_of("estimator", &cand_cfg));
+        // 予算・設定の概念が無い戦略は null
+        assert_eq!(budget_of("heuristic", &cand_cfg), None);
+        assert_eq!(behavior_of("heuristic", &cand_cfg), None);
+    }
 
     /// **`cand_env` の思考予算が候補の実効値として反映される**
     /// （PR #22 再レビュー P2）。`ARENA_CAND_KNOBS` はプロセス env を触らないので、

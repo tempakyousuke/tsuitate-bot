@@ -158,12 +158,22 @@ numpy クロスチェックのテストも固定コピー側で走る）。
 `ARENA_MATCH_SEED` 未指定の通常アリーナで候補だけ全対局が同じシードになり、
 対照との比較がノブ以外の理由で崩れる。
 
-**記録も実効値から取る**。arena の `think_budget_ms_a` は候補の
-`StrategyConfig::think_budget_ms`（数値）。プロセス env を読むと、
-`cand_env` で予算を渡したときに `cand_knobs` と食い違う
-（ノブはプロセス env を触らないので env 側は未設定のまま）。
-`baseline_behavior` は基準ごとの `frozen::behavior_fingerprint` で、
-基準が違えば別の値になる。
+**記録も実効値から取る**。arena の `think_budget_ms_a` / `cand_config` /
+`baseline_behavior` は、**その戦略の種別に合った実効値**を入れる:
+
+| 候補・基準の種別 | 実効設定の指紋 | 実効思考予算 |
+| --- | --- | --- |
+| 現行 estimator 系 | instance の `StrategyConfig::fingerprint()` | `StrategyConfig::think_budget_ms` |
+| 凍結版 v6〜v14 | `frozen::behavior_fingerprint` | `frozen::effective_think_budget_ms`（**版ごとの読み取り規則**） |
+| `heuristic` 等 | `null` | `null`（予算の概念が無い） |
+
+現行 estimator でプロセス env を読むと、`cand_env` で予算を渡したときに
+`cand_knobs` と食い違う（ノブはプロセス env を触らないので env 側は未設定のまま）。
+逆に候補が凍結版のときは instance config が実効ではない
+（v12/v13 だけが `TSUITATE_CAND_THINK_BUDGET_MS` を読む、v14 以前の他は
+`TSUITATE_THINK_BUDGET_MS` だけ、v15 以降はどちらも読まない）。
+`effective_think_budget_ms` は**凍結ファイル自身から読み取り規則と既定値を取り出す**
+ので、現行の解決式で代用したときの嘘が混ざらない。
 
 ## 7. 既定挙動の同一性確認
 

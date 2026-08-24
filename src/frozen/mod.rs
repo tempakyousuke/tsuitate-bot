@@ -101,6 +101,53 @@ pub fn env_keys_read_by(name: &str) -> Vec<String> {
     out
 }
 
+/// 凍結版の**実効思考予算**（PR #22 再レビュー P2）。
+///
+/// 予算の読み方は版ごとに違う（v12/v13 は凍結時に
+/// `TSUITATE_CAND_THINK_BUDGET_MS` を持ち込んでいて読む、v14 以前の他の版は
+/// `TSUITATE_THINK_BUDGET_MS` だけ、v15 以降は**どちらも読まない**）。
+/// **凍結ファイル自身から読み取り規則と既定値を取り出す**ので、
+/// 「現行 estimator の解決式で代用する」ことによる嘘を混ぜない。
+///
+/// 凍結版でない名前は `None`（呼び出し側が instance config か「該当なし」を選ぶ）。
+pub fn effective_think_budget_ms(
+    name: &str,
+    env: &std::collections::BTreeMap<String, String>,
+) -> Option<u64> {
+    let (_, _, src) = SOURCES.iter().find(|(_, n, _)| *n == name)?;
+    // 既定値（凍結ファイル自身の const）
+    let default = src
+        .split("const DEFAULT_THINK_BUDGET_MS: u64 = ")
+        .nth(1)
+        .and_then(|rest| rest.split(';').next())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    // 読む env 名を、凍結ファイルに書かれている順で拾う
+    let keys: Vec<&str> = match src.split("for name in [").nth(1).and_then(|r| r.split(']').next())
+    {
+        // v12 / v13 のように配列で優先順を書いている版
+        Some(list) => list
+            .split(',')
+            .filter_map(|t| t.trim().strip_prefix('"')?.strip_suffix('"'))
+            .collect(),
+        // 単一キーを直接読む版（v6〜v11）。v15 以降は env を読まないので空
+        None => {
+            let mut v = vec![];
+            for k in ["TSUITATE_CAND_THINK_BUDGET_MS", "TSUITATE_THINK_BUDGET_MS"] {
+                if src.contains(&format!("env::var(\"{k}\")")) {
+                    v.push(k);
+                }
+            }
+            v
+        }
+    };
+    Some(
+        keys.iter()
+            .find_map(|k| env.get(*k).and_then(|v| v.parse::<u64>().ok()))
+            .unwrap_or(default),
+    )
+}
+
 /// 凍結版の**実効挙動の指紋**（PR #22 レビュー指摘4）。
 ///
 /// 「相手の設定」を現行 `StrategyConfig` の指紋で記録すると、v6〜v14 は
@@ -373,6 +420,39 @@ mod tests {
                 assert!(crate::config::STRATEGY_ENV_KEYS.contains(k), "{k}");
             }
         }
+    }
+
+    /// 凍結版の実効予算は**版ごとの読み取り規則**で決まる（PR #22 再レビュー P2）。
+    #[test]
+    fn 凍結版の実効思考予算は版ごとの規則で決まる() {
+        use std::collections::BTreeMap;
+        let mut cand = BTreeMap::new();
+        cand.insert("TSUITATE_CAND_THINK_BUDGET_MS".to_string(), "777".to_string());
+        let mut common = BTreeMap::new();
+        common.insert("TSUITATE_THINK_BUDGET_MS".to_string(), "555".to_string());
+        let empty = BTreeMap::new();
+
+        // どの版も未設定なら凍結時点の既定
+        for (_, name, _) in SOURCES {
+            assert_eq!(effective_think_budget_ms(name, &empty), Some(2000), "{name}");
+        }
+        // **v12 / v13 だけが候補専用の名前を読む**（凍結時に持ち込んだ）
+        assert_eq!(effective_think_budget_ms("estimator_v12", &cand), Some(777));
+        assert_eq!(effective_think_budget_ms("estimator_v13", &cand), Some(777));
+        for name in ["estimator_v9", "estimator_v11", "estimator_v14"] {
+            assert_eq!(
+                effective_think_budget_ms(name, &cand),
+                Some(2000),
+                "{name} は候補専用の名前を読まない"
+            );
+        }
+        // 共通の名前はどの版も読む
+        for (_, name, _) in SOURCES {
+            assert_eq!(effective_think_budget_ms(name, &common), Some(555), "{name}");
+        }
+        // 凍結版でない名前は None
+        assert!(effective_think_budget_ms("estimator", &common).is_none());
+        assert!(effective_think_budget_ms("heuristic", &common).is_none());
     }
 
     /// v6〜v14 は env を読む「既知の負債」。一覧が取れることを担保する
