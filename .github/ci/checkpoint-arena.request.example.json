@@ -6,16 +6,14 @@
   "min_remaining": 20,
   "extract_seed": 20260823,
   "split": "dev",
-  "seeds": 2,
+  "seeds": 4,
   "budgets": "700",
   "shards": 4,
-  "_known_note": "known は「同じ candidate / control / opponent / 予算で arena.yml を取り直した差」だけに付ける。別構成・別 matchup の過去の記録（CLAUDE.md の -12.8 / -8.5 / -7.4pt など）は流用できない。未計測なら付けない。",
+  "_env_note": "TSUITATE_* はプロセス全体に効き、相手（凍結版）も同じプロセスで作られる。既定 matrix で使いたいノブは全部 estimator_v14 が読むので、candidate_env を使うと『同じ固定相手』で比べられない。checkpoint_arena は実行前に検出して止める。",
+  "_known_note": "known は「同じ candidate / control / opponent / 予算で arena.yml を取り直した差」だけに付ける。CLAUDE.md の -12.8 / -8.5 / -7.4pt などは流用できない。",
+  "_seeds_note": "seed は 2 の倍数（AB/BA が cluster 内で閉じる）。seed 数の効果まで測るなら 4 以上（= 2 replicate 以上）。",
   "experiments": [
     { "label": "aa" },
-    {
-      "label": "anchor_move",
-      "candidate_env": "TSUITATE_ANCHOR_MOVE_W=0.6"
-    },
     {
       "label": "v13_v12_vs_opp",
       "candidate_strategy": "estimator_v13",

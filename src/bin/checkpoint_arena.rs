@@ -50,6 +50,70 @@ use tsuitate_bot::truth_replay::{load_end, side_idx};
 
 const SCHEMA: u32 = 1;
 
+/// 戦略ごとのソース（**compile-time に埋め込む**）。
+///
+/// `TSUITATE_*` はプロセス全体に効くので、candidate arm にだけ env を渡したつもりでも
+/// **同じプロセスで作る相手（凍結版）にも効く**。凍結版は凍結時点で読んでいた env を
+/// 今も読むので、既定 matrix の env はほぼ全部 v14 が読む（PR #20 追加レビュー指摘1）。
+/// そうなると candidate arm は「candidate 設定の現行 vs **candidate 設定の v14**」に
+/// なり、control arm の「既定の現行 vs 既定の v14」と同じ固定相手で比べられていない。
+///
+/// ソースを埋め込んで env 名を走査すれば、この食い違いを**実行前に**検出できる
+/// （ハンドメンテの表と違って、凍結版を足しても勝手に追随する）。
+/// バイナリは数 MB 太るが、これは開発用ツールなので許容する。
+const STRATEGY_SOURCES: &[(&str, &[&str])] = &[
+    ("estimator", &[
+        include_str!("../strategy.rs"),
+        include_str!("../estimator.rs"),
+        include_str!("../check.rs"),
+        include_str!("../shogi.rs"),
+    ]),
+    ("estimator_v6", &[include_str!("../frozen/estimator_v6.rs")]),
+    ("estimator_v7", &[include_str!("../frozen/estimator_v7.rs")]),
+    ("estimator_v8", &[include_str!("../frozen/estimator_v8.rs")]),
+    ("estimator_v9", &[include_str!("../frozen/estimator_v9.rs")]),
+    ("estimator_v10", &[include_str!("../frozen/estimator_v10.rs")]),
+    ("estimator_v11", &[include_str!("../frozen/estimator_v11.rs")]),
+    ("estimator_v12", &[include_str!("../frozen/estimator_v12.rs")]),
+    ("estimator_v13", &[include_str!("../frozen/estimator_v13.rs")]),
+    ("estimator_v14", &[include_str!("../frozen/estimator_v14.rs")]),
+];
+
+/// 戦略 `name` が env `key` を読むか。**未知の戦略名は「読む」と見なす**
+/// （安全側。`estimator_rush` などソースを列挙していないものが該当）
+fn strategy_reads_env(name: &str, key: &str) -> bool {
+    match STRATEGY_SOURCES.iter().find(|(n, _)| *n == name) {
+        Some((_, srcs)) => srcs.iter().any(|s| s.contains(key)),
+        None => true,
+    }
+}
+
+/// 相手が読む env のうち、実効のプロセス env に設定されているものを列挙する。
+/// JSONL へ残して「両 arm で相手の実効設定が同じか」を compare 側で検査できるようにする
+fn opponent_effective_env(opponent: &str) -> BTreeMap<String, String> {
+    std::env::vars()
+        .filter(|(k, _)| k.starts_with("TSUITATE_") && strategy_reads_env(opponent, k))
+        .collect()
+}
+
+/// **arm ごとに違う env を相手が読んでいたら止める**（追加レビュー指摘1）。
+/// 両 arm で同じ値の env（`--budget-ms` 等）は相手にも等しく効くので問題ない
+fn assert_opponent_blind_to(opponent: &str, arm_env_keys: &[String], allow: bool) -> Vec<String> {
+    let leaked: Vec<String> = arm_env_keys
+        .iter()
+        .filter(|k| strategy_reads_env(opponent, k))
+        .cloned()
+        .collect();
+    if !leaked.is_empty() && !allow {
+        die(&format!(
+            "相手 {opponent} が arm 固有の env を読みます: {}\n             これでは candidate arm と control arm で「同じ固定相手」になりません\n             （env はプロセス全体に効き、相手も同じプロセスで作られるため）。\n             相手が読まないノブだけを使うか、--allow-opponent-env で承知のうえ続行してください",
+            leaked.join(", ")
+        ));
+    }
+    leaked
+}
+
+
 fn usage() -> &'static str {
     "usage: checkpoint_arena <extract|run|unit|pair|compare|report> [options]\n\
      \n\
@@ -120,6 +184,18 @@ impl Args {
     fn num<T: std::str::FromStr>(&self, k: &str, default: T) -> T {
         self.get(k).and_then(|v| v.parse().ok()).unwrap_or(default)
     }
+}
+
+/// `--arm-env-keys a,b,c` を読む
+fn split_keys(spec: Option<&str>) -> Vec<String> {
+    spec.map(|s| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    })
+    .unwrap_or_default()
 }
 
 /// **実行時 cwd の HEAD** を返す（バイナリの revision ではない）。
@@ -402,7 +478,12 @@ fn play_one_arm(
     prewarmed: Option<&Prewarmed>,
     experiment: &str,
     prewarm_reason: &str,
+    arm_env_keys: &[String],
+    allow_opponent_env: bool,
 ) -> UnitResult {
+    // 相手が arm 固有の env を読んでいないか（読んでいたら固定相手が arm ごとに変わる）
+    let leaked = assert_opponent_blind_to(opponent, arm_env_keys, allow_opponent_env);
+    let opp_env = opponent_effective_env(opponent);
     let start = restore(deck_dir, entry).unwrap_or_else(|e| die(&e));
     let me = start.pos.turn();
     let me_i = side_idx(me);
@@ -500,6 +581,10 @@ fn play_one_arm(
             .unwrap_or_else(|_| "2000".into()),
         "prewarm_shared": shared,
         "prewarm_reason": prewarm_reason,
+        // 相手が実際に読む env（両 arm で一致していないと「同じ固定相手」ではない）
+        "opponent_env": opp_env,
+        "arm_env_keys": arm_env_keys,
+        "opponent_reads_arm_env": leaked,
         "score": score,
         "reason": out.reason,
         "plies": out.plies,
@@ -553,8 +638,10 @@ fn cmd_unit(args: &Args) {
     let order: usize = args.num("arm-order", 0);
     let experiment = args.get("experiment").unwrap_or("adhoc").to_string();
     let reason = args.get("prewarm-reason").unwrap_or("").to_string();
+    let arm_env_keys = split_keys(args.get("arm-env-keys"));
     let r = play_one_arm(
         &dir, &deck, &entry, seed, &arm, &opponent, order, None, &experiment, &reason,
+        &arm_env_keys, args.flag("allow-opponent-env"),
     );
     println!("{}", r.line);
 }
@@ -625,9 +712,12 @@ fn cmd_pair(args: &Args) {
         [&candidate, &control]
     };
     let reason = args.get("prewarm-reason").unwrap_or("").to_string();
+    let arm_env_keys = split_keys(args.get("arm-env-keys"));
+    let allow_opp_env = args.flag("allow-opponent-env");
     for (k, arm) in arms.iter().enumerate() {
         let r = play_one_arm(
             &dir, &deck, &entry, seed, arm, &opponent, k, shared.as_ref(), &experiment, &reason,
+            &arm_env_keys, allow_opp_env,
         );
         println!("{}", r.line);
     }
@@ -653,8 +743,13 @@ fn run_child(
 ) -> Vec<String> {
     let mut cmd = std::process::Command::new(bin);
     cmd.arg(sub).arg(deck_path).args(extra);
-    // arm ごとの env は追加のみ（親の TSUITATE_* を消さない = 呼び出し側が
-    // 両 arm 共通の予算を渡せる）。ARENA_* は審判側なので親のまま両 arm 同一
+    // **親から継承した TSUITATE_* を一度すべて落としてから、意図した env だけ設定する**
+    // （PR #20 追加レビュー指摘1）。継承したままだと全 shard で同じ値になるので
+    // arm 内一意性検査を通ってしまい、「親からの混入も捕まる」が成立しない。
+    // ARENA_*（審判側の設定）は両 arm 同一なので継承したままでよい
+    for (k, _) in std::env::vars().filter(|(k, _)| k.starts_with("TSUITATE_")) {
+        cmd.env_remove(k);
+    }
     for (k, v) in env {
         cmd.env(k, v);
     }
@@ -708,6 +803,20 @@ fn cmd_run(args: &Args) {
         control_env.insert("TSUITATE_THINK_BUDGET_MS".into(), b.clone());
         candidate_env.insert("TSUITATE_THINK_BUDGET_MS".into(), b.clone());
     }
+    // **arm ごとに違う env のキー**（両 arm で同じ値のものは相手にも等しく効くので無害）。
+    // 相手がこれらを読むなら「同じ固定相手」で比べられていないので止める
+    let arm_env_keys: Vec<String> = {
+        let mut keys: BTreeSet<String> = BTreeSet::new();
+        for k in control_env.keys().chain(candidate_env.keys()) {
+            if control_env.get(k) != candidate_env.get(k) {
+                keys.insert(k.clone());
+            }
+        }
+        keys.into_iter().collect()
+    };
+    let allow_opponent_env = args.flag("allow-opponent-env");
+    assert_opponent_blind_to(&opponent, &arm_env_keys, allow_opponent_env);
+
     let control = RunArm {
         label: "control".into(),
         strategy: args.get("control-strategy").unwrap_or("estimator").to_string(),
@@ -797,20 +906,27 @@ fn cmd_run(args: &Args) {
             .map(|t| {
                 let (control, candidate, deck_path, experiment, opponent, done) =
                     (&control, &candidate, &deck_path, &experiment, &opponent, &done);
+                let arm_env_keys = &arm_env_keys;
                 scope.spawn(move || {
                     let mut out: Vec<String> = vec![];
                     let mut k = t;
                     while k < units.len() {
                         let (ei, seed, order) = units[k];
                         let entry = &entries[ei];
-                        let base = vec![
+                        let mut base = vec![
                             "--id".to_string(), entry.id.clone(),
                             "--seed".to_string(), seed.to_string(),
                             "--opponent".to_string(), opponent.clone(),
                             "--experiment".to_string(), experiment.clone(),
                             "--prewarm-reason".to_string(),
                             if share_reason.is_empty() { "共有条件を満たす".to_string() } else { share_reason.to_string() },
+                            "--arm-env-keys".to_string(),
+                            arm_env_keys.join(","),
                         ];
+                        if allow_opponent_env {
+                            base.push("--allow-opponent-env".to_string());
+                            base.push("1".to_string());
+                        }
                         if share {
                             let mut extra = base.clone();
                             extra.extend([
@@ -895,6 +1011,8 @@ struct Row {
     strategy: String,
     /// 実効 env（`TSUITATE_*` のみ）。arm 内で一意であることを検査する
     env: BTreeMap<String, String>,
+    /// **相手が実際に読む env**。両 arm で一致していないと「同じ固定相手」ではない
+    opponent_env: BTreeMap<String, String>,
     prewarm_shared: bool,
     metrics: BTreeMap<&'static str, f64>,
     prewarm_ms: f64,
@@ -993,6 +1111,16 @@ fn parse_rows(paths: &[String]) -> Vec<Row> {
                 think_budget: req_s("think_budget_ms"),
                 opponent: req_s("opponent"),
                 strategy: req_s("strategy"),
+                opponent_env: v["opponent_env"]
+                    .as_object()
+                    .map(|m| {
+                        m.iter()
+                            .map(|(k, val)| {
+                                (k.clone(), val.as_str().unwrap_or_default().to_string())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 env: v["env"]
                     .as_object()
                     .map(|m| {
@@ -1077,6 +1205,53 @@ fn validate_rows(
                 &mut notes,
             );
         }
+    }
+
+    // **相手の実効 env が両 arm で同じ**であること（追加レビュー指摘1）。
+    // env はプロセス全体に効くので、arm 固有のノブを相手が読むと
+    // 「candidate 設定の v14 vs 既定の v14」を比べることになり、
+    // 固定相手という前提が壊れる。JSONL 上は opponent 名が同じなので
+    // 名前の一致だけでは捕まらない
+    let opp_envs: HashSet<String> = rows
+        .iter()
+        .map(|r| {
+            r.opponent_env
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect();
+    if opp_envs.len() > 1 {
+        let mut v: Vec<String> = opp_envs.into_iter().collect();
+        v.sort();
+        fail(
+            format!(
+                "相手の実効 env が arm 間で違います（同じ固定相手になっていません）: {}",
+                v.join(" || ")
+            ),
+            &mut notes,
+        );
+    }
+    let leaked: HashSet<&str> = rows
+        .iter()
+        .flat_map(|r| r.opponent_env.keys().map(String::as_str))
+        .filter(|k| {
+            // arm 間で値が違う env を相手が読んでいるか
+            let vals: HashSet<Option<&String>> = rows
+                .iter()
+                .map(|r| r.env.get(*k))
+                .collect();
+            vals.len() > 1
+        })
+        .collect();
+    if !leaked.is_empty() {
+        let mut v: Vec<&str> = leaked.into_iter().collect();
+        v.sort_unstable();
+        fail(
+            format!("arm ごとに違う env を相手が読んでいます: {}", v.join(", ")),
+            &mut notes,
+        );
     }
 
     // 同じ (checkpoint, seed, arm) が2行あってはいけない（後勝ちで黙って上書きしない）
@@ -1269,10 +1444,15 @@ fn power_simulation_bootstrap(
             *x = centered[rng.random_range(0..centered.len())] + delta;
         }
         let (lo, hi) = bootstrap_ci_of_means(&sample, boot, seed ^ (i as u64 + 1), alpha);
-        // 「効果を検出した」= CI が 0 を跨がず、かつ符号が真の効果と同じ
-        if lo > 0.0 && delta > 0.0 {
-            hits += 1;
-        } else if hi < 0.0 && delta < 0.0 {
+        let rejected = lo > 0.0 || hi < 0.0;
+        if delta == 0.0 {
+            // **delta=0 は type-I error（偽陽性率）を数える経路**。
+            // 符号一致を要求すると構造上ゼロになり、検査にならない（追加レビュー指摘3）
+            if rejected {
+                hits += 1;
+            }
+        } else if (delta > 0.0 && lo > 0.0) || (delta < 0.0 && hi < 0.0) {
+            // 「効果を検出した」= CI が 0 を跨がず、かつ符号が真の効果と同じ
             hits += 1;
         }
     }
@@ -1522,12 +1702,13 @@ fn cmd_compare(args: &Args) {
 
     out.push_str("\n### 勝敗（主指標）\n\n");
     out.push_str(&format!(
-        "- candidate {:.1}% / control {:.1}% / **paired delta {} [{} , {}]**（元対局 cluster bootstrap 95%）\n",
+        "- candidate {:.1}% / control {:.1}% / **paired delta {} [{} , {}]**（元対局 cluster bootstrap {:.0}%）\n",
         cand_rate * 100.0,
         ctrl_rate * 100.0,
         pct(d),
         pct(lo),
-        pct(hi)
+        pct(hi),
+        (1.0 - alpha) * 100.0
     ));
     out.push_str(&format!(
         "- ペア結果: 改善 {improved} / 同じ {same} / 悪化 {worse}\n"
@@ -1607,27 +1788,46 @@ fn cmd_compare(args: &Args) {
             let rb2 = rb2_raw.min(rep_total);
             let rw2 = r * (rep_total - rb2);
             out.push_str(&format!(
-                "単位は **replicate = 連続する2 seed の AB/BA 平均**（実測 {r:.0} replicate/元対局 = {:.0} seed）。\n",
+                "単位は **replicate = 連続する2 seed の AB/BA 平均**（実測 {r:.0} replicate/元対局 = {:.0} seed）。\n\n",
                 r * 2.0
             ));
-            out.push_str("replicate 間なら iid と見なせるので 1/r の外挿が正当化される（生の seed は arm 順で意図的に反相関しており、σ_w²/s の外挿は使えない）。\n\n");
             if r < 1.5 {
-                out.push_str("**注意: 1元対局あたり replicate が1つしかないので replicate 間分散 σ_r² が同定できない**（0 と推定され、下表の seed 列は全部同じ値になる）。seed 数の効果を見るには **4 seed 以上**（= 2 replicate 以上）で取り直すこと。\n\n");
-            }
-            out.push_str("| 元対局数 \\ seed 数 | 2 | 4 | 6 | 10 |\n|---|---|---|---|---|\n");
-            for nn in [16usize, 32, 64, 128, 256] {
-                let cells: Vec<String> = [1usize, 2, 3, 5]
+                // **replicate が1つだと cluster 内自由度が 0 で σ_r² が同定できない**。
+                // 未同定成分を 0 に置いたまま 4/6/10 seed へ外挿すると、
+                // 「データから得た結論」ではなく「0 と置いた結果」を出すことになる
+                // （PR #20 追加レビュー指摘2）
+                out.push_str("**seed 数の外挿は出さない**: 1元対局あたり replicate が1つ（= 2 seed）しかないので replicate 間分散 σ_r² が同定できない（cluster 内自由度 0）。未同定成分を 0 に置いた外挿は data ではなく仮定なので抑止する。**seed 数の効果を測るには 4 seed 以上（2 replicate 以上）の実測が要る**。\n\n");
+                out.push_str(&format!(
+                    "この 2-seed 設計での実測値だけ: 元対局 {n} / SE ±{:.1}pt / MDE ±{:.1}pt / 元対局数を増やしたときの MDE は下表\n\n",
+                    se * 100.0,
+                    mde(se, z_alpha, z_beta) * 100.0
+                ));
+                out.push_str("| 元対局数 | 16 | 32 | 64 | 128 | 256 |\n|---|---|---|---|---|---|\n");
+                let cells: Vec<String> = [16usize, 32, 64, 128, 256]
                     .iter()
-                    .map(|&rr| {
-                        let se = (rb2 / nn as f64 + rw2 / (nn as f64 * rr as f64)).sqrt();
-                        format!(
-                            "MDE ±{:.1}pt<br>(CI半幅 ±{:.1}pt)",
-                            mde(se, z_alpha, z_beta) * 100.0,
-                            z_alpha * se * 100.0
-                        )
+                    .map(|&nn| {
+                        let se_n = (rep_total / nn as f64).sqrt();
+                        format!("±{:.1}pt", mde(se_n, z_alpha, z_beta) * 100.0)
                     })
                     .collect();
-                out.push_str(&format!("| {nn} | {} |\n", cells.join(" | ")));
+                out.push_str(&format!("| MDE | {} |\n", cells.join(" | ")));
+            } else {
+                out.push_str("replicate 間なら iid と見なせるので 1/r の外挿が正当化される（生の seed は arm 順で意図的に反相関しており、σ_w²/s の外挿は使えない）。\n\n");
+                out.push_str("| 元対局数 \\ seed 数 | 2 | 4 | 6 | 10 |\n|---|---|---|---|---|\n");
+                for nn in [16usize, 32, 64, 128, 256] {
+                    let cells: Vec<String> = [1usize, 2, 3, 5]
+                        .iter()
+                        .map(|&rr| {
+                            let se_c = (rb2 / nn as f64 + rw2 / (nn as f64 * rr as f64)).sqrt();
+                            format!(
+                                "MDE ±{:.1}pt<br>(CI半幅 ±{:.1}pt)",
+                                mde(se_c, z_alpha, z_beta) * 100.0,
+                                z_alpha * se_c * 100.0
+                            )
+                        })
+                        .collect();
+                    out.push_str(&format!("| {nn} | {} |\n", cells.join(" | ")));
+                }
             }
         }
         _ => {
@@ -1719,20 +1919,24 @@ fn cmd_compare(args: &Args) {
             out.push_str(&format!(
                 "**var·CPU秒 = (σ_b² + σ_r²/r)·r·(1 replicate の CPU秒) = {var_cpu:.0}**（小さいほど効率がよい。n に依らない）\n\n"
             ));
-            out.push_str("| replicate 数（= seed÷2） | 1 | 2 | 3 | 5 |\n|---|---|---|---|---|\n");
-            out.push_str(&format!(
-                "| var·CPU秒 | {:.0} | {:.0} | {:.0} | {:.0} |\n",
-                var_cpu_at(1.0),
-                var_cpu_at(2.0),
-                var_cpu_at(3.0),
-                var_cpu_at(5.0)
-            ));
-            if rb2 > 0.0 {
-                out.push_str(
-                    "\nσ_b² > 0 なので replicate を増やすほど var·CPU秒 は悪化する（元対局数を増やすべき）。\n",
-                );
+            if r < 1.5 {
+                // replicate 1つでは σ_r² が同定できないので、replicate 数を変えた
+                // var·CPU秒 は「未同定成分を 0 に置いた結果」でしかない（追加レビュー指摘2）
+                out.push_str("**replicate 数を変えた比較は出さない**: replicate が1つ（= 2 seed）では σ_r² が同定できず、増減の結論はデータではなく仮定になる。4 seed 以上の実測が要る。\n");
             } else {
-                out.push_str("\nこの実測では σ_b² = 0 なので replicate 数は var·CPU秒 に中立。**実験時は σ_b² > 0 になるはずで、そのときは元対局数を増やすほうが効く**。\n");
+                out.push_str("| replicate 数（= seed÷2） | 1 | 2 | 3 | 5 |\n|---|---|---|---|---|\n");
+                out.push_str(&format!(
+                    "| var·CPU秒 | {:.0} | {:.0} | {:.0} | {:.0} |\n",
+                    var_cpu_at(1.0),
+                    var_cpu_at(2.0),
+                    var_cpu_at(3.0),
+                    var_cpu_at(5.0)
+                ));
+                if rb2 > 0.0 {
+                    out.push_str("\nσ_b² > 0 なので replicate を増やすほど var·CPU秒 は悪化する（元対局数を増やすべき）。\n");
+                } else {
+                    out.push_str("\nこの実測では σ_b² = 0 なので replicate 数は var·CPU秒 に中立。\n");
+                }
             }
         }
         _ => {
@@ -1746,7 +1950,10 @@ fn cmd_compare(args: &Args) {
 
     // ---- 安全性の共同指標 ----
     out.push_str("\n### 安全性の共同指標（元対局単位のペア差）\n\n");
-    out.push_str("| 指標 | control | candidate | delta | 95% CI |\n|---|---:|---:|---:|---|\n");
+    out.push_str(&format!(
+        "| 指標 | control | candidate | delta | {:.0}% CI |\n|---|---:|---:|---:|---|\n",
+        (1.0 - alpha) * 100.0
+    ));
     for (key, name) in METRICS.iter().skip(1) {
         let cl = cluster_deltas(key);
         let dd = mean(&cl.iter().map(|c| mean(c)).collect::<Vec<f64>>());
@@ -1932,7 +2139,7 @@ fn cmd_report(args: &Args) {
     let mut out = String::new();
     out.push_str("## checkpoint arena 横断レポート\n\n");
     out.push_str(
-        "| 実験 | 予算ms | 元対局 | seed | 既知arena | checkpoint delta | 95% CI | MDE | ICC | 反則delta | var·CPU秒 | CPU時間 |\n\
+        "| 実験 | 予算ms | 元対局 | seed | 既知arena | checkpoint delta | CI | MDE | ICC | 反則delta | var·CPU秒 | CPU時間 |\n\
          |---|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|\n",
     );
     let f = |v: &serde_json::Value, k: &str| v[k].as_f64().unwrap_or(f64::NAN);
@@ -2052,15 +2259,32 @@ mod tests {
                 _ => 0.25,
             })
             .collect();
-        // 効果ゼロ → 棄却率は alpha 前後（percentile bootstrap は保守的に出やすい）
-        let fp = power_simulation_bootstrap(&centered, 64, 0.0, 0.05, 300, 300, 3);
-        assert!(fp < 0.12, "偽陽性率 {fp} が高すぎる");
+        // **効果ゼロは type-I error（偽陽性率）の経路**。符号一致を要求すると
+        // 構造上ゼロになり検査にならないので、CI が 0 を外した割合を数える
+        let fp = power_simulation_bootstrap(&centered, 64, 0.0, 0.05, 400, 400, 3);
+        assert!(fp > 0.0, "偽陽性率が構造上ゼロになっている（検査が空回り）");
+        assert!(fp < 0.15, "偽陽性率 {fp} が alpha=0.05 から離れすぎ");
         // 大きい効果 → ほぼ必ず検出
         let pw = power_simulation_bootstrap(&centered, 64, -0.25, 0.05, 300, 300, 3);
         assert!(pw > 0.9, "検出力 {pw} が低すぎる");
         // 単調性
         let mid = power_simulation_bootstrap(&centered, 64, -0.10, 0.05, 300, 300, 3);
         assert!(fp < mid && mid < pw, "fp {fp} / mid {mid} / pw {pw}");
+    }
+
+    /// 相手が arm 固有の env を読むかを、凍結版のソースから検出できる
+    /// （PR #20 追加レビュー指摘1: env はプロセス全体に効くので、相手も
+    ///  同じノブを読むと「同じ固定相手」で比べられない）
+    #[test]
+    fn detects_env_leaking_into_the_frozen_opponent() {
+        // v14 は実際にこれらを読む（凍結時点の読み方が残っている）
+        assert!(strategy_reads_env("estimator_v14", "TSUITATE_ANCHOR_MOVE_W"));
+        assert!(strategy_reads_env("estimator_v14", "TSUITATE_DROP_PROBE_REPEAT_GATE"));
+        assert!(strategy_reads_env("estimator_v14", "TSUITATE_HAND_ASSET_W"));
+        // v14 は生成時に落とされる名前は読まない
+        assert!(!strategy_reads_env("estimator_v14", "TSUITATE_KING_SENSOR_W"));
+        // 未知の戦略名は安全側（読むと見なす）
+        assert!(strategy_reads_env("estimator_rush", "TSUITATE_ANCHOR_MOVE_W"));
     }
 
     /// bootstrap CI の percentile は alpha に連動する（alpha を広げれば CI は狭くなる）

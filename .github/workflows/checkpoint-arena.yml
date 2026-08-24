@@ -111,28 +111,37 @@ jobs:
           req='.github/ci/checkpoint-arena.request.json'
           # P0-b の既定セット。
           #
-          # **`known` は既定では入れない**（PR #20 レビュー指摘2）。CLAUDE.md に
-          # 残っている −12.8 / −8.5 / −7.4 / −2.8pt は、いずれも
-          #   - 当時の main（その後たくさんの採用が入っている）を対照に、
-          #   - 別の対戦条件（vs v13 の3シード等）で
-          # 測った値で、このワークフローの条件（固定相手 estimator_v14・
-          # 途中局面からの継続・この予算）で測り直した値ではない。
-          # とくに `pr1combo` の −7.4pt は5つの新ノブ＋material_degen＋GEN/PREROLE/
-          # CAPTURE_RETREAT を全部入れた構成の値で、per-knob ablation は未実施
-          # （CLAUDE.md に明記）。2項だけに −7.4pt を付ける根拠は無い。
-          # 凍結版どうしも同様で、ここで測っているのは
-          #   (v13 vs 相手) − (v12 vs 相手)
-          # であって (v13 vs v12) ではない。非推移性のあるゲームなので別物。
+          # **env 実験は既定から外してある**（PR #20 追加レビュー指摘1）。
+          # `TSUITATE_*` はプロセス全体に効き、相手（凍結版）も同じプロセスで
+          # 作られるので、candidate arm にだけノブを渡したつもりでも
+          #   candidate: 候補設定の現行 vs **候補設定の v14**
+          #   control  : 既定の現行     vs 既定の v14
+          # となって「同じ固定相手」で比べられない。しかも既定 matrix で使いたい
+          # ノブ（DROP_PROBE_REPEAT_GATE / ANCHOR_MOVE_W / EXPOSED_PAWN_HEAD_W /
+          # HAND_ASSET_W / KING_KNOWN_APPROACH_W / LINK_ENDGAME_DAMPEN /
+          # MATERIAL_DEGEN_Q0 / PROMOTE_FAR_W / GEN_NONPROMOTE）は
+          # **全部 src/frozen/estimator_v14.rs が読む**（確認済み）。
+          # checkpoint_arena はこれを実行前に検出して止める（相手のソースを
+          # compile-time に埋め込んで env 名を走査する）。
           #
-          # 較正したいときは、**同じ candidate / control / opponent / 予算で
-          # arena.yml を取り直して**、その差を `compare --known-arena-delta` へ渡す。
-          # ラベルは「何を測っているか」が分かる名前にしてある。
+          # 候補側だけにノブを効かせる経路（現行 strategy だけが読む alias、
+          # または評価パラメータのインスタンス注入）ができるまでは、
+          # 既定は「相手も候補も env なし」で成立する実験だけにする。
+          # 手で `experiments` を渡して `--allow-opponent-env` 相当を使う場合は、
+          # 「候補単体の効果」ではないことを承知のうえで読むこと。
+          #
+          # `known` も既定では入れない: CLAUDE.md に残っている
+          # −12.8 / −8.5 / −7.4 / −2.8pt は当時の main・別の対戦条件で測った値で、
+          # このワークフローの条件で測り直した値ではない。較正したいときは
+          # 同じ candidate / control / opponent / 予算で arena.yml を取り直して
+          # `compare --known-arena-delta` へ渡す。
+          #
+          # 凍結版どうしの実験がここで測るのは
+          #   (v13 vs 相手) − (v12 vs 相手)
+          # であって (v13 vs v12) ではない（非推移性があるので別物）。
+          # ラベルもそう読めるようにしてある。
           default_experiments='[
             {"label":"aa"},
-            {"label":"repeat_gate","candidate_env":"TSUITATE_DROP_PROBE_REPEAT_GATE=1"},
-            {"label":"anchor_move","candidate_env":"TSUITATE_ANCHOR_MOVE_W=0.6"},
-            {"label":"pawn_head","candidate_env":"TSUITATE_EXPOSED_PAWN_HEAD_W=0.5"},
-            {"label":"pr1combo_full","candidate_env":"TSUITATE_HAND_ASSET_W=0.5,TSUITATE_KING_KNOWN_APPROACH_W=2,TSUITATE_LINK_ENDGAME_DAMPEN=40,TSUITATE_MATERIAL_DEGEN_Q0=0.3,TSUITATE_PROMOTE_FAR_W=1.0,TSUITATE_GEN_NONPROMOTE=1"},
             {"label":"v13_v12_vs_opp","candidate_strategy":"estimator_v13","control_strategy":"estimator_v12"},
             {"label":"v14_v10_vs_opp","candidate_strategy":"estimator_v14","control_strategy":"estimator_v10"}
           ]'

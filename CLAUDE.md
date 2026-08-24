@@ -134,6 +134,12 @@
   - **既知の arena 差を較正に使うときは、同じ candidate / control / opponent / 予算で
     測り直した値だけを渡す**。CLAUDE.md に残っている −12.8 / −8.5 / −7.4pt は
     当時の main・別の対戦条件で測った値なので流用できない（PR #20 レビュー指摘）
+  - **env ノブは候補側だけに効かせられない**。`TSUITATE_*` はプロセス全体に効き、
+    相手（凍結版）も同じプロセスで作られるので、arm ごとに値が違う env を相手が
+    読むと「同じ固定相手」で比べられない（arena.yml と同じ罠）。**既定 matrix から
+    env 実験は外してある**。`run`/`unit`/`pair` は相手のソースを compile-time に
+    埋め込んで env 名を走査し、実行前に止める（`--allow-opponent-env` で続行可）。
+    両 arm に同じ値を渡す `--budget-ms` は対象外
   - 実行は CI（`.github/workflows/checkpoint-arena.yml`、**通常のコード push では走らない**）。
     `gh workflow run checkpoint-arena.yml -f arena_run_id=<Arena実行ID> -f budgets="700 2000"`、
     `gh` が無ければ `.github/ci/checkpoint-arena.request.json` を置いて push（削除の push は
