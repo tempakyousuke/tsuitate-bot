@@ -1,5 +1,7 @@
 {
-  "_why": "issue #19 の P0: 通常 arena の局ごとのペア差の実測 Var（候補側）。対照は run 32721832218（同条件・cand_env なし）。pair_with で aggregate が arena-var を回し、Var(ペア差)・この構成での既知 arena 差・var·CPU秒 を出す",
+  "_why": "issue #19 の P0: 候補 run 32726853966（cand_env=DROP_PROBE_REPEAT_GATE=1・104局・match_seed=20260824）の対局記録を再集計し、対照 run 32721832218 と局ごとにペア集計する。対局はやり直さない（前回は checkout がダウンロードを消して落ちた）",
+  "games_from_run_id": "32726853966",
+  "pair_with": "32721832218",
   "games": 104,
   "candidate": "estimator",
   "baselines": "estimator_v14",
@@ -8,6 +10,5 @@
   "oracle": "",
   "clock": "",
   "env": "",
-  "cand_env": "TSUITATE_DROP_PROBE_REPEAT_GATE=1",
-  "pair_with": "32721832218"
+  "cand_env": "TSUITATE_DROP_PROBE_REPEAT_GATE=1"
 }
