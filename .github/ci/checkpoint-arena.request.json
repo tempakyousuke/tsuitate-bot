@@ -1,12 +1,15 @@
 {
-  "_why": "issue #19 の P0: run 32723624182 を known 付きで再集計する。drop_probe_gate の既知 arena 差は同条件で測り直した -16.3pt（対照 32721832218 / 候補 32726853966、104局・match_seed=20260824・2000ms・vs v14）。偽陽性率（delta=0）の行も出る",
+  "_why": "issue #19 の P0: 横断レポートの符号一致・見逃しの数え方を直したうえで run 32723624182 を再集計する。drop_probe_gate の既知 arena 差は同条件で測り直した -16.3pt",
   "arms_from_run_id": "32723624182",
   "split": "all",
   "seeds": 4,
   "budgets": "700",
   "shards": 8,
   "experiments": [
-    { "label": "aa", "known": 0 },
+    {
+      "label": "aa",
+      "known": 0
+    },
     {
       "label": "v13_v12_vs_opp",
       "candidate_strategy": "estimator_v13",

@@ -2482,12 +2482,12 @@ fn cmd_report(args: &Args) {
         .iter()
         .filter(|v| v["known_arena_delta_pt"].as_f64().is_some())
         .collect();
-    if known.len() < 2 {
+    if known.is_empty() {
         out.push_str(
-            "\n**未較正**: 既知の通常 arena 差が2件未満なので符号一致・順位相関は出さない。\n             較正には、**同じ candidate / control / opponent / 予算で測り直した** arena の差を\n             `compare --known-arena-delta` で渡すこと（別構成・別 matchup の過去の記録は使えない。\n             PR #20 レビュー指摘2）。\n",
+            "\n**未較正**: 既知の通常 arena 差が1件も無い。\n             較正には、**同じ candidate / control / opponent / 予算で測り直した** arena の差を\n             `compare --known-arena-delta` で渡すこと（別構成・別 matchup の過去の記録は使えない。\n             PR #20 レビュー指摘2）。通常 arena 側は `arena.yml` の `pair_with` が\n             `checkpoint_arena arena-var` を回して出す。\n",
         );
     }
-    if known.len() >= 2 {
+    if !known.is_empty() {
         let k: Vec<f64> = known.iter().map(|v| f(v, "known_arena_delta_pt")).collect();
         let c: Vec<f64> = known.iter().map(|v| f(v, "delta_pt")).collect();
         // **真値 0（A/A 等）は符号一致から外す**。`f64::signum(0.0)` は +1 を返すので、
@@ -2499,17 +2499,29 @@ fn cmd_report(args: &Args) {
             .map(|(a, b)| (*a, *b))
             .collect();
         let zeros = k.len() - signed.len();
-        let agree = signed.iter().filter(|(a, b)| a.signum() == b.signum()).count();
-        out.push_str(&format!(
-            "\n- 符号一致: {agree}/{}{}\n- 順位相関（スピアマン）: {:.3}\n",
-            signed.len(),
-            if zeros > 0 {
-                format!("（真値 0 の {zeros} 件は符号を持たないので除外）")
-            } else {
-                String::new()
-            },
-            spearman(&k, &c)
-        ));
+        if signed.len() >= 2 {
+            let agree = signed.iter().filter(|(a, b)| a.signum() == b.signum()).count();
+            out.push_str(&format!(
+                "\n- 符号一致: {agree}/{}{}\n",
+                signed.len(),
+                if zeros > 0 {
+                    format!("（真値 0 の {zeros} 件は符号を持たないので除外）")
+                } else {
+                    String::new()
+                },
+            ));
+        }
+        // **2点の順位相関は必ず ±1** になるので出さない（情報がゼロなのに
+        // 「相関 −1.000」と書くと較正が済んだように読める）
+        if signed.len() >= 3 {
+            let (ks, cs): (Vec<f64>, Vec<f64>) = signed.iter().copied().unzip();
+            out.push_str(&format!("- 順位相関（スピアマン）: {:.3}\n", spearman(&ks, &cs)));
+        } else {
+            out.push_str(&format!(
+                "\n**較正は {} 点のみ**: 順位相関は3件以上でないと出さない（2点では必ず ±1 になる）。\n",
+                signed.len()
+            ));
+        }
         // 重大悪化（既知 −8pt 以下）に何が起きたか。
         // **「検出できなかった」と「逆符号で有意になった」を分ける**:
         // 後者は「悪化していない」ではなく「改善している」と読める出力なので、
