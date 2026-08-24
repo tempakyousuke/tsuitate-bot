@@ -2144,6 +2144,26 @@ fn cmd_compare(args: &Args) {
         "判定規則は**本番と同じ** percentile cluster bootstrap CI（alpha={alpha:.2}）が 0 を跨がないこと。\n\n"
     ));
     out.push_str("| 効果量 \\ 元対局数 | 16 | 32 | 64 | 128 |\n|---|---|---|---|---|\n");
+    // **偽陽性率（type-I）を必ず出す**。A/A が有意になったときに
+    // 「判定規則が甘いのか、たまたま引いたのか」を切り分けられないと、
+    // ゲートとして使えるかどうかが決まらない（2026-08-24 の A/A が +7.0pt
+    // [+0.2, +14.1] で 0 を外したのが発端）
+    {
+        let cells: Vec<String> = [16usize, 32, 64, 128]
+            .iter()
+            .map(|&nn| {
+                let fp = power_simulation_bootstrap(
+                    &centered, nn, 0.0, alpha, sims, sim_boot, 20260823,
+                );
+                format!("{:.1}%", fp * 100.0)
+            })
+            .collect();
+        out.push_str(&format!(
+            "| **0pt（偽陽性率。名目 {:.0}%）** | {} |\n",
+            alpha * 100.0,
+            cells.join(" | ")
+        ));
+    }
     for pt in [5.0f64, 10.0, 15.0, 20.0, 25.0] {
         let cells: Vec<String> = [16usize, 32, 64, 128]
             .iter()
