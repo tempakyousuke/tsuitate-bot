@@ -79,6 +79,10 @@ on:
         description: "実験の JSON 配列（label / candidate_env / control_env / candidate_strategy / control_strategy / known）"
         required: false
         default: ""
+      arms_from_run_id:
+        description: "既存 Checkpoint arena 実行の arm 記録を再集計する（deck / run を丸ごと飛ばす。known を後から付けて compare をやり直す用）"
+        required: false
+        default: ""
   push:
     paths:
       - ".github/ci/checkpoint-arena.request.json"
@@ -99,6 +103,7 @@ jobs:
       extract_seed: ${{ steps.split.outputs.extract_seed }}
       split: ${{ steps.split.outputs.split }}
       seeds: ${{ steps.split.outputs.seeds }}
+      arms_from: ${{ steps.split.outputs.arms_from }}
     steps:
       - uses: actions/checkout@v5
       - id: split
@@ -115,6 +120,7 @@ jobs:
           IN_BUDGETS: ${{ github.event.inputs.budgets }}
           IN_SHARDS: ${{ github.event.inputs.shards }}
           IN_EXPERIMENTS: ${{ github.event.inputs.experiments }}
+          IN_ARMS_FROM: ${{ github.event.inputs.arms_from_run_id }}
         run: |
           set -euo pipefail
           req='.github/ci/checkpoint-arena.request.json'
@@ -156,6 +162,7 @@ jobs:
             budgets="${IN_BUDGETS:-2000}"
             shards="${IN_SHARDS:-4}"
             experiments="${IN_EXPERIMENTS:-}"
+            arms_from="${IN_ARMS_FROM:-}"
           else
             if [ ! -f "$req" ]; then
               # push の paths フィルタは削除にも一致する。計測後に $req を消す
@@ -174,6 +181,7 @@ jobs:
                 echo "extract_seed=0"
                 echo "split=dev"
                 echo "seeds=4"
+                echo "arms_from="
               } >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -189,6 +197,7 @@ jobs:
             shards=$(jq -r '.shards // 4' "$req")
             experiments=$(jq -c '.experiments // ""' "$req")
             [ "$experiments" = '""' ] && experiments=""
+            arms_from=$(jq -r '.arms_from_run_id // ""' "$req")
           fi
           [ -n "$experiments" ] || experiments="$default_experiments"
           # seed は 2 の倍数（arm 順が (checkpoint 番号 + seed) % 2 なので、
@@ -224,12 +233,14 @@ jobs:
             echo "extract_seed=$extract_seed"
             echo "split=$split"
             echo "seeds=$seeds"
+            echo "arms_from=$arms_from"
           } >> "$GITHUB_OUTPUT"
           echo "実験 $(jq '.include | length' <<<"$matrix") 本 × シャード ${shards}"
 
   deck:
     needs: plan
-    if: needs.plan.outputs.skip != 'true'
+    # `arms_from_run_id` を指定した再集計では、デッキも arm 記録も過去の run から取る
+    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.arms_from == ''
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -279,7 +290,7 @@ jobs:
 
   run:
     needs: [plan, deck]
-    if: needs.plan.outputs.skip != 'true'
+    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.arms_from == ''
     strategy:
       fail-fast: false
       matrix:
@@ -327,21 +338,42 @@ jobs:
     needs: [plan, deck, run]
     # 一部シャードが落ちても残りを合算する。plan 自体の失敗と
     # スキップは除く（artifact ゼロで二重に赤くなるのを避ける）
-    if: always() && needs.plan.result == 'success' && needs.deck.result == 'success' && needs.plan.outputs.skip != 'true'
+    if: always() && needs.plan.result == 'success' && needs.plan.outputs.skip != 'true'
+      && (needs.deck.result == 'success' || needs.deck.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/download-artifact@v7
+        if: needs.plan.outputs.arms_from == ''
         with:
           pattern: ckarena-*
           path: arms
           merge-multiple: true
       - uses: actions/download-artifact@v7
+        if: needs.plan.outputs.arms_from == ''
         with:
           name: checkpoint-deck
           path: deck
+      # 再集計（`arms_from_run_id`）: 対局はやり直さず、過去の run の arm 記録と
+      # デッキだけ取ってきて compare / report を回す。`known`（同条件で測り直した
+      # 通常 arena の差）は対局のあとにしか出ないので、後から付けるにはこれが要る
+      - uses: actions/download-artifact@v7
+        if: needs.plan.outputs.arms_from != ''
+        with:
+          pattern: ckarena-*
+          path: arms
+          merge-multiple: true
+          run-id: ${{ needs.plan.outputs.arms_from }}
+          github-token: ${{ github.token }}
+      - uses: actions/download-artifact@v7
+        if: needs.plan.outputs.arms_from != ''
+        with:
+          name: checkpoint-deck
+          path: deck
+          run-id: ${{ needs.plan.outputs.arms_from }}
+          github-token: ${{ github.token }}
 
       - name: Compare and report
         env:
@@ -411,6 +443,9 @@ jobs:
               cat "$f"
             done
           } >> "$GITHUB_STEP_SUMMARY"
+          # **ログにも出す**。ジョブサマリーは API から読めないので、
+          # これが無いと artifact を落とせない環境では結果を確認できない
+          cat "$GITHUB_STEP_SUMMARY"
           # 部分集計は成果物としては残すが、ジョブは失敗させる
           if [ -f out/INCOMPLETE.txt ]; then
             mv out incomplete-out
