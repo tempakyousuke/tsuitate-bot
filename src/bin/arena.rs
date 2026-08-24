@@ -12,6 +12,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use tsuitate_bot::config;
+
 use tsuitate_bot::selfplay::{
     MatchStats, fischer_increment_ms, fischer_initial_ms, run_match_with, run_match_with_seeds,
     thread_count,
@@ -374,7 +376,11 @@ fn main() {
                         for g in games {
                             lines.push(
                                 serde_json::json!({
-                                    "schema": 1,
+                                    // schema 2: **実効条件の指紋を必須にした**
+                                    // （PR #23 レビュー指摘2。名前と時計しか見ていないと、
+                                    //  同じ `estimator_v14` でも共通 env・共有モデル pin・
+                                    //  予算が違う2 run を「ペア」として受理してしまう）
+                                    "schema": 2,
                                     // **arm を突き合わせる前提の一部**。env アブレーション
                                     // なら両 run で同じでなければならない（違うなら
                                     // 測っているのは別 revision の差でもある）
@@ -395,8 +401,17 @@ fn main() {
                                     "think_ms_b": g.think_ms_b,
                                     "moves_a": g.moves_a,
                                     "moves_b": g.moves_b,
+                                    // **両側の実効予算**。片側だけだと 700ms と 2000ms の
+                                    // 2 run が「同じ条件のペア」として通る
                                     "think_budget_ms_a": budget_of(&candidate, &candidate_config()),
+                                    "think_budget_ms_b": budget_of(opp, &config::ambient()),
                                     "cand_knobs": knobs,
+                                    // 候補と固定相手の**実効挙動**の指紋（summary と同じ規約）
+                                    "cand_config": behavior_of(&candidate, &candidate_config()),
+                                    "baseline_behavior": behavior_of(opp, &config::ambient()),
+                                    // 両側に効くプロセス env（`-f env=`）。ここが違えば
+                                    // 固定相手の挙動も違う
+                                    "shared_env": process_env(),
                                     "clock": [fischer_initial_ms(), fischer_increment_ms()],
                                 })
                                 .to_string(),

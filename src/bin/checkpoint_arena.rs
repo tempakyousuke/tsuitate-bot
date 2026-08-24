@@ -268,6 +268,7 @@ fn usage() -> &'static str {
      report <summary.json...> [--markdown OUT]\n\
      arena-var --control <games.jsonl...> --candidate <games.jsonl...>\n\
      \x20         [--baseline NAME] [--label NAME] [--alpha 0.05] [--power 0.80] [--boot N]\n\
+     \x20         [--allow-budget-diff]\n\
      \x20         [--markdown OUT] [--json OUT] [--allow-incomplete]"
 }
 
@@ -2577,10 +2578,24 @@ struct GameRow {
     commit: String,
     cand_knobs: BTreeMap<String, String>,
     clock: String,
+    /// 候補側の実効思考予算
     budget: String,
+    /// **固定相手の実効思考予算**。片側だけ見ていると 700ms と 2000ms の
+    /// 2 run が「同じ条件のペア」として通る（PR #23 レビュー指摘1・2）
+    budget_opp: String,
+    /// 候補の実効設定の指紋
+    cand_config: String,
+    /// **固定相手の実効挙動**の指紋。名前が同じでも共通 env・共有モデル pin が
+    /// 違えば別物なので、ここを必須一致にする
+    baseline_behavior: String,
+    /// 両側に効くプロセス env（`-f env=`）
+    shared_env: BTreeMap<String, String>,
 }
 
-const GAME_ROW_SCHEMA: u64 = 1;
+/// schema 2 で実効条件の指紋を必須にした。schema 1（名前と時計しか残していない）は
+/// **集計から弾く**: 欠損を空値で埋めると「相手 env は両 run とも空で一致」と
+/// 解釈されて検査を素通りする（PR #22 で schema 2 へ上げたのと同じ理由）
+const GAME_ROW_SCHEMA: u64 = 2;
 
 fn parse_game_rows(paths: &[String], arm: &str) -> Vec<GameRow> {
     let mut rows = vec![];
@@ -2614,6 +2629,13 @@ fn parse_game_rows(paths: &[String], arm: &str) -> Vec<GameRow> {
                 v.get(k)
                     .and_then(|x| x.as_u64())
                     .unwrap_or_else(|| die(&format!("{where_}: {k} がありません")))
+            };
+            // **欠損は空値で埋めずにエラー**（PR #23 レビュー指摘2）。
+            // null は「その戦略には概念が無い」の意味なので値として受ける
+            let req_json = |k: &str| -> String {
+                v.get(k)
+                    .unwrap_or_else(|| die(&format!("{where_}: {k} がありません")))
+                    .to_string()
             };
             let map = |k: &str| -> BTreeMap<String, String> {
                 v.get(k)
@@ -2651,11 +2673,12 @@ fn parse_game_rows(paths: &[String], arm: &str) -> Vec<GameRow> {
                     .unwrap_or_default()
                     .to_string(),
                 cand_knobs: map("cand_knobs"),
-                clock: v.get("clock").map(|x| x.to_string()).unwrap_or_default(),
-                budget: v
-                    .get("think_budget_ms_a")
-                    .map(|x| x.to_string())
-                    .unwrap_or_default(),
+                clock: req_json("clock"),
+                budget: req_json("think_budget_ms_a"),
+                budget_opp: req_json("think_budget_ms_b"),
+                cand_config: req_json("cand_config"),
+                baseline_behavior: req_json("baseline_behavior"),
+                shared_env: map("shared_env"),
             });
         }
     }
@@ -2708,11 +2731,18 @@ fn assert_uniform(arm: &str, rows: &[GameRow]) {
     }
     uniq("clock", rows.iter().map(|r| r.clock.clone()).collect());
     uniq("commit", rows.iter().map(|r| r.commit.clone()).collect());
+    uniq("think_budget_ms_a", rows.iter().map(|r| r.budget.clone()).collect());
+    uniq("think_budget_ms_b", rows.iter().map(|r| r.budget_opp.clone()).collect());
+    uniq("cand_config", rows.iter().map(|r| r.cand_config.clone()).collect());
+    uniq(
+        "baseline_behavior",
+        rows.iter().map(|r| r.baseline_behavior.clone()).collect(),
+    );
+    uniq("shared_env", rows.iter().map(|r| fmt_env(&r.shared_env)).collect());
     uniq(
         "cand_knobs",
         rows.iter().map(|r| fmt_env(&r.cand_knobs)).collect(),
     );
-    uniq("think_budget_ms", rows.iter().map(|r| r.budget.clone()).collect());
     let mut seen = BTreeSet::new();
     for r in rows {
         let key = (r.baseline.clone(), r.match_seed, r.game_no);
@@ -2767,6 +2797,33 @@ fn cmd_arena_var(args: &Args) {
         die(&format!(
             "時計が違います: control={} / candidate={}",
             ctrl[0].clock, cand[0].clock
+        ));
+    }
+    // **固定相手が本当に同じか**は名前ではなく実効挙動の指紋で見る
+    // （PR #22 / issue #21 で塞いだ「同名だが実効挙動が違う相手」の再発防止）。
+    // 共通 env が違えば凍結相手の挙動も違うので、そちらも必須一致
+    if ctrl[0].baseline_behavior != cand[0].baseline_behavior {
+        die(&format!(
+            "相手 {} の実効挙動が違います: control={} / candidate={}\n                         （名前が同じでも、共通 env・共有モデルの pin・実効予算が違えば別物です）",
+            ctrl[0].baseline, ctrl[0].baseline_behavior, cand[0].baseline_behavior
+        ));
+    }
+    if fmt_env(&ctrl[0].shared_env) != fmt_env(&cand[0].shared_env) {
+        die(&format!(
+            "両側に効く env が違います: control=[{}] / candidate=[{}]",
+            fmt_env(&ctrl[0].shared_env),
+            fmt_env(&cand[0].shared_env)
+        ));
+    }
+    // **思考予算は必須一致**。ここを見ていなかったので、700ms の checkpoint と
+    // 2000ms の arena を突き合わせる誤りを機械的に止められなかった
+    // （PR #23 レビュー指摘1・2）。予算そのものを treatment にしたいときだけ
+    // `--allow-budget-diff` で明示的に許可し、両方の値を出力へ残す
+    let budget_diff = ctrl[0].budget != cand[0].budget || ctrl[0].budget_opp != cand[0].budget_opp;
+    if budget_diff && !args.flag("allow-budget-diff") {
+        die(&format!(
+            "思考予算が違います: control=(候補 {} / 相手 {}) / candidate=(候補 {} / 相手 {})\n                         予算が違う2 run は別の estimand なので、そのままでは較正値に使えません。\n                         予算そのものを比べたいときだけ --allow-budget-diff（出力に両方の値を残します）",
+            ctrl[0].budget, ctrl[0].budget_opp, cand[0].budget, cand[0].budget_opp
         ));
     }
     // **commit が違えば env アブレーションではない**（測っているのは
@@ -2879,8 +2936,26 @@ fn cmd_arena_var(args: &Args) {
         },
         ctrl[0].baseline,
         ctrl[0].clock,
-        cand[0].budget,
+        if budget_diff {
+            format!(
+                "**不一致** control(候補 {} / 相手 {}) vs candidate(候補 {} / 相手 {})",
+                ctrl[0].budget, ctrl[0].budget_opp, cand[0].budget, cand[0].budget_opp
+            )
+        } else {
+            format!("候補 {} / 相手 {}", cand[0].budget, cand[0].budget_opp)
+        },
     ));
+    out.push_str(&format!(
+        "相手の実効挙動 `{}` / 両側 env [{}]\n\n",
+        &ctrl[0].baseline_behavior,
+        fmt_env(&ctrl[0].shared_env)
+    ));
+    if budget_diff {
+        out.push_str(
+            "> **警告: 思考予算が違う2 run を突き合わせている**（`--allow-budget-diff`）。\
+             これは別の estimand なので、checkpoint の `--known-arena-delta` には渡さないこと。\n\n",
+        );
+    }
     if ctrl[0].commit == cand[0].commit {
         out.push_str(&format!("commit `{}`\n\n", ctrl[0].commit));
     } else {
@@ -2992,6 +3067,12 @@ fn cmd_arena_var(args: &Args) {
             "candidate_commit": cand[0].commit,
             "clock": ctrl[0].clock,
             "think_budget_ms": cand[0].budget,
+            "think_budget_ms_opponent": cand[0].budget_opp,
+            "control_think_budget_ms": ctrl[0].budget,
+            "control_think_budget_ms_opponent": ctrl[0].budget_opp,
+            "budget_mismatch": budget_diff,
+            "baseline_behavior": ctrl[0].baseline_behavior,
+            "shared_env": ctrl[0].shared_env,
             "games": n,
             "alpha": alpha,
             "power": power,
@@ -3074,6 +3155,33 @@ mod tests {
         assert!(!accepted(&av));
     }
 
+    /// **実効条件の指紋が game row に必須**であること（PR #23 レビュー指摘2）。
+    /// 名前と時計しか見ていないと、同じ `estimator_v14` でも共通 env・共有モデル pin・
+    /// 予算が違う2 run を「ペア」として受理してしまう
+    #[test]
+    fn game_row_schema_requires_effective_conditions() {
+        assert_eq!(GAME_ROW_SCHEMA, 2, "指紋を必須にした時点で schema を上げる");
+        let r = game_row("checkmate", 1.0);
+        // 突き合わせの前提になる項目が型として存在すること（欠損は parse で die する）
+        assert!(!r.baseline_behavior.is_empty());
+        assert!(!r.cand_config.is_empty());
+        assert!(!r.budget.is_empty() && !r.budget_opp.is_empty());
+    }
+
+    /// **予算が違えば別の estimand**。片側だけ見ていると 700ms と 2000ms が通る
+    #[test]
+    fn budget_mismatch_is_detected_on_both_sides() {
+        let a = game_row("checkmate", 1.0);
+        let mut b = game_row("checkmate", 1.0);
+        assert!(!(a.budget != b.budget || a.budget_opp != b.budget_opp));
+        b.budget = "700".into();
+        assert!(a.budget != b.budget || a.budget_opp != b.budget_opp);
+        let mut c = game_row("checkmate", 1.0);
+        // 相手側だけ違う場合も捕まえる（候補側の予算だけ見ていると素通りする）
+        c.budget_opp = "700".into();
+        assert!(a.budget != c.budget || a.budget_opp != c.budget_opp);
+    }
+
     /// arena-var の土台。`variance` は n−1 の標本分散
     #[test]
     fn sample_variance_matches_hand_calc() {
@@ -3113,6 +3221,10 @@ mod tests {
             cand_knobs: BTreeMap::new(),
             clock: "[1000000,3000]".into(),
             budget: "2000".into(),
+            budget_opp: "2000".into(),
+            cand_config: "cfg".into(),
+            baseline_behavior: "beh".into(),
+            shared_env: BTreeMap::new(),
         }
     }
 
