@@ -158,6 +158,13 @@ numpy クロスチェックのテストも固定コピー側で走る）。
 `ARENA_MATCH_SEED` 未指定の通常アリーナで候補だけ全対局が同じシードになり、
 対照との比較がノブ以外の理由で崩れる。
 
+**記録も実効値から取る**。arena の `think_budget_ms_a` は候補の
+`StrategyConfig::think_budget_ms`（数値）。プロセス env を読むと、
+`cand_env` で予算を渡したときに `cand_knobs` と食い違う
+（ノブはプロセス env を触らないので env 側は未設定のまま）。
+`baseline_behavior` は基準ごとの `frozen::behavior_fingerprint` で、
+基準が違えば別の値になる。
+
 ## 7. 既定挙動の同一性確認
 
 設定の解決を env から config へ移す変更なので、**既定（env なし）の挙動が

@@ -130,9 +130,10 @@ fn summary_json(candidate: &str, baseline: &str, stats: &MatchStats) -> serde_js
         "clock_min_ms_b": stats.clock_min_ms_b,
         "fischer_initial_ms": fischer_initial_ms(),
         "fischer_increment_ms": fischer_increment_ms(),
-        "think_budget_ms_a": std::env::var("TSUITATE_CAND_THINK_BUDGET_MS")
-            .or_else(|_| std::env::var("TSUITATE_THINK_BUDGET_MS"))
-            .ok(),
+        // **候補の実効予算**（数値）。`ARENA_CAND_KNOBS` はプロセス env を触らずに
+        // candidate_config へ重ねるので、env を読むと実際と食い違う
+        // （PR #22 再レビュー P2）。基準側は凍結版が読むプロセス env のまま
+        "think_budget_ms_a": candidate_config().think_budget_ms,
         // 候補側だけに効かせたノブと、両側の実効設定の指紋（issue #21）
         "cand_knobs": cand_knobs(),
         "cand_config": candidate_config().fingerprint(),
@@ -202,12 +203,16 @@ fn baseline_fingerprint(name: &str) -> String {
 fn candidate_config() -> Arc<tsuitate_bot::config::StrategyConfig> {
     use tsuitate_bot::config::{EnvSource, StrategyConfig};
     static C: std::sync::OnceLock<Arc<StrategyConfig>> = std::sync::OnceLock::new();
-    C.get_or_init(|| {
-        Arc::new(StrategyConfig::from_source(
-            EnvSource::from_process().with_overrides(cand_knobs()),
-        ))
-    })
-    .clone()
+    C.get_or_init(|| Arc::new(candidate_config_from(&EnvSource::from_process(), &cand_knobs())))
+        .clone()
+}
+
+/// [`candidate_config`] の純粋版（プロセス env を読まないのでテストできる）。
+fn candidate_config_from(
+    base: &tsuitate_bot::config::EnvSource,
+    knobs: &BTreeMap<String, String>,
+) -> tsuitate_bot::config::StrategyConfig {
+    tsuitate_bot::config::StrategyConfig::from_source(base.with_overrides(knobs.clone()))
 }
 
 /// 候補側の戦略を作る（ノブがあれば config で渡す）。
@@ -329,6 +334,48 @@ fn main() {
             total.wins_a,
             total.wins_b,
             total.draws
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tsuitate_bot::config::EnvSource;
+
+    /// **`cand_env` の思考予算が候補の実効値として反映される**
+    /// （PR #22 再レビュー P2）。`ARENA_CAND_KNOBS` はプロセス env を触らないので、
+    /// 記録側が env を読むと `cand_knobs` と `think_budget_ms_a` が食い違う。
+    #[test]
+    fn 候補ノブの思考予算が実効設定へ入る() {
+        let base = EnvSource::empty();
+        let knob = |k: &str, v: &str| -> BTreeMap<String, String> {
+            [(k.to_string(), v.to_string())].into_iter().collect()
+        };
+        // 既定（凍結時点から変わらない基準値）
+        assert_eq!(
+            candidate_config_from(&base, &BTreeMap::new()).think_budget_ms,
+            2000
+        );
+        // 候補専用の名前
+        assert_eq!(
+            candidate_config_from(&base, &knob("TSUITATE_CAND_THINK_BUDGET_MS", "777"))
+                .think_budget_ms,
+            777
+        );
+        // 共通の名前でも候補 config には効く（プロセス env は触らない）
+        assert_eq!(
+            candidate_config_from(&base, &knob("TSUITATE_THINK_BUDGET_MS", "555")).think_budget_ms,
+            555
+        );
+        // 候補専用が優先
+        let mut both = knob("TSUITATE_THINK_BUDGET_MS", "555");
+        both.insert("TSUITATE_CAND_THINK_BUDGET_MS".into(), "777".into());
+        assert_eq!(candidate_config_from(&base, &both).think_budget_ms, 777);
+        // **基準側（プロセス env）は動かない**: base だけで解決した値は既定のまま
+        assert_eq!(
+            tsuitate_bot::config::StrategyConfig::from_source(base).think_budget_ms,
+            2000
         );
     }
 }
