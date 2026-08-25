@@ -16,6 +16,7 @@
 //!   --max-depth N           採用する詰み手数の上限（既定: 15）
 //!   --skip-plies N          この手数までの局面は無視する（既定: 20）
 //!   --limit N               採用する問題数の上限（0 = 無制限）
+//!   --max-per-game N        1対局から採る問題数の上限（既定: 1、0 = 無制限）
 //!   --max-candidates N      ソルバーに投げる候補数の上限（0 = 無制限）
 //!   --jobs N                ソルバーの並列実行数（既定: 1）
 //!   --timeout-secs N        ソルバーの1問あたりのタイムアウト（既定: 60）
@@ -41,8 +42,15 @@
 //! 玉方が攻め方になる局面（後手番）は、盤面を180度回して先手番に直す
 //! （ソルバーは攻め方 = 先手を前提にしている）。駒の向きも回転で入れ替わるので、
 //! 色のラベルを差し替えるだけでよい。
+//!
+//! **1対局・1攻め方から採るのは1問だけ**（`--max-per-game`、既定 1）。詰みのある
+//! 局面は一度現れると、攻め方が見逃したまま数手続くことが多く、その各手番の局面を
+//! 全部採ると「同じ対局の2手違い」のほとんど同じ問題が並んでしまう。盤面の署名
+//! による重複排除では別局面なので落ちない。対局内で**最初に詰みが現れた局面**
+//! （最も手前の決定点）を採る。攻め方が違えば（先手に詰みがあった後、見逃して
+//! 後手に詰みが回った等）盤の向きも駒の構成も別なので、別問題として許容する。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -98,6 +106,8 @@ struct Candidate {
     question: Value,
     /// 正規化JSONの SHA-256 先頭16桁。重複排除と取り込みの upsert キーを兼ねる
     signature: String,
+    /// どの対局（記録ファイル名）のどちらの攻め方から採ったか。`--max-per-game` の単位
+    game: String,
     /// どの記録の何手目から採ったか（出典。デバッグ・再現用）
     origin: String,
 }
@@ -185,6 +195,7 @@ struct Args {
     max_depth: u32,
     skip_plies: u32,
     limit: usize,
+    max_per_game: usize,
     max_candidates: usize,
     jobs: usize,
     timeout_secs: u64,
@@ -205,6 +216,7 @@ fn parse_args() -> Result<Args, String> {
         max_depth: 15,
         skip_plies: 20,
         limit: 0,
+        max_per_game: 1,
         max_candidates: 0,
         jobs: 1,
         timeout_secs: 60,
@@ -227,6 +239,7 @@ fn parse_args() -> Result<Args, String> {
             "--max-depth" => args.max_depth = value("--max-depth")?.parse().map_err(|_| "--max-depth が数値ではありません".to_string())?,
             "--skip-plies" => args.skip_plies = value("--skip-plies")?.parse().map_err(|_| "--skip-plies が数値ではありません".to_string())?,
             "--limit" => args.limit = value("--limit")?.parse().map_err(|_| "--limit が数値ではありません".to_string())?,
+            "--max-per-game" => args.max_per_game = value("--max-per-game")?.parse().map_err(|_| "--max-per-game が数値ではありません".to_string())?,
             "--max-candidates" => args.max_candidates = value("--max-candidates")?.parse().map_err(|_| "--max-candidates が数値ではありません".to_string())?,
             "--jobs" => args.jobs = value("--jobs")?.parse().map_err(|_| "--jobs が数値ではありません".to_string())?,
             "--timeout-secs" => args.timeout_secs = value("--timeout-secs")?.parse().map_err(|_| "--timeout-secs が数値ではありません".to_string())?,
@@ -276,6 +289,7 @@ fn collect_candidates(args: &Args) -> Vec<Candidate> {
             found.push(Candidate {
                 question,
                 signature,
+                game: format!("{name}/{}", if side == Color::Sente { "sente" } else { "gote" }),
                 origin: format!("{name}#{decision_id}"),
             });
         });
@@ -346,6 +360,28 @@ fn accept(args: &Args, result: &Value) -> bool {
     result["rating"]["value"].is_number()
 }
 
+/// 採用済みの問題から、対局×攻め方ごとの上限（`--max-per-game`）を超えるものを落とす。
+///
+/// 候補は対局内で手番順に並んでいるので、残るのは**最初に詰みが現れた局面**。
+/// 詰みは一度現れると攻め方が見逃したまま数手続くことが多く、盤面署名の
+/// 重複排除だけでは「同じ対局の2手違い」がほとんど同じ問題として並んでしまう。
+/// 攻め方が違えば別問題として許容する（先手の詰みと後手の詰みは盤の向きも
+/// 駒の構成も別物）
+fn take_per_game<T>(args: &Args, accepted: Vec<T>, game_of: impl Fn(&T) -> String) -> Vec<T> {
+    let mut per_game: HashMap<String, usize> = HashMap::new();
+    accepted
+        .into_iter()
+        .filter(|item| {
+            let count = per_game.entry(game_of(item)).or_insert(0);
+            if args.max_per_game > 0 && *count >= args.max_per_game {
+                return false;
+            }
+            *count += 1;
+            true
+        })
+        .collect()
+}
+
 fn main() {
     let args = match parse_args() {
         Ok(a) => a,
@@ -408,14 +444,27 @@ fn main() {
         }
     });
 
+    let accepted: Vec<(&Candidate, Value)> = candidates
+        .iter()
+        .zip(results)
+        .filter_map(|(candidate, result)| {
+            let result = result.into_inner().unwrap()?;
+            accept(&args, &result).then_some((candidate, result))
+        })
+        .collect();
+    let accepted_total = accepted.len();
+    let accepted = take_per_game(&args, accepted, |(candidate, _)| candidate.game.clone());
+    if accepted.len() < accepted_total {
+        eprintln!(
+            "同じ対局・同じ攻め方の問題を間引き: {}件 → {}件（--max-per-game {}）",
+            accepted_total,
+            accepted.len(),
+            args.max_per_game
+        );
+    }
+
     let mut puzzles: Vec<Value> = Vec::new();
-    for (candidate, result) in candidates.iter().zip(results) {
-        let Some(result) = result.into_inner().unwrap() else {
-            continue;
-        };
-        if !accept(&args, &result) {
-            continue;
-        }
+    for (candidate, result) in accepted {
         puzzles.push(json!({
             "sourceId": candidate.signature,
             "origin": candidate.origin,
@@ -569,6 +618,45 @@ mod tests {
         ));
     }
 
+    /// 同じ対局・同じ攻め方からは最初に詰みが現れた局面だけを採る
+    /// （詰みは見逃されたまま数手続くので、全部採るとほぼ同じ問題が並ぶ）。
+    /// 攻め方が違えば別問題
+    #[test]
+    fn only_the_first_mate_of_each_game_and_attacker_is_taken() {
+        let accepted = vec![
+            ("game-a/sente", 40),
+            ("game-a/sente", 42),
+            ("game-b/gote", 51),
+            ("game-a/sente", 44),
+            ("game-a/gote", 45),
+            ("game-b/gote", 53),
+            ("game-a/gote", 47),
+        ];
+        let mut args = parse_args_for_test();
+        let taken = take_per_game(&args, accepted.clone(), |(game, _)| game.to_string());
+        assert_eq!(taken, vec![("game-a/sente", 40), ("game-b/gote", 51), ("game-a/gote", 45)]);
+
+        // 上限を広げれば手番順にその数だけ採る
+        args.max_per_game = 2;
+        let taken = take_per_game(&args, accepted.clone(), |(game, _)| game.to_string());
+        assert_eq!(
+            taken,
+            vec![
+                ("game-a/sente", 40),
+                ("game-a/sente", 42),
+                ("game-b/gote", 51),
+                ("game-a/gote", 45),
+                ("game-b/gote", 53),
+                ("game-a/gote", 47),
+            ]
+        );
+
+        // 0 は無制限（従来の挙動）
+        args.max_per_game = 0;
+        let taken = take_per_game(&args, accepted.clone(), |(game, _)| game.to_string());
+        assert_eq!(taken, accepted);
+    }
+
     fn parse_args_for_test() -> Args {
         Args {
             inputs: vec![],
@@ -579,6 +667,7 @@ mod tests {
             max_depth: 15,
             skip_plies: 20,
             limit: 0,
+            max_per_game: 1,
             max_candidates: 0,
             jobs: 1,
             timeout_secs: 60,
