@@ -81,13 +81,27 @@ def load(path):
             g.engine_score.append(float(engine_score))
             g.rows.append([float(x) for x in row[ID_COLS:]])
     out = []
+    violations = 0
     for g in groups.values():
         g.X = np.array(g.rows, dtype=float)
         g.engine_rank = np.array(g.engine_rank, dtype=float)
         g.engine_score = np.array(g.engine_score, dtype=float)
         g.rows = None
+        # **契約の機械検査**（PR #25 レビュー指摘 P1）: `engine_score` の降順は
+        # `engine_rank` の昇順と厳密に一致していなければならない。CSV 側で丸めて
+        # 偽の同点ができると、baseline の argmax と concordance がそこで狂う
+        order = np.argsort(g.engine_rank)
+        sc = g.engine_score[order]
+        if len(sc) > 1 and not np.all(sc[:-1] > sc[1:]):
+            violations += 1
         # 同じ決定状態の中で move_number 等は定数なので、後で分散ゼロ列を落とす
         out.append(g)
+    if violations:
+        sys.exit(
+            f"engine_score の降順が engine_rank と一致しない決定状態が {violations} 件"
+            " あります（同点＝精度が落ちている疑い）。exporter が `cand.score` を"
+            " 丸めずに出しているか確認してください"
+        )
     out.sort(key=lambda g: (g.cluster, g.state, g.seed))
     return out, feat_cols
 

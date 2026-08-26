@@ -465,7 +465,7 @@ fn run_unit(job: &Job, seed: u64, config: &Arc<StrategyConfig>) -> (Vec<Row>, (u
                 let feats = feature_row(&view, cand, &ctx);
                 let score = st.scores.get(&cand.usi).copied().flatten();
                 let mut line = format!(
-                    "{},{},{},{},{},{seed},{},{},1,{engine_rank},{:.6}",
+                    "{},{},{},{},{},{seed},{},{},1,{engine_rank},{}",
                     job.stem,
                     id,
                     st.scenario,
@@ -473,7 +473,12 @@ fn run_unit(job: &Job, seed: u64, config: &Arc<StrategyConfig>) -> (Vec<Row>, (u
                     if side == Color::Sente { "b" } else { "w" },
                     cand.usi,
                     score.map(|s| s.to_string()).unwrap_or_default(),
-                    // 乱数込みの実スコア（特徴量ではない。P1 の数値合成と baseline 用）
+                    // 乱数込みの実スコア（特徴量ではない。P1 の数値合成と baseline 用）。
+                    // **丸めない**（PR #25 レビュー指摘 P1）: `{:.6}` だと
+                    // 5.0000004 と 5.0000003 が同値になり、現行方策では順位が
+                    // ついている候補が CSV 上で同点になる。baseline の argmax と
+                    // concordance がその偽の同点で変わってしまう。Rust の既定表示は
+                    // round-trip する最短表現なので、これで実行時の値が復元できる
                     cand.score,
                 );
                 for f in feats {
