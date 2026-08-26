@@ -324,10 +324,13 @@
     replicate として数えるのは「同じ実験の独立サンプル」だけ: 中身の hash が
     相異なる・母集団（決定状態×seed×候補×採点。候補外の手も USI ごと）が一致・
     summary JSON の `budget_ms` / `config_fingerprint` / `source_fingerprint` /
-    `seeds` / `eval_fingerprint` が一致、を検査する（同じファイルを3回渡すだけで
-    本数関門を通せてはいけない）。`source_fingerprint` は `src/**/*.rs` ＋
-    `joseki.json` ＋ 元 KIF のハッシュで、`config_fingerprint`（解決済みノブの値だけ）
-    が捉えない**コード版**を表す（git を使わないので dirty worktree も区別できる）。
+    `data_fingerprint` / `seeds` / `eval_fingerprint` が一致、を検査する（同じファイルを
+    3回渡すだけで本数関門を通せてはいけない）。指紋は2つ:
+    **`source_fingerprint`** は `build.rs` が**コンパイル時に**焼き込む
+    `src/**/*.rs` ＋ `Cargo.lock` のハッシュ（実行時に worktree を読むと、別コミットで
+    ビルドしたバイナリを今の worktree の指紋で記録する TOCTOU になる）。
+    **`data_fingerprint`** は実効定跡パスの**中身**と元 KIF の中身
+    （`config_fingerprint` は定跡のパス文字列しか持たない）。
     一方**得点系は2セット6本とも安定**（大きい2局の対比較 top-1 は −0.31〜−1.45、
     未採点への逃避は +0.28〜+0.38）なので、判定はそちらで確定する
   - **指標の落とし穴8件**（PR #25 の5回のレビューで判明。**8件とも

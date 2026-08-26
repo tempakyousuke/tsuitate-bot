@@ -41,44 +41,36 @@ use tsuitate_bot::scenario_core::{clone_log, make_view, replay, side_idx};
 use tsuitate_bot::shogi::parse_usi;
 use tsuitate_bot::strategy::{self, Strategy};
 
-/// **挙動を決めるソースの指紋**（PR #25 レビュー指摘 P1）。
+/// **実行時データの指紋**（PR #25 レビュー指摘 P1）。
 ///
-/// `config_fingerprint` は解決済みノブの値だけなので、評価ロジックを変えた
-/// 別コミットの CSF が「同じ実験の replicate」として平均に混ざってしまう。
-/// `src/**/*.rs`（凍結版・共有モデル込み）と `joseki.json`、それに今回使った
-/// 元 KIF の中身を全部ハッシュして、**コード版と外部内容の両方**を1つの指紋にする。
-/// git を使わないので dirty worktree もそのまま区別できる。
-fn source_fingerprint(source_kifs: &[PathBuf]) -> String {
+/// コード版は `build.rs` が焼き込む `TSUITATE_SOURCE_FINGERPRINT`（`src/**/*.rs` ＋
+/// `Cargo.lock`）が表す。こちらは**実行時に読むデータ**: 解決済みの定跡パス
+/// （`config.joseki_path` = `TSUITATE_JOSEKI`。`config_fingerprint` にはパス文字列
+/// しか入らないので、同じパスの中身を差し替えられると挙動だけが変わる）と、
+/// 今回使った元 KIF の中身。
+fn data_fingerprint(joseki_path: &str, source_kifs: &[PathBuf]) -> String {
     use sha2::Digest as _;
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let mut files: Vec<PathBuf> = vec![];
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.is_dir() {
-                walk(&p, out);
-            } else if p.extension().is_some_and(|x| x == "rs") {
-                out.push(p);
-            }
-        }
-    }
-    walk(&root.join("src"), &mut files);
-    files.push(root.join("joseki.json"));
-    files.extend(source_kifs.iter().cloned());
-    files.sort();
-    files.dedup();
     let mut h = sha2::Sha256::new();
-    for f in files {
-        h.update(f.strip_prefix(root).unwrap_or(&f).to_string_lossy().as_bytes());
+    // 定跡は**実効パスの中身**（パス文字列も入れる: 相対/絶対の違いも残す）
+    h.update(b"joseki\0");
+    h.update(joseki_path.as_bytes());
+    h.update([0]);
+    h.update(std::fs::read(joseki_path).unwrap_or_default());
+    h.update([0]);
+    let mut kifs: Vec<&PathBuf> = source_kifs.iter().collect();
+    kifs.sort();
+    kifs.dedup();
+    for f in kifs {
+        h.update(f.strip_prefix(root).unwrap_or(f).to_string_lossy().as_bytes());
         h.update([0]);
-        h.update(std::fs::read(&f).unwrap_or_default());
+        h.update(std::fs::read(f).unwrap_or_default());
         h.update([0]);
     }
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// 1決定状態（eval の1ブロック）の復元結果
+/// 1決定状態（eval の1ブロック）の復元結果/// 1決定状態（eval の1ブロック）の復元結果
 struct State {
     /// 見出しの N手目
     num: usize,
@@ -151,7 +143,13 @@ fn main() {
         eprintln!("--summary は廃止しました（summary は --out と同じ名前の .summary.json に出ます）");
         std::process::exit(2);
     }
-    let summary_path = out.replace(".csv", ".summary.json");
+    // **起動時に検査する**: `.csv` で終わらないと下の置換が `out` をそのまま返し、
+    // 重いエクスポートの最後に summary が CSV を上書きして結果が消える
+    let Some(stem) = out.strip_suffix(".csv") else {
+        eprintln!("--out は `.csv` で終わる必要があります（summary を同名の .summary.json に出すため）: {out}");
+        std::process::exit(2);
+    };
+    let summary_path = format!("{stem}.summary.json");
     let seeds: u64 = take_opt(&mut args, "--seeds")
         .map_or(4, |v| v.parse().expect("--seeds は整数"));
     let budget_ms: Option<u64> = take_opt(&mut args, "--budget-ms")
@@ -328,9 +326,15 @@ engine_rank,engine_score,",
     js.push_str(&format!("  \"budget_ms\": {},\n", config.think_budget_ms));
     js.push_str(&format!("  \"config_fingerprint\": \"{}\",\n", config.fingerprint()));
     js.push_str(&format!("  \"seeds\": {seeds},\n"));
+    // コード版は build.rs がコンパイル時に焼き込んだ値（実行時に worktree を
+    // 読むと、別コミットでビルドしたバイナリを今の worktree の指紋で記録してしまう）
     js.push_str(&format!(
         "  \"source_fingerprint\": \"{}\",\n",
-        source_fingerprint(&source_kifs)
+        env!("TSUITATE_SOURCE_FINGERPRINT")
+    ));
+    js.push_str(&format!(
+        "  \"data_fingerprint\": \"{}\",\n",
+        data_fingerprint(&config.joseki_path, &source_kifs)
     ));
     js.push_str(&format!("  \"eval_fingerprint\": \"{}\",\n", {
         use sha2::Digest as _;

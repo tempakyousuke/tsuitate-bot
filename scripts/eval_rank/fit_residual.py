@@ -373,10 +373,13 @@ def stratum_of(g):
 EXPERIMENT_KEYS = (
     "budget_ms",
     "config_fingerprint",
-    # **コード版**（src/**/*.rs・joseki・元 KIF の中身のハッシュ）。config_fingerprint は
-    # 解決済みノブの値だけなので、評価ロジックを変えた別コミットの CSV が
-    # 「同じ実験の replicate」として平均に混ざってしまう
+    # **コード版**（build.rs がコンパイル時に焼き込む `src/**/*.rs` ＋ `Cargo.lock` の
+    # ハッシュ）。`config_fingerprint` は解決済みノブの値だけなので、評価ロジックを
+    # 変えた別コミットの CSV が「同じ実験の replicate」として平均に混ざってしまう
     "source_fingerprint",
+    # **実行時データ**（実効定跡パスの中身＋元 KIF の中身）。`config_fingerprint` は
+    # 定跡のパス文字列しか持たないので、同じパスの中身が差し替わると挙動だけ変わる
+    "data_fingerprint",
     "seeds",
     "eval_fingerprint",
 )
@@ -385,9 +388,12 @@ EXPERIMENT_KEYS = (
 def experiment_fingerprint(csv_path):
     """CSV の隣の summary JSON から実験条件を読む（無ければ止める）"""
     p = pathlib.Path(csv_path)
-    # summary の場所は CSV 名から一意に決まる（exporter 側も同じ契約。
-    # 別名を許すと「正しく作った組を渡したのに存在しないパスを探して止まる」）
-    side = p.with_name(p.name.replace(".csv", ".summary.json"))
+    # summary の場所は CSV 名から一意に決まる（exporter 側も同じ契約で、
+    # `--out` は `.csv` 必須。別名を許すと「正しく作った組を渡したのに存在しない
+    # パスを探して止まる」ことになる）
+    if not p.name.endswith(".csv"):
+        sys.exit(f"{csv_path}: 入力は `.csv` で終わる必要があります（exporter の --out と同じ規約）")
+    side = p.with_name(p.name[: -len(".csv")] + ".summary.json")
     if not side.exists():
         sys.exit(
             f"{csv_path}: summary JSON（{side.name}）がありません。"

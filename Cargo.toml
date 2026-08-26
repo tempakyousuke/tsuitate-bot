@@ -17,3 +17,8 @@ rand = "0.9"
 tiny_http = "0.12.0"
 hmac = "0.13.0"
 sha2 = "0.11.0"
+
+# ビルド時のソース指紋（build.rs）。issue #24 の replicate 検査で、
+# 「この CSV を作ったバイナリのコード版」をバイナリへ焼き込むために使う
+[build-dependencies]
+sha2 = "0.11.0"

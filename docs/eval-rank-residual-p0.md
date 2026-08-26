@@ -114,12 +114,22 @@ python3 scripts/eval_rank/fit_residual.py data/eval_rank.csv --out /tmp/p0.md
   入れ替わっても通る）③summary JSON の `budget_ms` / `config_fingerprint` /
   **`source_fingerprint`** / `seeds` / `eval_fingerprint` が全 replicate で
   一致すること、を検査する。
-  `source_fingerprint` は **`src/**/*.rs`（凍結版・共有モデル込み）＋ `joseki.json`
-  ＋ 使った元 KIF の中身**のハッシュで、`config_fingerprint`（解決済みノブの値だけ）
-  では捉えられない**コード版**を表す。git を使わないので dirty worktree もそのまま
-  区別できる。これが無いと、評価ロジックを変えた別コミットの CSV が同じ実験の
-  replicate として平均に混ざる。
-  summary の場所は CSV 名から一意に決まる（exporter の `--summary` は廃止した）
+  指紋は2つに分ける:
+  - **`source_fingerprint`（コード版）** = `build.rs` が**コンパイル時に**焼き込む
+    `src/**/*.rs`（凍結版・共有モデル込み）＋ `Cargo.lock` のハッシュ。
+    実行時に worktree を読むと、commit A でビルドしたバイナリを worktree B の
+    状態で走らせたときに **A の挙動を B の指紋で記録**してしまう（長い実行中の
+    編集でも同じ TOCTOU）。**実測で確認済み**: 再ビルドせずに worktree を編集しても
+    指紋は動かず、再ビルドすると動き、元に戻すと戻る
+  - **`data_fingerprint`（実行時データ）** = 解決済みの定跡パス（`config.joseki_path`
+    = `TSUITATE_JOSEKI`）の**中身**と、使った元 KIF の中身。`config_fingerprint` には
+    定跡の**パス文字列しか入らない**ので、同じパスの中身を差し替えると実効挙動だけが
+    変わる。**実測で確認済み**: 中身を変えると `config_fingerprint` は不変のまま
+    `data_fingerprint` だけが変わる
+
+  summary の場所は CSV 名から一意に決まる（exporter の `--summary` は廃止し、
+  `--out` は `.csv` 必須を起動時に検査する。`.csv` で終わらないと summary が
+  CSV を上書きして、重いエクスポートの最後に結果が消えるため）
 - **P1 合成の成分も丸めない**。`gain` / `p_legal` / `foul_cost` は特徴量であると
   同時に gain 側合成の入力なので、特徴量列も全精度で出す
 
