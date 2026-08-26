@@ -135,7 +135,11 @@ python3 scripts/eval_rank/fit_residual.py data/eval_rank.csv --out /tmp/p0.md
   この列は**丸めない**（丸めると現行方策で順位がついている候補が同点になる）。
   読み込み時に「降順が `engine_rank` の昇順と一致する」ことを検査する
 - **1本のエクスポートで符号を論じない**。壁時計予算で粒子数が揺れるため、同じコードでも
-  macro concordance が ±0.03 動く（P0 の門 +0.05 と同じ桁）
+  macro concordance が門（+0.05）をまたいで散る（実測 +0.050 / +0.056 / −0.027）。
+  `fit_residual.py a.csv b.csv c.csv` が replicate として集約し、3本未満なら
+  concordance を「判定不能」にして合格を出さない
+- P1 の統合形を測るときは **`gain` 側へ足す**（`gain' = gain + 残差` →
+  `combine_score(...)`）。最終 score へ直接足すと合法性の割引を迂回した別物になる
 - 順位系の特徴量は**完全同点も決定的に割る**（USI の辞書順）。安定ソートに任せると
   タイブレーク乱数の並び順が `rank` に残り、順位学習がそれを拾う（実測で
   concordance の見かけの改善 +0.017 がこれで消えた）

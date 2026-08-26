@@ -39,6 +39,10 @@ BOUND_CAP = 2.0  # P1 の bounded residual の cap（人手採点の点数スケ
 # 未採点手を選んだ率の許容増分。これを超えたら**逃避した分が測れていない**ので、
 # 他の条件が通っていても P0 は確定しない（PR #25 レビュー指摘 P1）
 UNSCORED_TOL = 0.01
+# concordance の合否に要る replicate（別エクスポート）の本数。壁時計予算で粒子数が
+# 揺れるため、同じコードでも macro concordance が門（+0.05）と同じ桁だけ動く。
+# 1本で `d_conc >= 0.05` を合格にすると、そのノイズで P0 合格を出せてしまう
+MIN_REPLICATES = 3
 ALPHAS = [1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0, 3000.0]
 
 ID_COLS = 11  # source_kif..engine_score
@@ -311,6 +315,46 @@ def seed_agreement(groups, pred_fn):
     return hit / tot if tot else float("nan")
 
 
+def combine_score(gain, p_legal, foul_cost):
+    """`strategy::combine_score` と同じ式。
+
+    期待値が負の手を `p_legal` で割り引かない min の形。割り引くと
+    「合法確率が低いほどスコアが高い」= わざと反則に寄る手が選ばれる。
+    """
+    return np.minimum(p_legal * gain, gain) - (1.0 - p_legal) * foul_cost
+
+
+def p1_composed(g, feat_cols, delta):
+    """**issue #24 の P1 が定めた gain 側の統合形**を再現する（レビュー指摘 P1）。
+
+        gain' = gain + delta
+        score' = combine_score(gain', p_legal, foul_cost) + 既存の外側補正
+
+    最終 score へ `delta` を直接足すのとは**等価でない**。`combine_score` は
+    正の gain を `p_legal` で割り引く非線形式なので、外側へ足すと学習値が
+    合法性の割引を迂回してしまう（issue が明示的に禁じている性質）。
+    例: gain=2 / p_legal=0.5 / foul_cost=0 / delta=1 なら、現行 1.0・
+    P1 案 1.5 に対し、外側加算は 2.0 まで上がる。
+
+    外側補正（`adjust` / `foul_probe`）と丸めなし baseline を保つために、
+    差分だけを `engine_score` へ乗せる:
+    `engine_score + combine(gain+delta) − combine(gain)`。
+
+    `gain` / `p_legal` / `foul_cost` は特徴量列なので 6 桁に丸めてあるが、
+    ここで効くのは**差分**（典型的に 0.1〜8）なので相対誤差は 1e-5 以下。
+    `engine_score` の丸めと違い**同点を作らない**（engine_score は全桁のまま
+    連続値なので、この誤差で順位が変わるのは最終値が 1e-6 未満しか離れていない
+    ときだけ）。
+    """
+    gain = g.X[:, feat_cols.index("gain")]
+    p_legal = g.X[:, feat_cols.index("p_legal")]
+    foul_cost = g.X[:, feat_cols.index("foul_cost")]
+    return baseline_scores(g) + (
+        combine_score(gain + delta, p_legal, foul_cost)
+        - combine_score(gain, p_legal, foul_cost)
+    )
+
+
 def stratum_of(g):
     s = []
     s.append("被王手" if g.X[0][FEAT.index("in_check")] > 0 else "通常")
@@ -321,29 +365,118 @@ def stratum_of(g):
     return s
 
 
+def fold_fit(groups, feat_cols):
+    """leave-one-source-KIF-out（外側）＋ 訓練 fold 内の nested CV（α）を回す。
+
+    replicate（別エクスポート）ごとに呼べるよう、記述的な表の出力から切り離してある。
+    戻り値は `(clusters, by_cluster, stats, chosen, base_res, model_res, paired)`。
+    """
+    clusters = sorted({g.cluster for g in groups})
+    by_cluster = {c: [g for g in groups if g.cluster == c] for c in clusters}
+    stats = {c: ClusterStats(by_cluster[c], len(feat_cols)) for c in clusters}
+
+    def fitted(train_clusters, alpha):
+        keep, scale = train_scale(stats, train_clusters)
+        return fit_ridge_from(stats, train_clusters, keep, scale, alpha), keep, scale
+
+    base_res, model_res, chosen = {}, {}, {}
+    for held in clusters:
+        inner_clusters = [c for c in clusters if c != held]
+        best_alpha, best_score = ALPHAS[len(ALPHAS) // 2], -1e9
+        # 内側 CV も**元 KIF 単位**。訓練 fold が2クラスタ未満なら α は既定のまま
+        for alpha in ALPHAS if len(inner_clusters) >= 2 else []:
+            accs = []
+            for inner in inner_clusters:
+                itr = [c for c in inner_clusters if c != inner]
+                beta, keep, scale = fitted(itr, alpha)
+                m = eval_fold(by_cluster[inner], lambda g: rank_scores(g, beta, keep, scale))
+                if "concordance" in m:
+                    accs.append(m["concordance"])
+            if accs and sum(accs) / len(accs) > best_score:
+                best_score, best_alpha = sum(accs) / len(accs), alpha
+        beta, keep, scale = fitted(inner_clusters, best_alpha)
+        chosen[held] = (best_alpha, beta, keep, scale)
+        base_res[held] = eval_fold(by_cluster[held], lambda g: baseline_scores(g))
+        model_res[held] = eval_fold(by_cluster[held], lambda g: rank_scores(g, beta, keep, scale))
+    paired = {}
+    for c in clusters:
+        _, beta_c, keep_c, scale_c = chosen[c]
+        paired[c] = paired_metrics(
+            by_cluster[c],
+            lambda g: baseline_scores(g),
+            lambda g, b=beta_c, k=keep_c, sc=scale_c: rank_scores(g, b, k, sc),
+        )
+    return clusters, by_cluster, stats, chosen, base_res, model_res, paired
+
+
+def gate_quantities(clusters, base_res, model_res, paired):
+    """合否に使う量だけを replicate 横断で比べられる形にまとめる"""
+    big = [c for c in clusters if c.startswith("quest")]
+    out = {
+        "d_conc": macro(model_res, "concordance") - macro(base_res, "concordance"),
+        "d_unscored": macro(model_res, "top1_unscored") - macro(base_res, "top1_unscored"),
+        "signs": [
+            model_res[c].get("concordance", 0) - base_res[c].get("concordance", 0)
+            for c in clusters
+        ],
+        "quest": {},
+        "small_worst": 0.0,
+        "small_worst_c": None,
+    }
+    for c in big:
+        r = paired[c]
+        if r is None:
+            out["quest"][c] = None
+            continue
+        b0, b1 = r["top1_bad"]
+        out["quest"][c] = {
+            "d_top1": r["top1_human"][1] - r["top1_human"][0],
+            "rel_bad": (b0 - b1) / b0 if b0 > 0 else 0.0,
+            "d_unscored": model_res[c].get("top1_unscored", 0.0)
+            - base_res[c].get("top1_unscored", 0.0),
+            "paired_states": r["paired_states"],
+            "states": r["states"],
+        }
+    for c in clusters:
+        if c.startswith("quest") or paired[c] is None:
+            continue
+        d = paired[c]["top1_human"][1] - paired[c]["top1_human"][0]
+        if d < out["small_worst"]:
+            out["small_worst"], out["small_worst_c"] = d, c
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("csv")
+    ap.add_argument(
+        "csv",
+        nargs="+",
+        help="bin/export_eval_rank_data の CSV。**複数渡すと replicate として扱う**"
+        f"（concordance の合否には {MIN_REPLICATES} 本以上が要る）",
+    )
     ap.add_argument("--out", help="markdown レポートの書き出し先")
     ap.add_argument("--boot", type=int, default=2000)
     args = ap.parse_args()
 
-    groups, feat_cols = load(args.csv)
+    groups, feat_cols = load(args.csv[0])
     global FEAT
     FEAT = feat_cols
-    clusters = sorted({g.cluster for g in groups})
     lines = []
 
     def say(s=""):
         print(s)
         lines.append(s)
 
+    # 十分統計と fold fitting（`fold_fit`。replicate ごとに回せる形に切り出してある）
+    clusters, by_cluster, stats, chosen, base_res, model_res, paired = fold_fit(groups, feat_cols)
+
     n_rows = sum(len(g.usi) for g in groups)
     n_scored = sum(sum(1 for s in g.score if s is not None) for g in groups)
     n_absent = sum(len(g.absent) for g in groups)
     say("# eval 残差ランカー P0: 棋譜外への一般化")
     say()
-    say(f"- 入力: `{args.csv}`")
+    say(f"- 入力: `{args.csv[0]}`"
+        + (f"（記述的な表はこの1本。replicate 計 {len(args.csv)} 本）" if len(args.csv) > 1 else ""))
     say(f"- 候補行 {n_rows}（うち採点済み {n_scored}）/ 決定状態×seed {len(groups)} 組")
     say(f"- 採点済みだが現行候補集合に無い手 {n_absent} 行")
     say(f"- クラスタ（元 KIF）{len(clusters)}: {', '.join(clusters)}")
@@ -357,9 +490,6 @@ def main():
         say(f"| {c} | {len({g.state for g in gs})} | {r} | {sc} | {r / n_rows:.1%} |")
     say()
 
-    # --- クラスタごとの十分統計（以後の fit は行列の足し算だけで済む）
-    by_cluster = {c: [g for g in groups if g.cluster == c] for c in clusters}
-    stats = {c: ClusterStats(by_cluster[c], len(feat_cols)) for c in clusters}
     say("- 学習に使う順序対（点差>0）の数: "
         + ", ".join(f"{c} {stats[c].pairs}" for c in clusters))
     say()
@@ -377,7 +507,7 @@ def main():
     mean_scored = sum(sum(1 for x in g.score if x is not None) for g in groups) / len(groups)
     cov = {k: [0, 0] for k in (1, 3, 10)}
     for g in groups:
-        order = np.argsort(-baseline_scores(g, feat_cols))
+        order = np.argsort(-baseline_scores(g))
         for k in cov:
             for i in order[:k]:
                 cov[k][1] += 1
@@ -391,28 +521,6 @@ def main():
         a, b = cov[k]
         say(f"- 現行 score の top-{k} が採点済みである割合: {a / b:.1%}")
     say()
-
-    # --- leave-one-source-KIF-out（外側）+ 訓練 fold 内の nested CV（α 選択）
-    base_res, model_res, chosen = {}, {}, {}
-    for held in clusters:
-        te = by_cluster[held]
-        inner_clusters = [c for c in clusters if c != held]
-        best_alpha, best_score = ALPHAS[len(ALPHAS) // 2], -1e9
-        # 内側 CV も**元 KIF 単位**。訓練 fold が2クラスタ未満なら α は既定のまま
-        for alpha in ALPHAS if len(inner_clusters) >= 2 else []:
-            accs = []
-            for inner in inner_clusters:
-                itr = [c for c in inner_clusters if c != inner]
-                beta, keep, scale = fitted(itr, alpha)
-                m = eval_fold(by_cluster[inner], lambda g: rank_scores(g, beta, keep, scale))
-                if "concordance" in m:
-                    accs.append(m["concordance"])
-            if accs and sum(accs) / len(accs) > best_score:
-                best_score, best_alpha = sum(accs) / len(accs), alpha
-        beta, keep, scale = fitted(inner_clusters, best_alpha)
-        chosen[held] = (best_alpha, beta, keep, scale)
-        base_res[held] = eval_fold(te, lambda g: baseline_scores(g, feat_cols))
-        model_res[held] = eval_fold(te, lambda g: rank_scores(g, beta, keep, scale))
 
     keys = [
         ("top1_human", "top-1 平均得点（採点済み条件つき）", "+"),
@@ -439,15 +547,8 @@ def main():
     say()
     say("| holdout | 状態数（対 / 全体） | top-1 得点 現行→模型 | 0〜2点 top-1 率 現行→模型 |")
     say("|---|---:|---|---|")
-    paired = {}
     for c in clusters:
-        _, beta_c, keep_c, scale_c = chosen[c]
-        r = paired_metrics(
-            by_cluster[c],
-            lambda g: baseline_scores(g),
-            lambda g, b=beta_c, k=keep_c, sc=scale_c: rank_scores(g, b, k, sc),
-        )
-        paired[c] = r
+        r = paired[c]
         if r is None:
             say(f"| {c} | 0 | — | — |")
             continue
@@ -593,8 +694,17 @@ def main():
     # 小さい W で改善する余地があるかを直接見る。W=0 は現行と完全一致
     say("### bounded residual（P1 の統合形）の W スイープ")
     say()
-    say(f"`pred = score + W × cap × tanh((r − r̄) / cap)`（cap={BOUND_CAP:g} 点、r = 残差モデルの出力）。")
-    say("W=0 は現行と完全一致。得点は**W=0 と対にした比較**（両腕とも top-1 が"
+    say("issue #24 の P1 は **gain 側**へ足す形（学習値が合法性の割引を迂回しないため）:")
+    say()
+    say("```")
+    say(f"gain' = gain + W × cap × tanh((r − r̄) / cap)   (cap={BOUND_CAP:g} 点)")
+    say("score' = combine_score(gain', p_legal, foul_cost) + 既存の外側補正")
+    say("```")
+    say()
+    say("最終 score へ直接足すのとは**等価でない**（`combine_score` は正の gain を"
+        " `p_legal` で割り引く非線形式）。ここは差分だけを丸めなしの `engine_score` へ"
+        "乗せて P1 案を再現する。"
+        "W=0 は現行と完全一致。得点は**W=0 と対にした比較**（両腕とも top-1 が"
         "採点済みの決定状態だけ）で、母集団が W ごとに動かないようにしてある。")
     say()
     say("macro は1決定状態しかないクラスタも106状態のクラスタも同じ重みで平均するので、"
@@ -610,7 +720,8 @@ def main():
         def pred_w(g, w=w):
             beta_w, keep_w, scale_w = lut_fold[id(g)]
             r = rank_scores(g, beta_w, keep_w, scale_w)
-            return baseline_scores(g) + w * BOUND_CAP * np.tanh((r - r.mean()) / BOUND_CAP)
+            delta = w * BOUND_CAP * np.tanh((r - r.mean()) / BOUND_CAP)
+            return p1_composed(g, feat_cols, delta)
 
         res = {c: eval_fold(by_cluster[c], pred_w) for c in clusters}
         per = {
@@ -657,90 +768,113 @@ def main():
             say(f"| {k} | {mean:+.3f} ± {sd:.3f} | {len(deltas)} |")
     say()
 
+    # --- replicate（別エクスポート）の集約。**concordance の合否はここでしか出さない**
+    reps = [gate_quantities(clusters, base_res, model_res, paired)]
+    for extra in args.csv[1:]:
+        g2, f2 = load(extra)
+        if f2 != feat_cols:
+            sys.exit(f"{extra}: 特徴量の列が1本目と違います（同じ exporter で出すこと）")
+        c2, by2, _, ch2, b2, m2, p2 = fold_fit(g2, f2)
+        if c2 != clusters:
+            sys.exit(f"{extra}: クラスタ（元 KIF）が1本目と違います")
+        reps.append(gate_quantities(c2, b2, m2, p2))
+    say("### replicate（別エクスポート）横断")
+    say()
+    if len(reps) < MIN_REPLICATES:
+        say(f"**replicate {len(reps)} 本**（concordance の合否には {MIN_REPLICATES} 本以上が要る）。"
+            "壁時計予算で粒子数が揺れるので、macro concordance は同じコードでも門"
+            "（+0.05）と同じ桁だけ動く。**1本では合否を出さない**")
+    else:
+        say(f"**replicate {len(reps)} 本**を平均して判定する。")
+    say()
+    say("| 量 | " + " | ".join(f"#{i + 1}" for i in range(len(reps))) + " | 平均 |")
+    say("|---|" + "---:|" * (len(reps) + 1))
+    rows = [("macro concordance の差", "d_conc"), ("macro 未採点率の差", "d_unscored")]
+    for label, k in rows:
+        vals = [r[k] for r in reps]
+        say(f"| {label} | " + " | ".join(f"{v:+.3f}" for v in vals)
+            + f" | {sum(vals) / len(vals):+.3f} |")
+    for c in [x for x in clusters if x.startswith("quest")]:
+        vals = [r["quest"][c]["d_top1"] if r["quest"].get(c) else float("nan") for r in reps]
+        say(f"| {c} の対比較 top-1 差 | " + " | ".join(f"{v:+.3f}" for v in vals)
+            + f" | {sum(vals) / len(vals):+.3f} |")
+    say()
+
     # --- P0 の合格条件
     say("## P0 の暫定合格条件との突き合わせ")
     say()
-    big = [c for c in clusters if c.startswith("quest")]
-    checks = []
-    quest_gate = []  # (得点条件, 未採点条件) を局ごとに
-    for c in big:
-        # **対比較で見る**（条件つきの片側平均は未採点への逃避で母集団が変わる）
-        r = paired[c]
-        if r is None:
-            checks.append(False)
+    say(f"得点系は1本目（`{args.csv[0]}`）の値、**concordance は replicate 平均**。")
+    say()
+    rep0 = reps[0]
+    quest_gate = []
+    for c in [x for x in clusters if x.startswith("quest")]:
+        q = rep0["quest"].get(c)
+        if q is None:
             quest_gate.append((False, True))
             say(f"- {c} 完全 holdout: 両腕とも採点済みの決定状態が無い → **否**")
             continue
-        d_top1 = r["top1_human"][1] - r["top1_human"][0]
-        b0, b1 = r["top1_bad"]
-        rel_bad = (b0 - b1) / b0 if b0 > 0 else 0.0
-        ok = d_top1 >= 0.5 or rel_bad >= 0.25
-        # **その局の未採点率も見る**（PR #25 レビュー指摘 P1）。macro の関門だけだと、
-        # この局で逃避が増えても他クラスタで減れば相殺されて通ってしまう。
-        # 逃避した分は対比較の部分集合から抜けているので、この局の得点差は
-        # 偏った母集団の上の値になる
-        du = model_res[c].get("top1_unscored", 0.0) - base_res[c].get("top1_unscored", 0.0)
-        ok_u = du <= UNSCORED_TOL
-        checks.append(ok and ok_u)
+        ok = q["d_top1"] >= 0.5 or q["rel_bad"] >= 0.25
+        # **その局の未採点率も見る**（macro の関門だけだと他クラスタで相殺される）
+        ok_u = q["d_unscored"] <= UNSCORED_TOL
         quest_gate.append((ok, ok_u))
-        say(f"- {c} 完全 holdout（対 {r['paired_states']}/{r['states']} 状態）: "
-            f"top-1 得点 {d_top1:+.3f}（要 +0.5）/ "
-            f"0〜2点 top-1 率の相対減 {rel_bad:+.1%}（要 25%）→ **{'合' if ok else '否'}**"
-            f"／この局の未採点率 {du:+.3f}（許容 +{UNSCORED_TOL:g}）"
+        say(f"- {c} 完全 holdout（対 {q['paired_states']}/{q['states']} 状態）: "
+            f"top-1 得点 {q['d_top1']:+.3f}（要 +0.5）/ "
+            f"0〜2点 top-1 率の相対減 {q['rel_bad']:+.1%}（要 25%）→ **{'合' if ok else '否'}**"
+            f"／この局の未採点率 {q['d_unscored']:+.3f}（許容 +{UNSCORED_TOL:g}）"
             f"→ **{'合' if ok_u else '未確定'}**")
         if ok and not ok_u:
             say(f"  - 得点条件は通っているが、この局で逃避が増えているので"
                 f"**{c} は incomplete**（追加採点まで確定しない）")
-    d_conc = macro(model_res, "concordance") - macro(base_res, "concordance")
-    ok_conc = d_conc >= 0.05
-    checks.append(ok_conc)
-    say(f"- macro pairwise concordance {d_conc:+.3f}（要 +0.05）→ **{'合' if ok_conc else '否'}**")
-    small = [c for c in clusters if not c.startswith("quest")]
-    worst, worst_c = 0.0, None
-    for c in small:
-        r = paired[c]
-        if r is None:
-            continue
-        d = r["top1_human"][1] - r["top1_human"][0]
-        if d < worst:
-            worst, worst_c = d, c
+
+    # **concordance は replicate 平均でしか合否を出さない**（PR #25 レビュー指摘 P1）。
+    # 1本での `d_conc >= 0.05` を合格にすると、壁時計予算由来のノイズだけで
+    # P0 合格を出せてしまう（実測で同一評価経路の3本が −0.010 / +0.019 / +0.050）
+    d_concs = [r["d_conc"] for r in reps]
+    mean_conc = sum(d_concs) / len(d_concs)
+    if len(reps) >= MIN_REPLICATES:
+        conc_state = "合" if mean_conc >= 0.05 else "否"
+    else:
+        conc_state = "判定不能"
+    say(f"- macro pairwise concordance {mean_conc:+.3f}"
+        f"（{len(reps)} 本の平均: {', '.join(f'{v:+.3f}' for v in d_concs)}、要 +0.05）"
+        f"→ **{conc_state}**")
+    if conc_state == "判定不能":
+        say(f"  - replicate が {MIN_REPLICATES} 本に満たないので、この条件では"
+            "**合格を出さない**（ノイズが門と同じ桁）")
+
+    worst, worst_c = rep0["small_worst"], rep0["small_worst_c"]
     ok_small = worst > -0.5
-    checks.append(ok_small)
     say(f"- 小さい eval 群（被王手・反則後）の最悪 top-1 差 {worst:+.3f}"
         f"{f'（{worst_c}）' if worst_c else ''}（要 > −0.5）→ **{'合' if ok_small else '否'}**")
-    signs = [model_res[c].get("concordance", 0) - base_res[c].get("concordance", 0) for c in clusters]
-    # **符号反転は中止条件そのもの**なので合否へ入れる（PR #25 レビュー指摘）。
-    # 表示だけにしておくと、中止条件に該当していても他が通れば「合格」と出てしまう
-    ok_sign = all(s >= 0 for s in signs) or all(s <= 0 for s in signs)
-    checks.append(ok_sign)
+
+    signs = rep0["signs"]
+    # **符号反転は中止条件そのもの**なので合否へ入れる
+    ok_sign = all(x >= 0 for x in signs) or all(x <= 0 for x in signs)
     say(f"- fold 間で concordance 差の符号が反転しない: "
-        f"{'一貫' if ok_sign else '**反転あり**'}（{', '.join(f'{s:+.3f}' for s in signs)}）"
+        f"{'一貫' if ok_sign else '**反転あり**'}（{', '.join(f'{x:+.3f}' for x in signs)}）"
         f"→ **{'合' if ok_sign else '否'}**")
-    # **未採点への逃避は合否へ入れる**（PR #25 レビュー指摘 P1）。
-    # 対比較は「両腕とも採点済み」の部分集合しか見ないので、逃避した分は
-    # 測れていない = 他の条件が通っても P0 は**確定しない**
-    d_unscored = macro(model_res, "top1_unscored") - macro(base_res, "top1_unscored")
+
+    # **未採点への逃避は合否へ入れる**。対比較は「両腕とも採点済み」の部分集合しか
+    # 見ないので、逃避した分は測れていない = 他の条件が通っても P0 は**確定しない**
+    d_unscored = rep0["d_unscored"]
     ok_unscored = d_unscored <= UNSCORED_TOL
-    checks.append(ok_unscored)
-    say(f"- 未採点手を選んだ率 {macro(base_res, 'top1_unscored'):.3f} → "
-        f"{macro(model_res, 'top1_unscored'):.3f}（{d_unscored:+.3f}、許容 +{UNSCORED_TOL:g}）"
+    say(f"- 未採点手を選んだ率の差 {d_unscored:+.3f}（許容 +{UNSCORED_TOL:g}）"
         f"→ **{'合' if ok_unscored else '未確定'}**")
     if not ok_unscored:
         say("  - 対比較は両腕とも採点済みの決定状態しか見ないので、**逃避した分は"
             "測れていない**。`append_unscored.py` で選ばれた未収載手を追記し、"
             "採点して `sync_eval.py` を掛けるまで得点差は確定しない")
     say()
-    # 「得点・順位の条件は全部通っているが、未採点への逃避だけが引っかかる」
-    # ときだけ incomplete（追加採点をすれば決まる）。それ以外は不合格
-    scored_ok = all(
-        [ok for ok, _ in quest_gate]  # 大きい quest の得点条件
-        + [ok_conc, ok_small, ok_sign]
-    )
-    unscored_ok = all([ok_u for _, ok_u in quest_gate] + [ok_unscored])
-    if scored_ok and unscored_ok:
+
+    # 得点・順位の条件が全部「合」で、未確定（未採点への逃避 / replicate 不足）
+    # だけが残るときは incomplete。それ以外は不合格
+    scored_ok = all([ok for ok, _ in quest_gate] + [ok_small, ok_sign]) and conc_state != "否"
+    pending = conc_state == "判定不能" or not ok_unscored or not all(u for _, u in quest_gate)
+    if scored_ok and not pending:
         verdict = "P0 合格（P1 へ）"
     elif scored_ok:
-        verdict = "**判定不能（incomplete）**: 未採点手への逃避を解消・追加採点してから再判定する"
+        verdict = ("**判定不能（incomplete）**: 未採点手への逃避の解消・追加採点、"
+                   f"および replicate {MIN_REPLICATES} 本以上での再計測が要る")
     else:
         verdict = "P0 不合格（runtime 実装をしない）"
     say(f"**判定: {verdict}**")
