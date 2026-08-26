@@ -124,6 +124,10 @@ python3 scripts/eval_rank/fit_residual.py data/eval_rank.csv --out /tmp/p0.md
 - 分析側（`fit_residual.py`）は **leave-one-source-KIF-out** しかしない。
   行・候補・決定点のランダム分割は同一棋譜の暗記でリークする（採点の 94% が
   2局由来）。numpy が要る（`pip install numpy`）
+- 得点系の指標は「top-1 が採点済み」条件つきで数え、合否は**両腕とも採点済みの
+  決定状態だけの対比較**で見る。未採点の top-1 を `UNSCORED_DEFAULT=4` で埋めて
+  平均へ混ぜると、未採点選択が増える側の腕の得点が実点次第で反転する
+  （PR #25 レビューで実際に符号が変わった）
 - P0 の判定と撤退条件は `docs/eval-rank-residual-p0.md`
 
 ## quest_20260731 の移行について

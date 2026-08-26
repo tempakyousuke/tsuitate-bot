@@ -18,7 +18,9 @@
 //! - 特徴量は `PlayerView` と `CandidateScore` だけから作る（`eval_rank::feature_row`）。
 //!   真実盤面・実戦の正解手・コメント文・棋譜名は入らない
 //! - 未採点（`?`）は `human_score` 空欄の**欠測**として出す（悪手として数えない）
-//! - タイブレーク乱数は `adjust` から引いてある
+//! - タイブレーク乱数はどの特徴量にも載らない（`score` / `static_score` / `adjust`
+//!   から引き、順位系は乱数を除いたスコアで付け直す）。乱数込みの実際の着手順位は
+//!   識別子列 `engine_rank` に出す（現行方策の baseline を再現するため）
 //! - eval の採点と、対応するシナリオ kif の `scores=` が一致しない場合は停止する
 
 use std::collections::{HashMap, HashSet};
@@ -27,7 +29,7 @@ use std::sync::{Arc, Mutex};
 
 use tsuitate_bot::config::{EnvSource, StrategyConfig};
 use tsuitate_bot::eval_rank::{
-    EvalBlock, FEATURE_COLUMNS, ScenarioIndex, SetContext, feature_row, parse_eval,
+    EvalBlock, FEATURE_COLUMNS, ScenarioIndex, SetContext, det_order, feature_row, parse_eval,
     real_fouls_at, source_kif_path,
 };
 use tsuitate_bot::kifu::{Kifu, parse_kif};
@@ -237,7 +239,7 @@ fn main() {
     }
     let mut csv = String::new();
     csv.push_str(
-        "source_kif,decision_state,scenario,ply,side,seed,usi,human_score,in_candidates,",
+        "source_kif,decision_state,scenario,ply,side,seed,usi,human_score,in_candidates,engine_rank,",
     );
     csv.push_str(&FEATURE_COLUMNS.join(","));
     csv.push('\n');
@@ -427,7 +429,17 @@ fn run_unit(job: &Job, seed: u64, config: &Arc<StrategyConfig>) -> (Vec<Row>, (u
                 miss.2 += 1;
                 continue;
             };
-            let top = ranking.first().map(|c| c.score).unwrap_or(0.0);
+            // 順位系の特徴量はタイブレーク乱数を除いたスコアで付け直す。
+            // 乱数込みの実際の順位（= 現行方策の着手順）は engine_rank へ出す
+            let order = det_order(&ranking);
+            let mut det_rank = vec![0usize; ranking.len()];
+            for (r, &i) in order.iter().enumerate() {
+                det_rank[i] = r;
+            }
+            let top = order
+                .first()
+                .map(|&i| ranking[i].score - ranking[i].tiebreak)
+                .unwrap_or(0.0);
             let n = ranking.len();
             let in_set: HashSet<&str> = ranking.iter().map(|c| c.usi.as_str()).collect();
             miss.0 += st
@@ -440,9 +452,9 @@ fn run_unit(job: &Job, seed: u64, config: &Arc<StrategyConfig>) -> (Vec<Row>, (u
                 .filter(|c| !st.scores.contains_key(&c.usi))
                 .count();
             let id = st.id(&job.stem);
-            for (rank, cand) in ranking.iter().enumerate() {
+            for (engine_rank, cand) in ranking.iter().enumerate() {
                 let ctx = SetContext {
-                    rank,
+                    rank: det_rank[engine_rank],
                     n_candidates: n,
                     top_score: top,
                     fouls_this_turn: st.fouls.len() as u32,
@@ -450,7 +462,7 @@ fn run_unit(job: &Job, seed: u64, config: &Arc<StrategyConfig>) -> (Vec<Row>, (u
                 let feats = feature_row(&view, cand, &ctx);
                 let score = st.scores.get(&cand.usi).copied().flatten();
                 let mut line = format!(
-                    "{},{},{},{},{},{seed},{},{},1",
+                    "{},{},{},{},{},{seed},{},{},1,{engine_rank}",
                     job.stem,
                     id,
                     st.scenario,
@@ -463,7 +475,7 @@ fn run_unit(job: &Job, seed: u64, config: &Arc<StrategyConfig>) -> (Vec<Row>, (u
                     line.push_str(&format!(",{f:.6}"));
                 }
                 rows.push(Row {
-                    id: format!("{id}|{seed:03}|{rank:04}"),
+                    id: format!("{id}|{seed:03}|{engine_rank:04}"),
                     line,
                 });
             }
@@ -480,7 +492,7 @@ fn run_unit(job: &Job, seed: u64, config: &Arc<StrategyConfig>) -> (Vec<Row>, (u
             absent.sort();
             for (i, (usi, score)) in absent.iter().enumerate() {
                 let mut line = format!(
-                    "{},{},{},{},{},{seed},{usi},{score},0",
+                    "{},{},{},{},{},{seed},{usi},{score},0,",
                     job.stem,
                     id,
                     st.scenario,

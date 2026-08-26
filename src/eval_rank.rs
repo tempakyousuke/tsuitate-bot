@@ -24,8 +24,13 @@
 //! [`CandidateScore`]（bot 自身が計算した内訳）だけで、**真の盤面
 //! （`Position`）も実戦の正解手もコメント文も棋譜名も渡らない**。
 //! 型で担保したうえで、相手駒を動かしても行が変わらないことをテストで検査する。
-//! タイブレーク乱数は `CandidateScore::tiebreak` として分離済みなので、
-//! 特徴量に載る `adjust` は乱数を引いた決定的な補正だけ。
+//!
+//! **タイブレーク乱数はどの列にも載せない**。`adjust` だけでなく `score` /
+//! `static_score` もこの乱数を含む（`score = combine_score(...) + foul_probe + adjust`）
+//! ので、3つとも `CandidateScore::tiebreak` を引いて出す。順位系の
+//! `rank` / `score_gap_top` も**乱数を除いたスコアで**付け直す
+//! （エクスポータが `det_order` で並べ替える）。乱数込みの実際の着手順位は
+//! 特徴量ではなく識別子列 `engine_rank` に置く（現行方策の baseline 再現用）。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -70,49 +75,94 @@ impl EvalBlock {
 
 /// `evals/<stem>.eval.md` を読む。見出しの順で返す。
 pub fn parse_eval(path: &Path) -> Result<Vec<EvalBlock>, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{} を読めません: {e}", path.display()))?;
-    Ok(parse_eval_text(&text))
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("{} を読めません: {e}", path.display()))?;
+    parse_eval_text(&text).map_err(|e| format!("{}: {e}", path.display()))
 }
 
-pub fn parse_eval_text(text: &str) -> Vec<EvalBlock> {
+/// eval の本文をブロックへ分解する。**壊れた行では止まる**（PR #25 レビュー指摘）:
+/// `###` の見出しが1文字崩れただけでも、以降の候補行は**直前のブロックへ接続され**、
+/// 反則後の採点が反則前の決定点へ流れ込む（PR #3 で実際に起きた事故と同じ形）。
+/// 黙って無視すると `scores=` の照合も件数も合ってしまうので気づけない。
+///
+/// 止める条件（すべて行番号つき）:
+///
+/// - `##` で始まるのに `## N手目…` / `### N手目（…の反則後）` として読めない
+/// - 括弧の中が正しい USI なのに、その後ろが点数（0〜10）でも `?` でもない
+/// - 見出しの前に候補行がある
+///
+/// USI を含まない行は従来どおり自由記述として読み飛ばす。
+pub fn parse_eval_text(text: &str) -> Result<Vec<EvalBlock>, String> {
     let mut out: Vec<EvalBlock> = vec![];
-    for line in text.split('\n') {
-        if let Some(rest) = line.strip_prefix("### ") {
-            if let (Some(num), Some(sub)) = (
-                rest.split("手目").next().and_then(|s| s.trim().parse().ok()),
-                rest.split('（').nth(1).and_then(|s| s.strip_suffix("の反則後）")),
-            ) {
-                out.push(EvalBlock { num, sub: Some(sub.to_string()), entries: vec![] });
-                continue;
-            }
+    for (no, line) in text.split('\n').enumerate() {
+        let no = no + 1;
+        let trimmed = line.trim();
+        if trimmed.starts_with("###") {
+            let rest = trimmed.strip_prefix("### ").ok_or_else(|| {
+                format!("{no}行目: 反則後の見出しとして読めません: {trimmed}")
+            })?;
+            let num = rest
+                .split("手目")
+                .next()
+                .and_then(|s| s.trim().parse().ok())
+                .ok_or_else(|| format!("{no}行目: 手目を読めません: {trimmed}"))?;
+            let sub = rest
+                .split('（')
+                .nth(1)
+                .and_then(|s| s.strip_suffix("の反則後）"))
+                .ok_or_else(|| {
+                    format!("{no}行目: `（和名(USI)の反則後）` の形ではありません: {trimmed}")
+                })?;
+            out.push(EvalBlock { num, sub: Some(sub.to_string()), entries: vec![] });
+            continue;
         }
-        if let Some(rest) = line.strip_prefix("## ") {
-            if let Some(num) = rest.split("手目").next().and_then(|s| s.trim().parse().ok()) {
-                out.push(EvalBlock { num, sub: None, entries: vec![] });
-                continue;
-            }
+        if trimmed.starts_with("##") {
+            let num = trimmed
+                .strip_prefix("## ")
+                .and_then(|rest| rest.split("手目").next())
+                .and_then(|s| s.trim().parse().ok())
+                .ok_or_else(|| format!("{no}行目: `## N手目` として読めません: {trimmed}"))?;
+            out.push(EvalBlock { num, sub: None, entries: vec![] });
+            continue;
         }
-        let Some(block) = out.last_mut() else { continue };
-        if let Some(e) = parse_move_line(line.trim()) {
-            block.entries.push(e);
-        }
+        let Some(entry) = parse_move_line(trimmed, no)? else {
+            continue;
+        };
+        let block = out
+            .last_mut()
+            .ok_or_else(|| format!("{no}行目: 見出しの前に候補行があります: {trimmed}"))?;
+        block.entries.push(entry);
     }
-    out
+    Ok(out)
 }
 
-/// `和名(USI) 点 コメント…` の行（sync_eval.py の MOVE 正規表現と同じ規約）
-fn parse_move_line(line: &str) -> Option<(String, Option<u8>)> {
-    let open = line.find('(')?;
-    let close = line[open..].find(')')? + open;
+/// `和名(USI) 点 コメント…` の行（sync_eval.py の MOVE 正規表現と同じ規約）。
+///
+/// 最初の括弧の中が USI でなければ自由記述（`Ok(None)`）。USI なのに点数が
+/// 続かない行は**エラー**（採点し忘れは `?` と書く決まりで、無言で落とすと
+/// その手だけ教師からも指標からも消える）。
+fn parse_move_line(line: &str, no: usize) -> Result<Option<(String, Option<u8>)>, String> {
+    let Some(open) = line.find('(') else {
+        return Ok(None);
+    };
+    let Some(close) = line[open..].find(')').map(|i| i + open) else {
+        return Ok(None);
+    };
     let usi = &line[open + 1..close];
-    parse_usi(usi)?;
-    let rest = line[close + 1..].trim_start();
-    let token = rest.split_whitespace().next()?;
-    if token == "?" {
-        return Some((usi.to_string(), None));
+    if parse_usi(usi).is_none() {
+        return Ok(None);
     }
-    let pt: u8 = token.parse().ok()?;
-    (pt <= 10).then(|| (usi.to_string(), Some(pt)))
+    let rest = line[close + 1..].trim_start();
+    let token = rest.split_whitespace().next().unwrap_or("");
+    if token == "?" {
+        return Ok(Some((usi.to_string(), None)));
+    }
+    match token.parse::<u8>() {
+        Ok(pt) if pt <= 10 => Ok(Some((usi.to_string(), Some(pt)))),
+        _ => Err(format!(
+            "{no}行目: {usi} の後ろが点数（0〜10）でも `?` でもありません: {line}"
+        )),
+    }
 }
 
 /// eval の stem に対応する元 KIF（`scenarios/archive/<stem>.kif` 優先）。
@@ -277,9 +327,11 @@ pub fn feature_row(view: &PlayerView, cand: &CandidateScore, ctx: &SetContext) -
         }
     };
     let is_drop = from.is_none() && to.is_some();
+    // タイブレーク乱数は score / static_score / adjust の3つに同じ量だけ載っている
+    // （`adjust` を1回足した形なので、それぞれから引けば決定的な値になる）
     let mut row = vec![
-        cand.score,
-        cand.static_score,
+        cand.score - cand.tiebreak,
+        cand.static_score - cand.tiebreak,
         cand.gain,
         cand.static_gain,
         cand.p_legal,
@@ -307,7 +359,7 @@ pub fn feature_row(view: &PlayerView, cand: &CandidateScore, ctx: &SetContext) -
         } else {
             0.0
         },
-        ctx.top_score - cand.score,
+        ctx.top_score - (cand.score - cand.tiebreak),
         ctx.n_candidates as f64,
         f64::from(view.move_number),
         f64::from(u8::from(view.you_in_check)),
@@ -349,12 +401,32 @@ pub fn feature_row(view: &PlayerView, cand: &CandidateScore, ctx: &SetContext) -
 }
 
 /// 候補集合ぜんたいの文脈（[`feature_row`] の順位系特徴に使う）。
+///
+/// `rank` / `top_score` は**タイブレーク乱数を除いたスコア**で作ること
+/// （[`det_order`] を使う）。乱数込みの順位を混ぜると、特徴量から乱数を外した
+/// 意味が無くなる。
 pub struct SetContext {
+    /// 決定的スコアでの順位（0 始まり）
     pub rank: usize,
     pub n_candidates: usize,
+    /// 決定的スコアの最大値
     pub top_score: f64,
     /// この決定状態までに（この手番で）既に消費した反則の数
     pub fouls_this_turn: u32,
+}
+
+/// タイブレーク乱数を除いたスコアの降順に並べた添字（同点は元の並び順）。
+/// `ranking` は乱数込みのスコア順なので、順位系の特徴量はこちらで付け直す。
+pub fn det_order(ranking: &[CandidateScore]) -> Vec<usize> {
+    let mut idx: Vec<usize> = (0..ranking.len()).collect();
+    idx.sort_by(|&a, &b| {
+        let (x, y) = (
+            ranking[b].score - ranking[b].tiebreak,
+            ranking[a].score - ranking[a].tiebreak,
+        );
+        x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    idx
 }
 
 fn is_promoted_role(r: Role) -> bool {
@@ -612,11 +684,28 @@ mod tests {
         mine.your_hand.insert(Role::Gold, 3);
         assert_ne!(base, feature_row(&mine, &cand, &ctx));
 
-        // 乱数は載っていない
-        let mut jittered = cand.clone();
-        jittered.adjust = cand.adjust + 0.004;
-        jittered.tiebreak = cand.tiebreak + 0.004;
+        // **タイブレーク乱数はどの列にも載っていない**。別の乱数を引くと
+        // `adjust` と、それを含む `score` / `static_score` が同じ量だけずれる
+        // （エンジンがそう作っている）ので、3つとも動かして不変を確かめる
+        let d = 0.004;
+        let jittered = CandidateScore {
+            adjust: cand.adjust + d,
+            score: cand.score + d,
+            static_score: cand.static_score + d,
+            tiebreak: cand.tiebreak + d,
+            ..cand.clone()
+        };
         assert_eq!(base, feature_row(&view, &jittered, &ctx));
+        // 順位系も乱数を除いたスコアで付けること。生のスコア順と決定的スコア順が
+        // **食い違う**組を作って、`det_order` が後者を返すことを確かめる
+        let hi = CandidateScore { score: 1.000, tiebreak: 0.009, ..cand.clone() };
+        let lo = CandidateScore { score: 0.995, tiebreak: 0.000, ..cand.clone() };
+        assert!(hi.score > lo.score, "テストの前提: 生のスコアは hi が上");
+        assert_eq!(
+            det_order(&[hi, lo]),
+            vec![1, 0],
+            "乱数を除いたスコア（0.991 < 0.995）で並べ替えていない"
+        );
 
         // view の残りの項目（時計・状態）は行に載っていない: 変えても不変
         let mut noise = view.clone();
@@ -629,6 +718,54 @@ mod tests {
         let mut used = view.clone();
         used.fouls = FoulCounts { you: view.fouls.you + 3, opponent: view.fouls.opponent };
         assert_ne!(base, feature_row(&used, &cand, &ctx));
+    }
+
+    /// 壊れた eval で**黙って続けない**こと（PR #25 レビュー指摘 P2）。
+    /// とくに `###` の見出しが崩れると、以降の候補行が直前のブロックへ接続され、
+    /// 反則後の採点が反則前の決定点へ流れ込む
+    #[test]
+    fn 壊れたevalは行番号つきで止まる() {
+        let ok = [
+            "## 61手目（先手番）",
+            "4七金(5g4g) 2 コメント",
+            "3六角打(B*3f) ?",
+            "### 62手目（4七歩打(P*4g)の反則後）",
+            "2二歩打(P*2b) 8",
+        ]
+        .join("\n");
+        let ok = ok.as_str();
+        let blocks = parse_eval_text(ok).expect("正しい eval が読めない");
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].entries.len(), 2);
+        assert_eq!(blocks[1].sub.as_deref(), Some("4七歩打(P*4g)"));
+
+        // 崩れた反則後の見出し（`の反則後）` が無い）は、続く候補行を
+        // 直前のブロックへ流し込む代わりに止まる
+        let broken = "## 61手目\n4七金(5g4g) 2\n### 62手目（4七歩打(P*4g)）\n2二歩打(P*2b) 8\n";
+        let e = parse_eval_text(broken).unwrap_err();
+        assert!(e.starts_with("3行目:"), "行番号が出ていない: {e}");
+
+        // USI なのに点数でも ? でもない
+        let e = parse_eval_text("## 61手目\n4七金(5g4g) いい手\n").unwrap_err();
+        assert!(e.starts_with("2行目:"), "行番号が出ていない: {e}");
+        let e = parse_eval_text("## 61手目\n4七金(5g4g) 11\n").unwrap_err();
+        assert!(e.starts_with("2行目:"), "0〜10 の範囲外を通している: {e}");
+
+        // 見出しの前の候補行
+        let e = parse_eval_text("4七金(5g4g) 2\n").unwrap_err();
+        assert!(e.starts_with("1行目:"), "行番号が出ていない: {e}");
+
+        // USI を含まない行は従来どおり自由記述
+        assert_eq!(
+            parse_eval_text("## 61手目\n（4七を守る唯一の駒）\n").unwrap()[0].entries.len(),
+            0
+        );
+
+        // インデントされた見出しも見出しとして読む（候補行として直前の
+        // ブロックへ流し込まない = この関数が防ぎたい事故そのもの）
+        let indented = parse_eval_text("## 61手目\n  ### 62手目（4七歩打(P*4g)の反則後）\n")
+            .expect("インデントされた見出しで止まってしまう");
+        assert_eq!(indented.len(), 2);
     }
 
     #[test]
