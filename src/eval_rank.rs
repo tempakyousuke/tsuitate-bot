@@ -146,8 +146,10 @@ fn parse_move_line(line: &str, no: usize) -> Result<Option<(String, Option<u8>)>
     let Some(open) = line.find('(') else {
         return Ok(None);
     };
+    // 開き括弧があるのに閉じていない行は候補行の書き損じ（PR #25 レビュー指摘 P2）。
+    // `4七金(5g4g 2` を自由記述として読み飛ばすと、その手だけが黙って消える
     let Some(close) = line[open..].find(')').map(|i| i + open) else {
-        return Ok(None);
+        return Err(format!("{no}行目: 閉じ括弧がありません: {line}"));
     };
     let usi = &line[open + 1..close];
     let rest = line[close + 1..].trim_start();
@@ -797,6 +799,15 @@ mod tests {
         // 括弧の後ろが点数でない行は従来どおり自由記述（USI かどうかを問わない）
         assert_eq!(
             parse_eval_text("## 61手目\n出典 (2026-08-07) のメモ\n").unwrap()[0].entries.len(),
+            0
+        );
+
+        // 閉じ括弧を欠いた候補行も止める（自由記述として消さない）
+        let e = parse_eval_text("## 61手目\n4七金(5g4g 2\n").unwrap_err();
+        assert!(e.starts_with("2行目:"), "閉じ括弧欠けを通している: {e}");
+        // 括弧が一切無い行は従来どおり自由記述
+        assert_eq!(
+            parse_eval_text("## 61手目\n4七を守る唯一の駒\n").unwrap()[0].entries.len(),
             0
         );
 

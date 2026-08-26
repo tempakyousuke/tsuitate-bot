@@ -19,8 +19,10 @@
 //!   真実盤面・実戦の正解手・コメント文・棋譜名は入らない
 //! - 未採点（`?`）は `human_score` 空欄の**欠測**として出す（悪手として数えない）
 //! - タイブレーク乱数はどの特徴量にも載らない（`score` / `static_score` / `adjust`
-//!   から引き、順位系は乱数を除いたスコアで付け直す）。乱数込みの実際の着手順位は
-//!   識別子列 `engine_rank` に出す（現行方策の baseline を再現するため）
+//!   から引き、順位系は乱数を除いたスコアで付け直す）。乱数込みの**実際のスコアと
+//!   順位**は識別子列 `engine_score` / `engine_rank` に出す: 現行方策の baseline の
+//!   再現と、P1 の統合形（`engine_score + W·cap·tanh(残差/cap)`）の数値合成に要る
+//!   （順位番号へ残差を足すと候補間の実スコア差が消えて別物の検証になる）
 //! - eval の採点と、対応するシナリオ kif の `scores=` が一致しない場合は停止する
 
 use std::collections::{HashMap, HashSet};
@@ -239,7 +241,8 @@ fn main() {
     }
     let mut csv = String::new();
     csv.push_str(
-        "source_kif,decision_state,scenario,ply,side,seed,usi,human_score,in_candidates,engine_rank,",
+        "source_kif,decision_state,scenario,ply,side,seed,usi,human_score,in_candidates,\
+engine_rank,engine_score,",
     );
     csv.push_str(&FEATURE_COLUMNS.join(","));
     csv.push('\n');
@@ -462,7 +465,7 @@ fn run_unit(job: &Job, seed: u64, config: &Arc<StrategyConfig>) -> (Vec<Row>, (u
                 let feats = feature_row(&view, cand, &ctx);
                 let score = st.scores.get(&cand.usi).copied().flatten();
                 let mut line = format!(
-                    "{},{},{},{},{},{seed},{},{},1,{engine_rank}",
+                    "{},{},{},{},{},{seed},{},{},1,{engine_rank},{:.6}",
                     job.stem,
                     id,
                     st.scenario,
@@ -470,6 +473,8 @@ fn run_unit(job: &Job, seed: u64, config: &Arc<StrategyConfig>) -> (Vec<Row>, (u
                     if side == Color::Sente { "b" } else { "w" },
                     cand.usi,
                     score.map(|s| s.to_string()).unwrap_or_default(),
+                    // 乱数込みの実スコア（特徴量ではない。P1 の数値合成と baseline 用）
+                    cand.score,
                 );
                 for f in feats {
                     line.push_str(&format!(",{f:.6}"));
@@ -492,7 +497,7 @@ fn run_unit(job: &Job, seed: u64, config: &Arc<StrategyConfig>) -> (Vec<Row>, (u
             absent.sort();
             for (i, (usi, score)) in absent.iter().enumerate() {
                 let mut line = format!(
-                    "{},{},{},{},{},{seed},{usi},{score},0,",
+                    "{},{},{},{},{},{seed},{usi},{score},0,,",
                     job.stem,
                     id,
                     st.scenario,

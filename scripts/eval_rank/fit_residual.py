@@ -41,7 +41,7 @@ BOUND_CAP = 2.0  # P1 の bounded residual の cap（人手採点の点数スケ
 UNSCORED_TOL = 0.01
 ALPHAS = [1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0, 3000.0]
 
-ID_COLS = 10  # source_kif..engine_rank
+ID_COLS = 11  # source_kif..engine_score
 
 
 class Group:
@@ -50,7 +50,9 @@ class Group:
     def __init__(self, cluster, state, seed):
         self.cluster, self.state, self.seed = cluster, state, seed
         self.usi, self.score, self.rows = [], [], []
-        self.engine_rank = []  # タイブレーク乱数込みの実際の着手順位（現行 baseline）
+        # タイブレーク乱数込みの実際の順位とスコア（特徴量ではない）。
+        # baseline の再現と、P1 の統合形の**数値**合成に使う
+        self.engine_rank, self.engine_score = [], []
         self.absent = []  # 採点済みだが現行候補集合に無い手の点
 
 
@@ -63,7 +65,7 @@ def load(path):
         feat_cols = header[ID_COLS:]
         for row in r:
             (src, state, _scenario, _ply, _side, seed, usi, human, in_cand,
-             engine_rank) = row[:ID_COLS]
+             engine_rank, engine_score) = row[:ID_COLS]
             key = (state, seed)
             g = groups.get(key)
             if g is None:
@@ -76,11 +78,13 @@ def load(path):
             g.usi.append(usi)
             g.score.append(float(human) if human else None)
             g.engine_rank.append(int(engine_rank))
+            g.engine_score.append(float(engine_score))
             g.rows.append([float(x) for x in row[ID_COLS:]])
     out = []
     for g in groups.values():
         g.X = np.array(g.rows, dtype=float)
         g.engine_rank = np.array(g.engine_rank, dtype=float)
+        g.engine_score = np.array(g.engine_score, dtype=float)
         g.rows = None
         # 同じ決定状態の中で move_number 等は定数なので、後で分散ゼロ列を落とす
         out.append(g)
@@ -156,10 +160,15 @@ def rank_scores(g, beta, cols_keep, scale):
 
 
 def baseline_scores(g, feat_cols=None):
-    """現行方策の順位（**タイブレーク乱数込みの実際の着手順**）。
-    特徴量の `score` 列は乱数を除いてあるので、baseline はそちらでなく
-    `engine_rank` を使う（同点の破り方まで含めて現行 estimator と一致させる）"""
-    return -g.engine_rank
+    """現行方策の**実スコア**（タイブレーク乱数込み）。
+
+    特徴量の `score` 列は乱数を除いてあるので baseline はそちらを使わない。
+    `engine_rank` でなく `engine_score` を返すのが要点で（PR #25 レビュー指摘 P1）、
+    順位番号に残差を足すと候補間の実スコア差が消えて、P1 が提案する
+    `score + W·cap·tanh(残差/cap)` とは別物の検証になる。
+    argmax は `engine_rank` 昇順と一致するので baseline の順位付けは変わらない。
+    """
+    return g.engine_score
 
 
 def group_metrics(g, pred):
@@ -639,21 +648,35 @@ def main():
     say()
     big = [c for c in clusters if c.startswith("quest")]
     checks = []
+    quest_gate = []  # (得点条件, 未採点条件) を局ごとに
     for c in big:
         # **対比較で見る**（条件つきの片側平均は未採点への逃避で母集団が変わる）
         r = paired[c]
         if r is None:
             checks.append(False)
+            quest_gate.append((False, True))
             say(f"- {c} 完全 holdout: 両腕とも採点済みの決定状態が無い → **否**")
             continue
         d_top1 = r["top1_human"][1] - r["top1_human"][0]
         b0, b1 = r["top1_bad"]
         rel_bad = (b0 - b1) / b0 if b0 > 0 else 0.0
         ok = d_top1 >= 0.5 or rel_bad >= 0.25
-        checks.append(ok)
+        # **その局の未採点率も見る**（PR #25 レビュー指摘 P1）。macro の関門だけだと、
+        # この局で逃避が増えても他クラスタで減れば相殺されて通ってしまう。
+        # 逃避した分は対比較の部分集合から抜けているので、この局の得点差は
+        # 偏った母集団の上の値になる
+        du = model_res[c].get("top1_unscored", 0.0) - base_res[c].get("top1_unscored", 0.0)
+        ok_u = du <= UNSCORED_TOL
+        checks.append(ok and ok_u)
+        quest_gate.append((ok, ok_u))
         say(f"- {c} 完全 holdout（対 {r['paired_states']}/{r['states']} 状態）: "
             f"top-1 得点 {d_top1:+.3f}（要 +0.5）/ "
-            f"0〜2点 top-1 率の相対減 {rel_bad:+.1%}（要 25%）→ **{'合' if ok else '否'}**")
+            f"0〜2点 top-1 率の相対減 {rel_bad:+.1%}（要 25%）→ **{'合' if ok else '否'}**"
+            f"／この局の未採点率 {du:+.3f}（許容 +{UNSCORED_TOL:g}）"
+            f"→ **{'合' if ok_u else '未確定'}**")
+        if ok and not ok_u:
+            say(f"  - 得点条件は通っているが、この局で逃避が増えているので"
+                f"**{c} は incomplete**（追加採点まで確定しない）")
     d_conc = macro(model_res, "concordance") - macro(base_res, "concordance")
     ok_conc = d_conc >= 0.05
     checks.append(ok_conc)
@@ -693,11 +716,16 @@ def main():
             "測れていない**。`append_unscored.py` で選ばれた未収載手を追記し、"
             "採点して `sync_eval.py` を掛けるまで得点差は確定しない")
     say()
-    others = checks[:-1]
-    if all(checks):
+    # 「得点・順位の条件は全部通っているが、未採点への逃避だけが引っかかる」
+    # ときだけ incomplete（追加採点をすれば決まる）。それ以外は不合格
+    scored_ok = all(
+        [ok for ok, _ in quest_gate]  # 大きい quest の得点条件
+        + [ok_conc, ok_small, ok_sign]
+    )
+    unscored_ok = all([ok_u for _, ok_u in quest_gate] + [ok_unscored])
+    if scored_ok and unscored_ok:
         verdict = "P0 合格（P1 へ）"
-    elif all(others):
-        # 他が全部通っていて未採点だけ未確定 = 追加採点をすれば決まる
+    elif scored_ok:
         verdict = "**判定不能（incomplete）**: 未採点手への逃避を解消・追加採点してから再判定する"
     else:
         verdict = "P0 不合格（runtime 実装をしない）"
