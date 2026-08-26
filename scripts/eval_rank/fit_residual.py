@@ -59,7 +59,7 @@ class Group:
         # タイブレーク乱数込みの実際の順位とスコア（特徴量ではない）。
         # baseline の再現と、P1 の統合形の**数値**合成に使う
         self.engine_rank, self.engine_score = [], []
-        self.absent = []  # 採点済みだが現行候補集合に無い手の点
+        self.absent = []  # 採点済みだが現行候補集合に無い手の (USI, 点)
 
 
 def load(path):
@@ -79,7 +79,7 @@ def load(path):
                 groups[key] = g
             if in_cand == "0":
                 if human:
-                    g.absent.append(float(human))
+                    g.absent.append((usi, float(human)))
                 continue
             g.usi.append(usi)
             g.score.append(float(human) if human else None)
@@ -231,7 +231,8 @@ def group_metrics(g, pred):
         m["concordance_strong"] = ok2 / n2
     # 候補生成 recall: 最高得点手が現在の候補集合にあるか
     if scored or g.absent:
-        m["cand_recall"] = 1.0 if (scored and max(scored) >= max(g.absent, default=-1)) else 0.0
+        best_absent = max((sc for _, sc in g.absent), default=-1)
+        m["cand_recall"] = 1.0 if (scored and max(scored) >= best_absent) else 0.0
     return m
 
 
@@ -369,12 +370,23 @@ def stratum_of(g):
 
 # replicate が満たすべき「同じ実験の別サンプル」の条件（PR #25 レビュー指摘 P1）。
 # summary JSON のこれらが全 replicate で一致しなければ止める
-EXPERIMENT_KEYS = ("budget_ms", "config_fingerprint", "seeds", "eval_fingerprint")
+EXPERIMENT_KEYS = (
+    "budget_ms",
+    "config_fingerprint",
+    # **コード版**（src/**/*.rs・joseki・元 KIF の中身のハッシュ）。config_fingerprint は
+    # 解決済みノブの値だけなので、評価ロジックを変えた別コミットの CSV が
+    # 「同じ実験の replicate」として平均に混ざってしまう
+    "source_fingerprint",
+    "seeds",
+    "eval_fingerprint",
+)
 
 
 def experiment_fingerprint(csv_path):
     """CSV の隣の summary JSON から実験条件を読む（無ければ止める）"""
     p = pathlib.Path(csv_path)
+    # summary の場所は CSV 名から一意に決まる（exporter 側も同じ契約。
+    # 別名を許すと「正しく作った組を渡したのに存在しないパスを探して止まる」）
     side = p.with_name(p.name.replace(".csv", ".summary.json"))
     if not side.exists():
         sys.exit(
@@ -408,8 +420,10 @@ def population_hash(groups):
         h.update(f"{g.state}|{g.seed}|".encode())
         for usi, sc in sorted(zip(g.usi, g.score)):
             h.update(f"{usi}:{'' if sc is None else int(sc)};".encode())
-        for sc in sorted(g.absent):
-            h.update(f"absent:{int(sc)};".encode())
+        # **候補外の手も USI ごと**（PR #25 レビュー指摘 P2）。点数の multiset だけだと
+        # 別の手へ入れ替わっても検査を通ってしまう
+        for usi, sc in sorted(g.absent):
+            h.update(f"absent:{usi}:{int(sc)};".encode())
     return h.hexdigest()
 
 

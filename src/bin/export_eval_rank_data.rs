@@ -6,8 +6,8 @@
 //!
 //! usage:
 //!   cargo run --release --bin export_eval_rank_data -- \
-//!     [--out data/eval_rank.csv] [--summary data/eval_rank.summary.json] \
-//!     [--seeds 4] [--budget-ms 2000] [--jobs N] [evals/xxx.eval.md ...]
+//!     [--out data/eval_rank.csv] [--seeds 4] [--budget-ms 2000] [--jobs N] \
+//!     [evals/xxx.eval.md ...]
 //!
 //! 省略時は `evals/*.eval.md` 全部・seed 0..3。**重い**（決定状態 × seed
 //! ぶんの `choose`。同一棋譜・同一手番側は prewarm 済み戦略を ply 昇順で
@@ -21,8 +21,8 @@
 //! - タイブレーク乱数はどの特徴量にも載らない（`score` / `static_score` / `adjust`
 //!   から引き、順位系は乱数を除いたスコアで付け直す）。乱数込みの**実際のスコアと
 //!   順位**は識別子列 `engine_score` / `engine_rank` に出す: 現行方策の baseline の
-//!   再現と、P1 の統合形（`engine_score + W·cap·tanh(残差/cap)`）の数値合成に要る
-//!   （順位番号へ残差を足すと候補間の実スコア差が消えて別物の検証になる）
+//!   再現と、P1 の統合形（`gain' = gain + 残差` → `combine_score(...)`）の数値ベースに
+//!   要る（順位番号へ残差を足すと候補間の実スコア差が消えて別物の検証になる）
 //! - eval の採点と、対応するシナリオ kif の `scores=` が一致しない場合は停止する
 
 use std::collections::{HashMap, HashSet};
@@ -40,6 +40,43 @@ use tsuitate_bot::protocol::Color;
 use tsuitate_bot::scenario_core::{clone_log, make_view, replay, side_idx};
 use tsuitate_bot::shogi::parse_usi;
 use tsuitate_bot::strategy::{self, Strategy};
+
+/// **挙動を決めるソースの指紋**（PR #25 レビュー指摘 P1）。
+///
+/// `config_fingerprint` は解決済みノブの値だけなので、評価ロジックを変えた
+/// 別コミットの CSF が「同じ実験の replicate」として平均に混ざってしまう。
+/// `src/**/*.rs`（凍結版・共有モデル込み）と `joseki.json`、それに今回使った
+/// 元 KIF の中身を全部ハッシュして、**コード版と外部内容の両方**を1つの指紋にする。
+/// git を使わないので dirty worktree もそのまま区別できる。
+fn source_fingerprint(source_kifs: &[PathBuf]) -> String {
+    use sha2::Digest as _;
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files: Vec<PathBuf> = vec![];
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                out.push(p);
+            }
+        }
+    }
+    walk(&root.join("src"), &mut files);
+    files.push(root.join("joseki.json"));
+    files.extend(source_kifs.iter().cloned());
+    files.sort();
+    files.dedup();
+    let mut h = sha2::Sha256::new();
+    for f in files {
+        h.update(f.strip_prefix(root).unwrap_or(&f).to_string_lossy().as_bytes());
+        h.update([0]);
+        h.update(std::fs::read(&f).unwrap_or_default());
+        h.update([0]);
+    }
+    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
 
 /// 1決定状態（eval の1ブロック）の復元結果
 struct State {
@@ -107,8 +144,14 @@ fn main() {
         })
     };
     let out = take_opt(&mut args, "--out").unwrap_or_else(|| "data/eval_rank.csv".into());
-    let summary_path = take_opt(&mut args, "--summary")
-        .unwrap_or_else(|| out.replace(".csv", ".summary.json"));
+    // summary の場所は `--out` から一意に決まる（PR #25 レビュー指摘 P2）。
+    // 分析側は CSV 名から導出するので、別名を許すと「正しく作った組を渡したのに
+    // 存在しないパスを探して止まる」ことになる
+    if args.iter().any(|a| a == "--summary") {
+        eprintln!("--summary は廃止しました（summary は --out と同じ名前の .summary.json に出ます）");
+        std::process::exit(2);
+    }
+    let summary_path = out.replace(".csv", ".summary.json");
     let seeds: u64 = take_opt(&mut args, "--seeds")
         .map_or(4, |v| v.parse().expect("--seeds は整数"));
     let budget_ms: Option<u64> = take_opt(&mut args, "--budget-ms")
@@ -151,6 +194,7 @@ fn main() {
         use sha2::Digest as _;
         sha2::Sha256::new()
     };
+    let mut source_kifs: Vec<PathBuf> = vec![];
     for path in &eval_paths {
         let stem = path
             .file_name()
@@ -159,6 +203,7 @@ fn main() {
             .replace(".eval.md", "");
         let src = source_kif_path(&stem)
             .unwrap_or_else(|| panic!("{stem}: 元 KIF（scenarios/archive/{stem}.kif）がありません"));
+        source_kifs.push(src.clone());
         let kifu = parse_kif(&std::fs::read_to_string(&src).expect("kif を読めません"))
             .unwrap_or_else(|e| panic!("{}: {e}", src.display()));
         let index = ScenarioIndex::build(&kifu);
@@ -283,6 +328,10 @@ engine_rank,engine_score,",
     js.push_str(&format!("  \"budget_ms\": {},\n", config.think_budget_ms));
     js.push_str(&format!("  \"config_fingerprint\": \"{}\",\n", config.fingerprint()));
     js.push_str(&format!("  \"seeds\": {seeds},\n"));
+    js.push_str(&format!(
+        "  \"source_fingerprint\": \"{}\",\n",
+        source_fingerprint(&source_kifs)
+    ));
     js.push_str(&format!("  \"eval_fingerprint\": \"{}\",\n", {
         use sha2::Digest as _;
         eval_hash
