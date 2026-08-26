@@ -43,34 +43,44 @@ use tsuitate_bot::strategy::{self, Strategy};
 
 /// **実行時データの指紋**（PR #25 レビュー指摘 P1）。
 ///
-/// コード版は `build.rs` が焼き込む `TSUITATE_SOURCE_FINGERPRINT`（`src/**/*.rs` ＋
-/// `Cargo.lock`）が表す。こちらは**実行時に読むデータ**: 解決済みの定跡パス
-/// （`config.joseki_path` = `TSUITATE_JOSEKI`。`config_fingerprint` にはパス文字列
-/// しか入らないので、同じパスの中身を差し替えられると挙動だけが変わる）と、
-/// 今回使った元 KIF の中身。
-fn data_fingerprint(joseki_path: &str, source_kifs: &[PathBuf]) -> String {
+/// コード版と実効ビルド条件は `build.rs` が焼き込む `TSUITATE_SOURCE_FINGERPRINT`。
+/// こちらは**実行時に読むデータ**: 解決済みの定跡パス（`config.joseki_path` =
+/// `TSUITATE_JOSEKI`。`config_fingerprint` にはパス文字列しか入らない）と、
+/// 今回使った元 KIF。
+///
+/// **ディスクを読み直さない**: 元 KIF は `parse_kif` に渡した**その bytes**を
+/// そのまま受け取る。長い実行の最後にファイルを読み直すと、A を読んで走った後に
+/// 同じパスを B へ差し替えられたとき、**CSV は A 由来なのに B の指紋が付く**
+/// （そして次の B 由来 export と検査を通ってしまう）。
+/// 定跡は `opening.rs` が遅延ロードしてプロセス内にキャッシュするので bytes を
+/// 取り出せない。代わりに**開始時と終了時に hash して不一致なら run を失敗させる**。
+fn data_fingerprint(joseki_path: &str, joseki_bytes: &[u8], source_kifs: &[(PathBuf, String)]) -> String {
     use sha2::Digest as _;
     let root = Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut h = sha2::Sha256::new();
-    // 定跡は**実効パスの中身**（パス文字列も入れる: 相対/絶対の違いも残す）
     h.update(b"joseki\0");
     h.update(joseki_path.as_bytes());
     h.update([0]);
-    h.update(std::fs::read(joseki_path).unwrap_or_default());
+    h.update(joseki_bytes);
     h.update([0]);
-    let mut kifs: Vec<&PathBuf> = source_kifs.iter().collect();
+    let mut kifs: Vec<&(PathBuf, String)> = source_kifs.iter().collect();
     kifs.sort();
-    kifs.dedup();
-    for f in kifs {
-        h.update(f.strip_prefix(root).unwrap_or(f).to_string_lossy().as_bytes());
+    kifs.dedup_by(|a, b| a.0 == b.0);
+    for (path, text) in kifs {
+        h.update(path.strip_prefix(root).unwrap_or(path).to_string_lossy().as_bytes());
         h.update([0]);
-        h.update(std::fs::read(f).unwrap_or_default());
+        h.update(text.as_bytes());
         h.update([0]);
     }
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// 1決定状態（eval の1ブロック）の復元結果/// 1決定状態（eval の1ブロック）の復元結果
+/// 定跡ファイルの hash（開始時と終了時に取って突き合わせる）
+fn joseki_bytes(path: &str) -> Vec<u8> {
+    std::fs::read(path).unwrap_or_default()
+}
+
+/// 1決定状態（eval の1ブロック）の復元結果
 struct State {
     /// 見出しの N手目
     num: usize,
@@ -179,6 +189,21 @@ fn main() {
         None => EnvSource::from_process(),
     };
     let config = Arc::new(StrategyConfig::from_source(source));
+    // **debug ビルドで計測させない**（PR #25 レビュー指摘 P1）。思考予算は壁時計
+    // なので、同じ 2000ms でも debug では探索量が桁で違い、replicate として
+    // 混ぜられない。ビルド条件は `source_fingerprint` にも入っているが、
+    // そもそも取らせないほうが早い
+    if env!("TSUITATE_BUILD_PROFILE") != "release" {
+        eprintln!(
+            "release ビルドで実行してください（現在: {}）。思考予算が壁時計なので\
+             debug ビルドの計測は replicate として使えません",
+            env!("TSUITATE_BUILD_PROFILE")
+        );
+        std::process::exit(2);
+    }
+    // 定跡は `opening.rs` が遅延ロードしてキャッシュするので bytes を取り出せない。
+    // **開始時に取っておき、終了時に取り直して不一致なら run を失敗させる**
+    let joseki_at_start = joseki_bytes(&config.joseki_path);
     eprintln!(
         "思考予算 {}ms / seeds {seeds} / jobs {jobs} / config {}",
         config.think_budget_ms,
@@ -192,7 +217,8 @@ fn main() {
         use sha2::Digest as _;
         sha2::Sha256::new()
     };
-    let mut source_kifs: Vec<PathBuf> = vec![];
+    // 元 KIF は「parse に渡した bytes」をそのまま指紋へ回す（読み直さない）
+    let mut source_kifs: Vec<(PathBuf, String)> = vec![];
     for path in &eval_paths {
         let stem = path
             .file_name()
@@ -201,9 +227,9 @@ fn main() {
             .replace(".eval.md", "");
         let src = source_kif_path(&stem)
             .unwrap_or_else(|| panic!("{stem}: 元 KIF（scenarios/archive/{stem}.kif）がありません"));
-        source_kifs.push(src.clone());
-        let kifu = parse_kif(&std::fs::read_to_string(&src).expect("kif を読めません"))
-            .unwrap_or_else(|e| panic!("{}: {e}", src.display()));
+        let kif_text = std::fs::read_to_string(&src).expect("kif を読めません");
+        let kifu = parse_kif(&kif_text).unwrap_or_else(|e| panic!("{}: {e}", src.display()));
+        source_kifs.push((src.clone(), kif_text));
         let index = ScenarioIndex::build(&kifu);
         let blocks = parse_eval(path).unwrap_or_else(|e| panic!("{e}"));
         {
@@ -332,9 +358,17 @@ engine_rank,engine_score,",
         "  \"source_fingerprint\": \"{}\",\n",
         env!("TSUITATE_SOURCE_FINGERPRINT")
     ));
+    // 実行中に定跡が差し替わっていないか（CSV は開始時の内容で走っている）
+    if joseki_bytes(&config.joseki_path) != joseki_at_start {
+        eprintln!(
+            "定跡 {} が実行中に変わりました。この CSV がどの定跡で走ったか確定できないので中止します",
+            config.joseki_path
+        );
+        std::process::exit(1);
+    }
     js.push_str(&format!(
         "  \"data_fingerprint\": \"{}\",\n",
-        data_fingerprint(&config.joseki_path, &source_kifs)
+        data_fingerprint(&config.joseki_path, &joseki_at_start, &source_kifs)
     ));
     js.push_str(&format!("  \"eval_fingerprint\": \"{}\",\n", {
         use sha2::Digest as _;

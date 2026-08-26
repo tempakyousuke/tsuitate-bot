@@ -327,10 +327,15 @@
     `data_fingerprint` / `seeds` / `eval_fingerprint` が一致、を検査する（同じファイルを
     3回渡すだけで本数関門を通せてはいけない）。指紋は2つ:
     **`source_fingerprint`** は `build.rs` が**コンパイル時に**焼き込む
-    `src/**/*.rs` ＋ `Cargo.lock` のハッシュ（実行時に worktree を読むと、別コミットで
-    ビルドしたバイナリを今の worktree の指紋で記録する TOCTOU になる）。
+    `src/**/*.rs` ＋ `Cargo.lock` ＋ `Cargo.toml` ＋ `build.rs` のハッシュに
+    **profile / target / features / RUSTFLAGS / rustc 版**を混ぜたもの
+    （実行時に worktree を読むと別コミットでビルドしたバイナリを今の worktree の
+    指紋で記録する TOCTOU になり、ソースだけだと debug と release が同じ指紋になる。
+    壁時計予算なので探索量は桁で違う。exporter は release でないと起動時に止まる）。
     **`data_fingerprint`** は実効定跡パスの**中身**と元 KIF の中身
-    （`config_fingerprint` は定跡のパス文字列しか持たない）。
+    （`config_fingerprint` は定跡のパス文字列しか持たない）。どちらも
+    **ディスクを読み直さず**、KIF は parse に渡した bytes、定跡は開始時の bytes を
+    使い、終了時に hash が変わっていたら run を失敗させる。
     一方**得点系は2セット6本とも安定**（大きい2局の対比較 top-1 は −0.31〜−1.45、
     未採点への逃避は +0.28〜+0.38）なので、判定はそちらで確定する
   - **指標の落とし穴8件**（PR #25 の5回のレビューで判明。**8件とも

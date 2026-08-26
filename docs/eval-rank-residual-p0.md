@@ -115,17 +115,31 @@ python3 scripts/eval_rank/fit_residual.py data/eval_rank.csv --out /tmp/p0.md
   **`source_fingerprint`** / `seeds` / `eval_fingerprint` が全 replicate で
   一致すること、を検査する。
   指紋は2つに分ける:
-  - **`source_fingerprint`（コード版）** = `build.rs` が**コンパイル時に**焼き込む
-    `src/**/*.rs`（凍結版・共有モデル込み）＋ `Cargo.lock` のハッシュ。
-    実行時に worktree を読むと、commit A でビルドしたバイナリを worktree B の
-    状態で走らせたときに **A の挙動を B の指紋で記録**してしまう（長い実行中の
-    編集でも同じ TOCTOU）。**実測で確認済み**: 再ビルドせずに worktree を編集しても
-    指紋は動かず、再ビルドすると動き、元に戻すと戻る
+  - **`source_fingerprint`（コード版と実効ビルド条件）** = `build.rs` が
+    **コンパイル時に**焼き込む `src/**/*.rs`（凍結版・共有モデル込み）＋
+    `Cargo.lock` ＋ `Cargo.toml` ＋ `build.rs` 自身のハッシュに、
+    **profile / target / opt-level / features / `RUSTFLAGS` / rustc 版**を混ぜたもの。
+    - 実行時に worktree を読むと、commit A でビルドしたバイナリを worktree B の
+      状態で走らせたときに **A の挙動を B の指紋で記録**してしまう（長い実行中の
+      編集でも同じ TOCTOU）。**実測**: 再ビルドせずに worktree を編集しても指紋は
+      動かず、再ビルドすると動き、元に戻すと戻る
+    - ソースだけでは足りない。同じ head を debug と release でビルドすると
+      **指紋が一致してしまう**が、思考予算が壁時計なので探索量と出力分布は
+      桁で違う。ビルド条件を混ぜて分離した（**実測**: debug と release で
+      焼き込み値の共通は 0 件、`RUSTFLAGS` を変えても変わる）
+    - あわせて **exporter は release ビルドでないと起動時に止まる**。
+      壁時計予算の計測を debug で取らせない
   - **`data_fingerprint`（実行時データ）** = 解決済みの定跡パス（`config.joseki_path`
     = `TSUITATE_JOSEKI`）の**中身**と、使った元 KIF の中身。`config_fingerprint` には
     定跡の**パス文字列しか入らない**ので、同じパスの中身を差し替えると実効挙動だけが
-    変わる。**実測で確認済み**: 中身を変えると `config_fingerprint` は不変のまま
-    `data_fingerprint` だけが変わる
+    変わる（**実測**: 中身を変えると `config_fingerprint` は不変のまま
+    `data_fingerprint` だけが変わる）。
+    **ディスクを読み直さない**のが要点: 元 KIF は `parse_kif` に渡した**その bytes**を
+    そのまま指紋にする。長い実行の最後に読み直すと、A を読んで走った後に同じパスを
+    B へ差し替えられたとき **CSV は A 由来なのに B の指紋が付く**。定跡は
+    `opening.rs` が遅延ロードしてキャッシュするので bytes を取り出せないため、
+    **開始時と終了時に hash して不一致なら run を失敗させる**（**実測**: 実行中に
+    定跡を差し替えると exit 1 で止まり、summary を書かない）
 
   summary の場所は CSV 名から一意に決まる（exporter の `--summary` は廃止し、
   `--out` は `.csv` 必須を起動時に検査する。`.csv` で終わらないと summary が
