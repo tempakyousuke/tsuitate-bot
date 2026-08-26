@@ -36,6 +36,7 @@ use tsuitate_bot::eval_rank::{
 };
 use tsuitate_bot::kifu::{Kifu, parse_kif};
 use tsuitate_bot::observation::{Observation, ObservationLog};
+use tsuitate_bot::opening;
 use tsuitate_bot::protocol::Color;
 use tsuitate_bot::scenario_core::{clone_log, make_view, replay, side_idx};
 use tsuitate_bot::shogi::parse_usi;
@@ -201,9 +202,18 @@ fn main() {
         );
         std::process::exit(2);
     }
-    // 定跡は `opening.rs` が遅延ロードしてキャッシュするので bytes を取り出せない。
-    // **開始時に取っておき、終了時に取り直して不一致なら run を失敗させる**
+    // 定跡は遅延ロードなので、開始時に読んだ bytes と実際に使われる bytes は
+    // **A→B→A の差し替えで食い違いうる**（開始・終了の比較では検出できない。
+    // PR #25 レビュー指摘 P1）。開始時の bytes を明示的にキャッシュへ入れて、
+    // 戦略も `data_fingerprint` も同じ immutable な bytes を見る形にする
     let joseki_at_start = joseki_bytes(&config.joseki_path);
+    if !opening::preload(&config.joseki_path, &joseki_at_start) {
+        eprintln!(
+            "定跡 {} は既にロード済みでした。この run がどの定跡で走るか確定できないので中止します",
+            config.joseki_path
+        );
+        std::process::exit(2);
+    }
     eprintln!(
         "思考予算 {}ms / seeds {seeds} / jobs {jobs} / config {}",
         config.think_budget_ms,
@@ -268,13 +278,17 @@ fn main() {
     let units: Vec<(usize, u64)> = (0..jobs_list.len())
         .flat_map(|i| (0..seeds).map(move |s| (i, s)))
         .collect();
+    // **実効並列度**（PR #25 レビュー指摘 P1）。思考予算は壁時計なので、
+    // 同じ 2000ms でも同時に走る unit 数で1本あたりの探索量が系統的に変わる。
+    // unit 数で clamp した実際の worker 本数を実験条件として記録する
+    let effective_jobs = jobs.max(1).min(units.len().max(1));
     let next = Arc::new(Mutex::new(0usize));
     let out_rows: Arc<Mutex<Vec<Row>>> = Arc::new(Mutex::new(vec![]));
     let stats = Arc::new(Mutex::new((0usize, 0usize, 0usize, 0usize)));
     let jobs_list = Arc::new(jobs_list);
     let units = Arc::new(units);
     std::thread::scope(|scope| {
-        for _ in 0..jobs.max(1) {
+        for _ in 0..effective_jobs {
             let next = Arc::clone(&next);
             let out_rows = Arc::clone(&out_rows);
             let stats = Arc::clone(&stats);
@@ -352,19 +366,22 @@ engine_rank,engine_score,",
     js.push_str(&format!("  \"budget_ms\": {},\n", config.think_budget_ms));
     js.push_str(&format!("  \"config_fingerprint\": \"{}\",\n", config.fingerprint()));
     js.push_str(&format!("  \"seeds\": {seeds},\n"));
+    js.push_str(&format!("  \"jobs\": {effective_jobs},\n"));
     // コード版は build.rs がコンパイル時に焼き込んだ値（実行時に worktree を
     // 読むと、別コミットでビルドしたバイナリを今の worktree の指紋で記録してしまう）
     js.push_str(&format!(
         "  \"source_fingerprint\": \"{}\",\n",
         env!("TSUITATE_SOURCE_FINGERPRINT")
     ));
-    // 実行中に定跡が差し替わっていないか（CSV は開始時の内容で走っている）
+    // 実行中にディスク上の定跡が変わっていても、走ったのは preload した bytes
+    // なので CSV は有効。指紋と食い違わないことだけ告知する（差し替えに気づかず
+    // 次の replicate を別の定跡で取ると `data_fingerprint` が割れて止まる）
     if joseki_bytes(&config.joseki_path) != joseki_at_start {
         eprintln!(
-            "定跡 {} が実行中に変わりました。この CSV がどの定跡で走ったか確定できないので中止します",
+            "注意: 定跡 {} が実行中にディスク上で変わりました。この run は開始時の\
+             内容（data_fingerprint に入っている bytes）で走っています",
             config.joseki_path
         );
-        std::process::exit(1);
     }
     js.push_str(&format!(
         "  \"data_fingerprint\": \"{}\",\n",

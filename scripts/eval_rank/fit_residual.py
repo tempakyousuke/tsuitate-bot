@@ -381,6 +381,9 @@ EXPERIMENT_KEYS = (
     # 定跡のパス文字列しか持たないので、同じパスの中身が差し替わると挙動だけ変わる
     "data_fingerprint",
     "seeds",
+    # **実効並列度**。思考予算は壁時計なので、同じ budget でも同時に走る unit 数で
+    # CPU contention が変わり、1本あたりの探索量・分布が系統的にずれる
+    "jobs",
     "eval_fingerprint",
 )
 

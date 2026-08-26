@@ -140,9 +140,14 @@ python3 scripts/eval_rank/fit_residual.py data/eval_rank.csv --out /tmp/p0.md
   concordance を「判定不能」にして合格を出さない。**合否に使う量はすべて平均**なので
   引数順で判定は変わらない。replicate は「同じ実験の独立サンプル」だけを数える
   （中身 hash・母集団・summary JSON の実験指紋を検査する。指紋は
-  `source_fingerprint` = build.rs がコンパイル時に焼き込む `src/**/*.rs` ＋ `Cargo.lock`
-  のハッシュと、`data_fingerprint` = 実効定跡パスの中身＋元 KIF の中身の2つで、
-  評価ロジックを変えた別コミットや定跡の差し替えは混ざらない）。
+  `source_fingerprint` = build.rs がコンパイル時に焼き込む `src/**/*.rs` ＋
+  `Cargo.lock` ＋ `Cargo.toml` ＋ `build.rs` のハッシュに
+  **profile / target / features / RUSTFLAGS / rustc 版**を混ぜたもの
+  （ソースだけだと debug と release が同じ指紋になる。壁時計予算なので
+  探索量は桁で違う。**exporter は release でないと起動時に止まる**）と、
+  `data_fingerprint` = 実効定跡パスの中身＋元 KIF の中身の2つで、
+  評価ロジックを変えた別コミット・別ビルド条件や定跡の差し替えは混ざらない。
+  壁時計挙動に効く **実効並列度 `jobs`** も実験条件として一致検査する）。
   `--out` / 入力 CSV は `.csv` 必須（summary は同名の `.summary.json`）
 - P1 の統合形を測るときは **`gain` 側へ足す**（`gain' = gain + 残差` →
   `combine_score(...)`）。最終 score へ直接足すと合法性の割引を迂回した別物になる

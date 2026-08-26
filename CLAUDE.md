@@ -324,8 +324,11 @@
     replicate として数えるのは「同じ実験の独立サンプル」だけ: 中身の hash が
     相異なる・母集団（決定状態×seed×候補×採点。候補外の手も USI ごと）が一致・
     summary JSON の `budget_ms` / `config_fingerprint` / `source_fingerprint` /
-    `data_fingerprint` / `seeds` / `eval_fingerprint` が一致、を検査する（同じファイルを
-    3回渡すだけで本数関門を通せてはいけない）。指紋は2つ:
+    `data_fingerprint` / `seeds` / `jobs` / `eval_fingerprint` が一致、を検査する
+    （同じファイルを3回渡すだけで本数関門を通せてはいけない）。`jobs` は
+    **実効並列度**（`--jobs` を unit 数で clamp した実際の worker 本数）で、
+    思考予算が壁時計である以上、同時に走る unit 数の違いは CPU contention 経由で
+    探索量を系統的に変える。指紋は2つ:
     **`source_fingerprint`** は `build.rs` が**コンパイル時に**焼き込む
     `src/**/*.rs` ＋ `Cargo.lock` ＋ `Cargo.toml` ＋ `build.rs` のハッシュに
     **profile / target / features / RUSTFLAGS / rustc 版**を混ぜたもの
@@ -334,8 +337,10 @@
     壁時計予算なので探索量は桁で違う。exporter は release でないと起動時に止まる）。
     **`data_fingerprint`** は実効定跡パスの**中身**と元 KIF の中身
     （`config_fingerprint` は定跡のパス文字列しか持たない）。どちらも
-    **ディスクを読み直さず**、KIF は parse に渡した bytes、定跡は開始時の bytes を
-    使い、終了時に hash が変わっていたら run を失敗させる。
+    **ディスクを読み直さない**: KIF は parse に渡した bytes を使い、定跡は
+    開始時の bytes を `opening::preload` でキャッシュへ入れてから走らせる
+    （遅延ロードのままだと A→B→A の差し替えで「開始・終了は A なのに走ったのは B」
+    が成立する。既にロード済みなら exit 2）。
     一方**得点系は2セット6本とも安定**（大きい2局の対比較 top-1 は −0.31〜−1.45、
     未採点への逃避は +0.28〜+0.38）なので、判定はそちらで確定する
   - **指標の落とし穴8件**（PR #25 の5回のレビューで判明。**8件とも
@@ -2311,6 +2316,11 @@
   残りの共有依存は `SHARED_MODEL_PINS` の sha256 が変わるとテストが落ち、
   影響する凍結版を名指しするので、(a) 固定コピーを作る (b) 承知でハッシュを更新し
   再計測を記録する、のどちらかを必ず選ぶことになる。
+  実績: **2026-08-26（PR #25）に `src/opening.rs` の pin を更新**した。`load()` を
+  `parse_book()` へ切り出し、「与えた bytes からキャッシュへ入れる」`preload()` を
+  足した変更で、**凍結版の挙動は変わらない**（読み取り規則とフォールバックは
+  文字どおり同じ・`preload` を呼ぶのは `bin/export_eval_rank_data` だけ）ため
+  基準の再計測はしていない。
   `versions_using(module)` / `env_keys_read_by(name)`（共有モジュール経由の env 込み）/
   `behavior_fingerprint(name, env)`（版・env・共有 pin から作る実効挙動の指紋）で
   機械可読に取れる。

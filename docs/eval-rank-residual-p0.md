@@ -112,8 +112,11 @@ python3 scripts/eval_rank/fit_residual.py data/eval_rank.csv --out /tmp/p0.md
   ①中身の hash が相異なること ②`(decision_state, seed, usi, 採点, 候補内か)` の
   母集団が一致すること（**候補外の手も USI ごと**。点数の multiset だけだと別の手へ
   入れ替わっても通る）③summary JSON の `budget_ms` / `config_fingerprint` /
-  **`source_fingerprint`** / `seeds` / `eval_fingerprint` が全 replicate で
-  一致すること、を検査する。
+  **`source_fingerprint`** / **`data_fingerprint`** / `seeds` / **`jobs`** /
+  `eval_fingerprint` が全 replicate で一致すること、を検査する。
+  `jobs` は**実効並列度**（`--jobs` を unit 数で clamp した実際の worker 本数）:
+  思考予算は壁時計なので、同じ 2000ms でも同時に走る unit 数で CPU contention が
+  変わり、1本あたりの探索量と分布が系統的にずれる（PR #25 レビュー指摘 P1）。
   指紋は2つに分ける:
   - **`source_fingerprint`（コード版と実効ビルド条件）** = `build.rs` が
     **コンパイル時に**焼き込む `src/**/*.rs`（凍結版・共有モデル込み）＋
@@ -137,9 +140,13 @@ python3 scripts/eval_rank/fit_residual.py data/eval_rank.csv --out /tmp/p0.md
     **ディスクを読み直さない**のが要点: 元 KIF は `parse_kif` に渡した**その bytes**を
     そのまま指紋にする。長い実行の最後に読み直すと、A を読んで走った後に同じパスを
     B へ差し替えられたとき **CSV は A 由来なのに B の指紋が付く**。定跡は
-    `opening.rs` が遅延ロードしてキャッシュするので bytes を取り出せないため、
-    **開始時と終了時に hash して不一致なら run を失敗させる**（**実測**: 実行中に
-    定跡を差し替えると exit 1 で止まり、summary を書かない）
+    `opening.rs` が遅延ロードするので、開始時に読んだ bytes と実際に使われる bytes は
+    **A→B→A の差し替えで食い違いうる**（開始・終了の比較では検出できない。
+    PR #25 レビュー指摘 P1）。開始時の bytes を `opening::preload` で明示的に
+    キャッシュへ入れ、**戦略も指紋も同じ immutable な bytes を見る**形にした
+    （既にロード済みなら「どの定跡で走るか確定できない」として exit 2。
+    実行中にディスク側が変わっても run は開始時の bytes で走っているので、
+    告知だけして CSV は有効とする）
 
   summary の場所は CSV 名から一意に決まる（exporter の `--summary` は廃止し、
   `--out` は `.csv` 必須を起動時に検査する。`.csv` で終わらないと summary が
