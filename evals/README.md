@@ -137,7 +137,9 @@ python3 scripts/eval_rank/fit_residual.py data/eval_rank.csv --out /tmp/p0.md
 - **1本のエクスポートで符号を論じない**。壁時計予算で粒子数が揺れるため、同じコードでも
   macro concordance が門（+0.05）をまたいで散る（実測 +0.050 / +0.056 / −0.027）。
   `fit_residual.py a.csv b.csv c.csv` が replicate として集約し、3本未満なら
-  concordance を「判定不能」にして合格を出さない
+  concordance を「判定不能」にして合格を出さない。**合否に使う量はすべて平均**なので
+  引数順で判定は変わらない。replicate は「同じ実験の独立サンプル」だけを数える
+  （中身 hash・母集団・summary JSON の実験指紋を検査する）
 - P1 の統合形を測るときは **`gain` 側へ足す**（`gain' = gain + 残差` →
   `combine_score(...)`）。最終 score へ直接足すと合法性の割引を迂回した別物になる
 - 順位系の特徴量は**完全同点も決定的に割る**（USI の辞書順）。安定ソートに任せると

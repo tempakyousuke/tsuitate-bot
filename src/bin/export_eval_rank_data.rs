@@ -146,6 +146,11 @@ fn main() {
 
     let mut summary = Summary::default();
     let mut jobs_list: Vec<Job> = vec![];
+    // 教師（eval）の指紋。replicate をまたいで採点が変わっていないことの検査用
+    let mut eval_hash = {
+        use sha2::Digest as _;
+        sha2::Sha256::new()
+    };
     for path in &eval_paths {
         let stem = path
             .file_name()
@@ -158,6 +163,18 @@ fn main() {
             .unwrap_or_else(|e| panic!("{}: {e}", src.display()));
         let index = ScenarioIndex::build(&kifu);
         let blocks = parse_eval(path).unwrap_or_else(|e| panic!("{e}"));
+        {
+            use sha2::Digest as _;
+            eval_hash.update(stem.as_bytes());
+            for b in &blocks {
+                eval_hash.update(b.num.to_le_bytes());
+                eval_hash.update(b.sub.as_deref().unwrap_or("").as_bytes());
+                for (u, p) in &b.entries {
+                    eval_hash.update(u.as_bytes());
+                    eval_hash.update([p.unwrap_or(255)]);
+                }
+            }
+        }
         let mut states = vec![];
         for block in &blocks {
             let st = restore(&stem, &kifu, &index, block);
@@ -266,6 +283,14 @@ engine_rank,engine_score,",
     js.push_str(&format!("  \"budget_ms\": {},\n", config.think_budget_ms));
     js.push_str(&format!("  \"config_fingerprint\": \"{}\",\n", config.fingerprint()));
     js.push_str(&format!("  \"seeds\": {seeds},\n"));
+    js.push_str(&format!("  \"eval_fingerprint\": \"{}\",\n", {
+        use sha2::Digest as _;
+        eval_hash
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    }));
     js.push_str(&format!("  \"decision_states\": {},\n", summary.states));
     js.push_str(&format!(
         "  \"decision_states_with_scenario\": {},\n",
@@ -482,7 +507,11 @@ fn run_unit(job: &Job, seed: u64, config: &Arc<StrategyConfig>) -> (Vec<Row>, (u
                     cand.score,
                 );
                 for f in feats {
-                    line.push_str(&format!(",{f:.6}"));
+                    // **丸めない**（PR #25 レビュー指摘 P2）。`gain` / `p_legal` /
+                    // `foul_cost` は P1 の gain 側合成の成分でもあるので、6桁に
+                    // 丸めると runtime の順位と一致しなくなる。列ごとに書式を
+                    // 変えるより全部を round-trip 表現で出すほうが契約が単純
+                    line.push_str(&format!(",{f}"));
                 }
                 rows.push(Row {
                     id: format!("{id}|{seed:03}|{engine_rank:04}"),

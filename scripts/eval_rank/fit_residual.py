@@ -23,6 +23,8 @@ numpy が要る（`pip install numpy`）。線形（ridge）だけを見る: 8�
 
 import argparse
 import csv
+import hashlib
+import json
 import math
 import pathlib
 import random
@@ -363,6 +365,52 @@ def stratum_of(g):
     s.append("序中盤" if mn < 50 else ("中盤" if mn < 90 else "終盤"))
     s.append("quest" if g.cluster.startswith("quest") else "arena")
     return s
+
+
+# replicate が満たすべき「同じ実験の別サンプル」の条件（PR #25 レビュー指摘 P1）。
+# summary JSON のこれらが全 replicate で一致しなければ止める
+EXPERIMENT_KEYS = ("budget_ms", "config_fingerprint", "seeds", "eval_fingerprint")
+
+
+def experiment_fingerprint(csv_path):
+    """CSV の隣の summary JSON から実験条件を読む（無ければ止める）"""
+    p = pathlib.Path(csv_path)
+    side = p.with_name(p.name.replace(".csv", ".summary.json"))
+    if not side.exists():
+        sys.exit(
+            f"{csv_path}: summary JSON（{side.name}）がありません。"
+            " replicate は同じ実験条件でしか混ぜられないので、exporter が出す"
+            " summary と対で渡してください"
+        )
+    js = json.loads(side.read_text(encoding="utf-8"))
+    missing = [k for k in EXPERIMENT_KEYS if k not in js]
+    if missing:
+        sys.exit(f"{side.name}: {', '.join(missing)} がありません（古い exporter の出力）")
+    return {k: js[k] for k in EXPERIMENT_KEYS}
+
+
+def content_hash(csv_path):
+    h = hashlib.sha256()
+    with open(csv_path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def population_hash(groups):
+    """`(decision_state, seed, usi, human_score, in_candidates)` の母集団。
+
+    候補生成は自駒だけから決まるので replicate 間で同一になるはず。ここが違う
+    replicate は別の母集団なので、macro を混ぜてはいけない。
+    """
+    h = hashlib.sha256()
+    for g in sorted(groups, key=lambda g: (g.state, g.seed)):
+        h.update(f"{g.state}|{g.seed}|".encode())
+        for usi, sc in sorted(zip(g.usi, g.score)):
+            h.update(f"{usi}:{'' if sc is None else int(sc)};".encode())
+        for sc in sorted(g.absent):
+            h.update(f"absent:{int(sc)};".encode())
+    return h.hexdigest()
 
 
 def fold_fit(groups, feat_cols):
@@ -769,11 +817,36 @@ def main():
     say()
 
     # --- replicate（別エクスポート）の集約。**concordance の合否はここでしか出さない**
+    # **同じ実験の独立サンプルだけを本数に数える**（PR #25 レビュー指摘 P1）。
+    # 列名とクラスタ名しか見ないと、同じファイルを3回渡すだけで本数関門を通せる
+    exp0 = experiment_fingerprint(args.csv[0])
+    seen_hashes = {content_hash(args.csv[0]): args.csv[0]}
+    pop0 = population_hash(groups)
     reps = [gate_quantities(clusters, base_res, model_res, paired)]
     for extra in args.csv[1:]:
+        h = content_hash(extra)
+        if h in seen_hashes:
+            sys.exit(
+                f"{extra}: {seen_hashes[h]} と中身が同一です。"
+                " replicate は別々のエクスポートでなければノイズ対策になりません"
+            )
+        seen_hashes[h] = extra
+        exp = experiment_fingerprint(extra)
+        diff = [k for k in EXPERIMENT_KEYS if exp[k] != exp0[k]]
+        if diff:
+            sys.exit(
+                f"{extra}: 実験条件が1本目と違います（{', '.join(diff)}）。"
+                " 同じコミット・同じ budget/config・同じ seed 数・同じ採点でしか"
+                " replicate として混ぜられません"
+            )
         g2, f2 = load(extra)
         if f2 != feat_cols:
             sys.exit(f"{extra}: 特徴量の列が1本目と違います（同じ exporter で出すこと）")
+        if population_hash(g2) != pop0:
+            sys.exit(
+                f"{extra}: 決定状態・候補・採点の母集団が1本目と違います"
+                "（欠けた決定状態がある / 採点が変わった）。別母集団の macro は混ぜられません"
+            )
         c2, by2, _, ch2, b2, m2, p2 = fold_fit(g2, f2)
         if c2 != clusters:
             sys.exit(f"{extra}: クラスタ（元 KIF）が1本目と違います")
@@ -785,78 +858,107 @@ def main():
             "壁時計予算で粒子数が揺れるので、macro concordance は同じコードでも門"
             "（+0.05）と同じ桁だけ動く。**1本では合否を出さない**")
     else:
-        say(f"**replicate {len(reps)} 本**を平均して判定する。")
-    say()
-    say("| 量 | " + " | ".join(f"#{i + 1}" for i in range(len(reps))) + " | 平均 |")
-    say("|---|" + "---:|" * (len(reps) + 1))
-    rows = [("macro concordance の差", "d_conc"), ("macro 未採点率の差", "d_unscored")]
-    for label, k in rows:
-        vals = [r[k] for r in reps]
-        say(f"| {label} | " + " | ".join(f"{v:+.3f}" for v in vals)
-            + f" | {sum(vals) / len(vals):+.3f} |")
-    for c in [x for x in clusters if x.startswith("quest")]:
-        vals = [r["quest"][c]["d_top1"] if r["quest"].get(c) else float("nan") for r in reps]
-        say(f"| {c} の対比較 top-1 差 | " + " | ".join(f"{v:+.3f}" for v in vals)
-            + f" | {sum(vals) / len(vals):+.3f} |")
+        say(f"**replicate {len(reps)} 本**。合否に使う量は**すべて平均**するので、"
+            "引数の順序を入れ替えても判定は変わらない。")
     say()
 
-    # --- P0 の合格条件
+    def rep_vals(fn):
+        """replicate 横断の値（nan は落とす）"""
+        return [v for v in (fn(r) for r in reps) if v is not None and not math.isnan(v)]
+
+    def rep_mean(fn):
+        vals = rep_vals(fn)
+        return sum(vals) / len(vals) if vals else float("nan")
+
+    big2 = [c for c in clusters if c.startswith("quest")]
+    say("| 量 | " + " | ".join(f"#{i + 1}" for i in range(len(reps))) + " | 平均 |")
+    say("|---|" + "---:|" * (len(reps) + 1))
+    cross = [
+        ("macro concordance の差", lambda r: r["d_conc"]),
+        ("macro 未採点率の差", lambda r: r["d_unscored"]),
+        ("小さい eval 群の最悪 top-1 差", lambda r: r["small_worst"]),
+    ]
+    for c in big2:
+        cross.append(
+            (f"{c} の対比較 top-1 差", lambda r, c=c: r["quest"][c]["d_top1"] if r["quest"].get(c) else None)
+        )
+        cross.append(
+            (f"{c} の未採点率の差", lambda r, c=c: r["quest"][c]["d_unscored"] if r["quest"].get(c) else None)
+        )
+    for label, fn in cross:
+        vals = [fn(r) for r in reps]
+        say(f"| {label} | "
+            + " | ".join("—" if v is None else f"{v:+.3f}" for v in vals)
+            + f" | {rep_mean(fn):+.3f} |")
+    say()
+
+    # --- P0 の合格条件（**すべて replicate 集約**。引数順に依存させない）
     say("## P0 の暫定合格条件との突き合わせ")
     say()
-    say(f"得点系は1本目（`{args.csv[0]}`）の値、**concordance は replicate 平均**。")
+    say(f"**合否に使う量はすべて {len(reps)} 本の平均**なので、この節は引数の順序に"
+        "依存しない（記述的な表だけが1本目のもの）。")
     say()
-    rep0 = reps[0]
     quest_gate = []
-    for c in [x for x in clusters if x.startswith("quest")]:
-        q = rep0["quest"].get(c)
-        if q is None:
+    for c in big2:
+        if any(r["quest"].get(c) is None for r in reps):
             quest_gate.append((False, True))
-            say(f"- {c} 完全 holdout: 両腕とも採点済みの決定状態が無い → **否**")
+            say(f"- {c} 完全 holdout: 両腕とも採点済みの決定状態が無い replicate がある → **否**")
             continue
-        ok = q["d_top1"] >= 0.5 or q["rel_bad"] >= 0.25
+        d_top1 = rep_mean(lambda r, c=c: r["quest"][c]["d_top1"])
+        rel_bad = rep_mean(lambda r, c=c: r["quest"][c]["rel_bad"])
+        du = rep_mean(lambda r, c=c: r["quest"][c]["d_unscored"])
+        ok = d_top1 >= 0.5 or rel_bad >= 0.25
         # **その局の未採点率も見る**（macro の関門だけだと他クラスタで相殺される）
-        ok_u = q["d_unscored"] <= UNSCORED_TOL
+        ok_u = du <= UNSCORED_TOL
         quest_gate.append((ok, ok_u))
-        say(f"- {c} 完全 holdout（対 {q['paired_states']}/{q['states']} 状態）: "
-            f"top-1 得点 {q['d_top1']:+.3f}（要 +0.5）/ "
-            f"0〜2点 top-1 率の相対減 {q['rel_bad']:+.1%}（要 25%）→ **{'合' if ok else '否'}**"
-            f"／この局の未採点率 {q['d_unscored']:+.3f}（許容 +{UNSCORED_TOL:g}）"
+        # 状態数も replicate 平均で出す（1本目だけを出すと表示が引数順に依存する）
+        ps = rep_mean(lambda r, c=c: float(r["quest"][c]["paired_states"]))
+        ts = rep_mean(lambda r, c=c: float(r["quest"][c]["states"]))
+        say(f"- {c} 完全 holdout（対 {ps:.0f}/{ts:.0f} 状態）: "
+            f"top-1 得点 {d_top1:+.3f}（要 +0.5）/ "
+            f"0〜2点 top-1 率の相対減 {rel_bad:+.1%}（要 25%）→ **{'合' if ok else '否'}**"
+            f"／この局の未採点率 {du:+.3f}（許容 +{UNSCORED_TOL:g}）"
             f"→ **{'合' if ok_u else '未確定'}**")
         if ok and not ok_u:
             say(f"  - 得点条件は通っているが、この局で逃避が増えているので"
                 f"**{c} は incomplete**（追加採点まで確定しない）")
 
-    # **concordance は replicate 平均でしか合否を出さない**（PR #25 レビュー指摘 P1）。
-    # 1本での `d_conc >= 0.05` を合格にすると、壁時計予算由来のノイズだけで
-    # P0 合格を出せてしまう（実測で同一評価経路の3本が −0.010 / +0.019 / +0.050）
-    d_concs = [r["d_conc"] for r in reps]
+    # **concordance は replicate 平均でしか合否を出さない**。1本での
+    # `d_conc >= 0.05` を合格にすると、壁時計予算由来のノイズだけで P0 合格を出せる
+    d_concs = rep_vals(lambda r: r["d_conc"])
     mean_conc = sum(d_concs) / len(d_concs)
     if len(reps) >= MIN_REPLICATES:
         conc_state = "合" if mean_conc >= 0.05 else "否"
     else:
         conc_state = "判定不能"
     say(f"- macro pairwise concordance {mean_conc:+.3f}"
-        f"（{len(reps)} 本の平均: {', '.join(f'{v:+.3f}' for v in d_concs)}、要 +0.05）"
+        # 値は昇順で出す（引数順で表示が変わると差分検査ができない）
+        f"（{len(reps)} 本: {', '.join(f'{v:+.3f}' for v in sorted(d_concs))}、要 +0.05）"
         f"→ **{conc_state}**")
     if conc_state == "判定不能":
         say(f"  - replicate が {MIN_REPLICATES} 本に満たないので、この条件では"
             "**合格を出さない**（ノイズが門と同じ桁）")
 
-    worst, worst_c = rep0["small_worst"], rep0["small_worst_c"]
+    worst = rep_mean(lambda r: r["small_worst"])
+    worst_cs = sorted({r["small_worst_c"] for r in reps if r["small_worst_c"]})
     ok_small = worst > -0.5
-    say(f"- 小さい eval 群（被王手・反則後）の最悪 top-1 差 {worst:+.3f}"
-        f"{f'（{worst_c}）' if worst_c else ''}（要 > −0.5）→ **{'合' if ok_small else '否'}**")
+    where = f"（{'、'.join(worst_cs)}）" if worst_cs else ""
+    say(f"- 小さい eval 群（被王手・反則後）の最悪 top-1 差 {worst:+.3f}{where}"
+        f"（要 > −0.5）→ **{'合' if ok_small else '否'}**")
 
-    signs = rep0["signs"]
-    # **符号反転は中止条件そのもの**なので合否へ入れる
-    ok_sign = all(x >= 0 for x in signs) or all(x <= 0 for x in signs)
+    # fold ごとの concordance 差も replicate 平均にしてから符号の一貫性を見る
+    sign_means = [
+        rep_mean(lambda r, i=i: r["signs"][i]) for i in range(len(clusters))
+    ]
+    ok_sign = all(x >= 0 for x in sign_means) or all(x <= 0 for x in sign_means)
     say(f"- fold 間で concordance 差の符号が反転しない: "
-        f"{'一貫' if ok_sign else '**反転あり**'}（{', '.join(f'{x:+.3f}' for x in signs)}）"
+        f"{'一貫' if ok_sign else '**反転あり**'}"
+        f"（{', '.join(f'{x:+.3f}' for x in sign_means)}）"
         f"→ **{'合' if ok_sign else '否'}**")
 
     # **未採点への逃避は合否へ入れる**。対比較は「両腕とも採点済み」の部分集合しか
     # 見ないので、逃避した分は測れていない = 他の条件が通っても P0 は**確定しない**
-    d_unscored = rep0["d_unscored"]
+    d_unscored = rep_mean(lambda r: r["d_unscored"])
     ok_unscored = d_unscored <= UNSCORED_TOL
     say(f"- 未採点手を選んだ率の差 {d_unscored:+.3f}（許容 +{UNSCORED_TOL:g}）"
         f"→ **{'合' if ok_unscored else '未確定'}**")
