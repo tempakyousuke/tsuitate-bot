@@ -138,9 +138,10 @@ pub fn parse_eval_text(text: &str) -> Result<Vec<EvalBlock>, String> {
 
 /// `和名(USI) 点 コメント…` の行（sync_eval.py の MOVE 正規表現と同じ規約）。
 ///
-/// 最初の括弧の中が USI でなければ自由記述（`Ok(None)`）。USI なのに点数が
-/// 続かない行は**エラー**（採点し忘れは `?` と書く決まりで、無言で落とすと
-/// その手だけ教師からも指標からも消える）。
+/// **候補行らしい形（括弧の後ろが点数か `?`）なら、USI が不正でも止まる**
+/// （PR #25 レビュー指摘 P2）。`4七金(5g4z) 2` のような打ち間違いを自由記述として
+/// 読み飛ばすと、その手だけが教師からも指標からも黙って消える。
+/// 括弧の後ろが点数でも `?` でもない行は自由記述（`Ok(None)`）。
 fn parse_move_line(line: &str, no: usize) -> Result<Option<(String, Option<u8>)>, String> {
     let Some(open) = line.find('(') else {
         return Ok(None);
@@ -149,20 +150,32 @@ fn parse_move_line(line: &str, no: usize) -> Result<Option<(String, Option<u8>)>
         return Ok(None);
     };
     let usi = &line[open + 1..close];
-    if parse_usi(usi).is_none() {
-        return Ok(None);
-    }
     let rest = line[close + 1..].trim_start();
     let token = rest.split_whitespace().next().unwrap_or("");
-    if token == "?" {
-        return Ok(Some((usi.to_string(), None)));
+    let score = match token {
+        "?" => None,
+        t => match t.parse::<u8>() {
+            Ok(pt) if pt <= 10 => Some(pt),
+            // 点数が続かないなら候補行ではない。ただし USI として正しい括弧が
+            // あるのに点数が無いのは「採点し忘れ」なので、そちらは止める
+            // （採点は `?` と書く決まり）
+            _ => {
+                return if parse_usi(usi).is_some() {
+                    Err(format!(
+                        "{no}行目: {usi} の後ろが点数（0〜10）でも `?` でもありません: {line}"
+                    ))
+                } else {
+                    Ok(None)
+                };
+            }
+        },
+    };
+    if parse_usi(usi).is_none() {
+        return Err(format!(
+            "{no}行目: 候補行に見えますが {usi} を USI として読めません: {line}"
+        ));
     }
-    match token.parse::<u8>() {
-        Ok(pt) if pt <= 10 => Ok(Some((usi.to_string(), Some(pt)))),
-        _ => Err(format!(
-            "{no}行目: {usi} の後ろが点数（0〜10）でも `?` でもありません: {line}"
-        )),
-    }
+    Ok(Some((usi.to_string(), score)))
 }
 
 /// eval の stem に対応する元 KIF（`scenarios/archive/<stem>.kif` 優先）。
@@ -415,16 +428,23 @@ pub struct SetContext {
     pub fouls_this_turn: u32,
 }
 
-/// タイブレーク乱数を除いたスコアの降順に並べた添字（同点は元の並び順）。
-/// `ranking` は乱数込みのスコア順なので、順位系の特徴量はこちらで付け直す。
+/// タイブレーク乱数を除いたスコアの降順に並べた添字。
+///
+/// **同点は USI の辞書順で割る**（PR #25 レビュー指摘 P2）。`ranking` は乱数込みの
+/// スコア順に並んでいるので、安定ソートで同点を放置すると**乱数の順序がそのまま
+/// `rank` / `rank_frac` に残る**（実測: 決定的スコアが完全同点の候補は 8,145 件、
+/// 1,088 決定状態×seed のうち 706 = 65% に存在する）。第2キーを決定的にすれば、
+/// 同じ候補集合なら乱数の引き方によらず同じ順位になる。
 pub fn det_order(ranking: &[CandidateScore]) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..ranking.len()).collect();
     idx.sort_by(|&a, &b| {
         let (x, y) = (
-            ranking[b].score - ranking[b].tiebreak,
             ranking[a].score - ranking[a].tiebreak,
+            ranking[b].score - ranking[b].tiebreak,
         );
-        x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+        y.partial_cmp(&x)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| ranking[a].usi.cmp(&ranking[b].usi))
     });
     idx
 }
@@ -707,6 +727,23 @@ mod tests {
             "乱数を除いたスコア（0.991 < 0.995）で並べ替えていない"
         );
 
+        // **決定的スコアが完全同点**なら USI の辞書順で割る（乱数の順序を
+        // 安定ソートで温存しない）。`ranking` は乱数込みのスコア順に並んで
+        // 来るので、同じ集合を逆順で渡しても同じ順位になること
+        let a = CandidateScore { usi: "1a1b".into(), score: 5.009, tiebreak: 0.009, ..cand.clone() };
+        let b = CandidateScore { usi: "9i9h".into(), score: 5.000, tiebreak: 0.000, ..cand.clone() };
+        assert_eq!(
+            (a.score - a.tiebreak, b.score - b.tiebreak),
+            (5.0, 5.0),
+            "テストの前提: 決定的スコアは同点"
+        );
+        assert_eq!(det_order(&[a.clone(), b.clone()]), vec![0, 1]);
+        assert_eq!(
+            det_order(&[b, a]),
+            vec![1, 0],
+            "同点の順位が入力順（＝乱数の引き方）で変わっている"
+        );
+
         // view の残りの項目（時計・状態）は行に載っていない: 変えても不変
         let mut noise = view.clone();
         noise.clocks = ClockState { sente_ms: 1, gote_ms: 2, running: None, server_time: 3 };
@@ -750,6 +787,18 @@ mod tests {
         assert!(e.starts_with("2行目:"), "行番号が出ていない: {e}");
         let e = parse_eval_text("## 61手目\n4七金(5g4g) 11\n").unwrap_err();
         assert!(e.starts_with("2行目:"), "0〜10 の範囲外を通している: {e}");
+
+        // **候補行らしいのに USI が不正**（打ち間違い）も止める。自由記述として
+        // 読み飛ばすと、その手だけ教師からも指標からも黙って消える
+        for bad in ["4七金(5g4z) 2", "4七金(5g4g+x) ?", "4七金(P*4z) 8"] {
+            let e = parse_eval_text(&format!("## 61手目\n{bad}\n")).unwrap_err();
+            assert!(e.starts_with("2行目:"), "{bad} を通している: {e}");
+        }
+        // 括弧の後ろが点数でない行は従来どおり自由記述（USI かどうかを問わない）
+        assert_eq!(
+            parse_eval_text("## 61手目\n出典 (2026-08-07) のメモ\n").unwrap()[0].entries.len(),
+            0
+        );
 
         // 見出しの前の候補行
         let e = parse_eval_text("4七金(5g4g) 2\n").unwrap_err();

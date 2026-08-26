@@ -36,6 +36,9 @@ except ImportError:  # pragma: no cover
 # 点差ごとの pairwise 重み（issue #24「2. ラベルとモデル」）
 W_STRONG, W_WEAK = 1.0, 0.3
 BOUND_CAP = 2.0  # P1 の bounded residual の cap（人手採点の点数スケール）
+# 未採点手を選んだ率の許容増分。これを超えたら**逃避した分が測れていない**ので、
+# 他の条件が通っていても P0 は確定しない（PR #25 レビュー指摘 P1）
+UNSCORED_TOL = 0.01
 ALPHAS = [1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0, 3000.0]
 
 ID_COLS = 10  # source_kif..engine_rank
@@ -166,7 +169,7 @@ def group_metrics(g, pred):
     契約どおり、得点系は「top-1 が採点済みの決定状態」だけで条件つきに数え、
     「未採点手を選んだ率」を別指標として並べる。仮 4 点で混ぜると、未採点選択が
     5.3% → 16.1% と増える側の腕の得点が、選ばれた手の実点次第で反転しうる。
-    条件つきの比較は腕ごとに母集団が変わるので、合否は `paired_top1` の
+    条件つきの比較は腕ごとに母集団が変わるので、合否は `paired_metrics` の
     **両腕とも採点済みの決定状態**で見ること。
     """
     order = np.argsort(-pred)
@@ -227,35 +230,48 @@ def eval_fold(groups, pred_fn):
     return agg
 
 
-def paired_top1(groups, pred_a, pred_b):
-    """**両腕とも top-1 が採点済み**の決定状態だけで比べる（合否はこれで見る）。
+def paired_metrics(groups, pred_a, pred_b):
+    """**両腕とも top-1 が採点済み**の決定状態だけで比べる（合否と CI はこれで見る）。
 
     条件つきの top-1 平均は腕ごとに母集団が変わるので、そのままでは
     「未採点へ逃げた分だけ悪い手が母集団から消える」腕が有利になる。
     同じ決定状態の上で対にすれば、その偏りが入らない。
-    戻り値は `(平均_a, 平均_b, 0〜2点率_a, 0〜2点率_b, 決定状態数, 全決定状態数)`。
+    得点系（top-1 得点・0〜2点率・regret）は**すべてこの経路で出す**
+    （cluster bootstrap も含む。PR #25 レビュー指摘 P2）。
+
+    戻り値は `{"top1_human": (a, b), "top1_bad": (a, b), "regret": (a, b),
+    "paired_states": n, "states": 全体}`。対にできる状態が無ければ None。
     """
     by_state = {}
     for g in groups:
         ia, ib = int(np.argmax(pred_a(g))), int(np.argmax(pred_b(g)))
-        by_state.setdefault(g.state, []).append((g.score[ia], g.score[ib]))
-    a, b, bad_a, bad_b = [], [], [], []
+        best = max((s for s in g.score if s is not None), default=None)
+        by_state.setdefault(g.state, []).append((g.score[ia], g.score[ib], best))
+    acc = {k: ([], []) for k in ("top1_human", "top1_bad", "regret")}
+    n = 0
     for ms in by_state.values():
-        both = [(x, y) for x, y in ms if x is not None and y is not None]
+        both = [(x, y, bt) for x, y, bt in ms if x is not None and y is not None]
         if not both:
             continue
-        a.append(sum(x for x, _ in both) / len(both))
-        b.append(sum(y for _, y in both) / len(both))
-        bad_a.append(sum(x <= 2 for x, _ in both) / len(both))
-        bad_b.append(sum(y <= 2 for _, y in both) / len(both))
-    if not a:
+        n += 1
+        acc["top1_human"][0].append(sum(x for x, _, _ in both) / len(both))
+        acc["top1_human"][1].append(sum(y for _, y, _ in both) / len(both))
+        acc["top1_bad"][0].append(sum(x <= 2 for x, _, _ in both) / len(both))
+        acc["top1_bad"][1].append(sum(y <= 2 for _, y, _ in both) / len(both))
+        rg = [(bt - x, bt - y) for x, y, bt in both if bt is not None]
+        if rg:
+            acc["regret"][0].append(sum(x for x, _ in rg) / len(rg))
+            acc["regret"][1].append(sum(y for _, y in rg) / len(rg))
+    if not n:
         return None
-    n = len(a)
-    return (
-        sum(a) / n, sum(b) / n,
-        sum(bad_a) / n, sum(bad_b) / n,
-        n, len(by_state),
-    )
+    out = {
+        k: (sum(v[0]) / len(v[0]), sum(v[1]) / len(v[1]))
+        for k, v in acc.items()
+        if v[0]
+    }
+    out["paired_states"] = n
+    out["states"] = len(by_state)
+    return out
 
 
 def seed_agreement(groups, pred_fn):
@@ -403,7 +419,7 @@ def main():
     paired = {}
     for c in clusters:
         _, beta_c, keep_c, scale_c = chosen[c]
-        r = paired_top1(
+        r = paired_metrics(
             by_cluster[c],
             lambda g: baseline_scores(g),
             lambda g, b=beta_c, k=keep_c, sc=scale_c: rank_scores(g, b, k, sc),
@@ -412,13 +428,15 @@ def main():
         if r is None:
             say(f"| {c} | 0 | — | — |")
             continue
-        say(f"| {c} | {r[4]} / {r[5]} | {r[0]:.2f} → {r[1]:.2f} | {r[2]:.3f} → {r[3]:.3f} |")
+        say(f"| {c} | {r['paired_states']} / {r['states']} | "
+            f"{r['top1_human'][0]:.2f} → {r['top1_human'][1]:.2f} | "
+            f"{r['top1_bad'][0]:.3f} → {r['top1_bad'][1]:.3f} |")
     pv = [r for r in paired.values() if r]
     if pv:
-        say(f"| **macro** | — | **{sum(r[0] for r in pv) / len(pv):.3f} → "
-            f"{sum(r[1] for r in pv) / len(pv):.3f}** | "
-            f"**{sum(r[2] for r in pv) / len(pv):.3f} → "
-            f"{sum(r[3] for r in pv) / len(pv):.3f}** |")
+        say(f"| **macro** | — | **{sum(r['top1_human'][0] for r in pv) / len(pv):.3f} → "
+            f"{sum(r['top1_human'][1] for r in pv) / len(pv):.3f}** | "
+            f"**{sum(r['top1_bad'][0] for r in pv) / len(pv):.3f} → "
+            f"{sum(r['top1_bad'][1] for r in pv) / len(pv):.3f}** |")
     say()
 
     say("### fold（= 元 KIF）ごと")
@@ -438,23 +456,49 @@ def main():
     # --- 元 KIF 単位の cluster bootstrap（8本しか無いので過信しない）
     say("### cluster bootstrap（元 KIF 単位・8クラスタなので参考値）")
     say()
+    say("得点系（top-1 得点・0〜2点率・regret）は**対比較のクラスタ差**を resample する。"
+        "腕ごとに条件つき母集団が違う平均どうしを引くと、未採点への逃避の偏りが CI にも残る。")
+    say()
     rng = random.Random(20260826)
-    say("| 指標 | 差の中央値 | 95% CI |")
-    say("|---|---:|---|")
-    for k, label, _ in keys:
-        deltas = []
+
+    def boot(deltas_by_cluster):
+        """クラスタごとの差を元 KIF 単位で resample した中央値と 95% CI"""
+        vals = []
         for _ in range(args.boot):
             pick = [rng.choice(clusters) for _ in clusters]
-            d = [model_res[c].get(k, float("nan")) - base_res[c].get(k, float("nan")) for c in pick]
+            d = [deltas_by_cluster[c] for c in pick if deltas_by_cluster.get(c) is not None]
             d = [x for x in d if not math.isnan(x)]
             if d:
-                deltas.append(sum(d) / len(d))
-        if not deltas:
-            continue
-        deltas.sort()
-        lo = deltas[int(0.025 * len(deltas))]
-        hi = deltas[int(0.975 * len(deltas)) - 1]
-        say(f"| {label} | {deltas[len(deltas) // 2]:+.3f} | [{lo:+.3f}, {hi:+.3f}] |")
+                vals.append(sum(d) / len(d))
+        if not vals:
+            return None
+        vals.sort()
+        return (
+            vals[len(vals) // 2],
+            vals[int(0.025 * len(vals))],
+            vals[int(0.975 * len(vals)) - 1],
+        )
+
+    say("| 指標 | 差の中央値 | 95% CI | 出どころ |")
+    say("|---|---:|---|---|")
+    for k, label, _ in keys:
+        if k in ("top1_human", "top1_bad", "regret"):
+            src = "対比較"
+            deltas = {
+                c: (paired[c][k][1] - paired[c][k][0])
+                if paired[c] and k in paired[c]
+                else None
+                for c in clusters
+            }
+        else:
+            src = "条件つき"
+            deltas = {
+                c: model_res[c].get(k, float("nan")) - base_res[c].get(k, float("nan"))
+                for c in clusters
+            }
+        r = boot(deltas)
+        if r:
+            say(f"| {label} | {r[0]:+.3f} | [{r[1]:+.3f}, {r[2]:+.3f}] | {src} |")
     say()
 
     # --- 層別（holdout 予測を集めて層で切る）
@@ -547,19 +591,19 @@ def main():
 
         res = {c: eval_fold(by_cluster[c], pred_w) for c in clusters}
         per = {
-            c: paired_top1(by_cluster[c], lambda g: baseline_scores(g), pred_w)
+            c: paired_metrics(by_cluster[c], lambda g: baseline_scores(g), pred_w)
             for c in clusters
         }
         pr = [r for r in per.values() if r]
-        big_cells = []
-        for c in big2:
-            r = per[c]
-            big_cells.append(f"{r[1] - r[0]:+.3f}" if r else "—")
+        big_cells = [
+            f"{per[c]['top1_human'][1] - per[c]['top1_human'][0]:+.3f}" if per[c] else "—"
+            for c in big2
+        ]
         say(
-            f"| {w:g} | {sum(r[0] for r in pr) / len(pr):.3f} → "
-            f"{sum(r[1] for r in pr) / len(pr):.3f} | "
-            f"{sum(r[2] for r in pr) / len(pr):.3f} → "
-            f"{sum(r[3] for r in pr) / len(pr):.3f} | "
+            f"| {w:g} | {sum(r['top1_human'][0] for r in pr) / len(pr):.3f} → "
+            f"{sum(r['top1_human'][1] for r in pr) / len(pr):.3f} | "
+            f"{sum(r['top1_bad'][0] for r in pr) / len(pr):.3f} → "
+            f"{sum(r['top1_bad'][1] for r in pr) / len(pr):.3f} | "
             + " | ".join(big_cells)
             + f" | {macro(res, 'top1_unscored'):.3f} | {macro(res, 'concordance'):.3f} |"
         )
@@ -602,11 +646,13 @@ def main():
             checks.append(False)
             say(f"- {c} 完全 holdout: 両腕とも採点済みの決定状態が無い → **否**")
             continue
-        d_top1 = r[1] - r[0]
-        rel_bad = (r[2] - r[3]) / r[2] if r[2] > 0 else 0.0
+        d_top1 = r["top1_human"][1] - r["top1_human"][0]
+        b0, b1 = r["top1_bad"]
+        rel_bad = (b0 - b1) / b0 if b0 > 0 else 0.0
         ok = d_top1 >= 0.5 or rel_bad >= 0.25
         checks.append(ok)
-        say(f"- {c} 完全 holdout（対 {r[4]}/{r[5]} 状態）: top-1 得点 {d_top1:+.3f}（要 +0.5）/ "
+        say(f"- {c} 完全 holdout（対 {r['paired_states']}/{r['states']} 状態）: "
+            f"top-1 得点 {d_top1:+.3f}（要 +0.5）/ "
             f"0〜2点 top-1 率の相対減 {rel_bad:+.1%}（要 25%）→ **{'合' if ok else '否'}**")
     d_conc = macro(model_res, "concordance") - macro(base_res, "concordance")
     ok_conc = d_conc >= 0.05
@@ -618,8 +664,9 @@ def main():
         r = paired[c]
         if r is None:
             continue
-        if r[1] - r[0] < worst:
-            worst, worst_c = r[1] - r[0], c
+        d = r["top1_human"][1] - r["top1_human"][0]
+        if d < worst:
+            worst, worst_c = d, c
     ok_small = worst > -0.5
     checks.append(ok_small)
     say(f"- 小さい eval 群（被王手・反則後）の最悪 top-1 差 {worst:+.3f}"
@@ -632,14 +679,29 @@ def main():
     say(f"- fold 間で concordance 差の符号が反転しない: "
         f"{'一貫' if ok_sign else '**反転あり**'}（{', '.join(f'{s:+.3f}' for s in signs)}）"
         f"→ **{'合' if ok_sign else '否'}**")
-    # 未採点への逃避は「見かけの改善」の常習経路なので、増えていたら明示する
+    # **未採点への逃避は合否へ入れる**（PR #25 レビュー指摘 P1）。
+    # 対比較は「両腕とも採点済み」の部分集合しか見ないので、逃避した分は
+    # 測れていない = 他の条件が通っても P0 は**確定しない**
     d_unscored = macro(model_res, "top1_unscored") - macro(base_res, "top1_unscored")
+    ok_unscored = d_unscored <= UNSCORED_TOL
+    checks.append(ok_unscored)
     say(f"- 未採点手を選んだ率 {macro(base_res, 'top1_unscored'):.3f} → "
-        f"{macro(model_res, 'top1_unscored'):.3f}（{d_unscored:+.3f}）"
-        + ("。**増えているので、上の得点差は選ばれた未採点手を採点するまで確定しない**"
-           if d_unscored > 0.01 else "")) 
+        f"{macro(model_res, 'top1_unscored'):.3f}（{d_unscored:+.3f}、許容 +{UNSCORED_TOL:g}）"
+        f"→ **{'合' if ok_unscored else '未確定'}**")
+    if not ok_unscored:
+        say("  - 対比較は両腕とも採点済みの決定状態しか見ないので、**逃避した分は"
+            "測れていない**。`append_unscored.py` で選ばれた未収載手を追記し、"
+            "採点して `sync_eval.py` を掛けるまで得点差は確定しない")
     say()
-    say(f"**判定: {'P0 合格（P1 へ）' if all(checks) else 'P0 不合格（runtime 実装をしない）'}**")
+    others = checks[:-1]
+    if all(checks):
+        verdict = "P0 合格（P1 へ）"
+    elif all(others):
+        # 他が全部通っていて未採点だけ未確定 = 追加採点をすれば決まる
+        verdict = "**判定不能（incomplete）**: 未採点手への逃避を解消・追加採点してから再判定する"
+    else:
+        verdict = "P0 不合格（runtime 実装をしない）"
+    say(f"**判定: {verdict}**")
 
     if args.out:
         p = pathlib.Path(args.out)
