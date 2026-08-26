@@ -207,6 +207,8 @@ mod tests {
             depth2: false,
             checker_removal: 0.0,
             capture_bet_penalty: 0.0,
+            foul_probe: 0.0,
+            tiebreak: 0.0,
             probe_unit: 0.0,
             probe_mass: 0.0,
             probe_concentration: 0.0,

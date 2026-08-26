@@ -95,6 +95,37 @@ python3 scripts/quest_review/append_unscored.py \
   「反則後にしか存在しない候補」が反則前のシナリオ名で出てきて採点が
   ずれる（2026-08-11 に PR #3 で実際に起きた。`cargo test 採点表` が関門）
 
+## 残差ランカーのデータ化（issue #24 P0）
+
+`bin/export_eval_rank_data` は eval の各ブロックを元 KIF の決定点（`ply` と、
+反則後サブ状態なら注入する `fouls` 列）へ復元し、現行 estimator の候補内訳と
+結合して CSV を書く。**「人手採点は評価器自身の教師になりうるか」を
+オフラインで判定するためのデータ**で、runtime へは何も影響しない。
+
+```
+cargo run --release --bin export_eval_rank_data -- \
+  --out data/eval_rank.csv --seeds 4 [--budget-ms 2000] [--jobs N] [evals/xxx.eval.md ...]
+python3 scripts/eval_rank/fit_residual.py data/eval_rank.csv --out /tmp/p0.md
+```
+
+- 1行 = `(source_kif, decision_state, seed, usi, human_score, 特徴量…)`。
+  特徴量は `PlayerView`（自分側の完全既知情報）と `CandidateScore`（bot 自身の
+  内訳）だけから作る = **真実盤面・実戦の正解手・コメント文・棋譜名は入らない**
+  （`cargo test 特徴量は相手の駒配置に依存しない` が実測で守る）
+- タイブレーク乱数は `CandidateScore::tiebreak` として分離してあるので、
+  `adjust` 列は乱数を引いた決定的な補正だけ
+- 未採点（`?`）は `human_score` 空欄の**欠測**（悪手として数えない）
+- **採点済みなのに現行候補集合に無い手**も `in_candidates=0` の行として残る
+  （黙って落とすと候補生成 recall が測れない）
+- 復元した `(ply, fouls)` に対応するシナリオ kif があれば `scores=` の完全一致を
+  検査し、ずれていたら停止する（`sync_eval.py` を掛け直すこと）。
+  反則後ブロックの対応が `foul_blocks.py` の FOUL_MAP と一致することも
+  `cargo test 反則後ブロックの対応がpython側の表と一致する` が常時検査する
+- 分析側（`fit_residual.py`）は **leave-one-source-KIF-out** しかしない。
+  行・候補・決定点のランダム分割は同一棋譜の暗記でリークする（採点の 94% が
+  2局由来）。numpy が要る（`pip install numpy`）
+- P0 の判定と撤退条件は `docs/eval-rank-residual-p0.md`
+
 ## quest_20260731 の移行について
 
 `docs/quest_20260731.md` の判定は `scripts/quest_review/md_to_eval.py`

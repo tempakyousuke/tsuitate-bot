@@ -269,6 +269,45 @@
   `cargo test 採点表` （`scenario_core` のテスト）で常時検査する。
   反則後ブロックとシナリオの対応表は
   `scripts/quest_review/foul_blocks.py` に一本化してある
+- `cargo run --release --bin export_eval_rank_data -- [--out data/eval_rank.csv]
+  [--seeds 4] [--budget-ms 2000] [--jobs N] [evals/*.eval.md...]` と
+  `python3 scripts/eval_rank/fit_residual.py data/eval_rank.csv` —
+  **人手採点を候補手評価へ戻せるかのオフライン判定**（issue #24 の P0、2026-08-26）。
+  `evals/*.eval.md` の各ブロックを元 KIF の決定点（`ply` と、反則後サブ状態なら
+  注入する `fouls` 列）へ復元し、現行 estimator の候補内訳（`CandidateScore` の46列）と
+  結合して CSV にする → 元 KIF 単位の leave-one-source-KIF-out で
+  「現行 score の順位より人手採点に近づけるか」を測る。**runtime へは何も
+  影響しない**（既定挙動は完全に不変。`CandidateScore` に `foul_probe` と
+  `tiebreak` を内訳として足しただけ）。
+  - 特徴量は `PlayerView`（自分側の完全既知情報）と `CandidateScore` だけから作る。
+    真実盤面・実戦の正解手・コメント文・棋譜名は型として渡らず、
+    `cargo test 特徴量は相手の駒配置に依存しない` が「相手の駒を全部消した
+    別の真実」から作った view で行が変わらないことを実測で守る
+  - 復元した `(ply, fouls)` に対応するシナリオ kif があれば `scores=` の完全一致を
+    検査して停止する。反則後ブロックの対応が `foul_blocks.py` の FOUL_MAP と
+    一致することも `cargo test 反則後ブロックの対応がpython側の表と一致する` が検査する
+  - 未採点（`?`）は**欠測**（悪手として数えない）。**採点済みなのに現行候補集合に
+    無い手**も `in_candidates=0` の行として残す（黙って落とすと候補生成 recall が
+    測れず、「未採点候補の除外による見かけの改善」と同じ穴が分析側に開く）
+  - **分割単位は元 KIF だけ**。採点 5,035 件の 94.4% が `quest_20260731` と
+    `quest_0809` の2局由来なので、行・候補・決定点のランダム分割はリークする。
+    α も訓練 fold 内の nested CV（これも元 KIF 単位）で選ぶ。指標は source KIF ごとの
+    macro 平均で、行の micro 平均は主張に使わない。seed は独立標本として数えない
+  - **P0 の実測（2026-08-26）は不合格で、runtime 実装（P1）はしない**:
+    pairwise concordance は bounded residual の重み W に対して**単調に上がる**
+    （0.735 → 0.788）のに、**top-1 平均得点はどの W でも現行 5.862 を超えない**
+    （W=1 で 5.753）。素の残差ランカーは macro で top-1 得点 −0.426・
+    8〜10点 top-3 recall −0.242・**未採点手を選んだ率 5.3% → 16.1%** で、
+    fold 間で concordance の符号も反転する（quest 2局の完全 holdout も
+    top-1 −0.78 / −0.99）。原因は**採点の被覆**: 1決定状態あたり候補 113.8 手の
+    うち採点は 18.3 手（16.1%）しかなく、順位を組み替えると argmax が採点されて
+    いない領域へ出る（「未採点手への逃避」のモデル版）。**候補生成は律速ではない**
+    （recall 99.7%）ので、issue の分岐「候補生成の多様化へ切り替える」は該当しない。
+    再判定には ①採点の被覆を方策が到達しうる範囲（現行 top-10 でも採点率 77.5%）まで
+    広げる ②独立棋譜を増やす（採点の 94.4% が2局由来。学習曲線の標準偏差は
+    棋譜数によらず ±0.28）の2つが先に要る。人手採点の役割は当面
+    「目的関数（suite / SPSA）」のままにする
+  - P0 の実測・合格条件との突き合わせ・撤退判断は `docs/eval-rank-residual-p0.md`
 - `cargo run --release --bin scenario -- <名前|suite|batch <名前...>>` — 実戦棋譜の
   局面再現実験。
   `scenarios/*.kif`（Shogi Quest エクスポート + `*scenario ply=N` 行）を再生して
