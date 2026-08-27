@@ -575,8 +575,13 @@
   - **記録の相手と `--opponent` が一致しないと起動時に止まる**
     （`--allow-opponent-mismatch` で解除）。継続の乱数は `(局, 決定点, seed)` だけ
     から作るので arm 間は共通乱数。meta の実験キー（相手・予算・seed 数・
-    max_safe・policy_w・実効並列度・記録集合・コード版）は全シャード一致が必須で、
-    重複行・arm 欠落も失敗させる（`report --allow-incomplete` で警告へ）
+    max_safe・policy_w・実効並列度（ランキング段と継続段を別々に）・記録集合
+    （解析に渡した bytes の指紋）・コード版）は全シャード一致が必須で、
+    重複行・arm 欠落も失敗させる（`report --allow-incomplete` で警告へ）。
+    **`--seeds` は 2 以上の偶数**（生成・`report`・workflow の3か所で必須）:
+    0 だと継続を1局も走らせずに `Δoracle` が 0 になり
+    **「Δoracle < 0.04 → 即中止」を成功終了で偽造できる**ため、
+    ここだけは `--allow-incomplete` でも降格しない
 - **詰み経済の CI**（`.github/workflows/mate-economy.yml`、**通常のコード push では
   走らない**）: `gh workflow run mate-economy.yml -f arena_run_id=<Arena実行ID>`、
   `gh` が無ければ `.github/ci/mate-economy.request.json` を置いて push（削除の push は

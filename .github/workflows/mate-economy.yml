@@ -165,9 +165,17 @@ jobs:
           if [ -z "$records_pattern" ]; then
             records_pattern="arena-records-${opponent}-*"
           fi
-          # 正直版（前半で選び後半で測る）が seed を半分に割るので偶数を要求する
-          if [ $(( cont_seeds % 2 )) -ne 0 ]; then
-            echo "continue_seeds は偶数にしてください（指定値 ${cont_seeds}）" >&2
+          # **2 以上の偶数**を要求する（PR #30 レビュー4巡目 [P1]）。
+          # 正直版（前半で選び後半で測る）が seed を半分に割るので偶数が要り、
+          # 0 だと継続を1局も走らせずに Δ が全部 0 になって
+          # 「Δoracle < 0.04 → 即中止」の判定を成功終了で偽造できる
+          case "$cont_seeds" in
+            ''|*[!0-9]*)
+              echo "continue_seeds は非負整数にしてください（指定値 ${cont_seeds}）" >&2
+              exit 1 ;;
+          esac
+          if [ "$cont_seeds" -lt 2 ] || [ $(( cont_seeds % 2 )) -ne 0 ]; then
+            echo "continue_seeds は 2 以上の偶数にしてください（指定値 ${cont_seeds}）" >&2
             exit 1
           fi
           {

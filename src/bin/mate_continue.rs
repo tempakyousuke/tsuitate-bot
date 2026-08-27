@@ -245,6 +245,24 @@ fn decision_state(end: &GameEndPayload, want: usize) -> Option<(Replayed, HashSe
 /// PR #30 レビュー指摘④: 強制した手を hash に混ぜると baseline / oracle /
 /// policy_* が別の乱数列で継続することになり、`Δpolicy − Δpolicy(w=0)` が
 /// 共通乱数のペア差にならない（強制手の効果に継続の乱数差が混ざる）。
+/// seed 数の関門。**2 以上の偶数**でなければ止める（PR #30 レビュー4巡目 [P1]）。
+///
+/// `0` は「継続を1局も走らせずに Δ を全部 0 にする」入力で、`Δoracle` が
+/// 0 になるので **「Δoracle < 0.04 → 即中止」の判定を成功終了で偽造できる**
+/// （実測: v14 の記録26局へ `--seeds 0` を渡すと `継続 0 局` /
+/// `Δoracle -0.0000 [NaN, NaN]` のまま「即中止」と出た）。奇数も
+/// 「前半で選び後半で測る」正直版が偏るので警告でなく失敗にする
+/// （arm 順が `(checkpoint 番号 + seed) % 2` の AB/BA 均衡と同じ理由）。
+fn check_seeds(seeds: u64, what: &str) {
+    if seeds < 2 || seeds % 2 != 0 {
+        die(&format!(
+            "{what} は 2 以上の偶数が必要です（受け取った値: {seeds}）。\
+0 だと継続を1局も走らせずに「Δoracle < 0.04 → 即中止」を出せてしまい、\
+奇数だと AB/BA と正直版が偏ります"
+        ));
+    }
+}
+
 fn continuation_seeds(game: &str, ply: usize, seed: u64) -> (u64, u64) {
     let base = stable_hash(seed, &format!("{game}#{ply}"));
     (mix(base ^ 0x0C0F_FEE0), mix(base ^ 0x0BEE_F000))
@@ -445,9 +463,7 @@ fn main() {
     // **開始時に読んだ bytes だけを使う**（解析も指紋も。PR #30 レビュー3巡目 [P1]）
     let records = read_records(&files);
     let records_fp = records_fingerprint(&records);
-    if seeds % 2 != 0 {
-        eprintln!("注意: --seeds が奇数だと「前半で選び後半で測る」正直版が偏ります");
-    }
+    check_seeds(seeds, "--seeds");
 
     let cfg = tsuitate_bot::config::ambient();
     let budget_ms = cfg.think_budget_ms;
@@ -835,6 +851,26 @@ fn report_files(args: &[String]) {
 /// - 重複行（同じ 局・決定点・arm・手・seed）が無いか
 /// - baseline がある (局, seed) に policy 3種も揃っているか
 ///   （欠けたぶんだけ `Δpolicy` が下振れする）
+/// **`--allow-incomplete` でも降格させない**入力の関門（PR #30 レビュー4巡目 [P1]）。
+///
+/// `seeds` が 0 だと継続を1局も走らせずに Δ が全部 0 になり、
+/// 「Δoracle < 0.04 → 即中止」という P0 の終了判断を成功終了で偽造できる。
+/// シャード欠けの許容（`--allow-incomplete`）とは別種の壊れ方なので、
+/// ここは常に失敗させる。
+fn fatal_inputs(metas: &[serde_json::Value]) -> Vec<String> {
+    let mut out = vec![];
+    for (i, m) in metas.iter().enumerate() {
+        let seeds = m["experiment"]["seeds"].as_u64().unwrap_or(0);
+        if seeds < 2 || seeds % 2 != 0 {
+            out.push(format!(
+                "meta {i} の seeds が {seeds} です（2 以上の偶数が必要。\
+0 だと継続 0 局のまま「即中止」の判定が出る）"
+            ));
+        }
+    }
+    out
+}
+
 fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<String> {
     let mut out = vec![];
     let experiments: Vec<&serde_json::Value> = metas.iter().map(|m| &m["experiment"]).collect();
@@ -988,6 +1024,10 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
     if metas.is_empty() {
         eprintln!("meta 行がありません（Δ の分母が取れない）");
         return;
+    }
+    // **降格できない関門**（レビュー4巡目 [P1]）を先に見る
+    for msg in fatal_inputs(metas) {
+        die(&msg);
     }
     // 入力の契約（PR #30 レビュー指摘③）。破っていたら判定を出さない
     for msg in check_inputs(metas, rows) {
@@ -1503,6 +1543,23 @@ mod tests {
             "読み直せば別集合になる（＝差し替えを素通ししているわけではない）"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// seed 数 0/奇数の meta は `--allow-incomplete` でも通さない（レビュー4巡目 [P1]）。
+    /// 0 だと継続 0 局のまま Δ が全部 0 になり「即中止」を偽造できる
+    #[test]
+    fn seed数が0や奇数のmetaは判定を出さない() {
+        let mut exp = exp_of("estimator_v14");
+        assert!(fatal_inputs(&[meta(exp.clone(), 0)]).is_empty(), "seeds=2 は通る");
+
+        for bad in [0, 1, 3] {
+            exp["seeds"] = serde_json::json!(bad);
+            let problems = fatal_inputs(&[meta(exp.clone(), 0)]);
+            assert!(
+                problems.iter().any(|p| p.contains("seeds")),
+                "seeds={bad} は止める: {problems:?}"
+            );
+        }
     }
 
     /// ランキング段と継続段の実効並列度は別々に記録する（レビュー3巡目 [P2]）
