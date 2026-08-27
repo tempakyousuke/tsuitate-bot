@@ -37,15 +37,14 @@ use tsuitate_bot::mate_economy::{
 };
 use tsuitate_bot::observation::Observation;
 use tsuitate_bot::protocol::GameEndPayload;
-use tsuitate_bot::scenario_core::{
-    Replayed, build_estimator, clone_log, ranking_one_with, side_idx, weighted_unique_particles,
-};
+use tsuitate_bot::scenario_core::{Replayed, clone_log, ranking_and_particles, side_idx};
 use tsuitate_bot::shogi::{Position, ShogiMove};
 use tsuitate_bot::truth_replay::{for_each_decision_full, load_bot_and_end};
 
 fn usage() -> &'static str {
     "usage: cargo run --release --bin mate_probe -- [--seeds 3] [--jobs N] [--controls 1] \
-     [--limit N] [--out PATH.csv] [--emit <dir> <接頭辞>] <records/*.jsonl...>"
+     [--limit N] [--opponent estimator_v14] [--out PATH.csv] [--emit <dir> <接頭辞>] \
+     <records/*.jsonl...>"
 }
 
 fn die(msg: &str) -> ! {
@@ -207,6 +206,7 @@ fn main() {
     let mut controls: usize = 1;
     let mut limit: usize = usize::MAX;
     let mut out_csv: Option<String> = None;
+    let mut opponent: Option<String> = None;
     let mut emit: Option<(String, String)> = None;
     let mut specs: Vec<String> = vec![];
     let mut i = 0;
@@ -236,6 +236,10 @@ fn main() {
                 out_csv = Some(args.get(i + 1).cloned().unwrap_or_else(|| die("--out にはパスが必要です")));
                 i += 2;
             }
+            "--opponent" => {
+                opponent = Some(args.get(i + 1).cloned().unwrap_or_else(|| die("--opponent には戦略名が必要です")));
+                i += 2;
+            }
             "--emit" => {
                 let dir = args.get(i + 1).cloned().unwrap_or_else(|| die("--emit <dir> <接頭辞>"));
                 let prefix = args.get(i + 2).cloned().unwrap_or_else(|| die("--emit <dir> <接頭辞>"));
@@ -259,8 +263,6 @@ fn main() {
 
     let cfg = tsuitate_bot::config::ambient();
     let budget_ms = cfg.think_budget_ms;
-    // 粒子構築の scale は評価側と同じ規約（既定 2000ms が scale 2000/900）
-    let scale = budget_ms as f64 / 900.0;
 
     // ---- 決定点の収集 -----------------------------------------------------
     let mut points: Vec<Point> = vec![];
@@ -268,6 +270,8 @@ fn main() {
     let mut games = 0u32;
     let mut mated_games = 0u32;
     let mut broken = 0u32;
+    let mut mismatched = 0u32;
+    let mut record_opponents: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
     let mut danger_found = 0usize;
     for path in &files {
         let name = path.to_string_lossy().to_string();
@@ -275,6 +279,13 @@ fn main() {
             broken += 1;
             continue;
         };
+        // ガントレットの記録は相手ごとに artifact が分かれる。混ざったまま
+        // 較正すると「どの相手との対局分布か」が言えなくなる（PR #30 レビュー指摘①）
+        *record_opponents.entry(end.opponent.username.clone()).or_insert(0) += 1;
+        if opponent.as_ref().is_some_and(|o| *o != end.opponent.username) {
+            mismatched += 1;
+            continue;
+        }
         let mut mates_of = |p: &Position, _ply: usize| mate_moves_in_1_fast(p);
         let Some(g) = analyze_game(&end, bot, &mut mates_of) else {
             broken += 1;
@@ -370,6 +381,20 @@ fn main() {
         }
     }
 
+    if mismatched > 0 {
+        println!(
+            "--opponent {} と一致しない記録 {mismatched} 件を除外しました",
+            opponent.clone().unwrap_or_default()
+        );
+    }
+    println!(
+        "記録の相手: {}",
+        record_opponents
+            .iter()
+            .map(|(k, n)| format!("{k} {n}局"))
+            .collect::<Vec<_>>()
+            .join(" / ")
+    );
     println!(
         "記録 {} 件（壊れ {broken}）/ 局 {games}（bot の詰み負け {mated_games}）\n\
          決定点: 危険 {n_danger} / 対照 {n_control}（--limit で落とした局 {dropped_games}）\n\
@@ -407,16 +432,17 @@ fn main() {
                     };
                     let (pi, seed) = units[ui];
                     let p = &points[pi];
-                    let Some((chosen, ranking)) =
-                        ranking_one_with(&p.rep, seed, "estimator", &p.foul_tried)
+                    // **ランキングを作ったのと同じ粒子**で q を測る（PR #30 レビュー
+                    // 指摘②）。同じ seed で `build_estimator` を回し直しても
+                    // `update` が壁時計デッドラインまで若返らせるので同じ集合には
+                    // ならず、「ランキングは集合A・q は集合B」になってしまう
+                    let Some((chosen, ranking, snapshot)) =
+                        ranking_and_particles(&p.rep, seed, "estimator", &p.foul_tried)
                     else {
                         eprintln!("{} ply{}: ランキングなし（定跡・候補ゼロ）", p.game, p.ply + 1);
                         continue;
                     };
-                    // 粒子は診断の規約（bin/scenario diag / GUI と同じ構築）で作る。
-                    // 同じ seed・同じ scale なので候補評価が見た集合と同じになる
-                    let est = build_estimator(&p.rep, seed, scale, |_, _| {});
-                    let particles = weighted_unique_particles(&est);
+                    let particles = snapshot.entries();
                     let rows = tsuitate_bot::mate_economy::build_rows(&p.rep.pos, &ranking, &particles);
                     results.lock().unwrap().push(UnitOut {
                         point: pi,

@@ -364,8 +364,12 @@ pub struct MateMass {
 
 /// 候補手を各粒子へ適用し、「相手に一手詰めが生じる」重みの割合を測る。
 ///
-/// `particles` は `scenario_core::weighted_unique_particles` の戻り値
-/// （評価側 `stratified_sample` と同じ重み規約）。
+/// `particles` は **`choose` が評価に使ったプールそのもの**
+/// （`strategy::ParticleSnapshot::entries`。`strict` は `stratified_sample` の
+/// 戻り、`taint` は厳密が全滅したときの落とし先）。
+/// **同じ seed で `build_estimator` を回し直したものを渡してはいけない**:
+/// `Estimator::update` は壁時計デッドラインまで若返らせるので、同じ seed でも
+/// 2回の実行で粒子集合が変わり、「ランキングは集合A・q は集合B」になる。
 pub fn particle_mate_mass(particles: &[(&Position, f64, bool)], mv: &ShogiMove) -> MateMass {
     let (mut num_all, mut den_all) = (0.0f64, 0.0f64);
     let (mut num_strict, mut den_strict) = (0.0f64, 0.0f64);

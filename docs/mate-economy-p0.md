@@ -217,6 +217,39 @@ arm は4種類:
   1シャードだけ集計すると分子だけが欠けて Δ が机上で小さくなる（`report` が
   meta の `shard` を見て検出する。CI 側でも artifact の本数を数えて失敗させる）
 
+### PR #30 レビューの反映（2026-08-27）
+
+計測の妥当性に直結する4件を直した。**runtime の既定挙動は変えていない**
+（粒子スナップショットは診断が明示的に on にしたときだけ保存する）。
+
+1. **q は「ランキングを作ったのと同じ粒子」で測る**。`Strategy` に
+   `set_capture_particles` / `last_particles` を足し（既定 off = コピーもしない）、
+   `choose` が評価へ渡したプールそのもの（`stratified_sample` の戻りと
+   taint プール）を `strategy::ParticleSnapshot` として持ち出す。
+   `scenario_core::ranking_and_particles` がランキングと一緒に返す。
+   **同じ seed で `build_estimator` を作り直しても同じ集合にはならない**
+   （`update` は壁時計デッドラインまで若返る）ので、作り直した粒子で測ると
+   「ランキングは集合A・q は集合B」になり、argmax も `Δpolicy` も
+   実装予定の方策のオフライン再現になっていなかった
+2. **記録の相手と継続対局の相手を突き合わせる**。ガントレットの Arena 実行は
+   相手ごとに artifact が分かれるので、`arena-records-*` をまとめて落とすと
+   v13 相手の棋譜まで v14 で継続してしまい、Δ が「受けの効果」と
+   「相手が変わった効果」の混合になる。`mate_continue` は
+   `end.opponent.username` が `--opponent` と違う記録があれば**起動時に止める**
+   （`--allow-opponent-mismatch` で承知のうえ混ぜられる）。`mate_probe` も
+   `--opponent` で絞れる。ワークフローの `records_pattern` は**空なら
+   `arena-records-<opponent>-*` を導出**するようにした
+3. **集約の契約を強くした**。meta に判定へ効く実験キー
+   （相手・予算・seed 数・`max_safe`・`policy_w`・**実効並列度**・全対局数・
+   シャード数・config 指紋・コード指紋・記録集合の指紋）を入れ、`report` は
+   全シャードでの完全一致を要求する。同じシャードの二重投入・重複行
+   （同じ 局・決定点・arm・手・seed）・baseline があるのに policy arm が
+   欠けている (局, seed) も失敗させる（`--allow-incomplete` で警告へ落とせる）。
+   検査は `check_inputs` に切り出してテストで固定した
+4. **継続の乱数は arm に依らない**。`(局, 決定点, seed)` だけから作るので、
+   baseline / oracle / policy_* が同じ乱数列で継続する（共通乱数法）。
+   `Δpolicy − Δpolicy(w=0)` の差に継続乱数の違いが混ざらない
+
 ### CI: `.github/workflows/mate-economy.yml`
 
 **通常のコード push では走らない**。起動は2通り（arena.yml と同じ規約）:
@@ -235,6 +268,15 @@ arm は4種類:
 （Δ の分母が狂うため。issue #19 の shard 欠落の教訓）。
 
 ### CI の実測（**本番の記録**。issue #28 の判定はこちらで出す）
+
+> **2026-08-27: 下の初回計測（run 33055734354）は撤回**。PR #30 のレビューで
+> ①危険質量 q を「ランキングを作ったのとは別に作り直した推定器」で測っていた
+> （`Estimator::update` は壁時計デッドラインまで若返らせるので、同じ seed でも
+> 集合が変わる = ランキングは集合A・q は集合B）②継続の乱数を強制手ごとに
+> 変えていたので `Δpolicy − Δpolicy(w=0)` が共通乱数のペア差になっていなかった、
+> の2点が判明したため。**JSONL の schema を 2 へ上げて schema 1 の記録は
+> `report` が弾く**（撤回済みの数字が判定へ戻らないように）。数字は下記
+> 「レビュー反映後の再計測」で置き換える。
 
 `Mate economy` run [33055734354](https://github.com/tempakyousuke/tsuitate-bot/actions/runs/33055734354)。
 棋譜は arena run 32697854659 の **v14 相手 104局のみ**（`records_pattern=arena-records-estimator_v14-*`）で、
@@ -315,7 +357,10 @@ seed 間のばらつき（最大の陽性 q の平均）: 厳密 0.164 / 0.149 /
 - taint を使うと argmax は 48.7% まで受けへ動く。**にもかかわらず P0-6 の
   `Δpolicy(taint)` は w=0 対照より −0.010 だった** = **受けへ変えるほど良くなるわけではない**
 
-### P0 の総合判定（2026-08-27）
+### P0 の総合判定（2026-08-27・**撤回した計測に基づく暫定値**）
+
+> 下表は撤回した初回計測の値。再計測が終わるまで**判定として引用しない**こと
+> （傾向まで変わるかは再計測で確かめる）。
 
 | 条件 | 実測 | 判定 |
 | --- | --- | --- |

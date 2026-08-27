@@ -54,6 +54,18 @@ pub trait Strategy {
         None
     }
 
+    /// **診断専用**: 直近の choose が評価に使った粒子プールを保存させる
+    /// （既定 off = コピーもしないので実対局の挙動とコストは不変）。
+    /// issue #28 の P0-3 / P0-6 が「ランキングを作ったのと同じ粒子」で
+    /// 危険質量を測るために使う。凍結版は編集しないので既定の no-op のまま
+    fn set_capture_particles(&mut self, _on: bool) {}
+
+    /// [`set_capture_particles`] を有効にしていたときの直近のスナップショット。
+    /// 定跡で指した手番・候補ゼロの手番は None
+    fn last_particles(&self) -> Option<&ParticleSnapshot> {
+        None
+    }
+
     /// 観測ログを内部推定器に先行反映する（候補評価はしない）。
     /// 実対局では choose が自分の手番ごとに呼ばれて推定器が逐次更新される
     /// （リプレイ予算も手番ごとに与えられる）。局面再現実験（bin/scenario）が
@@ -5018,6 +5030,33 @@ impl EvalParams {
     }
 }
 
+/// **診断専用**の粒子スナップショット（issue #28 P0-3 / P0-6）。
+///
+/// `choose` が実際に評価へ渡したプールそのもの:
+/// `strict` は `stratified_sample` の戻り（物理整合の粒子だけ・評価重みつき）、
+/// `taint` は物理制約を緩めた粒子のプール（厳密が全滅したときに評価が落ちる先）。
+///
+/// **同じ seed でもう一度 `Estimator` を作り直しても同じ集合にはならない**
+/// （`update` は壁時計デッドラインまで若返らせるので、実行のたびに粒子数が
+/// 揺れる）。「ランキングを作ったのと同じ粒子」で危険質量を測るには、
+/// 評価が見たプールをそのまま持ち出すしかない。
+#[derive(Clone, Debug, Default)]
+pub struct ParticleSnapshot {
+    pub strict: Vec<(Position, f64)>,
+    pub taint: Vec<(Position, f64)>,
+}
+
+impl ParticleSnapshot {
+    /// `(局面, 重み, 厳密か)` の並び（診断側が扱いやすい形）
+    pub fn entries(&self) -> Vec<(&Position, f64, bool)> {
+        self.strict
+            .iter()
+            .map(|(p, w)| (p, *w, true))
+            .chain(self.taint.iter().map(|(p, w)| (p, *w, false)))
+            .collect()
+    }
+}
+
 /// 観測履歴から相手局面を推定して指す戦略。
 ///
 /// 候補手（自分に見える範囲の疑似合法手）を、推定粒子の平均で評価する:
@@ -5043,6 +5082,12 @@ pub struct EstimatorStrategy {
     last_debug: Option<serde_json::Value>,
     /// 直近の choose 時点の全候補評価（スコア降順、scenario-gui 用）
     last_ranking: Option<Vec<CandidateScore>>,
+    /// **診断専用**（既定 false）: 直近の choose が評価に使った粒子プールを
+    /// 保存する。off のときはコピーもしないので実対局・アリーナの挙動と
+    /// コストは完全に不変（issue #28 P0-3 / P0-6 が「ランキングを作ったのと
+    /// 同じ粒子」で危険質量を測るために使う）
+    capture_particles: bool,
+    last_particles: Option<ParticleSnapshot>,
     /// **この instance の設定**（issue #21）。trait メソッドの入口で
     /// `crate::config::scoped` に設置するので、同じプロセスの別 instance
     /// （凍結相手・別 arm の候補）とは混ざらない
@@ -5102,6 +5147,8 @@ impl EstimatorStrategy {
             },
             last_debug: None,
             last_ranking: None,
+            capture_particles: false,
+            last_particles: None,
             config,
         }
     }
@@ -5652,8 +5699,10 @@ impl Strategy for EstimatorStrategy {
         let _cfg = crate::config::scoped(&self.config);
         let budget = self.budget;
         let seed = self.seed;
-        // 定跡・候補ゼロで早期 return したとき前の手番のランキングが残らないように
+        // 定跡・候補ゼロで早期 return したとき前の手番のランキング（と診断の
+        // 粒子スナップショット）が残らないように
         self.last_ranking = None;
+        self.last_particles = None;
         let est = self.est.get_or_insert_with(|| match seed {
             Some(s) => Estimator::with_seed_and_scale(view.your_color, s, budget.scale),
             None => Estimator::with_scale(view.your_color, budget.scale),
@@ -5788,6 +5837,13 @@ impl Strategy for EstimatorStrategy {
             vec![]
         };
         let taint_pool: Vec<(&Position, f64)> = taint_owned.iter().map(|(p, w)| (p, *w)).collect();
+        // 診断（issue #28）のスナップショット。**既定 off なのでコピーもしない**
+        if self.capture_particles {
+            self.last_particles = Some(ParticleSnapshot {
+                strict: sample.iter().map(|&(p, w)| (p.clone(), w)).collect(),
+                taint: taint_pool.iter().map(|&(p, w)| (p.clone(), w)).collect(),
+            });
+        }
 
         // 王手中は粒子に依存しない制約推論で「王手を解消する確率」を出す
         // （粒子が枯渇する終盤の反則バースト対策。check.rs 参照）。
@@ -7263,6 +7319,17 @@ impl Strategy for EstimatorStrategy {
 
     fn last_ranking(&self) -> Option<&[CandidateScore]> {
         self.last_ranking.as_deref()
+    }
+
+    fn set_capture_particles(&mut self, on: bool) {
+        self.capture_particles = on;
+        if !on {
+            self.last_particles = None;
+        }
+    }
+
+    fn last_particles(&self) -> Option<&ParticleSnapshot> {
+        self.last_particles.as_ref()
     }
 }
 
@@ -14577,6 +14644,48 @@ pub(crate) mod tests {
             usi.starts_with("5i"),
             "王手中は玉移動を選ぶはず（選ばれた手: {usi}）"
         );
+    }
+
+    /// 粒子スナップショット（issue #28 の診断）は**明示的に on にしたときだけ**
+    /// 保存する。既定はコピーもしないので実対局の挙動とコストは不変
+    #[test]
+    fn 粒子スナップショットは診断のときだけ保存する() {
+        let mut view = minimal_view(
+            vec![
+                VisiblePiece {
+                    square: "5i".into(),
+                    role: Role::King,
+                },
+                VisiblePiece {
+                    square: "7g".into(),
+                    role: Role::Pawn,
+                },
+            ],
+            HashMap::new(),
+        );
+        // 王手中にすると定跡を通らずに候補評価まで進む
+        view.you_in_check = true;
+        let mut strat = EstimatorStrategy::new();
+        let log = ObservationLog::default();
+
+        assert!(strat.choose(&view, &log, &HashSet::new()).is_some());
+        assert!(
+            strat.last_particles().is_none(),
+            "既定では保存しない（実対局のコストを増やさない）"
+        );
+
+        strat.set_capture_particles(true);
+        assert!(strat.choose(&view, &log, &HashSet::new()).is_some());
+        let snap = strat.last_particles().expect("on にしたら残る");
+        assert!(
+            !snap.strict.is_empty() || !snap.taint.is_empty(),
+            "評価に使ったプールが空ではない"
+        );
+        assert_eq!(snap.entries().len(), snap.strict.len() + snap.taint.len());
+        assert!(snap.entries().iter().filter(|e| e.2).count() == snap.strict.len());
+
+        strat.set_capture_particles(false);
+        assert!(strat.last_particles().is_none(), "off に戻したら捨てる");
     }
 
     #[test]

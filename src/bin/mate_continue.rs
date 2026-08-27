@@ -41,20 +41,22 @@ use tsuitate_bot::mate_economy::{analyze_game, force_move, rescored_usis};
 use tsuitate_bot::observation::Observation;
 use tsuitate_bot::protocol::{Color, GameEndPayload};
 use tsuitate_bot::scenario_core::{
-    Replayed, build_estimator, clone_log, make_view, ranking_one_with, side_idx,
-    weighted_unique_particles,
+    Replayed, clone_log, make_view, ranking_and_particles, side_idx,
 };
 use tsuitate_bot::selfplay::{GameResult, StartState, mix, play_continuation};
 use tsuitate_bot::shogi::{Position, ShogiMove};
 use tsuitate_bot::strategy::{self, candidate_moves};
 use tsuitate_bot::truth_replay::{for_each_decision_full, load_bot_and_end};
 
-const ROW_SCHEMA: u32 = 1;
+/// JSONL の schema。**schema 1 は撤回**（PR #30 レビュー指摘②④の修正前に取った
+/// 記録で、q が別の粒子集合・継続の乱数が arm ごとに違う）。`report` は
+/// schema 2 以外を弾く（撤回済みの数字が判定へ戻らないように）
+const ROW_SCHEMA: u32 = 2;
 
 fn usage() -> &'static str {
     "usage: cargo run --release --bin mate_continue -- [--seeds 2] [--max-safe 4] \
      [--opponent estimator_v14] [--policy-w 4] [--jobs N] [--shard i/n] [--out out.jsonl] \
-     <records/*.jsonl...>\n   または: mate_continue report <out-*.jsonl...>"
+     [--allow-opponent-mismatch] <records/*.jsonl...>\n        または: mate_continue report [--allow-incomplete] <out-*.jsonl...>"
 }
 
 fn die(msg: &str) -> ! {
@@ -134,6 +136,39 @@ fn collect_records(specs: &[String]) -> Vec<PathBuf> {
 }
 
 
+/// 記録集合の指紋（ファイル名の並び）。**シャードは同じ集合を見る**ので、
+/// これが食い違う JSONL は別実験（`report` が弾く）
+fn records_fingerprint(files: &[PathBuf]) -> String {
+    use sha2::Digest as _;
+    let mut names: Vec<String> = files
+        .iter()
+        .map(|p| {
+            p.file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        })
+        .collect();
+    names.sort();
+    let mut h = sha2::Sha256::new();
+    h.update(names.len().to_string().as_bytes());
+    for n in &names {
+        h.update(n.as_bytes());
+        h.update(b"\n");
+    }
+    h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()
+}
+
+/// `{相手: 局数}` を読みやすい1行にする
+fn fmt_tally(t: &BTreeMap<String, u32>) -> String {
+    if t.is_empty() {
+        return "-".to_string();
+    }
+    t.iter()
+        .map(|(k, n)| format!("{k} {n}局"))
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
 /// 決定点の状態を復元する（`bin/mate_probe` と同じ規約: その手番の反則を
 /// 消化した後の状態と、そこまでに試した `foul_tried`）
 fn decision_state(end: &GameEndPayload, want: usize) -> Option<(Replayed, HashSet<String>)> {
@@ -164,6 +199,17 @@ fn decision_state(end: &GameEndPayload, want: usize) -> Option<(Replayed, HashSe
         ));
     });
     out
+}
+
+/// 継続対局の乱数（bot 側・相手側）。**arm によらず (局, 決定点, seed) だけ**
+/// から作る。
+///
+/// PR #30 レビュー指摘④: 強制した手を hash に混ぜると baseline / oracle /
+/// policy_* が別の乱数列で継続することになり、`Δpolicy − Δpolicy(w=0)` が
+/// 共通乱数のペア差にならない（強制手の効果に継続の乱数差が混ざる）。
+fn continuation_seeds(game: &str, ply: usize, seed: u64) -> (u64, u64) {
+    let base = stable_hash(seed, &format!("{game}#{ply}"));
+    (mix(base ^ 0x0C0F_FEE0), mix(base ^ 0x0BEE_F000))
 }
 
 /// 一手強制して継続対局を回し、bot 側のスコア（勝1 / 分0.5 / 負0）を返す。
@@ -212,10 +258,7 @@ fn forced_continuation(
     let logs = forced.logs;
 
     let me_i = side_idx(p.bot);
-    let key = format!("{}#{}#{}", p.game, p.ply, order.first().map_or("", String::as_str));
-    let base = stable_hash(seed, &key);
-    let seed_me = mix(base ^ 0x0C0F_FEE0);
-    let seed_opp = mix(base ^ 0x0BEE_F000);
+    let (seed_me, seed_opp) = continuation_seeds(&p.game, p.ply, seed);
 
     let mut strats: [Option<Box<dyn strategy::Strategy>>; 2] = [None, None];
     for i in 0..2 {
@@ -284,6 +327,8 @@ fn main() {
         std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(2).max(1));
     let mut shard = (0usize, 1usize);
     let mut out_path: Option<String> = None;
+    let mut allow_opponent_mismatch = false;
+    let mut allow_incomplete = false;
     let mut specs: Vec<String> = vec![];
     let mut i = 0;
     while i < args.len() {
@@ -327,6 +372,14 @@ fn main() {
                 out_path = Some(need(args.get(i + 1), "--out"));
                 i += 2;
             }
+            "--allow-opponent-mismatch" => {
+                allow_opponent_mismatch = true;
+                i += 1;
+            }
+            "--allow-incomplete" => {
+                allow_incomplete = true;
+                i += 1;
+            }
             s if s.starts_with("--") => die(&format!("未知のオプション: {s}")),
             s => {
                 specs.push(s.to_string());
@@ -347,7 +400,6 @@ fn main() {
 
     let cfg = tsuitate_bot::config::ambient();
     let budget_ms = cfg.think_budget_ms;
-    let scale = budget_ms as f64 / 900.0;
 
     // ---- 対象の決定点 ----------------------------------------------------
     let mut points: Vec<Point> = vec![];
@@ -356,12 +408,24 @@ fn main() {
     let mut games_with_defense = 0u32;
     let mut broken = 0u32;
     let mut dropped_safe = 0usize;
+    // 記録の元相手の内訳（判定の前提を出力へ残す）と、不一致で捨てた局
+    let mut record_opponents: BTreeMap<String, u32> = BTreeMap::new();
+    let mut mismatched: Vec<(String, String)> = vec![];
     for (gi, path) in files.iter().enumerate() {
         let name = path.to_string_lossy().to_string();
         let Some((bot, end)) = load_bot_and_end(&name) else {
             broken += 1;
             continue;
         };
+        // **元対局の相手が継続対局の相手と一致しているか**（PR #30 レビュー指摘①）。
+        // ガントレットの Arena 実行は相手ごとに artifact が分かれるので、
+        // `arena-records-*` をまとめて落とすと v13 相手の棋譜まで混ざり、
+        // Δ が「受けの効果」と「相手が変わった効果」の混合になる
+        *record_opponents.entry(end.opponent.username.clone()).or_insert(0) += 1;
+        if !allow_opponent_mismatch && end.opponent.username != opponent {
+            mismatched.push((name.clone(), end.opponent.username.clone()));
+            continue;
+        }
         let mut mates_of = |p: &Position, _ply: usize| mate_moves_in_1_fast(p);
         let Some(g) = analyze_game(&end, bot, &mut mates_of) else {
             broken += 1;
@@ -436,9 +500,23 @@ fn main() {
         });
     }
 
+    if !mismatched.is_empty() {
+        eprintln!("元対局の相手が --opponent {opponent} と一致しない記録が {} 件あります:", mismatched.len());
+        for (name, opp) in mismatched.iter().take(5) {
+            eprintln!("  {name}: 相手 {opp}");
+        }
+        eprintln!("記録の相手の内訳: {}", fmt_tally(&record_opponents));
+        die(
+            "**Δ が「受けの効果」と「相手が変わった効果」の混合になる**ので中止しました。\n\
+             records_pattern を相手で絞る（例 arena-records-estimator_v14-*）か、\n\
+             承知のうえで混ぜるなら --allow-opponent-mismatch を付けてください",
+        );
+    }
     println!(
-        "記録 {} 件（壊れ {broken}）/ 局 {games_total}（詰み負け {games_mated}・受けが候補にあった {games_with_defense}）",
-        files.len()
+        "記録 {} 件（壊れ {broken}）/ 局 {games_total}（詰み負け {games_mated}・受けが候補にあった {games_with_defense}）\n\
+         記録の相手: {}",
+        files.len(),
+        fmt_tally(&record_opponents),
     );
     println!(
         "対象の決定点 {}（--max-safe {max_safe} で落とした安全手 {dropped_safe}本）/ 相手 {opponent} / \
@@ -463,11 +541,13 @@ fn main() {
     run_parallel(jobs, policy_units.len(), |ui| {
         let (pi, seed) = policy_units[ui];
         let p = &points_ref[pi];
-        let Some((_, ranking)) = ranking_one_with(&p.rep, seed, "estimator", &p.foul_tried) else {
+        // **ランキングを作ったのと同じ粒子**で q を測る（PR #30 レビュー指摘②）
+        let Some((_, ranking, snapshot)) =
+            ranking_and_particles(&p.rep, seed, "estimator", &p.foul_tried)
+        else {
             return;
         };
-        let est = build_estimator(&p.rep, seed, scale, |_, _| {});
-        let particles = weighted_unique_particles(&est);
+        let particles = snapshot.entries();
         let rows = tsuitate_bot::mate_economy::build_rows(&p.rep.pos, &ranking, &particles);
         // 反則上限（10回）を超えて並べても意味が無いので先頭 12 本で足りる
         let mut strict = rescored_usis(&rows, policy_w, false);
@@ -502,15 +582,19 @@ fn main() {
         }
     }
     let lines: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(vec![]));
+    // **実効並列度**（壁時計予算なので、同時に走る unit 数は探索量を変える
+    // = 実験条件。issue #24 の教訓と同じ）
+    let effective_jobs = jobs.min(units.len().max(1)).max(1);
     let started = std::time::Instant::now();
     {
         let units = &units;
         let points_ref = Arc::clone(&points_ref);
         let lines = Arc::clone(&lines);
+        let opponent_ref = opponent.as_str();
         run_parallel(jobs, units.len(), move |ui| {
             let (pi, seed, arm, order) = &units[ui];
             let p = &points_ref[*pi];
-            if let Some(mut v) = forced_continuation(p, order, *seed, &opponent) {
+            if let Some(mut v) = forced_continuation(p, order, *seed, opponent_ref) {
                 v["arm"] = serde_json::json!(arm.tag());
                 v["safe_covered"] = serde_json::json!(p.safe_covered.len());
                 v["safe_used"] = serde_json::json!(p.safe_used.len());
@@ -533,22 +617,34 @@ fn main() {
         started.elapsed().as_secs_f64() / 60.0
     );
 
+    // **判定に効く実験キー**（PR #30 レビュー指摘③）。`report` は全シャードで
+    // これが完全一致していることを要求する。局数だけ合っていれば混ざる、
+    // という状態を無くすため相手・予算・seed 数・方策・実効並列度・
+    // コード版・記録集合の指紋まで入れる（壁時計計測なので jobs も実験条件）
+    let experiment = serde_json::json!({
+        "opponent": opponent,
+        "budget_ms": budget_ms,
+        "seeds": seeds,
+        "max_safe": max_safe,
+        "policy_w": policy_w,
+        "jobs": effective_jobs,
+        "games": games_total,
+        "shard_total": shard.1,
+        "config": cfg.fingerprint(),
+        "source_fingerprint": env!("TSUITATE_SOURCE_FINGERPRINT"),
+        "records": records_fingerprint(&files),
+    });
     let meta = serde_json::json!({
         "schema": ROW_SCHEMA,
         "type": "meta",
+        "experiment": experiment,
+        "shard": shard.0,
         "games": games_total,
         "games_mated": games_mated,
         "games_with_defense": games_with_defense,
         "points": points_ref.len(),
-        "seeds": seeds,
-        "max_safe": max_safe,
         "dropped_safe": dropped_safe,
-        "opponent_meta": true,
-        "budget_ms": budget_ms,
-        "policy_w": policy_w,
-        "shard": format!("{}/{}", shard.0, shard.1),
-        "config": cfg.fingerprint(),
-        "source_fingerprint": env!("TSUITATE_SOURCE_FINGERPRINT"),
+        "record_opponents": record_opponents,
     });
     if let Some(path) = &out_path {
         let mut s = format!("{meta}\n");
@@ -560,7 +656,7 @@ fn main() {
             Err(e) => eprintln!("{path}: 書けません: {e}"),
         }
     }
-    report(&[meta], &lines);
+    report(&[meta], &lines, allow_incomplete);
 }
 
 /// `n` 個の unit を `jobs` 本のスレッドで回す（実効並列度は unit 数で clamp）
@@ -592,13 +688,19 @@ fn run_parallel(jobs: usize, n: usize, f: impl Fn(usize) + Sync + Send) {
     });
 }
 
-fn report_files(paths: &[String]) {
+fn report_files(args: &[String]) {
+    let allow_incomplete = args.iter().any(|a| a == "--allow-incomplete");
+    let paths: Vec<String> = args
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .cloned()
+        .collect();
     if paths.is_empty() {
         die("report には JSONL を指定してください");
     }
     let mut metas = vec![];
     let mut rows = vec![];
-    for p in paths {
+    for p in &paths {
         let Ok(text) = std::fs::read_to_string(p) else {
             die(&format!("{p}: 読めません"));
         };
@@ -616,19 +718,110 @@ fn report_files(paths: &[String]) {
             }
         }
     }
-    report(&metas, &rows);
+    report(&metas, &rows, allow_incomplete);
+}
+
+/// `report` の入力契約（PR #30 レビュー指摘③）。破っている点を全部返す。
+///
+/// - `experiment`（相手・予算・seed 数・max_safe・policy_w・実効並列度・
+///   コード版・記録集合・全対局数）が全シャードで一致しているか。
+///   **局数だけ合っていれば違う実験を混ぜられる**状態にしない
+/// - 同じシャードの JSONL を2回渡していないか（行が二重に数えられる）
+/// - 重複行（同じ 局・決定点・arm・手・seed）が無いか
+/// - baseline がある (局, seed) に policy 3種も揃っているか
+///   （欠けたぶんだけ `Δpolicy` が下振れする）
+fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<String> {
+    let mut out = vec![];
+    let experiments: Vec<&serde_json::Value> = metas.iter().map(|m| &m["experiment"]).collect();
+    if let Some(first) = experiments.first() {
+        for (i, e) in experiments.iter().enumerate().skip(1) {
+            if *e != *first {
+                let diff: Vec<String> = first
+                    .as_object()
+                    .map(|o| {
+                        o.keys()
+                            .filter(|k| first[k.as_str()] != e[k.as_str()])
+                            .map(|k| format!("{k}: {} vs {}", first[k.as_str()], e[k.as_str()]))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                out.push(format!(
+                    "meta の実験キーが {i} 本目で食い違います（違う実験を混ぜている）: {}",
+                    diff.join(" / ")
+                ));
+            }
+        }
+    }
+    let mut shards: Vec<u64> = metas.iter().filter_map(|m| m["shard"].as_u64()).collect();
+    let n = shards.len();
+    shards.sort_unstable();
+    shards.dedup();
+    if shards.len() != n {
+        out.push("同じシャードの JSONL を2回渡しています（行が二重に数えられる）".to_string());
+    }
+
+    let mut keys: HashSet<(String, u64, String, String, u64)> = HashSet::new();
+    let mut dups = 0usize;
+    let mut present: BTreeMap<(String, u64), HashSet<String>> = BTreeMap::new();
+    for r in rows {
+        let game = r["game"].as_str().unwrap_or("?").to_string();
+        let arm = r["arm"].as_str().unwrap_or("?").to_string();
+        let seed = r["seed"].as_u64().unwrap_or(0);
+        let key = (
+            game.clone(),
+            r["ply"].as_u64().unwrap_or(0),
+            arm.clone(),
+            r["usi"].as_str().unwrap_or("").to_string(),
+            seed,
+        );
+        if !keys.insert(key) {
+            dups += 1;
+        }
+        present.entry((game, seed)).or_default().insert(arm);
+    }
+    if dups > 0 {
+        out.push(format!(
+            "重複行が {dups} 件あります（同じ arm・同じ seed の継続が二重）"
+        ));
+    }
+    let want = ["baseline", "policy_strict", "policy_all", "policy_w0"];
+    let missing: Vec<String> = present
+        .iter()
+        .filter_map(|((g, s), arms)| {
+            let lack: Vec<&str> = want.iter().copied().filter(|a| !arms.contains(*a)).collect();
+            (!lack.is_empty()).then(|| format!("{g}#seed{s}: {}", lack.join(",")))
+        })
+        .collect();
+    if !missing.is_empty() {
+        out.push(format!(
+            "arm が欠けている (局, seed) が {} 件あります（Δpolicy がそのぶん下振れする）: {}{}",
+            missing.len(),
+            missing.iter().take(3).cloned().collect::<Vec<_>>().join(" / "),
+            if missing.len() > 3 { " ..." } else { "" }
+        ));
+    }
+    out
 }
 
 /// 局ごとの平均スコアを arm 別に畳み、Δ と cluster bootstrap CI を出す
-fn report(metas: &[serde_json::Value], rows: &[serde_json::Value]) {
-    // **シャードは同じ記録集合を見て局単位で割る**ので、`games` は合計ではなく
-    // 全シャードで同じ値になる（合計するとシャード数だけ Δ の分母が膨らむ）。
-    // 食い違ったら「違う記録集合を混ぜた」ということなので止める
-    let game_counts: Vec<u64> = metas.iter().map(|m| m["games"].as_u64().unwrap_or(0)).collect();
-    if game_counts.windows(2).any(|w| w[0] != w[1]) {
-        die("meta の games がシャード間で食い違います（違う記録集合を混ぜている）");
+fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incomplete: bool) {
+    if metas.is_empty() {
+        eprintln!("meta 行がありません（Δ の分母が取れない）");
+        return;
     }
-    let games_total: u64 = game_counts.first().copied().unwrap_or(0);
+    // 入力の契約（PR #30 レビュー指摘③）。破っていたら判定を出さない
+    for msg in check_inputs(metas, rows) {
+        if allow_incomplete {
+            eprintln!("警告: {msg}");
+        } else {
+            die(&msg);
+        }
+    }
+    let exp = metas
+        .first()
+        .map(|m| m["experiment"].clone())
+        .unwrap_or_default();
+    let games_total: u64 = exp["games"].as_u64().unwrap_or(0);
     let games_mated: u64 = metas
         .iter()
         .map(|m| m["games_mated"].as_u64().unwrap_or(0))
@@ -637,28 +830,22 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value]) {
     // シャードが揃っているか（Δ の分母は全対局数なので、1シャードだけ集計すると
     // 分母はそのままで分子だけが欠ける = **Δ が机上で小さくなる**）。
     // 揃っていなければ判定を出さない
-    let mut shard_ids: Vec<(usize, usize)> = vec![];
-    for m in metas {
-        let spec = m["shard"].as_str().unwrap_or("0/1");
-        if let Some((a, b)) = spec.split_once('/') {
-            if let (Ok(a), Ok(b)) = (a.parse::<usize>(), b.parse::<usize>()) {
-                shard_ids.push((a, b));
-            }
-        }
-    }
-    let shard_total = shard_ids.first().map_or(1, |s| s.1);
-    let mut seen: Vec<usize> = shard_ids.iter().map(|s| s.0).collect();
+    let shard_total = exp["shard_total"].as_u64().unwrap_or(1) as usize;
+    let mut seen: Vec<usize> = metas
+        .iter()
+        .filter_map(|m| m["shard"].as_u64().map(|v| v as usize))
+        .collect();
     seen.sort_unstable();
     seen.dedup();
-    let shards_complete = shard_ids.iter().all(|s| s.1 == shard_total) && seen.len() == shard_total;
-
+    let shards_complete = seen.len() == shard_total;
     // 継続した局と落とした安全手はシャードで**割った**ぶんなので合計する
     let dropped: u64 = metas
         .iter()
         .map(|m| m["dropped_safe"].as_u64().unwrap_or(0))
         .sum();
+
     if games_total == 0 {
-        eprintln!("meta 行がありません（Δ の分母が取れない）");
+        eprintln!("meta の games が 0 です（Δ の分母が取れない）");
         return;
     }
     // game → arm → usi → seed → score
@@ -745,6 +932,11 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value]) {
     let d_w0 = sum(&|c| c.policy_w0);
 
     println!("\n=== P0-6: 一手強制の継続診断 ===");
+    println!(
+        "  実験: 相手 {} / 予算 {}ms / seeds {} / max_safe {} / policy_w {} / jobs {} / 記録 {} / code {}",
+        exp["opponent"], exp["budget_ms"], exp["seeds"], exp["max_safe"], exp["policy_w"],
+        exp["jobs"], exp["records"], exp["source_fingerprint"],
+    );
     println!(
         "全 {games_total}局（詰み負け {games_mated}・継続した局 {}）/ 継続 {} 局ぶん{}",
         contrib.len(),
@@ -886,4 +1078,95 @@ fn cluster_bootstrap(
     }
     draws.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     (draws[(reps as f64 * 0.025) as usize], draws[(reps as f64 * 0.975) as usize])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn meta(exp: serde_json::Value, shard: u64) -> serde_json::Value {
+        serde_json::json!({
+            "schema": ROW_SCHEMA, "type": "meta", "experiment": exp, "shard": shard,
+            "games_mated": 2, "dropped_safe": 0,
+        })
+    }
+
+    fn exp_of(opponent: &str) -> serde_json::Value {
+        serde_json::json!({
+            "opponent": opponent, "budget_ms": 700, "seeds": 2, "max_safe": 4,
+            "policy_w": 4.0, "jobs": 3, "games": 104, "shard_total": 2,
+            "config": "cfg", "source_fingerprint": "src", "records": "rec",
+        })
+    }
+
+    fn row(game: &str, arm: &str, usi: &str, seed: u64) -> serde_json::Value {
+        serde_json::json!({
+            "schema": ROW_SCHEMA, "game": game, "ply": 90, "arm": arm, "usi": usi,
+            "seed": seed, "score": 0.0, "reason": "checkmate",
+        })
+    }
+
+    fn full_arms(game: &str, seed: u64) -> Vec<serde_json::Value> {
+        ["baseline", "policy_strict", "policy_all", "policy_w0"]
+            .iter()
+            .map(|a| row(game, a, "7g7f", seed))
+            .collect()
+    }
+
+    /// 継続の乱数は arm（強制手）に依らない = 共通乱数でペアになる
+    #[test]
+    fn 継続の乱数は強制手に依存しない() {
+        let a = continuation_seeds("game1", 90, 0);
+        let b = continuation_seeds("game1", 90, 0);
+        assert_eq!(a, b, "同じ (局, 決定点, seed) なら同じ乱数");
+        assert_ne!(a, continuation_seeds("game1", 90, 1), "seed が違えば変わる");
+        assert_ne!(a, continuation_seeds("game1", 92, 0), "決定点が違えば変わる");
+        assert_ne!(a, continuation_seeds("game2", 90, 0), "局が違えば変わる");
+        assert_ne!(a.0, a.1, "自分と相手のシードは別");
+    }
+
+    /// 実験キーが違う JSONL は混ぜられない（局数だけ合っていても止める）
+    #[test]
+    fn 違う実験のjsonlは混ぜられない() {
+        let rows: Vec<serde_json::Value> = full_arms("g1", 0);
+        let ok = vec![meta(exp_of("estimator_v14"), 0), meta(exp_of("estimator_v14"), 1)];
+        assert!(check_inputs(&ok, &rows).is_empty(), "同じ実験なら通る");
+
+        let mixed = vec![meta(exp_of("estimator_v14"), 0), meta(exp_of("estimator_v13"), 1)];
+        let problems = check_inputs(&mixed, &rows);
+        assert_eq!(problems.len(), 1);
+        assert!(problems[0].contains("opponent"), "違うキーを名指しする: {}", problems[0]);
+    }
+
+    /// 同じシャードを2回渡す・重複行・arm の欠落を検出する
+    #[test]
+    fn 重複と欠落を検出する() {
+        let metas = vec![meta(exp_of("estimator_v14"), 0), meta(exp_of("estimator_v14"), 0)];
+        let problems = check_inputs(&metas, &full_arms("g1", 0));
+        assert!(problems.iter().any(|p| p.contains("2回")), "{problems:?}");
+
+        let metas = vec![meta(exp_of("estimator_v14"), 0)];
+        let mut rows = full_arms("g1", 0);
+        rows.push(row("g1", "baseline", "7g7f", 0));
+        let problems = check_inputs(&metas, &rows);
+        assert!(problems.iter().any(|p| p.contains("重複行が 1 件")), "{problems:?}");
+
+        // policy_w0 が欠けた (局, seed)
+        let rows: Vec<serde_json::Value> = full_arms("g1", 0)
+            .into_iter()
+            .filter(|r| r["arm"] != "policy_w0")
+            .collect();
+        let problems = check_inputs(&metas, &rows);
+        assert!(problems.iter().any(|p| p.contains("policy_w0")), "{problems:?}");
+    }
+
+    /// 記録集合の指紋はファイルの並び順に依らず、集合が違えば変わる
+    #[test]
+    fn 記録集合の指紋は集合で決まる() {
+        let a = records_fingerprint(&[PathBuf::from("x/1.jsonl"), PathBuf::from("y/2.jsonl")]);
+        let b = records_fingerprint(&[PathBuf::from("y/2.jsonl"), PathBuf::from("x/1.jsonl")]);
+        assert_eq!(a, b, "並び順には依らない");
+        let c = records_fingerprint(&[PathBuf::from("x/1.jsonl")]);
+        assert_ne!(a, c, "集合が違えば変わる");
+    }
 }

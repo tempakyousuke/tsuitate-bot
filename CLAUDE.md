@@ -564,6 +564,14 @@
   - `--max-safe` で落とした安全手の本数は必ず出る（`Δoracle` はそのぶん下界）。
     **シャードが揃っていない集計では判定を出さない**（分母は全対局数なので
     分子だけが欠けて Δ が過小に出る）
+  - **q は「ランキングを作ったのと同じ粒子」で測る**（`Strategy::set_capture_particles`
+    / `last_particles` = 既定 off の診断フック。`build_estimator` で作り直すと
+    壁時計デッドラインのぶん集合が変わって別物になる）
+  - **記録の相手と `--opponent` が一致しないと起動時に止まる**
+    （`--allow-opponent-mismatch` で解除）。継続の乱数は `(局, 決定点, seed)` だけ
+    から作るので arm 間は共通乱数。meta の実験キー（相手・予算・seed 数・
+    max_safe・policy_w・実効並列度・記録集合・コード版）は全シャード一致が必須で、
+    重複行・arm 欠落も失敗させる（`report --allow-incomplete` で警告へ）
 - **詰み経済の CI**（`.github/workflows/mate-economy.yml`、**通常のコード push では
   走らない**）: `gh workflow run mate-economy.yml -f arena_run_id=<Arena実行ID>`、
   `gh` が無ければ `.github/ci/mate-economy.request.json` を置いて push（削除の push は
@@ -576,7 +584,9 @@
   P0-6 は局単位のシャードで回し、aggregate が `mate_continue report` で合算する
   （**シャードが欠けたら失敗させる** = Δ の分母が狂うため）。
   設計・実測・判定は `docs/mate-economy-p0.md`。
-  **実測（run 33055734354、v14 相手104局）で P0 の判定は「P1 へ進まない」**:
+  **初回実測（run 33055734354）は PR #30 のレビューで撤回**（q を別に作り直した
+  推定器で測っていた・継続の乱数が arm ごとに違った）。JSONL の schema は 2 で、
+  schema 1 の記録は `report` が弾く。以下は撤回した暫定値（再計測で置き換える）:
   `Δoracle` **+0.111**（正直版 +0.048。指し直しの対照 baseline が +0.024 あるので
   実質 +0.087）で中止条件は回避したが、**`Δpolicy` は +0.034（厳密）/ +0.014（taint）で
   必要条件 0.04 に届かない**（同じ経路の w=0 対照が +0.024 なので、危険量ペナルティ

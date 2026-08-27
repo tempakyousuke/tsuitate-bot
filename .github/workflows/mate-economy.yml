@@ -25,9 +25,9 @@ on:
         required: false
         default: ""
       records_pattern:
-        description: "取ってくる artifact のパターン。**ガントレットの run は相手ごとに分かれる**ので、継続対局の opponent と揃えること（例 arena-records-estimator_v14-*）"
+        description: "取ってくる artifact のパターン。**空なら opponent から導出**（arena-records-<opponent>-*）。ガントレットの run は相手ごとに分かれるので、継続対局の opponent と揃っていないと Δ が「受けの効果」と「相手が変わった効果」の混合になる"
         required: false
-        default: "arena-records-*"
+        default: ""
       probe_seeds:
         description: "P0-3 の決定点あたり seed 数（少数シードの差は判定に使わないこと）"
         required: false
@@ -105,7 +105,7 @@ jobs:
           req='.github/ci/mate-economy.request.json'
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             run_id="${IN_RUN_ID:-}"
-            records_pattern="${IN_RECORDS_PATTERN:-arena-records-*}"
+            records_pattern="${IN_RECORDS_PATTERN:-}"
             probe_seeds="${IN_PROBE_SEEDS:-3}"
             controls="${IN_CONTROLS:-1}"
             probe_budget="${IN_PROBE_BUDGET:-2000}"
@@ -123,7 +123,7 @@ jobs:
               {
                 echo "skip=true"
                 echo "arena_run_id="
-                echo "records_pattern=arena-records-*"
+                echo "records_pattern="
                 echo "probe_seeds=3"
                 echo "controls=1"
                 echo "probe_budget_ms=2000"
@@ -137,7 +137,7 @@ jobs:
               exit 0
             fi
             run_id=$(jq -r '.arena_run_id // ""' "$req")
-            records_pattern=$(jq -r '.records_pattern // "arena-records-*"' "$req")
+            records_pattern=$(jq -r '.records_pattern // ""' "$req")
             probe_seeds=$(jq -r '.probe_seeds // 3' "$req")
             controls=$(jq -r '.controls // 1' "$req")
             probe_budget=$(jq -r '.probe_budget_ms // 2000' "$req")
@@ -147,6 +147,12 @@ jobs:
             opponent=$(jq -r '.opponent // "estimator_v14"' "$req")
             policy_w=$(jq -r '.policy_w // 4' "$req")
             shards=$(jq -r '.shards // 4' "$req")
+          fi
+          # **pattern は opponent から導出する**のを既定にする（PR #30 レビュー指摘①:
+          # 既定が arena-records-* だと、ガントレット run の全相手が混ざったまま
+          # 全部を同じ --opponent で継続してしまう）
+          if [ -z "$records_pattern" ]; then
+            records_pattern="arena-records-${opponent}-*"
           fi
           # 正直版（前半で選び後半で測る）が seed を半分に割るので偶数を要求する
           if [ $(( cont_seeds % 2 )) -ne 0 ]; then
@@ -197,6 +203,7 @@ jobs:
           ./target/release/mate_probe \
             --seeds "${{ needs.plan.outputs.probe_seeds }}" \
             --controls "${{ needs.plan.outputs.controls }}" \
+            --opponent "${{ needs.plan.outputs.opponent }}" \
             --jobs "$jobs" \
             --out mate-probe.csv \
             --emit emitted mate-defense \
