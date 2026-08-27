@@ -154,7 +154,9 @@ jobs:
             cont_budget=$(jq -r '.continue_budget_ms // 700' "$req")
             opponent=$(jq -r '.opponent // "estimator_v14"' "$req")
             policy_w=$(jq -r 'if (.policy_w | type) == "array" then (.policy_w | map(tostring) | join(",")) else (.policy_w // "2,4,8,16,30" | tostring) end' "$req")
-            run_probe=$(jq -r '.run_probe // true | tostring' "$req")
+            # `// true` は **false も既定値扱いになる**（jq の `//` は null と false を
+            # 同じに扱う）。has() で「キーがあるか」を見る
+            run_probe=$(jq -r 'if has("run_probe") then .run_probe else true end | tostring' "$req")
             shards=$(jq -r '.shards // 4' "$req")
           fi
           # **pattern は opponent から導出する**のを既定にする（PR #30 レビュー指摘①:
