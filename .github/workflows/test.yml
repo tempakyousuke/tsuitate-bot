@@ -8,6 +8,7 @@ name: Test
 #   - `cargo test`（候補手生成・プロトコル・エンジン・推定器・採点表の整合）
 #   - ビルド警告ゼロの維持（`-D warnings`。凍結版の未使用コードは
 #     src/lib.rs の `pub mod frozen;` 側で allow 済み）
+#   - NN の forward pass の速度しきい値（**release でだけ**測る。issue #26）
 # 遅い検証（perft depth 4/5 = `-- --ignored`）と強さの判定は対象外。
 #
 # push は main のみ、他ブランチは pull_request で拾う（両方を全ブランチ対象に
@@ -50,5 +51,24 @@ jobs:
       - name: Build (deny warnings)
         run: cargo build --all-targets --locked
 
+      # **速度しきい値テストは debug から外す**（issue #26）。
+      # `forward_pass_is_fast_enough_for_hot_loop`（value_nn / value_nn_v22 /
+      # opp_move_nn）の debug 側しきい値 2ms/回 は、手元の debug 実測
+      # 514〜522µs に対して約3.9倍の余裕しかない。GitHub のランナーは手元より
+      # 約4.2倍遅く（実測 2.1〜2.3ms/回）、**しきい値を超えて断続的に落ちる**
+      # （PR #25 のブランチで CI 10回中2回）。再実行で緑になるので回帰では
+      # なく、ランナー差がそのまま出ているだけ。
       - name: Test
-        run: cargo test --locked
+        run: cargo test --locked -- --skip forward_pass_is_fast_enough_for_hot_loop
+
+      # 速度の判定は release でやる。テスト自身の方針（「debugビルドは極端に
+      # 遅い…速度の実態はreleaseで測る」）と一致し、しきい値 100µs/回 に対する
+      # 実測は 2.4〜2.8µs/回 = **約36〜41倍の余裕**なので、ランナーが4倍遅くても
+      # 揺れない。**性能回帰の門はここで維持される**（debug の assert を単に
+      # 消すと門が無くなる）。
+      #
+      # `--lib` で lib のテストバイナリだけを作る（bin を含めると release の
+      # ビルドが数倍になる）。実測 44秒（依存が rust-cache に載っている場合）/
+      # 1分37秒（コールド、4コア）。
+      - name: NN forward pass speed (release)
+        run: cargo test --release --locked --lib forward_pass_is_fast_enough_for_hot_loop
