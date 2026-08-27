@@ -246,7 +246,12 @@ pub const SHARED_MODEL_PINS: &[(&str, &str, &str, &str)] = &[
         // 凍結版の序盤分布が変わる（この中の `TSUITATE_JOSEKI` が
         // `env_keys_read_by` で凍結版の実効 env として拾われる）
         "src/opening.rs",
-        "7eedcb135bbd977b85811401702a3e43c1969a968dab442c3388ef8fd87cee09",
+        // 2026-08-26 更新（PR #25）: `load()` の中身を `parse_book()` へ切り出し、
+        // 「与えた bytes からキャッシュへ入れる」`preload()` を足した。**凍結版の
+        // 挙動は変わらない**（`load()` の読み取り規則・フォールバックは文字どおり
+        // 同じで、`preload` を呼ぶのは `bin/export_eval_rank_data` だけ）ので、
+        // 基準の再計測はしていない。ここは「読んだ上での更新」
+        "ff35932492b9dc3a2917aca1c1971c130ba131b3353ddc3d4389e971eb43f05e",
         "opening",
         include_str!("../opening.rs"),
     ),

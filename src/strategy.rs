@@ -337,6 +337,13 @@ pub struct CandidateScore {
     /// 反則質量のうち**最大の回収先マス**が占める割合（原因駒の集中度。
     /// 低いと「どの駒が原因か割れている」= 指し直しで取りに行けない）
     pub probe_concentration: f64,
+    /// 打ちプローブの反則情報価値（drop_probe_w）。gain の**外側**
+    /// （combine_score の (1−p_legal) 側）へ加算されている正の値。
+    /// `score = combine_score(gain, p_legal, foul_cost) + foul_probe + adjust`
+    pub foul_probe: f64,
+    /// `adjust` に含まれるタイブレーク乱数（0〜0.01）。学習・回帰の特徴量から
+    /// 乱数を外せるように分離して持つ（`adjust - tiebreak` が決定的な補正）
+    pub tiebreak: f64,
 }
 
 /// 前進を好むヒューリスティック＋乱数（従来実装）
@@ -3783,6 +3790,10 @@ struct EvalOut {
     probe_unit: f64,
     probe_mass: f64,
     probe_concentration: f64,
+    /// `adjust` に含まれるタイブレーク乱数（`rng.random_range(0.0..0.01)`）。
+    /// evaluate() の外（候補ループ）で引いて書き戻す。学習用のエクスポートが
+    /// 「乱数を除いた adjust」を出すために分離して持つ（`CandidateScore::tiebreak`）
+    tiebreak: f64,
 }
 
 impl EvalOut {
@@ -6869,7 +6880,9 @@ impl Strategy for EstimatorStrategy {
             }
             // gain の外側の補正（タイブレーク乱数・手戻り/シャッフル減点）は
             // 2手読み後の再計算でも同じ値を使うので分離して持つ
-            let mut adjust = rng.random_range(0.0..0.01);
+            let tiebreak = rng.random_range(0.0..0.01);
+            out.tiebreak = tiebreak;
+            let mut adjust = tiebreak;
             if !blind_king_dist.is_empty() {
                 // 攻め加点は p(合法) で割り引く（加点が実現するのは手が受理された
                 // ときだけ）。adjust は combine_score の外側に加算されるため、
@@ -7188,6 +7201,8 @@ impl Strategy for EstimatorStrategy {
                 promo: out.promo,
                 hand_option: out.hand_option,
                 board_discount: out.board_discount,
+                foul_probe: out.foul_probe,
+                tiebreak: out.tiebreak,
             });
             if best.as_ref().is_none_or(|(_, _, s)| final_score > *s) {
                 best = Some((usi, out.p_legal, final_score));
@@ -9962,6 +9977,8 @@ fn evaluate(
         probe_unit,
         probe_mass,
         probe_concentration,
+        // 候補ループが引いた乱数を後から書き戻す（evaluate は乱数を持たない）
+        tiebreak: 0.0,
     }
 }
 

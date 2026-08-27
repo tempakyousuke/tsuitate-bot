@@ -13,6 +13,7 @@ pub mod client;
 pub mod config;
 pub mod deduce;
 pub mod estimator;
+pub mod eval_rank;
 pub mod effect_profile;
 // 凍結版は生成時点のコピーなので、現行コードから見ると未使用の import や
 // 到達しない補助関数が残る（それを直さないのが「凍結後は編集しない」の意味）。

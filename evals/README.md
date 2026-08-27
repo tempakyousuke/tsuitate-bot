@@ -95,6 +95,67 @@ python3 scripts/quest_review/append_unscored.py \
   「反則後にしか存在しない候補」が反則前のシナリオ名で出てきて採点が
   ずれる（2026-08-11 に PR #3 で実際に起きた。`cargo test 採点表` が関門）
 
+## 残差ランカーのデータ化（issue #24 P0）
+
+`bin/export_eval_rank_data` は eval の各ブロックを元 KIF の決定点（`ply` と、
+反則後サブ状態なら注入する `fouls` 列）へ復元し、現行 estimator の候補内訳と
+結合して CSV を書く。**「人手採点は評価器自身の教師になりうるか」を
+オフラインで判定するためのデータ**で、runtime へは何も影響しない。
+
+```
+cargo run --release --bin export_eval_rank_data -- \
+  --out data/eval_rank.csv --seeds 4 [--budget-ms 2000] [--jobs N] [evals/xxx.eval.md ...]
+python3 scripts/eval_rank/fit_residual.py data/eval_rank.csv --out /tmp/p0.md
+```
+
+- 1行 = `(source_kif, decision_state, seed, usi, human_score, 特徴量…)`。
+  特徴量は `PlayerView`（自分側の完全既知情報）と `CandidateScore`（bot 自身の
+  内訳）だけから作る = **真実盤面・実戦の正解手・コメント文・棋譜名は入らない**
+  （`cargo test 特徴量は相手の駒配置に依存しない` が実測で守る）
+- タイブレーク乱数は `CandidateScore::tiebreak` として分離してあるので、
+  `adjust` 列は乱数を引いた決定的な補正だけ
+- 未採点（`?`）は `human_score` 空欄の**欠測**（悪手として数えない）
+- **採点済みなのに現行候補集合に無い手**も `in_candidates=0` の行として残る
+  （黙って落とすと候補生成 recall が測れない）
+- 復元した `(ply, fouls)` に対応するシナリオ kif があれば `scores=` の完全一致を
+  検査し、ずれていたら停止する（`sync_eval.py` を掛け直すこと）。
+  反則後ブロックの対応が `foul_blocks.py` の FOUL_MAP と一致することも
+  `cargo test 反則後ブロックの対応がpython側の表と一致する` が常時検査する
+- 分析側（`fit_residual.py`）は **leave-one-source-KIF-out** しかしない。
+  行・候補・決定点のランダム分割は同一棋譜の暗記でリークする（採点の 94% が
+  2局由来）。numpy が要る（`pip install numpy`）
+- 得点系の指標は「top-1 が採点済み」条件つきで数え、合否も CI も**両腕とも採点済みの
+  決定状態だけの対比較**で見る。未採点の top-1 を `UNSCORED_DEFAULT=4` で埋めて
+  平均へ混ぜると、未採点選択が増える側の腕の得点が実点次第で反転する
+  （PR #25 レビューで実際に符号が変わった）
+- **未採点への逃避が増えたら判定を止める**（許容 +0.01）。対比較は両腕とも採点済みの
+  部分集合しか見ないので、逃避した分は測れていない。関門は macro だけでなく
+  **大きい棋譜1局ごとにも**掛ける（macro だけだと他クラスタで相殺される）
+- P1 の統合形を試すときは、順位番号でなく**実スコア（`engine_score` 列）へ合成する**。
+  この列は**丸めない**（丸めると現行方策で順位がついている候補が同点になる）。
+  読み込み時に「降順が `engine_rank` の昇順と一致する」ことを検査する
+- **1本のエクスポートで符号を論じない**。壁時計予算で粒子数が揺れるため、同じコードでも
+  macro concordance が門（+0.05）をまたいで散る（実測 +0.050 / +0.056 / −0.027）。
+  `fit_residual.py a.csv b.csv c.csv` が replicate として集約し、3本未満なら
+  concordance を「判定不能」にして合格を出さない。**合否に使う量はすべて平均**なので
+  引数順で判定は変わらない。replicate は「同じ実験の独立サンプル」だけを数える
+  （中身 hash・母集団・summary JSON の実験指紋を検査する。指紋は
+  `source_fingerprint` = build.rs がコンパイル時に焼き込む `src/**/*.rs` ＋
+  `Cargo.lock` ＋ `Cargo.toml` ＋ `build.rs` のハッシュに
+  **profile / target / features / RUSTFLAGS / rustc 版**を混ぜたもの
+  （ソースだけだと debug と release が同じ指紋になる。壁時計予算なので
+  探索量は桁で違う。**exporter は release でないと起動時に止まる**）と、
+  `data_fingerprint` = 実効定跡パスの中身＋元 KIF の中身の2つで、
+  評価ロジックを変えた別コミット・別ビルド条件や定跡の差し替えは混ざらない。
+  壁時計挙動に効く **実効並列度 `jobs`** も実験条件として一致検査する）。
+  `--out` / 入力 CSV は `.csv` 必須（summary は同名の `.summary.json`）
+- P1 の統合形を測るときは **`gain` 側へ足す**（`gain' = gain + 残差` →
+  `combine_score(...)`）。最終 score へ直接足すと合法性の割引を迂回した別物になる
+- 順位系の特徴量は**完全同点も決定的に割る**（USI の辞書順）。安定ソートに任せると
+  タイブレーク乱数の並び順が `rank` に残り、順位学習がそれを拾う（実測で
+  concordance の見かけの改善 +0.017 がこれで消えた）
+- P0 の判定と撤退条件は `docs/eval-rank-residual-p0.md`
+
 ## quest_20260731 の移行について
 
 `docs/quest_20260731.md` の判定は `scripts/quest_review/md_to_eval.py`

@@ -44,24 +44,60 @@ const BUILTIN_LINES: [&[&str]; 4] = [
 /// 共有データ」なので、arm ごとに別のファイルを指せないと隔離できない。
 /// 読み込み結果はプロセス寿命ぶん保持する（プロセスあたり高々数本）
 fn load() -> &'static (Vec<String>, Vec<Vec<String>>) {
-    static LOADED: std::sync::OnceLock<
-        std::sync::Mutex<HashMap<String, &'static (Vec<String>, Vec<Vec<String>>)>>,
-    > = std::sync::OnceLock::new();
     let path = crate::config::current(|c| c.joseki_path.clone());
-    let cache = LOADED.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let cache = cache();
     let mut cache = cache.lock().expect("定跡キャッシュの Mutex");
     if let Some(hit) = cache.get(path.as_str()) {
         return hit;
     }
-    let loaded: &'static (Vec<String>, Vec<Vec<String>>) = Box::leak(Box::new(load_path(&path)));
+    let loaded: &'static (Vec<String>, Vec<Vec<String>>) =
+        Box::leak(Box::new(parse_book(&path, std::fs::read_to_string(&path).ok().as_deref())));
     cache.insert(path, loaded);
     loaded
 }
 
-fn load_path(path: &str) -> (Vec<String>, Vec<Vec<String>>) {
+#[allow(clippy::type_complexity)]
+fn cache() -> &'static std::sync::Mutex<HashMap<String, &'static (Vec<String>, Vec<Vec<String>>)>> {
+    static LOADED: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, &'static (Vec<String>, Vec<Vec<String>>)>>,
+    > = std::sync::OnceLock::new();
+    LOADED.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// 定跡を**与えた bytes から**キャッシュへ入れる（ディスクを読まない）。
+///
+/// 用途は「実際に使った定跡」を指紋に残す計測経路（`bin/export_eval_rank_data`）。
+/// ロードは遅延なので、開始時に読んだ bytes と実際に使われる bytes は
+/// **A→B→A の差し替えで食い違いうる**（開始・終了の比較では検出できない。
+/// PR #25 レビュー指摘 P1）。ここで先に入れておけば、戦略も指紋も同じ
+/// immutable な bytes を見る。
+///
+/// 戻り値 `false` = そのパスは既にロード済み（この bytes では走らないので、
+/// 呼び出し側は計測を中止すること）。
+pub fn preload(path: &str, bytes: &[u8]) -> bool {
+    let cache = cache();
+    let mut cache = cache.lock().expect("定跡キャッシュの Mutex");
+    if cache.contains_key(path) {
+        return false;
+    }
+    // 空 = 「読めなかった」（`load()` の `read_to_string().ok()` と同じ扱い）
+    let content = if bytes.is_empty() {
+        None
+    } else {
+        std::str::from_utf8(bytes).ok().map(str::to_string)
+    };
+    let loaded: &'static (Vec<String>, Vec<Vec<String>>) =
+        Box::leak(Box::new(parse_book(path, content.as_deref())));
+    cache.insert(path.to_string(), loaded);
+    true
+}
+
+/// `content`（None = ファイルを読めなかった）から定跡ラインを作る。
+/// 有効なラインが1本も取れなければ組み込み定跡へ落ちる
+fn parse_book(path: &str, content: Option<&str>) -> (Vec<String>, Vec<Vec<String>>) {
     {
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            match serde_json::from_str::<serde_json::Value>(&content) {
+        if let Some(content) = content {
+            match serde_json::from_str::<serde_json::Value>(content) {
                 Ok(v) => {
                     let mut names = vec![];
                     let mut lines = vec![];
@@ -232,6 +268,27 @@ impl OpeningBook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// preload した bytes がそのまま使われる（ディスクを読まない）。
+    ///
+    /// 存在しないパスを渡しているので、ディスク経由なら組み込み定跡へ落ちる。
+    /// ここでラインが出てくること自体が「preload した bytes で走っている」証拠
+    #[test]
+    fn preload_した_bytesで走る() {
+        let path = "/nonexistent/tsuitate-preload-test.json";
+        let json = r#"{"lines":[{"name":"テスト線","moves":["7g7f","2g2f"]}]}"#;
+        assert!(preload(path, json.as_bytes()), "初回の preload は成功する");
+        assert!(!preload(path, json.as_bytes()), "2回目はロード済みなので false");
+        // 定跡パスは config の値を直接差し替える（env の**リテラル**をこのファイルへ
+        // 持ち込むと、共有モジュール経由の env 読取を走査で検出する
+        // `bin/checkpoint_arena` のテストの前提が変わる）
+        let mut cfg = crate::config::StrategyConfig::defaults();
+        cfg.joseki_path = path.to_string();
+        let cfg = std::sync::Arc::new(cfg);
+        let _scope = crate::config::scoped(&cfg);
+        assert_eq!(line_names(), &vec!["テスト線".to_string()]);
+        assert_eq!(lines(), &vec![vec!["7g7f".to_string(), "2g2f".to_string()]]);
+    }
 
     #[test]
     fn mirror_flips_point_symmetric() {
