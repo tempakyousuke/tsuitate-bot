@@ -40,19 +40,29 @@ struct GameRecord {
     p_legal_outcomes: Vec<(f64, bool, u32)>,
     /// 決定点（positions のインデックス）→ その決定の chose debug で観測できる
     /// 「厳密粒子ゼロだったか」。`debug.sample_slots`（評価に使った厳密粒子の
-    /// スロット数）が 0 なら true。旧記録は sample_slots を持たないので None。
+    /// スロット数）が 0 なら true。
+    ///
+    /// **その手番の最初の `chose` だけを見る**。反則後の再選択は同じ move_number で
+    /// 何度も来るが、粒子の状態は反則の観測を食った後の別物なので混ぜられない。
+    /// 最初の選択に `sample_slots` が無ければ（定跡手・旧記録の `debug: null`）
+    /// その決定は `Some(None)` = 判定不能として登録し、**再選択の値で埋めない**。
     /// P0-2 の漏斗の3段目（2手読みは厳密粒子ゼロには効かない）で使う
-    blind_decisions: HashMap<usize, bool>,
+    blind_decisions: HashMap<usize, Option<bool>>,
 }
 
 fn load(path: &str) -> Option<GameRecord> {
     let content = std::fs::read_to_string(path).ok()?;
+    parse_record(path, &content)
+}
+
+/// 記録（JSONL）1局ぶんの本体。テストから直接呼べるように path と分けてある
+fn parse_record(path: &str, content: &str) -> Option<GameRecord> {
     let mut bot_color = None;
     let mut strategy = String::new();
     let mut observations = vec![];
     let mut end = None;
     let mut p_legal_outcomes = vec![];
-    let mut blind_decisions: HashMap<usize, bool> = HashMap::new();
+    let mut blind_decisions: HashMap<usize, Option<bool>> = HashMap::new();
     // 直近の chose イベントの (usi, p_legal)。次の MyMove/MyFoul 観測と照合する
     let mut pending_chose: Option<(String, f64)> = None;
     for line in content.lines() {
@@ -72,14 +82,17 @@ fn load(path: &str) -> Option<GameRecord> {
                     pending_chose = Some((usi.to_string(), p));
                 }
                 // chose の move_number はその決定点の手数（着手前）なので
-                // positions のインデックスは -1（MyMove の -2 とは規約が違う）
-                if let (Some(mn), Some(slots)) =
-                    (v["move_number"].as_u64(), v["debug"]["sample_slots"].as_u64())
-                {
-                    // 同じ手番の反則後の再選択は上書きしない（最初の決定を見る）
+                // positions のインデックスは -1（MyMove の -2 とは規約が違う）。
+                // **最初の chose を必ず登録する**: sample_slots が無いときに
+                // 未登録のまま残すと、同じ手番の反則後の再選択（粒子が反則の
+                // 観測を食った後の別状態）がその手番の「最初の決定」として
+                // 登録されてしまう
+                if let Some(mn) = v["move_number"].as_u64() {
                     blind_decisions
                         .entry((mn as usize).saturating_sub(1))
-                        .or_insert(slots == 0);
+                        .or_insert_with(|| {
+                            v["debug"]["sample_slots"].as_u64().map(|slots| slots == 0)
+                        });
                 }
             }
             Some("obs") => {
@@ -818,7 +831,7 @@ fn mate_defense_episodes(
                 }
             }
             safe_here = Some(safe_usi.len());
-            blind = rec.blind_decisions.get(&(idx - 1)).copied();
+            blind = rec.blind_decisions.get(&(idx - 1)).copied().flatten();
         }
 
         let continues = prev_threat_idx == Some(idx.saturating_sub(2));
@@ -1825,6 +1838,27 @@ mod tests {
     use super::*;
     use tsuitate_bot::board::parse_usi_square;
     use tsuitate_bot::shogi::Piece;
+
+    /// 反則を挟む手番の `blind_decisions` は**最初の選択**だけを見る。
+    /// 初回が `debug: null`（定跡手・旧記録）なら、その手番は判定不能のままで、
+    /// 反則後の再選択の `sample_slots` で埋めてはいけない（PR #29 レビュー指摘）
+    #[test]
+    fn 反則後の再選択で最初の決定の粒子状態を埋めない() {
+        let jsonl = r#"{"type":"match","your_color":"sente","strategy":"estimator","game_id":"t"}
+{"type":"chose","move_number":12,"usi":"7g7f","debug":null}
+{"type":"obs","event":{"kind":"my_foul","move_number":12,"usi":"7g7f"}}
+{"type":"chose","move_number":12,"usi":"2g2f","debug":{"sample_slots":426}}
+{"type":"obs","event":{"kind":"my_move","move_number":13,"usi":"2g2f","captured":null}}
+{"type":"chose","move_number":14,"usi":"2f2e","debug":{"sample_slots":0}}
+{"type":"obs","event":{"kind":"my_move","move_number":15,"usi":"2f2e","captured":null}}
+{"type":"end","payload":{"result":"draw","reason":"draw","finalSfen":"","moves":[],"foulAttempts":[],"ratingChange":{"you":{"before":0,"after":0},"opponent":{"before":0,"after":0}},"opponent":{"username":"x","rating":0}}}
+"#;
+        let rec = parse_record("t.jsonl", jsonl).expect("記録をパースできる");
+        // 12手目 = positions[11]: 初回に sample_slots が無いので判定不能のまま
+        assert_eq!(rec.blind_decisions.get(&11), Some(&None));
+        // 14手目 = positions[13]: 初回に値があるのでそのまま使う
+        assert_eq!(rec.blind_decisions.get(&13), Some(&Some(true)));
+    }
 
     fn sq(usi: &str) -> Coord {
         parse_usi_square(usi).unwrap()
