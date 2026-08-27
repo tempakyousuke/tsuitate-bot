@@ -19,7 +19,7 @@ use std::collections::{HashMap, HashSet};
 
 use tsuitate_bot::board::Coord;
 use tsuitate_bot::check::CheckSolver;
-use tsuitate_bot::mate::{drop_mate, mate_in_1};
+use tsuitate_bot::mate::{has_mate_in_1_fast, mate_moves_in_1, mate_moves_in_1_fast};
 use tsuitate_bot::model::GameModel;
 use tsuitate_bot::observation::{stale_king_foul_dests, Observation, ObservationLog};
 use tsuitate_bot::protocol::{
@@ -38,6 +38,11 @@ struct GameRecord {
     /// debug.p_legal と、その手の受理/反則の突き合わせ（C-7 P3 の較正測定）。
     /// move_number は王手中の手番だけに絞った較正（王手中の p_legal 過信の診断）用
     p_legal_outcomes: Vec<(f64, bool, u32)>,
+    /// 決定点（positions のインデックス）→ その決定の chose debug で観測できる
+    /// 「厳密粒子ゼロだったか」。`debug.sample_slots`（評価に使った厳密粒子の
+    /// スロット数）が 0 なら true。旧記録は sample_slots を持たないので None。
+    /// P0-2 の漏斗の3段目（2手読みは厳密粒子ゼロには効かない）で使う
+    blind_decisions: HashMap<usize, bool>,
 }
 
 fn load(path: &str) -> Option<GameRecord> {
@@ -47,6 +52,7 @@ fn load(path: &str) -> Option<GameRecord> {
     let mut observations = vec![];
     let mut end = None;
     let mut p_legal_outcomes = vec![];
+    let mut blind_decisions: HashMap<usize, bool> = HashMap::new();
     // 直近の chose イベントの (usi, p_legal)。次の MyMove/MyFoul 観測と照合する
     let mut pending_chose: Option<(String, f64)> = None;
     for line in content.lines() {
@@ -64,6 +70,16 @@ fn load(path: &str) -> Option<GameRecord> {
                     (v["usi"].as_str(), v["debug"]["p_legal"].as_f64())
                 {
                     pending_chose = Some((usi.to_string(), p));
+                }
+                // chose の move_number はその決定点の手数（着手前）なので
+                // positions のインデックスは -1（MyMove の -2 とは規約が違う）
+                if let (Some(mn), Some(slots)) =
+                    (v["move_number"].as_u64(), v["debug"]["sample_slots"].as_u64())
+                {
+                    // 同じ手番の反則後の再選択は上書きしない（最初の決定を見る）
+                    blind_decisions
+                        .entry((mn as usize).saturating_sub(1))
+                        .or_insert(slots == 0);
                 }
             }
             Some("obs") => {
@@ -99,6 +115,7 @@ fn load(path: &str) -> Option<GameRecord> {
         observations,
         end: end?,
         p_legal_outcomes,
+        blind_decisions,
     })
 }
 
@@ -574,17 +591,275 @@ fn tally_check_stale_king_missed(
     out
 }
 
-fn has_mate_in_one(pos: &Position) -> Option<String> {
-    for mv in pos.legal_moves() {
-        let mut next = pos.clone();
-        next.play_unchecked(&mv);
-        if let Some(Outcome::Checkmate { winner }) = next.outcome() {
-            if winner == pos.turn() {
-                return Some(mv.to_usi());
+/// `mate_moves_in_1_fast` の実測コスト（issue #28 P1-A: `mate_samples` と
+/// 対象候補数を決める前に、**実戦の局面**で単発コストを測る）。
+///
+/// 初期局面の perft から出した movegen の平均単価は、詰み直前の終盤で
+/// 相手の合法応手をほぼ全走査する最悪ケースの代理にならない。
+#[derive(Default)]
+struct MateCost {
+    /// 1呼び出しの所要ナノ秒と、その局面が終盤（90手目以降）か
+    samples: Vec<(u64, bool)>,
+    /// `TSUITATE_MATE_COST=1` のときだけ測る完全版（全合法手）との比
+    full_ns: u64,
+    fast_ns: u64,
+    compared: u32,
+}
+
+impl MateCost {
+    /// 計測つきで `mate_moves_in_1_fast` を呼ぶ
+    fn measure(&mut self, pos: &Position, ply: usize) -> Vec<ShogiMove> {
+        let t0 = std::time::Instant::now();
+        let out = mate_moves_in_1_fast(pos);
+        let ns = u64::try_from(t0.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.samples.push((ns, ply >= 90));
+        if compare_full_search() {
+            let t1 = std::time::Instant::now();
+            let full = mate_moves_in_1(pos);
+            self.full_ns += u64::try_from(t1.elapsed().as_nanos()).unwrap_or(0);
+            self.fast_ns += ns;
+            self.compared += 1;
+            assert_eq!(
+                full.iter().map(|m| m.to_usi()).collect::<HashSet<_>>(),
+                out.iter().map(|m| m.to_usi()).collect::<HashSet<_>>(),
+            );
+        }
+        out
+    }
+
+    fn report(&self) {
+        if self.samples.is_empty() {
+            return;
+        }
+        let pct = |v: &[u64], q: f64| -> f64 {
+            if v.is_empty() {
+                return 0.0;
             }
+            let i = ((v.len() - 1) as f64 * q).round() as usize;
+            v[i] as f64 / 1000.0
+        };
+        let line = |label: &str, mut v: Vec<u64>| {
+            v.sort_unstable();
+            println!(
+                "  {label}: {}回 / p50 {:.1}µs / p95 {:.1}µs / 最大 {:.1}µs",
+                v.len(),
+                pct(&v, 0.5),
+                pct(&v, 0.95),
+                pct(&v, 1.0),
+            );
+        };
+        println!("mate_moves_in_1_fast の単発コスト（issue #28 P1-A）:");
+        line("全決定点", self.samples.iter().map(|&(ns, _)| ns).collect());
+        let endgame: Vec<u64> = self
+            .samples
+            .iter()
+            .filter(|&&(_, e)| e)
+            .map(|&(ns, _)| ns)
+            .collect();
+        if !endgame.is_empty() {
+            line("終盤（90手目以降）", endgame);
+        }
+        if self.compared > 0 {
+            println!(
+                "  完全版（全合法手）との比: 絞り込み {:.1}µs/回 vs 完全版 {:.1}µs/回 = {:.1}倍速（{}局面）",
+                self.fast_ns as f64 / f64::from(self.compared) / 1000.0,
+                self.full_ns as f64 / f64::from(self.compared) / 1000.0,
+                self.full_ns as f64 / self.fast_ns.max(1) as f64,
+                self.compared,
+            );
         }
     }
-    None
+}
+
+/// `TSUITATE_MATE_COST=1` で完全版との突き合わせ計測を有効にする（既定は絞り込み版だけ）
+fn compare_full_search() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TSUITATE_MATE_COST").as_deref() == Ok("1"))
+}
+
+/// 詰め手集合の排他的分類（issue #28 P0-2）。
+///
+/// 従来の `打ち詰み` フラグは `drop_mate` の有無だったので「打ちでも盤上移動でも
+/// 詰む」局面が打ち側にだけ数えられ、**排他的な分類になっていなかった**。
+/// 全詰め手を列挙して union で分類する
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MateKind {
+    DropOnly,
+    BoardOnly,
+    Both,
+}
+
+impl MateKind {
+    fn of(moves: &[ShogiMove]) -> Option<Self> {
+        let drop = moves.iter().any(|m| matches!(m, ShogiMove::Drop { .. }));
+        let board = moves.iter().any(|m| matches!(m, ShogiMove::Board { .. }));
+        match (drop, board) {
+            (true, true) => Some(MateKind::Both),
+            (true, false) => Some(MateKind::DropOnly),
+            (false, true) => Some(MateKind::BoardOnly),
+            (false, false) => None,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            MateKind::DropOnly => "打ちのみ",
+            MateKind::BoardOnly => "盤上のみ",
+            MateKind::Both => "両方",
+        }
+    }
+}
+
+/// 被詰めろの**エピソード**（連続した相手番の被詰めろを1つに畳んだもの）。
+///
+/// 手番単位で数えると「1回の危険が何手番続いたか」と「何回危険に入ったか」が
+/// 混ざる（issue #28 P0-1: 局が長くなっただけの増加と区別できない）。
+struct MateEpisode {
+    /// 最初に被詰めろになった相手番の positions インデックス
+    start_idx: usize,
+    /// 連続した被詰めろ手番の数 = 受ける機会の回数
+    turns: usize,
+    /// エピソード内の全詰め手の union で分類
+    kind: MateKind,
+    /// 実際に詰まされたなら、その手が打ちだったか
+    executed_drop: Option<bool>,
+    /// 危険へ入った手番（`start_idx` の直前の bot 決定点）で真実上あった安全手の本数
+    safe_at_entry: Option<usize>,
+    /// 安全手が真実上あった手番の数
+    safe_turns: usize,
+    /// そのうち安全手が bot の候補生成（自駒のみ）に載っていた手番の数
+    covered_turns: usize,
+    /// 最後に回避できた相手番の positions インデックス
+    last_avoidable: Option<usize>,
+    /// 決定点が厳密粒子ゼロだった手番の数 / 記録から判定できた手番の数
+    blind_turns: usize,
+    known_turns: usize,
+}
+
+/// bot の各決定点（positions のインデックス）に対応する観測ログの prefix 長。
+/// 反則を挟む手番は最初の試行の直前で切る（その手番の入口の視界）
+fn decision_prefixes(rec: &GameRecord) -> HashMap<usize, usize> {
+    let mut out: HashMap<usize, usize> = HashMap::new();
+    for (i, obs) in rec.observations.iter().enumerate() {
+        // MyMove の move_number は適用後の値なので -2、MyFoul は手番維持なので -1
+        let idx = match obs {
+            Observation::MyMove { move_number, .. } => (*move_number as usize).saturating_sub(2),
+            Observation::MyFoul { move_number, .. } => (*move_number as usize).saturating_sub(1),
+            _ => continue,
+        };
+        out.entry(idx).or_insert(i);
+    }
+    out
+}
+
+/// 被詰めろエピソードと受けの漏斗（issue #28 P0-2）。
+///
+/// 被詰めろ局面は相手番なので**一手巻き戻して** bot の直前の決定点を見る。
+/// 段ごとに:
+/// 1. 真実上、指した後に相手の一手詰めが消える手があったか（理論上限）
+/// 2. その手が bot の候補生成（自駒のみ）に載るか
+/// 3. その決定点に厳密粒子があったか（2手読みは厳密粒子ゼロには効かない）
+fn mate_defense_episodes(
+    rec: &GameRecord,
+    positions: &[Position],
+    bot: Color,
+    cost: &mut MateCost,
+) -> Vec<MateEpisode> {
+    let prefixes = decision_prefixes(rec);
+    let mut episodes: Vec<MateEpisode> = vec![];
+    let mut prev_threat_idx: Option<usize> = None;
+    for (idx, pos) in positions.iter().enumerate() {
+        if pos.turn() == bot || pos.outcome().is_some() {
+            continue;
+        }
+        let mates = cost.measure(pos, idx + 1);
+        let Some(kind) = MateKind::of(&mates) else {
+            continue;
+        };
+        // 実際に詰まされたか（この相手番の手で終局したか）
+        let executed_drop = positions
+            .get(idx + 1)
+            .and_then(|p| p.outcome())
+            .and_then(|o| match o {
+                Outcome::Checkmate { winner } if winner != bot => rec
+                    .end
+                    .moves
+                    .get(idx)
+                    .and_then(|m| parse_usi(&m.usi))
+                    .map(|mv| matches!(mv, ShogiMove::Drop { .. })),
+                _ => None,
+            });
+
+        // 漏斗: 一手巻き戻した bot の決定点
+        let mut safe_here: Option<usize> = None;
+        let mut covered = false;
+        let mut blind: Option<bool> = None;
+        if idx >= 1 && positions[idx - 1].turn() == bot {
+            let decision = &positions[idx - 1];
+            let mut safe_usi: HashSet<String> = HashSet::new();
+            for mv in decision.legal_moves() {
+                let mut next = decision.clone();
+                next.play_unchecked(&mv);
+                if !has_mate_in_1_fast(&next) {
+                    safe_usi.insert(mv.to_usi());
+                }
+            }
+            if !safe_usi.is_empty() {
+                if let Some(&prefix) = prefixes.get(&(idx - 1)) {
+                    let mut log = ObservationLog::default();
+                    for prev in &rec.observations[..prefix] {
+                        log.record(prev.clone());
+                    }
+                    let model = GameModel::from_log(bot, &log);
+                    let view = view_from_model(&model, decision.in_check(bot));
+                    covered = candidate_moves(&view, &HashSet::new())
+                        .iter()
+                        .any(|(usi, _)| safe_usi.contains(usi));
+                }
+            }
+            safe_here = Some(safe_usi.len());
+            blind = rec.blind_decisions.get(&(idx - 1)).copied();
+        }
+
+        let continues = prev_threat_idx == Some(idx.saturating_sub(2));
+        prev_threat_idx = Some(idx);
+        if continues {
+            let ep = episodes.last_mut().expect("継続なら直前のエピソードがある");
+            ep.turns += 1;
+            ep.kind = match (ep.kind, kind) {
+                (a, b) if a == b => a,
+                _ => MateKind::Both,
+            };
+            if executed_drop.is_some() {
+                ep.executed_drop = executed_drop;
+            }
+            if safe_here.is_some_and(|n| n > 0) {
+                ep.safe_turns += 1;
+                ep.last_avoidable = Some(idx);
+                if covered {
+                    ep.covered_turns += 1;
+                }
+            }
+            if let Some(b) = blind {
+                ep.known_turns += 1;
+                ep.blind_turns += usize::from(b);
+            }
+        } else {
+            episodes.push(MateEpisode {
+                start_idx: idx,
+                turns: 1,
+                kind,
+                executed_drop,
+                safe_at_entry: safe_here,
+                safe_turns: usize::from(safe_here.is_some_and(|n| n > 0)),
+                covered_turns: usize::from(covered),
+                last_avoidable: safe_here.is_some_and(|n| n > 0).then_some(idx),
+                blind_turns: usize::from(blind == Some(true)),
+                known_turns: usize::from(blind.is_some()),
+            });
+        }
+    }
+    episodes
 }
 
 fn main() {
@@ -606,9 +881,35 @@ fn main() {
     // 実行してこない環境（アリーナの凍結版同士は互いに玉位置が見えない）でも
     // 受けの改善を直接測れる。nofoul オラクルと同じ趣旨の診断
     let mut total_mate_allowed = 0u32;
-    let mut total_mate_allowed_drop = 0u32;
     let mut total_mate_executed = 0u32;
     let mut games_mate_allowed = 0u32;
+    // issue #28 P0-1/P0-2: エピソード単位・排他的分類・手数調整・受けの漏斗
+    let mut total_mate_episodes = 0u32;
+    let mut total_mate_episodes_endgame = 0u32;
+    let mut total_decisions = 0u32;
+    let mut total_decisions_endgame = 0u32;
+    let mut episode_len_hist = [0u32; 6]; // 1,2,3,4,5,6手番以上
+    let mut total_kind_drop_only = 0u32;
+    let mut total_kind_board_only = 0u32;
+    let mut total_kind_both = 0u32;
+    let mut total_executed_drop = 0u32;
+    let mut total_executed_board = 0u32;
+    let mut total_safe_at_entry = 0u32;
+    let mut total_episodes_with_safe = 0u32;
+    let mut total_episodes_covered = 0u32;
+    let mut total_funnel_blind = 0u32;
+    let mut total_funnel_known = 0u32;
+    let mut total_first_threat_ply = 0u64;
+    let mut total_first_threat_games = 0u32;
+    // 攻め／受けを分けた終局分布（P0-1）。全終局に占める詰みの比率ではなく
+    // 候補側（bot）の詰み負け率・詰み勝ち率で見る
+    let mut games_bot_mated = 0u32;
+    let mut games_bot_mates = 0u32;
+    // 攻め側の一手詰めの排他的分類（参考値・玉位置は不可視）
+    let mut total_missed_drop_only = 0u32;
+    let mut total_missed_board_only = 0u32;
+    let mut total_missed_both = 0u32;
+    let mut mate_cost = MateCost::default();
     let mut total_check_turns = 0;
     let mut total_check_actual_fouls = 0;
     let mut total_check_solved = 0;
@@ -1159,6 +1460,15 @@ fn main() {
             }
         }
 
+        // 終局の内訳（P0-1: 全終局に占める詰み比率でなく、候補側の詰み負け／詰み勝ち）
+        if let Some(Outcome::Checkmate { winner }) = positions.last().and_then(|p| p.outcome()) {
+            if winner == bot {
+                games_bot_mates += 1;
+            } else {
+                games_bot_mated += 1;
+            }
+        }
+
         // 詰み逃し: bot 手番の各局面で1手詰みがあったか
         for (i, pos) in positions.iter().enumerate() {
             if pos.turn() != bot {
@@ -1167,53 +1477,101 @@ fn main() {
             if pos.outcome().is_some() {
                 break;
             }
-            if let Some(mate) = has_mate_in_one(pos) {
-                let played = rec.end.moves.get(i).map(|m| m.usi.as_str()).unwrap_or("-");
-                // 実際に詰ませた手なら逃していない
-                if i + 1 == positions.len() - 1
-                    && positions.last().unwrap().outcome().is_some()
-                {
-                    continue;
-                }
-                println!(
-                    "  1手詰みが存在 {}手目: {mate}（実際は {played}。玉位置は不可視なので参考値）",
-                    i + 1
-                );
-                total_missed_mates += 1;
+            let mates = mate_cost.measure(pos, i + 1);
+            let Some(kind) = MateKind::of(&mates) else {
+                continue;
+            };
+            let played = rec.end.moves.get(i).map(|m| m.usi.as_str()).unwrap_or("-");
+            // 実際に詰ませた手なら逃していない
+            if i + 1 == positions.len() - 1 && positions.last().unwrap().outcome().is_some() {
+                continue;
+            }
+            println!(
+                "  1手詰みが存在 {}手目: {}（{}・実際は {played}。玉位置は不可視なので参考値）",
+                i + 1,
+                mates[0].to_usi(),
+                kind.label(),
+            );
+            total_missed_mates += 1;
+            match kind {
+                MateKind::DropOnly => total_missed_drop_only += 1,
+                MateKind::BoardOnly => total_missed_board_only += 1,
+                MateKind::Both => total_missed_both += 1,
             }
         }
 
-        // 被詰めろ: 相手番の各局面で相手に一手詰めがあったか（= bot が受け損ねた）
-        let mut allowed_here = 0u32;
+        // 被詰めろ（issue #28 P0-1/P0-2）: 相手番の各局面で相手に一手詰めが
+        // あったかを**エピソード単位**で畳み、受けの漏斗（真実上の受けの有無 →
+        // 候補生成に載るか → 厳密粒子があったか）と詰め手の排他的分類を出す
+        let episodes = mate_defense_episodes(&rec, &positions, bot, &mut mate_cost);
+        // 手数調整のための分母: bot の決定点（相手番でない・終局前）
         for (i, pos) in positions.iter().enumerate() {
-            if pos.turn() == bot || pos.outcome().is_some() {
+            if pos.turn() != bot || pos.outcome().is_some() {
                 continue;
             }
-            let Some(mate) = mate_in_1(pos) else { continue };
-            allowed_here += 1;
-            total_mate_allowed += 1;
-            let by_drop = drop_mate(pos, pos.turn()).is_some();
-            if by_drop {
-                total_mate_allowed_drop += 1;
+            total_decisions += 1;
+            if i + 1 >= 90 {
+                total_decisions_endgame += 1;
             }
-            let played = rec.end.moves.get(i).map(|m| m.usi.as_str()).unwrap_or("-");
-            let executed = positions
-                .get(i + 1)
-                .and_then(|p| p.outcome())
-                .is_some_and(|o| matches!(o, Outcome::Checkmate { winner } if winner != bot));
-            if executed {
-                total_mate_executed += 1;
-            }
-            println!(
-                "  被詰めろ {}手目: 相手に {} があった（実際は {played}{}{}）",
-                i + 1,
-                mate.to_usi(),
-                if by_drop { "・打ち詰み" } else { "" },
-                if executed { "・実行された" } else { "" },
-            );
         }
-        if allowed_here > 0 {
+        if !episodes.is_empty() {
             games_mate_allowed += 1;
+            total_first_threat_ply += episodes[0].start_idx as u64 + 1;
+            total_first_threat_games += 1;
+        }
+        for ep in &episodes {
+            total_mate_episodes += 1;
+            total_mate_allowed += ep.turns as u32;
+            if ep.start_idx + 1 >= 90 {
+                total_mate_episodes_endgame += 1;
+            }
+            episode_len_hist[(ep.turns - 1).min(episode_len_hist.len() - 1)] += 1;
+            match ep.kind {
+                MateKind::DropOnly => total_kind_drop_only += 1,
+                MateKind::BoardOnly => total_kind_board_only += 1,
+                MateKind::Both => total_kind_both += 1,
+            }
+            if let Some(by_drop) = ep.executed_drop {
+                total_mate_executed += 1;
+                if by_drop {
+                    total_executed_drop += 1;
+                } else {
+                    total_executed_board += 1;
+                }
+            }
+            if ep.safe_at_entry.is_some_and(|n| n > 0) {
+                total_safe_at_entry += 1;
+            }
+            if ep.safe_turns > 0 {
+                total_episodes_with_safe += 1;
+            }
+            if ep.covered_turns > 0 {
+                total_episodes_covered += 1;
+            }
+            total_funnel_blind += ep.blind_turns as u32;
+            total_funnel_known += ep.known_turns as u32;
+            println!(
+                "  被詰めろ {}手目〜 {}手番（{}{}）: 入口の安全手 {} / 受けられた手番 {}（候補生成に載った {}）{}{}",
+                ep.start_idx + 1,
+                ep.turns,
+                ep.kind.label(),
+                if ep.known_turns > 0 {
+                    format!("・厳密粒子ゼロ {}/{}", ep.blind_turns, ep.known_turns)
+                } else {
+                    String::new()
+                },
+                ep.safe_at_entry
+                    .map_or("-".to_string(), |n| n.to_string()),
+                ep.safe_turns,
+                ep.covered_turns,
+                ep.last_avoidable
+                    .map_or(String::new(), |i| format!("・最後に回避できたのは {}手目", i + 1)),
+                match ep.executed_drop {
+                    Some(true) => "・実行された(打ち)",
+                    Some(false) => "・実行された(盤上)",
+                    None => "",
+                },
+            );
         }
     }
 
@@ -1231,10 +1589,51 @@ fn main() {
     println!(
         "取り返し: 機会{total_recap_ops}回中 実行{total_recap_taken}回 / 得だったのに逃した{total_recap_missed_good}回"
     );
-    println!("1手詰みの存在（参考値・玉位置は不可視）: {total_missed_mates}回");
     println!(
-        "被詰めろ（相手に1手詰めを与えた局面）: {total_mate_allowed}回 / {games_mate_allowed}局（うち打ち詰み {total_mate_allowed_drop}回・実際に詰まされた {total_mate_executed}回）"
+        "1手詰みの存在（参考値・玉位置は不可視）: {total_missed_mates}回（打ちのみ {total_missed_drop_only} / 盤上のみ {total_missed_board_only} / 両方 {total_missed_both}）"
     );
+    println!("\n--- 詰み経済（issue #28 P0-1/P0-2）---");
+    let pct = |a: u32, b: u32| -> f64 {
+        if b == 0 { 0.0 } else { f64::from(a) * 100.0 / f64::from(b) }
+    };
+    println!(
+        "終局: bot の詰み負け {games_bot_mated}/{games}局 ({:.1}%) / 詰み勝ち {games_bot_mates}/{games}局 ({:.1}%)",
+        pct(games_bot_mated, games),
+        pct(games_bot_mates, games),
+    );
+    println!(
+        "被詰めろ: {total_mate_episodes}エピソード / {total_mate_allowed}手番 / {games_mate_allowed}局（実際に詰まされた {total_mate_executed}回 = 打ち {total_executed_drop} / 盤上移動 {total_executed_board}）"
+    );
+    println!(
+        "  露出（手数調整）: bot の決定点 {total_decisions}（終盤90手以降 {total_decisions_endgame}）→ 100決定点あたり {:.2}エピソード / 終盤 {:.2}エピソード",
+        if total_decisions == 0 { 0.0 } else { f64::from(total_mate_episodes) * 100.0 / f64::from(total_decisions) },
+        if total_decisions_endgame == 0 { 0.0 } else { f64::from(total_mate_episodes_endgame) * 100.0 / f64::from(total_decisions_endgame) },
+    );
+    if total_first_threat_games > 0 {
+        println!(
+            "  初回被詰めろの手数: 平均 {:.1}手目（{total_first_threat_games}局）",
+            total_first_threat_ply as f64 / f64::from(total_first_threat_games),
+        );
+    }
+    println!(
+        "  エピソード長（受ける機会の手番数）: 1:{} 2:{} 3:{} 4:{} 5:{} 6以上:{}",
+        episode_len_hist[0], episode_len_hist[1], episode_len_hist[2],
+        episode_len_hist[3], episode_len_hist[4], episode_len_hist[5],
+    );
+    println!(
+        "  詰め手の排他的分類: 打ちのみ {total_kind_drop_only} / 盤上のみ {total_kind_board_only} / 両方 {total_kind_both}（**現行の mate_risk_w は打ち詰みしか見ない**）"
+    );
+    println!(
+        "  受けの漏斗: 入口で真実上の安全手あり {total_safe_at_entry}/{total_mate_episodes} ({:.1}%) → どこかの手番で受けられた {total_episodes_with_safe} → その安全手が候補生成に載った {total_episodes_covered}",
+        pct(total_safe_at_entry, total_mate_episodes),
+    );
+    if total_funnel_known > 0 {
+        println!(
+            "  被詰めろ手番の決定点が厳密粒子ゼロ: {total_funnel_blind}/{total_funnel_known} ({:.1}%。2手読みはここには効かない)",
+            pct(total_funnel_blind, total_funnel_known),
+        );
+    }
+    mate_cost.report();
     println!(
         "王手駒の即取られ: {total_checker_lost}回（うち取り返しなし {total_checker_lost_free}回）/ 直接王手 {total_bot_checks}回"
     );

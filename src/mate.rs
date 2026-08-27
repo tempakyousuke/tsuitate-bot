@@ -13,7 +13,7 @@
 
 use crate::board::{Coord, on_board, orient, rays, steps};
 use crate::protocol::{Color, Role};
-use crate::shogi::{Position, ShogiMove};
+use crate::shogi::{Position, ShogiMove, promote_role};
 
 /// 打ちで王手になりうる (マス, 駒種)。空きマスのみ・持ち駒があるものだけ。
 /// 玉のマスから8方向へ空きマスを辿り、「そのマスの `side` の `role` が
@@ -157,15 +157,168 @@ pub fn drop_mate(pos: &Position, side: Color) -> Option<ShogiMove> {
 
 /// 手番側の一手詰め（全合法手を見る完全版。診断・記録分析用で重い）
 pub fn mate_in_1(pos: &Position) -> Option<ShogiMove> {
+    mate_moves_in_1(pos).into_iter().next()
+}
+
+/// 手番側の一手詰めを**全部**返す完全版（全合法手を試す。診断・照合用で重い）。
+/// `mate_moves_in_1_fast` の正解基準（テストで集合一致を検査する）
+pub fn mate_moves_in_1(pos: &Position) -> Vec<ShogiMove> {
     let opp = pos.turn().other();
+    let mut out = vec![];
     for mv in pos.legal_moves() {
         let mut next = pos.clone();
         next.play_unchecked(&mv);
         if next.in_check(opp) && !next.has_any_legal_move() {
-            return Some(mv);
+            out.push(mv);
         }
     }
-    None
+    out
+}
+
+/// `to` に置かれた `side` の `role` が `king` へ利くか。
+///
+/// `vacated`（その手で空になる移動元）はレイ走査で空きマスとみなす。
+/// `to` 自身の駒（取られる駒）は走査の開始点の外なので無関係。
+fn role_attacks_king(
+    pos: &Position,
+    side: Color,
+    role: Role,
+    to: Coord,
+    king: Coord,
+    vacated: Option<Coord>,
+) -> bool {
+    for &delta in steps(role) {
+        let (df, dr) = orient(delta, side);
+        if king.file == to.file + df && king.rank == to.rank + dr {
+            return true;
+        }
+    }
+    for &delta in rays(role) {
+        let (df, dr) = orient(delta, side);
+        let mut c = Coord { file: to.file + df, rank: to.rank + dr };
+        while on_board(c) {
+            if c == king {
+                return true;
+            }
+            if Some(c) != vacated && pos.piece_at(c).is_some() {
+                break;
+            }
+            c = Coord { file: c.file + df, rank: c.rank + dr };
+        }
+    }
+    false
+}
+
+/// `from` を空けると開き王手になりうるか（**保守的な必要条件**）。
+///
+/// 開き王手は走り駒でしか起きない（隣接ステップの駒と玉の間にはマスが無い）ので、
+/// 「玉 → from が同一直線・間は空き・from の先に自分の走り駒がその向きへ利く」を見る。
+/// 着手後に移動駒が同じ線へ戻って塞ぐ場合も true を返すが、最終判定は実際に
+/// 指してからの `in_check` が行うので健全（見落としが無い）側に倒している。
+fn may_discover_check(pos: &Position, side: Color, king: Coord, from: Coord) -> bool {
+    const DIRS: [(i8, i8); 8] = [
+        (0, -1), (0, 1), (1, 0), (-1, 0), (1, -1), (-1, -1), (1, 1), (-1, 1),
+    ];
+    for (df, dr) in DIRS {
+        let mut c = Coord { file: king.file + df, rank: king.rank + dr };
+        while on_board(c) {
+            if c == from {
+                // from の先に「玉の方向へ利く自分の走り駒」があるか
+                let mut d = Coord { file: c.file + df, rank: c.rank + dr };
+                while on_board(d) {
+                    if let Some(p) = pos.piece_at(d) {
+                        if p.color == side {
+                            let back = (-df, -dr);
+                            if rays(p.role).iter().any(|&delta| orient(delta, side) == back) {
+                                return true;
+                            }
+                        }
+                        break; // 先頭の駒で遮断（敵味方問わず）
+                    }
+                    d = Coord { file: d.file + df, rank: d.rank + dr };
+                }
+                break;
+            }
+            if pos.piece_at(c).is_some() {
+                break; // 玉と from の間に別の駒 = from を空けても開かない
+            }
+            c = Coord { file: c.file + df, rank: c.rank + dr };
+        }
+    }
+    false
+}
+
+/// 手番側の一手詰めを、**王手になりうる手だけ**に絞って列挙する（hot path 用）。
+///
+/// 絞り込みは3経路の構成的な和で、どれも「王手になりうる」の必要条件を
+/// 見落とさない側に倒してある:
+/// - 打ち: `drop_check_candidates`（玉から8方向＋桂の逆引き。歩は打ち歩詰めが
+///   反則なので原理的に一手詰めにならず、`legal_moves` 側でも弾かれる）
+/// - 盤上の直接王手: 着手後の駒種で `to` から玉へ利くか（移動元は空きとみなす）
+/// - 盤上の開き王手: `may_discover_check`
+///
+/// 各候補は `is_legal` → `play_unchecked` → `in_check` → `has_any_legal_move` で
+/// 確定するので、`mate_moves_in_1`（全合法手版）と**集合として一致する**
+/// （`mate_fast_agrees_with_full_search` が乱数局面と実戦局面で検査する）。
+pub fn mate_moves_in_1_fast(pos: &Position) -> Vec<ShogiMove> {
+    collect_mates(pos, false)
+}
+
+/// 一手詰めが1つでもあるか（見つけ次第打ち切る）。`mate_moves_in_1_fast` の早期脱出版
+pub fn has_mate_in_1_fast(pos: &Position) -> bool {
+    !collect_mates(pos, true).is_empty()
+}
+
+fn collect_mates(pos: &Position, first_only: bool) -> Vec<ShogiMove> {
+    let side = pos.turn();
+    let opp = side.other();
+    let mut out = vec![];
+    let Some(king) = pos.king_square(opp) else {
+        return out;
+    };
+    let is_mate = |mv: &ShogiMove| {
+        if !pos.is_legal(mv) {
+            return false;
+        }
+        let mut next = pos.clone();
+        next.play_unchecked(mv);
+        next.in_check(opp) && !next.has_any_legal_move()
+    };
+
+    for (to, role) in drop_check_candidates(pos, side, king) {
+        let mv = ShogiMove::Drop { role, to };
+        if is_mate(&mv) {
+            out.push(mv);
+            if first_only {
+                return out;
+            }
+        }
+    }
+    for mv in pos.pseudo_legal_moves() {
+        let ShogiMove::Board { from, to, promote } = mv else {
+            continue;
+        };
+        let Some(piece) = pos.piece_at(from) else {
+            continue;
+        };
+        let role = if promote {
+            promote_role(piece.role).unwrap_or(piece.role)
+        } else {
+            piece.role
+        };
+        if !role_attacks_king(pos, side, role, to, king, Some(from))
+            && !may_discover_check(pos, side, king, from)
+        {
+            continue;
+        }
+        if is_mate(&mv) {
+            out.push(mv);
+            if first_only {
+                return out;
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -281,6 +434,72 @@ mod tests {
         assert_eq!(
             drop_mate_threat(&next, Color::Gote).map(|(_, k)| k),
             Some(MateThreat::IfSupported)
+        );
+    }
+
+    fn usi_set(moves: &[ShogiMove]) -> std::collections::BTreeSet<String> {
+        moves.iter().map(|m| m.to_usi()).collect()
+    }
+
+    /// 絞り込み列挙（hot path 用）と全合法手版が**集合として一致**すること。
+    /// 乱数の自己対局で局面を進めながら毎局面で照合する（開き王手・成り王手・
+    /// 桂の跳び王手・打ち歩詰めの除外がすべてこの経路に載る）
+    #[test]
+    fn mate_fast_agrees_with_full_search() {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        let mut checked = 0u32;
+        let mut mates_seen = 0u32;
+        for seed in 0..24u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            let mut pos = Position::initial();
+            for _ in 0..90 {
+                let full = mate_moves_in_1(&pos);
+                let fast = mate_moves_in_1_fast(&pos);
+                assert_eq!(
+                    usi_set(&full),
+                    usi_set(&fast),
+                    "seed {seed} で一手詰めの集合が食い違う"
+                );
+                assert_eq!(has_mate_in_1_fast(&pos), !full.is_empty());
+                checked += 1;
+                mates_seen += u32::try_from(full.len()).unwrap_or(0);
+                let legal = pos.legal_moves();
+                if legal.is_empty() {
+                    break;
+                }
+                // 詰みは局面を終わらせるので、詰まない手を優先して長く続ける
+                let quiet: Vec<_> = legal
+                    .iter()
+                    .filter(|mv| {
+                        let mut next = pos.clone();
+                        next.play_unchecked(mv);
+                        next.outcome().is_none()
+                    })
+                    .cloned()
+                    .collect();
+                let pool = if quiet.is_empty() { &legal } else { &quiet };
+                let mv = pool[rng.random_range(0..pool.len())];
+                pos.play_unchecked(&mv);
+            }
+        }
+        assert!(checked > 1000, "照合した局面が少なすぎる: {checked}");
+        assert!(mates_seen > 0, "一手詰めが1件も出ていない = 照合になっていない");
+    }
+
+    /// 実戦局面（発端の対人局）でも集合一致する。打ち詰めと盤上移動の詰めが
+    /// 排他的に分類できることも合わせて確認する
+    #[test]
+    fn mate_fast_agrees_on_real_game_position() {
+        let mut pos = play_estimator_ply58();
+        pos.set_turn(Color::Gote);
+        let full = mate_moves_in_1(&pos);
+        assert_eq!(usi_set(&full), usi_set(&mate_moves_in_1_fast(&pos)));
+        assert!(full.iter().any(|m| m.to_usi() == "G*7h"));
+        assert!(
+            full
+                .iter()
+                .any(|m| matches!(m, ShogiMove::Drop { .. })),
+            "打ちの詰めがあるはず"
         );
     }
 
