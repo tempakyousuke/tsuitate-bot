@@ -1,0 +1,11 @@
+{
+  "_comment": "issue #28 P0-6 の w スイープ取り直し（PR #30 レビュー2巡目 [P1]）。probe は w に依らず corrected 済みなので run_probe=false。policy_w は事前登録した集合を全部回す",
+  "arena_run_id": "32697854659",
+  "continue_seeds": 2,
+  "max_safe": 4,
+  "continue_budget_ms": 700,
+  "opponent": "estimator_v14",
+  "policy_w": "2,4,8,16,30",
+  "run_probe": false,
+  "shards": 4
+}
