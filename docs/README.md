@@ -18,5 +18,5 @@
 | `checkpoint-arena-p0.md` | 計画/記録 | 2026-08-23。issue #19 の P0。実装と計測経路は入った。続行/縮小/撤退の判断は「撤退判断」節 |
 | `frozen-hermetic-boundary.md` | 設計/運用 | 2026-08-24。issue #21。設定境界（`config.rs`）・凍結境界の分類・ガードの一覧。**共有モデルの更新で v12〜v14 が動く**ことの記録も |
 | `eval-rank-residual-p0.md` | 計画/記録 | 2026-08-26。issue #24 の P0。**不合格で P1 の runtime 実装はしない**（順位一致は上がるが選ぶ手は良くならない・未採点手への逃避）。指標の落とし穴（未採点 top-1 の仮点埋め）で初版の符号が反転した記録も。再判定に要る2条件は「再判定に要るもの」節 |
-| `mate-economy-p0.md` | 計画/記録 | 2026-08-27。issue #28 の P0。計測基盤（`mate_moves_in_1_fast`・`analyze` の詰み経済セクション）と P0-3（`bin/mate_probe` の較正・argmax シミュレーション）・P0-6（`bin/mate_continue` の一手強制の継続診断）が入った段階。**採否の判定はまだ出していない**（CI の `Mate economy` を実際の Arena 実行に対して回すのが次。P0-1 の時系列・P0-4・P0-5 も残り） |
+| `mate-economy-p0.md` | 計画/記録 | 2026-08-27。issue #28 の P0。計測基盤・P0-3（`bin/mate_probe`）・P0-6（`bin/mate_continue`）が入り、**CI で v14 相手104局の実測を取った**。P0-6 は `Δoracle` +0.111（正直版 +0.048・baseline +0.024）で中止条件は回避、**`Δpolicy` は +0.034 で必要条件 0.04 に届かない**（ペナルティ自身の寄与は +0.010 = ノイズ圏）。P0-3 の較正と P0-1 の時系列・P0-4・P0-5 が残り |
 | `tsuitate-viewer-webhook-bot.md` | 運用 | `webhook_bot` の現行手順。既定戦略は凍結版 `estimator_v10` |
