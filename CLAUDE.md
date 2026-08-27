@@ -14,7 +14,21 @@
   `pub mod frozen;` に付けた `#[allow(...)]` で抑止してあるので、警告が出るのは
   現行コードだけ。**CI のツールチェインは固定**（`-D warnings` と `@stable` の
   組み合わせは rustc が lint を足した日に無関係な PR を落とすため）なので、
-  上げるときは手元で警告ゼロを確認してから test.yml のバージョンを書き換える
+  上げるときは手元で警告ゼロを確認してから test.yml のバージョンを書き換える。
+  **NN の速度しきい値テスト**（`forward_pass_is_fast_enough_for_hot_loop`、
+  value_nn / value_nn_v22 / opp_move_nn）は **debug の `cargo test` から
+  `--skip` で外し、`cargo test --release --lib` の専用ステップで測る**
+  （issue #26、2026-08-27）。debug 側のしきい値 2ms/回 は手元実測 514〜522µs に
+  対して約3.9倍の余裕しかなく、GitHub のランナーはそれより約4.2倍遅い
+  （実測 2.1〜2.3ms/回）ので断続的に落ちていた（PR #25 のブランチで CI 10回中2回。
+  再実行で緑 = 回帰ではなくランナー差）。release 側は 100µs/回 に対して実測
+  2.4〜2.8µs/回 = **36〜41倍の余裕**なので揺れず、**性能回帰の門はそのまま残る**
+  （debug の assert を消すだけだと門が無くなる）。しきい値の定数は
+  `src/value_nn.rs` 等にそのまま残してあるので、ローカルの `cargo test` では
+  従来どおり debug 側も走る。**`src/value_nn_v22.rs` は触らない**:
+  `frozen::SHARED_MODEL_PINS` がファイル全体を sha256 しているので、テストの
+  定数だけを直しても pin 更新が要り、ランタイム挙動は不変なのに v12〜v14 の
+  `behavior_fingerprint` が変わる（workflow 側で解決すればこの副作用はゼロ）
 - `cargo test --release -- --ignored` — 遅い検証（shogi.rs の perft depth 4/5）
 - `cargo run --release --bin arena -- [対局数] [候補] [基準1] [基準2] ...` — 戦略同士の対戦。
   基準を複数並べるとガントレット（候補が各基準と対局数ずつ対戦）。
