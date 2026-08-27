@@ -227,7 +227,10 @@ arm は4種類:
 
 `arena_run_id` を渡すと `arena-records-*` を落としてそれを使う（**追加の対局
 コストはゼロ**・局面分布が実際の対局分布と一致する）。空ならリポジトリの
-`records/`（対人59局）を使う。P0-6 は局単位でシャードに割り、aggregate ジョブが
+`records/`（対人59局）を使う。**ガントレットの run は相手ごとに artifact が
+分かれる**ので、`records_pattern`（例 `arena-records-estimator_v14-*`）で
+絞って継続対局の `opponent` と揃えること（v13 相手の棋譜に v14 を継続相手として
+当てると、`Δ` が「受けの効果」と「相手が変わった効果」の混合になる）。P0-6 は局単位でシャードに割り、aggregate ジョブが
 `mate_continue report` で合算する。**シャードが1つでも欠けたら失敗させる**
 （Δ の分母が狂うため。issue #19 の shard 欠落の教訓）。
 

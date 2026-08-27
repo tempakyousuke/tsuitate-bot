@@ -569,6 +569,10 @@
   `gh` が無ければ `.github/ci/mate-economy.request.json` を置いて push（削除の push は
   全ジョブがスキップされる）。`arena_run_id` を渡すと `arena-records-*` を落として
   使う（**追加の対局コストはゼロ**・局面分布が実際の対局分布と一致する）。
+  ガントレットの run は相手ごとに artifact が分かれるので、`records_pattern`
+  （例 `arena-records-estimator_v14-*`）で絞って継続対局の `opponent` と揃えること
+  （v13 相手の棋譜に v14 を継続相手として当てると、Δ が「受けの効果」と
+  「相手が変わった効果」の混合になる）。
   P0-6 は局単位のシャードで回し、aggregate が `mate_continue report` で合算する
   （**シャードが欠けたら失敗させる** = Δ の分母が狂うため）。
   設計・実測・判定は `docs/mate-economy-p0.md`

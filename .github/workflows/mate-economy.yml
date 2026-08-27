@@ -24,6 +24,10 @@ on:
         description: "棋譜の取得元 Arena 実行ID（空ならリポジトリの records/ を使う）"
         required: false
         default: ""
+      records_pattern:
+        description: "取ってくる artifact のパターン。**ガントレットの run は相手ごとに分かれる**ので、継続対局の opponent と揃えること（例 arena-records-estimator_v14-*）"
+        required: false
+        default: "arena-records-*"
       probe_seeds:
         description: "P0-3 の決定点あたり seed 数（少数シードの差は判定に使わないこと）"
         required: false
@@ -70,6 +74,7 @@ jobs:
     outputs:
       skip: ${{ steps.split.outputs.skip }}
       arena_run_id: ${{ steps.split.outputs.arena_run_id }}
+      records_pattern: ${{ steps.split.outputs.records_pattern }}
       probe_seeds: ${{ steps.split.outputs.probe_seeds }}
       controls: ${{ steps.split.outputs.controls }}
       probe_budget_ms: ${{ steps.split.outputs.probe_budget_ms }}
@@ -85,6 +90,7 @@ jobs:
         env:
           EVENT_NAME: ${{ github.event_name }}
           IN_RUN_ID: ${{ github.event.inputs.arena_run_id }}
+          IN_RECORDS_PATTERN: ${{ github.event.inputs.records_pattern }}
           IN_PROBE_SEEDS: ${{ github.event.inputs.probe_seeds }}
           IN_CONTROLS: ${{ github.event.inputs.controls }}
           IN_PROBE_BUDGET: ${{ github.event.inputs.probe_budget_ms }}
@@ -99,6 +105,7 @@ jobs:
           req='.github/ci/mate-economy.request.json'
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             run_id="${IN_RUN_ID:-}"
+            records_pattern="${IN_RECORDS_PATTERN:-arena-records-*}"
             probe_seeds="${IN_PROBE_SEEDS:-3}"
             controls="${IN_CONTROLS:-1}"
             probe_budget="${IN_PROBE_BUDGET:-2000}"
@@ -116,6 +123,7 @@ jobs:
               {
                 echo "skip=true"
                 echo "arena_run_id="
+                echo "records_pattern=arena-records-*"
                 echo "probe_seeds=3"
                 echo "controls=1"
                 echo "probe_budget_ms=2000"
@@ -129,6 +137,7 @@ jobs:
               exit 0
             fi
             run_id=$(jq -r '.arena_run_id // ""' "$req")
+            records_pattern=$(jq -r '.records_pattern // "arena-records-*"' "$req")
             probe_seeds=$(jq -r '.probe_seeds // 3' "$req")
             controls=$(jq -r '.controls // 1' "$req")
             probe_budget=$(jq -r '.probe_budget_ms // 2000' "$req")
@@ -147,6 +156,7 @@ jobs:
           {
             echo "skip=false"
             echo "arena_run_id=$run_id"
+            echo "records_pattern=$records_pattern"
             echo "probe_seeds=$probe_seeds"
             echo "controls=$controls"
             echo "probe_budget_ms=$probe_budget"
@@ -171,7 +181,7 @@ jobs:
         if: needs.plan.outputs.arena_run_id != ''
         uses: actions/download-artifact@v7
         with:
-          pattern: arena-records-*
+          pattern: ${{ needs.plan.outputs.records_pattern }}
           path: records-in
           run-id: ${{ needs.plan.outputs.arena_run_id }}
           github-token: ${{ github.token }}
@@ -222,7 +232,7 @@ jobs:
         if: needs.plan.outputs.arena_run_id != ''
         uses: actions/download-artifact@v7
         with:
-          pattern: arena-records-*
+          pattern: ${{ needs.plan.outputs.records_pattern }}
           path: records-in
           run-id: ${{ needs.plan.outputs.arena_run_id }}
           github-token: ${{ github.token }}
