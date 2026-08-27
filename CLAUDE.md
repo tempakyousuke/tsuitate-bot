@@ -540,8 +540,8 @@
   - **思考予算はプロセス env**（粒子構築 `build_estimator` と候補評価 `ranking_one`
     で同じ scale を使うため、ここでは上書きしない）
 - `TSUITATE_THINK_BUDGET_MS=700 cargo run --release --bin mate_continue -- [--seeds 2]
-  [--max-safe 4] [--opponent estimator_v14] [--policy-w 4] [--shard i/n] [--out out.jsonl]
-  <records...>` / `mate_continue report <out-*.jsonl...>` — **一手強制の継続診断**
+  [--max-safe 4] [--opponent estimator_v14] [--policy-w 2,4,8,16,30] [--shard i/n]
+  [--out out.jsonl] <records...>` / `mate_continue report <out-*.jsonl...>` — **一手強制の継続診断**
   （issue #28 P0-6、2026-08-27）。「最後に受けられた決定点」から一手だけ強制して
   `selfplay::play_continuation`（通常アリーナと同じ裁定関数・**時計は無効**）で
   終局まで指し継ぎ、勝1/分0.5/負0 で数える。**受けが勝敗へどれだけ変換されうるか**の
@@ -591,8 +591,11 @@
   設計・実測・判定は `docs/mate-economy-p0.md`。
   **実測（w スイープ run 33081827712、v14 相手104局・事前登録した w=2,4,8,16,30 を
   全部。初回 run 33055734354 は PR #30 レビュー1巡目で撤回 = q を別に作り直した
-  推定器で測っていた・継続の乱数が arm ごとに違った。JSONL の schema は 3 で
-  schema 1/2 は `report` が弾く）で P0 の判定は「P1 へ進まない」**:
+  推定器で測っていた・継続の乱数が arm ごとに違った。この run の JSONL は schema 3、
+  現行の書き出しは **schema 4**（レビュー3巡目で meta の並列度を
+  `policy_jobs` / `continuation_jobs` に分けた）。`report` は 3/4 を読めるが
+  **同じ集計の中で混ぜられない**・schema 1/2 は弾く）で P0 の判定は
+  「P1 へ進まない」**:
   `Δoracle` **+0.125**（正直版 +0.087。指し直しの対照 baseline が +0.014 あるので
   実質 +0.111）で中止条件は回避したが、**`Δpolicy` は事前登録した w のどれでも
   0.04 に届かない**（最大 `policy_strict@w8` +0.0385。w=0 対照が +0.024 なので

@@ -172,6 +172,16 @@ pub fn for_each_decision_full(
 /// この2つで足りる。どちらか欠けていたら None（その局は捨てる）。
 pub fn load_bot_and_end(path: &str) -> Option<(Color, GameEndPayload)> {
     let content = std::fs::read_to_string(path).ok()?;
+    parse_bot_and_end(&content)
+}
+
+/// `load_bot_and_end` の**中身版**（ディスクを読み直さない）。
+///
+/// 記録集合の指紋を取る診断（`bin/mate_continue`）は、**解析に渡したのと
+/// 同じ bytes** から指紋を作らないと TOCTOU になる（PR #30 レビュー3巡目 [P1]:
+/// A を読んだ後に同じパスを B へ差し替えると、行は A 由来なのに meta は B の
+/// 指紋になり、B 由来の別シャードと「同じ母集団」として集約を通ってしまう）。
+pub fn parse_bot_and_end(content: &str) -> Option<(Color, GameEndPayload)> {
     let mut color = None;
     let mut end = None;
     for line in content.lines() {

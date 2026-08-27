@@ -24,7 +24,7 @@
 //!
 //! usage:
 //!   TSUITATE_THINK_BUDGET_MS=700 cargo run --release --bin mate_continue -- \
-//!     [--seeds 2] [--max-safe 4] [--opponent estimator_v14] [--policy-w 4] \
+//!     [--seeds 2] [--max-safe 4] [--opponent estimator_v14] [--policy-w 2,4,8,16,30] \
 //!     [--jobs N] [--shard i/n] [--out out.jsonl] <records/*.jsonl...>
 //!   cargo run --release --bin mate_continue -- report <out-*.jsonl...>
 //!
@@ -46,21 +46,29 @@ use tsuitate_bot::scenario_core::{
 use tsuitate_bot::selfplay::{GameResult, StartState, mix, play_continuation};
 use tsuitate_bot::shogi::{Position, ShogiMove};
 use tsuitate_bot::strategy::{self, candidate_moves};
-use tsuitate_bot::truth_replay::{for_each_decision_full, load_bot_and_end};
+use tsuitate_bot::truth_replay::for_each_decision_full;
 
-/// JSONL の schema。`report` はこの値以外を弾く。
+/// 今書き出す JSONL の schema。
 ///
 /// - **schema 1 は撤回**（PR #30 レビュー1巡目の指摘②④の修正前に取った記録で、
 ///   q が別の粒子集合・継続の乱数が arm ごとに違う）
 /// - **schema 2 は単一 w の記録**（arm 名が `policy_strict` / `policy_all`、
 ///   meta は `policy_w`）。run 33073983617 の値は w=4 の測定としては有効だが、
-///   arm の語彙が違うので schema 3 とは混ぜられない（レビュー2巡目 [P1] で
+///   arm の語彙が違うので schema 3 以降とは混ぜられない（レビュー2巡目 [P1] で
 ///   「事前登録した有限個の w を全部回す」形になった）
-const ROW_SCHEMA: u32 = 3;
+/// - **schema 3 は行の内容が 4 と同じで、meta の実験キーだけが粗い**
+///   （並列度が `jobs` 1本。レビュー3巡目 [P2] で `policy_jobs` /
+///   `continuation_jobs` に分けた）。**撤回はしていない**ので `report` は
+///   読めるが、4 と混ぜることはできない（下記 `READABLE_SCHEMAS`）
+const ROW_SCHEMA: u32 = 4;
+
+/// `report` が読める schema。**同じ集計の中で混ぜることはできない**
+/// （3 と 4 は実験キーの粒度が違うので、同じ `jobs` でも別条件かもしれない）。
+const READABLE_SCHEMAS: &[u32] = &[3, 4];
 
 fn usage() -> &'static str {
     "usage: cargo run --release --bin mate_continue -- [--seeds 2] [--max-safe 4] \
-     [--opponent estimator_v14] [--policy-w 4] [--jobs N] [--shard i/n] [--out out.jsonl] \
+     [--opponent estimator_v14] [--policy-w 2,4,8,16,30] [--jobs N] [--shard i/n] [--out out.jsonl] \
      [--allow-opponent-mismatch] <records/*.jsonl...>\n        または: mate_continue report [--allow-incomplete] <out-*.jsonl...>"
 }
 
@@ -138,26 +146,42 @@ fn collect_records(specs: &[String]) -> Vec<PathBuf> {
 }
 
 
+/// 記録集合を**開始時に一度だけ**読む（名前と bytes）。
+///
+/// PR #30 レビュー3巡目 [P1]: 指紋を継続対局の**後**にディスクから取り直すと
+/// TOCTOU になる（A を読んで30分継続した後にパスが B へ差し替わっていると、
+/// 行は A 由来なのに meta は B の指紋になり、B 由来の別シャードと
+/// 「同じ母集団」として集約を通ってしまう）。解析も指紋もこの bytes だけを見る。
+fn read_records(files: &[PathBuf]) -> Vec<(PathBuf, Vec<u8>)> {
+    files
+        .iter()
+        .map(|p| {
+            let bytes = std::fs::read(p).unwrap_or_else(|e| die(&format!("{}: {e}", p.display())));
+            (p.clone(), bytes)
+        })
+        .collect()
+}
+
 /// 記録集合の指紋（**ファイル名と中身の両方**）。シャードは同じ集合を見るので、
 /// これが食い違う JSONL は別実験（`report` が弾く）。
 ///
 /// PR #30 レビュー2巡目 [P2]: 名前だけを hash すると、**同名で中身の違う記録**
 /// （別の Arena 実行から落とした同じ artifact 名など）が「同じ母集団」を
 /// 通ってしまう。名前と bytes の境界も含めて hash する。
-fn records_fingerprint(files: &[PathBuf]) -> String {
+/// 引数は `read_records` が開始時に読んだ bytes（ディスクは読み直さない）。
+fn records_fingerprint(records: &[(PathBuf, Vec<u8>)]) -> String {
     use sha2::Digest as _;
-    let mut entries: Vec<(String, Vec<u8>)> = files
+    let mut entries: Vec<(String, &[u8])> = records
         .iter()
-        .map(|p| {
+        .map(|(p, bytes)| {
             let name = p
                 .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            let bytes = std::fs::read(p).unwrap_or_else(|e| die(&format!("{}: {e}", p.display())));
-            (name, bytes)
+            (name, bytes.as_slice())
         })
         .collect();
-    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
     let mut h = sha2::Sha256::new();
     h.update(entries.len().to_string().as_bytes());
     for (name, bytes) in &entries {
@@ -418,6 +442,9 @@ fn main() {
     if files.is_empty() {
         die("記録ファイルが見つかりません");
     }
+    // **開始時に読んだ bytes だけを使う**（解析も指紋も。PR #30 レビュー3巡目 [P1]）
+    let records = read_records(&files);
+    let records_fp = records_fingerprint(&records);
     if seeds % 2 != 0 {
         eprintln!("注意: --seeds が奇数だと「前半で選び後半で測る」正直版が偏ります");
     }
@@ -435,9 +462,12 @@ fn main() {
     // 記録の元相手の内訳（判定の前提を出力へ残す）と、不一致で捨てた局
     let mut record_opponents: BTreeMap<String, u32> = BTreeMap::new();
     let mut mismatched: Vec<(String, String)> = vec![];
-    for (gi, path) in files.iter().enumerate() {
+    for (gi, (path, bytes)) in records.iter().enumerate() {
         let name = path.to_string_lossy().to_string();
-        let Some((bot, end)) = load_bot_and_end(&name) else {
+        let Some((bot, end)) = std::str::from_utf8(bytes)
+            .ok()
+            .and_then(tsuitate_bot::truth_replay::parse_bot_and_end)
+        else {
             broken += 1;
             continue;
         };
@@ -539,7 +569,7 @@ fn main() {
     println!(
         "記録 {} 件（壊れ {broken}）/ 局 {games_total}（詰み負け {games_mated}・受けが候補にあった {games_with_defense}）\n\
          記録の相手: {}",
-        files.len(),
+        records.len(),
         fmt_tally(&record_opponents),
     );
     println!(
@@ -564,6 +594,11 @@ fn main() {
     let policy: Arc<Mutex<HashMap<(usize, u64), BTreeMap<String, Vec<String>>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let points_ref = Arc::new(points);
+    // ランキング/q 生成の**実効並列度**は継続対局とは別（決定点×seed の数で
+    // clamp される）。壁時計予算なのでここも探索量を変える実験条件になる
+    // （PR #30 レビュー3巡目 [P2]: 疎なシャードでは policy 2並列・継続 3並列の
+    // ように食い違い、`jobs` 1つだと別条件のシャードが同じ値で集約を通る）
+    let policy_jobs = jobs.min(policy_units.len().max(1)).max(1);
     run_parallel(jobs, policy_units.len(), |ui| {
         let (pi, seed) = policy_units[ui];
         let p = &points_ref[pi];
@@ -624,7 +659,7 @@ fn main() {
     let lines: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(vec![]));
     // **実効並列度**（壁時計予算なので、同時に走る unit 数は探索量を変える
     // = 実験条件。issue #24 の教訓と同じ）
-    let effective_jobs = jobs.min(units.len().max(1)).max(1);
+    let continuation_jobs = jobs.min(units.len().max(1)).max(1);
     let started = std::time::Instant::now();
     {
         let units = &units;
@@ -665,19 +700,21 @@ fn main() {
     // **判定に効く実験キー**（PR #30 レビュー指摘③）。`report` は全シャードで
     // これが完全一致していることを要求する。局数だけ合っていれば混ざる、
     // という状態を無くすため相手・予算・seed 数・方策・実効並列度・
-    // コード版・記録集合の指紋まで入れる（壁時計計測なので jobs も実験条件）
+    // コード版・記録集合の指紋まで入れる（壁時計計測なので jobs も実験条件。
+    // ランキング段と継続段は clamp 先が違うので**別々に**残す）
     let experiment = serde_json::json!({
         "opponent": opponent,
         "budget_ms": budget_ms,
         "seeds": seeds,
         "max_safe": max_safe,
         "policy_ws": policy_ws.iter().map(|w| fmt_w(*w)).collect::<Vec<_>>(),
-        "jobs": effective_jobs,
+        "policy_jobs": policy_jobs,
+        "continuation_jobs": continuation_jobs,
         "games": games_total,
         "shard_total": shard.1,
         "config": cfg.fingerprint(),
         "source_fingerprint": env!("TSUITATE_SOURCE_FINGERPRINT"),
-        "records": records_fingerprint(&files),
+        "records": records_fp,
     });
     let meta = serde_json::json!({
         "schema": ROW_SCHEMA,
@@ -757,6 +794,7 @@ fn report_files(args: &[String]) {
     }
     let mut metas = vec![];
     let mut rows = vec![];
+    let mut seen_schema: Option<u32> = None;
     for p in &paths {
         let Ok(text) = std::fs::read_to_string(p) else {
             die(&format!("{p}: 読めません"));
@@ -765,8 +803,18 @@ fn report_files(args: &[String]) {
             let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
                 die(&format!("{p}: JSON として読めない行があります"));
             };
-            if v["schema"].as_u64() != Some(u64::from(ROW_SCHEMA)) {
-                die(&format!("{p}: schema が {ROW_SCHEMA} ではありません（撤回済みの記録は混ぜない）"));
+            let schema = v["schema"].as_u64().unwrap_or(0) as u32;
+            if !READABLE_SCHEMAS.contains(&schema) {
+                die(&format!(
+                    "{p}: schema {schema} は読めません（読めるのは {READABLE_SCHEMAS:?}。\
+撤回済みの記録は混ぜない）"
+                ));
+            }
+            match seen_schema {
+                Some(s) if s != schema => die(&format!(
+                    "{p}: schema {schema} と {s} を混ぜています（実験キーの粒度が違う）"
+                )),
+                _ => seen_schema = Some(schema),
             }
             if v["type"] == "meta" {
                 metas.push(v);
@@ -1070,10 +1118,19 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
     let d_w0 = policy_of("policy_w0");
 
     println!("\n=== P0-6: 一手強制の継続診断 ===");
+    // 並列度は**段ごと**に記録する（レビュー3巡目 [P2]）。段別の記録が入る前に
+    // 取った JSONL は `jobs` 1本しか持たないので、そのときはそう明示して出す
+    // （掲載済みの実測 artifact をそのまま再集計できるようにしておく）
+    let jobs_disp = if exp["policy_jobs"].is_null() && exp["continuation_jobs"].is_null() {
+        format!("{}（段別の記録なし）", exp["jobs"])
+    } else {
+        format!("{}/{}", exp["policy_jobs"], exp["continuation_jobs"])
+    };
     println!(
-        "  実験: 相手 {} / 予算 {}ms / seeds {} / max_safe {} / policy_w {} / jobs {} / 記録 {} / code {}",
+        "  実験: 相手 {} / 予算 {}ms / seeds {} / max_safe {} / policy_w {} / \
+jobs(ランキング/継続) {jobs_disp} / 記録 {} / code {}",
         exp["opponent"], exp["budget_ms"], exp["seeds"], exp["max_safe"], exp["policy_ws"],
-        exp["jobs"], exp["records"], exp["source_fingerprint"],
+        exp["records"], exp["source_fingerprint"],
     );
     println!(
         "全 {games_total}局（詰み負け {games_mated}・継続した局 {}）/ 継続 {} 局ぶん{}",
@@ -1265,7 +1322,8 @@ mod tests {
     fn exp_of(opponent: &str) -> serde_json::Value {
         serde_json::json!({
             "opponent": opponent, "budget_ms": 700, "seeds": 2, "max_safe": 4,
-            "policy_ws": ["4", "8"], "jobs": 3, "games": 104, "shard_total": 2,
+            "policy_ws": ["4", "8"], "policy_jobs": 3, "continuation_jobs": 3,
+            "games": 104, "shard_total": 2,
             "config": "cfg", "source_fingerprint": "src", "records": "rec",
         })
     }
@@ -1397,18 +1455,70 @@ mod tests {
         let one = write("1.jsonl", "a");
         let two = write("2.jsonl", "b");
 
-        let a = records_fingerprint(&[one.clone(), two.clone()]);
-        let b = records_fingerprint(&[two.clone(), one.clone()]);
+        let a = records_fingerprint(&read_records(&[one.clone(), two.clone()]));
+        let b = records_fingerprint(&read_records(&[two.clone(), one.clone()]));
         assert_eq!(a, b, "並び順には依らない");
-        assert_ne!(a, records_fingerprint(&[one.clone()]), "集合が違えば変わる");
+        assert_ne!(
+            a,
+            records_fingerprint(&read_records(&[one.clone()])),
+            "集合が違えば変わる"
+        );
 
         // **同名で中身が違う**記録は別集合として扱う（レビュー2巡目 [P2]）
         write("2.jsonl", "b2");
         assert_ne!(
             a,
-            records_fingerprint(&[one.clone(), two.clone()]),
+            records_fingerprint(&read_records(&[one.clone(), two.clone()])),
             "中身が変われば指紋も変わる"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// **指紋は解析に渡した bytes から作る**（レビュー3巡目 [P1]）。
+    /// 開始時に読んだ集合を持ち回るので、継続対局の途中でパスの中身が
+    /// 差し替わっても「行は A 由来・meta は B の指紋」にはならない。
+    #[test]
+    fn 指紋は開始時に読んだbytesから作る() {
+        let dir = std::env::temp_dir().join(format!("mate-continue-toctou-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("g.jsonl");
+        std::fs::write(&path, "A").unwrap();
+
+        // 開始時に読む（この bytes だけを解析にも指紋にも使う）
+        let records = read_records(&[path.clone()]);
+        let fp = records_fingerprint(&records);
+
+        // 継続対局の最中に同じパスが差し替わったとする
+        std::fs::write(&path, "B").unwrap();
+
+        assert_eq!(
+            fp,
+            records_fingerprint(&records),
+            "終了時に読み直さないので指紋は動かない"
+        );
+        assert_eq!(records[0].1, b"A", "解析に渡る bytes も開始時のまま");
+        assert_ne!(
+            fp,
+            records_fingerprint(&read_records(&[path.clone()])),
+            "読み直せば別集合になる（＝差し替えを素通ししているわけではない）"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// ランキング段と継続段の実効並列度は別々に記録する（レビュー3巡目 [P2]）
+    #[test]
+    fn 実験キーはランキングと継続の並列度を分けて持つ() {
+        let mut a = exp_of("estimator_v14");
+        let b = a.clone();
+        assert_eq!(a, b);
+        // 疎なシャード（決定点が少なくランキングだけ 2 並列）は別実験
+        a["policy_jobs"] = serde_json::json!(2);
+        assert_ne!(a, b, "policy_jobs だけが違っても別実験として弾ける");
+        let metas = vec![meta(b, 0), meta(a, 1)];
+        let errs = check_inputs(&metas, &[]);
+        assert!(
+            errs.iter().any(|e| e.contains("policy_jobs")),
+            "実験キーの食い違いとして報告される: {errs:?}"
+        );
     }
 }

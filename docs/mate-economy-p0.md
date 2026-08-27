@@ -179,14 +179,15 @@ TSUITATE_THINK_BUDGET_MS=2000 cargo run --release --bin mate_probe -- \
 
 ```
 TSUITATE_THINK_BUDGET_MS=700 cargo run --release --bin mate_continue -- \
-  [--seeds 2] [--max-safe 4] [--opponent estimator_v14] [--policy-w 4] \
+  [--seeds 2] [--max-safe 4] [--opponent estimator_v14] [--policy-w 2,4,8,16,30] \
   [--jobs N] [--shard i/n] [--out out.jsonl] <records...>
 cargo run --release --bin mate_continue -- report <out-*.jsonl...>
 ```
 
 「最後に受けられた決定点」から**一手だけ強制**して `selfplay::play_continuation`
 （通常アリーナと同じ裁定関数）で終局まで指し継ぎ、勝1 / 分0.5 / 負0 で数える。
-arm は4種類:
+arm は次の5系統（方策系は事前登録した w ごとに1本ずつなので、既定では
+`baseline` / `oracle` / `policy_w0` ＋ `policy_strict@w*` 5本 ＋ `policy_all@w*` 5本 = 13 arm）:
 
 | arm | 強制する手 | 役割 |
 | --- | --- | --- |
@@ -274,7 +275,32 @@ arm は4種類:
 3. **記録集合の指紋**はファイル名だけでなく**中身の bytes** も hash する
    （同名で中身の違う記録が「同じ母集団」を通らないように）
 4. JSONL の schema は **3**（arm の語彙が変わったので schema 2 とは混ぜられない。
-   schema 2 = run 33073983617 は w=4 単点の測定としては有効）
+   schema 2 = run 33073983617 は w=4 単点の測定としては有効）。
+   掲載した w スイープ run 33081827712 はこの schema 3 で、レビュー3巡目の
+   実験キー分割で現行の書き出しは schema 4 になった（`report` は 3/4 とも
+   読めるが**混ぜられない**ので、この run はそのまま再集計できる）
+
+### PR #30 レビュー3巡目の反映（2026-08-27）
+
+いずれも**掲載済みの実測値は動かない**（run 33081827712 は全シャードで決定点が
+5件以上あり、ランキング段も継続段も 3 並列。記録ファイルが差し替わった形跡も無い）。
+今後の実験契約の穴を塞ぐ修正:
+
+1. **指紋の TOCTOU**: `records_fingerprint` が継続対局の**後**にディスクを
+   読み直していた。A を読んで30分継続する間にパスが B へ差し替わると、
+   行は A 由来なのに meta は B の指紋になり、B 由来の別シャードと
+   「同じ母集団」として集約を通ってしまう。**開始時に一度だけ読んだ bytes**
+   （`read_records`）を解析にも指紋にも使う形にした（`truth_replay::parse_bot_and_end`
+   がその bytes から直接 parse する。`bin/export_eval_rank_data` の
+   `data_fingerprint` と同じ規約 = 「ディスクを読み直さない」）
+2. **並列度は段ごとに記録する**: ランキング/q 生成の実効並列度は
+   `min(jobs, 決定点×seed)`、継続対局は `min(jobs, 候補列の数)` で **clamp 先が違う**。
+   決定点の少ない疎なシャードでは「ランキング 2 並列・継続 3 並列」になり、
+   ランキングも 3 並列だった別シャードと同じ `jobs: 3` で集約を通ってしまう。
+   壁時計予算なのでランキング段の並列度も探索量を変える実験条件なので、
+   実験キーへ **`policy_jobs` / `continuation_jobs` を別々に**残す
+   （`jobs` 1本しか持たない旧 JSONL は `report` がそう明示して出すので、
+   掲載済み artifact はそのまま再集計できる）
 
 ### CI: `.github/workflows/mate-economy.yml`
 
