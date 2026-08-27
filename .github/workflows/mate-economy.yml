@@ -57,9 +57,13 @@ on:
         required: false
         default: "estimator_v14"
       policy_w:
-        description: "P0-6 の Δpolicy が使う危険量の重み w（P0-3 の最小 w から選ぶ）"
+        description: "P0-6 の Δpolicy が使う危険量の重み。**カンマ区切りで事前登録した集合を全部回す**（probe と continue は同時に走るので、その run の P0-3 結果から1点を選ぶことはできない）"
         required: false
-        default: "4"
+        default: "2,4,8,16,30"
+      run_probe:
+        description: "P0-3（probe）も走らせるか。false なら P0-6 だけ取り直す（probe は w に依らないので、w を変えた再計測では不要）"
+        required: false
+        default: "true"
       shards:
         description: "P0-6 の分割数（局単位で割る）"
         required: false
@@ -83,6 +87,7 @@ jobs:
       continue_budget_ms: ${{ steps.split.outputs.continue_budget_ms }}
       opponent: ${{ steps.split.outputs.opponent }}
       policy_w: ${{ steps.split.outputs.policy_w }}
+      run_probe: ${{ steps.split.outputs.run_probe }}
       shards: ${{ steps.split.outputs.shards }}
     steps:
       - uses: actions/checkout@v5
@@ -99,6 +104,7 @@ jobs:
           IN_CONT_BUDGET: ${{ github.event.inputs.continue_budget_ms }}
           IN_OPPONENT: ${{ github.event.inputs.opponent }}
           IN_POLICY_W: ${{ github.event.inputs.policy_w }}
+          IN_RUN_PROBE: ${{ github.event.inputs.run_probe }}
           IN_SHARDS: ${{ github.event.inputs.shards }}
         run: |
           set -euo pipefail
@@ -113,7 +119,8 @@ jobs:
             max_safe="${IN_MAX_SAFE:-4}"
             cont_budget="${IN_CONT_BUDGET:-700}"
             opponent="${IN_OPPONENT:-estimator_v14}"
-            policy_w="${IN_POLICY_W:-4}"
+            policy_w="${IN_POLICY_W:-2,4,8,16,30}"
+            run_probe="${IN_RUN_PROBE:-true}"
             shards="${IN_SHARDS:-4}"
           else
             if [ ! -f "$req" ]; then
@@ -131,7 +138,8 @@ jobs:
                 echo "max_safe=4"
                 echo "continue_budget_ms=700"
                 echo "opponent=estimator_v14"
-                echo "policy_w=4"
+                echo "policy_w=2,4,8,16,30"
+                echo "run_probe=true"
                 echo "shards=4"
               } >> "$GITHUB_OUTPUT"
               exit 0
@@ -145,7 +153,8 @@ jobs:
             max_safe=$(jq -r '.max_safe // 4' "$req")
             cont_budget=$(jq -r '.continue_budget_ms // 700' "$req")
             opponent=$(jq -r '.opponent // "estimator_v14"' "$req")
-            policy_w=$(jq -r '.policy_w // 4' "$req")
+            policy_w=$(jq -r 'if (.policy_w | type) == "array" then (.policy_w | map(tostring) | join(",")) else (.policy_w // "2,4,8,16,30" | tostring) end' "$req")
+            run_probe=$(jq -r '.run_probe // true | tostring' "$req")
             shards=$(jq -r '.shards // 4' "$req")
           fi
           # **pattern は opponent から導出する**のを既定にする（PR #30 レビュー指摘①:
@@ -171,12 +180,13 @@ jobs:
             echo "continue_budget_ms=$cont_budget"
             echo "opponent=$opponent"
             echo "policy_w=$policy_w"
+            echo "run_probe=$run_probe"
             echo "shards=$(jq -n -c "[range(0; ${shards})]")"
           } >> "$GITHUB_OUTPUT"
 
   probe:
     needs: plan
-    if: needs.plan.outputs.skip != 'true'
+    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_probe != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:

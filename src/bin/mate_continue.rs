@@ -48,10 +48,15 @@ use tsuitate_bot::shogi::{Position, ShogiMove};
 use tsuitate_bot::strategy::{self, candidate_moves};
 use tsuitate_bot::truth_replay::{for_each_decision_full, load_bot_and_end};
 
-/// JSONL の schema。**schema 1 は撤回**（PR #30 レビュー指摘②④の修正前に取った
-/// 記録で、q が別の粒子集合・継続の乱数が arm ごとに違う）。`report` は
-/// schema 2 以外を弾く（撤回済みの数字が判定へ戻らないように）
-const ROW_SCHEMA: u32 = 2;
+/// JSONL の schema。`report` はこの値以外を弾く。
+///
+/// - **schema 1 は撤回**（PR #30 レビュー1巡目の指摘②④の修正前に取った記録で、
+///   q が別の粒子集合・継続の乱数が arm ごとに違う）
+/// - **schema 2 は単一 w の記録**（arm 名が `policy_strict` / `policy_all`、
+///   meta は `policy_w`）。run 33073983617 の値は w=4 の測定としては有効だが、
+///   arm の語彙が違うので schema 3 とは混ぜられない（レビュー2巡目 [P1] で
+///   「事前登録した有限個の w を全部回す」形になった）
+const ROW_SCHEMA: u32 = 3;
 
 fn usage() -> &'static str {
     "usage: cargo run --release --bin mate_continue -- [--seeds 2] [--max-safe 4] \
@@ -65,30 +70,27 @@ fn die(msg: &str) -> ! {
     std::process::exit(1);
 }
 
-/// 強制する手の由来
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Arm {
-    /// 実戦で指した手（指し直しの対照）
-    Baseline,
-    /// 真実の安全手（オラクル）
-    Oracle,
-    /// P0-3 のオフライン方策（厳密粒子の q / taint 込みの q）
-    PolicyStrict,
-    PolicyAll,
-    /// 同じ経路で w=0（= 現行方策そのもの）。**再決定のぶんを切り分ける対照**:
-    /// `Δpolicy − Δpolicy(w=0)` が危険量ペナルティ自身の効果になる
-    PolicyW0,
+/// 強制する手の由来（arm のタグ）。
+///
+/// - `baseline` … 実戦で指した手（指し直しの対照）
+/// - `oracle` … 真実の安全手
+/// - `policy_w0` … 同じ経路で w=0（＝現行方策そのもの）。**再決定のぶんを
+///   切り分ける対照**: `Δpolicy − Δpolicy(w=0)` が危険量ペナルティ自身の効果
+/// - `policy_strict@w<W>` / `policy_all@w<W>` … P0-3 のオフライン方策。
+///   **w は事前登録した有限集合を全部回す**（PR #30 レビュー2巡目 [P1]:
+///   probe と continue は同じ run で同時に走るので、その run の P0-3 結果から
+///   w を選ぶことはできない。1点だけ測ると「未計測の重みなら門を超えたかも
+///   しれない」を否定できない）
+fn policy_arm(taint: bool, w: f64) -> String {
+    format!("policy_{}@w{}", if taint { "all" } else { "strict" }, fmt_w(w))
 }
 
-impl Arm {
-    fn tag(&self) -> &'static str {
-        match self {
-            Arm::Baseline => "baseline",
-            Arm::Oracle => "oracle",
-            Arm::PolicyStrict => "policy_strict",
-            Arm::PolicyAll => "policy_all",
-            Arm::PolicyW0 => "policy_w0",
-        }
+/// w の表示（arm タグと meta で同じ表記にする）
+fn fmt_w(w: f64) -> String {
+    if (w - w.round()).abs() < 1e-9 {
+        format!("{}", w.round() as i64)
+    } else {
+        format!("{w}")
     }
 }
 
@@ -136,24 +138,36 @@ fn collect_records(specs: &[String]) -> Vec<PathBuf> {
 }
 
 
-/// 記録集合の指紋（ファイル名の並び）。**シャードは同じ集合を見る**ので、
-/// これが食い違う JSONL は別実験（`report` が弾く）
+/// 記録集合の指紋（**ファイル名と中身の両方**）。シャードは同じ集合を見るので、
+/// これが食い違う JSONL は別実験（`report` が弾く）。
+///
+/// PR #30 レビュー2巡目 [P2]: 名前だけを hash すると、**同名で中身の違う記録**
+/// （別の Arena 実行から落とした同じ artifact 名など）が「同じ母集団」を
+/// 通ってしまう。名前と bytes の境界も含めて hash する。
 fn records_fingerprint(files: &[PathBuf]) -> String {
     use sha2::Digest as _;
-    let mut names: Vec<String> = files
+    let mut entries: Vec<(String, Vec<u8>)> = files
         .iter()
         .map(|p| {
-            p.file_name()
+            let name = p
+                .file_name()
                 .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_default()
+                .unwrap_or_default();
+            let bytes = std::fs::read(p).unwrap_or_else(|e| die(&format!("{}: {e}", p.display())));
+            (name, bytes)
         })
         .collect();
-    names.sort();
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     let mut h = sha2::Sha256::new();
-    h.update(names.len().to_string().as_bytes());
-    for n in &names {
-        h.update(n.as_bytes());
-        h.update(b"\n");
+    h.update(entries.len().to_string().as_bytes());
+    for (name, bytes) in &entries {
+        // 長さを混ぜて名前と中身の境界を固定する（連結の曖昧さを避ける）
+        h.update(name.len().to_string().as_bytes());
+        h.update(b":");
+        h.update(name.as_bytes());
+        h.update(bytes.len().to_string().as_bytes());
+        h.update(b":");
+        h.update(bytes);
     }
     h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
@@ -322,7 +336,8 @@ fn main() {
     let mut seeds: u64 = 2;
     let mut max_safe: usize = 4;
     let mut opponent = "estimator_v14".to_string();
-    let mut policy_w: f64 = 4.0;
+    // **事前登録する w の集合**（レビュー2巡目 [P1]）。単一値でも渡せる
+    let mut policy_ws: Vec<f64> = vec![2.0, 4.0, 8.0, 16.0, 30.0];
     let mut jobs: usize =
         std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(2).max(1));
     let mut shard = (0usize, 1usize);
@@ -349,7 +364,16 @@ fn main() {
                 i += 2;
             }
             "--policy-w" => {
-                policy_w = need(args.get(i + 1), "--policy-w").parse().unwrap_or_else(|_| die("--policy-w は数値"));
+                policy_ws = need(args.get(i + 1), "--policy-w")
+                    .split(',')
+                    .filter(|t| !t.trim().is_empty())
+                    .map(|t| t.trim().parse::<f64>().unwrap_or_else(|_| die("--policy-w は数値（カンマ区切りで複数可）")))
+                    .collect();
+                policy_ws.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                policy_ws.dedup();
+                if policy_ws.is_empty() {
+                    die("--policy-w には少なくとも1つの重みが要ります");
+                }
                 i += 2;
             }
             "--jobs" => {
@@ -520,10 +544,11 @@ fn main() {
     );
     println!(
         "対象の決定点 {}（--max-safe {max_safe} で落とした安全手 {dropped_safe}本）/ 相手 {opponent} / \
-         思考予算 {budget_ms}ms / seeds {seeds} / jobs {jobs} / shard {}/{} / policy_w {policy_w}",
+         思考予算 {budget_ms}ms / seeds {seeds} / jobs {jobs} / shard {}/{} / policy_w {}",
         points.len(),
         shard.0,
         shard.1,
+        policy_ws.iter().map(|w| fmt_w(*w)).collect::<Vec<_>>().join(","),
     );
     if points.is_empty() {
         die("継続する決定点がありません");
@@ -535,7 +560,8 @@ fn main() {
         .flat_map(|p| (0..seeds).map(move |s| (p, s)))
         .collect();
     // 方策は argmax だけでなく**順序**を持つ（先頭が非合法なら次点へ = 実対局の反則）
-    let policy: Arc<Mutex<HashMap<(usize, u64), (Vec<String>, Vec<String>, Vec<String>)>>> =
+    // (決定点, seed) → arm タグ → 強制する候補列
+    let policy: Arc<Mutex<HashMap<(usize, u64), BTreeMap<String, Vec<String>>>>> =
         Arc::new(Mutex::new(HashMap::new()));
     let points_ref = Arc::new(points);
     run_parallel(jobs, policy_units.len(), |ui| {
@@ -550,34 +576,48 @@ fn main() {
         let particles = snapshot.entries();
         let rows = tsuitate_bot::mate_economy::build_rows(&p.rep.pos, &ranking, &particles);
         // 反則上限（10回）を超えて並べても意味が無いので先頭 12 本で足りる
-        let mut strict = rescored_usis(&rows, policy_w, false);
-        let mut all = rescored_usis(&rows, policy_w, true);
-        let mut w0 = rescored_usis(&rows, 0.0, false);
-        strict.truncate(12);
-        all.truncate(12);
-        w0.truncate(12);
-        policy.lock().unwrap().insert((pi, seed), (strict, all, w0));
+        let order = |w: f64, taint: bool| {
+            let mut v = rescored_usis(&rows, w, taint);
+            v.truncate(12);
+            v
+        };
+        let mut by_arm: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        by_arm.insert("policy_w0".to_string(), order(0.0, false));
+        for &w in &policy_ws {
+            by_arm.insert(policy_arm(false, w), order(w, false));
+            by_arm.insert(policy_arm(true, w), order(w, true));
+        }
+        by_arm.retain(|_, v| !v.is_empty());
+        policy.lock().unwrap().insert((pi, seed), by_arm);
     });
     let policy = Arc::try_unwrap(policy).ok().unwrap().into_inner().unwrap();
 
     // ---- 継続対局の unit ---------------------------------------------------
-    let mut units: Vec<(usize, u64, Arm, Vec<String>)> = vec![];
+    // **同じ候補列は1回だけ走らせて、結果を該当する arm 全部へ配る**。
+    // 継続の乱数は (局, 決定点, seed) だけから作るので、候補列が同じなら
+    // 継続は完全に同一（近似ではなく厳密な重複排除）。w を5点に増やしても
+    // 実際に走る継続数は「相異なる候補列の数」までしか増えない
+    let mut units: Vec<(usize, u64, Vec<String>, Vec<String>)> = vec![];
     for (pi, p) in points_ref.iter().enumerate() {
         for seed in 0..seeds {
-            units.push((pi, seed, Arm::Baseline, vec![p.played.clone()]));
+            let mut by_order: BTreeMap<Vec<String>, Vec<String>> = BTreeMap::new();
+            by_order
+                .entry(vec![p.played.clone()])
+                .or_default()
+                .push("baseline".to_string());
             for usi in &p.safe_used {
-                units.push((pi, seed, Arm::Oracle, vec![usi.clone()]));
+                by_order
+                    .entry(vec![usi.clone()])
+                    .or_default()
+                    .push("oracle".to_string());
             }
-            if let Some((strict, all, w0)) = policy.get(&(pi, seed)) {
-                if !strict.is_empty() {
-                    units.push((pi, seed, Arm::PolicyStrict, strict.clone()));
+            if let Some(by_arm) = policy.get(&(pi, seed)) {
+                for (arm, order) in by_arm {
+                    by_order.entry(order.clone()).or_default().push(arm.clone());
                 }
-                if !all.is_empty() {
-                    units.push((pi, seed, Arm::PolicyAll, all.clone()));
-                }
-                if !w0.is_empty() {
-                    units.push((pi, seed, Arm::PolicyW0, w0.clone()));
-                }
+            }
+            for (order, arms) in by_order {
+                units.push((pi, seed, order, arms));
             }
         }
     }
@@ -592,13 +632,18 @@ fn main() {
         let lines = Arc::clone(&lines);
         let opponent_ref = opponent.as_str();
         run_parallel(jobs, units.len(), move |ui| {
-            let (pi, seed, arm, order) = &units[ui];
+            let (pi, seed, order, arms) = &units[ui];
             let p = &points_ref[*pi];
-            if let Some(mut v) = forced_continuation(p, order, *seed, opponent_ref) {
-                v["arm"] = serde_json::json!(arm.tag());
-                v["safe_covered"] = serde_json::json!(p.safe_covered.len());
-                v["safe_used"] = serde_json::json!(p.safe_used.len());
-                lines.lock().unwrap().push(v);
+            if let Some(v) = forced_continuation(p, order, *seed, opponent_ref) {
+                let mut out = lines.lock().unwrap();
+                for arm in arms {
+                    // 同じ候補列 = 同じ継続なので、arm ごとに同じ結果を配る
+                    let mut row = v.clone();
+                    row["arm"] = serde_json::json!(arm);
+                    row["safe_covered"] = serde_json::json!(p.safe_covered.len());
+                    row["safe_used"] = serde_json::json!(p.safe_used.len());
+                    out.push(row);
+                }
             }
         });
     }
@@ -626,7 +671,7 @@ fn main() {
         "budget_ms": budget_ms,
         "seeds": seeds,
         "max_safe": max_safe,
-        "policy_w": policy_w,
+        "policy_ws": policy_ws.iter().map(|w| fmt_w(*w)).collect::<Vec<_>>(),
         "jobs": effective_jobs,
         "games": games_total,
         "shard_total": shard.1,
@@ -643,6 +688,18 @@ fn main() {
         "games_mated": games_mated,
         "games_with_defense": games_with_defense,
         "points": points_ref.len(),
+        // **期待する行数を meta 自身に残す**（PR #30 レビュー2巡目 [P1]）。
+        // 「入力に現れた (局, seed) の中で arm が揃っているか」だけを見ると、
+        // ある seed の全 arm がまとめて欠けたときに検出できない
+        "points_detail": points_ref
+            .iter()
+            .map(|p| serde_json::json!({
+                "game": p.game,
+                "ply": p.ply + 1,
+                "safe_used": p.safe_used.len(),
+                "safe_covered": p.safe_covered.len(),
+            }))
+            .collect::<Vec<_>>(),
         "dropped_safe": dropped_safe,
         "record_opponents": record_opponents,
     });
@@ -784,11 +841,26 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
             "重複行が {dups} 件あります（同じ arm・同じ seed の継続が二重）"
         ));
     }
-    let want = ["baseline", "policy_strict", "policy_all", "policy_w0"];
+    // 期待する arm は meta の `policy_ws` から作る（w を増やしても検査が追随する）
+    let mut want: Vec<String> = vec!["baseline".to_string(), "policy_w0".to_string()];
+    for w in metas
+        .first()
+        .and_then(|m| m["experiment"]["policy_ws"].as_array())
+        .into_iter()
+        .flatten()
+    {
+        let w = w.as_str().unwrap_or_default();
+        want.push(format!("policy_strict@w{w}"));
+        want.push(format!("policy_all@w{w}"));
+    }
     let missing: Vec<String> = present
         .iter()
         .filter_map(|((g, s), arms)| {
-            let lack: Vec<&str> = want.iter().copied().filter(|a| !arms.contains(*a)).collect();
+            let lack: Vec<&str> = want
+                .iter()
+                .map(String::as_str)
+                .filter(|a| !arms.contains(*a))
+                .collect();
             (!lack.is_empty()).then(|| format!("{g}#seed{s}: {}", lack.join(",")))
         })
         .collect();
@@ -799,6 +871,66 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
             missing.iter().take(3).cloned().collect::<Vec<_>>().join(" / "),
             if missing.len() > 3 { " ..." } else { "" }
         ));
+    }
+
+    // **meta が宣言した期待行数と突き合わせる**（PR #30 レビュー2巡目 [P1]）。
+    // 上の検査は「入力に現れた (局, seed)」しか見ないので、ある seed の全 arm が
+    // まとめて欠けても素通りする（実測: 1局1 seed ぶん 8行を落とすと
+    // Δoracle 0.1106 → 0.1058、Δpolicy 0.0240 → 0.0192 と動くのに通ってしまう）
+    let seeds = metas
+        .first()
+        .and_then(|m| m["experiment"]["seeds"].as_u64())
+        .unwrap_or(0);
+    let mut want_points: BTreeMap<(String, u64), u64> = BTreeMap::new();
+    for m in metas {
+        for d in m["points_detail"].as_array().into_iter().flatten() {
+            let key = (
+                d["game"].as_str().unwrap_or("?").to_string(),
+                d["ply"].as_u64().unwrap_or(0),
+            );
+            want_points.insert(key, d["safe_used"].as_u64().unwrap_or(0));
+        }
+    }
+    if seeds > 0 && !want_points.is_empty() {
+        // (局, ply, arm) → 見えた seed
+        let mut seen_rows: BTreeMap<(String, u64, String), Vec<u64>> = BTreeMap::new();
+        for r in rows {
+            seen_rows
+                .entry((
+                    r["game"].as_str().unwrap_or("?").to_string(),
+                    r["ply"].as_u64().unwrap_or(0),
+                    r["arm"].as_str().unwrap_or("?").to_string(),
+                ))
+                .or_default()
+                .push(r["seed"].as_u64().unwrap_or(0));
+        }
+        let mut lacks: Vec<String> = vec![];
+        for ((game, ply), safe_used) in &want_points {
+            for arm in &want {
+                let got = seen_rows
+                    .get(&(game.clone(), *ply, arm.clone()))
+                    .map_or(0, |v| v.len() as u64);
+                if got != seeds {
+                    lacks.push(format!("{game}#{ply} {arm}: {got}/{seeds}"));
+                }
+            }
+            // oracle は「強制した安全手の本数 × seed 数」だけあるはず
+            let got = seen_rows
+                .get(&(game.clone(), *ply, "oracle".to_string()))
+                .map_or(0, |v| v.len() as u64);
+            let expect = safe_used * seeds;
+            if got != expect {
+                lacks.push(format!("{game}#{ply} oracle: {got}/{expect}"));
+            }
+        }
+        if !lacks.is_empty() {
+            out.push(format!(
+                "meta が宣言した決定点に対して行が {} 箇所欠けています（Δ の分子が欠ける）: {}{}",
+                lacks.len(),
+                lacks.iter().take(3).cloned().collect::<Vec<_>>().join(" / "),
+                if lacks.len() > 3 { " ..." } else { "" }
+            ));
+        }
     }
     out
 }
@@ -909,13 +1041,17 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
                 mean(&test.iter().filter_map(|s| m.get(s).copied()).collect::<Vec<_>>())
             })
         });
+        // 方策 arm は w ごとに増えるので、名前で引ける形で持つ
+        let policy: BTreeMap<String, f64> = arms
+            .keys()
+            .filter(|a| a.starts_with("policy"))
+            .map(|a| (a.clone(), arm_mean(a)))
+            .collect();
         contrib.push(Contrib {
             baseline: arm_mean("baseline"),
             oracle,
             oracle_honest,
-            policy_strict: arm_mean("policy_strict"),
-            policy_all: arm_mean("policy_all"),
-            policy_w0: arm_mean("policy_w0"),
+            policy,
         });
         let _ = game;
     }
@@ -927,14 +1063,16 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
     let d_base = sum(&|c| c.baseline);
     let d_oracle = sum(&|c| c.oracle);
     let d_honest = sum(&|c| c.oracle_honest);
-    let d_ps = sum(&|c| c.policy_strict);
-    let d_pa = sum(&|c| c.policy_all);
-    let d_w0 = sum(&|c| c.policy_w0);
+    let policy_of = |arm: &str| -> f64 {
+        let arm = arm.to_string();
+        sum(&move |c: &Contrib| c.policy.get(&arm).copied().unwrap_or(0.0))
+    };
+    let d_w0 = policy_of("policy_w0");
 
     println!("\n=== P0-6: 一手強制の継続診断 ===");
     println!(
         "  実験: 相手 {} / 予算 {}ms / seeds {} / max_safe {} / policy_w {} / jobs {} / 記録 {} / code {}",
-        exp["opponent"], exp["budget_ms"], exp["seeds"], exp["max_safe"], exp["policy_w"],
+        exp["opponent"], exp["budget_ms"], exp["seeds"], exp["max_safe"], exp["policy_ws"],
         exp["jobs"], exp["records"], exp["source_fingerprint"],
     );
     println!(
@@ -953,22 +1091,45 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
         cluster_bootstrap(&contrib, f, games_total as usize)
     };
     let (lo_o, hi_o) = ci(&|c| c.oracle);
-    let (lo_ps, hi_ps) = ci(&|c| c.policy_strict);
-    let (lo_pa, hi_pa) = ci(&|c| c.policy_all);
     let (lo_b, hi_b) = ci(&|c| c.baseline);
-    let (lo_w0, hi_w0) = ci(&|c| c.policy_w0);
+    let (lo_w0, hi_w0) = ci(&|c| c.policy.get("policy_w0").copied().unwrap_or(0.0));
     println!("  baseline（実戦の手を強制して指し直し）: {:+.4} [{lo_b:+.4}, {hi_b:+.4}]", d_base);
     println!("  Δoracle（最良の安全手・楽観）:          {:+.4} [{lo_o:+.4}, {hi_o:+.4}]", d_oracle);
     println!("  Δoracle（前半で選び後半で測る正直版）:  {:+.4}", d_honest);
-    println!("  Δpolicy（厳密粒子の q）:                {:+.4} [{lo_ps:+.4}, {hi_ps:+.4}]", d_ps);
-    println!("  Δpolicy（taint 込みの q）:              {:+.4} [{lo_pa:+.4}, {hi_pa:+.4}]", d_pa);
-    println!(
-        "  対照 w=0（同じ経路で再決定するだけ）:   {:+.4} [{lo_w0:+.4}, {hi_w0:+.4}] \
-         → 危険量ペナルティ自身の効果は 厳密 {:+.4} / taint {:+.4}",
-        d_w0,
-        d_ps - d_w0,
-        d_pa - d_w0
-    );
+    println!("  対照 w=0（同じ経路で再決定するだけ）:   {:+.4} [{lo_w0:+.4}, {hi_w0:+.4}]", d_w0);
+    // **事前登録した w を全部出す**（レビュー2巡目 [P1]: 1点だけ測ると
+    // 「未計測の重みなら門を超えたかもしれない」を否定できない）
+    let mut policy_arms: Vec<String> = contrib
+        .iter()
+        .flat_map(|c| c.policy.keys().cloned())
+        .filter(|a| a != "policy_w0")
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    policy_arms.sort_by_key(|a| {
+        // policy_strict@w4 → (strict/all, w)
+        let (kind, w) = a.split_once("@w").unwrap_or((a.as_str(), "0"));
+        (
+            kind.to_string(),
+            (w.parse::<f64>().unwrap_or(0.0) * 1000.0) as i64,
+        )
+    });
+    println!("  Δpolicy（事前登録した w を全部・w=0 対照との差つき）:");
+    let mut best: Option<(String, f64)> = None;
+    for arm in &policy_arms {
+        let d = policy_of(arm);
+        let (lo, hi) = {
+            let a = arm.clone();
+            ci(&move |c: &Contrib| c.policy.get(&a).copied().unwrap_or(0.0))
+        };
+        println!(
+            "    {arm:<22} {d:+.4} [{lo:+.4}, {hi:+.4}]（w=0 対照との差 {:+.4}）",
+            d - d_w0
+        );
+        if best.as_ref().is_none_or(|(_, b)| d > *b) {
+            best = Some((arm.clone(), d));
+        }
+    }
     if shards_complete {
         println!(
             "  判定: Δoracle {} 0.04 → {}",
@@ -976,9 +1137,19 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
             if d_oracle < 0.04 {
                 "**即中止**（受けても救われないので受け項は律速でない）"
             } else {
-                "P1 へ進む必要条件のうち Δoracle は満たす（Δpolicy ≥ 0.04 と P0-3 の較正も要る）"
+                "P1 へ進む必要条件のうち Δoracle は満たす"
             }
         );
+        if let Some((arm, d)) = &best {
+            println!(
+                "        Δpolicy の最大は {arm} の {d:+.4} → {}",
+                if *d < 0.04 {
+                    "**事前登録した w のどれでも必要条件 0.04 に届かない**（この形の P1 は終了）"
+                } else {
+                    "門を超える w がある。**選定バイアスに注意**（未使用 seed で確認してから採否を決めること）"
+                }
+            );
+        }
     } else {
         println!(
             "  判定: **出せない**（シャード {}/{} しか揃っていない。Δ の分母は全対局数なので、\
@@ -1040,9 +1211,8 @@ struct Contrib {
     baseline: f64,
     oracle: f64,
     oracle_honest: f64,
-    policy_strict: f64,
-    policy_all: f64,
-    policy_w0: f64,
+    /// arm 名（`policy_w0` / `policy_strict@w4` …）→ その局の平均スコア
+    policy: BTreeMap<String, f64>,
 }
 
 fn cluster_bootstrap(
@@ -1087,14 +1257,15 @@ mod tests {
     fn meta(exp: serde_json::Value, shard: u64) -> serde_json::Value {
         serde_json::json!({
             "schema": ROW_SCHEMA, "type": "meta", "experiment": exp, "shard": shard,
-            "games_mated": 2, "dropped_safe": 0,
+            "games_mated": 2, "dropped_safe": 0, "points": 1,
+            "points_detail": [{"game": "g1", "ply": 90, "safe_used": 1, "safe_covered": 3}],
         })
     }
 
     fn exp_of(opponent: &str) -> serde_json::Value {
         serde_json::json!({
             "opponent": opponent, "budget_ms": 700, "seeds": 2, "max_safe": 4,
-            "policy_w": 4.0, "jobs": 3, "games": 104, "shard_total": 2,
+            "policy_ws": ["4", "8"], "jobs": 3, "games": 104, "shard_total": 2,
             "config": "cfg", "source_fingerprint": "src", "records": "rec",
         })
     }
@@ -1106,11 +1277,27 @@ mod tests {
         })
     }
 
+    /// meta の期待（決定点1つ・safe_used 1本）と整合する1 seed ぶんの行
     fn full_arms(game: &str, seed: u64) -> Vec<serde_json::Value> {
-        ["baseline", "policy_strict", "policy_all", "policy_w0"]
+        [
+            "baseline",
+            "policy_w0",
+            "policy_strict@w4",
+            "policy_all@w4",
+            "policy_strict@w8",
+            "policy_all@w8",
+            "oracle",
+        ]
             .iter()
             .map(|a| row(game, a, "7g7f", seed))
             .collect()
+    }
+
+    /// seeds=2 ぶんの完全な入力
+    fn full_input(game: &str) -> Vec<serde_json::Value> {
+        let mut v = full_arms(game, 0);
+        v.extend(full_arms(game, 1));
+        v
     }
 
     /// 継続の乱数は arm（強制手）に依らない = 共通乱数でペアになる
@@ -1128,45 +1315,100 @@ mod tests {
     /// 実験キーが違う JSONL は混ぜられない（局数だけ合っていても止める）
     #[test]
     fn 違う実験のjsonlは混ぜられない() {
-        let rows: Vec<serde_json::Value> = full_arms("g1", 0);
-        let ok = vec![meta(exp_of("estimator_v14"), 0), meta(exp_of("estimator_v14"), 1)];
+        let rows: Vec<serde_json::Value> = full_input("g1");
+        // 2シャードぶんの meta は同じ決定点を宣言しない（各シャードは別の局を持つ）ので、
+        // ここでは1シャードぶんの meta を2回渡さず、実験キーの一致だけを見る
+        let ok = vec![meta(exp_of("estimator_v14"), 0)];
         assert!(check_inputs(&ok, &rows).is_empty(), "同じ実験なら通る");
 
         let mixed = vec![meta(exp_of("estimator_v14"), 0), meta(exp_of("estimator_v13"), 1)];
         let problems = check_inputs(&mixed, &rows);
-        assert_eq!(problems.len(), 1);
-        assert!(problems[0].contains("opponent"), "違うキーを名指しする: {}", problems[0]);
+        assert!(
+            problems.iter().any(|p| p.contains("opponent")),
+            "違うキーを名指しする: {problems:?}"
+        );
     }
 
     /// 同じシャードを2回渡す・重複行・arm の欠落を検出する
     #[test]
     fn 重複と欠落を検出する() {
         let metas = vec![meta(exp_of("estimator_v14"), 0), meta(exp_of("estimator_v14"), 0)];
-        let problems = check_inputs(&metas, &full_arms("g1", 0));
+        let problems = check_inputs(&metas, &full_input("g1"));
         assert!(problems.iter().any(|p| p.contains("2回")), "{problems:?}");
 
         let metas = vec![meta(exp_of("estimator_v14"), 0)];
-        let mut rows = full_arms("g1", 0);
+        let mut rows = full_input("g1");
         rows.push(row("g1", "baseline", "7g7f", 0));
         let problems = check_inputs(&metas, &rows);
         assert!(problems.iter().any(|p| p.contains("重複行が 1 件")), "{problems:?}");
 
-        // policy_w0 が欠けた (局, seed)
-        let rows: Vec<serde_json::Value> = full_arms("g1", 0)
+        // w ごとの arm が欠けた (局, seed) も検出する
+        let rows: Vec<serde_json::Value> = full_input("g1")
             .into_iter()
-            .filter(|r| r["arm"] != "policy_w0")
+            .filter(|r| !(r["arm"] == "policy_all@w8" && r["seed"] == 0))
             .collect();
         let problems = check_inputs(&metas, &rows);
-        assert!(problems.iter().any(|p| p.contains("policy_w0")), "{problems:?}");
+        assert!(problems.iter().any(|p| p.contains("policy_all@w8")), "{problems:?}");
     }
 
-    /// 記録集合の指紋はファイルの並び順に依らず、集合が違えば変わる
+    /// **ある seed の全 arm がまとめて欠けても検出する**（レビュー2巡目 [P1]）。
+    /// 「入力に現れた (局, seed) の中で arm が揃うか」だけでは素通りする穴
     #[test]
-    fn 記録集合の指紋は集合で決まる() {
-        let a = records_fingerprint(&[PathBuf::from("x/1.jsonl"), PathBuf::from("y/2.jsonl")]);
-        let b = records_fingerprint(&[PathBuf::from("y/2.jsonl"), PathBuf::from("x/1.jsonl")]);
+    fn seedごと欠けた行を検出する() {
+        let metas = vec![meta(exp_of("estimator_v14"), 0)];
+        assert!(
+            check_inputs(&metas, &full_input("g1")).is_empty(),
+            "揃っていれば通る"
+        );
+
+        // seed 0 の行を丸ごと落とす（(局, seed) のキー自体が現れない）
+        let rows: Vec<serde_json::Value> = full_input("g1")
+            .into_iter()
+            .filter(|r| r["seed"] != 0)
+            .collect();
+        let problems = check_inputs(&metas, &rows);
+        assert!(
+            problems.iter().any(|p| p.contains("meta が宣言した決定点")),
+            "{problems:?}"
+        );
+
+        // oracle は safe_used × seeds ぶん要る（強制した安全手が欠けても止める）
+        let rows: Vec<serde_json::Value> = full_input("g1")
+            .into_iter()
+            .filter(|r| !(r["arm"] == "oracle" && r["seed"] == 1))
+            .collect();
+        let problems = check_inputs(&metas, &rows);
+        assert!(
+            problems.iter().any(|p| p.contains("oracle")),
+            "{problems:?}"
+        );
+    }
+
+    /// 記録集合の指紋はファイルの並び順に依らず、**中身**が違えば変わる
+    #[test]
+    fn 記録集合の指紋は名前と中身で決まる() {
+        let dir = std::env::temp_dir().join(format!("mate-continue-fp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, body: &str| {
+            let p = dir.join(name);
+            std::fs::write(&p, body).unwrap();
+            p
+        };
+        let one = write("1.jsonl", "a");
+        let two = write("2.jsonl", "b");
+
+        let a = records_fingerprint(&[one.clone(), two.clone()]);
+        let b = records_fingerprint(&[two.clone(), one.clone()]);
         assert_eq!(a, b, "並び順には依らない");
-        let c = records_fingerprint(&[PathBuf::from("x/1.jsonl")]);
-        assert_ne!(a, c, "集合が違えば変わる");
+        assert_ne!(a, records_fingerprint(&[one.clone()]), "集合が違えば変わる");
+
+        // **同名で中身が違う**記録は別集合として扱う（レビュー2巡目 [P2]）
+        write("2.jsonl", "b2");
+        assert_ne!(
+            a,
+            records_fingerprint(&[one.clone(), two.clone()]),
+            "中身が変われば指紋も変わる"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
