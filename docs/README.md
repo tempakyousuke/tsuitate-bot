@@ -18,4 +18,5 @@
 | `checkpoint-arena-p0.md` | 計画/記録 | 2026-08-23。issue #19 の P0。実装と計測経路は入った。続行/縮小/撤退の判断は「撤退判断」節 |
 | `frozen-hermetic-boundary.md` | 設計/運用 | 2026-08-24。issue #21。設定境界（`config.rs`）・凍結境界の分類・ガードの一覧。**共有モデルの更新で v12〜v14 が動く**ことの記録も |
 | `eval-rank-residual-p0.md` | 計画/記録 | 2026-08-26。issue #24 の P0。**不合格で P1 の runtime 実装はしない**（順位一致は上がるが選ぶ手は良くならない・未採点手への逃避）。指標の落とし穴（未採点 top-1 の仮点埋め）で初版の符号が反転した記録も。再判定に要る2条件は「再判定に要るもの」節 |
+| `mate-economy-p0.md` | 計画/記録 | 2026-08-27。issue #28 の P0。計測基盤（`mate_moves_in_1_fast` と `analyze` の詰み経済セクション）だけが入った段階。**採否の判定はまだ出していない**（P0-3 / P0-5 / P0-6 が残り） |
 | `tsuitate-viewer-webhook-bot.md` | 運用 | `webhook_bot` の現行手順。既定戦略は凍結版 `estimator_v10` |

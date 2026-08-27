@@ -249,13 +249,17 @@ jobs:
             | tee arena-result.txt
 
       # 被詰めろオラクル: 相手が詰みを実行してこない環境でも自玉の受けを測れる
-      # 唯一の指標なので、記録を捨てる前にこのジョブで集計してサマリーへ出す
-      - name: Analyze records (被詰めろオラクル)
+      # 唯一の指標なので、記録を捨てる前にこのジョブで集計してサマリーへ出す。
+      # issue #28 の詰み経済セクション（終局の攻め／受け・手数調整した露出・
+      # 詰め手の排他的分類・受けの漏斗・列挙コスト）もここから拾う。
+      # **行を足したらこのフィルタも直す**（analyze の出力は局ごとの明細が
+      # 大半なので、集計行だけを列挙で拾う方式にしてある）
+      - name: Analyze records (詰み経済・被詰めろオラクル)
         if: always()
         run: |
           if ls arena-records/*.jsonl > /dev/null 2>&1; then
             cargo run --release --bin analyze -- arena-records/*.jsonl \
-              | grep -E "^(被詰めろ|1手詰みの存在|只取られ|反則の原因|  +[0-9]+回)" \
+              | grep -E "^(被詰めろ:|1手詰みの存在|只取られ|反則の原因|終局:|--- 詰み経済|mate_moves_in_1_fast|  +[0-9]+回|  (露出|初回被詰めろ|エピソード長|詰め手の排他的分類|受けの漏斗|被詰めろ手番|全決定点|終盤（|完全版))" \
               > analyze-summary.txt || true
             cat analyze-summary.txt
           fi
