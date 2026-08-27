@@ -19,7 +19,8 @@ use std::collections::{HashMap, HashSet};
 
 use tsuitate_bot::board::Coord;
 use tsuitate_bot::check::CheckSolver;
-use tsuitate_bot::mate::{has_mate_in_1_fast, mate_moves_in_1, mate_moves_in_1_fast};
+use tsuitate_bot::mate::{mate_moves_in_1, mate_moves_in_1_fast};
+use tsuitate_bot::mate_economy::{MateKind, fold_episodes, threat_turns};
 use tsuitate_bot::model::GameModel;
 use tsuitate_bot::observation::{stale_king_foul_dests, Observation, ObservationLog};
 use tsuitate_bot::protocol::{
@@ -690,39 +691,6 @@ fn compare_full_search() -> bool {
     *ON.get_or_init(|| std::env::var("TSUITATE_MATE_COST").as_deref() == Ok("1"))
 }
 
-/// 詰め手集合の排他的分類（issue #28 P0-2）。
-///
-/// 従来の `打ち詰み` フラグは `drop_mate` の有無だったので「打ちでも盤上移動でも
-/// 詰む」局面が打ち側にだけ数えられ、**排他的な分類になっていなかった**。
-/// 全詰め手を列挙して union で分類する
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum MateKind {
-    DropOnly,
-    BoardOnly,
-    Both,
-}
-
-impl MateKind {
-    fn of(moves: &[ShogiMove]) -> Option<Self> {
-        let drop = moves.iter().any(|m| matches!(m, ShogiMove::Drop { .. }));
-        let board = moves.iter().any(|m| matches!(m, ShogiMove::Board { .. }));
-        match (drop, board) {
-            (true, true) => Some(MateKind::Both),
-            (true, false) => Some(MateKind::DropOnly),
-            (false, true) => Some(MateKind::BoardOnly),
-            (false, false) => None,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            MateKind::DropOnly => "打ちのみ",
-            MateKind::BoardOnly => "盤上のみ",
-            MateKind::Both => "両方",
-        }
-    }
-}
-
 /// 被詰めろの**エピソード**（連続した相手番の被詰めろを1つに畳んだもの）。
 ///
 /// 手番単位で数えると「1回の危険が何手番続いたか」と「何回危険に入ったか」が
@@ -779,100 +747,65 @@ fn mate_defense_episodes(
     cost: &mut MateCost,
 ) -> Vec<MateEpisode> {
     let prefixes = decision_prefixes(rec);
-    let mut episodes: Vec<MateEpisode> = vec![];
-    let mut prev_threat_idx: Option<usize> = None;
-    for (idx, pos) in positions.iter().enumerate() {
-        if pos.turn() == bot || pos.outcome().is_some() {
-            continue;
-        }
-        let mates = cost.measure(pos, idx + 1);
-        let Some(kind) = MateKind::of(&mates) else {
-            continue;
-        };
-        // 実際に詰まされたか（この相手番の手で終局したか）
-        let executed_drop = positions
-            .get(idx + 1)
-            .and_then(|p| p.outcome())
-            .and_then(|o| match o {
-                Outcome::Checkmate { winner } if winner != bot => rec
-                    .end
-                    .moves
-                    .get(idx)
-                    .and_then(|m| parse_usi(&m.usi))
-                    .map(|mv| matches!(mv, ShogiMove::Drop { .. })),
-                _ => None,
-            });
+    // 被詰めろの手番・詰め手の分類・一手巻き戻した決定点の安全手は
+    // `mate_economy` の共有定義（P0-3 / P0-6 の診断と同じ数え方）
+    let played = |i: usize| rec.end.moves.get(i).and_then(|m| parse_usi(&m.usi));
+    let mut mates_of = |p: &Position, ply: usize| cost.measure(p, ply);
+    let turns = threat_turns(positions, bot, &mut mates_of, &played);
 
-        // 漏斗: 一手巻き戻した bot の決定点
-        let mut safe_here: Option<usize> = None;
-        let mut covered = false;
-        let mut blind: Option<bool> = None;
-        if idx >= 1 && positions[idx - 1].turn() == bot {
-            let decision = &positions[idx - 1];
-            let mut safe_usi: HashSet<String> = HashSet::new();
-            for mv in decision.legal_moves() {
-                let mut next = decision.clone();
-                next.play_unchecked(&mv);
-                if !has_mate_in_1_fast(&next) {
-                    safe_usi.insert(mv.to_usi());
-                }
+    let mut out = vec![];
+    for ep in fold_episodes(&turns) {
+        let first = &turns[ep.turns[0]];
+        let mut e = MateEpisode {
+            start_idx: first.idx,
+            turns: ep.turns.len(),
+            kind: first.kind,
+            executed_drop: None,
+            safe_at_entry: first.decision_idx.map(|_| first.safe.len()),
+            safe_turns: 0,
+            covered_turns: 0,
+            last_avoidable: None,
+            blind_turns: 0,
+            known_turns: 0,
+        };
+        for &ti in &ep.turns {
+            let t = &turns[ti];
+            e.kind = e.kind.merge(t.kind);
+            if let Some(mv) = &t.executed {
+                e.executed_drop = Some(matches!(mv, ShogiMove::Drop { .. }));
             }
-            if !safe_usi.is_empty() {
-                if let Some(&prefix) = prefixes.get(&(idx - 1)) {
+            let Some(decision_idx) = t.decision_idx else {
+                continue;
+            };
+            if !t.safe.is_empty() {
+                e.safe_turns += 1;
+                e.last_avoidable = Some(t.idx);
+                // 漏斗の2段目: その安全手が bot の候補生成（自駒のみ）に載るか
+                let safe_usi: HashSet<String> = t.safe.iter().map(ShogiMove::to_usi).collect();
+                if let Some(&prefix) = prefixes.get(&decision_idx) {
                     let mut log = ObservationLog::default();
                     for prev in &rec.observations[..prefix] {
                         log.record(prev.clone());
                     }
                     let model = GameModel::from_log(bot, &log);
-                    let view = view_from_model(&model, decision.in_check(bot));
-                    covered = candidate_moves(&view, &HashSet::new())
+                    let view = view_from_model(&model, positions[decision_idx].in_check(bot));
+                    if candidate_moves(&view, &HashSet::new())
                         .iter()
-                        .any(|(usi, _)| safe_usi.contains(usi));
+                        .any(|(usi, _)| safe_usi.contains(usi))
+                    {
+                        e.covered_turns += 1;
+                    }
                 }
             }
-            safe_here = Some(safe_usi.len());
-            blind = rec.blind_decisions.get(&(idx - 1)).copied().flatten();
+            // 漏斗の3段目: その決定点に厳密粒子があったか
+            if let Some(blind) = rec.blind_decisions.get(&decision_idx).copied().flatten() {
+                e.known_turns += 1;
+                e.blind_turns += usize::from(blind);
+            }
         }
-
-        let continues = prev_threat_idx == Some(idx.saturating_sub(2));
-        prev_threat_idx = Some(idx);
-        if continues {
-            let ep = episodes.last_mut().expect("継続なら直前のエピソードがある");
-            ep.turns += 1;
-            ep.kind = match (ep.kind, kind) {
-                (a, b) if a == b => a,
-                _ => MateKind::Both,
-            };
-            if executed_drop.is_some() {
-                ep.executed_drop = executed_drop;
-            }
-            if safe_here.is_some_and(|n| n > 0) {
-                ep.safe_turns += 1;
-                ep.last_avoidable = Some(idx);
-                if covered {
-                    ep.covered_turns += 1;
-                }
-            }
-            if let Some(b) = blind {
-                ep.known_turns += 1;
-                ep.blind_turns += usize::from(b);
-            }
-        } else {
-            episodes.push(MateEpisode {
-                start_idx: idx,
-                turns: 1,
-                kind,
-                executed_drop,
-                safe_at_entry: safe_here,
-                safe_turns: usize::from(safe_here.is_some_and(|n| n > 0)),
-                covered_turns: usize::from(covered),
-                last_avoidable: safe_here.is_some_and(|n| n > 0).then_some(idx),
-                blind_turns: usize::from(blind == Some(true)),
-                known_turns: usize::from(blind.is_some()),
-            });
-        }
+        out.push(e);
     }
-    episodes
+    out
 }
 
 fn main() {

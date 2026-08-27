@@ -321,56 +321,58 @@ fn collect_mates(pos: &Position, first_only: bool) -> Vec<ShogiMove> {
     out
 }
 
+/// 発端の実戦局面（scenarios/play-estimator-20260725-090838.kif の 58手目まで、
+/// 先手番）。後手は直前に打った 6六桂の支えで G*7八 の一手詰めを持っている。
+/// `mate_economy` のテストも同じ局面を使うのでモジュール外へ出してある
+#[cfg(test)]
+pub(crate) fn play_estimator_ply58() -> Position {
+    use crate::shogi::Piece;
+    let mut pos = Position::empty(Color::Sente);
+    let mut put = |file: i8, rank: i8, color: Color, role: Role| {
+        pos.set(Coord { file, rank }, Some(Piece { color, role }));
+    };
+    use Color::{Gote as G, Sente as S};
+    use Role::*;
+    // 後手
+    put(9, 1, G, Gold);
+    put(4, 1, G, Gold);
+    put(3, 1, G, Bishop);
+    put(2, 1, G, Knight);
+    put(1, 1, G, Lance);
+    put(3, 2, G, Silver);
+    put(5, 3, G, King);
+    for f in [9, 7, 6, 4, 3, 2, 1] {
+        put(f, 3, G, Pawn);
+    }
+    put(5, 4, G, Pawn);
+    put(6, 6, G, Knight); // 58手目の打ち（先手からは不可視）
+    // 先手
+    put(7, 9, S, King);
+    put(9, 9, S, Lance);
+    put(1, 9, S, Lance);
+    put(4, 9, S, Gold);
+    put(3, 9, S, Silver);
+    put(7, 7, S, Bishop);
+    put(3, 6, S, Silver);
+    put(1, 7, S, Knight);
+    for (f, r) in [(9, 7), (8, 7), (6, 7), (4, 7), (3, 7), (2, 7)] {
+        put(f, r, S, Pawn);
+    }
+    put(7, 6, S, Pawn);
+    put(5, 6, S, Pawn);
+    put(1, 6, S, Pawn);
+    pos.set_hand(S, Knight, 1);
+    pos.set_hand(S, Rook, 1);
+    for role in [Gold, Lance, Pawn, Rook, Silver] {
+        pos.set_hand(G, role, 1);
+    }
+    pos
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::shogi::parse_usi;
-
-    /// 発端の実戦局面（scenarios/play-estimator-20260725-090838.kif の 58手目まで、
-    /// 先手番）。後手は直前に打った 6六桂の支えで G*7八 の一手詰めを持っている
-    fn play_estimator_ply58() -> Position {
-        use crate::shogi::Piece;
-        let mut pos = Position::empty(Color::Sente);
-        let mut put = |file: i8, rank: i8, color: Color, role: Role| {
-            pos.set(Coord { file, rank }, Some(Piece { color, role }));
-        };
-        use Color::{Gote as G, Sente as S};
-        use Role::*;
-        // 後手
-        put(9, 1, G, Gold);
-        put(4, 1, G, Gold);
-        put(3, 1, G, Bishop);
-        put(2, 1, G, Knight);
-        put(1, 1, G, Lance);
-        put(3, 2, G, Silver);
-        put(5, 3, G, King);
-        for f in [9, 7, 6, 4, 3, 2, 1] {
-            put(f, 3, G, Pawn);
-        }
-        put(5, 4, G, Pawn);
-        put(6, 6, G, Knight); // 58手目の打ち（先手からは不可視）
-        // 先手
-        put(7, 9, S, King);
-        put(9, 9, S, Lance);
-        put(1, 9, S, Lance);
-        put(4, 9, S, Gold);
-        put(3, 9, S, Silver);
-        put(7, 7, S, Bishop);
-        put(3, 6, S, Silver);
-        put(1, 7, S, Knight);
-        for (f, r) in [(9, 7), (8, 7), (6, 7), (4, 7), (3, 7), (2, 7)] {
-            put(f, r, S, Pawn);
-        }
-        put(7, 6, S, Pawn);
-        put(5, 6, S, Pawn);
-        put(1, 6, S, Pawn);
-        pos.set_hand(S, Knight, 1);
-        pos.set_hand(S, Rook, 1);
-        for role in [Gold, Lance, Pawn, Rook, Silver] {
-            pos.set_hand(G, role, 1);
-        }
-        pos
-    }
 
     #[test]
     fn drop_mate_finds_the_real_game_mate() {

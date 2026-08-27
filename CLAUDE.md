@@ -524,6 +524,54 @@
   N は平均79〜82手で N<10 はアリーナ800局で出現ゼロ（対人・終盤では効きうるので
   指標には残す）。王手の期待反則数は「手段クラス数 × 解消手の互いに素性 ÷ 解消手数」
   で決まる（詳細はメモリ strong-check-few-resolutions）
+- `TSUITATE_THINK_BUDGET_MS=2000 cargo run --release --bin mate_probe -- [--seeds 3]
+  [--controls 1] [--jobs N] [--limit N] [--out data/mate_probe.csv] [--emit <dir> <接頭辞>]
+  <records...>` — **盤上版の被詰めろのオフライン較正と argmax シミュレーション**
+  （issue #28 P0-3、2026-08-27）。詰み負けした局の「最後に受けられた決定点」と
+  **同じ手数帯の対照決定点**で、候補ごとに「真実で指すと相手の一手詰めが生じるか」
+  と「粒子上の危険質量 q」を突き合わせる。**runtime には何も入らない**。
+  - q は**厳密粒子 / taint 込みを別々に**出す（初版の P1-B は厳密だけを読む）。
+    Brier・しきい値ごとの適合率/再現率・信頼度別の較正・**対照決定点の偽陽性率**・
+    受け手の現行順位と top8/top17 包含率・**argmax が受けへ変わる最小 w**
+  - 再スコアは P1-B の形（`gain` から引いて `combine_score` を通す。issue #24 の
+    教訓⑦。最終 score へ直接足すのとは等価でない）。順位は乱数を除いたスコアで
+    付け直し同点は USI の辞書順（同②）
+  - `--emit` で決定点を `scenarios/` 形式の kif として書き出す（`rank_probe` へ流す用）
+  - **思考予算はプロセス env**（粒子構築 `build_estimator` と候補評価 `ranking_one`
+    で同じ scale を使うため、ここでは上書きしない）
+- `TSUITATE_THINK_BUDGET_MS=700 cargo run --release --bin mate_continue -- [--seeds 2]
+  [--max-safe 4] [--opponent estimator_v14] [--policy-w 4] [--shard i/n] [--out out.jsonl]
+  <records...>` / `mate_continue report <out-*.jsonl...>` — **一手強制の継続診断**
+  （issue #28 P0-6、2026-08-27）。「最後に受けられた決定点」から一手だけ強制して
+  `selfplay::play_continuation`（通常アリーナと同じ裁定関数・**時計は無効**）で
+  終局まで指し継ぎ、勝1/分0.5/負0 で数える。**受けが勝敗へどれだけ変換されうるか**の
+  上限（`Δoracle`）と実現可能推定（`Δpolicy`）を出す。**`Δoracle < 0.04` なら
+  issue #28 の P0 は即中止**。
+  - 分母は**記録の全対局数 G**（受けの機会が無かった局は 0）。CI は元対局単位の
+    cluster bootstrap（seed を独立標本として数えない）
+  - `Δoracle` は最良手を採るぶん**楽観**（勝者の呪い）なので、seed を前半（選ぶ）/
+    後半（測る）に割った正直版も併記する
+  - **`baseline`（実戦の手を強制して指し直し）を必ず取る**: 元局が負けでも継続が
+    0 になるとは限らない（両者が指し直すので別の対局になる）。Δ の一部が
+    「単に指し直したから」でないことをここで見る
+  - **方策が真実で非合法な手を選んだら実対局と同じく反則を積んで次点へ進む**
+    （手番は変わらない・上限10回で反則負け）。「非合法なら測定不能」にすると
+    方策の実力を過大評価する。観測の記録は審判と同じ関数
+    （`truth_replay::add_move_obs` / `add_foul_obs`）を共有する
+  - arm は `baseline`（実戦の手）/ `oracle`（真実の安全手）/ `policy_strict` /
+    `policy_all` / **`policy_w0`（同じ経路で w=0 = 現行方策そのもの）**。
+    `Δpolicy − Δpolicy(w=0)` が危険量ペナルティ自身の効果（再決定のぶんを切り分ける）
+  - `--max-safe` で落とした安全手の本数は必ず出る（`Δoracle` はそのぶん下界）。
+    **シャードが揃っていない集計では判定を出さない**（分母は全対局数なので
+    分子だけが欠けて Δ が過小に出る）
+- **詰み経済の CI**（`.github/workflows/mate-economy.yml`、**通常のコード push では
+  走らない**）: `gh workflow run mate-economy.yml -f arena_run_id=<Arena実行ID>`、
+  `gh` が無ければ `.github/ci/mate-economy.request.json` を置いて push（削除の push は
+  全ジョブがスキップされる）。`arena_run_id` を渡すと `arena-records-*` を落として
+  使う（**追加の対局コストはゼロ**・局面分布が実際の対局分布と一致する）。
+  P0-6 は局単位のシャードで回し、aggregate が `mate_continue report` で合算する
+  （**シャードが欠けたら失敗させる** = Δ の分母が狂うため）。
+  設計・実測・判定は `docs/mate-economy-p0.md`
 - `cargo run --release --bin mine_check -- [--min-fouls N] [--emit <dir> <接頭辞>] <records/*.jsonl...>`
   — **被王手の決定点の採掘**（2026-08-19）。記録の真実を再生し bot 側の被王手
   決定点から「反則を N 回以上した」（foul）と「王手駒を玉以外で取れたのに
@@ -2198,6 +2246,13 @@
   （`mate_in_1`、診断専用）はホットパスに載らないので打ちに限定している
   （実測: 対人83局の被詰めろ232件のうち72%が打ち詰み）。
   strategy.rs の `mate_threat_w`/`mate_risk_w` と bin/analyze の被詰めろ指標が使う
+- `mate_economy.rs` — **詰み経済の共有定義**（issue #28、2026-08-27。runtime には
+  入らない診断だけ）。詰め手の排他的分類（`drop_only / board_only / both`）・
+  安全手（指した後に相手の一手詰めが消える手）・被詰めろのエピソード
+  （連続する相手番を1つに畳む）・**最後に受けられた決定点**・同じ手数帯の
+  対照決定点・粒子上の危険質量 q とオフライン再スコア。
+  `bin/analyze`（P0-1/P0-2）・`bin/mate_probe`（P0-3）・`bin/mate_continue`（P0-6）が
+  **同じ定義**で数えるための場所（別々に数えると較正の数字が意味を失う）
 - `model.rs` — 観測履歴だけから自分側（自駒配置・持ち駒・相手手数・取られた駒）を
   再構成する GameModel。client.rs が sync の PlayerView と照合してズレを警告する
 - `estimator.rs` — 相手局面のパーティクルフィルタ（determinization）。粒子=具体的なフル局面。
