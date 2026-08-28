@@ -147,6 +147,10 @@ pub struct CheckTurn {
     /// 真に合法な候補のうち**ソルバー p が最上位のもの**の順位（1始まり）。
     /// 1 なら「ソルバー最善が最初から合法だったのに反則してから到達した」
     pub best_legal_rank_at_entry: Option<usize>,
+    /// 開始時に `CheckSolver` を作れたか（両王手で仮説が全滅すると作れない）。
+    /// false の手番は**ソルバー順位が付かない**ので、集計では「判定不能」に
+    /// 分けること（0 として数えると率が下振れする）
+    pub solver_at_entry: bool,
     /// 受理された手の**開始時点のソルバー p 順位**（1始まり）。
     ///
     /// エンジンの順位ではない（それは粒子が要るので P0-4 の rank_probe の領分）。
@@ -308,9 +312,11 @@ pub fn check_turns(
         let mut entry_rank: Vec<(String, f64)> = vec![];
         let mut p_max_at_entry = 0.0f64;
         let mut hypotheses_at_entry = 0;
+        let mut solver_at_entry = false;
         let mut true_hyp_share = None;
         let mut hyp_entropy = None;
         if let Some(mut solver) = CheckSolver::new(&view, &[], &[], &log) {
+            solver_at_entry = true;
             for (usi, mv) in &entry_candidates {
                 let p = solver.resolve_probability(mv);
                 p_max_at_entry = p_max_at_entry.max(p);
@@ -381,6 +387,7 @@ pub fn check_turns(
             accepted_legal_at_entry,
             legal_candidates_at_entry,
             best_legal_rank_at_entry,
+            solver_at_entry,
             accepted_rank_at_entry,
             candidates_at_entry: entry_candidates.len(),
             p_max_at_entry,
@@ -610,12 +617,19 @@ pub fn argmax_at(moves: &[PricedMove], cost: f64) -> Option<&PricedMove> {
 /// （床の折れをそのまま扱えるように細かい格子で argmax を追う）。
 pub fn k_star(moves: &[PricedMove], base: f64, floor: f64, kmax: f64) -> Option<f64> {
     const STEP: f64 = 0.02;
-    let mut k = 1.0;
-    while k <= kmax + 1e-9 {
+    // **格子は整数から作って小数第2位へ丸める**。`k += STEP` の累積だと
+    // k=3.00 が 3.0000000000000018 になり、「k\* ≤ 3」の判定が
+    // その場の集計（生の値）と CSV 経由の集計（`{:.2}` で丸めた値）で
+    // 食い違う（門の割合が経路によって変わる）
+    let steps = ((kmax - 1.0) / STEP).floor() as i64;
+    for i in 0..=steps.max(0) {
+        let k = ((1.0 + i as f64 * STEP) * 100.0).round() / 100.0;
+        if k > kmax {
+            break;
+        }
         if argmax_at(moves, (k * base).max(floor))?.is_king {
             return Some(k);
         }
-        k += STEP;
     }
     None
 }
@@ -688,6 +702,7 @@ mod tests {
                 accepted_legal_at_entry: None,
                 legal_candidates_at_entry: 0,
                 best_legal_rank_at_entry: None,
+                solver_at_entry: true,
                 accepted_rank_at_entry: None,
                 candidates_at_entry: 0,
                 p_max_at_entry: 0.0,
@@ -824,6 +839,27 @@ mod tests {
         assert!((k - 3.0).abs() < 0.05, "k* = {k}");
         assert!(argmax_at(&moves, k).unwrap().is_king);
         assert!(!argmax_at(&moves, (k - 0.1).max(1.0)).unwrap().is_king);
+    }
+
+    #[test]
+    fn k_starは小数第2位で丸めた格子を返す() {
+        // `k += 0.02` の累積だと格子点が 3.0000000000000018 のようにずれ、
+        // 「k* ≤ 3」の判定がその場の集計（生の値）と CSV 経由の集計
+        // （`{:.2}` で丸めた値）で食い違う。丸めた格子なら経路によらず一致する
+        let moves = vec![priced("5f5e", 0.4, 3.0, false), priced("5i4h", 0.9, 2.0, true)];
+        let k = k_star(&moves, 1.0, 1.0, 30.0).unwrap();
+        // 交点はコスト 3.0（= k 3.0）だが、**同点は USI の辞書順**で割るので
+        // ちょうど交点では玉の手 5i4h が 5f5e に負ける。玉の手が strict に
+        // 首位を取る最初の格子点は 3.02
+        assert_eq!(k, 3.02);
+        assert_eq!(format!("{k:.2}").parse::<f64>().unwrap(), k, "CSV の round-trip と一致");
+        // 格子点は全部 2 桁で表せる（累積誤差が乗らない）
+        for kmax in [1.5, 4.0, 30.0] {
+            let far = vec![priced("5f5e", 0.4, 100.0, false), priced("5i4h", 0.9, 0.0, true)];
+            if let Some(k) = k_star(&far, 1.0, 1.0, kmax) {
+                assert_eq!(format!("{k:.2}").parse::<f64>().unwrap(), k, "kmax={kmax}");
+            }
+        }
     }
 
     #[test]

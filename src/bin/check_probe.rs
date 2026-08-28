@@ -364,12 +364,14 @@ fn main() {
             mismatched += 1;
             continue;
         }
-        games += 1;
         let short = Path::new(&name)
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or(name.clone());
         let mut found: Vec<Point> = vec![];
+        // 途中で壊れた棋譜は `found` ごと捨てるので、型の分布もこの局の分は
+        // 捨てる（`--types` を選ぶ表が監査した決定点と食い違わないように）
+        let mut local_types: BTreeMap<String, u32> = BTreeMap::new();
         let ok = for_each_decision_full(&end, |d| {
             if d.side != bot || d.fouls_this_turn == 0 || !d.pos.in_check(bot) {
                 return;
@@ -411,7 +413,7 @@ fn main() {
             let first_kind = classify_move_kind(&first, &view, solver.as_mut());
             let acc_kind = classify_move_kind(&acc_mv, &view, solver.as_mut());
             let tag = type_tag(first_kind, acc_kind);
-            *type_counts.entry(tag.to_string()).or_insert(0) += 1;
+            *local_types.entry(tag.to_string()).or_insert(0) += 1;
             if !types.iter().any(|t| t == tag) {
                 return;
             }
@@ -432,6 +434,10 @@ fn main() {
         if !ok {
             broken += 1;
             continue;
+        }
+        games += 1;
+        for (k, v) in local_types {
+            *type_counts.entry(k).or_insert(0) += v;
         }
         points.extend(found);
     }
@@ -603,6 +609,10 @@ fn main() {
     let (shard_i, shard_n) = shard.unwrap_or((0, 1));
     let meta = serde_json::json!({
         "schema": ROW_SCHEMA,
+        // **相手を meta に持つ**（`records` 指紋はディレクトリ全体のハッシュなので、
+        // 同じ記録集合から `--opponent` だけ変えた2本は指紋が一致してしまう。
+        // 相手ごとに分けるのが判定の前提なので、混ぜたら集約で止める）
+        "opponent": opponent.clone().unwrap_or_default(),
         "shard": shard_i,
         "shards": shard_n,
         "seeds": seeds,
@@ -633,6 +643,7 @@ fn main() {
         })
         .collect();
     check_completeness(&rows, seeds, allow_incomplete);
+    check_points_present(&rows, points.len(), allow_incomplete);
     if shard_n > 1 {
         println!(
             "\n**シャード {shard_i}/{shard_n} の部分集計**（判定は `check_probe report` で全シャードを集めてから）"
@@ -725,6 +736,27 @@ fn check_completeness(rows: &[Row], seeds: u64, allow_incomplete: bool) {
     }
 }
 
+/// **決定点そのものが消えていないか**を検査する。
+///
+/// 全 seed でランキングが取れなかった決定点は行が1つも残らないので、
+/// `check_completeness`（行がある決定点しか見ない）では捕まらない。
+/// 門の分母が黙って縮むので、meta の決定点数と突き合わせる。
+fn check_points_present(rows: &[Row], expected: usize, allow_incomplete: bool) {
+    let seen: BTreeSet<(String, u32)> = rows.iter().map(|r| r.point_key()).collect();
+    if seen.len() == expected {
+        return;
+    }
+    let msg = format!(
+        "決定点が {} 件しか残っていません（対象 {expected} 件）: 門の分母が縮む",
+        seen.len()
+    );
+    if allow_incomplete {
+        eprintln!("警告: {msg}");
+    } else {
+        die(&format!("{msg}\n（承知のうえで集計するなら --allow-incomplete）"));
+    }
+}
+
 /// 型ごとの集計値（表示と検査で同じものを使う）
 #[derive(Default)]
 struct Stats {
@@ -759,30 +791,37 @@ fn summarize(rows: &[Row]) -> Vec<(String, Stats)> {
         let mut st = Stats { points: keys.len(), ..Stats::default() };
         for key in &keys {
             let rs = &points[key];
-            if let Some(m) = majority(&rs.iter().map(|r| r.top1_is_king).collect::<Vec<_>>()) {
+            // **決定点の分類は多数決で1回だけ決める**（seed は独立標本として
+            // 数えない）。首位が既に玉の手の決定点は「価格の出番なし」に入れ、
+            // 門の分母からは丸ごと外す: 多数決で既に玉の手なのに、少数側の
+            // 1 unit だけで「反転した」を分母1で数えると門の割合が水増しされる
+            let is_already = majority(&rs.iter().map(|r| r.top1_is_king).collect::<Vec<_>>());
+            if let Some(m) = is_already {
                 st.already_king.push(m);
             }
             if let Some(m) = majority(&rs.iter().map(|r| r.matches_record).collect::<Vec<_>>()) {
                 st.reproduced.push(m);
             }
-            // **門の分母は「首位が玉以外」の unit だけ**。首位が既に玉の手なら
-            // 価格を上げるまでもないので「反転した」には数えない
-            let rev: Vec<bool> = rs
-                .iter()
-                .filter(|r| !r.top1_is_king)
-                .map(|r| r.k_star.is_some_and(|k| k <= 3.0))
-                .collect();
-            if let Some(m) = majority(&rev) {
-                st.k3.push(m);
+            if is_already == Some(false) {
+                // 門の分母は「首位が玉以外」の決定点だけ。その中でも
+                // 首位が玉の手だった seed は問い自体が立たないので除く
+                let rev: Vec<bool> = rs
+                    .iter()
+                    .filter(|r| !r.top1_is_king)
+                    .map(|r| r.k_star.is_some_and(|k| k <= 3.0))
+                    .collect();
+                if let Some(m) = majority(&rev) {
+                    st.k3.push(m);
+                }
+                for r in rs.iter().filter(|r| !r.top1_is_king) {
+                    match r.k_star {
+                        Some(k) => st.k_values.push(k),
+                        None => st.unreverted += 1,
+                    }
+                }
             }
             if let Some(m) = majority(&rs.iter().filter_map(|r| r.changed).collect::<Vec<_>>()) {
                 st.changed.push(m);
-            }
-            for r in rs.iter().filter(|r| !r.top1_is_king) {
-                match r.k_star {
-                    Some(k) => st.k_values.push(k),
-                    None => st.unreverted += 1,
-                }
             }
             for r in rs {
                 if let (Some(after), true) = (r.p_king_after, r.p_king.is_finite()) {
@@ -995,6 +1034,11 @@ fn run_report(args: &[String]) {
         die("meta の seeds が 0 です（空の集計で判定を偽造できてしまう）");
     }
     check_completeness(&rows, seeds, allow_incomplete);
+    let expected: usize = metas
+        .iter()
+        .map(|m| m["points"].as_u64().unwrap_or_else(|| die("meta に points がありません")) as usize)
+        .sum();
+    check_points_present(&rows, expected, allow_incomplete);
     println!("CSV {} 本 / シャード {total} / 行 {}", paths.len(), rows.len());
     println!("meta {}", first);
     report(&rows);
@@ -1038,6 +1082,22 @@ mod tests {
         assert_eq!(total.k3, vec![true]);
         assert_eq!(total.already_king, vec![true, false]);
         assert_eq!(total.unreverted, 1);
+    }
+
+    #[test]
+    fn 多数決で既に玉の手の決定点は少数側のunitでも門に入らない() {
+        // 3 seed 中 2 つで首位が既に玉の手 → その決定点は「価格の出番なし」。
+        // 残り 1 seed が k*≤3 で反転しても、分母1で「反転した」に数えない
+        let rows = vec![
+            row("a", 10, 0, true, Some(1.0)),
+            row("a", 10, 1, true, Some(1.0)),
+            row("a", 10, 2, false, Some(2.0)),
+        ];
+        let st = summarize(&rows);
+        let total = &st.iter().find(|(t, _)| t == "**合計**").unwrap().1;
+        assert_eq!(total.already_king, vec![true]);
+        assert!(total.k3.is_empty(), "門の分母に入らない: {:?}", total.k3);
+        assert!(total.k_values.is_empty(), "k* の分布にも混ぜない");
     }
 
     #[test]

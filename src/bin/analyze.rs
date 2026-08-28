@@ -166,8 +166,12 @@ struct CheckEconomy {
     /// 1本しか無い手番は価格では避けられない（確かめが必要）
     legal_outs_hist: [u32; 3],
     /// 反則した手番のうち、**ソルバー最善が最初から真に合法**だった手番
-    /// （= 1反則も要らなかった。issue の「64手番」に対応）
+    /// （= 1反則も要らなかった。issue の「64手番」に対応）。
+    /// 分母は**開始時にソルバーを作れた手番だけ**（両王手で仮説が全滅した
+    /// 手番はソルバー順位が付かないので、0 として数えると率が下振れする）
     best_legal_was_top: (u32, u32),
+    /// そのソルバーを作れなかった手番の数（判定不能として別に出す）
+    best_legal_unknown: u32,
     /// 受理された**非玉手**の開始時ソルバー p 順位 [1位, 2〜3位, 4位以上, 不明]
     accepted_nonking_rank: [u32; 4],
     /// 反則した王手手番の開始時の**残り反則**（index = 残り回数 0..=10）
@@ -220,9 +224,13 @@ impl CheckEconomy {
                     _ => 2,
                 };
                 self.legal_outs_hist[outs] += 1;
-                self.best_legal_was_top.1 += 1;
-                if turn.best_legal_rank_at_entry == Some(1) {
-                    self.best_legal_was_top.0 += 1;
+                if turn.solver_at_entry {
+                    self.best_legal_was_top.1 += 1;
+                    if turn.best_legal_rank_at_entry == Some(1) {
+                        self.best_legal_was_top.0 += 1;
+                    }
+                } else {
+                    self.best_legal_unknown += 1;
                 }
             }
             if let (Some(acc), true) = (turn.accepted_attempt(), turn.fouls() > 0) {
@@ -303,8 +311,13 @@ impl CheckEconomy {
             );
             let (top, tot) = self.best_legal_was_top;
             println!(
-                "  そのうちソルバー最善が最初から合法だった手番: {top}/{tot} ({:.1}% = 1反則も要らなかった)",
-                pct(top, tot)
+                "  そのうちソルバー最善が最初から合法だった手番: {top}/{tot} ({:.1}% = 1反則も要らなかった{})",
+                pct(top, tot),
+                if self.best_legal_unknown > 0 {
+                    format!("。ソルバーを作れず判定不能 {}", self.best_legal_unknown)
+                } else {
+                    String::new()
+                },
             );
         }
         let r = self.accepted_nonking_rank;
