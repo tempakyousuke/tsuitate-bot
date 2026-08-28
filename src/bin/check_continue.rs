@@ -353,12 +353,13 @@ fn main() {
                 })
                 .collect();
             let estimand = if record_order.is_empty() { "nofoul" } else { "foul" };
-            if let Some(accepted) = end.moves.get(d.decision_id as usize) {
-                record_order.push(accepted.usi.clone());
-            }
-            if record_order.is_empty() {
+            // **受理手を持たない手番（その手番で終局した）は対象外**。
+            // baseline が「反則列だけを強制して受理手が無い」列になり、
+            // 実際には別の理由で終わった局を反則負け 0 点として数えてしまう
+            let Some(accepted) = end.moves.get(d.decision_id as usize) else {
                 return;
-            }
+            };
+            record_order.push(accepted.usi.clone());
             found.push(Point {
                 game: short.clone(),
                 move_number: d.pos.move_number(),

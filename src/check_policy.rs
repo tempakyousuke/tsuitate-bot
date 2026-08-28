@@ -486,8 +486,8 @@ pub fn delta_v(
     updater: &ShadowUpdater,
     moves: &[PolicyMove],
     p: &[f64],
-    price: &Price,
-    price_after: &Price,
+    c_pre: f64,
+    c_post: f64,
     fouls_so_far: &[ShogiMove],
     excluded: &HashSet<String>,
 ) -> Vec<f64> {
@@ -498,17 +498,20 @@ pub fn delta_v(
     if live.len() < 2 {
         return out;
     }
-    let score_pre = |i: usize| moves[i].score(p[i], price.current);
+    // **その方策自身の価格で測る**（α×β では c = max(k×base, 床) が現行価格と
+    // 違うので、現行価格で順位を付けると別の世界の ΔV になる）
+    let score_pre = |i: usize| moves[i].score(p[i], c_pre);
     let leader = live
         .iter()
         .copied()
         .map(score_pre)
         .fold(f64::NEG_INFINITY, f64::max);
-    // 首位から c 以内の候補だけが β で動きうる（doc の上界）
+    // 首位から (c − c_min) 以内の候補だけが β で動きうる（doc の上界。
+    // 余裕を見て c まで広げる）
     let targets: Vec<usize> = live
         .iter()
         .copied()
-        .filter(|i| score_pre(*i) >= leader - price.current)
+        .filter(|i| score_pre(*i) >= leader - c_pre)
         .collect();
     if targets.len() < 2 {
         return out;
@@ -530,7 +533,7 @@ pub fn delta_v(
             .iter()
             .copied()
             .filter(|i| *i != m)
-            .map(|i| moves[i].score(p_post[i], price_after.current))
+            .map(|i| moves[i].score(p_post[i], c_post))
             .fold(f64::NEG_INFINITY, f64::max);
         if vpre.is_finite() && vpost.is_finite() {
             raw.push((m, vpost - vpre));
@@ -611,9 +614,21 @@ pub fn simulate(
         let price = price_at(params, you, opp_fouls);
         let price_after = price_at(params, you + 1, opp_fouls);
         let dv = if policy.needs_delta_v() {
+            // ΔV は**その方策自身の価格**で測る（β-order は現行価格、
+            // β は `max(k × base, 床)`）
+            let c_of = |pr: &Price| match policy {
+                Policy::Beta { k, .. } => (k * pr.base).max(pr.floor),
+                _ => pr.current,
+            };
             match &rule {
                 UpdateRule::Shadow(u) => Some(delta_v(
-                    u, &moves, &p, &price, &price_after, &fouls_mv, &excluded,
+                    u,
+                    &moves,
+                    &p,
+                    c_of(&price),
+                    c_of(&price_after),
+                    &fouls_mv,
+                    &excluded,
                 )),
                 // 仮想更新が使えない対照（Static / Real）では β は ΔV を持てない
                 _ => None,
@@ -834,6 +849,29 @@ mod tests {
         let costs =
             effective_costs(&Policy::Beta { k: 1.0, lambda: 1.0 }, &moves, &last, Some(&[9.0, 0.0]));
         assert_eq!(costs, vec![2.0, 2.0]);
+    }
+
+    /// `delta_v` が「首位から c 以内」で枝刈りしてよい根拠。
+    ///
+    /// β が動かせる score は高々 `(1−p)·(c − c_min) ≤ c − c_min = 0.5c` なので、
+    /// 首位から c 以上離れた候補は β では首位になれない（枝刈りは近似ではなく上界）。
+    #[test]
+    fn betaが動かせるスコアはc_minまでの差で頭打ち() {
+        let pr = Price { base: 2.0, floor: 0.0, current: 2.0, remaining: 5 };
+        let moves = vec![pm("5f5e", 3.0, 0.4, false, false), pm("5i4h", 2.0, 0.9, true, true)];
+        for dv in [-100.0, -1.0, 0.0, 1.0, 100.0] {
+            let costs = effective_costs(
+                &Policy::Beta { k: 1.0, lambda: 1.0 },
+                &moves,
+                &pr,
+                Some(&[dv, dv]),
+            );
+            for (i, m) in moves.iter().enumerate() {
+                let shift = (m.score(m.p_legal, costs[i]) - m.score(m.p_legal, pr.current)).abs();
+                let bound = (1.0 - BETA_C_MIN_RATIO) * pr.current;
+                assert!(shift <= bound + 1e-9, "ΔV={dv} で {shift} > {bound}");
+            }
+        }
     }
 
     #[test]
