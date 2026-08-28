@@ -770,22 +770,58 @@ fn majority(vals: &[bool]) -> Option<bool> {
 /// 揃っていない決定点があると、多数決の分母が決定点ごとに変わり
 /// （2/3 seed の点は同数で「反転しない」側へ倒れる）、門の割合が黙って動く。
 /// `--allow-incomplete` を付けたときだけ警告へ落とす（issue #28 の契約と同じ）。
+/// H2 の値（生 / 対照 / 正味）が欠測している unit を列挙する。
+///
+/// B（実再決定）や A（対照）のランキングが取れなかった unit は行だけ残って
+/// `changed` 系が空になり、`summarize` の `filter_map` が黙って落とす。
+/// 全 seed で欠測した決定点は H2 の分母から丸ごと消えるので、20% の門が
+/// 欠測の偏りで動く（PR #32 レビュー2巡目 [P2]）。
+fn missing_h2(rows: &[Row]) -> Vec<String> {
+    rows.iter()
+        .filter_map(|r| {
+            let what: Vec<&str> = [
+                ("changed", r.changed.is_none()),
+                ("changed_ctrl", r.changed_ctrl.is_none()),
+                ("changed_vs_ctrl", r.changed_vs_ctrl.is_none()),
+            ]
+            .iter()
+            .filter(|(_, missing)| *missing)
+            .map(|(name, _)| *name)
+            .collect();
+            (!what.is_empty()).then(|| {
+                format!("{} {}手目 seed{}（{}）", r.game, r.move_number, r.seed, what.join(","))
+            })
+        })
+        .collect()
+}
+
 fn check_completeness(rows: &[Row], seeds: u64, allow_incomplete: bool) {
     let mut per_point: BTreeMap<(String, u32), BTreeSet<u64>> = BTreeMap::new();
     for r in rows {
         per_point.entry(r.point_key()).or_default().insert(r.seed);
     }
-    let bad: Vec<String> = per_point
+    let mut bad: Vec<String> = per_point
         .iter()
         .filter(|(_, s)| s.len() as u64 != seeds)
         .map(|((g, mn), s)| format!("{g} {mn}手目（seed {}/{seeds}）", s.len()))
         .collect();
+    // **H2 の欠測も検査する**（PR #32 レビュー2巡目 [P2]）。B / A のランキングが
+    // 取れなかった unit は行だけ残って `changed` 系が空になり、`summarize` の
+    // `filter_map` が黙って落とす。全 seed で欠測した決定点は H2 の分母から
+    // 丸ごと消えるので、20% の門が欠測の偏りで動く
+    let missing = missing_h2(rows);
+    if !missing.is_empty() {
+        bad.push(format!(
+            "H2 の値が欠測している unit が {} 件あります（H2 の分母から黙って落ちる）:\n  {}",
+            missing.len(),
+            missing.join("\n  ")
+        ));
+    }
     if bad.is_empty() {
         return;
     }
     let msg = format!(
-        "seed が揃っていない決定点が {} 件あります（多数決の分母が決定点ごとに変わる）:\n  {}",
-        bad.len(),
+        "集計の完全性に問題があります（多数決の分母が決定点ごとに変わる）:\n  {}",
         bad.join("\n  ")
     );
     if allow_incomplete {
@@ -1236,6 +1272,19 @@ mod tests {
         assert_eq!(total.k3, vec![true]);
         assert_eq!(total.already_king, vec![true, false]);
         assert_eq!(total.unreverted, 1);
+    }
+
+    #[test]
+    fn h2の欠測は完全性検査で止まる() {
+        // B / A のランキングが取れなかった unit は行だけ残って changed 系が空に
+        // なる。summarize は filter_map で落とすので、検査しないと H2 の分母が
+        // 黙って縮む（PR #32 レビュー2巡目 [P2]）
+        let mut rows = vec![row("a", 10, 0, false, Some(2.0)), row("a", 10, 1, false, Some(2.0))];
+        assert!(missing_h2(&rows).is_empty());
+        rows[1].changed_vs_ctrl = None;
+        assert_eq!(missing_h2(&rows).len(), 1);
+        rows[0].changed = None;
+        assert_eq!(missing_h2(&rows).len(), 2);
     }
 
     #[test]
