@@ -1147,8 +1147,22 @@ fn run_report(args: &[String]) {
             if k_star.is_some_and(|k| !k.is_finite() || k < 1.0) {
                 bad("k_star", at(5));
             }
-            // p_king は玉の手が無ければ NaN を書くので、NaN も正当な値
+            // **確率の列は値域まで検査する**（PR #32 レビュー3巡目 [P2]:
+            // 構文が通るだけでは NaN・無限大・[0,1] の外が素通りし、
+            // 集計の「p_legal の変化」が黙って NaN になる）
+            let prob = |k: usize, what: &str| -> Option<f64> {
+                opt_f64(k, what).inspect(|v| {
+                    if !v.is_finite() || !(0.0..=1.0).contains(v) {
+                        bad(what, at(k));
+                    }
+                })
+            };
+            // `p_king` だけは NaN が「その決定点に玉の手が無い」正規の sentinel。
+            // それ以外の非有限値と範囲外は拒否する
             let p_king: f64 = at(10).parse().unwrap_or_else(|_| bad("p_king", at(10)));
+            if !p_king.is_nan() && (!p_king.is_finite() || !(0.0..=1.0).contains(&p_king)) {
+                bad("p_king", at(10));
+            }
             let seed = req_u64(3, "seed");
             if seed >= seeds_hint {
                 die(&format!(
@@ -1168,8 +1182,8 @@ fn run_report(args: &[String]) {
                 changed_vs_ctrl: opt_bool(8, "changed_vs_ctrl"),
                 matches_record: req_bool(9, "matches_record"),
                 p_king,
-                p_king_after: opt_f64(11, "p_king_after"),
-                p_king_ctrl: opt_f64(12, "p_king_ctrl"),
+                p_king_after: prob(11, "p_king_after"),
+                p_king_ctrl: prob(12, "p_king_ctrl"),
             });
         }
         metas.push(meta);
