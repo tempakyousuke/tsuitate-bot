@@ -19,13 +19,15 @@ use std::collections::{HashMap, HashSet};
 
 use tsuitate_bot::board::Coord;
 use tsuitate_bot::check::CheckSolver;
+use tsuitate_bot::check_economy::{
+    CheckFoulReason, CheckMoveKind, CheckTurn, TurnType, check_turns, classify_check_foul,
+    cluster_ratio_ci, sq as sq_name, true_checkers, view_from_model,
+};
 use tsuitate_bot::mate::{mate_moves_in_1, mate_moves_in_1_fast};
 use tsuitate_bot::mate_economy::{MateKind, fold_episodes, threat_turns};
 use tsuitate_bot::model::GameModel;
 use tsuitate_bot::observation::{stale_king_foul_dests, Observation, ObservationLog};
-use tsuitate_bot::protocol::{
-    ClockState, Color, FoulCounts, FoulRecord, GameEndPayload, GameStatus, PlayerView, Role,
-};
+use tsuitate_bot::protocol::{Color, FoulRecord, GameEndPayload, Role};
 use tsuitate_bot::shogi::{Outcome, Position, ShogiMove, parse_usi, piece_value};
 use tsuitate_bot::strategy::candidate_moves;
 
@@ -39,6 +41,11 @@ struct GameRecord {
     /// debug.p_legal と、その手の受理/反則の突き合わせ（C-7 P3 の較正測定）。
     /// move_number は王手中の手番だけに絞った較正（王手中の p_legal 過信の診断）用
     p_legal_outcomes: Vec<(f64, bool, u32)>,
+    /// (決定点の move_number, USI) → 記録された p_legal。
+    /// `p_legal_outcomes` と違い**決定点の手数**で引ける（MyMove の
+    /// move_number は適用後の値なので -1 して揃える）。issue #31 の
+    /// 手種別・順番別の較正が、試行1つずつを手種へ割り当てるのに使う
+    p_legal_by_attempt: HashMap<(u32, String), f64>,
     /// 決定点（positions のインデックス）→ その決定の chose debug で観測できる
     /// 「厳密粒子ゼロだったか」。`debug.sample_slots`（評価に使った厳密粒子の
     /// スロット数）が 0 なら true。
@@ -63,6 +70,7 @@ fn parse_record(path: &str, content: &str) -> Option<GameRecord> {
     let mut observations = vec![];
     let mut end = None;
     let mut p_legal_outcomes = vec![];
+    let mut p_legal_by_attempt: HashMap<(u32, String), f64> = HashMap::new();
     let mut blind_decisions: HashMap<usize, Option<bool>> = HashMap::new();
     // 直近の chose イベントの (usi, p_legal)。次の MyMove/MyFoul 観測と照合する
     let mut pending_chose: Option<(String, f64)> = None;
@@ -103,12 +111,15 @@ fn parse_record(path: &str, content: &str) -> Option<GameRecord> {
                             if usi == cu =>
                         {
                             p_legal_outcomes.push((*p, true, *move_number));
+                            p_legal_by_attempt
+                                .insert((move_number.saturating_sub(1), usi.clone()), *p);
                             pending_chose = None;
                         }
                         (Observation::MyFoul { usi, move_number }, Some((cu, p)))
                             if usi == cu =>
                         {
                             p_legal_outcomes.push((*p, false, *move_number));
+                            p_legal_by_attempt.insert((*move_number, usi.clone()), *p);
                             pending_chose = None;
                         }
                         _ => {}
@@ -129,32 +140,273 @@ fn parse_record(path: &str, content: &str) -> Option<GameRecord> {
         observations,
         end: end?,
         p_legal_outcomes,
+        p_legal_by_attempt,
         blind_decisions,
     })
 }
 
-/// 観測ログの復元から PlayerView 相当を作る（王手ソルバーの再現検証用）
-fn view_from_model(model: &GameModel, in_check: bool) -> PlayerView {
-    PlayerView {
-        game_id: "replay".into(),
-        your_color: model.my_color(),
-        your_pieces: model.my_pieces(),
-        your_hand: model.my_hand(),
-        turn: model.my_color(),
-        move_number: 0,
-        clocks: ClockState {
-            sente_ms: 0,
-            gote_ms: 0,
-            running: None,
-            server_time: 0,
-        },
-        fouls: FoulCounts {
-            you: model.my_fouls(),
-            opponent: model.opponent_fouls(),
-        },
-        you_in_check: in_check,
-        opponent_in_check: false,
-        status: GameStatus::Playing,
+/// ソルバー方策が「破滅した」とみなす反則数（issue #31 の実測では 8〜10回）
+const SOLVER_CATASTROPHE: u32 = 8;
+
+/// 王手中の反則経済（issue #31 P0-1/P0-2/P0-3）の集計器。
+///
+/// **粒子を回さない**（記録の観測列＋真実の棋譜＋CheckSolver だけ）ので
+/// アリーナ記録に対してそのまま常設できる。エンジンの順位・gain が要る量
+/// （k\* 監査・方策シミュレーション）は P0-4/P0-5 の領分。
+#[derive(Default)]
+struct CheckEconomy {
+    /// 型別の (手番数, 反則数)
+    types: HashMap<TurnType, (u32, u32)>,
+    /// 最初の反則の着手先（真実）: [王手駒がいた, 敵駒はいたが王手駒でない, 空]
+    first_foul_target: [u32; 3],
+    /// 整合性検査（受理手が決定点の真実局面で合法か）。反則は手番を変えない
+    /// ので常に一致するはずで、ずれたら手数の対応がおかしい
+    accepted_consistent: (u32, u32),
+    /// 反則した手番の開始時点で**真に合法だった候補の本数** [1本, 2〜3本, 4本以上]。
+    /// 1本しか無い手番は価格では避けられない（確かめが必要）
+    legal_outs_hist: [u32; 3],
+    /// 反則した手番のうち、**ソルバー最善が最初から真に合法**だった手番
+    /// （= 1反則も要らなかった。issue の「64手番」に対応）
+    best_legal_was_top: (u32, u32),
+    /// 受理された**非玉手**の開始時ソルバー p 順位 [1位, 2〜3位, 4位以上, 不明]
+    accepted_nonking_rank: [u32; 4],
+    /// 反則した王手手番の開始時の**残り反則**（index = 残り回数 0..=10）
+    remaining_hist: [u32; 11],
+    /// P0-2 の較正: (手種, 順番束 0/1/2+) → (n, Σ予測, 合法数)
+    calib: HashMap<(CheckMoveKind, usize), (u32, f64, u32)>,
+    /// 捕獲試みの**方向つき較正誤差**の cluster（元対局ごとの (Σ(p−y), n)）
+    capture_gap_clusters: Vec<(f64, f64)>,
+    /// 王手中の bot の手番の総数（**反則0の手番も含む分母**）
+    turns_total: u32,
+    fouls_total: u32,
+    /// 真の王手駒仮説の重みシェアとエントロピー（反則あり/なしの手番で分ける）。
+    /// 「知らない（希釈）」と「知っていて払う」を分ける量
+    hyp_share: [(u32, f64, f64); 2],
+}
+
+impl CheckEconomy {
+    /// 1局ぶんの王手手番を畳む。`turns` は check_economy::check_turns の出力
+    fn add_game(&mut self, turns: &[CheckTurn]) {
+        let mut gap_sum = 0.0;
+        let mut gap_n = 0.0;
+        for turn in turns {
+            self.turns_total += 1;
+            self.fouls_total += turn.fouls() as u32;
+            let e = self.types.entry(turn.turn_type()).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += turn.fouls() as u32;
+            if let Some(first) = turn.first_foul() {
+                let bucket = if first.truth_checker_at_to {
+                    0
+                } else if first.truth_enemy_at_to {
+                    1
+                } else {
+                    2
+                };
+                self.first_foul_target[bucket] += 1;
+                let remaining = 10usize.saturating_sub(turn.fouls_before as usize);
+                self.remaining_hist[remaining.min(10)] += 1;
+            }
+            if turn.accepted_legal_at_entry.is_some() {
+                self.accepted_consistent.1 += 1;
+                if turn.accepted_legal_at_entry == Some(true) {
+                    self.accepted_consistent.0 += 1;
+                }
+            }
+            if turn.fouls() > 0 {
+                let outs = match turn.legal_candidates_at_entry {
+                    0 | 1 => 0,
+                    2..=3 => 1,
+                    _ => 2,
+                };
+                self.legal_outs_hist[outs] += 1;
+                self.best_legal_was_top.1 += 1;
+                if turn.best_legal_rank_at_entry == Some(1) {
+                    self.best_legal_was_top.0 += 1;
+                }
+            }
+            if let (Some(acc), true) = (turn.accepted_attempt(), turn.fouls() > 0) {
+                if acc.kind != CheckMoveKind::King {
+                    let bucket = match turn.accepted_rank_at_entry {
+                        Some(1) => 0,
+                        Some(2..=3) => 1,
+                        Some(_) => 2,
+                        None => 3,
+                    };
+                    self.accepted_nonking_rank[bucket] += 1;
+                }
+            }
+            if let (Some(share), Some(ent)) = (turn.true_hyp_share, turn.hyp_entropy) {
+                let slot = usize::from(turn.fouls() > 0);
+                self.hyp_share[slot].0 += 1;
+                self.hyp_share[slot].1 += share;
+                self.hyp_share[slot].2 += ent;
+            }
+            for a in &turn.attempts {
+                let Some(p) = a.p_legal else { continue };
+                let order = a.order.min(2);
+                let c = self.calib.entry((a.kind, order)).or_insert((0, 0.0, 0));
+                c.0 += 1;
+                c.1 += p;
+                if a.was_legal {
+                    c.2 += 1;
+                }
+                if a.kind == CheckMoveKind::CheckerCapture {
+                    gap_sum += p - if a.was_legal { 1.0 } else { 0.0 };
+                    gap_n += 1.0;
+                }
+            }
+        }
+        // 捕獲試みが1件も無かった局も cluster として数える（分母は元対局）
+        self.capture_gap_clusters.push((gap_sum, gap_n));
+    }
+
+    fn report(&self) {
+        if self.turns_total == 0 {
+            return;
+        }
+        println!("\n--- 王手中の反則経済（issue #31 P0-1/P0-2）---");
+        let pct = |a: u32, b: u32| -> f64 {
+            if b == 0 { 0.0 } else { f64::from(a) * 100.0 / f64::from(b) }
+        };
+        println!(
+            "王手中の手番: {} / 反則 {}（分母は反則0の手番も含む全王手手番）",
+            self.turns_total, self.fouls_total
+        );
+        for t in TurnType::ALL {
+            let (turns, fouls) = self.types.get(&t).copied().unwrap_or((0, 0));
+            println!(
+                "  型 {:<34} 手番 {:>4} ({:>4.1}%) / 反則 {:>4}",
+                t.label(),
+                turns,
+                pct(turns, self.turns_total),
+                fouls,
+            );
+        }
+        let ft = self.first_foul_target;
+        println!(
+            "  最初の反則の着手先（真実）: 王手駒がいた {} / 敵駒はいたが王手駒でない {} / 空 {}",
+            ft[0], ft[1], ft[2]
+        );
+        let (ok, all) = self.accepted_consistent;
+        if all > 0 && ok != all {
+            println!(
+                "  **整合性検査に失敗**: 受理手が決定点の真実局面で合法 {ok}/{all}（手数の対応がずれている）"
+            );
+        }
+        let outs = self.legal_outs_hist;
+        let outs_n: u32 = outs.iter().sum();
+        if outs_n > 0 {
+            println!(
+                "  反則した手番の開始時に真に合法だった候補: 1本以下 {} / 2〜3本 {} / 4本以上 {}（1本の手番は価格では避けられない）",
+                outs[0], outs[1], outs[2]
+            );
+            let (top, tot) = self.best_legal_was_top;
+            println!(
+                "  そのうちソルバー最善が最初から合法だった手番: {top}/{tot} ({:.1}% = 1反則も要らなかった)",
+                pct(top, tot)
+            );
+        }
+        let r = self.accepted_nonking_rank;
+        let rn: u32 = r.iter().sum();
+        if rn > 0 {
+            println!(
+                "  受理された非玉手の開始時ソルバーp順位: 1位 {} / 2〜3位 {} / 4位以上 {} / 不明 {}（上位なら「単に次点へ進んだだけ」。エンジン順位は P0-4）",
+                r[0], r[1], r[2], r[3]
+            );
+        }
+        for (slot, name) in [(0usize, "反則0"), (1, "反則あり")] {
+            let (n, share, ent) = self.hyp_share[slot];
+            if n > 0 {
+                println!(
+                    "  王手駒仮説（{name}の手番 {n}）: 真の王手駒の重みシェア 平均 {:.3} / 正規化エントロピー 平均 {:.3}",
+                    share / f64::from(n),
+                    ent / f64::from(n),
+                );
+            }
+        }
+        let rem: Vec<String> = (1..=10)
+            .rev()
+            .map(|k| format!("{k}:{}", self.remaining_hist[k]))
+            .collect();
+        println!("  反則した王手手番の開始時の残り反則: {}", rem.join(" "));
+
+        if self.calib.is_empty() {
+            println!(
+                "  p_legal 較正: 記録に chose.debug.p_legal がありません（旧記録。P0-2 は arena-records に対して回すこと）"
+            );
+            return;
+        }
+        println!("  p_legal 較正（手種 × 手番内の順番。記録の chose.debug.p_legal）:");
+        for kind in CheckMoveKind::ALL {
+            for order in 0..3 {
+                let Some(&(n, sum_p, legal)) = self.calib.get(&(kind, order)) else {
+                    continue;
+                };
+                if n == 0 {
+                    continue;
+                }
+                let mean_p = sum_p / f64::from(n);
+                let rate = f64::from(legal) / f64::from(n);
+                println!(
+                    "    {:<16} 順番{:<3} n={:>4} 平均予測 {:.3} / 合法率 {:.3} / 差 {:+.3}",
+                    kind.label(),
+                    if order == 2 { "2+".to_string() } else { order.to_string() },
+                    n,
+                    mean_p,
+                    rate,
+                    mean_p - rate,
+                );
+            }
+        }
+        // H3 の判定は Brier ではなく**方向つき較正誤差**（元対局 cluster CI）。
+        // 門: 下限 > 0.1（そして v13 / v14 の両相手で同方向）
+        let n: f64 = self.capture_gap_clusters.iter().map(|c| c.1).sum();
+        if n > 0.0 {
+            let gap: f64 = self.capture_gap_clusters.iter().map(|c| c.0).sum::<f64>() / n;
+            let (lo, hi) = cluster_ratio_ci(&self.capture_gap_clusters, 0.05, 0x2026_0828);
+            println!(
+                "  捕獲試みの方向つき較正誤差（平均予測 − 合法率）: {gap:+.3} [95% CI {lo:+.3}, {hi:+.3}]（n={n:.0}手 / {}局。門: CI下限 > 0.1 かつ v13/v14 で同方向）",
+                self.capture_gap_clusters.len(),
+            );
+        }
+    }
+}
+
+/// ソルバー方策の**破滅**（issue #31 P0-3）: 解消確率の argmax で指し直すと
+/// かえって 8 反則以上を積む手番。P1 の方策がソルバーの p を強く信じるほど
+/// この破滅を継承するので、原因（仮説集合に真の王手駒が無い／`legal_under` が
+/// 支え駒を置かない盲点）を手番ごとに記録する。
+#[derive(Default)]
+struct SolverCatastrophes {
+    turns: u32,
+    /// 真の王手駒の仮説集合での状態 [マス・駒種とも一致, マスのみ一致, なし]
+    hypothesis_status: [u32; 3],
+    /// ソルバーが積んだ反則の原因
+    reasons: HashMap<CheckFoulReason, u32>,
+}
+
+impl SolverCatastrophes {
+    fn report(&self, threshold: u32) {
+        println!(
+            "  ソルバー方策の破滅（{threshold}反則以上）: {}手番",
+            self.turns
+        );
+        if self.turns == 0 {
+            return;
+        }
+        let h = self.hypothesis_status;
+        println!(
+            "    真の王手駒の仮説: マス・駒種とも一致 {} / マスのみ一致 {} / 仮説集合に無い {}",
+            h[0], h[1], h[2]
+        );
+        let mut reasons: Vec<_> = self.reasons.iter().collect();
+        reasons.sort_by_key(|(_, n)| std::cmp::Reverse(**n));
+        let line: Vec<String> = reasons
+            .iter()
+            .map(|(r, n)| format!("{} {}", r.label(), n))
+            .collect();
+        println!("    反則の原因（真実から分類）: {}", line.join(" / "));
     }
 }
 
@@ -162,7 +414,12 @@ fn view_from_model(model: &GameModel, in_check: bool) -> PlayerView {
 /// 最初から指し直し、合法手に到達するまでの反則回数を実際の反則回数と比較する。
 /// 実運用と同じく、反則するたびにその手を仮説消去へ回して選び直す。
 /// 戻り値: (検証した手番数, 実際の反則合計, ソルバー方策での反則合計)
-fn simulate_check_solver(rec: &GameRecord, positions: &[Position], bot: Color) -> (u32, u32, u32) {
+fn simulate_check_solver(
+    rec: &GameRecord,
+    positions: &[Position],
+    bot: Color,
+    cat: &mut SolverCatastrophes,
+) -> (u32, u32, u32) {
     // 手番ごとの実際の反則回数と、その手番の最初の反則の直前までの観測数
     let mut turns: Vec<(u32, usize, u32)> = vec![]; // (move_number, obs_prefix, actual_fouls)
     for (i, obs) in rec.observations.iter().enumerate() {
@@ -229,6 +486,43 @@ fn simulate_check_solver(rec: &GameRecord, positions: &[Position], bot: Color) -
             "  王手手番 {move_number}手目: 実際の反則 {actual}回 → ソルバー方策 {sim_fouls}回 [{}]",
             sequence.join(" ")
         );
+        // P0-3: 破滅した手番（ソルバーのほうが大きく損をする）の原因を記録する。
+        // 「ソルバーに従え」は解ではないので、P1 の方策がこの破滅を継承しないか
+        // を見る材料にする
+        if sim_fouls >= SOLVER_CATASTROPHE {
+            cat.turns += 1;
+            let checkers = true_checkers(truth, bot);
+            let hyps = CheckSolver::new(&view, &[], &[], &log)
+                .map(|s| s.hypotheses_debug())
+                .unwrap_or_default();
+            let status = if checkers
+                .iter()
+                .any(|(s, r)| hyps.iter().any(|(hs, hr, _)| hs == s && hr == r))
+            {
+                0
+            } else if checkers.iter().any(|(s, _)| hyps.iter().any(|(hs, _, _)| hs == s)) {
+                1
+            } else {
+                2
+            };
+            cat.hypothesis_status[status] += 1;
+            let mut reasons: Vec<String> = vec![];
+            for mv in &fouls {
+                let reason = classify_check_foul(truth, bot, mv);
+                *cat.reasons.entry(reason).or_insert(0) += 1;
+                reasons.push(reason.label().to_string());
+            }
+            println!(
+                "    [破滅] 真の王手駒 {} / 仮説 {} / 原因 {}",
+                checkers
+                    .iter()
+                    .map(|(s, r)| format!("{}{:?}", sq_name(*s), r))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                ["マス・駒種一致", "マスのみ一致", "仮説集合に無い"][status],
+                reasons.join(","),
+            );
+        }
     }
     (tested, actual_total, solver_total)
 }
@@ -856,6 +1150,9 @@ fn main() {
     let mut total_missed_board_only = 0u32;
     let mut total_missed_both = 0u32;
     let mut mate_cost = MateCost::default();
+    // issue #31 P0-1〜P0-3: 王手中の反則経済（粒子不要）
+    let mut check_econ = CheckEconomy::default();
+    let mut catastrophes = SolverCatastrophes::default();
     let mut total_check_turns = 0;
     let mut total_check_actual_fouls = 0;
     let mut total_check_solved = 0;
@@ -1329,8 +1626,37 @@ fn main() {
             );
         }
 
+        // issue #31 P0-1/P0-2: 王手中の手番の型分類と、手種別・順番別の較正。
+        // **分母は反則0の手番も含む全王手手番**（新しいプローブを足す害の
+        // estimand がそこなので、反則した手番だけを数えてはいけない）
+        let econ_turns = check_turns(
+            &rec.observations,
+            &positions,
+            bot,
+            &rec.p_legal_by_attempt,
+        );
+        for turn in &econ_turns {
+            if turn.fouls() == 0 {
+                continue;
+            }
+            println!(
+                "  王手手番 {}手目（残り反則{}）: {} → 型 {} / 受理手の開始時 {}",
+                turn.move_number,
+                10u32.saturating_sub(turn.fouls_before),
+                turn.sequence(),
+                turn.turn_type().label(),
+                match (turn.accepted_legal_at_entry, turn.accepted_rank_at_entry) {
+                    (Some(true), Some(r)) => format!("合法・ソルバーp {r}位"),
+                    (Some(true), None) => "合法".to_string(),
+                    (Some(false), _) => "反則（情報が要った）".to_string(),
+                    (None, _) => "受理手なし".to_string(),
+                },
+            );
+        }
+        check_econ.add_game(&econ_turns);
+
         // 王手ソルバーの再現検証（王手中に反則した手番それぞれを指し直す）
-        let (tested, actual, sim) = simulate_check_solver(&rec, &positions, bot);
+        let (tested, actual, sim) = simulate_check_solver(&rec, &positions, bot, &mut catastrophes);
         total_check_turns += tested;
         total_check_actual_fouls += actual;
         total_check_solved += sim;
@@ -1671,6 +1997,9 @@ fn main() {
             );
         }
     }
+    check_econ.report();
+    catastrophes.report(SOLVER_CATASTROPHE);
+
     // p_legal の較正（C-7 P3）: 選択手の合法確率予測 vs 実際の受理/反則。
     // Brier = mean((p-y)^2)（小さいほど良い）。参考: 常に基底率を答える予測の Brier
     if !p_legal_all.is_empty() {

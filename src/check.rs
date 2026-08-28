@@ -495,6 +495,15 @@ impl CheckSolver {
         }
     }
 
+    /// **診断専用**の読み取り（issue #31 P0-3）: 仮説集合の (マス, 駒種, 重み)。
+    ///
+    /// 「ソルバー方策が 8〜10 反則で破滅した手番で、真の王手駒が仮説集合に
+    /// そもそも載っていたのか」を `bin/analyze` が見るために公開する。
+    /// runtime は呼ばない（読むだけなので挙動は変わらない）。
+    pub fn hypotheses_debug(&self) -> Vec<(Coord, Role, f64)> {
+        self.hypotheses.iter().map(|h| (h.square, h.role, h.weight)).collect()
+    }
+
     /// **既知敵駒がカバーする玉の行き先の p_legal 上限**（2026-08-20、
     /// arena-check-foul02 が発端。codex 設計相談）。粒子の合法性投票は
     /// 「既知マスの駒はもう動いた」と信じて玉逃げの p_legal を 0.7 に保つが、
