@@ -541,8 +541,19 @@ fn main() {
 
 // ---- 集計 ------------------------------------------------------------------
 
+/// 1ペアの観測。`treatment_first` は「その unit で treatment が先に走ったか」
+/// （`arm_order == 0`）で、実行順効果が推定へ漏れていないかの検査に使う
+struct Pair {
+    game: String,
+    delta: f64,
+    remaining: u32,
+    opp_remaining: u32,
+    band: String,
+    treatment_first: Option<bool>,
+}
+
 /// ペア（control / treatment）の差を局ごとに畳む
-fn pairs(rows: &[serde_json::Value]) -> Vec<(String, f64, u32, u32, String)> {
+fn pairs(rows: &[serde_json::Value]) -> Vec<Pair> {
     let mut by: BTreeMap<(String, u64, u64), BTreeMap<String, serde_json::Value>> = BTreeMap::new();
     for r in rows {
         by.entry((
@@ -559,13 +570,14 @@ fn pairs(rows: &[serde_json::Value]) -> Vec<(String, f64, u32, u32, String)> {
             continue;
         };
         let d = t["score"].as_f64().unwrap_or(0.0) - c["score"].as_f64().unwrap_or(0.0);
-        out.push((
+        out.push(Pair {
             game,
-            d,
-            c["remaining"].as_u64().unwrap_or(0) as u32,
-            c["opp_remaining"].as_u64().unwrap_or(0) as u32,
-            c["band"].as_str().unwrap_or("?").to_string(),
-        ));
+            delta: d,
+            remaining: c["remaining"].as_u64().unwrap_or(0) as u32,
+            opp_remaining: c["opp_remaining"].as_u64().unwrap_or(0) as u32,
+            band: c["band"].as_str().unwrap_or("?").to_string(),
+            treatment_first: t["arm_order"].as_u64().map(|k| k == 0),
+        });
     }
     out
 }
@@ -584,6 +596,44 @@ fn cluster(diffs: &[(String, f64)]) -> (f64, f64, f64) {
     let point = if den > 0.0 { num / den } else { f64::NAN };
     let (lo, hi) = cluster_ratio_ci(&v, 0.05, 0x31_2028);
     (point, lo, hi)
+}
+
+/// AB/BA の均衡と、**実行順の半分ごとの影の価格**を出す。
+///
+/// 実行順効果 ω̂ が 0 から離れていても、半分の個数が揃っていれば ω はペア差から
+/// 相殺されるので推定は不偏。歪んでいるなら「treatment 先」と「control 先」で
+/// 価格が食い違うはずなので、**そちらが本当の関門**。両半分の CI が重なるかで読む。
+fn order_balance(all: &[Pair]) {
+    let mut halves: [Vec<(String, f64)>; 2] = [vec![], vec![]];
+    let mut unknown = 0usize;
+    for p in all {
+        match p.treatment_first {
+            Some(true) => halves[0].push((p.game.clone(), p.delta)),
+            Some(false) => halves[1].push((p.game.clone(), p.delta)),
+            None => unknown += 1,
+        }
+    }
+    if unknown > 0 {
+        println!("  実行順の内訳: **測れない**（`arm_order` の無い行が {unknown} 本）");
+        return;
+    }
+    let (na, nb) = (halves[0].len(), halves[1].len());
+    let imbalance = (na as f64 - nb as f64).abs() / (na + nb).max(1) as f64;
+    println!(
+        "  実行順の均衡: treatment 先 {na} / control 先 {nb}（偏り {:.1}%。0% なら実行順効果はペア差から厳密に相殺する）",
+        imbalance * 100.0
+    );
+    for (label, v) in [("treatment 先", &halves[0]), ("control 先", &halves[1])] {
+        if v.is_empty() {
+            continue;
+        }
+        let (d, lo, hi) = cluster(v);
+        println!("    {label:<14} n={:<5} {d:+.4} [{lo:+.4}, {hi:+.4}]", v.len());
+    }
+    println!(
+        "    ※ **この2行が食い違っていたら実行順が推定へ漏れている**。ω̂ ≠ 0 だけでは\
+漏れの証拠にならない（均衡していれば相殺されるため）"
+    );
 }
 
 fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incomplete: bool) {
@@ -609,21 +659,33 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
         println!("  ペアが1つもありません（control / treatment が揃っていない）");
         return;
     }
-    let (d, lo, hi) = cluster(&all.iter().map(|(g, d, ..)| (g.clone(), *d)).collect::<Vec<_>>());
+    let (d, lo, hi) = cluster(
+        &all.iter()
+            .map(|p| (p.game.clone(), p.delta))
+            .collect::<Vec<_>>(),
+    );
     println!(
         "  ペア {} / 元対局 {} / **影の価格（treatment − control、勝率単位）: {d:+.4} [{lo:+.4}, {hi:+.4}]**",
         all.len(),
-        all.iter().map(|(g, ..)| g).collect::<BTreeSet<_>>().len(),
+        all.iter().map(|p| &p.game).collect::<BTreeSet<_>>().len(),
     );
     println!(
         "  ※ 負なら「反則1個が勝率をこれだけ下げる」。`foul_cost` は評価点単位なので\
 水準は比べられない。読むのは**残数に対する曲線の形**だけ"
     );
 
-    let table = |title: &str, key: &dyn Fn(&(String, f64, u32, u32, String)) -> String| {
+    // **実行順が推定へ漏れていないかの直接の検査**（PR #33 レビュー [P1] の続き）。
+    // AB/BA が釣り合っていれば、実行順効果 ω はペア差の平均から**厳密に**落ちる:
+    // treatment 先の unit は δ+ω、control 先の unit は δ−ω を観測するので、
+    // 両半分の個数が同じなら ω は相殺する。つまり ω̂ ≠ 0 それ自体は推定を歪めない
+    // （むしろ「均衡させる設計が要る環境だった」の証拠）。歪んでいるかどうかは
+    // **半分ごとの影の価格が一致するか**で見るのが正しい検査なので、両方出す。
+    order_balance(&all);
+
+    let table = |title: &str, key: &dyn Fn(&Pair) -> String| {
         let mut by: BTreeMap<String, Vec<(String, f64)>> = BTreeMap::new();
         for p in &all {
-            by.entry(key(p)).or_default().push((p.0.clone(), p.1));
+            by.entry(key(p)).or_default().push((p.game.clone(), p.delta));
         }
         println!("  {title}:");
         for (k, v) in by {
@@ -635,13 +697,13 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
         }
     };
     table("残り反則別（曲線の形。現行 foul_cost は残数だけの静的関数）", &|p| {
-        format!("残り{}", p.2)
+        format!("残り{}", p.remaining)
     });
-    table("手数帯別", &|p| p.4.clone());
+    table("手数帯別", &|p| p.band.clone());
     table("相手の残り反則別（効果修飾）", &|p| {
         format!(
             "相手残り{}",
-            match p.3 {
+            match p.opp_remaining {
                 0..=3 => "0-3".to_string(),
                 4..=6 => "4-6".to_string(),
                 _ => "7-10".to_string(),
@@ -688,7 +750,7 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
     };
     match order_effect {
         Some((n, (d, lo, hi))) => println!(
-            "  実行順効果（先に走った arm − 後、n={n}）: {d:+.4} [{lo:+.4}, {hi:+.4}]（0 から離れていたら AB/BA の均衡が効いていない）"
+            "  実行順効果（先に走った arm − 後、n={n}）: {d:+.4} [{lo:+.4}, {hi:+.4}]（**環境に実行順効果が有るか**の量。均衡していれば推定からは相殺されるので、漏れの関門は上の「実行順の均衡」の2行）"
         ),
         None => println!(
             "  実行順効果: **測れない**（`arm_order` が無い = schema 1 の記録。control / treatment を同時実行していたのでペア差にスケジューリング差が混ざる）"
@@ -897,8 +959,67 @@ mod tests {
         assert!(check_inputs(&[meta(exp(), 0)], &full()).is_empty());
         let p = pairs(&full());
         assert_eq!(p.len(), 2);
-        let (d, _, _) = cluster(&p.iter().map(|(g, d, ..)| (g.clone(), *d)).collect::<Vec<_>>());
+        let (d, _, _) = cluster(
+            &p.iter()
+                .map(|x| (x.game.clone(), x.delta))
+                .collect::<Vec<_>>(),
+        );
         assert!((d + 1.0).abs() < 1e-9, "treatment が全敗なら −1.0: {d}");
+    }
+
+    /// **実行順効果が有っても、AB/BA が釣り合っていればペア差からは相殺される**。
+    /// 「ω̂ ≠ 0 なら判定を出さない」は過剰な門なので、そうでないことを固定する
+    #[test]
+    fn 実行順効果は均衡していればペア差から相殺される() {
+        // 真の効果 δ = −0.2、実行順効果 ω = +0.5（先に走った arm が有利）。
+        // treatment 先の unit では δ+ω、control 先では δ−ω を観測する
+        let (delta, omega) = (-0.2, 0.5);
+        let mut rows = vec![];
+        for pi in 0..8u64 {
+            for seed in 0..2u64 {
+                let treatment_first = (pi + seed) % 2 == 1;
+                // control の素点を基準に、順番の効果を先に走ったほうへ乗せる
+                let (c, t) = if treatment_first {
+                    (0.5 - omega / 2.0, 0.5 + delta + omega / 2.0)
+                } else {
+                    (0.5 + omega / 2.0, 0.5 + delta - omega / 2.0)
+                };
+                for (arm, score, k) in [
+                    ("control", c, u64::from(treatment_first)),
+                    ("treatment", t, u64::from(!treatment_first)),
+                ] {
+                    rows.push(serde_json::json!({
+                        "schema": ROW_SCHEMA, "game": format!("g{pi}"),
+                        "move_number": 41, "seed": seed, "arm": arm,
+                        "score": score, "remaining": 5, "opp_remaining": 5,
+                        "band": "中盤(50-89)", "reason": "checkmate",
+                        "arm_order": k,
+                    }));
+                }
+            }
+        }
+        let p = pairs(&rows);
+        assert_eq!(p.len(), 16);
+        let (d, _, _) = cluster(
+            &p.iter()
+                .map(|x| (x.game.clone(), x.delta))
+                .collect::<Vec<_>>(),
+        );
+        assert!(
+            (d - delta).abs() < 1e-9,
+            "均衡しているので ω は落ち δ が残るはず: {d}"
+        );
+        // 半分ごとに見れば ω がそのまま出る（＝この2行が食い違うのが漏れの署名）
+        let half = |want: bool| {
+            let v: Vec<(String, f64)> = p
+                .iter()
+                .filter(|x| x.treatment_first == Some(want))
+                .map(|x| (x.game.clone(), x.delta))
+                .collect();
+            cluster(&v).0
+        };
+        assert!((half(true) - (delta + omega)).abs() < 1e-9);
+        assert!((half(false) - (delta - omega)).abs() < 1e-9);
     }
 
     #[test]

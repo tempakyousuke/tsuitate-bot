@@ -1,13 +1,14 @@
 {
-  "_comment": "issue #31 P0-6 継続の局所効果。**検証セット**（run 33179939954、match_seed=20260828・main vs estimator_v14 104局）で回す。発見セット（run 32697854659）とは別の局面分布で、水準は発見セットを見てから変えない: 主 arm は alpha@k2、secondary は alpha@k3 で 2026-08-28 に固定済み（P0-5 の実測を見て決定）。current と baseline は自動で入る。β の arm は P0-5 で中止したので回さない",
-  "arena_run_id": "33179939954",
-  "opponents": ["estimator_v14"],
+  "_comment": "issue #31 P0-7 の再集計だけ。run 33182254613（schema 2 の測り直し）で v14 側の実行順効果が +0.0632 [+0.0067, +0.1229] と 0 を跨がなかったので、**それが推定へ漏れているか**を直接見る診断（実行順の均衡と、treatment 先 / control 先それぞれの影の価格）を report に足した。対局は回さず既存 artifact を集計し直すだけ。shards は元の run と同じ 8",
+  "arena_run_id": "32697854659",
+  "opponents": ["estimator_v13", "estimator_v14"],
+  "reaggregate_run_id": "33182254613",
   "run_probe": false,
   "run_policy": false,
-  "run_price": false,
-  "run_continue": true,
-  "continue_policy": "alpha@k2,alpha@k3",
-  "continue_seeds": 4,
-  "continue_budget_ms": 700,
-  "continue_shards": 8
+  "run_price": true,
+  "price_seeds": 2,
+  "price_budget_ms": 700,
+  "price_per_game": 2,
+  "price_shards": 8,
+  "run_continue": false
 }
