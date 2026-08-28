@@ -1,0 +1,10 @@
+{
+  "_comment": "issue #31 P0-1〜P0-4 の再計測（レビュー対応後。発見セット: run 32697854659 の main vs v13 / v14 各104局）。view_from_model の手数修正でソルバー由来の列が動くので P0-1〜P0-3 も取り直す。計測後にこのファイルを消す push は全ジョブがスキップされる",
+  "arena_run_id": "32697854659",
+  "opponents": ["estimator_v13", "estimator_v14"],
+  "run_probe": true,
+  "probe_seeds": 3,
+  "probe_budget_ms": 2000,
+  "probe_types": "nonking_king,nonking_nonking",
+  "probe_shards": 4
+}
