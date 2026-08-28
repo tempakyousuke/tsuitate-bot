@@ -781,6 +781,30 @@
     足し合わせない）。残り反則の水準が散るように累計反則の順で等間隔に採る
   - 層別は 残り反則 × 手数帯 × **相手の残り反則**（効果修飾）。CI は元対局単位の
     cluster bootstrap
+- `TSUITATE_THINK_BUDGET_MS=700 cargo run --release --bin check_continue -- [--seeds 4]
+  [--opponent estimator_v14] [--policy alpha@k2] [--jobs N] [--shard i/n]
+  [--out out.jsonl] <records...>` / `check_continue report <jsonl...>` —
+  **王手中の反則経済 P0-6: 継続の局所効果**（issue #31。**検証セットでだけ回す**）。
+  王手中の1手番を方策どおりに指させ（非合法なら実対局と同じく反則を積んで次候補へ）、
+  そのあとを終局まで指し継いで勝敗に変換する。P0-5 が出すのは「反則が減ったか・
+  真実指標が良くなったか」までで、**勝敗への変換はここでしか測れない**。
+  - **一手番の局所効果**であって全局反復適用の下界でも上界でもない
+    （P1 の arena へ進むための有効性確認）
+  - **検証セットでだけ回す**: 未使用の `match_seed` で取り直した Arena 実行を
+    `arena_run_id` に指定した**別の起動**で回し、発見セットを見てから水準を変えない。
+    主 arm は `--policy` で外から固定する（水準をコードに埋めない）
+  - **1元対局につき estimand ごとに最大1決定点**。強制列は P0-5 と同じ配管
+    （`entry_setup` → `simulate` の `sequence` を `force_move` へ）
+  - **比較の基準は `baseline`（実戦の手）ではなく `current`**（同じ配管で
+    オフラインに引き直した現行方策）。オフラインの再決定は実戦の選択と 64〜67% しか
+    一致しない（P0-4）ので、baseline と比べると「指し直したから」の差が混ざる。
+    baseline はその混入量の目安として併記する
+  - 継続の乱数は arm に依らず `(局, 決定点, seed)`。Δ の分母は**全対局数**、
+    CI は元対局単位の cluster bootstrap、**シャードが欠けたら判定を出さない**
+  - 門: 反則あり estimand は `Δpolicy − Δcurrent ≥ +0.04`（CI 下限 > 0）かつ
+    foul_limit・破滅率が悪化しない。反則0 estimand は**非劣性**
+    （`≥ −0.01` かつ CI 下限 > −0.02）かつ即時反則が悪化しない。
+    **β-order は即時反則の非増加を必須**、**full β は反則増を許す**
 - **王手中の反則経済の CI**（`.github/workflows/check-economy.yml`、**通常のコード
   push では走らない**）: `gh workflow run check-economy.yml -f arena_run_id=<Arena実行ID>
   -f opponents="estimator_v13 estimator_v14"`、`gh` が無ければ
@@ -792,7 +816,9 @@
   **重い段は既定では走らない**（要る段だけ true にする。全部同時に有効化すると
   相手2 × シャードで 30 ジョブを超えてキューが詰まる）:
   P0-4 `run_probe` / `probe_shards`（既定4）、P0-5 `run_policy` /
-  `policy_shards`（既定6。決定点が P0-4 の約4倍）、P0-7 `run_price` /
+  `policy_shards`（既定6。決定点が P0-4 の約4倍）、
+  P0-6 `run_continue` / `continue_policy` / `continue_shards`（既定8。
+  **検証セットを指す別の起動で回す**）、P0-7 `run_price` /
   `price_shards`（既定8。**継続対局なので最も重い**）。
   どれも元対局単位で割り、`*-aggregate` が `report` で合算する
   （**シャードが欠けたら失敗**）
@@ -2488,7 +2514,8 @@
   候補分布上の較正（`CalibrationSums`）。
   **p_legal のブレンドは `strategy::blend_p_legal` を呼ぶ**（`evaluate` と同じ関数。
   別々に書くと「仮想更新が実再決定とずれた」のか「式が食い違っていた」のかを
-  分けられない）
+  分けられない）。`entry_setup`（手番開始時のランキング・粒子・prewarm 済み
+  instance）は P0-5 と P0-6 が共有する
 - `mate_economy.rs` — **詰み経済の共有定義**（issue #28、2026-08-27。runtime には
   入らない診断だけ）。詰め手の排他的分類（`drop_only / board_only / both`）・
   安全手（指した後に相手の一手詰めが消える手）・被詰めろのエピソード

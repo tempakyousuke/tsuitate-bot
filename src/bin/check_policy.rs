@@ -57,12 +57,12 @@ use tsuitate_bot::check_economy::{
     CheckMoveKind, classify_move_kind, cluster_ratio_ci, entry_replayed,
 };
 use tsuitate_bot::check_policy::{
-    CalibrationSums, Policy, PolicyMove, ShadowUpdater, SimOutcome, UpdateRule, fmt_num,
-    policy_moves, simulate, truth_after,
+    CalibrationSums, EntrySetup, Policy, PolicyMove, SimOutcome, UpdateRule,
+    entry_setup as check_policy_entry, fmt_num, policy_moves, simulate, truth_after,
 };
 use tsuitate_bot::observation::Observation;
 use tsuitate_bot::protocol::Color;
-use tsuitate_bot::scenario_core::{Replayed, clone_log, make_view, prewarm_for_trial, side_idx};
+use tsuitate_bot::scenario_core::{Replayed, clone_log, make_view, side_idx};
 use tsuitate_bot::shogi::{Position, ShogiMove, parse_usi};
 use tsuitate_bot::strategy::{self, EvalParams};
 use tsuitate_bot::truth_replay::{for_each_decision_full, parse_bot_and_end};
@@ -611,37 +611,10 @@ fn run_unit(
 ) -> Option<Vec<serde_json::Value>> {
     let side = p.entry.pos.turn();
     let king = p.entry.pos.king_square(side);
-    let entry_log = clone_log(&p.entry.logs[side_idx(side)]);
-    let entry_view = make_view(&p.entry.pos, side, &p.entry.fouls);
     // **ランキングを作ったのと同じ粒子**で仮想更新する（issue #28 P0-3 の教訓）。
     // prewarm は1回だけで、実再決定はこの instance の clone に反則を食わせた継続
-    let mut strat = strategy::make_seeded("estimator", seed).expect("未知の戦略名");
-    strat.set_capture_particles(true);
-    prewarm_for_trial(&mut *strat, &p.entry);
-    strat.choose(&entry_view, &entry_log, &HashSet::new())?;
-    let ranking = strat.last_ranking()?.to_vec();
-    let snapshot = strat.last_particles().cloned().unwrap_or_default();
-
-    let mut entry_solver = CheckSolver::new(&entry_view, &[], &[], &entry_log);
-    let moves = policy_moves(
-        &ranking,
-        &entry_view,
-        &p.truth,
-        entry_solver.as_mut(),
-        king,
-    );
-    if moves.is_empty() {
-        return None;
-    }
-    let p0: Vec<f64> = moves.iter().map(|m| m.p_legal).collect();
-    let updater = ShadowUpdater::new(
-        &entry_view,
-        &entry_log,
-        &snapshot.strict,
-        &snapshot.taint,
-        params,
-        eval_particles,
-    );
+    let setup = check_policy_entry(&p.entry, &p.truth, seed, params, eval_particles)?;
+    let EntrySetup { strat, log: entry_log, moves, p0, updater, .. } = setup;
     // **健全性**: 反則0での仮想更新は初回ランキングの p_legal を再現するはず。
     // ずれるなら `evaluate` の経路（min キャップや別のノブ）を取りこぼしている
     let p_repro = updater.p_after(&moves, &[]);

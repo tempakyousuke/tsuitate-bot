@@ -212,6 +212,60 @@ impl ShadowUpdater {
     }
 }
 
+/// 手番開始時（反則0）の決定を作り直した結果（P0-5 と P0-6 で共有する）。
+pub struct EntrySetup {
+    /// **prewarm 済みの戦略 instance**。実再決定はこれを `clone_boxed` して
+    /// 反則の観測を食わせた**継続**として作る（別々に組み直すと壁時計
+    /// デッドラインのぶん粒子集合が別物になる。PR #32 レビュー [P1]）
+    pub strat: Box<dyn crate::strategy::Strategy>,
+    pub view: PlayerView,
+    pub log: ObservationLog,
+    pub moves: Vec<PolicyMove>,
+    /// 初回ランキングの p_legal（`moves` と同じ並び）
+    pub p0: Vec<f64>,
+    pub updater: ShadowUpdater,
+}
+
+/// 手番開始時の状態からランキング・粒子・候補を作る。
+///
+/// `ranking_and_particles` と同じことをするが、**prewarm 済みの instance を
+/// 返す**ので実再決定（`UpdateRule::Real`）の継続に使える。
+/// 定跡手・候補ゼロでランキングが取れなければ `None`。
+pub fn entry_setup(
+    entry: &crate::scenario_core::Replayed,
+    truth: &Position,
+    seed: u64,
+    params: &EvalParams,
+    eval_particles: usize,
+) -> Option<EntrySetup> {
+    use crate::scenario_core::{clone_log, make_view, prewarm_for_trial, side_idx};
+    let side = entry.pos.turn();
+    let king = entry.pos.king_square(side);
+    let log = clone_log(&entry.logs[side_idx(side)]);
+    let view = make_view(&entry.pos, side, &entry.fouls);
+    let mut strat = crate::strategy::make_seeded("estimator", seed)?;
+    strat.set_capture_particles(true);
+    prewarm_for_trial(&mut *strat, entry);
+    strat.choose(&view, &log, &HashSet::new())?;
+    let ranking = strat.last_ranking()?.to_vec();
+    let snapshot = strat.last_particles().cloned().unwrap_or_default();
+    let mut solver = CheckSolver::new(&view, &[], &[], &log);
+    let moves = policy_moves(&ranking, &view, truth, solver.as_mut(), king);
+    if moves.is_empty() {
+        return None;
+    }
+    let p0: Vec<f64> = moves.iter().map(|m| m.p_legal).collect();
+    let updater = ShadowUpdater::new(
+        &view,
+        &log,
+        &snapshot.strict,
+        &snapshot.taint,
+        params,
+        eval_particles,
+    );
+    Some(EntrySetup { strat, view, log, moves, p0, updater })
+}
+
 /// 相手の盤上駒数の見積り（`prior_legal` の引数。`choose` と同じ式）
 pub fn opp_board_count(log: &ObservationLog) -> f64 {
     let my_captures = log
@@ -264,6 +318,29 @@ impl Policy {
     /// β 系か（ΔV の計算が要るか）
     pub fn needs_delta_v(&self) -> bool {
         matches!(self, Policy::Beta { .. } | Policy::BetaOrder { .. })
+    }
+
+    /// `tag()` の逆。P0-6 が「主 arm を1本だけ固定する」ために使う
+    /// （P0-4 / P0-5 を見てから水準を選ぶので、arm 名は文字列で渡す）
+    pub fn parse(tag: &str) -> Option<Policy> {
+        let num = |s: &str| s.parse::<f64>().ok().filter(|v| v.is_finite());
+        match tag {
+            "current" => Some(Policy::Current),
+            "solver_greedy" => Some(Policy::SolverGreedy),
+            t => {
+                if let Some(k) = t.strip_prefix("alpha@k") {
+                    return Some(Policy::Alpha { k: num(k)? });
+                }
+                if let Some(l) = t.strip_prefix("beta_order@l") {
+                    return Some(Policy::BetaOrder { lambda: num(l)? });
+                }
+                if let Some(rest) = t.strip_prefix("beta@k") {
+                    let (k, l) = rest.split_once('l')?;
+                    return Some(Policy::Beta { k: num(k)?, lambda: num(l)? });
+                }
+                None
+            }
+        }
     }
 }
 
@@ -820,6 +897,24 @@ mod tests {
         let p = vec![0.5, 0.5];
         let ex = HashSet::new();
         assert_eq!(pick(&Policy::Current, &moves, &p, &price(1.0), &ex, None), Some(0));
+    }
+
+    #[test]
+    fn arm名は往復する() {
+        // P0-6 は主 arm を文字列で受け取るので、tag() と parse() は往復すること
+        for p in [
+            Policy::Current,
+            Policy::SolverGreedy,
+            Policy::Alpha { k: 1.5 },
+            Policy::Alpha { k: 3.0 },
+            Policy::Beta { k: 1.0, lambda: 0.5 },
+            Policy::BetaOrder { lambda: 1.0 },
+        ] {
+            assert_eq!(Policy::parse(&p.tag()), Some(p.clone()), "{}", p.tag());
+        }
+        for bad in ["", "alpha", "alpha@k", "alpha@kx", "beta@k1", "beta@k1lx", "nope"] {
+            assert_eq!(Policy::parse(bad), None, "{bad}");
+        }
     }
 
     #[test]
