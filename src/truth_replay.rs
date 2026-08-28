@@ -17,7 +17,12 @@ pub fn side_idx(c: Color) -> usize {
     }
 }
 
-fn add_foul_obs(
+/// 反則試行1回ぶんの観測を**両者**のログへ記録し、累積反則数を進める。
+///
+/// 手番は変わらない（サイトの judge.ts と同じ）。`bin/mate_continue` の
+/// オフライン方策が真実で非合法な手を選んだときも、審判と同じ規約で
+/// 反則を積むためにここを共有する。
+pub fn add_foul_obs(
     side: Color,
     usi: String,
     pos: &Position,
@@ -34,7 +39,12 @@ fn add_foul_obs(
     });
 }
 
-fn add_move_obs(
+/// 受理された1手ぶんの観測を**両者**のログへ記録する（`pos` は着手後の局面）。
+///
+/// 順序と move_number 規約は `selfplay.rs` の審判と同じ。一手だけ強制して
+/// 継続する診断（`bin/mate_continue`、issue #28 P0-6）が同じ規約で状態を
+/// 作れるように公開してある（ここを別実装にすると観測が食い違う）。
+pub fn add_move_obs(
     side: Color,
     mv: &ShogiMove,
     captured: Option<Role>,
@@ -153,6 +163,36 @@ pub fn for_each_decision_full(
         add_move_obs(side, &mv, captured, &pos, &mut logs);
     }
     true
+}
+
+/// 記録ファイル（JSONL）から (bot 側の手番色, 終局ペイロード) を読む。
+///
+/// `bin/analyze` は同じ JSONL からもっと多くを読む（chose の debug 等）が、
+/// 真実の再生だけが要る診断（`bin/mate_probe` / `bin/mate_continue`）は
+/// この2つで足りる。どちらか欠けていたら None（その局は捨てる）。
+pub fn load_bot_and_end(path: &str) -> Option<(Color, GameEndPayload)> {
+    let content = std::fs::read_to_string(path).ok()?;
+    parse_bot_and_end(&content)
+}
+
+/// `load_bot_and_end` の**中身版**（ディスクを読み直さない）。
+///
+/// 記録集合の指紋を取る診断（`bin/mate_continue`）は、**解析に渡したのと
+/// 同じ bytes** から指紋を作らないと TOCTOU になる（PR #30 レビュー3巡目 [P1]:
+/// A を読んだ後に同じパスを B へ差し替えると、行は A 由来なのに meta は B の
+/// 指紋になり、B 由来の別シャードと「同じ母集団」として集約を通ってしまう）。
+pub fn parse_bot_and_end(content: &str) -> Option<(Color, GameEndPayload)> {
+    let mut color = None;
+    let mut end = None;
+    for line in content.lines() {
+        let v: serde_json::Value = serde_json::from_str(line).ok()?;
+        match v["type"].as_str() {
+            Some("match") => color = serde_json::from_value(v["your_color"].clone()).ok(),
+            Some("end") => end = serde_json::from_value(v["payload"].clone()).ok(),
+            _ => {}
+        }
+    }
+    Some((color?, end?))
 }
 
 /// 記録ファイル（JSONL）から終局ペイロード（真実）を読む

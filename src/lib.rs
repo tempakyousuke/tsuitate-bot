@@ -26,6 +26,7 @@ pub mod kifu;
 pub mod king_belief_nn;
 pub mod likelihood;
 pub mod mate;
+pub mod mate_economy;
 pub mod model;
 pub mod observation;
 pub mod opening;

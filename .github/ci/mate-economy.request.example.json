@@ -1,0 +1,14 @@
+{
+  "_comment": "このファイルを .github/ci/mate-economy.request.json という名前でコミットして push すると Mate economy（issue #28 P0-3 / P0-6）が起動する。キーは workflow_dispatch の inputs と同じ。計測後に消す push は全ジョブがスキップされる",
+  "arena_run_id": "32697854659",
+  "records_pattern": "arena-records-estimator_v14-*",
+  "probe_seeds": 3,
+  "controls": 1,
+  "probe_budget_ms": 2000,
+  "continue_seeds": 2,
+  "max_safe": 4,
+  "continue_budget_ms": 700,
+  "opponent": "estimator_v14",
+  "policy_w": 4,
+  "shards": 4
+}

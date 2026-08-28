@@ -1,0 +1,328 @@
+name: Mate economy
+
+# **issue #28 の P0-3 / P0-6**: 受け側の詰み経済を、過去の Arena 実行の棋譜
+# （`arena-records-*`）に対して測る診断。**runtime の挙動は変えない**。
+#
+#   - P0-3 `bin/mate_probe`   … 盤上版の被詰めろのオフライン較正
+#     （PR・Brier・信頼度別・**対照決定点の偽陽性率**）と argmax シミュレーション
+#   - P0-6 `bin/mate_continue` … 「最後に受けられた決定点」から一手だけ強制して
+#     終局まで指し継ぎ、`Δoracle` / `Δpolicy` を出す（`Δoracle < 0.04` は即中止）
+#
+# 起動は arena.yml / checkpoint-arena.yml と同じ2通り（**通常のコード push では
+# 走らない**）:
+#   1. Actions UI / `gh workflow run mate-economy.yml -f arena_run_id=<Arena実行ID>`
+#   2. `.github/ci/mate-economy.request.json` を含む push
+#      （リクエストファイルを消す push は plan が「削除された push」と判定して
+#        全ジョブをスキップするので、後片付けで赤い run は残らない）
+#
+# **思考予算はプロセス env で両側に等しく効かせる**（`TSUITATE_THINK_BUDGET_MS`）。
+# 凍結相手も同じ env を読むので、片側だけ厚くなることはない。
+on:
+  workflow_dispatch:
+    inputs:
+      arena_run_id:
+        description: "棋譜の取得元 Arena 実行ID（空ならリポジトリの records/ を使う）"
+        required: false
+        default: ""
+      records_pattern:
+        description: "取ってくる artifact のパターン。**空なら opponent から導出**（arena-records-<opponent>-*）。ガントレットの run は相手ごとに分かれるので、継続対局の opponent と揃っていないと Δ が「受けの効果」と「相手が変わった効果」の混合になる"
+        required: false
+        default: ""
+      probe_seeds:
+        description: "P0-3 の決定点あたり seed 数（少数シードの差は判定に使わないこと）"
+        required: false
+        default: "3"
+      controls:
+        description: "P0-3 の危険な決定点1つあたりの対照決定点の数"
+        required: false
+        default: "1"
+      probe_budget_ms:
+        description: "P0-3 の思考予算（ms。粒子構築と候補評価で同じ値を使う）"
+        required: false
+        default: "2000"
+      continue_seeds:
+        description: "P0-6 の強制手あたり seed 数（偶数。正直版が seed を半分に割る）"
+        required: false
+        default: "2"
+      max_safe:
+        description: "P0-6 で強制する安全手の上限（落とした本数はサマリーに出る）"
+        required: false
+        default: "4"
+      continue_budget_ms:
+        description: "P0-6 の思考予算（ms。継続対局は本数が多いので既定は薄め）"
+        required: false
+        default: "700"
+      opponent:
+        description: "P0-6 の継続対局の相手（凍結版）"
+        required: false
+        default: "estimator_v14"
+      policy_w:
+        description: "P0-6 の Δpolicy が使う危険量の重み。**カンマ区切りで事前登録した集合を全部回す**（probe と continue は同時に走るので、その run の P0-3 結果から1点を選ぶことはできない）"
+        required: false
+        default: "2,4,8,16,30"
+      run_probe:
+        description: "P0-3（probe）も走らせるか。false なら P0-6 だけ取り直す（probe は w に依らないので、w を変えた再計測では不要）"
+        required: false
+        default: "true"
+      shards:
+        description: "P0-6 の分割数（局単位で割る）"
+        required: false
+        default: "4"
+  push:
+    paths:
+      - ".github/ci/mate-economy.request.json"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.split.outputs.skip }}
+      arena_run_id: ${{ steps.split.outputs.arena_run_id }}
+      records_pattern: ${{ steps.split.outputs.records_pattern }}
+      probe_seeds: ${{ steps.split.outputs.probe_seeds }}
+      controls: ${{ steps.split.outputs.controls }}
+      probe_budget_ms: ${{ steps.split.outputs.probe_budget_ms }}
+      continue_seeds: ${{ steps.split.outputs.continue_seeds }}
+      max_safe: ${{ steps.split.outputs.max_safe }}
+      continue_budget_ms: ${{ steps.split.outputs.continue_budget_ms }}
+      opponent: ${{ steps.split.outputs.opponent }}
+      policy_w: ${{ steps.split.outputs.policy_w }}
+      run_probe: ${{ steps.split.outputs.run_probe }}
+      shards: ${{ steps.split.outputs.shards }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: split
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IN_RUN_ID: ${{ github.event.inputs.arena_run_id }}
+          IN_RECORDS_PATTERN: ${{ github.event.inputs.records_pattern }}
+          IN_PROBE_SEEDS: ${{ github.event.inputs.probe_seeds }}
+          IN_CONTROLS: ${{ github.event.inputs.controls }}
+          IN_PROBE_BUDGET: ${{ github.event.inputs.probe_budget_ms }}
+          IN_CONT_SEEDS: ${{ github.event.inputs.continue_seeds }}
+          IN_MAX_SAFE: ${{ github.event.inputs.max_safe }}
+          IN_CONT_BUDGET: ${{ github.event.inputs.continue_budget_ms }}
+          IN_OPPONENT: ${{ github.event.inputs.opponent }}
+          IN_POLICY_W: ${{ github.event.inputs.policy_w }}
+          IN_RUN_PROBE: ${{ github.event.inputs.run_probe }}
+          IN_SHARDS: ${{ github.event.inputs.shards }}
+        run: |
+          set -euo pipefail
+          req='.github/ci/mate-economy.request.json'
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            run_id="${IN_RUN_ID:-}"
+            records_pattern="${IN_RECORDS_PATTERN:-}"
+            probe_seeds="${IN_PROBE_SEEDS:-3}"
+            controls="${IN_CONTROLS:-1}"
+            probe_budget="${IN_PROBE_BUDGET:-2000}"
+            cont_seeds="${IN_CONT_SEEDS:-2}"
+            max_safe="${IN_MAX_SAFE:-4}"
+            cont_budget="${IN_CONT_BUDGET:-700}"
+            opponent="${IN_OPPONENT:-estimator_v14}"
+            policy_w="${IN_POLICY_W:-2,4,8,16,30}"
+            run_probe="${IN_RUN_PROBE:-true}"
+            shards="${IN_SHARDS:-4}"
+          else
+            if [ ! -f "$req" ]; then
+              # push の paths フィルタは削除にも一致する。計測後に $req を消す
+              # commit は後片付けの正常系なので、赤い run を残さず全部スキップ
+              echo "リクエストファイルが削除された push（後片付け）なので何もしない"
+              {
+                echo "skip=true"
+                echo "arena_run_id="
+                echo "records_pattern="
+                echo "probe_seeds=3"
+                echo "controls=1"
+                echo "probe_budget_ms=2000"
+                echo "continue_seeds=2"
+                echo "max_safe=4"
+                echo "continue_budget_ms=700"
+                echo "opponent=estimator_v14"
+                echo "policy_w=2,4,8,16,30"
+                echo "run_probe=true"
+                echo "shards=4"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            run_id=$(jq -r '.arena_run_id // ""' "$req")
+            records_pattern=$(jq -r '.records_pattern // ""' "$req")
+            probe_seeds=$(jq -r '.probe_seeds // 3' "$req")
+            controls=$(jq -r '.controls // 1' "$req")
+            probe_budget=$(jq -r '.probe_budget_ms // 2000' "$req")
+            cont_seeds=$(jq -r '.continue_seeds // 2' "$req")
+            max_safe=$(jq -r '.max_safe // 4' "$req")
+            cont_budget=$(jq -r '.continue_budget_ms // 700' "$req")
+            opponent=$(jq -r '.opponent // "estimator_v14"' "$req")
+            policy_w=$(jq -r 'if (.policy_w | type) == "array" then (.policy_w | map(tostring) | join(",")) else (.policy_w // "2,4,8,16,30" | tostring) end' "$req")
+            # `// true` は **false も既定値扱いになる**（jq の `//` は null と false を
+            # 同じに扱う）。has() で「キーがあるか」を見る
+            run_probe=$(jq -r 'if has("run_probe") then .run_probe else true end | tostring' "$req")
+            shards=$(jq -r '.shards // 4' "$req")
+          fi
+          # **pattern は opponent から導出する**のを既定にする（PR #30 レビュー指摘①:
+          # 既定が arena-records-* だと、ガントレット run の全相手が混ざったまま
+          # 全部を同じ --opponent で継続してしまう）
+          if [ -z "$records_pattern" ]; then
+            records_pattern="arena-records-${opponent}-*"
+          fi
+          # **2 以上の偶数**を要求する（PR #30 レビュー4巡目 [P1]）。
+          # 正直版（前半で選び後半で測る）が seed を半分に割るので偶数が要り、
+          # 0 だと継続を1局も走らせずに Δ が全部 0 になって
+          # 「Δoracle < 0.04 → 即中止」の判定を成功終了で偽造できる
+          case "$cont_seeds" in
+            ''|*[!0-9]*)
+              echo "continue_seeds は非負整数にしてください（指定値 ${cont_seeds}）" >&2
+              exit 1 ;;
+          esac
+          if [ "$cont_seeds" -lt 2 ] || [ $(( cont_seeds % 2 )) -ne 0 ]; then
+            echo "continue_seeds は 2 以上の偶数にしてください（指定値 ${cont_seeds}）" >&2
+            exit 1
+          fi
+          {
+            echo "skip=false"
+            echo "arena_run_id=$run_id"
+            echo "records_pattern=$records_pattern"
+            echo "probe_seeds=$probe_seeds"
+            echo "controls=$controls"
+            echo "probe_budget_ms=$probe_budget"
+            echo "continue_seeds=$cont_seeds"
+            echo "max_safe=$max_safe"
+            echo "continue_budget_ms=$cont_budget"
+            echo "opponent=$opponent"
+            echo "policy_w=$policy_w"
+            echo "run_probe=$run_probe"
+            echo "shards=$(jq -n -c "[range(0; ${shards})]")"
+          } >> "$GITHUB_OUTPUT"
+
+  probe:
+    needs: plan
+    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_probe != 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Download arena records
+        if: needs.plan.outputs.arena_run_id != ''
+        uses: actions/download-artifact@v7
+        with:
+          pattern: ${{ needs.plan.outputs.records_pattern }}
+          path: records-in
+          run-id: ${{ needs.plan.outputs.arena_run_id }}
+          github-token: ${{ github.token }}
+      - name: Probe
+        env:
+          TSUITATE_THINK_BUDGET_MS: ${{ needs.plan.outputs.probe_budget_ms }}
+        run: |
+          set -euo pipefail
+          src=records-in
+          [ -d "$src" ] || src=records
+          cargo build --release --bin mate_probe
+          jobs=$(( $(nproc) - 1 )); [ "$jobs" -ge 1 ] || jobs=1
+          ./target/release/mate_probe \
+            --seeds "${{ needs.plan.outputs.probe_seeds }}" \
+            --controls "${{ needs.plan.outputs.controls }}" \
+            --opponent "${{ needs.plan.outputs.opponent }}" \
+            --jobs "$jobs" \
+            --out mate-probe.csv \
+            --emit emitted mate-defense \
+            "$src" | tee mate-probe.txt
+          {
+            echo '## P0-3 盤上版の較正と argmax シミュレーション'
+            echo '```'
+            cat mate-probe.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: mate-probe
+          path: |
+            mate-probe.csv
+            mate-probe.txt
+            emitted/
+
+  continue:
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.shards) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Download arena records
+        if: needs.plan.outputs.arena_run_id != ''
+        uses: actions/download-artifact@v7
+        with:
+          pattern: ${{ needs.plan.outputs.records_pattern }}
+          path: records-in
+          run-id: ${{ needs.plan.outputs.arena_run_id }}
+          github-token: ${{ github.token }}
+      - name: Forced continuations
+        env:
+          TSUITATE_THINK_BUDGET_MS: ${{ needs.plan.outputs.continue_budget_ms }}
+        run: |
+          set -euo pipefail
+          src=records-in
+          [ -d "$src" ] || src=records
+          cargo build --release --bin mate_continue
+          jobs=$(( $(nproc) - 1 )); [ "$jobs" -ge 1 ] || jobs=1
+          n=$(jq -n -c '${{ needs.plan.outputs.shards }} | length')
+          ./target/release/mate_continue \
+            --seeds "${{ needs.plan.outputs.continue_seeds }}" \
+            --max-safe "${{ needs.plan.outputs.max_safe }}" \
+            --opponent "${{ needs.plan.outputs.opponent }}" \
+            --policy-w "${{ needs.plan.outputs.policy_w }}" \
+            --jobs "$jobs" \
+            --shard "${{ matrix.shard }}/$n" \
+            --out "mate-continue-${{ matrix.shard }}.jsonl" \
+            "$src" | tee "mate-continue-${{ matrix.shard }}.txt"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: mate-continue-${{ matrix.shard }}
+          path: |
+            mate-continue-${{ matrix.shard }}.jsonl
+            mate-continue-${{ matrix.shard }}.txt
+
+  aggregate:
+    needs: [plan, continue]
+    if: needs.plan.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: mate-continue-*
+          path: shards
+      - name: Report
+        run: |
+          set -euo pipefail
+          # シャードが1つでも欠けたら Δ の分母（全対局数）が狂うので止める。
+          # **黙って少ない分母で報告しない**（issue #19 の shard 欠落の教訓）
+          n=$(jq -n -c '${{ needs.plan.outputs.shards }} | length')
+          found=$(find shards -name 'mate-continue-*.jsonl' | wc -l)
+          if [ "$found" -ne "$n" ]; then
+            echo "シャードが欠けています（$found / $n）: Δ の分母が狂うので中止" >&2
+            exit 1
+          fi
+          cargo run --release --bin mate_continue -- report $(find shards -name '*.jsonl' | sort) \
+            | tee mate-continue-report.txt
+          {
+            echo '## P0-6 一手強制の継続診断'
+            echo '```'
+            cat mate-continue-report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: mate-continue-combined
+          path: |
+            mate-continue-report.txt
+            shards/

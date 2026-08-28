@@ -563,12 +563,50 @@ pub fn ranking_one(
     seed: u64,
     name: &str,
 ) -> Option<(String, Vec<strategy::CandidateScore>)> {
+    ranking_one_with(rep, seed, name, &HashSet::new())
+}
+
+/// [`ranking_one`] の「**評価が見た粒子ごと**」返す版（issue #28 P0-3 / P0-6）。
+///
+/// `build_estimator` で同じ seed からもう一度作り直した粒子は**同じ集合には
+/// ならない**（`Estimator::update` は壁時計デッドラインまで若返らせるので、
+/// 実行のたびに粒子数が揺れる）。危険質量 q を「ランキングを作ったのと同じ
+/// 粒子」で測るには、`choose` が評価へ渡したプールをそのまま持ち出す。
+pub fn ranking_and_particles(
+    rep: &Replayed,
+    seed: u64,
+    name: &str,
+    foul_tried: &HashSet<String>,
+) -> Option<(String, Vec<strategy::CandidateScore>, strategy::ParticleSnapshot)> {
+    let side = rep.pos.turn();
+    let mut strat = strategy::make_seeded(name, seed).expect("未知の戦略名");
+    strat.set_capture_particles(true);
+    let log = clone_log(&rep.logs[side_idx(side)]);
+    prewarm_for_trial(&mut *strat, rep);
+    let view = make_view(&rep.pos, side, &rep.fouls);
+    let chosen = strat.choose(&view, &log, foul_tried)?;
+    let ranking = strat.last_ranking()?.to_vec();
+    // 粒子スナップショットは現行 estimator だけが実装する（凍結版は None）
+    let particles = strat.last_particles().cloned().unwrap_or_default();
+    Some((chosen, ranking, particles))
+}
+
+/// [`ranking_one`] の `foul_tried` 指定版。
+///
+/// 実戦の決定点を復元する診断（`bin/mate_probe`）は、その手番で既に試した
+/// 反則を渡さないと候補集合が実戦と変わる（反則した手が候補に残る）。
+pub fn ranking_one_with(
+    rep: &Replayed,
+    seed: u64,
+    name: &str,
+    foul_tried: &HashSet<String>,
+) -> Option<(String, Vec<strategy::CandidateScore>)> {
     let side = rep.pos.turn();
     let mut strat = strategy::make_seeded(name, seed).expect("未知の戦略名");
     let log = clone_log(&rep.logs[side_idx(side)]);
     prewarm_for_trial(&mut *strat, rep);
     let view = make_view(&rep.pos, side, &rep.fouls);
-    let chosen = strat.choose(&view, &log, &HashSet::new())?;
+    let chosen = strat.choose(&view, &log, foul_tried)?;
     let ranking = strat.last_ranking()?.to_vec();
     Some((chosen, ranking))
 }
