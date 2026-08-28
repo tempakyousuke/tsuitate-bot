@@ -160,11 +160,21 @@ jobs:
       - name: Analyze
         run: |
           set -euo pipefail
-          src=records-in
-          [ -d "$src" ] || src=records
+          # **artifact が落ちてこなかったときに records/（人対局の59局）へ黙って
+          # 落ちない**。相手ごとのラベルの下で別の母集団を報告してしまう
+          run_id='${{ needs.plan.outputs.arena_run_id }}'
+          if [ -n "$run_id" ]; then
+            src=records-in
+            if [ -z "$(find "$src" -name '*.jsonl' 2>/dev/null | head -1)" ]; then
+              echo "run $run_id から相手 '${{ matrix.opponent }}' の記録を取得できませんでした（artifact 名を確認）" >&2
+              exit 1
+            fi
+          else
+            src=records
+          fi
           files=$(find "$src" -name '*.jsonl' | sort)
           if [ -z "$files" ]; then
-            echo "記録が1つも見つかりません（相手 '${{ matrix.opponent }}' の artifact 名を確認）" >&2
+            echo "記録が1つも見つかりません" >&2
             exit 1
           fi
           echo "記録 $(echo "$files" | wc -l) 局（相手 ${{ matrix.opponent }}）"
@@ -217,12 +227,24 @@ jobs:
           TSUITATE_THINK_BUDGET_MS: ${{ needs.plan.outputs.probe_budget_ms }}
         run: |
           set -euo pipefail
-          src=records-in
-          [ -d "$src" ] || src=records
+          run_id='${{ needs.plan.outputs.arena_run_id }}'
+          if [ -n "$run_id" ]; then
+            src=records-in
+            if [ -z "$(find "$src" -name '*.jsonl' 2>/dev/null | head -1)" ]; then
+              echo "run $run_id から相手 '${{ matrix.opponent }}' の記録を取得できませんでした（artifact 名を確認）" >&2
+              exit 1
+            fi
+          else
+            src=records
+          fi
           cargo build --release --bin check_probe
           jobs=$(( $(nproc) - 1 )); [ "$jobs" -ge 1 ] || jobs=1
           n=${{ needs.plan.outputs.probe_shard_count }}
-          ./target/release/check_probe \
+          # **記録の相手を二重に検査する**（artifact のパターンだけに頼らない）。
+          # 相手ごとに分けるのが判定の前提なので、混ざったら止める
+          opp='${{ matrix.opponent }}'
+          [ -n "$opp" ] && set -- --opponent "$opp" || set --
+          ./target/release/check_probe "$@" \
             --seeds "${{ needs.plan.outputs.probe_seeds }}" \
             --types "${{ needs.plan.outputs.probe_types }}" \
             --jobs "$jobs" \

@@ -21,15 +21,20 @@ use crate::strategy::{CandidateScore, candidate_moves};
 /// 観測ログの復元から PlayerView 相当を作る（ソルバーの再現用）。
 ///
 /// 診断はどれも「その決定点で bot が見ていた視界」を作り直すので、規約
-/// （手番・持ち駒・反則数の出どころ）を1箇所に閉じる。
-pub fn view_from_model(model: &GameModel, in_check: bool) -> PlayerView {
+/// （手番・持ち駒・反則数・**手数**の出どころ）を1箇所に閉じる。
+///
+/// **`move_number` は必ず決定点の手数を渡す**（`scenario_core::make_view` と
+/// 同じ規約）: `CheckSolver` は既知の敵駒マスの鮮度を
+/// `view.move_number − 8` で切るので、0 を渡すと窓が無制限になり、
+/// 実戦では載らない古い幻の駒を base に載せた別物のソルバーになる。
+pub fn view_from_model(model: &GameModel, in_check: bool, move_number: u32) -> PlayerView {
     PlayerView {
         game_id: "replay".into(),
         your_color: model.my_color(),
         your_pieces: model.my_pieces(),
         your_hand: model.my_hand(),
         turn: model.my_color(),
-        move_number: 0,
+        move_number,
         clocks: ClockState { sente_ms: 0, gote_ms: 0, running: None, server_time: 0 },
         fouls: FoulCounts { you: model.my_fouls(), opponent: model.opponent_fouls() },
         you_in_check: in_check,
@@ -292,7 +297,7 @@ pub fn check_turns(
         }
         let model = GameModel::from_log(bot, &log);
         let fouls_before = model.my_fouls();
-        let view = view_from_model(&model, true);
+        let view = view_from_model(&model, true, truth.move_number());
         let checkers: HashSet<Coord> =
             true_checkers(truth, bot).into_iter().map(|(s, _)| s).collect();
 

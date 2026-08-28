@@ -448,7 +448,7 @@ fn simulate_check_solver(
             log.record(prev.clone());
         }
         let model = GameModel::from_log(bot, &log);
-        let view = view_from_model(&model, true);
+        let view = view_from_model(&model, true, truth.move_number());
 
         let mut fouls: Vec<ShogiMove> = vec![];
         let mut tried: HashSet<String> = HashSet::new();
@@ -662,7 +662,7 @@ fn audit_check_fouls(
             }
         }
         let model = GameModel::from_log(bot, &log);
-        let view = view_from_model(&model, true);
+        let view = view_from_model(&model, true, truth.move_number());
         let Some(mut solver) = CheckSolver::new(&view, &[], &fouls, &log) else {
             continue;
         };
@@ -1082,7 +1082,11 @@ fn mate_defense_episodes(
                         log.record(prev.clone());
                     }
                     let model = GameModel::from_log(bot, &log);
-                    let view = view_from_model(&model, positions[decision_idx].in_check(bot));
+                    let view = view_from_model(
+                        &model,
+                        positions[decision_idx].in_check(bot),
+                        positions[decision_idx].move_number(),
+                    );
                     if candidate_moves(&view, &HashSet::new())
                         .iter()
                         .any(|(usi, _)| safe_usi.contains(usi))

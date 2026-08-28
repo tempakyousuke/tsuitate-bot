@@ -17,7 +17,7 @@
 //!
 //! usage:
 //!   TSUITATE_THINK_BUDGET_MS=2000 cargo run --release --bin check_probe -- \
-//!     [--seeds 3] [--jobs N] [--limit N] [--shard i/n] [--kmax 30] \
+//!     [--seeds 3] [--jobs N] [--limit N] [--shard i/n] [--kmax 30] [--allow-incomplete] \
 //!     [--opponent estimator_v14] [--types nonking_king,nonking_nonking] \
 //!     [--out data/check_probe.csv] <records...>
 
@@ -235,6 +235,7 @@ fn main() {
         std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(2).max(1));
     let mut limit = usize::MAX;
     let mut kmax = 30.0f64;
+    let mut allow_incomplete = false;
     let mut shard: Option<(usize, usize)> = None;
     let mut opponent: Option<String> = None;
     let mut types: Vec<String> = vec!["nonking_king".into(), "nonking_nonking".into()];
@@ -258,6 +259,10 @@ fn main() {
             "--limit" => {
                 limit = num(args.get(i + 1), "--limit");
                 i += 2;
+            }
+            "--allow-incomplete" => {
+                allow_incomplete = true;
+                i += 1;
             }
             "--kmax" => {
                 kmax = args
@@ -313,6 +318,11 @@ fn main() {
     }
     if specs.is_empty() {
         die("記録ファイル（またはディレクトリ）を指定してください");
+    }
+    // **`--seeds 0` で「対象なし」を成功終了にできてはいけない**（issue #28 が
+    // `mate_continue` で塞いだ穴と同じ: 判定を空の集計で偽造できる）
+    if seeds == 0 {
+        die("--seeds は 1 以上にしてください（0 だとランキングを1本も取らずに集計が空になる）");
     }
     let files = collect_records(&specs);
     if files.is_empty() {
@@ -480,12 +490,14 @@ fn main() {
         .collect();
     let effective_jobs = jobs.min(units.len()).max(1);
     let next = Arc::new(Mutex::new(0usize));
+    let dropped = Arc::new(Mutex::new(0usize));
     let results: Arc<Mutex<Vec<UnitOut>>> = Arc::new(Mutex::new(vec![]));
     let points = Arc::new(points);
     let started = std::time::Instant::now();
     std::thread::scope(|scope| {
         for _ in 0..effective_jobs {
             let next = Arc::clone(&next);
+            let dropped = Arc::clone(&dropped);
             let results = Arc::clone(&results);
             let points = Arc::clone(&points);
             let units = &units;
@@ -509,10 +521,14 @@ fn main() {
                         ranking_one_with(&p.entry, seed, "estimator", &HashSet::new())
                     else {
                         eprintln!("{} {}手目: 初回ランキングなし", p.game, p.move_number);
+                        *dropped.lock().unwrap() += 1;
                         continue;
                     };
                     let priced = priced_moves(&entry_rank, king);
-                    let Some(top1) = priced.first() else { continue };
+                    let Some(top1) = priced.first() else {
+                        *dropped.lock().unwrap() += 1;
+                        continue;
+                    };
                     let king_best = priced.iter().find(|m| m.is_king);
                     let base = base_foul_cost(
                         params,
@@ -572,6 +588,10 @@ fn main() {
     });
     let mut results = Arc::try_unwrap(results).ok().unwrap().into_inner().unwrap();
     results.sort_by_key(|r| (r.point, r.seed));
+    let dropped = *dropped.lock().unwrap();
+    if dropped > 0 {
+        eprintln!("ランキングが取れずに落とした unit: {dropped}");
+    }
     eprintln!(
         "{} unit / {:.1}秒",
         results.len(),
@@ -612,6 +632,7 @@ fn main() {
             p_king_after: r.p_king_after,
         })
         .collect();
+    check_completeness(&rows, seeds, allow_incomplete);
     if shard_n > 1 {
         println!(
             "\n**シャード {shard_i}/{shard_n} の部分集計**（判定は `check_probe report` で全シャードを集めてから）"
@@ -672,6 +693,36 @@ fn majority(vals: &[bool]) -> Option<bool> {
     }
     let yes = vals.iter().filter(|v| **v).count();
     Some(yes * 2 > vals.len())
+}
+
+/// **決定点ごとに seed が全部揃っているか**を検査する。
+///
+/// 揃っていない決定点があると、多数決の分母が決定点ごとに変わり
+/// （2/3 seed の点は同数で「反転しない」側へ倒れる）、門の割合が黙って動く。
+/// `--allow-incomplete` を付けたときだけ警告へ落とす（issue #28 の契約と同じ）。
+fn check_completeness(rows: &[Row], seeds: u64, allow_incomplete: bool) {
+    let mut per_point: BTreeMap<(String, u32), BTreeSet<u64>> = BTreeMap::new();
+    for r in rows {
+        per_point.entry(r.point_key()).or_default().insert(r.seed);
+    }
+    let bad: Vec<String> = per_point
+        .iter()
+        .filter(|(_, s)| s.len() as u64 != seeds)
+        .map(|((g, mn), s)| format!("{g} {mn}手目（seed {}/{seeds}）", s.len()))
+        .collect();
+    if bad.is_empty() {
+        return;
+    }
+    let msg = format!(
+        "seed が揃っていない決定点が {} 件あります（多数決の分母が決定点ごとに変わる）:\n  {}",
+        bad.len(),
+        bad.join("\n  ")
+    );
+    if allow_incomplete {
+        eprintln!("警告: {msg}");
+    } else {
+        die(&format!("{msg}\n（承知のうえで集計するなら --allow-incomplete）"));
+    }
 }
 
 /// 型ごとの集計値（表示と検査で同じものを使う）
@@ -807,6 +858,7 @@ fn report(rows: &[Row]) {
 /// 混ぜない。
 fn run_report(args: &[String]) {
     let mut want_shards: Option<usize> = None;
+    let mut allow_incomplete = false;
     let mut paths: Vec<String> = vec![];
     let mut i = 0;
     while i < args.len() {
@@ -818,6 +870,10 @@ fn run_report(args: &[String]) {
                         .unwrap_or_else(|| die("--shards には数値が必要です")),
                 );
                 i += 2;
+            }
+            "--allow-incomplete" => {
+                allow_incomplete = true;
+                i += 1;
             }
             s if s.starts_with("--") => die(&format!("未知のオプション: {s}")),
             s => {
@@ -912,7 +968,15 @@ fn run_report(args: &[String]) {
     }
     let shards: BTreeSet<u64> = metas.iter().filter_map(|m| m["shard"].as_u64()).collect();
     let total = metas[0]["shards"].as_u64().unwrap_or(1) as usize;
-    let total = want_shards.unwrap_or(total);
+    // `--shards` は**上書きではなく突き合わせ**（上書きを許すと「1本しか無いのに
+    // --shards 1 で通す」で欠落検査を素通りできる）
+    if let Some(want) = want_shards {
+        if want != total {
+            die(&format!(
+                "--shards {want} は CSV の meta（shards {total}）と食い違います"
+            ));
+        }
+    }
     if shards.len() != total || shards.iter().max().map_or(0, |m| *m as usize + 1) != total {
         die(&format!(
             "シャードが欠けています（{:?} / 全 {total}）: 決定点の分母が狂うので中止",
@@ -926,6 +990,11 @@ fn run_report(args: &[String]) {
             die("同じ (決定点, seed) が重複しています（シャードの割り当てがおかしい）");
         }
     }
+    let seeds = metas[0]["seeds"].as_u64().unwrap_or_else(|| die("meta に seeds がありません"));
+    if seeds == 0 {
+        die("meta の seeds が 0 です（空の集計で判定を偽造できてしまう）");
+    }
+    check_completeness(&rows, seeds, allow_incomplete);
     println!("CSV {} 本 / シャード {total} / 行 {}", paths.len(), rows.len());
     println!("meta {}", first);
     report(&rows);
