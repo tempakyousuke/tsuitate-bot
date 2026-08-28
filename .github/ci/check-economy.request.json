@@ -1,0 +1,13 @@
+{
+  "_comment": "PR #33 レビュー [P1] で近似通過条件の統計量を直した（符号付き平均 → unit ごとの絶対誤差）ので、run 33171943105 の P0-5 シャード artifact を**集計し直すだけ**。対局もランキングも回さない。shards は元の run と同じ 6",
+  "arena_run_id": "32697854659",
+  "opponents": ["estimator_v13", "estimator_v14"],
+  "reaggregate_run_id": "33171943105",
+  "run_probe": false,
+  "run_policy": true,
+  "policy_seeds": 4,
+  "policy_budget_ms": 2000,
+  "policy_shards": 6,
+  "run_price": false,
+  "run_continue": false
+}

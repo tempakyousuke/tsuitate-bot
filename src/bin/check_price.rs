@@ -39,7 +39,16 @@ use tsuitate_bot::shogi::Position;
 use tsuitate_bot::strategy;
 use tsuitate_bot::truth_replay::{for_each_decision_full, parse_bot_and_end};
 
-const ROW_SCHEMA: u32 = 1;
+/// JSONL の契約バージョン。
+///
+/// **schema 1 は撤回**（PR #33 レビュー [P1]）: control と treatment を別 unit として
+/// 共通キューへ積み、複数 worker で同時実行していた。思考予算は壁時計なので、
+/// 同じ乱数 seed でも CPU 競合と開始順が違えば粒子数と継続方策が変わり、
+/// ペア差へスケジューリング差が混ざる。しかも常に control を先に積んでいたので
+/// 実行順も均衡していなかった。schema 2 は**1 worker が同じ `(決定点, seed)` の
+/// 両 arm を背中合わせに走らせ、偶数 seed 内で AB/BA を反転する**
+/// （checkpoint arena が実行順効果を cluster の内側へ閉じたのと同じ契約）。
+const ROW_SCHEMA: u32 = 2;
 
 fn die(msg: &str) -> ! {
     eprintln!("{msg}");
@@ -270,9 +279,14 @@ fn main() {
     if specs.is_empty() {
         die("記録ファイル（またはディレクトリ）を指定してください");
     }
-    // **`--seeds 0` で空の集計を作れてはいけない**（issue #28 が塞いだ穴と同じ）
-    if seeds == 0 {
-        die("--seeds は 1 以上にしてください（0 だと継続を1局も走らせずに影の価格が 0 になる）");
+    // **`--seeds` は 2 以上の偶数**（issue #28 が塞いだ穴＋ AB/BA の均衡）。
+    // 0 は継続を1局も走らせずに影の価格 0 を出せてしまい、奇数だと
+    // 実行順（control 先 / treatment 先）が決定点ごとに偏る
+    if seeds < 2 || seeds % 2 != 0 {
+        die(&format!(
+            "--seeds は 2 以上の偶数にしてください（受け取った値: {seeds}）。\
+0 だと継続を1局も走らせずに影の価格が 0 になり、奇数だと AB/BA が偏ります"
+        ));
     }
     if per_game == 0 {
         die("--per-game は 1 以上にしてください");
@@ -414,8 +428,12 @@ fn main() {
     println!("source_fingerprint {}", env!("TSUITATE_SOURCE_FINGERPRINT"));
 
     // ---- 継続（control / treatment のペア）---------------------------------
-    let units: Vec<(usize, u64, bool)> = (0..points.len())
-        .flat_map(|p| (0..seeds).flat_map(move |s| [(p, s, false), (p, s, true)]))
+    // **1 unit = 1つの `(決定点, seed)` の両 arm**。同じ worker が背中合わせに
+    // 走らせるので、CPU 競合と開始順の差はペアの内側で相殺する。arm の順番は
+    // `(決定点番号 + seed) % 2` で反転させ、**偶数 seed の中で AB/BA を均衡**させる
+    // （checkpoint arena と同じ契約。PR #33 レビュー [P1]）
+    let units: Vec<(usize, u64)> = (0..points.len())
+        .flat_map(|p| (0..seeds).map(move |s| (p, s)))
         .collect();
     let effective_jobs = jobs.min(units.len()).max(1);
     let next = Arc::new(Mutex::new(0usize));
@@ -440,9 +458,23 @@ fn main() {
                         *g += 1;
                         v
                     };
-                    let (pi, seed, extra) = units[ui];
-                    let row = run_continuation(&points[pi], extra, seed, opponent);
-                    lines.lock().unwrap().push(row);
+                    let (pi, seed) = units[ui];
+                    // treatment を先に走らせる seed と control を先に走らせる seed を
+                    // 交互にする（実行順効果を cluster の内側で閉じる）
+                    let treatment_first = (pi as u64 + seed) % 2 == 1;
+                    let order = if treatment_first {
+                        [true, false]
+                    } else {
+                        [false, true]
+                    };
+                    let mut rows = vec![];
+                    for (k, extra) in order.into_iter().enumerate() {
+                        let mut row = run_continuation(&points[pi], extra, seed, opponent);
+                        // 何番目に走ったか（`report` が実行順効果を出すのに使う）
+                        row["arm_order"] = serde_json::json!(k);
+                        rows.push(row);
+                    }
+                    lines.lock().unwrap().extend(rows);
                 }
             });
         }
@@ -633,6 +665,35 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
         }
         think.push(r["think_mean_ms"].as_f64().unwrap_or(0.0));
     }
+    // **実行順効果**（先に走った arm − 後に走った arm）。0 から離れていたら
+    // AB/BA の均衡が効いていない＝ペア差にスケジューリング差が残っている
+    let order_effect = {
+        let mut by: BTreeMap<(String, u64, u64), BTreeMap<u64, f64>> = BTreeMap::new();
+        for r in rows {
+            if let Some(k) = r["arm_order"].as_u64() {
+                by.entry((
+                    r["game"].as_str().unwrap_or("?").to_string(),
+                    r["move_number"].as_u64().unwrap_or(0),
+                    r["seed"].as_u64().unwrap_or(0),
+                ))
+                .or_default()
+                .insert(k, r["score"].as_f64().unwrap_or(0.0));
+            }
+        }
+        let diffs: Vec<(String, f64)> = by
+            .iter()
+            .filter_map(|((g, _, _), m)| Some((g.clone(), m.get(&0)? - m.get(&1)?)))
+            .collect();
+        (!diffs.is_empty()).then(|| (diffs.len(), cluster(&diffs)))
+    };
+    match order_effect {
+        Some((n, (d, lo, hi))) => println!(
+            "  実行順効果（先に走った arm − 後、n={n}）: {d:+.4} [{lo:+.4}, {hi:+.4}]（0 から離れていたら AB/BA の均衡が効いていない）"
+        ),
+        None => println!(
+            "  実行順効果: **測れない**（`arm_order` が無い = schema 1 の記録。control / treatment を同時実行していたのでペア差にスケジューリング差が混ざる）"
+        ),
+    }
     println!(
         "  残り1→0 で継続を始めなかった treatment: {immediate} 本（即 foul_limit 負けとして 0 点）"
     );
@@ -656,8 +717,11 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
         return vec!["meta 行がありません".into()];
     }
     let first = &metas[0]["experiment"];
-    if first["seeds"].as_u64().unwrap_or(0) == 0 {
-        out.push("meta の seeds が 0 です（継続 0 局のまま影の価格 0 を出せてしまう）".into());
+    let seeds_meta = first["seeds"].as_u64().unwrap_or(0);
+    if seeds_meta < 2 || seeds_meta % 2 != 0 {
+        out.push(format!(
+            "meta の seeds が {seeds_meta} です（2 以上の偶数が必要。0 だと継続 0 局のまま影の価格 0 を出せてしまい、奇数だと AB/BA が偏ります）"
+        ));
     }
     for (i, m) in metas.iter().enumerate().skip(1) {
         if m["experiment"] != *first {
@@ -754,7 +818,8 @@ fn run_report(args: &[String]) {
             let schema = v["schema"].as_u64().unwrap_or(0) as u32;
             if schema != ROW_SCHEMA {
                 die(&format!(
-                    "{p}: schema {schema} は集計できません（現行 {ROW_SCHEMA}）"
+                    "{p}: schema {schema} は集計できません（現行 {ROW_SCHEMA}）。\
+schema 1 は control / treatment を同時実行していた撤回済みの記録です"
                 ));
             }
             if v["type"] == "meta" {
@@ -795,7 +860,27 @@ mod tests {
             "score": score, "reason": "checkmate", "plies": 90, "added_plies": 10,
             "fouls_me": 5, "remaining": 5, "opp_remaining": 7, "band": "中盤(50-89)",
             "think_mean_ms": 700.0, "immediate_loss": false,
+            "arm_order": u64::from(arm == "treatment"),
         })
+    }
+
+    /// **arm の実行順は `(決定点番号 + seed) % 2` で反転する**（PR #33 レビュー [P1]）。
+    /// 偶数 seed の中で AB/BA が閉じるので、実行順効果が cluster の外へ漏れない
+    #[test]
+    fn 実行順は偶数seedの中で反転する() {
+        let first_is_treatment = |pi: usize, seed: u64| (pi as u64 + seed) % 2 == 1;
+        for pi in 0..4 {
+            // 同じ決定点の seed 2k / 2k+1 は必ず逆順
+            for k in 0..2 {
+                assert_ne!(
+                    first_is_treatment(pi, 2 * k),
+                    first_is_treatment(pi, 2 * k + 1),
+                    "決定点 {pi} の seed {} と {} が同じ順番",
+                    2 * k,
+                    2 * k + 1
+                );
+            }
+        }
     }
 
     fn full() -> Vec<serde_json::Value> {

@@ -804,6 +804,33 @@ fn paired_ci(
     base: &str,
     key: &dyn Fn(&serde_json::Value) -> f64,
 ) -> (f64, f64, f64) {
+    paired_with(rows, arm, base, key, &|a, b| a - b)
+}
+
+/// **unit ごとに `|arm − base|` を作ってから**元対局 cluster で集約する。
+///
+/// 近似の良し悪しは**符号付き平均では測れない**（PR #33 レビュー [P1]）:
+/// 「ある unit で +1 反則ずれ、別の unit で −1 反則ずれる」仮想更新は、
+/// 符号付き平均だと誤差 0 に見えて門を通ってしまう。実測でも v13 は
+/// 符号付き −0.015 に対し unit ごとの絶対誤差は 0.097 で、比率は
+/// 0.33 → 2.15 と一桁違う。**門には必ずこちらを使う**。
+fn paired_abs_ci(
+    rows: &[&serde_json::Value],
+    arm: &str,
+    base: &str,
+    key: &dyn Fn(&serde_json::Value) -> f64,
+) -> (f64, f64, f64) {
+    paired_with(rows, arm, base, key, &|a, b| (a - b).abs())
+}
+
+/// `combine(arm の値, base の値)` を unit ごとに作り、元対局 cluster で畳む
+fn paired_with(
+    rows: &[&serde_json::Value],
+    arm: &str,
+    base: &str,
+    key: &dyn Fn(&serde_json::Value) -> f64,
+    combine: &dyn Fn(f64, f64) -> f64,
+) -> (f64, f64, f64) {
     // (局, 決定点, seed) → arm → 値
     let mut by: BTreeMap<(String, u64, u64), BTreeMap<String, f64>> = BTreeMap::new();
     for r in rows {
@@ -819,7 +846,7 @@ fn paired_ci(
     for ((game, _, _), m) in &by {
         if let (Some(a), Some(b)) = (m.get(arm), m.get(base)) {
             let e = clusters.entry(game.clone()).or_default();
-            e.0 += a - b;
+            e.0 += combine(*a, *b);
             e.1 += 1.0;
         }
     }
@@ -1016,9 +1043,11 @@ fn approximation_gate(rows: &[serde_json::Value]) {
         println!("  実再決定の arm がありません（--no-real で回した）。判定は出せない");
         return;
     }
-    let (gap, glo, ghi) = paired_ci(&sel, "current@shadow", "current@real", &|r| {
-        r["fouls"].as_f64().unwrap_or(0.0)
-    });
+    let fouls = |r: &serde_json::Value| r["fouls"].as_f64().unwrap_or(0.0);
+    // **門は unit ごとの絶対誤差**（符号付き平均だと正負が相殺して通ってしまう）
+    let (gap, glo, ghi) = paired_abs_ci(&sel, "current@shadow", "current@real", &fouls);
+    // 符号付きの差は「仮想更新に偏りがあるか」の情報として別に出す（門には使わない）
+    let (bias, blo, bhi) = paired_ci(&sel, "current@shadow", "current@real", &fouls);
     let agree = {
         let mut by: BTreeMap<(String, u64, u64), BTreeMap<String, String>> = BTreeMap::new();
         for r in &sel {
@@ -1043,7 +1072,12 @@ fn approximation_gate(rows: &[serde_json::Value]) {
             pairs.iter().filter(|b| **b).count() as f64 / pairs.len() as f64
         }
     };
-    println!("  受理までの反則数の差（shadow − real）: {gap:+.3} [{glo:+.3}, {ghi:+.3}]");
+    println!(
+        "  **受理までの反則数の絶対誤差 |shadow − real|（門はこちら）: {gap:.3} [{glo:.3}, {ghi:.3}]**"
+    );
+    println!(
+        "  符号付きの差（shadow − real、偏りの情報。門には使わない）: {bias:+.3} [{blo:+.3}, {bhi:+.3}]"
+    );
     println!("  受理手が一致した割合: {:.1}%", 100.0 * agree);
     // β の対現行改善量（反則が減る = 負の差なので符号を反転して「改善量」にする）
     let best_beta = rows
@@ -1054,9 +1088,7 @@ fn approximation_gate(rows: &[serde_json::Value]) {
         .collect::<BTreeSet<_>>();
     let mut best: Option<(String, f64)> = None;
     for arm in best_beta {
-        let (d, _, _) = paired_ci(&sel, arm, "current@shadow", &|r| {
-            r["fouls"].as_f64().unwrap_or(0.0)
-        });
+        let (d, _, _) = paired_ci(&sel, arm, "current@shadow", &fouls);
         let improve = -d;
         if best.as_ref().is_none_or(|(_, b)| improve > *b) {
             best = Some((arm.to_string(), improve));
@@ -1064,7 +1096,7 @@ fn approximation_gate(rows: &[serde_json::Value]) {
     }
     match best {
         Some((arm, improve)) if improve > 0.0 => {
-            let ratio = gap.abs() / improve;
+            let ratio = gap / improve;
             println!(
                 "  β の対現行改善量の最大は {arm} の {improve:+.3}（反則/手番）→ 近似誤差 / 改善量 = {ratio:.2} → {}",
                 if ratio <= 0.25 {
@@ -1434,5 +1466,30 @@ mod tests {
         });
         assert_eq!(d, 0.0, "同じ反則数ならペア差は 0");
         assert_eq!((lo, hi), (0.0, 0.0));
+    }
+
+    /// **近似の門は符号付き平均では測れない**（PR #33 レビュー [P1]）。
+    /// 「ある unit で +1、別の unit で −1」ずれる仮想更新は符号付きでは
+    /// 誤差 0 に見えるが、unit ごとの絶対誤差なら 1.0 として現れる
+    #[test]
+    fn 近似誤差は符号付き平均でなくunitごとの絶対値で測る() {
+        let mut rows = vec![];
+        // 決定点 g1#41: shadow が real より +1 反則 / g2#41: −1 反則
+        for (game, shadow, real) in [("g1", 2u32, 1u32), ("g2", 0, 1)] {
+            for seed in 0..2 {
+                let mut a = row("current@shadow", seed, shadow);
+                a["game"] = serde_json::json!(game);
+                let mut b = row("current@real", seed, real);
+                b["game"] = serde_json::json!(game);
+                rows.push(a);
+                rows.push(b);
+            }
+        }
+        let refs: Vec<&serde_json::Value> = rows.iter().collect();
+        let fouls = |r: &serde_json::Value| r["fouls"].as_f64().unwrap_or(0.0);
+        let (signed, _, _) = paired_ci(&refs, "current@shadow", "current@real", &fouls);
+        let (abs, _, _) = paired_abs_ci(&refs, "current@shadow", "current@real", &fouls);
+        assert!(signed.abs() < 1e-9, "符号付きでは相殺して 0 に見える: {signed}");
+        assert!((abs - 1.0).abs() < 1e-9, "絶対誤差は 1.0: {abs}");
     }
 }

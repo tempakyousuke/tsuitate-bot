@@ -123,6 +123,11 @@ fn run_arm(p: &Point, order: &[String], seed: u64, opponent: &str) -> serde_json
     let forced = force_move(&p.entry.pos, &logs, p.entry.fouls, p.bot, order);
     let forced_fouls = forced.forced_fouls;
     let base = |score: f64, reason: &str, plies: u32, added: u32, think: f64, extra: u32| {
+        // **`reason == "foul_limit"` は「誰かが反則負けした」でしかない**
+        // （PR #33 レビュー [P1]）。相手が反則負けして bot が勝った終局まで同じ 1 に
+        // 数えると、相手の自滅を増やした方策を「反則負け悪化」で落としてしまうし、
+        // 自分負けと相手負けの入れ替わりも見えない。**bot 側の負けだけ**を数える
+        let limit = reason == "foul_limit";
         serde_json::json!({
             "schema": ROW_SCHEMA,
             "game": p.game, "move_number": p.move_number, "estimand": p.estimand,
@@ -130,9 +135,14 @@ fn run_arm(p: &Point, order: &[String], seed: u64, opponent: &str) -> serde_json
             "score": score, "reason": reason, "plies": plies, "added_plies": added,
             // **即時反則** = その手番で積んだ反則（β-order の門はここを見る）
             "immediate_fouls": forced_fouls,
+            // **即時破滅** = その手番だけで8反則以上（事前登録の破滅率）
+            "immediate_catastrophe": forced_fouls >= 8,
             "added_fouls_me": forced_fouls + extra,
             "think_mean_ms": think,
-            "foul_limit": reason == "foul_limit",
+            "foul_limit": limit,
+            // bot が反則負けした / 相手が反則負けして bot が勝った
+            "foul_limit_loss": limit && score < 0.5,
+            "foul_limit_win": limit && score > 0.5,
         })
     };
     if forced.foul_limit || forced.played.is_none() {
@@ -468,7 +478,13 @@ fn main() {
     let orders = Arc::try_unwrap(orders).ok().unwrap().into_inner().unwrap();
 
     // ---- 継続（同じ強制列は1回だけ走らせて該当 arm へ配る）-----------------
-    let mut units: Vec<(usize, u64, Vec<String>, Vec<String>)> = vec![];
+    // **1 unit = 1つの `(決定点, seed)` の全 arm**。同じ worker が背中合わせに
+    // 走らせるので、壁時計予算のもとでの CPU 競合と開始順の差が arm 間の Δ へ
+    // 混ざらない。arm の並びは `(決定点番号 + seed)` で回転させ、
+    // 「いつも current が先」に偏らないようにする
+    // （`bin/check_price` と同じ契約。PR #33 レビュー [P1] の一般化）
+    type Unit = (usize, u64, Vec<(Vec<String>, Vec<String>)>);
+    let mut units: Vec<Unit> = vec![];
     for (pi, p) in points.iter().enumerate() {
         for seed in 0..seeds {
             let mut by_order: BTreeMap<Vec<String>, Vec<String>> = BTreeMap::new();
@@ -481,9 +497,12 @@ fn main() {
                     by_order.entry(order.clone()).or_default().push(arm.clone());
                 }
             }
-            for (order, arms) in by_order {
-                units.push((pi, seed, order, arms));
+            let mut group: Vec<(Vec<String>, Vec<String>)> = by_order.into_iter().collect();
+            if !group.is_empty() {
+                let shift = (pi + seed as usize) % group.len();
+                group.rotate_left(shift);
             }
+            units.push((pi, seed, group));
         }
     }
     let lines: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(vec![]));
@@ -495,15 +514,20 @@ fn main() {
         let units = &units;
         let opponent = opponent.as_str();
         run_parallel(jobs, units.len(), move |ui| {
-            let (pi, seed, order, arms) = &units[ui];
-            let row = run_arm(&points[*pi], order, *seed, opponent);
-            let mut out = lines.lock().unwrap();
-            for arm in arms {
-                // 同じ強制列 = 同じ継続なので、arm ごとに同じ結果を配る
-                let mut r = row.clone();
-                r["arm"] = serde_json::json!(arm);
-                out.push(r);
+            let (pi, seed, group) = &units[ui];
+            let mut rows = vec![];
+            for (k, (order, arms)) in group.iter().enumerate() {
+                let row = run_arm(&points[*pi], order, *seed, opponent);
+                for arm in arms {
+                    // 同じ強制列 = 同じ継続なので、arm ごとに同じ結果を配る
+                    let mut r = row.clone();
+                    r["arm"] = serde_json::json!(arm);
+                    // 何番目に走ったか（実行順効果の監査用）
+                    r["arm_order"] = serde_json::json!(k);
+                    rows.push(r);
+                }
             }
+            lines.lock().unwrap().extend(rows);
         });
     }
     let mut lines = Arc::try_unwrap(lines).ok().unwrap().into_inner().unwrap();
@@ -715,8 +739,16 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
             .collect();
         let score = contributions(&sel, &|r| r["score"].as_f64().unwrap_or(0.0));
         let fouls = contributions(&sel, &|r| r["immediate_fouls"].as_f64().unwrap_or(0.0));
-        let limit = contributions(&sel, &|r| {
-            f64::from(u8::from(r["foul_limit"].as_bool().unwrap_or(false)))
+        // **bot 側の反則負けだけ**を数える（相手の反則負け＝bot の勝ちを混ぜない）
+        let loss = contributions(&sel, &|r| {
+            f64::from(u8::from(r["foul_limit_loss"].as_bool().unwrap_or(false)))
+        });
+        let win = contributions(&sel, &|r| {
+            f64::from(u8::from(r["foul_limit_win"].as_bool().unwrap_or(false)))
+        });
+        // 事前登録の**破滅率**（その手番だけで8反則以上）
+        let cat = contributions(&sel, &|r| {
+            f64::from(u8::from(r["immediate_catastrophe"].as_bool().unwrap_or(false)))
         });
         println!(
             "\n--- estimand {estimand}（決定点のある局 {} / 継続 {} 本）---",
@@ -724,22 +756,26 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
             sel.len()
         );
         println!(
-            "  {:<18} {:>9} {:>26} {:>10} {:>10}",
-            "arm", "Δ", "Δ − Δcurrent [CI]", "即時反則", "反則負け%"
+            "  {:<18} {:>9} {:>26} {:>9} {:>9} {:>9} {:>9}",
+            "arm", "Δ", "Δ − Δcurrent [CI]", "即時反則", "破滅%", "反則負け%", "相手反則負け%"
         );
         for arm in &arms {
             let (d, _, _) = delta_ci(&score, arm, None, games_total);
             let (dd, lo, hi) = delta_ci(&score, arm, Some("current"), games_total);
             let (f, _, _) = delta_ci(&fouls, arm, None, games_total);
-            let (fl, _, _) = delta_ci(&limit, arm, None, games_total);
+            let (c, _, _) = delta_ci(&cat, arm, None, games_total);
+            let (fl, _, _) = delta_ci(&loss, arm, None, games_total);
+            let (fw, _, _) = delta_ci(&win, arm, None, games_total);
             println!(
-                "  {arm:<18} {d:>+9.4} {:>26} {f:>10.3} {:>10.1}",
+                "  {arm:<18} {d:>+9.4} {:>26} {f:>9.3} {:>9.1} {:>9.1} {:>9.1}",
                 if arm == "current" {
                     "—".to_string()
                 } else {
                     format!("{dd:+.4} [{lo:+.4}, {hi:+.4}]")
                 },
+                100.0 * c,
                 100.0 * fl,
+                100.0 * fw,
             );
         }
         if !complete {
@@ -750,29 +786,52 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
         for arm in arms.iter().filter(|a| *a != "current" && *a != "baseline") {
             let (dd, lo, hi) = delta_ci(&score, arm, Some("current"), games_total);
             let (df, _, _) = delta_ci(&fouls, arm, Some("current"), games_total);
-            let (dl, _, _) = delta_ci(&limit, arm, Some("current"), games_total);
+            let (dl, _, _) = delta_ci(&loss, arm, Some("current"), games_total);
+            let (dc, _, _) = delta_ci(&cat, arm, Some("current"), games_total);
+            // **full β だけが反則増を許される**（β-order は反則経済施策なので
+            // 即時反則の非増加が必須。issue #31 の事前登録）
+            let full_beta = arm.starts_with("beta@");
+            // 安全性の共通条件: bot の反則負けと破滅率が悪化しない
+            let safe = dl <= 0.0 && dc <= 0.0;
+            let safe_note = match (dl > 0.0, dc > 0.0) {
+                (true, true) => "反則負けと破滅が悪化",
+                (true, false) => "反則負けが悪化",
+                (false, true) => "破滅率が悪化",
+                (false, false) => "",
+            };
             let verdict = if estimand == "foul" {
-                // 反則あり: Δpolicy − Δcurrent ≥ +0.04 かつ CI 下限 > 0 かつ
-                // foul_limit・破滅が悪化しない
-                if dd >= 0.04 && lo > 0.0 && dl <= 0.0 {
-                    "**門を超える**"
-                } else if dd >= 0.04 && lo > 0.0 {
-                    "改善量は門を超えるが反則負けが悪化（不合格）"
-                } else {
-                    "不合格"
+                // 反則あり: Δ差 ≥ +0.04 かつ CI 下限 > 0 かつ foul_limit・破滅が悪化しない
+                match (dd >= 0.04 && lo > 0.0, safe) {
+                    (true, true) => "**門を超える**".to_string(),
+                    (true, false) => format!("改善量は門を超えるが{safe_note}（不合格）"),
+                    (false, _) => "不合格".to_string(),
                 }
             } else {
-                // 反則0: 非劣性（≥ −0.01 かつ CI 下限 > −0.02）かつ即時反則が悪化しない
-                if dd >= -0.01 && lo > -0.02 && df <= 0.0 {
-                    "**非劣性を満たす**"
-                } else if dd >= -0.01 && lo > -0.02 {
-                    "非劣性は満たすが即時反則が増えている（β-order なら不合格）"
-                } else {
-                    "非劣性を満たさない"
+                // 反則0: 非劣性 かつ 即時反則・破滅率・foul_limit が悪化しない。
+                // full β だけは即時反則の増加を許す（勝率と foul_limit で判定）
+                let noninferior = dd >= -0.01 && lo > -0.02;
+                let foul_ok = df <= 0.0 || full_beta;
+                match (noninferior, safe && foul_ok) {
+                    (true, true) if df > 0.0 => {
+                        "**非劣性を満たす**（即時反則は増えているが full β は許容）".to_string()
+                    }
+                    (true, true) => "**非劣性を満たす**".to_string(),
+                    (true, false) => {
+                        let mut why: Vec<&str> = vec![];
+                        if !safe_note.is_empty() {
+                            why.push(safe_note);
+                        }
+                        if df > 0.0 && !full_beta {
+                            why.push("即時反則が増えている");
+                        }
+                        format!("非劣性は満たすが{}（不合格）", why.join("・"))
+                    }
+                    (false, _) => "非劣性を満たさない".to_string(),
                 }
             };
             println!(
-                "    {arm:<18} Δ差 {dd:+.4} [{lo:+.4}, {hi:+.4}] / 即時反則 {df:+.3} / 反則負け {dl:+.4} → {verdict}"
+                "    {arm:<18} Δ差 {dd:+.4} [{lo:+.4}, {hi:+.4}] / 即時反則 {df:+.3} / \
+破滅 {dc:+.4} / 反則負け {dl:+.4} → {verdict}"
             );
         }
     }
@@ -984,7 +1043,29 @@ mod tests {
             "seed": seed, "arm": arm, "score": score, "reason": "checkmate",
             "plies": 90, "added_plies": 10, "immediate_fouls": 1, "added_fouls_me": 1,
             "think_mean_ms": 700.0, "foul_limit": false,
+            "foul_limit_loss": false, "foul_limit_win": false,
+            "immediate_catastrophe": false,
         })
+    }
+
+    /// **`reason == "foul_limit"` は bot の負けとは限らない**（PR #33 レビュー [P1]）。
+    /// 相手が反則負けして bot が勝った終局を「反則負け」に数えると、相手の自滅を
+    /// 増やした方策を安全性ゲートで落としてしまう
+    #[test]
+    fn 反則負けは自分の負けだけを数える() {
+        let win = serde_json::json!({
+            "reason": "foul_limit", "score": 1.0,
+            "foul_limit": true, "foul_limit_loss": false, "foul_limit_win": true,
+        });
+        let lose = serde_json::json!({
+            "reason": "foul_limit", "score": 0.0,
+            "foul_limit": true, "foul_limit_loss": true, "foul_limit_win": false,
+        });
+        // 素の `foul_limit` はどちらも真 = 区別できない
+        assert_eq!(win["foul_limit"], lose["foul_limit"]);
+        // 集計が見るのは `foul_limit_loss` の方
+        assert_eq!(win["foul_limit_loss"], serde_json::json!(false));
+        assert_eq!(lose["foul_limit_loss"], serde_json::json!(true));
     }
 
     fn full() -> Vec<serde_json::Value> {

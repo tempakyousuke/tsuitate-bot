@@ -23,6 +23,8 @@ name: Check economy
 #
 # **P0-4 / P0-5 / P0-6 / P0-7 は既定では走らない**（`run_probe` / `run_policy` /
 # `run_continue` / `run_price`）。P0-1〜P0-3 は粒子を回さないので常に走る。
+# `reaggregate_run_id` を渡すと**シャードは回さず既存 run の artifact を集計し直す**
+# （集計側のバグを直したときの当て直し。シャード数は元の run と揃えること）。
 # **全部を同時に有効化しない**（相手2 × シャードでジョブが 30 を超えて詰まる）。
 # P0-6 は主 arm を P0-4 / P0-5 で固定してから、**検証セットを指す別の起動**で回す。
 #
@@ -102,6 +104,10 @@ on:
         description: "P0-7 の分割数（元対局単位。欠けたら aggregate が失敗する）"
         required: false
         default: "8"
+      reaggregate_run_id:
+        description: "既存の Check economy 実行のシャード artifact を使って**集計だけ**やり直す（対局もランキングも回さない）。集計側を直したときの当て直し用。有効な run_* の aggregate だけが走る"
+        required: false
+        default: ""
       run_continue:
         description: "P0-6（継続の局所効果）も走らせるか。**検証セットの Arena 実行を arena_run_id に指定した別の起動で回すこと**（発見セットで回すと選定バイアスが入る）"
         required: false
@@ -150,6 +156,7 @@ jobs:
       price_per_game: ${{ steps.split.outputs.price_per_game }}
       price_shards: ${{ steps.split.outputs.price_shards }}
       price_shard_count: ${{ steps.split.outputs.price_shard_count }}
+      reaggregate_run_id: ${{ steps.split.outputs.reaggregate_run_id }}
       run_continue: ${{ steps.split.outputs.run_continue }}
       continue_policy: ${{ steps.split.outputs.continue_policy }}
       continue_seeds: ${{ steps.split.outputs.continue_seeds }}
@@ -177,6 +184,7 @@ jobs:
           IN_PRICE_BUDGET: ${{ github.event.inputs.price_budget_ms }}
           IN_PRICE_PER_GAME: ${{ github.event.inputs.price_per_game }}
           IN_PRICE_SHARDS: ${{ github.event.inputs.price_shards }}
+          IN_REAGGREGATE: ${{ github.event.inputs.reaggregate_run_id }}
           IN_RUN_CONTINUE: ${{ github.event.inputs.run_continue }}
           IN_CONTINUE_POLICY: ${{ github.event.inputs.continue_policy }}
           IN_CONTINUE_SEEDS: ${{ github.event.inputs.continue_seeds }}
@@ -202,6 +210,7 @@ jobs:
             price_budget="${IN_PRICE_BUDGET:-700}"
             price_per_game="${IN_PRICE_PER_GAME:-2}"
             price_shards="${IN_PRICE_SHARDS:-8}"
+            reaggregate="${IN_REAGGREGATE:-}"
             run_continue="${IN_RUN_CONTINUE:-false}"
             continue_policy="${IN_CONTINUE_POLICY:-current}"
             continue_seeds="${IN_CONTINUE_SEEDS:-4}"
@@ -233,6 +242,7 @@ jobs:
                 echo "price_per_game=2"
                 echo 'price_shards=[0]'
                 echo "price_shard_count=1"
+                echo "reaggregate_run_id="
                 echo "run_continue=false"
                 echo "continue_policy=current"
                 echo "continue_seeds=4"
@@ -260,6 +270,7 @@ jobs:
             price_budget=$(jq -r '.price_budget_ms // 700' "$req")
             price_per_game=$(jq -r '.price_per_game // 2' "$req")
             price_shards=$(jq -r '.price_shards // 8' "$req")
+            reaggregate=$(jq -r '.reaggregate_run_id // ""' "$req")
             run_continue=$(jq -r 'if has("run_continue") then .run_continue else false end | tostring' "$req")
             continue_policy=$(jq -r 'if (.continue_policy | type) == "array" then (.continue_policy | join(",")) else (.continue_policy // "current") end' "$req")
             continue_seeds=$(jq -r '.continue_seeds // 4' "$req")
@@ -291,6 +302,7 @@ jobs:
             echo "price_per_game=$price_per_game"
             echo "price_shards=$(jq -n -c "[range(0; ${price_shards})]")"
             echo "price_shard_count=$price_shards"
+            echo "reaggregate_run_id=$reaggregate"
             echo "run_continue=$run_continue"
             echo "continue_policy=$continue_policy"
             echo "continue_seeds=$continue_seeds"
@@ -468,7 +480,9 @@ jobs:
   # ---- P0-5 方策シミュレーション（粒子を回す）----------------------------
   policy:
     needs: plan
-    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_policy == 'true'
+    if: >-
+      needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_policy == 'true'
+      && needs.plan.outputs.reaggregate_run_id == ''
     strategy:
       fail-fast: false
       matrix:
@@ -526,7 +540,12 @@ jobs:
 
   policy-aggregate:
     needs: [plan, policy]
-    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_policy == 'true'
+    # **シャード matrix が skip されても走る**（`reaggregate_run_id` で既存 run の
+    # artifact を集計し直す経路）。`policy` が失敗したときだけ止める
+    if: >-
+      !cancelled() && needs.plan.outputs.skip != 'true'
+      && needs.plan.outputs.run_policy == 'true'
+      && (needs.policy.result == 'success' || needs.policy.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
@@ -540,6 +559,9 @@ jobs:
         with:
           pattern: check-policy-${{ matrix.opponent }}-s*
           path: shards
+          # 空なら現在の run（既定）。`reaggregate_run_id` があればその run から拾う
+          run-id: ${{ needs.plan.outputs.reaggregate_run_id || github.run_id }}
+          github-token: ${{ github.token }}
       - name: Report
         run: |
           set -euo pipefail
@@ -569,7 +591,9 @@ jobs:
   # ---- P0-7 反則トークンの影の価格（継続対局を回すので最も重い）----------
   price:
     needs: plan
-    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_price == 'true'
+    if: >-
+      needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_price == 'true'
+      && needs.plan.outputs.reaggregate_run_id == ''
     strategy:
       fail-fast: false
       matrix:
@@ -631,7 +655,12 @@ jobs:
 
   price-aggregate:
     needs: [plan, price]
-    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_price == 'true'
+    # **シャード matrix が skip されても走る**（`reaggregate_run_id` で既存 run の
+    # artifact を集計し直す経路）。`price` が失敗したときだけ止める
+    if: >-
+      !cancelled() && needs.plan.outputs.skip != 'true'
+      && needs.plan.outputs.run_price == 'true'
+      && (needs.price.result == 'success' || needs.price.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
@@ -645,6 +674,9 @@ jobs:
         with:
           pattern: check-price-${{ matrix.opponent }}-s*
           path: shards
+          # 空なら現在の run（既定）。`reaggregate_run_id` があればその run から拾う
+          run-id: ${{ needs.plan.outputs.reaggregate_run_id || github.run_id }}
+          github-token: ${{ github.token }}
       - name: Report
         run: |
           set -euo pipefail
@@ -676,7 +708,9 @@ jobs:
   # 主 arm を選んだのと同じデータで検証することになり選定バイアスが入る。
   continue:
     needs: plan
-    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_continue == 'true'
+    if: >-
+      needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_continue == 'true'
+      && needs.plan.outputs.reaggregate_run_id == ''
     strategy:
       fail-fast: false
       matrix:
@@ -734,7 +768,12 @@ jobs:
 
   continue-aggregate:
     needs: [plan, continue]
-    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_continue == 'true'
+    # **シャード matrix が skip されても走る**（`reaggregate_run_id` で既存 run の
+    # artifact を集計し直す経路）。`continue` が失敗したときだけ止める
+    if: >-
+      !cancelled() && needs.plan.outputs.skip != 'true'
+      && needs.plan.outputs.run_continue == 'true'
+      && (needs.continue.result == 'success' || needs.continue.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
@@ -748,6 +787,9 @@ jobs:
         with:
           pattern: check-continue-${{ matrix.opponent }}-s*
           path: shards
+          # 空なら現在の run（既定）。`reaggregate_run_id` があればその run から拾う
+          run-id: ${{ needs.plan.outputs.reaggregate_run_id || github.run_id }}
+          github-token: ${{ github.token }}
       - name: Report
         run: |
           set -euo pipefail
