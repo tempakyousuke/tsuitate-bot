@@ -685,7 +685,11 @@
   中止条件は「k\* ≤ 3 で反転する決定点が 20% 未満 **かつ** 反則注入後に首位が
   変わる決定点も 20% 未満」→ α / β の枝は中止。
   **思考予算は記録を取ったアリーナと揃える**（違うと粒子数が変わり「その決定点で
-  実際に見えていたランキング」でなくなる）
+  実際に見えていたランキング」でなくなる）。
+  `--shard i/n` は**元対局単位**で割り、`check_probe report [--shards N] <csv...>`
+  が合算する。**シャードが欠けたら失敗**（決定点の分母が狂う）。CSV の1行目の
+  `#meta` に seed 数・型・予算・config 指紋・コード版・記録集合の指紋を書き、
+  `report` が「同じ実験の独立サンプルか」を検査する（別実験の混入と重複は失敗）
 - **王手中の反則経済の CI**（`.github/workflows/check-economy.yml`、**通常のコード
   push では走らない**）: `gh workflow run check-economy.yml -f arena_run_id=<Arena実行ID>
   -f opponents="estimator_v13 estimator_v14"`、`gh` が無ければ

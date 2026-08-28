@@ -21,7 +21,7 @@
 //!     [--opponent estimator_v14] [--types nonking_king,nonking_nonking] \
 //!     [--out data/check_probe.csv] <records...>
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -34,7 +34,11 @@ use tsuitate_bot::protocol::Color;
 use tsuitate_bot::scenario_core::{Replayed, clone_log, make_view, ranking_one_with, side_idx};
 use tsuitate_bot::shogi::parse_usi;
 use tsuitate_bot::strategy::EvalParams;
-use tsuitate_bot::truth_replay::{for_each_decision_full, load_bot_and_end};
+use tsuitate_bot::truth_replay::{for_each_decision_full, parse_bot_and_end};
+
+/// CSV / 集約の契約バージョン。**古い schema は集計から弾く**
+/// （撤回済みの数字が横断表へ戻らないように。issue #28 の契約と同じ）
+const ROW_SCHEMA: u32 = 1;
 
 fn die(msg: &str) -> ! {
     eprintln!("{msg}");
@@ -90,6 +94,29 @@ struct UnitOut {
     /// 最良の玉の手の p_legal が反則注入後にどう動いたか
     p_king_after: Option<f64>,
     candidates: usize,
+}
+
+/// 集計の単位（CSV の1行 = 決定点 × seed）。**その場の実行でもシャードの
+/// CSV からでも同じ集計を通す**ための共通形
+#[derive(Clone)]
+struct Row {
+    game: String,
+    move_number: u32,
+    type_tag: String,
+    seed: u64,
+    top1_is_king: bool,
+    k_star: Option<f64>,
+    changed: Option<bool>,
+    matches_record: bool,
+    p_king: f64,
+    p_king_after: Option<f64>,
+}
+
+impl Row {
+    /// 決定点のキー（seed は独立標本として数えないので、ここで束ねる）
+    fn point_key(&self) -> (String, u32) {
+        (self.game.clone(), self.move_number)
+    }
 }
 
 fn walk_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -198,6 +225,11 @@ fn type_tag(first: CheckMoveKind, accepted: CheckMoveKind) -> &'static str {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `report` は既存の CSV を集約するだけ（粒子を回さない）
+    if args.first().is_some_and(|a| a == "report") {
+        run_report(&args[1..]);
+        return;
+    }
     let mut seeds: u64 = 3;
     let mut jobs: usize =
         std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(2).max(1));
@@ -288,6 +320,7 @@ fn main() {
     }
     let cfg = tsuitate_bot::config::ambient();
     let params = EvalParams::default();
+    use sha2::Digest as _;
 
     // ---- 決定点の収集（粒子は回さない）-----------------------------------
     let mut points: Vec<Point> = vec![];
@@ -297,9 +330,18 @@ fn main() {
     let mut skipped = 0u32;
     let mut record_opponents: BTreeMap<String, u32> = BTreeMap::new();
     let mut type_counts: BTreeMap<String, u32> = BTreeMap::new();
+    // **解析に渡したのと同じ bytes** から記録集合の指紋を作る（ディスクを
+    // 読み直すと TOCTOU になる。issue #28 PR #30 レビュー3巡目の教訓）
+    let mut digest = sha2::Sha256::new();
     for path in &files {
         let name = path.to_string_lossy().to_string();
-        let Some((bot, end)) = load_bot_and_end(&name) else {
+        let Ok(content) = std::fs::read_to_string(path) else {
+            broken += 1;
+            continue;
+        };
+        sha2::Digest::update(&mut digest, name.as_bytes());
+        sha2::Digest::update(&mut digest, content.as_bytes());
+        let Some((bot, end)) = parse_bot_and_end(&content) else {
             broken += 1;
             continue;
         };
@@ -536,14 +578,54 @@ fn main() {
         started.elapsed().as_secs_f64()
     );
 
+    let records_fingerprint: String =
+        digest.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    let (shard_i, shard_n) = shard.unwrap_or((0, 1));
+    let meta = serde_json::json!({
+        "schema": ROW_SCHEMA,
+        "shard": shard_i,
+        "shards": shard_n,
+        "seeds": seeds,
+        "types": types.join(","),
+        "kmax": kmax,
+        "budget_ms": cfg.think_budget_ms,
+        "config": cfg.fingerprint(),
+        "source_fingerprint": env!("TSUITATE_SOURCE_FINGERPRINT"),
+        "records": records_fingerprint,
+        "points": points.len(),
+    });
     if let Some(path) = &out_csv {
-        write_csv(path, &points, &results);
+        write_csv(path, &points, &results, &meta);
     }
-    report(&points, &results, seeds);
+    let rows: Vec<Row> = results
+        .iter()
+        .map(|r| Row {
+            game: points[r.point].game.clone(),
+            move_number: points[r.point].move_number,
+            type_tag: points[r.point].type_tag.to_string(),
+            seed: r.seed,
+            top1_is_king: r.top1_is_king,
+            k_star: r.k_star,
+            changed: r.changed,
+            matches_record: r.matches_record,
+            p_king: r.p_king,
+            p_king_after: r.p_king_after,
+        })
+        .collect();
+    if shard_n > 1 {
+        println!(
+            "\n**シャード {shard_i}/{shard_n} の部分集計**（判定は `check_probe report` で全シャードを集めてから）"
+        );
+    }
+    report(&rows);
 }
 
-fn write_csv(path: &str, points: &[Point], results: &[UnitOut]) {
-    let mut s = String::from(
+fn write_csv(path: &str, points: &[Point], results: &[UnitOut], meta: &serde_json::Value) {
+    // 1行目は **meta**（集約が「同じ実験の独立サンプルか」を検査する）。
+    // シャードを跨いで seeds / types / 予算 / config / コード版 / 記録集合が
+    // 一致していなければ集計は失敗させる（issue #28 の契約と同じ）
+    let mut s = format!("#meta {meta}\n");
+    s.push_str(
         "game,move_number,type,remaining,fouls_actual,accepted,seed,candidates,top1,top1_is_king,\
 king_best,p_top1,p_king,score_gap,k_star,next_static,top1_after,changed,p_king_after,\
 matches_record,true_hyp_share,hyp_entropy\n",
@@ -592,102 +674,316 @@ fn majority(vals: &[bool]) -> Option<bool> {
     Some(yes * 2 > vals.len())
 }
 
-fn report(points: &[Point], results: &[UnitOut], seeds: u64) {
-    println!("\n=== P0-4 w* 監査（issue #31）===");
-    println!("決定点 {} / seed {seeds} / unit {}", points.len(), results.len());
-    let mut by_type: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
-    for (i, p) in points.iter().enumerate() {
-        by_type.entry(p.type_tag).or_default().push(i);
+/// 型ごとの集計値（表示と検査で同じものを使う）
+#[derive(Default)]
+struct Stats {
+    points: usize,
+    /// 決定点ごとの多数決（seed は独立標本として数えない）
+    reproduced: Vec<bool>,
+    already_king: Vec<bool>,
+    /// **首位が玉以外**の unit だけで取る「k* ≤ 3 で反転したか」
+    k3: Vec<bool>,
+    changed: Vec<bool>,
+    k_values: Vec<f64>,
+    unreverted: usize,
+    p_king_delta: Vec<f64>,
+}
+
+/// 決定点ごとに畳んだ集計。型ごと＋合計を返す
+fn summarize(rows: &[Row]) -> Vec<(String, Stats)> {
+    let mut points: BTreeMap<(String, u32), Vec<&Row>> = BTreeMap::new();
+    for r in rows {
+        points.entry(r.point_key()).or_default().push(r);
     }
-    let mut all: Vec<usize> = (0..points.len()).collect();
-    all.sort();
-    for (tag, idxs) in by_type
-        .iter()
-        .map(|(t, v)| (*t, v.clone()))
-        .chain(std::iter::once(("**合計**", all)))
+    let mut by_type: BTreeMap<String, Vec<(String, u32)>> = BTreeMap::new();
+    for (key, rs) in &points {
+        by_type.entry(rs[0].type_tag.clone()).or_default().push(key.clone());
+    }
+    let all: Vec<(String, u32)> = points.keys().cloned().collect();
+    let mut out = vec![];
+    for (tag, keys) in by_type
+        .into_iter()
+        .chain(std::iter::once(("**合計**".to_string(), all)))
     {
-        let mut k3 = vec![];
-        let mut changed = vec![];
-        let mut already_king = vec![];
-        let mut reproduced = vec![];
-        let mut k_values: Vec<f64> = vec![];
-        let mut unreverted = 0usize;
-        let mut p_king_delta: Vec<f64> = vec![];
-        for &pi in &idxs {
-            let rows: Vec<&UnitOut> = results.iter().filter(|r| r.point == pi).collect();
-            if rows.is_empty() {
-                continue;
+        let mut st = Stats { points: keys.len(), ..Stats::default() };
+        for key in &keys {
+            let rs = &points[key];
+            if let Some(m) = majority(&rs.iter().map(|r| r.top1_is_king).collect::<Vec<_>>()) {
+                st.already_king.push(m);
             }
-            let ak: Vec<bool> = rows.iter().map(|r| r.top1_is_king).collect();
-            let is_already = majority(&ak);
-            if let Some(m) = is_already {
-                already_king.push(m);
+            if let Some(m) = majority(&rs.iter().map(|r| r.matches_record).collect::<Vec<_>>()) {
+                st.reproduced.push(m);
             }
-            if let Some(m) = majority(&rows.iter().map(|r| r.matches_record).collect::<Vec<_>>()) {
-                reproduced.push(m);
-            }
-            // **門の分母は「首位が玉以外」の決定点だけ**。首位が既に玉の手なら
+            // **門の分母は「首位が玉以外」の unit だけ**。首位が既に玉の手なら
             // 価格を上げるまでもないので「反転した」には数えない
-            let rev: Vec<bool> = rows
+            let rev: Vec<bool> = rs
                 .iter()
                 .filter(|r| !r.top1_is_king)
                 .map(|r| r.k_star.is_some_and(|k| k <= 3.0))
                 .collect();
             if let Some(m) = majority(&rev) {
-                k3.push(m);
+                st.k3.push(m);
             }
-            let ch: Vec<bool> = rows.iter().filter_map(|r| r.changed).collect();
-            if let Some(m) = majority(&ch) {
-                changed.push(m);
+            if let Some(m) = majority(&rs.iter().filter_map(|r| r.changed).collect::<Vec<_>>()) {
+                st.changed.push(m);
             }
-            for r in rows.iter().filter(|r| !r.top1_is_king) {
+            for r in rs.iter().filter(|r| !r.top1_is_king) {
                 match r.k_star {
-                    Some(k) => k_values.push(k),
-                    None => unreverted += 1,
+                    Some(k) => st.k_values.push(k),
+                    None => st.unreverted += 1,
                 }
             }
-            for r in &rows {
+            for r in rs {
                 if let (Some(after), true) = (r.p_king_after, r.p_king.is_finite()) {
-                    p_king_delta.push(after - r.p_king);
+                    st.p_king_delta.push(after - r.p_king);
                 }
             }
         }
-        let pct = |v: &[bool]| -> String {
-            if v.is_empty() {
-                return "-".into();
-            }
-            let n = v.iter().filter(|b| **b).count();
-            format!("{n}/{} ({:.1}%)", v.len(), 100.0 * n as f64 / v.len() as f64)
-        };
-        k_values.sort_by(f64::total_cmp);
-        let median = if k_values.is_empty() {
+        st.k_values.sort_by(f64::total_cmp);
+        out.push((tag, st));
+    }
+    out
+}
+
+/// 集計の表示（その場の実行でも、シャードの CSV を集めた `report` でも同じ経路）
+fn report(rows: &[Row]) {
+    let seeds: BTreeSet<u64> = rows.iter().map(|r| r.seed).collect();
+    let points: BTreeSet<(String, u32)> = rows.iter().map(|r| r.point_key()).collect();
+    println!("\n=== P0-4 w* 監査（issue #31）===");
+    println!(
+        "決定点 {} / seed {} / unit {}",
+        points.len(),
+        seeds.len(),
+        rows.len()
+    );
+    let pct = |v: &[bool]| -> String {
+        if v.is_empty() {
+            return "-".into();
+        }
+        let n = v.iter().filter(|b| **b).count();
+        format!("{n}/{} ({:.1}%)", v.len(), 100.0 * n as f64 / v.len() as f64)
+    };
+    for (tag, st) in summarize(rows) {
+        let median = if st.k_values.is_empty() {
             "-".to_string()
         } else {
-            format!("{:.2}", k_values[k_values.len() / 2])
+            format!("{:.2}", st.k_values[st.k_values.len() / 2])
         };
-        let mean_delta = if p_king_delta.is_empty() {
+        let mean_delta = if st.p_king_delta.is_empty() {
             "-".to_string()
         } else {
             format!(
                 "{:+.3}",
-                p_king_delta.iter().sum::<f64>() / p_king_delta.len() as f64
+                st.p_king_delta.iter().sum::<f64>() / st.p_king_delta.len() as f64
             )
         };
-        println!("{tag}: 決定点 {}", idxs.len());
-        println!("  初回ランキングの首位が実戦の最初の反則と一致: {}", pct(&reproduced));
+        println!("{tag}: 決定点 {}", st.points);
+        println!(
+            "  初回ランキングの首位が実戦の最初の反則と一致: {}",
+            pct(&st.reproduced)
+        );
         println!(
             "  現行の首位が既に玉の手（価格の出番なし・門の分母から外す）: {}",
-            pct(&already_king)
+            pct(&st.already_king)
         );
         println!(
-            "  **k* ≤ 3 で玉の手が首位になる: {}**（首位が玉以外の unit のみ。k* の中央値 {median} / kmax までに反転しない unit {unreverted}）",
-            pct(&k3)
+            "  **k* ≤ 3 で玉の手が首位になる: {}**（首位が玉以外の unit のみ。k* の中央値 {median} / kmax までに反転しない unit {}）",
+            pct(&st.k3),
+            st.unreverted,
         );
-        println!("  **反則注入後の実再決定が静的な次点と違う: {}**", pct(&changed));
+        println!("  **反則注入後の実再決定が静的な次点と違う: {}**", pct(&st.changed));
         println!("  最良の玉の手の p_legal の変化（反則注入の前後）: {mean_delta}");
     }
     println!(
         "\n中止条件（issue #31）: **k* ≤ 3 で反転する決定点が 20% 未満 かつ\n\
          反則注入後に首位が変わる決定点も 20% 未満**なら α / β の枝は中止"
     );
+}
+
+/// シャードの CSV を集約する（`check_probe report [--shards N] <csv...>`）。
+///
+/// **欠けたシャードを黙って少ない分母で報告しない**（issue #19 / #28 の教訓）。
+/// meta が食い違う CSV（別の seed 数・型・予算・config・コード版・記録集合）も
+/// 混ぜない。
+fn run_report(args: &[String]) {
+    let mut want_shards: Option<usize> = None;
+    let mut paths: Vec<String> = vec![];
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--shards" => {
+                want_shards = Some(
+                    args.get(i + 1)
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or_else(|| die("--shards には数値が必要です")),
+                );
+                i += 2;
+            }
+            s if s.starts_with("--") => die(&format!("未知のオプション: {s}")),
+            s => {
+                paths.push(s.to_string());
+                i += 1;
+            }
+        }
+    }
+    if paths.is_empty() {
+        die("CSV を指定してください");
+    }
+    let mut rows: Vec<Row> = vec![];
+    let mut metas: Vec<serde_json::Value> = vec![];
+    for path in &paths {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| die(&format!("{path} を読めません: {e}")));
+        let mut lines = text.lines();
+        let meta: serde_json::Value = lines
+            .next()
+            .and_then(|l| l.strip_prefix("#meta "))
+            .and_then(|j| serde_json::from_str(j).ok())
+            .unwrap_or_else(|| die(&format!("{path}: meta 行がありません（schema 0 の CSV）")));
+        if meta["schema"].as_u64() != Some(u64::from(ROW_SCHEMA)) {
+            die(&format!(
+                "{path}: schema {} は集計できません（現行 {ROW_SCHEMA}）",
+                meta["schema"]
+            ));
+        }
+        let header = lines.next().unwrap_or_default();
+        let cols: Vec<&str> = header.split(',').collect();
+        let idx = |name: &str| -> usize {
+            cols.iter()
+                .position(|c| *c == name)
+                .unwrap_or_else(|| die(&format!("{path}: 列 {name} がありません")))
+        };
+        let (i_game, i_mn, i_type, i_seed, i_king, i_k, i_ch, i_match, i_pk, i_pka) = (
+            idx("game"),
+            idx("move_number"),
+            idx("type"),
+            idx("seed"),
+            idx("top1_is_king"),
+            idx("k_star"),
+            idx("changed"),
+            idx("matches_record"),
+            idx("p_king"),
+            idx("p_king_after"),
+        );
+        for line in lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let f: Vec<&str> = line.split(',').collect();
+            if f.len() != cols.len() {
+                die(&format!("{path}: 列数が合わない行があります"));
+            }
+            rows.push(Row {
+                game: f[i_game].to_string(),
+                move_number: f[i_mn].parse().unwrap_or(0),
+                type_tag: f[i_type].to_string(),
+                seed: f[i_seed].parse().unwrap_or(0),
+                top1_is_king: f[i_king] == "1",
+                k_star: f[i_k].parse().ok(),
+                changed: match f[i_ch] {
+                    "1" => Some(true),
+                    "0" => Some(false),
+                    _ => None,
+                },
+                matches_record: f[i_match] == "1",
+                p_king: f[i_pk].parse().unwrap_or(f64::NAN),
+                p_king_after: f[i_pka].parse().ok(),
+            });
+        }
+        metas.push(meta);
+    }
+    // 実験キーの一致（shard 番号だけが違うこと）
+    let key = |m: &serde_json::Value| -> String {
+        let mut m = m.clone();
+        if let Some(o) = m.as_object_mut() {
+            o.remove("shard");
+            o.remove("points");
+        }
+        m.to_string()
+    };
+    let first = key(&metas[0]);
+    for (path, m) in paths.iter().zip(&metas) {
+        if key(m) != first {
+            die(&format!(
+                "{path}: meta が他と食い違います（別の実験を混ぜている）\n  {}\n  {first}",
+                key(m)
+            ));
+        }
+    }
+    let shards: BTreeSet<u64> = metas.iter().filter_map(|m| m["shard"].as_u64()).collect();
+    let total = metas[0]["shards"].as_u64().unwrap_or(1) as usize;
+    let total = want_shards.unwrap_or(total);
+    if shards.len() != total || shards.iter().max().map_or(0, |m| *m as usize + 1) != total {
+        die(&format!(
+            "シャードが欠けています（{:?} / 全 {total}）: 決定点の分母が狂うので中止",
+            shards
+        ));
+    }
+    // 同じ (決定点, seed) が2度出てくる = シャードの重複
+    let mut seen = HashSet::new();
+    for r in &rows {
+        if !seen.insert((r.game.clone(), r.move_number, r.seed)) {
+            die("同じ (決定点, seed) が重複しています（シャードの割り当てがおかしい）");
+        }
+    }
+    println!("CSV {} 本 / シャード {total} / 行 {}", paths.len(), rows.len());
+    println!("meta {}", first);
+    report(&rows);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(game: &str, mn: u32, seed: u64, king: bool, k: Option<f64>) -> Row {
+        Row {
+            game: game.into(),
+            move_number: mn,
+            type_tag: "nonking_king".into(),
+            seed,
+            top1_is_king: king,
+            k_star: k,
+            changed: Some(false),
+            matches_record: true,
+            p_king: 0.8,
+            p_king_after: Some(0.9),
+        }
+    }
+
+    #[test]
+    fn 首位が既に玉の手の決定点は門の分母から外れる() {
+        let rows = vec![
+            // 決定点A: 3 seed とも首位が既に玉の手 → k3 には入らない
+            row("a", 10, 0, true, Some(1.0)),
+            row("a", 10, 1, true, Some(1.0)),
+            row("a", 10, 2, true, Some(1.0)),
+            // 決定点B: 首位はプローブで、k* ≤ 3 で反転する
+            row("b", 20, 0, false, Some(2.0)),
+            row("b", 20, 1, false, Some(2.5)),
+            row("b", 20, 2, false, None),
+        ];
+        let st = summarize(&rows);
+        let total = &st.iter().find(|(t, _)| t == "**合計**").unwrap().1;
+        assert_eq!(total.points, 2);
+        // 分母は決定点B だけ（A は「価格の出番なし」に数える）
+        assert_eq!(total.k3, vec![true]);
+        assert_eq!(total.already_king, vec![true, false]);
+        assert_eq!(total.unreverted, 1);
+    }
+
+    #[test]
+    fn seedは独立標本として数えず決定点ごとに多数決を取る() {
+        // 3 seed 中 1 つだけ反転 → その決定点は「反転しない」
+        let rows = vec![
+            row("a", 10, 0, false, Some(2.0)),
+            row("a", 10, 1, false, Some(9.0)),
+            row("a", 10, 2, false, None),
+        ];
+        let st = summarize(&rows);
+        let total = &st.iter().find(|(t, _)| t == "**合計**").unwrap().1;
+        assert_eq!(total.k3, vec![false]);
+        assert_eq!(majority(&[true, true, false]), Some(true));
+        assert_eq!(majority(&[true, false]), Some(false), "同数は「反転しない」側");
+        assert_eq!(majority(&[]), None);
+    }
 }

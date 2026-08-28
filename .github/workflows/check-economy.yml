@@ -48,6 +48,10 @@ on:
         description: "P0-4 の対象の型（P0-1 の表のタグ。既定は最大の2つ）"
         required: false
         default: "nonking_king,nonking_nonking"
+      probe_shards:
+        description: "P0-4 の分割数（元対局単位で割る。欠けたら aggregate が失敗する）"
+        required: false
+        default: "4"
   push:
     paths:
       - ".github/ci/check-economy.request.json"
@@ -63,6 +67,8 @@ jobs:
       probe_seeds: ${{ steps.split.outputs.probe_seeds }}
       probe_budget_ms: ${{ steps.split.outputs.probe_budget_ms }}
       probe_types: ${{ steps.split.outputs.probe_types }}
+      probe_shards: ${{ steps.split.outputs.probe_shards }}
+      probe_shard_count: ${{ steps.split.outputs.probe_shard_count }}
     steps:
       - uses: actions/checkout@v5
       - id: split
@@ -74,6 +80,7 @@ jobs:
           IN_PROBE_SEEDS: ${{ github.event.inputs.probe_seeds }}
           IN_PROBE_BUDGET: ${{ github.event.inputs.probe_budget_ms }}
           IN_PROBE_TYPES: ${{ github.event.inputs.probe_types }}
+          IN_PROBE_SHARDS: ${{ github.event.inputs.probe_shards }}
         run: |
           set -euo pipefail
           req='.github/ci/check-economy.request.json'
@@ -84,6 +91,7 @@ jobs:
             probe_seeds="${IN_PROBE_SEEDS:-3}"
             probe_budget="${IN_PROBE_BUDGET:-2000}"
             probe_types="${IN_PROBE_TYPES:-nonking_king,nonking_nonking}"
+            probe_shards="${IN_PROBE_SHARDS:-4}"
           else
             if [ ! -f "$req" ]; then
               # push の paths フィルタは削除にも一致する。計測後に $req を消す
@@ -97,6 +105,8 @@ jobs:
                 echo "probe_seeds=3"
                 echo "probe_budget_ms=2000"
                 echo "probe_types=nonking_king,nonking_nonking"
+                echo 'probe_shards=[0]'
+                echo "probe_shard_count=1"
               } >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -108,6 +118,7 @@ jobs:
             probe_seeds=$(jq -r '.probe_seeds // 3' "$req")
             probe_budget=$(jq -r '.probe_budget_ms // 2000' "$req")
             probe_types=$(jq -r 'if (.probe_types | type) == "array" then (.probe_types | join(",")) else (.probe_types // "nonking_king,nonking_nonking") end' "$req")
+            probe_shards=$(jq -r '.probe_shards // 4' "$req")
           fi
           # 記録元が無い（リポジトリの records/ を使う）ときは1ジョブだけ回す
           if [ -z "$run_id" ]; then
@@ -121,6 +132,8 @@ jobs:
             echo "probe_seeds=$probe_seeds"
             echo "probe_budget_ms=$probe_budget"
             echo "probe_types=$probe_types"
+            echo "probe_shards=$(jq -n -c "[range(0; ${probe_shards})]")"
+            echo "probe_shard_count=$probe_shards"
           } >> "$GITHUB_OUTPUT"
 
   analyze:
@@ -181,6 +194,7 @@ jobs:
       fail-fast: false
       matrix:
         opponent: ${{ fromJSON(needs.plan.outputs.opponents) }}
+        shard: ${{ fromJSON(needs.plan.outputs.probe_shards) }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
@@ -207,12 +221,52 @@ jobs:
           [ -d "$src" ] || src=records
           cargo build --release --bin check_probe
           jobs=$(( $(nproc) - 1 )); [ "$jobs" -ge 1 ] || jobs=1
+          n=${{ needs.plan.outputs.probe_shard_count }}
           ./target/release/check_probe \
             --seeds "${{ needs.plan.outputs.probe_seeds }}" \
             --types "${{ needs.plan.outputs.probe_types }}" \
             --jobs "$jobs" \
-            --out "check-probe-${{ matrix.opponent }}.csv" \
-            "$src" | tee "check-probe-${{ matrix.opponent }}.txt"
+            --shard "${{ matrix.shard }}/$n" \
+            --out "check-probe-${{ matrix.opponent }}-s${{ matrix.shard }}.csv" \
+            "$src" | tee "check-probe-${{ matrix.opponent }}-s${{ matrix.shard }}.txt"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: check-probe-${{ matrix.opponent }}-s${{ matrix.shard }}
+          path: |
+            check-probe-${{ matrix.opponent }}-s${{ matrix.shard }}.csv
+            check-probe-${{ matrix.opponent }}-s${{ matrix.shard }}.txt
+
+  probe-aggregate:
+    needs: [plan, probe]
+    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_probe == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        opponent: ${{ fromJSON(needs.plan.outputs.opponents) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: check-probe-${{ matrix.opponent }}-s*
+          path: shards
+      - name: Report
+        run: |
+          set -euo pipefail
+          # **欠けたシャードを黙って少ない分母で報告しない**（issue #19 / #28 の
+          # 教訓）。check_probe report 自身も meta の shard 番号で検査するが、
+          # 本数の食い違いはここでも止める
+          n=${{ needs.plan.outputs.probe_shard_count }}
+          found=$(find shards -name 'check-probe-*.csv' | wc -l)
+          if [ "$found" -ne "$n" ]; then
+            echo "シャードが欠けています（$found / $n）: 決定点の分母が狂うので中止" >&2
+            exit 1
+          fi
+          cargo run --release --bin check_probe -- report --shards "$n" \
+            $(find shards -name '*.csv' | sort) \
+            | tee "check-probe-${{ matrix.opponent }}.txt"
           {
             echo "## P0-4 w* 監査（相手 ${{ matrix.opponent }}）"
             echo '```'
@@ -221,7 +275,7 @@ jobs:
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v6
         with:
-          name: check-probe-${{ matrix.opponent }}
+          name: check-probe-combined-${{ matrix.opponent }}
           path: |
-            check-probe-${{ matrix.opponent }}.csv
             check-probe-${{ matrix.opponent }}.txt
+            shards/

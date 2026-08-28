@@ -135,7 +135,12 @@ gh workflow run check-economy.yml -f arena_run_id=<Arena実行ID> \
 arena.yml と check-economy.yml の両方のフィルタを直すこと**）。
 
 P0-4 は**粒子を回すので P0-1〜P0-3 の数十倍かかる**ため既定では走らない
-（`run_probe: true` で有効化）。思考予算は**記録を取ったアリーナと揃える**こと
+（`run_probe: true` で有効化）。元対局単位で `probe_shards` 個に割り、
+`probe-aggregate` が `check_probe report --shards N` で合算する。
+**シャードが欠けたら失敗させる**（決定点の分母が狂うため）。CSV の1行目の
+`#meta` に seed 数・型・予算・config 指紋・コード版（`source_fingerprint`）・
+記録集合の指紋を書き、`report` が「同じ実験の独立サンプルか」を検査する
+（別の実験を混ぜた集計・重複シャードは失敗）。思考予算は**記録を取ったアリーナと揃える**こと
 （予算が違うと粒子数が変わり、「その決定点で実際に見えていたランキング」では
 なくなる）。ローカルなら:
 
