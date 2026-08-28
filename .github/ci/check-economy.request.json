@@ -1,13 +1,13 @@
 {
-  "_comment": "PR #33 レビュー [P1] で近似通過条件の統計量を直した（符号付き平均 → unit ごとの絶対誤差）ので、run 33171943105 の P0-5 シャード artifact を**集計し直すだけ**。対局もランキングも回さない。shards は元の run と同じ 6",
+  "_comment": "issue #31 P0-7 の測り直し。PR #33 レビュー [P1] で対照と処置の並走交絡を直した（1 unit = 1 (決定点, seed) を1つの worker が背中合わせに走らせ、偶数 seed の内側で AB/BA を反転）ので、schema 1 の run 33171943105 の数字は撤回して発見セット（run 32697854659、match_seed=20260815）で取り直す。条件は撤回した測定と同じ 2 seed / 700ms / 1局2点で、変えたのは実行順の契約だけ",
   "arena_run_id": "32697854659",
   "opponents": ["estimator_v13", "estimator_v14"],
-  "reaggregate_run_id": "33171943105",
   "run_probe": false,
-  "run_policy": true,
-  "policy_seeds": 4,
-  "policy_budget_ms": 2000,
-  "policy_shards": 6,
-  "run_price": false,
+  "run_policy": false,
+  "run_price": true,
+  "price_seeds": 2,
+  "price_budget_ms": 700,
+  "price_per_game": 2,
+  "price_shards": 8,
   "run_continue": false
 }
