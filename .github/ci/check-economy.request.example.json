@@ -1,5 +1,9 @@
 {
-  "_comment": "このファイルを .github/ci/check-economy.request.json という名前でコミットして push すると Check economy（issue #31 P0-1〜P0-3）が起動する。キーは workflow_dispatch の inputs と同じ。計測後に消す push は全ジョブがスキップされる",
+  "_comment": "このファイルを .github/ci/check-economy.request.json という名前でコミットして push すると Check economy（issue #31 P0-1〜P0-4）が起動する。キーは workflow_dispatch の inputs と同じ。計測後に消す push は全ジョブがスキップされる",
   "arena_run_id": "32697854659",
-  "opponents": ["estimator_v13", "estimator_v14"]
+  "opponents": ["estimator_v13", "estimator_v14"],
+  "run_probe": true,
+  "probe_seeds": 3,
+  "probe_budget_ms": 2000,
+  "probe_types": "nonking_king,nonking_nonking"
 }

@@ -8,6 +8,9 @@ name: Check economy
 #   - P0-2 手種別・順番別の p_legal 較正と、捕獲試みの方向つき較正誤差
 #     （**元対局 cluster bootstrap CI**。Brier では H1 と H3 を分けられない）
 #   - P0-3 ソルバー方策の破滅手番（8反則以上）の原因
+#   - P0-4 w\* 監査（`bin/check_probe`。**粒子を回すのでここだけ重い**）:
+#     玉の手が首位になる反則コスト倍率 k\* と、実戦の反則列を食わせた
+#     **実再決定**が静的な次点と違う手を選ぶか
 #
 # **相手ごとに別ジョブで回す**のが要点（`opponents`）: 判定は「v13 / v14 の
 # 両相手で同方向」なので、両者の記録を混ぜて1つの数字にしてはいけない。
@@ -29,6 +32,22 @@ on:
         description: "相手ごとに分けて集計する（空白区切り。artifact 名 arena-records-<相手>-* を引く）。records/ を使うときは無視される"
         required: false
         default: "estimator_v13 estimator_v14"
+      run_probe:
+        description: "P0-4（w* 監査）も走らせるか。粒子を回すので P0-1〜P0-3 の数十倍かかる"
+        required: false
+        default: "false"
+      probe_seeds:
+        description: "P0-4 の決定点あたり seed 数（seed は独立標本として数えず、決定点ごとに多数決を取る）"
+        required: false
+        default: "3"
+      probe_budget_ms:
+        description: "P0-4 の思考予算（ms。記録を取ったアリーナと揃えること）"
+        required: false
+        default: "2000"
+      probe_types:
+        description: "P0-4 の対象の型（P0-1 の表のタグ。既定は最大の2つ）"
+        required: false
+        default: "nonking_king,nonking_nonking"
   push:
     paths:
       - ".github/ci/check-economy.request.json"
@@ -40,6 +59,10 @@ jobs:
       skip: ${{ steps.split.outputs.skip }}
       arena_run_id: ${{ steps.split.outputs.arena_run_id }}
       opponents: ${{ steps.split.outputs.opponents }}
+      run_probe: ${{ steps.split.outputs.run_probe }}
+      probe_seeds: ${{ steps.split.outputs.probe_seeds }}
+      probe_budget_ms: ${{ steps.split.outputs.probe_budget_ms }}
+      probe_types: ${{ steps.split.outputs.probe_types }}
     steps:
       - uses: actions/checkout@v5
       - id: split
@@ -47,12 +70,20 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           IN_RUN_ID: ${{ github.event.inputs.arena_run_id }}
           IN_OPPONENTS: ${{ github.event.inputs.opponents }}
+          IN_RUN_PROBE: ${{ github.event.inputs.run_probe }}
+          IN_PROBE_SEEDS: ${{ github.event.inputs.probe_seeds }}
+          IN_PROBE_BUDGET: ${{ github.event.inputs.probe_budget_ms }}
+          IN_PROBE_TYPES: ${{ github.event.inputs.probe_types }}
         run: |
           set -euo pipefail
           req='.github/ci/check-economy.request.json'
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             run_id="${IN_RUN_ID:-}"
             opponents="${IN_OPPONENTS:-estimator_v13 estimator_v14}"
+            run_probe="${IN_RUN_PROBE:-false}"
+            probe_seeds="${IN_PROBE_SEEDS:-3}"
+            probe_budget="${IN_PROBE_BUDGET:-2000}"
+            probe_types="${IN_PROBE_TYPES:-nonking_king,nonking_nonking}"
           else
             if [ ! -f "$req" ]; then
               # push の paths フィルタは削除にも一致する。計測後に $req を消す
@@ -62,11 +93,21 @@ jobs:
                 echo "skip=true"
                 echo "arena_run_id="
                 echo 'opponents=[""]'
+                echo "run_probe=false"
+                echo "probe_seeds=3"
+                echo "probe_budget_ms=2000"
+                echo "probe_types=nonking_king,nonking_nonking"
               } >> "$GITHUB_OUTPUT"
               exit 0
             fi
             run_id=$(jq -r '.arena_run_id // ""' "$req")
             opponents=$(jq -r 'if (.opponents | type) == "array" then (.opponents | join(" ")) else (.opponents // "estimator_v13 estimator_v14") end' "$req")
+            # `// false` は false も既定値扱いになる（jq の `//` は null と false を
+            # 同じに扱う）ので has() で「キーがあるか」を見る
+            run_probe=$(jq -r 'if has("run_probe") then .run_probe else false end | tostring' "$req")
+            probe_seeds=$(jq -r '.probe_seeds // 3' "$req")
+            probe_budget=$(jq -r '.probe_budget_ms // 2000' "$req")
+            probe_types=$(jq -r 'if (.probe_types | type) == "array" then (.probe_types | join(",")) else (.probe_types // "nonking_king,nonking_nonking") end' "$req")
           fi
           # 記録元が無い（リポジトリの records/ を使う）ときは1ジョブだけ回す
           if [ -z "$run_id" ]; then
@@ -76,6 +117,10 @@ jobs:
             echo "skip=false"
             echo "arena_run_id=$run_id"
             echo "opponents=$(jq -n -c --arg s "$opponents" 'if $s == "" then [""] else ($s | split(" ") | map(select(. != ""))) end')"
+            echo "run_probe=$run_probe"
+            echo "probe_seeds=$probe_seeds"
+            echo "probe_budget_ms=$probe_budget"
+            echo "probe_types=$probe_types"
           } >> "$GITHUB_OUTPUT"
 
   analyze:
@@ -128,3 +173,55 @@ jobs:
           path: |
             check-economy.txt
             analyze-full.txt
+
+  probe:
+    needs: plan
+    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_probe == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        opponent: ${{ fromJSON(needs.plan.outputs.opponents) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Download arena records
+        if: needs.plan.outputs.arena_run_id != ''
+        uses: actions/download-artifact@v7
+        with:
+          pattern: arena-records-${{ matrix.opponent }}-*
+          path: records-in
+          run-id: ${{ needs.plan.outputs.arena_run_id }}
+          github-token: ${{ github.token }}
+      - name: w* audit
+        env:
+          # **思考予算はプロセス env**（粒子構築と候補評価で同じ scale を使う）。
+          # 記録を取ったアリーナと揃えること: 予算が違うと粒子数が変わり、
+          # 「その決定点で実際に見えていたランキング」ではなくなる
+          TSUITATE_THINK_BUDGET_MS: ${{ needs.plan.outputs.probe_budget_ms }}
+        run: |
+          set -euo pipefail
+          src=records-in
+          [ -d "$src" ] || src=records
+          cargo build --release --bin check_probe
+          jobs=$(( $(nproc) - 1 )); [ "$jobs" -ge 1 ] || jobs=1
+          ./target/release/check_probe \
+            --seeds "${{ needs.plan.outputs.probe_seeds }}" \
+            --types "${{ needs.plan.outputs.probe_types }}" \
+            --jobs "$jobs" \
+            --out "check-probe-${{ matrix.opponent }}.csv" \
+            "$src" | tee "check-probe-${{ matrix.opponent }}.txt"
+          {
+            echo "## P0-4 w* 監査（相手 ${{ matrix.opponent }}）"
+            echo '```'
+            cat "check-probe-${{ matrix.opponent }}.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: check-probe-${{ matrix.opponent }}
+          path: |
+            check-probe-${{ matrix.opponent }}.csv
+            check-probe-${{ matrix.opponent }}.txt

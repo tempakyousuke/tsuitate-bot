@@ -16,7 +16,7 @@ use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{ClockState, Color, FoulCounts, GameStatus, PlayerView, Role};
 use crate::board::Coord;
 use crate::shogi::{Position, ShogiMove, parse_usi};
-use crate::strategy::candidate_moves;
+use crate::strategy::{CandidateScore, candidate_moves};
 
 /// 観測ログの復元から PlayerView 相当を作る（ソルバーの再現用）。
 ///
@@ -305,32 +305,16 @@ pub fn check_turns(
         let mut hypotheses_at_entry = 0;
         let mut true_hyp_share = None;
         let mut hyp_entropy = None;
-        let truth_checkers = true_checkers(truth, bot);
         if let Some(mut solver) = CheckSolver::new(&view, &[], &[], &log) {
             for (usi, mv) in &entry_candidates {
                 let p = solver.resolve_probability(mv);
                 p_max_at_entry = p_max_at_entry.max(p);
                 entry_rank.push((usi.clone(), p));
             }
-            let hyps = solver.hypotheses_debug();
-            hypotheses_at_entry = hyps.len();
-            let total: f64 = hyps.iter().map(|(_, _, w)| w.max(0.0)).sum();
-            if total > 0.0 {
-                let hit: f64 = hyps
-                    .iter()
-                    .filter(|(hs, hr, _)| truth_checkers.iter().any(|(s, r)| s == hs && r == hr))
-                    .map(|(_, _, w)| w.max(0.0))
-                    .sum();
-                true_hyp_share = Some(hit / total);
-                let h: f64 = hyps
-                    .iter()
-                    .map(|(_, _, w)| w.max(0.0) / total)
-                    .filter(|q| *q > 0.0)
-                    .map(|q| -q * q.ln())
-                    .sum();
-                let max_h = (hyps.len().max(2) as f64).ln();
-                hyp_entropy = Some(h / max_h);
-            }
+            hypotheses_at_entry = solver.hypotheses_debug().len();
+            let (share, entropy) = hypothesis_stats(Some(&solver), truth, bot);
+            true_hyp_share = share;
+            hyp_entropy = entropy;
         }
         // 同点は USI の辞書順で割る（安定ソートに任せると生成順が順位に残る）
         entry_rank.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
@@ -342,7 +326,7 @@ pub fn check_turns(
             let Some(mv) = parse_usi(usi) else { continue };
             let mut solver = CheckSolver::new(&view, &[], &fouls_so_far, &log);
             let solver_p = solver.as_mut().map_or(0.5, |s| s.resolve_probability(&mv));
-            let kind = classify_kind(&mv, &view, solver.as_mut());
+            let kind = classify_move_kind(&mv, &view, solver.as_mut());
             let to = match mv {
                 ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
             };
@@ -433,8 +417,10 @@ pub fn decision_groups(observations: &[Observation]) -> Vec<Vec<(u32, usize, Str
     out
 }
 
-/// 手種の判定。捕獲試みかどうかは**ソルバーの仮説**で決める（bot の意図）
-fn classify_kind(
+/// 手種の判定。捕獲試みかどうかは**ソルバーの仮説**で決める（bot の意図）。
+///
+/// P0-4 の監査（`bin/check_probe`）も同じ規約で型を分けるので公開する。
+pub fn classify_move_kind(
     mv: &ShogiMove,
     view: &PlayerView,
     solver: Option<&mut CheckSolver>,
@@ -455,6 +441,42 @@ fn classify_kind(
             }
         }
     }
+}
+
+/// 王手駒仮説の質: `(真の王手駒（マス・駒種とも一致）に載っている重みシェア,
+/// 重みの正規化エントロピー)`。
+///
+/// **「知らない（希釈）」と「知っていて払う」を分ける量**。シェアが低く
+/// エントロピーが 1 に近いほど、仮説集合は「どの駒が王手しているか」を
+/// ほとんど知らない（正しい捕獲の p まで薄まる = kakutori の構図）。
+pub fn hypothesis_stats(
+    solver: Option<&CheckSolver>,
+    truth: &Position,
+    bot: Color,
+) -> (Option<f64>, Option<f64>) {
+    let Some(solver) = solver else {
+        return (None, None);
+    };
+    let hyps = solver.hypotheses_debug();
+    let total: f64 = hyps.iter().map(|(_, _, w)| w.max(0.0)).sum();
+    if total <= 0.0 {
+        return (None, None);
+    }
+    let checkers = true_checkers(truth, bot);
+    let hit: f64 = hyps
+        .iter()
+        .filter(|(hs, hr, _)| checkers.iter().any(|(s, r)| s == hs && r == hr))
+        .map(|(_, _, w)| w.max(0.0))
+        .sum();
+    let h: f64 = hyps
+        .iter()
+        .map(|(_, _, w)| w.max(0.0) / total)
+        .filter(|q| *q > 0.0)
+        .map(|q| -q * q.ln())
+        .sum();
+    // 一様分布を 1 に正規化する（仮説の本数は局面ごとに違う）
+    let max_h = (hyps.len().max(2) as f64).ln();
+    (Some(hit / total), Some(h / max_h))
 }
 
 /// 反則の原因（**真実**から見た理由）。P0-3 の破滅手番の内訳に使う
@@ -515,6 +537,82 @@ pub fn classify_check_foul(truth: &Position, bot: Color, mv: &ShogiMove) -> Chec
     } else {
         CheckFoulReason::HiddenAttack
     }
+}
+
+/// 反則コストを動かしたときの並べ替えを再計算するための最小の入力
+/// （issue #31 の P0-4 の k\* 監査と、P1-α の再計算が**同じ式**を使う）。
+///
+/// `score = min(p·G, G) − (1−p)·c + foul_probe + adjust` なので、コストを
+/// `c → c_k` へ変えた効果は `−(1−p)(c_k − c)` の付け替えで厳密に出る
+/// （gain も p_legal も再計算しない = α が変えるのは価格だけ）。
+#[derive(Clone, Debug)]
+pub struct PricedMove {
+    pub usi: String,
+    pub p_legal: f64,
+    /// **乱数を除いた**現行スコア（`CandidateScore::score − tiebreak`）
+    pub det_score: f64,
+    /// その決定で実際に使われた反則コスト（床適用後）
+    pub foul_cost: f64,
+    pub is_king: bool,
+}
+
+impl PricedMove {
+    /// 反則コストを `cost` に置き換えたときの決定的スコア
+    pub fn score_at(&self, cost: f64) -> f64 {
+        self.det_score - (1.0 - self.p_legal) * (cost - self.foul_cost)
+    }
+}
+
+/// `ranking` を価格再計算の形へ落とす。順位は**乱数を除いたスコア**で付け直し、
+/// 同点は USI の辞書順で割る（安定ソートに任せると生成順が順位に残る。
+/// issue #24 の教訓②）。
+pub fn priced_moves(ranking: &[CandidateScore], king: Option<Coord>) -> Vec<PricedMove> {
+    let mut out: Vec<PricedMove> = ranking
+        .iter()
+        .map(|c| PricedMove {
+            usi: c.usi.clone(),
+            p_legal: c.p_legal,
+            det_score: c.score - c.tiebreak,
+            foul_cost: c.foul_cost,
+            is_king: is_king_move(&c.usi, king),
+        })
+        .collect();
+    out.sort_by(|a, b| b.det_score.total_cmp(&a.det_score).then_with(|| a.usi.cmp(&b.usi)));
+    out
+}
+
+/// その USI が玉の移動か（打ちと他の駒の移動は false）
+pub fn is_king_move(usi: &str, king: Option<Coord>) -> bool {
+    match parse_usi(usi) {
+        Some(ShogiMove::Board { from, .. }) => Some(from) == king,
+        _ => false,
+    }
+}
+
+/// コスト `cost` での首位（同点は USI の辞書順）
+pub fn argmax_at(moves: &[PricedMove], cost: f64) -> Option<&PricedMove> {
+    moves.iter().min_by(|a, b| {
+        b.score_at(cost)
+            .total_cmp(&a.score_at(cost))
+            .then_with(|| a.usi.cmp(&b.usi))
+    })
+}
+
+/// **k\***: 玉の手が首位になる最小の反則コスト倍率（`kmax` までに反転しなければ None）。
+///
+/// 価格は玉の手の (1−p) 側にも効くので「score 差 ÷ プローブの傾斜」では出ない。
+/// P1-α と同じ `check_cost = max(k × base, 床)` で**全候補を再計算して交点を探す**
+/// （床の折れをそのまま扱えるように細かい格子で argmax を追う）。
+pub fn k_star(moves: &[PricedMove], base: f64, floor: f64, kmax: f64) -> Option<f64> {
+    const STEP: f64 = 0.02;
+    let mut k = 1.0;
+    while k <= kmax + 1e-9 {
+        if argmax_at(moves, (k * base).max(floor))?.is_king {
+            return Some(k);
+        }
+        k += STEP;
+    }
+    None
 }
 
 /// 元対局単位の cluster bootstrap（percentile CI）。
@@ -704,6 +802,39 @@ mod tests {
             classify_check_foul(&hid, Color::Sente, &parse_usi("5i4i").unwrap()),
             CheckFoulReason::HiddenAttack
         );
+    }
+
+    fn priced(usi: &str, p: f64, det: f64, king: bool) -> PricedMove {
+        PricedMove { usi: usi.into(), p_legal: p, det_score: det, foul_cost: 1.0, is_king: king }
+    }
+
+    #[test]
+    fn k_starは価格が両側に効くことを織り込む() {
+        // プローブ: gain が高いが合法確率 0.4 / 玉の手: 低いが 0.9。
+        // 価格を上げるとプローブのほうが速く沈むので、どこかで逆転する
+        let moves = vec![priced("5f5e", 0.4, 3.0, false), priced("5i4h", 0.9, 2.0, true)];
+        assert!(!argmax_at(&moves, 1.0).unwrap().is_king, "現行価格ではプローブが首位");
+        let k = k_star(&moves, 1.0, 1.0, 30.0).expect("有限の k で反転する");
+        // 交点は (3.0−2.0)/((1−0.4)−(1−0.9)) = 2.0 → コスト 1.0 の 3 倍
+        assert!((k - 3.0).abs() < 0.05, "k* = {k}");
+        assert!(argmax_at(&moves, k).unwrap().is_king);
+        assert!(!argmax_at(&moves, (k - 0.1).max(1.0)).unwrap().is_king);
+    }
+
+    #[test]
+    fn 合法確率が同じか低い玉の手は価格では浮かない() {
+        // 玉の手のほうが p が低ければ、価格を上げるほど差は開く（分母が 0 以下）
+        let moves = vec![priced("5f5e", 0.9, 3.0, false), priced("5i4h", 0.4, 2.0, true)];
+        assert_eq!(k_star(&moves, 1.0, 1.0, 30.0), None);
+    }
+
+    #[test]
+    fn 床は倍率より優先される() {
+        // 残り1回のガード床（60）が効いている決定では、k=1 でもコストは床
+        let moves = vec![priced("5f5e", 0.4, 3.0, false), priced("5i4h", 0.9, 2.0, true)];
+        // 床 60 なら k=1 の時点で既に玉の手が首位（= 反転に価格の上乗せは要らない）
+        assert!(argmax_at(&moves, 60.0).unwrap().is_king);
+        assert_eq!(k_star(&moves, 1.0, 60.0, 30.0), Some(1.0));
     }
 
     #[test]

@@ -664,6 +664,28 @@
   候補生成カバー率 99% なので、**律速は受けの検出でも候補生成でもなく「受けた後」**
   （オラクルの継続は反則負けが 56〜63% = baseline 13〜17% へ増える）。
   P0-3 の数字も run ごとに数ポイント動くので小数第2位は読まない
+- `TSUITATE_THINK_BUDGET_MS=2000 cargo run --release --bin check_probe -- [--seeds 3]
+  [--jobs N] [--limit N] [--shard i/n] [--kmax 30] [--opponent estimator_v14]
+  [--types nonking_king,nonking_nonking] [--out data/check_probe.csv] <records...>` —
+  **王手中の反則経済 P0-4: w\* 監査**（issue #31、2026-08-28）。「浮かせたい候補が
+  そもそも在るのか」を方策を変える前に測る（`TSUITATE_PROBE_AUDIT` と同じ考え方）。
+  **runtime には何も入らない**。王手中で反則した手番ごとに、①手番開始時（反則0）
+  ②実戦の反則列を食った後（実再決定）の2つのランキングを取り、
+  - **k\*** = 玉の手が首位になる最小の反則コスト倍率。価格は玉の手の (1−p) 側にも
+    効くので score 差 ÷ 傾斜では出ない。**P1-α と同じ `max(k × base, 床)` で
+    全候補を再計算して交点を探す**（`check_economy::k_star`。コストの付け替えは
+    `−(1−p)(c_k − c)` で厳密＝ gain も p_legal も再計算しない）。順位は乱数を
+    除いたスコアで付け、同点は USI の辞書順
+  - **反則注入後の実再決定が「初回ランキングの次点」と違う手を選ぶか**（H2。
+    現行 `combine_score` が暗黙に置く「次善手固定」の仮定そのものとの比較）
+  - 監査の健全性として**初回ランキングの首位が実戦の最初の反則と一致した率**も出す
+    （予算やコードが記録と違うと下がる。判定の前にここを見る）
+  **門の分母は「首位が玉以外」の unit だけ**（再現で首位が既に玉の手なら価格の
+  出番がない）。seed は独立標本として数えず決定点ごとに多数決。
+  中止条件は「k\* ≤ 3 で反転する決定点が 20% 未満 **かつ** 反則注入後に首位が
+  変わる決定点も 20% 未満」→ α / β の枝は中止。
+  **思考予算は記録を取ったアリーナと揃える**（違うと粒子数が変わり「その決定点で
+  実際に見えていたランキング」でなくなる）
 - **王手中の反則経済の CI**（`.github/workflows/check-economy.yml`、**通常のコード
   push では走らない**）: `gh workflow run check-economy.yml -f arena_run_id=<Arena実行ID>
   -f opponents="estimator_v13 estimator_v14"`、`gh` が無ければ
@@ -671,7 +693,9 @@
   スキップされる）。**相手ごとに別ジョブで集計する**のが要点で、判定が
   「v13 / v14 の両相手で同方向」なので両者の記録を混ぜてはいけない。
   同じ集計行は `arena.yml` のサマリーにも出る（**analyze に集計行を足したら
-  arena.yml と check-economy.yml の両方のフィルタを直す**）
+  arena.yml と check-economy.yml の両方のフィルタを直す**）。
+  **P0-4（`bin/check_probe`）は粒子を回すので既定では走らない**（`run_probe: true`
+  で有効化。P0-1〜P0-3 の数十倍かかる）
 - `cargo run --release --bin mine_check -- [--min-fouls N] [--emit <dir> <接頭辞>] <records/*.jsonl...>`
   — **被王手の決定点の採掘**（2026-08-19）。記録の真実を再生し bot 側の被王手
   決定点から「反則を N 回以上した」（foul）と「王手駒を玉以外で取れたのに
