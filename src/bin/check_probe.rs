@@ -31,14 +31,16 @@ use tsuitate_bot::check_economy::{
 };
 use tsuitate_bot::observation::{Observation, ObservationLog};
 use tsuitate_bot::protocol::Color;
-use tsuitate_bot::scenario_core::{Replayed, clone_log, make_view, ranking_one_with, side_idx};
+use tsuitate_bot::scenario_core::{Replayed, clone_log, make_view, prewarm_for_trial, side_idx};
 use tsuitate_bot::shogi::parse_usi;
-use tsuitate_bot::strategy::EvalParams;
+use tsuitate_bot::strategy::{self, EvalParams};
 use tsuitate_bot::truth_replay::{for_each_decision_full, parse_bot_and_end};
 
 /// CSV / 集約の契約バージョン。**古い schema は集計から弾く**
 /// （撤回済みの数字が横断表へ戻らないように。issue #28 の契約と同じ）
-const ROW_SCHEMA: u32 = 1;
+/// schema 2 で「反則の観測を入れない対照（A）」の列が入った。schema 1 の CSV は
+/// 実再決定を独立に組み直していて、反則注入の効果と再構築ノイズを分離できない
+const ROW_SCHEMA: u32 = 2;
 
 fn die(msg: &str) -> ! {
     eprintln!("{msg}");
@@ -55,9 +57,9 @@ struct Point {
     /// 実戦の反則列（順番どおり）と受理された手
     fouls: Vec<String>,
     accepted: String,
-    /// 手番開始時（反則0）の状態と、実戦の反則を食った後の状態
+    /// 手番開始時（反則0）の状態。**反則を食った後の状態はここから作る**
+    /// （同じ prewarm 済み instance に `MyFoul` を食わせた継続にするため）
     entry: Replayed,
-    post: Replayed,
     /// 開始時の残り反則
     remaining: u32,
     /// 王手駒仮説の質（真の王手駒の重みシェア / 正規化エントロピー）
@@ -89,10 +91,18 @@ struct UnitOut {
     next_static: Option<String>,
     /// 反則注入後の実再決定の首位
     top1_after: Option<String>,
-    /// 実再決定が静的な次点と違う手を選んだか（H2）
+    /// 実再決定が静的な次点と違う手を選んだか（H2 の生の値。**対照と比べること**）
     changed: Option<bool>,
+    /// **対照（A）**: 反則の観測を入れずに同じ視界・同じ除外集合で選び直した首位
+    top1_ctrl: Option<String>,
+    /// 対照が静的な次点と違うか（= 再決定と価格だけで動くノイズ床）
+    changed_ctrl: Option<bool>,
+    /// **実再決定が対照と違うか = 反則の観測だけの効果**（H2 の正味）
+    changed_vs_ctrl: Option<bool>,
     /// 最良の玉の手の p_legal が反則注入後にどう動いたか
     p_king_after: Option<f64>,
+    /// 同じ量の対照（観測を入れない側）
+    p_king_ctrl: Option<f64>,
     candidates: usize,
 }
 
@@ -107,9 +117,12 @@ struct Row {
     top1_is_king: bool,
     k_star: Option<f64>,
     changed: Option<bool>,
+    changed_ctrl: Option<bool>,
+    changed_vs_ctrl: Option<bool>,
     matches_record: bool,
     p_king: f64,
     p_king_after: Option<f64>,
+    p_king_ctrl: Option<f64>,
 }
 
 impl Row {
@@ -200,16 +213,6 @@ fn entry_replayed(post: &Replayed, side: Color, fouls_this_turn: u32) -> Option<
     })
 }
 
-fn clone_replayed(rep: &Replayed) -> Replayed {
-    Replayed {
-        pos: rep.pos.clone(),
-        logs: [clone_log(&rep.logs[0]), clone_log(&rep.logs[1])],
-        fouls: rep.fouls,
-        plies: rep.plies,
-        injected_fouls: rep.injected_fouls.clone(),
-        oracle: rep.oracle.clone(),
-    }
-}
 
 /// 型（粗い束）のタグ。P0-1 の表と同じ分類
 fn type_tag(first: CheckMoveKind, accepted: CheckMoveKind) -> &'static str {
@@ -426,7 +429,6 @@ fn main() {
                 accepted,
                 remaining: 10u32.saturating_sub(entry.fouls[side_idx(d.side)]),
                 entry,
-                post,
                 true_hyp_share: share.unwrap_or(f64::NAN),
                 hyp_entropy: entropy.unwrap_or(f64::NAN),
             });
@@ -523,10 +525,24 @@ fn main() {
                     let p = &points[pi];
                     let side = p.entry.pos.turn();
                     let king = p.entry.pos.king_square(side);
-                    let Some((_, entry_rank)) =
-                        ranking_one_with(&p.entry, seed, "estimator", &HashSet::new())
-                    else {
+                    // **prewarm は1回だけ**。entry と post を別々に作り直すと
+                    // 壁時計デッドラインのぶん粒子集合が別物になり、「反則注入の
+                    // 効果」と「独立に組み直したノイズ」が混ざる（PR #32 レビュー
+                    // [P1]: 同じ設定の2 run で entry の首位が 67〜69% しか一致
+                    // しない）。実対局と同じく**同じ instance に反則の観測を
+                    // 食わせた継続**として post を作る
+                    let mut strat = strategy::make_seeded("estimator", seed)
+                        .expect("未知の戦略名");
+                    prewarm_for_trial(&mut *strat, &p.entry);
+                    let entry_log = clone_log(&p.entry.logs[side_idx(side)]);
+                    let entry_view = make_view(&p.entry.pos, side, &p.entry.fouls);
+                    if strat.choose(&entry_view, &entry_log, &HashSet::new()).is_none() {
                         eprintln!("{} {}手目: 初回ランキングなし", p.game, p.move_number);
+                        *dropped.lock().unwrap() += 1;
+                        continue;
+                    }
+                    let Some(entry_rank) = strat.last_ranking().map(<[_]>::to_vec) else {
+                        eprintln!("{} {}手目: 初回ランキングなし（定跡）", p.game, p.move_number);
                         *dropped.lock().unwrap() += 1;
                         continue;
                     };
@@ -554,22 +570,54 @@ fn main() {
                         .iter()
                         .find(|m| !tried.contains(&m.usi))
                         .map(|m| m.usi.clone());
-                    // 実再決定（`MyFoul` を食った推定器で全候補を評価し直す）
-                    let post = clone_replayed(&p.post);
-                    let after = ranking_one_with(&post, seed, "estimator", &tried);
-                    let after_priced: Option<Vec<PricedMove>> =
-                        after.as_ref().map(|(_, r)| priced_moves(r, king));
-                    let (top1_after, p_king_after) = match &after_priced {
-                        Some(r) => (
-                            r.first().map(|m| m.usi.clone()),
-                            r.iter().find(|m| m.is_king).map(|m| m.p_legal),
-                        ),
-                        None => (None, None),
+                    // 反則を観測した後の視界（残り反則が減るので価格も動く）と観測列
+                    let mut post_log = clone_log(&entry_log);
+                    let mut post_fouls = p.entry.fouls;
+                    for usi in &p.fouls {
+                        post_fouls[side_idx(side)] += 1;
+                        post_log.record(Observation::MyFoul {
+                            move_number: p.entry.pos.move_number(),
+                            usi: usi.clone(),
+                        });
+                    }
+                    let post_view = make_view(&p.entry.pos, side, &post_fouls);
+                    // **実再決定（B）**: 同じ prewarm 済み instance の clone に
+                    // 実戦の反則列を食わせて選び直す（`Estimator::update` を通る）
+                    let rank_of = |strat: &mut Box<dyn strategy::Strategy>,
+                                   view: &_,
+                                   log: &_|
+                     -> Option<Vec<PricedMove>> {
+                        strat.choose(view, log, &tried)?;
+                        strat.last_ranking().map(|r| priced_moves(r, king))
                     };
-                    let changed = match (&next_static, &top1_after) {
+                    let after_priced = strat
+                        .clone_boxed()
+                        .and_then(|mut b| rank_of(&mut b, &post_view, &post_log));
+                    // **対照（A）**: B と**同じ除外集合・同じ視界（＝同じ価格）**で、
+                    // 反則の観測だけを入れずに選び直す。B と A の差が
+                    // 「反則を観測したことによる信念更新の効果」そのもの
+                    // （A と静的な次点の差は、再決定と価格だけで動くぶん = ノイズ床）
+                    let ctrl_priced = strat
+                        .clone_boxed()
+                        .and_then(|mut a| rank_of(&mut a, &post_view, &entry_log));
+                    let pick = |r: &Option<Vec<PricedMove>>| -> (Option<String>, Option<f64>) {
+                        match r {
+                            Some(r) => (
+                                r.first().map(|m| m.usi.clone()),
+                                r.iter().find(|m| m.is_king).map(|m| m.p_legal),
+                            ),
+                            None => (None, None),
+                        }
+                    };
+                    let (top1_after, p_king_after) = pick(&after_priced);
+                    let (top1_ctrl, p_king_ctrl) = pick(&ctrl_priced);
+                    let diff = |a: &Option<String>, b: &Option<String>| match (a, b) {
                         (Some(a), Some(b)) => Some(a != b),
                         _ => None,
                     };
+                    let changed = diff(&next_static, &top1_after);
+                    let changed_ctrl = diff(&next_static, &top1_ctrl);
+                    let changed_vs_ctrl = diff(&top1_ctrl, &top1_after);
                     results.lock().unwrap().push(UnitOut {
                         point: pi,
                         seed,
@@ -585,7 +633,11 @@ fn main() {
                         next_static,
                         top1_after,
                         changed,
+                        top1_ctrl,
+                        changed_ctrl,
+                        changed_vs_ctrl,
                         p_king_after,
+                        p_king_ctrl,
                         candidates: entry_rank.len(),
                     });
                 }
@@ -637,9 +689,12 @@ fn main() {
             top1_is_king: r.top1_is_king,
             k_star: r.k_star,
             changed: r.changed,
+            changed_ctrl: r.changed_ctrl,
+            changed_vs_ctrl: r.changed_vs_ctrl,
             matches_record: r.matches_record,
             p_king: r.p_king,
             p_king_after: r.p_king_after,
+            p_king_ctrl: r.p_king_ctrl,
         })
         .collect();
     check_completeness(&rows, seeds, allow_incomplete);
@@ -660,12 +715,12 @@ fn write_csv(path: &str, points: &[Point], results: &[UnitOut], meta: &serde_jso
     s.push_str(
         "game,move_number,type,remaining,fouls_actual,accepted,seed,candidates,top1,top1_is_king,\
 king_best,p_top1,p_king,score_gap,k_star,next_static,top1_after,changed,p_king_after,\
-matches_record,true_hyp_share,hyp_entropy\n",
+top1_ctrl,changed_ctrl,changed_vs_ctrl,p_king_ctrl,matches_record,true_hyp_share,hyp_entropy\n",
     );
     for r in results {
         let p = &points[r.point];
         s.push_str(&format!(
-            "{},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{},{},{},{},{},{},{:.4},{:.4}\n",
+            "{},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4},{:.4},{},{},{},{},{},{},{},{},{},{},{:.4},{:.4}\n",
             p.game,
             p.move_number,
             p.type_tag,
@@ -685,6 +740,10 @@ matches_record,true_hyp_share,hyp_entropy\n",
             r.top1_after.clone().unwrap_or_default(),
             r.changed.map_or(String::new(), |c| u8::from(c).to_string()),
             r.p_king_after.map_or(String::new(), |p| format!("{p:.4}")),
+            r.top1_ctrl.clone().unwrap_or_default(),
+            r.changed_ctrl.map_or(String::new(), |c| u8::from(c).to_string()),
+            r.changed_vs_ctrl.map_or(String::new(), |c| u8::from(c).to_string()),
+            r.p_king_ctrl.map_or(String::new(), |p| format!("{p:.4}")),
             u8::from(r.matches_record),
             p.true_hyp_share,
             p.hyp_entropy,
@@ -767,9 +826,14 @@ struct Stats {
     /// **首位が玉以外**の unit だけで取る「k* ≤ 3 で反転したか」
     k3: Vec<bool>,
     changed: Vec<bool>,
+    /// 対照（反則の観測を入れない）が静的な次点と違う率 = ノイズ床
+    changed_ctrl: Vec<bool>,
+    /// 実再決定が対照と違う率 = **反則の観測だけの効果**（H2 の正味）
+    changed_vs_ctrl: Vec<bool>,
     k_values: Vec<f64>,
     unreverted: usize,
     p_king_delta: Vec<f64>,
+    p_king_delta_ctrl: Vec<f64>,
 }
 
 /// 決定点ごとに畳んだ集計。型ごと＋合計を返す
@@ -823,9 +887,22 @@ fn summarize(rows: &[Row]) -> Vec<(String, Stats)> {
             if let Some(m) = majority(&rs.iter().filter_map(|r| r.changed).collect::<Vec<_>>()) {
                 st.changed.push(m);
             }
+            if let Some(m) =
+                majority(&rs.iter().filter_map(|r| r.changed_ctrl).collect::<Vec<_>>())
+            {
+                st.changed_ctrl.push(m);
+            }
+            if let Some(m) =
+                majority(&rs.iter().filter_map(|r| r.changed_vs_ctrl).collect::<Vec<_>>())
+            {
+                st.changed_vs_ctrl.push(m);
+            }
             for r in rs {
                 if let (Some(after), true) = (r.p_king_after, r.p_king.is_finite()) {
                     st.p_king_delta.push(after - r.p_king);
+                }
+                if let (Some(ctrl), true) = (r.p_king_ctrl, r.p_king.is_finite()) {
+                    st.p_king_delta_ctrl.push(ctrl - r.p_king);
                 }
             }
         }
@@ -859,14 +936,15 @@ fn report(rows: &[Row]) {
         } else {
             format!("{:.2}", st.k_values[st.k_values.len() / 2])
         };
-        let mean_delta = if st.p_king_delta.is_empty() {
-            "-".to_string()
-        } else {
-            format!(
-                "{:+.3}",
-                st.p_king_delta.iter().sum::<f64>() / st.p_king_delta.len() as f64
-            )
+        let mean = |v: &[f64]| -> String {
+            if v.is_empty() {
+                "-".to_string()
+            } else {
+                format!("{:+.3}", v.iter().sum::<f64>() / v.len() as f64)
+            }
         };
+        let mean_delta = mean(&st.p_king_delta);
+        let mean_delta_ctrl = mean(&st.p_king_delta_ctrl);
         println!("{tag}: 決定点 {}", st.points);
         println!(
             "  初回ランキングの首位が実戦の最初の反則と一致: {}",
@@ -881,12 +959,27 @@ fn report(rows: &[Row]) {
             pct(&st.k3),
             st.unreverted,
         );
-        println!("  **反則注入後の実再決定が静的な次点と違う: {}**", pct(&st.changed));
-        println!("  最良の玉の手の p_legal の変化（反則注入の前後）: {mean_delta}");
+        println!(
+            "  反則注入後の実再決定が静的な次点と違う: {}（生の値。対照と比べること）",
+            pct(&st.changed)
+        );
+        println!(
+            "  対照（反則の観測を入れず・同じ視界と除外集合で選び直し）が静的な次点と違う: {}（= 再決定と価格だけで動くノイズ床）",
+            pct(&st.changed_ctrl)
+        );
+        println!(
+            "  **実再決定が対照と違う = 反則の観測だけの効果: {}**（H2 の正味）",
+            pct(&st.changed_vs_ctrl)
+        );
+        println!(
+            "  最良の玉の手の p_legal の変化（反則注入の前後）: {mean_delta} / 対照 {mean_delta_ctrl}"
+        );
     }
     println!(
         "\n中止条件（issue #31）: **k* ≤ 3 で反転する決定点が 20% 未満 かつ\n\
-         反則注入後に首位が変わる決定点も 20% 未満**なら α / β の枝は中止"
+         反則注入後に首位が変わる決定点も 20% 未満**なら α / β の枝は中止\n\
+         （H2 の判定には**対照との差**を使うこと。生の「静的な次点と違う」率は\n\
+         再決定のノイズ床を含む）"
     );
 }
 
@@ -941,48 +1034,106 @@ fn run_report(args: &[String]) {
                 meta["schema"]
             ));
         }
+        let seeds_hint = meta["seeds"]
+            .as_u64()
+            .unwrap_or_else(|| die(&format!("{path}: meta に seeds がありません")));
         let header = lines.next().unwrap_or_default();
         let cols: Vec<&str> = header.split(',').collect();
-        let idx = |name: &str| -> usize {
+        // **壊れた値を欠測・false・0 へ黙って変換しない**（PR #32 レビュー [P2]:
+        // 不正な k_star が「kmax まで反転しない」に、不正な changed が
+        // 「分母から脱落」に化けると、20% の門の分子・分母が静かに動く）。
+        // 空文字を許すのは**設計上 optional な列だけ**で、構文不正は必ず止める
+        let col = |name: &str| -> usize {
             cols.iter()
                 .position(|c| *c == name)
                 .unwrap_or_else(|| die(&format!("{path}: 列 {name} がありません")))
         };
-        let (i_game, i_mn, i_type, i_seed, i_king, i_k, i_ch, i_match, i_pk, i_pka) = (
-            idx("game"),
-            idx("move_number"),
-            idx("type"),
-            idx("seed"),
-            idx("top1_is_king"),
-            idx("k_star"),
-            idx("changed"),
-            idx("matches_record"),
-            idx("p_king"),
-            idx("p_king_after"),
-        );
-        for line in lines {
+        let idx: Vec<usize> = [
+            "game",
+            "move_number",
+            "type",
+            "seed",
+            "top1_is_king",
+            "k_star",
+            "changed",
+            "changed_ctrl",
+            "changed_vs_ctrl",
+            "matches_record",
+            "p_king",
+            "p_king_after",
+            "p_king_ctrl",
+        ]
+        .iter()
+        .map(|n| col(n))
+        .collect();
+        for (lineno, line) in lines.enumerate() {
             if line.trim().is_empty() {
                 continue;
             }
             let f: Vec<&str> = line.split(',').collect();
             if f.len() != cols.len() {
-                die(&format!("{path}: 列数が合わない行があります"));
+                die(&format!("{path}:{}: 列数が合いません", lineno + 3));
             }
-            rows.push(Row {
-                game: f[i_game].to_string(),
-                move_number: f[i_mn].parse().unwrap_or(0),
-                type_tag: f[i_type].to_string(),
-                seed: f[i_seed].parse().unwrap_or(0),
-                top1_is_king: f[i_king] == "1",
-                k_star: f[i_k].parse().ok(),
-                changed: match f[i_ch] {
+            let at = |k: usize| f[idx[k]];
+            let bad = |what: &str, v: &str| -> ! {
+                die(&format!("{path}:{}: {what} の値が不正です（{v:?}）", lineno + 3))
+            };
+            let req_u32 = |k: usize, what: &str| -> u32 {
+                at(k).parse().unwrap_or_else(|_| bad(what, at(k)))
+            };
+            let req_u64 = |k: usize, what: &str| -> u64 {
+                at(k).parse().unwrap_or_else(|_| bad(what, at(k)))
+            };
+            let req_bool = |k: usize, what: &str| -> bool {
+                match at(k) {
+                    "1" => true,
+                    "0" => false,
+                    v => bad(what, v),
+                }
+            };
+            // 空文字は「その値が無い」= 設計上の欠測（反則注入後のランキングが
+            // 取れなかった等）。それ以外の構文不正は止める
+            let opt_bool = |k: usize, what: &str| -> Option<bool> {
+                match at(k) {
+                    "" => None,
                     "1" => Some(true),
                     "0" => Some(false),
-                    _ => None,
-                },
-                matches_record: f[i_match] == "1",
-                p_king: f[i_pk].parse().unwrap_or(f64::NAN),
-                p_king_after: f[i_pka].parse().ok(),
+                    v => bad(what, v),
+                }
+            };
+            let opt_f64 = |k: usize, what: &str| -> Option<f64> {
+                match at(k) {
+                    "" => None,
+                    v => Some(v.parse().unwrap_or_else(|_| bad(what, v))),
+                }
+            };
+            let k_star = opt_f64(5, "k_star");
+            if k_star.is_some_and(|k| !k.is_finite() || k < 1.0) {
+                bad("k_star", at(5));
+            }
+            // p_king は玉の手が無ければ NaN を書くので、NaN も正当な値
+            let p_king: f64 = at(10).parse().unwrap_or_else(|_| bad("p_king", at(10)));
+            let seed = req_u64(3, "seed");
+            if seed >= seeds_hint {
+                die(&format!(
+                    "{path}:{}: seed {seed} は meta の seeds {seeds_hint} の範囲外です",
+                    lineno + 3
+                ));
+            }
+            rows.push(Row {
+                game: at(0).to_string(),
+                move_number: req_u32(1, "move_number"),
+                type_tag: at(2).to_string(),
+                seed,
+                top1_is_king: req_bool(4, "top1_is_king"),
+                k_star,
+                changed: opt_bool(6, "changed"),
+                changed_ctrl: opt_bool(7, "changed_ctrl"),
+                changed_vs_ctrl: opt_bool(8, "changed_vs_ctrl"),
+                matches_record: req_bool(9, "matches_record"),
+                p_king,
+                p_king_after: opt_f64(11, "p_king_after"),
+                p_king_ctrl: opt_f64(12, "p_king_ctrl"),
             });
         }
         metas.push(meta);
@@ -1057,9 +1208,12 @@ mod tests {
             top1_is_king: king,
             k_star: k,
             changed: Some(false),
+            changed_ctrl: Some(false),
+            changed_vs_ctrl: Some(false),
             matches_record: true,
             p_king: 0.8,
             p_king_after: Some(0.9),
+            p_king_ctrl: Some(0.85),
         }
     }
 
