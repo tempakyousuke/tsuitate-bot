@@ -374,7 +374,9 @@ jobs:
 
   probe:
     needs: plan
-    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_probe == 'true'
+    if: >-
+      needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_probe == 'true'
+      && needs.plan.outputs.reaggregate_run_id == ''
     strategy:
       fail-fast: false
       matrix:
@@ -435,7 +437,12 @@ jobs:
 
   probe-aggregate:
     needs: [plan, probe]
-    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_probe == 'true'
+    # **シャード matrix が skip されても走る**（`reaggregate_run_id` で既存 run の
+    # artifact を集計し直す経路）。`probe` が失敗したときだけ止める
+    if: >-
+      !cancelled() && needs.plan.outputs.skip != 'true'
+      && needs.plan.outputs.run_probe == 'true'
+      && (needs.probe.result == 'success' || needs.probe.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
@@ -449,6 +456,9 @@ jobs:
         with:
           pattern: check-probe-${{ matrix.opponent }}-s*
           path: shards
+          # 空なら現在の run（既定）。`reaggregate_run_id` があればその run から拾う
+          run-id: ${{ needs.plan.outputs.reaggregate_run_id || github.run_id }}
+          github-token: ${{ github.token }}
       - name: Report
         run: |
           set -euo pipefail

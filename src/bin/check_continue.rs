@@ -56,7 +56,25 @@ use tsuitate_bot::shogi::Position;
 use tsuitate_bot::strategy::{self, EvalParams};
 use tsuitate_bot::truth_replay::{for_each_decision_full, parse_bot_and_end};
 
-const ROW_SCHEMA: u32 = 1;
+/// 行の契約の版。**schema 1 は集計から弾く**（PR #33 レビュー2巡目 [P1]）:
+/// 1 には安全性の列（`foul_limit_loss` / `foul_limit_win` / `immediate_catastrophe`）と
+/// `arm_order` が無く、しかも arm を別 unit として並走させていた。欠けた列を
+/// `unwrap_or(false)` で 0 と読むと**反則負けも破滅も常に非悪化に見えて門を通せる**ので、
+/// 版の拒否と**必須列の存在検査**（`REQUIRED_ROW_KEYS`）の両方で止める。
+const ROW_SCHEMA: u32 = 2;
+
+/// 継続1本の行に必ず入っていなければならない列。1つでも欠けたら集計しない
+/// （欠測を「悪化なし」と読むのが一番危ない失敗の仕方なので、既定では降格させない）
+const REQUIRED_ROW_KEYS: [&str; 8] = [
+    "arm",
+    "estimand",
+    "score",
+    "immediate_fouls",
+    "foul_limit_loss",
+    "foul_limit_win",
+    "immediate_catastrophe",
+    "seed",
+];
 
 fn die(msg: &str) -> ! {
     eprintln!("{msg}");
@@ -885,6 +903,23 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
     if first["seeds"].as_u64().unwrap_or(0) == 0 {
         out.push("meta の seeds が 0 です（継続 0 局のまま Δ を 0 にできてしまう）".into());
     }
+    // **必須列の欠落を「悪化なし」と読ませない**（schema の版だけに頼らない二重の関門）。
+    // 安全性の列が欠けた行を 0 と読むと、反則負けも破滅も常に非悪化に見えて門を通せる
+    {
+        let mut missing: BTreeMap<&str, usize> = BTreeMap::new();
+        for r in rows {
+            for k in REQUIRED_ROW_KEYS {
+                if r.get(k).is_none_or(serde_json::Value::is_null) {
+                    *missing.entry(k).or_insert(0) += 1;
+                }
+            }
+        }
+        for (k, n) in missing {
+            out.push(format!(
+                "必須列 `{k}` が {n} 行で欠けています（欠測を 0 と読むと安全性の門が素通りする）"
+            ));
+        }
+    }
     for (i, m) in metas.iter().enumerate().skip(1) {
         if m["experiment"] != *first {
             let diff: Vec<String> = first
@@ -1046,6 +1081,42 @@ mod tests {
             "foul_limit_loss": false, "foul_limit_win": false,
             "immediate_catastrophe": false,
         })
+    }
+
+    /// **安全性の列を落とした行は集計させない**（PR #33 レビュー2巡目 [P1]）。
+    /// 修正前（schema 1）の artifact には `foul_limit_loss` / `immediate_catastrophe` が
+    /// 無く、`unwrap_or(false)` で 0 と読むと**反則負けも破滅も常に非悪化に見えて
+    /// 門を通せる**。版の拒否と必須列の検査の両方で止まることを固定する
+    #[test]
+    fn 安全性の列が欠けた行は集計させない() {
+        for key in [
+            "foul_limit_loss",
+            "foul_limit_win",
+            "immediate_catastrophe",
+            "score",
+        ] {
+            let rows: Vec<serde_json::Value> = full()
+                .into_iter()
+                .map(|mut r| {
+                    if let Some(o) = r.as_object_mut() {
+                        o.remove(key);
+                    }
+                    r
+                })
+                .collect();
+            let problems = check_inputs(&[meta(exp(), 0)], &rows);
+            assert!(
+                problems.iter().any(|p| p.contains(key)),
+                "{key} が欠けても素通りした: {problems:?}"
+            );
+        }
+    }
+
+    /// 旧 schema は版の時点で弾く（`reaggregate_run_id` で修正前の artifact を
+    /// 読み直したときに、欠けた列を 0 と読んで門を通すのを防ぐ二重の関門の片方）
+    #[test]
+    fn 旧schemaは現行の版と一致しない() {
+        assert_eq!(ROW_SCHEMA, 2, "安全性の列を足したので版を上げてある");
     }
 
     /// **`reason == "foul_limit"` は bot の負けとは限らない**（PR #33 レビュー [P1]）。
