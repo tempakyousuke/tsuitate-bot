@@ -551,6 +551,53 @@ pub fn classify_check_foul(truth: &Position, bot: Color, mv: &ShogiMove) -> Chec
     }
 }
 
+/// **手番開始時（反則0）の状態**を、その手番の反則を消化した後の状態から作る。
+///
+/// `truth_replay::for_each_decision_full` が渡すのは**その手番の反則を全部
+/// 食った後**の状態なので、両者のログ末尾から反則の観測を `fouls_this_turn`
+/// 本だけ落とす（手番側は `MyFoul`・相手側は `OpponentFoul`。
+/// `add_foul_obs` が対で積む）。反則は局面を変えないので `pos` はそのまま。
+///
+/// 落とす末尾が本当に反則の観測かを確かめてから落とす（規約が変わったら
+/// `None` を返して止める）。P0-4（`bin/check_probe`）と P0-5
+/// （`bin/check_policy`）が同じ復元を使う。
+pub fn entry_replayed(
+    post: &crate::scenario_core::Replayed,
+    side: Color,
+    fouls_this_turn: u32,
+) -> Option<crate::scenario_core::Replayed> {
+    use crate::scenario_core::side_idx;
+    let n = fouls_this_turn as usize;
+    let mut logs = [ObservationLog::default(), ObservationLog::default()];
+    for (idx, log) in logs.iter_mut().enumerate() {
+        let events = post.logs[idx].events();
+        let keep = events.len().checked_sub(n)?;
+        for e in &events[keep..] {
+            let ok = if idx == side_idx(side) {
+                matches!(e, Observation::MyFoul { .. })
+            } else {
+                matches!(e, Observation::OpponentFoul { .. })
+            };
+            if !ok {
+                return None;
+            }
+        }
+        for e in &events[..keep] {
+            log.record(e.clone());
+        }
+    }
+    let mut fouls = post.fouls;
+    fouls[side_idx(side)] = fouls[side_idx(side)].checked_sub(fouls_this_turn)?;
+    Some(crate::scenario_core::Replayed {
+        pos: post.pos.clone(),
+        logs,
+        fouls,
+        plies: post.plies,
+        injected_fouls: vec![],
+        oracle: None,
+    })
+}
+
 /// 反則コストを動かしたときの並べ替えを再計算するための最小の入力
 /// （issue #31 の P0-4 の k\* 監査と、P1-α の再計算が**同じ式**を使う）。
 ///

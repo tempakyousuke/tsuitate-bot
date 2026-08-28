@@ -722,6 +722,65 @@
   失敗する（`--allow-incomplete` で警告へ降格）。CSV の1行目の
   `#meta` に seed 数・型・予算・config 指紋・コード版・記録集合の指紋を書き、
   `report` が「同じ実験の独立サンプルか」を検査する（別実験の混入と重複は失敗）
+- `TSUITATE_THINK_BUDGET_MS=2000 cargo run --release --bin check_policy -- [--seeds 4]
+  [--jobs N] [--limit N] [--shard i/n] [--opponent estimator_v14]
+  [--alpha-k 1.5,2,3] [--beta-lambda 0.5,1] [--beta-k 1] [--no-real]
+  [--out data/check_policy.jsonl] <records...>` / `check_policy report <jsonl...>` —
+  **王手中の反則経済 P0-5: オフライン方策シミュレーション**（issue #31、2026-08-28）。
+  王手中の1手番を「候補 × p_legal × 価格」の小さな世界として取り出し、方策を
+  **反則するたび更新しながら真実で裁定**する。**runtime には何も入らない**。
+  - estimand は2つ: `foul`（実戦で反則した王手手番）と、反則0の王手手番から
+    **同数**を決定論的に抽出した `nofoul`（新しいプローブを足す害）。対照は
+    `(局, 手数)` の辞書順で等間隔に採る（現行方策の順位で選ぶと方策に引きずられる）。
+    **全記録を見てから割る**のでシャードが違っても同じ標本になる
+  - arm は `<方策>@<更新規則>`。方策は `current` / `alpha@k*`（`c = max(k×base, 床)`。
+    **床は倍率化しない**）/ `beta@k*l*`（`c_eff = max(0.5c, c − λ·ΔV)`、残り1回では
+    無効）/ `beta_order@l*` / `solver_greedy`。**γ（較正マップ）の arm は無い**
+    （P0-2 で H3 は棄却済み。落ちた枝に arm を足すと「有限個の arm の最大値」を
+    無駄に広げるだけ）
+  - 更新規則は issue の「4本の対照」: ①記録の実反則列 ②`current@static`
+    （＝現行 `combine_score` が暗黙に置く「次善手固定」の仮定そのもの）
+    ③`current@real`（**実再決定**。`MyFoul` を注入して `Estimator::update` と
+    ランキングを走らせる正解基準。gain も `removal_term` も作り直されるので
+    **候補リストごと差し替える**）④それ以外の arm = **p-only shadow update**
+  - **仮想更新は `evaluate` と同じ式を呼ぶ**: 「m が合法だった粒子を落とす」＋
+    「`CheckSolver` を反則列込みで作り直す」だけをやり、p_legal は
+    `strategy::blend_p_legal`（`evaluate` が呼ぶのと同じ関数。この PR で
+    切り出した。挙動は不変）で組み直す。gain・リスク・`removal_term` は
+    再計算しない。**健全性**として「反則0での仮想更新が初回ランキングの
+    p_legal を再現するか」を出す（ローカル実測で最大差 0.0000。ずれていたら
+    `evaluate` の min 系キャップを取りこぼしているので判定の前にここを見る）
+  - **ΔV は水準の差を引く**（参照＝候補平均）。生の `Vpost − Vpre` には m に
+    依らない定数が乗るので、そのまま使うと β が価格の水準を動かして α と
+    役割が混ざる。中心化すると平均 ΔV = 0 になり、β は**配分**だけを変える。
+    計算量は「首位から `c` 以内の候補だけ仮想更新する」で抑える（β が動かせる
+    score は高々 `(1−p)(c − c_min) ≤ 0.5c` なので厳密な枝刈り）
+  - **近似通過条件（事前登録）**: β の対現行改善量が正のときだけ比率を定義し、
+    `current@shadow` と `current@real` の「受理までの反則数/手番」の差が
+    その **25% 以下**なら通過。改善量が 0 以下なら β は不採用。超えるなら
+    P1-β は候補ごとに推定器を clone して仮想 `MyFoul` を注入する設計が要る
+  - **主指標は真実ベース**（受理直後の材料差・被一手詰め・次の被王手）。受理手の
+    現行 gain を主指標にすると β が評価の穴を突いたときに自己正当化する。
+    破滅率（10回到達・≥8）も必ず併記する。**候補分布上の較正**も出す
+    （P0-2 は「選ばれた手」の較正なので順位を変えた後へは外挿できない）
+- `TSUITATE_THINK_BUDGET_MS=700 cargo run --release --bin check_price -- [--seeds 2]
+  [--per-game 2] [--opponent estimator_v14] [--jobs N] [--shard i/n]
+  [--out out.jsonl] <records...>` / `check_price report <jsonl...>` —
+  **王手中の反則経済 P0-7: 反則トークンの影の価格**（issue #31、H1 の主測定）。
+  王手手番の**直後**の盤面・信念・乱数を固定し、**審判の累積反則数だけを +1 した**
+  paired continuation を共通乱数で走らせる。差 = 情報価値を固定した純粋な
+  トークン価格。裁定は `selfplay::play_continuation`（通常アリーナと同じ関数・時計は無効）。
+  - **単位が違う**: 影の価格は勝率単位、`foul_cost` は評価点単位。比べられるのは
+    **残数に対する曲線の形・比率**だけで、「水準が過小」はここでは判定しない
+  - **ログには反則を足さない**（足すと相手の信念と自分の `foul_tried` まで動いて
+    「情報価値を固定した」ことにならない）。動かすのは `StartState.fouls` と
+    `PlayerView.fouls` だけ。**継続側の全コードが累積数をそこからしか読まない**ことは
+    `selfplay` のテスト `継続の累積反則数は開始状態から読む` が固定する
+  - **残り1を0にする treatment は継続を始めず即 foul_limit 負け**（0 点）
+  - **1局から採る決定点は `--per-game` 本まで**（同じ局の相互排他的な未来を
+    足し合わせない）。残り反則の水準が散るように累計反則の順で等間隔に採る
+  - 層別は 残り反則 × 手数帯 × **相手の残り反則**（効果修飾）。CI は元対局単位の
+    cluster bootstrap
 - **王手中の反則経済の CI**（`.github/workflows/check-economy.yml`、**通常のコード
   push では走らない**）: `gh workflow run check-economy.yml -f arena_run_id=<Arena実行ID>
   -f opponents="estimator_v13 estimator_v14"`、`gh` が無ければ
@@ -730,8 +789,13 @@
   「v13 / v14 の両相手で同方向」なので両者の記録を混ぜてはいけない。
   同じ集計行は `arena.yml` のサマリーにも出る（**analyze に集計行を足したら
   arena.yml と check-economy.yml の両方のフィルタを直す**）。
-  **P0-4（`bin/check_probe`）は粒子を回すので既定では走らない**（`run_probe: true`
-  で有効化。P0-1〜P0-3 の数十倍かかる）
+  **重い段は既定では走らない**（要る段だけ true にする。全部同時に有効化すると
+  相手2 × シャードで 30 ジョブを超えてキューが詰まる）:
+  P0-4 `run_probe` / `probe_shards`（既定4）、P0-5 `run_policy` /
+  `policy_shards`（既定6。決定点が P0-4 の約4倍）、P0-7 `run_price` /
+  `price_shards`（既定8。**継続対局なので最も重い**）。
+  どれも元対局単位で割り、`*-aggregate` が `report` で合算する
+  （**シャードが欠けたら失敗**）
 - `cargo run --release --bin mine_check -- [--min-fouls N] [--emit <dir> <接頭辞>] <records/*.jsonl...>`
   — **被王手の決定点の採掘**（2026-08-19）。記録の真実を再生し bot 側の被王手
   決定点から「反則を N 回以上した」（foul）と「王手駒を玉以外で取れたのに
@@ -2413,7 +2477,18 @@
   `CheckMoveKind`）・型（`TurnType`）・反則の原因の真実からの分類
   （`classify_check_foul`）・元対局 cluster bootstrap（`cluster_ratio_ci`）。
   `bin/analyze`（P0-1〜P0-3）と、以後の P0-4/P0-5/P0-7 が**同じ定義**で
-  数えるための場所
+  数えるための場所。手番開始時（反則0）の状態の復元（`entry_replayed`。
+  `for_each_decision_full` が渡すのは反則を食った後なので、両者のログ末尾から
+  反則の観測を落とす）も P0-4 / P0-5 で共有する
+- `check_policy.rs` — **王手中の反則経済 P0-5 の共有定義**（issue #31、2026-08-28。
+  runtime には入らない診断だけ）。1候補の最小の入力（`PolicyMove`。**p と価格の
+  両方**を付け替えて score を引き直せる。`check_economy::PricedMove` は価格しか
+  動かせない）・**p-only shadow update**（`ShadowUpdater`）・方策（`Policy`）と
+  真実に対する裁定（`simulate`）・受理直後の真実指標（`truth_after`）・
+  候補分布上の較正（`CalibrationSums`）。
+  **p_legal のブレンドは `strategy::blend_p_legal` を呼ぶ**（`evaluate` と同じ関数。
+  別々に書くと「仮想更新が実再決定とずれた」のか「式が食い違っていた」のかを
+  分けられない）
 - `mate_economy.rs` — **詰み経済の共有定義**（issue #28、2026-08-27。runtime には
   入らない診断だけ）。詰め手の排他的分類（`drop_only / board_only / both`）・
   安全手（指した後に相手の一手詰めが消える手）・被詰めろのエピソード

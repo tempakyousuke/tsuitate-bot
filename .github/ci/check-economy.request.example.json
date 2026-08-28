@@ -1,10 +1,20 @@
 {
-  "_comment": "このファイルを .github/ci/check-economy.request.json という名前でコミットして push すると Check economy（issue #31 P0-1〜P0-4）が起動する。キーは workflow_dispatch の inputs と同じ。計測後に消す push は全ジョブがスキップされる",
+  "_comment": "このファイルを .github/ci/check-economy.request.json という名前でコミットして push すると Check economy（issue #31 P0-1〜P0-5 / P0-7）が起動する。キーは workflow_dispatch の inputs と同じ。計測後に消す push は全ジョブがスキップされる",
+  "_heavy": "run_probe / run_policy は粒子を回し、run_price は継続対局を回すので最も重い。要る段だけ true にすること",
   "arena_run_id": "32697854659",
   "opponents": ["estimator_v13", "estimator_v14"],
   "run_probe": true,
   "probe_seeds": 3,
   "probe_budget_ms": 2000,
   "probe_types": "nonking_king,nonking_nonking",
-  "probe_shards": 4
+  "probe_shards": 4,
+  "run_policy": true,
+  "policy_seeds": 4,
+  "policy_budget_ms": 2000,
+  "policy_shards": 6,
+  "run_price": true,
+  "price_seeds": 2,
+  "price_budget_ms": 700,
+  "price_per_game": 2,
+  "price_shards": 8
 }
