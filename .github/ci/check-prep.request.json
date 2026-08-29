@@ -4,5 +4,5 @@
   "opponents": ["estimator_v13", "estimator_v14"],
   "origin_weights": "",
   "adj_share": 0.5,
-  "bootstrap": 500
+  "bootstrap": 1000
 }
