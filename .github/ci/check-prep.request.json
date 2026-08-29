@@ -6,7 +6,7 @@
   "adj_share": 0.5,
   "bootstrap": 1000,
   "expect_candidate": "estimator",
-  "_no_match_seed": "run 32697854659 は arena-games.jsonl を持たない（= match_seed 無しで回っている）ので expect_match_seed は指定できない。発見セットには seed の独立性は要らないが、**検証セットには使えない**",
+  "_no_match_seed": "run 32697854659 の commit 886ef75 は ARENA_GAMES_JSON（1行=1対局の記録）より前なので arena-games.jsonl が無く、match_seed を記録から確かめられない（CLAUDE.md の match_seed=20260815 という記述の裏は artifact からは取れない）。よって expect_match_seed は指定しない。発見セットには seed の独立性は要らないが、**検証セットには使えない**",
   "expect_games": 104,
   "expect_commit": "886ef75dca443462696604eeea132f3a1cd5c3ef"
 }

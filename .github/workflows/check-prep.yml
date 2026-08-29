@@ -320,10 +320,10 @@ jobs:
               exit 1
             fi
           elif [ -n "$EXPECT_MATCH_SEED" ]; then
-            echo "::error::arena-games.jsonl がありません（match_seed 無しで回した run なので、検証セットの独立 seed を機械的に固定できません）"
+            echo "::error::arena-games.jsonl がありません（match_seed 無しで回したか、元 run の commit が ARENA_GAMES_JSON より前）。どちらにせよ検証セットの独立 seed を機械的に固定できません"
             exit 1
           else
-            echo "::warning::arena-games.jsonl がありません（match_seed 無しの run）。**検証セットには使えません**"
+            echo "::warning::arena-games.jsonl がありません（match_seed 無しで回したか、元 run の commit が ARENA_GAMES_JSON より前）。match_seed を記録から確かめられないので**検証セットには使えません**"
           fi
           printf 'games=%s\nshards=%s\n' "$games" "$n" >> provenance.env
           echo "検証済みの実験条件:"; cat provenance.env
