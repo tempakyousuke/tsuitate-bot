@@ -65,7 +65,7 @@ const ROW_SCHEMA: u32 = 2;
 
 /// 継続1本の行に必ず入っていなければならない列。1つでも欠けたら集計しない
 /// （欠測を「悪化なし」と読むのが一番危ない失敗の仕方なので、既定では降格させない）
-const REQUIRED_ROW_KEYS: [&str; 8] = [
+const REQUIRED_ROW_KEYS: [&str; 10] = [
     "arm",
     "estimand",
     "score",
@@ -74,6 +74,10 @@ const REQUIRED_ROW_KEYS: [&str; 8] = [
     "foul_limit_win",
     "immediate_catastrophe",
     "seed",
+    // 実行順の監査（arm 群の回転）ができなくなるので、これも欠測を許さない
+    "arm_order",
+    // 欠測を 0 と読むと**別々の実行が同じ replicate に潰れて**重複検査を素通りする
+    "replicate",
 ];
 
 fn die(msg: &str) -> ! {
@@ -227,6 +231,10 @@ fn main() {
     let mut jobs: usize =
         std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(2).max(1));
     let mut shard = (0usize, 1usize);
+    // **2回実行して平均する**ときの実行番号（issue #31 の再実行規則）。
+    // report は replicate ごとにシャードの完全性を検査し、全 replicate で
+    // 実験キー（= 同じ build の `source_fingerprint`）が一致することを要求する
+    let mut replicate: u64 = 0;
     let mut out_path: Option<String> = None;
     let mut allow_opponent_mismatch = false;
     let mut allow_incomplete = false;
@@ -261,6 +269,12 @@ fn main() {
                     .parse::<usize>()
                     .unwrap_or_else(|_| die("--jobs は整数"))
                     .max(1);
+                i += 2;
+            }
+            "--replicate" => {
+                replicate = need(args.get(i + 1), "--replicate")
+                    .parse::<u64>()
+                    .unwrap_or_else(|_| die("--replicate は整数"));
                 i += 2;
             }
             "--shard" => {
@@ -542,6 +556,7 @@ fn main() {
                     r["arm"] = serde_json::json!(arm);
                     // 何番目に走ったか（実行順効果の監査用）
                     r["arm_order"] = serde_json::json!(k);
+                    r["replicate"] = serde_json::json!(replicate);
                     rows.push(r);
                 }
             }
@@ -583,6 +598,7 @@ fn main() {
         "type": "meta",
         "experiment": experiment,
         "shard": shard.0,
+        "replicate": replicate,
         "games": games,
         "points": points.len(),
         "points_detail": points
@@ -734,12 +750,37 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
         exp["opponent"], exp["budget_ms"], exp["seeds"], exp["policies"], exp["records"],
         exp["source_fingerprint"],
     );
-    // シャードが揃っているか（Δ の分母は全対局数なので、欠けると分子だけが落ちる）
+    // シャードが揃っているか（Δ の分母は全対局数なので、欠けると分子だけが落ちる）。
+    // **replicate ごとに**数える（2回実行して平均する経路。`check_inputs` が本判定）
     let shard_total = exp["shard_total"].as_u64().unwrap_or(1) as usize;
-    let mut seen: Vec<u64> = metas.iter().filter_map(|m| m["shard"].as_u64()).collect();
-    seen.sort_unstable();
-    seen.dedup();
-    let complete = seen.len() == shard_total;
+    let mut reps: Vec<u64> = metas
+        .iter()
+        .map(|m| m["replicate"].as_u64().unwrap_or(0))
+        .collect();
+    reps.sort_unstable();
+    reps.dedup();
+    let mut per_rep_ok = true;
+    for rep in &reps {
+        let mut seen: Vec<u64> = metas
+            .iter()
+            .filter(|m| m["replicate"].as_u64().unwrap_or(0) == *rep)
+            .filter_map(|m| m["shard"].as_u64())
+            .collect();
+        seen.sort_unstable();
+        seen.dedup();
+        per_rep_ok &= seen.len() == shard_total;
+    }
+    let complete = per_rep_ok;
+    if reps.len() > 1 {
+        // **平均は集計器が取る**（表示値を手で平均しない。PR #33 レビュー3巡目 [P1]）。
+        // 局ごとの寄与を replicate 間で平均してから cluster bootstrap するので、
+        // 点推定は「各 replicate の Δ の平均」に厳密に一致し、CI も合成される
+        println!(
+            "  **{} replicate の平均**（replicate {:?}。実験キーが全 replicate で一致 = 同じ build・同じ設定）",
+            reps.len(),
+            reps
+        );
+    }
     if games_total == 0 {
         println!("  meta の games が 0（Δ の分母が取れない）");
         return;
@@ -855,10 +896,9 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
     }
     if !complete {
         println!(
-            "\n  **判定は出せない**（シャード {}/{} しか揃っていない。Δ の分母は全対局数なので、\
-欠けたシャードのぶんだけ分子だけが落ちて Δ が過小に出る）",
-            seen.len(),
-            shard_total
+            "\n  **判定は出せない**（どれかの replicate でシャードが全 {shard_total} に\
+揃っていない。Δ の分母は全対局数なので、欠けたシャードのぶんだけ分子だけが落ちて\
+Δ が過小に出る）"
         );
     }
     println!(
@@ -939,24 +979,41 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
             ));
         }
     }
-    let mut shards: Vec<u64> = metas.iter().filter_map(|m| m["shard"].as_u64()).collect();
-    let n = shards.len();
-    shards.sort_unstable();
-    shards.dedup();
-    if shards.len() != n {
-        out.push("同じシャードの JSONL を2回渡しています（行が二重に数えられる）".into());
-    }
+    // **replicate ごとにシャードの完全性を検査する**（PR #33 レビュー3巡目 [P1]）。
+    // 2回実行して平均するとき（issue #31 の「門付近なら全 arm を2回実行して平均」）、
+    // 実験キーの一致検査が **同じ build**（`source_fingerprint`）であることを保証し、
+    // ここが **各 replicate が全シャード揃っている**ことを保証する。
+    // 手で report の表示値を平均すると、この2つがどちらも検証されない
     let total = first["shard_total"].as_u64().unwrap_or(1) as usize;
-    if shards.len() != total {
-        out.push(format!(
-            "シャードが欠けています（{shards:?} / 全 {total}）: Δ の分子だけが落ちる"
-        ));
+    let mut by_rep: BTreeMap<u64, Vec<u64>> = BTreeMap::new();
+    for m in metas {
+        by_rep
+            .entry(m["replicate"].as_u64().unwrap_or(0))
+            .or_default()
+            .push(m["shard"].as_u64().unwrap_or(0));
     }
-    // 重複行
-    let mut keys: HashSet<(String, u64, u64, String)> = HashSet::new();
+    for (rep, sh) in &mut by_rep {
+        let n = sh.len();
+        sh.sort_unstable();
+        sh.dedup();
+        if sh.len() != n {
+            out.push(format!(
+                "replicate {rep} に同じシャードの JSONL が2回あります（行が二重に数えられる）"
+            ));
+        }
+        if sh.len() != total {
+            out.push(format!(
+                "replicate {rep} のシャードが欠けています（{sh:?} / 全 {total}）: Δ の分子だけが落ちる"
+            ));
+        }
+    }
+    let replicates = by_rep.len();
+    // 重複行（**replicate をキーに含める**。2回実行の同じ決定点は重複ではない）
+    let mut keys: HashSet<(u64, String, u64, u64, String)> = HashSet::new();
     let mut dups = 0;
     for r in rows {
         let k = (
+            r["replicate"].as_u64().unwrap_or(0),
             r["game"].as_str().unwrap_or("?").to_string(),
             r["move_number"].as_u64().unwrap_or(0),
             r["seed"].as_u64().unwrap_or(0),
@@ -987,7 +1044,15 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
             .or_default() += 1;
     }
     let mut lacks: Vec<String> = vec![];
-    for m in metas {
+    let first_rep = metas
+        .iter()
+        .map(|m| m["replicate"].as_u64().unwrap_or(0))
+        .min()
+        .unwrap_or(0);
+    for m in metas
+        .iter()
+        .filter(|m| m["replicate"].as_u64().unwrap_or(0) == first_rep)
+    {
         for d in m["points_detail"].as_array().into_iter().flatten() {
             let g = d["game"].as_str().unwrap_or("?").to_string();
             let mn = d["move_number"].as_u64().unwrap_or(0);
@@ -996,8 +1061,10 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
                     .get(&(g.clone(), mn, arm.clone()))
                     .copied()
                     .unwrap_or(0) as u64;
-                if got != seeds {
-                    lacks.push(format!("{g}#{mn} {arm}: {got}/{seeds}"));
+                // replicate をまたいで同じ決定点を数えるので、期待値は seeds × replicate 数
+                let want_n = seeds * replicates as u64;
+                if got != want_n {
+                    lacks.push(format!("{g}#{mn} {arm}: {got}/{want_n}"));
                 }
             }
         }
@@ -1067,6 +1134,7 @@ mod tests {
     fn meta(e: serde_json::Value, shard: u64) -> serde_json::Value {
         serde_json::json!({
             "schema": ROW_SCHEMA, "type": "meta", "experiment": e, "shard": shard,
+            "replicate": 0,
             "games": 104, "points": 1,
             "points_detail": [{"game": "g1", "move_number": 41, "estimand": "foul"}],
         })
@@ -1079,8 +1147,63 @@ mod tests {
             "plies": 90, "added_plies": 10, "immediate_fouls": 1, "added_fouls_me": 1,
             "think_mean_ms": 700.0, "foul_limit": false,
             "foul_limit_loss": false, "foul_limit_win": false,
-            "immediate_catastrophe": false,
+            "immediate_catastrophe": false, "arm_order": 0, "replicate": 0,
         })
+    }
+
+    /// **2回実行の平均は集計器が取る**（PR #33 レビュー3巡目 [P1]）。
+    /// 局ごとの寄与を replicate 間で平均してから Δ を作るので、点推定は
+    /// 「各 replicate の Δ の平均」に厳密に一致する（手で表示値を平均しない）
+    #[test]
+    fn replicateの平均は各replicateのdeltaの平均に一致する() {
+        let mk = |rep: u64, score: f64| -> Vec<serde_json::Value> {
+            let mut v = vec![];
+            for seed in 0..2u64 {
+                for (arm, sc) in [("baseline", 0.5), ("current", 0.5), ("alpha@k2", score)] {
+                    let mut r = row(arm, seed, sc);
+                    r["replicate"] = serde_json::json!(rep);
+                    v.push(r);
+                }
+            }
+            v
+        };
+        // replicate 0 は alpha@k2 が 1.0、replicate 1 は 0.0 → 平均 0.5 = current と同じ
+        let mut rows = mk(0, 1.0);
+        rows.extend(mk(1, 0.0));
+        let mut m0 = meta(exp(), 0);
+        m0["replicate"] = serde_json::json!(0);
+        let mut m1 = meta(exp(), 0);
+        m1["replicate"] = serde_json::json!(1);
+        assert!(
+            check_inputs(&[m0, m1], &rows).is_empty(),
+            "同じ実験の2 replicate は契約を通る"
+        );
+        let sel: Vec<&serde_json::Value> = rows.iter().collect();
+        let contrib = contributions(&sel, &|r| r["score"].as_f64().unwrap_or(0.0));
+        let (d, _, _) = delta_ci(&contrib, "alpha@k2", Some("current"), 104);
+        assert!(
+            d.abs() < 1e-9,
+            "1.0 と 0.0 の平均は current と同じ = Δ差 0 のはず: {d}"
+        );
+    }
+
+    /// replicate ごとにシャードの完全性を検査する（片方だけ欠けても止まる）
+    #[test]
+    fn replicateごとにシャードの欠落を検出する() {
+        let mut e = exp();
+        e["shard_total"] = serde_json::json!(2);
+        let mut m0a = meta(e.clone(), 0);
+        m0a["replicate"] = serde_json::json!(0);
+        let mut m0b = meta(e.clone(), 1);
+        m0b["replicate"] = serde_json::json!(0);
+        // replicate 1 はシャード 0 しか無い
+        let mut m1 = meta(e, 0);
+        m1["replicate"] = serde_json::json!(1);
+        let problems = check_inputs(&[m0a, m0b, m1], &[]);
+        assert!(
+            problems.iter().any(|p| p.contains("replicate 1")),
+            "replicate 1 の欠落を検出できていない: {problems:?}"
+        );
     }
 
     /// **安全性の列を落とした行は集計させない**（PR #33 レビュー2巡目 [P1]）。
@@ -1094,6 +1217,7 @@ mod tests {
             "foul_limit_win",
             "immediate_catastrophe",
             "score",
+            "arm_order",
         ] {
             let rows: Vec<serde_json::Value> = full()
                 .into_iter()

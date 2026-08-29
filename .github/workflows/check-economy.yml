@@ -128,6 +128,10 @@ on:
         description: "P0-6 の分割数（元対局単位。欠けたら判定を出さない）"
         required: false
         default: "8"
+      continue_replicates:
+        description: "P0-6 を何回実行して平均するか（issue #31 の再実行規則。門付近なら 2。**同じ run の中で回すので build と設定が厳密に一致する**）"
+        required: false
+        default: "1"
   push:
     paths:
       - ".github/ci/check-economy.request.json"
@@ -163,6 +167,8 @@ jobs:
       continue_budget_ms: ${{ steps.split.outputs.continue_budget_ms }}
       continue_shards: ${{ steps.split.outputs.continue_shards }}
       continue_shard_count: ${{ steps.split.outputs.continue_shard_count }}
+      continue_replicate_list: ${{ steps.split.outputs.continue_replicate_list }}
+      continue_replicate_count: ${{ steps.split.outputs.continue_replicate_count }}
     steps:
       - uses: actions/checkout@v5
       - id: split
@@ -187,6 +193,7 @@ jobs:
           IN_REAGGREGATE: ${{ github.event.inputs.reaggregate_run_id }}
           IN_RUN_CONTINUE: ${{ github.event.inputs.run_continue }}
           IN_CONTINUE_POLICY: ${{ github.event.inputs.continue_policy }}
+          IN_CONTINUE_REPLICATES: ${{ github.event.inputs.continue_replicates }}
           IN_CONTINUE_SEEDS: ${{ github.event.inputs.continue_seeds }}
           IN_CONTINUE_BUDGET: ${{ github.event.inputs.continue_budget_ms }}
           IN_CONTINUE_SHARDS: ${{ github.event.inputs.continue_shards }}
@@ -216,6 +223,7 @@ jobs:
             continue_seeds="${IN_CONTINUE_SEEDS:-4}"
             continue_budget="${IN_CONTINUE_BUDGET:-700}"
             continue_shards="${IN_CONTINUE_SHARDS:-8}"
+            continue_replicates="${IN_CONTINUE_REPLICATES:-1}"
           else
             if [ ! -f "$req" ]; then
               # push の paths フィルタは削除にも一致する。計測後に $req を消す
@@ -249,6 +257,8 @@ jobs:
                 echo "continue_budget_ms=700"
                 echo 'continue_shards=[0]'
                 echo "continue_shard_count=1"
+                echo 'continue_replicate_list=[0]'
+                echo "continue_replicate_count=1"
               } >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -276,6 +286,7 @@ jobs:
             continue_seeds=$(jq -r '.continue_seeds // 4' "$req")
             continue_budget=$(jq -r '.continue_budget_ms // 700' "$req")
             continue_shards=$(jq -r '.continue_shards // 8' "$req")
+            continue_replicates=$(jq -r '.continue_replicates // 1' "$req")
           fi
           # 記録元が無い（リポジトリの records/ を使う）ときは1ジョブだけ回す
           if [ -z "$run_id" ]; then
@@ -309,6 +320,8 @@ jobs:
             echo "continue_budget_ms=$continue_budget"
             echo "continue_shards=$(jq -n -c "[range(0; ${continue_shards})]")"
             echo "continue_shard_count=$continue_shards"
+            echo "continue_replicate_list=$(jq -n -c "[range(0; ${continue_replicates})]")"
+            echo "continue_replicate_count=$continue_replicates"
           } >> "$GITHUB_OUTPUT"
 
   analyze:
@@ -726,6 +739,7 @@ jobs:
       matrix:
         opponent: ${{ fromJSON(needs.plan.outputs.opponents) }}
         shard: ${{ fromJSON(needs.plan.outputs.continue_shards) }}
+        replicate: ${{ fromJSON(needs.plan.outputs.continue_replicate_list) }}
     runs-on: ubuntu-latest
     timeout-minutes: 350
     steps:
@@ -766,15 +780,16 @@ jobs:
             --policy "${{ needs.plan.outputs.continue_policy }}" \
             --jobs "$jobs" \
             --shard "${{ matrix.shard }}/$n" \
+            --replicate "${{ matrix.replicate }}" \
             --allow-incomplete \
-            --out "check-continue-${{ matrix.opponent }}-s${{ matrix.shard }}.jsonl" \
-            "$src" | tee "check-continue-${{ matrix.opponent }}-s${{ matrix.shard }}.txt"
+            --out "check-continue-${{ matrix.opponent }}-r${{ matrix.replicate }}-s${{ matrix.shard }}.jsonl" \
+            "$src" | tee "check-continue-${{ matrix.opponent }}-r${{ matrix.replicate }}-s${{ matrix.shard }}.txt"
       - uses: actions/upload-artifact@v6
         with:
-          name: check-continue-${{ matrix.opponent }}-s${{ matrix.shard }}
+          name: check-continue-${{ matrix.opponent }}-r${{ matrix.replicate }}-s${{ matrix.shard }}
           path: |
-            check-continue-${{ matrix.opponent }}-s${{ matrix.shard }}.jsonl
-            check-continue-${{ matrix.opponent }}-s${{ matrix.shard }}.txt
+            check-continue-${{ matrix.opponent }}-r${{ matrix.replicate }}-s${{ matrix.shard }}.jsonl
+            check-continue-${{ matrix.opponent }}-r${{ matrix.replicate }}-s${{ matrix.shard }}.txt
 
   continue-aggregate:
     needs: [plan, continue]
@@ -795,7 +810,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: actions/download-artifact@v7
         with:
-          pattern: check-continue-${{ matrix.opponent }}-s*
+          pattern: check-continue-${{ matrix.opponent }}-r*
           path: shards
           # 空なら現在の run（既定）。`reaggregate_run_id` があればその run から拾う
           run-id: ${{ needs.plan.outputs.reaggregate_run_id || github.run_id }}
@@ -803,11 +818,14 @@ jobs:
       - name: Report
         run: |
           set -euo pipefail
-          # Δ の分母は全対局数なので、シャードが欠けると分子だけが落ちて Δ が過小に出る
-          n=${{ needs.plan.outputs.continue_shard_count }}
+          # Δ の分母は全対局数なので、シャードが欠けると分子だけが落ちて Δ が過小に出る。
+          # **replicate ごとに全シャードが要る**（2回実行して平均する経路）。
+          # 本判定は check_continue report の check_inputs（replicate ごとの完全性 +
+          # 全 replicate で実験キー = 同じ build が一致）で、ここは本数の粗い関門
+          n=$(( ${{ needs.plan.outputs.continue_shard_count }} * ${{ needs.plan.outputs.continue_replicate_count }} ))
           found=$(find shards -name 'check-continue-*.jsonl' | wc -l)
           if [ "$found" -ne "$n" ]; then
-            echo "シャードが欠けています（$found / $n）: Δ の分子だけが落ちるので中止" >&2
+            echo "シャード/replicate が欠けています（$found / $n）: Δ の分子だけが落ちるので中止" >&2
             exit 1
           fi
           cargo run --release --bin check_continue -- report \
