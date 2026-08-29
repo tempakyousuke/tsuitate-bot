@@ -1,0 +1,617 @@
+name: Check belief
+
+# **issue #36 の P0-1 / P0-2 / P0-2b**: 王手駒仮説の**希釈**を、過去の Arena 実行の
+# 棋譜（`arena-records-*`）に対して測る診断。**runtime の挙動は変えない**
+# （`CheckSolver` に足したのは診断専用のフックだけで、設置しなければ既定挙動と
+# bit-exact）。#31 / #34 と同じく**相手ごとに別ジョブ**で集計する
+# （判定が「v13 / v14 の両相手で同方向」なので混ぜてはいけない）。
+#
+#   - P0-1 伝達の分解（`bin/check_belief_probe`。**記述のみ・中止の門は置かない**）:
+#     ソルバー単体 q → 粒子投票後 q → `prior_legal` との積 → `blend_p_legal` →
+#     cap → score → rank を、「真の王手駒を玉以外で取る手」と「誤仮説マスへの
+#     捕獲の最大値」で対にして並べる。母集団は **bot の全王手中手番**
+#     （反則0も**終端手番**も含む。落ちた本数は attrition として出す）
+#   - P0-2 オラクル arm（`bin/check_policy` の `--belief`）:
+#     `oracle@k*@shadow`（= issue の `oracle_p_only@k`）/
+#     `oracle@kinf@real`（= **主 arm** `oracle_full_score@real`）/
+#     `oracle_misdirected@k*`（adversarial stress test）/ `deduce_last_move`。
+#     **`oracle@k1` は恒等対照**で、`current` と bit-exact でなければ判定以前
+#   - P0-2b オラクルの継続上限（`bin/check_continue --policy oracle@kinf@real`）:
+#     一手番強制→終局まで指し継いで勝率へ変換する。**対照は `current@real`**
+#     （shadow の `current` と比べると「オラクル」と「指し直したこと」が混ざる）
+#
+# **P0-2 / P0-2b は既定では走らない**（`run_policy` / `run_continue`）。
+# P0-1 は粒子を回すが1決定点あたり1回の `choose` で済むので軽い。
+# **全部を同時に有効化しない**（相手2 × シャードでジョブが詰まる）。
+#
+# 起動は arena.yml / check-prep.yml と同じ2通り（**通常のコード push では走らない**）:
+#   1. Actions UI / `gh workflow run check-belief.yml -f arena_run_id=<Arena実行ID>`
+#   2. `.github/ci/check-belief.request.json` を含む push
+#      （リクエストファイルを消す push は plan が「削除された push」と判定して
+#        全ジョブをスキップするので、後片付けで赤い run は残らない）
+#
+# **発見セットと検証セットを分ける**（issue #36）: 発見 = run 32697854659 /
+# 33179939954、学習 = 新規に回す記録用アリーナ、検証 = **未使用の `match_seed`**。
+# 検証セットの起動では `expect_match_seed` を必ず渡す（独立 seed を機械的に固定する）。
+# 元 Arena 実行の実験条件の検査は `scripts/ci/verify_arena_provenance.sh`（共通）。
+on:
+  workflow_dispatch:
+    inputs:
+      arena_run_id:
+        description: "棋譜の取得元 Arena 実行ID（空ならリポジトリの records/ を使う）"
+        required: false
+        default: ""
+      opponents:
+        description: "相手ごとに分けて集計する（空白区切り）。records/ を使うときは無視される"
+        required: false
+        default: "estimator_v13 estimator_v14"
+      probe_seeds:
+        description: "P0-1 の決定点あたり seed 数"
+        required: false
+        default: "3"
+      probe_budget_ms:
+        description: "P0-1 の思考予算（ms。**記録を取ったアリーナと揃えること**）"
+        required: false
+        default: "2000"
+      probe_shards:
+        description: "P0-1 の分割数（元対局単位。欠けたら aggregate が失敗する）。**母集団は #31 P0-4 の約3倍**（反則0の手番も終端手番も含む全王手中手番）なので既定を厚めに取ってある"
+        required: false
+        default: "8"
+      run_policy:
+        description: "P0-2（オラクル arm）も走らせるか。実再決定を含むので重い"
+        required: false
+        default: "false"
+      policy_beliefs:
+        description: "P0-2 の p-only arm（カンマ区切り）。`oracle@k1` は恒等対照なので外さない"
+        required: false
+        default: "oracle@k1,oracle@k2,oracle@k4,oracle@k8,oracle@kinf,oracle_misdirected@k4,oracle_misdirected@kinf,deduce_last_move"
+      policy_beliefs_real:
+        description: "P0-2 で実再決定まで回す arm（主 arm = oracle@kinf）"
+        required: false
+        default: "oracle@kinf"
+      policy_seeds:
+        description: "P0-2 の決定点あたり seed 数"
+        required: false
+        default: "3"
+      policy_budget_ms:
+        description: "P0-2 の思考予算（ms）"
+        required: false
+        default: "2000"
+      policy_shards:
+        description: "P0-2 の分割数（元対局単位）"
+        required: false
+        default: "6"
+      run_continue:
+        description: "P0-2b（継続上限）も走らせるか。**継続対局を回すので最も重い**"
+        required: false
+        default: "false"
+      continue_policy:
+        description: "P0-2b の arm（カンマ区切り）。`current@real` は自動で入る"
+        required: false
+        default: "oracle@kinf@real"
+      continue_seeds:
+        description: "P0-2b の決定点あたり seed 数"
+        required: false
+        default: "4"
+      continue_budget_ms:
+        description: "P0-2b の思考予算（ms。**ランキング段と継続段の両方に効く**。issue #36 は 2000）"
+        required: false
+        default: "2000"
+      continue_shards:
+        description: "P0-2b の分割数（元対局単位。欠けたら判定を出さない）"
+        required: false
+        default: "8"
+      continue_replicates:
+        description: "P0-2b を何回実行して平均するか（issue #36 は**常に 2**）"
+        required: false
+        default: "2"
+      expect_candidate:
+        description: "元 Arena 実行の候補戦略（空なら照合しない）"
+        required: false
+        default: "estimator"
+      expect_match_seed:
+        description: "元 Arena 実行の match_seed base（**検証セットでは必ず指定する**）"
+        required: false
+        default: ""
+      expect_commit:
+        description: "元 Arena 実行の commit（head_sha）。空なら照合しない"
+        required: false
+        default: ""
+      expect_games:
+        description: "相手ごとの期待局数（空なら照合しない）"
+        required: false
+        default: ""
+      expect_shards:
+        description: "元 Arena 実行のシャード数（空なら照合しない）"
+        required: false
+        default: ""
+  push:
+    paths:
+      - ".github/ci/check-belief.request.json"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.split.outputs.skip }}
+      arena_run_id: ${{ steps.split.outputs.arena_run_id }}
+      opponents: ${{ steps.split.outputs.opponents }}
+      probe_seeds: ${{ steps.split.outputs.probe_seeds }}
+      probe_budget_ms: ${{ steps.split.outputs.probe_budget_ms }}
+      probe_shards: ${{ steps.split.outputs.probe_shards }}
+      probe_shard_count: ${{ steps.split.outputs.probe_shard_count }}
+      run_policy: ${{ steps.split.outputs.run_policy }}
+      policy_beliefs: ${{ steps.split.outputs.policy_beliefs }}
+      policy_beliefs_real: ${{ steps.split.outputs.policy_beliefs_real }}
+      policy_seeds: ${{ steps.split.outputs.policy_seeds }}
+      policy_budget_ms: ${{ steps.split.outputs.policy_budget_ms }}
+      policy_shards: ${{ steps.split.outputs.policy_shards }}
+      policy_shard_count: ${{ steps.split.outputs.policy_shard_count }}
+      run_continue: ${{ steps.split.outputs.run_continue }}
+      continue_policy: ${{ steps.split.outputs.continue_policy }}
+      continue_seeds: ${{ steps.split.outputs.continue_seeds }}
+      continue_budget_ms: ${{ steps.split.outputs.continue_budget_ms }}
+      continue_shards: ${{ steps.split.outputs.continue_shards }}
+      continue_shard_count: ${{ steps.split.outputs.continue_shard_count }}
+      continue_replicate_list: ${{ steps.split.outputs.continue_replicate_list }}
+      expect_candidate: ${{ steps.split.outputs.expect_candidate }}
+      expect_match_seed: ${{ steps.split.outputs.expect_match_seed }}
+      expect_commit: ${{ steps.split.outputs.expect_commit }}
+      expect_games: ${{ steps.split.outputs.expect_games }}
+      expect_shards: ${{ steps.split.outputs.expect_shards }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: split
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IN_RUN_ID: ${{ github.event.inputs.arena_run_id }}
+          IN_OPPONENTS: ${{ github.event.inputs.opponents }}
+          IN_PROBE_SEEDS: ${{ github.event.inputs.probe_seeds }}
+          IN_PROBE_BUDGET: ${{ github.event.inputs.probe_budget_ms }}
+          IN_PROBE_SHARDS: ${{ github.event.inputs.probe_shards }}
+          IN_RUN_POLICY: ${{ github.event.inputs.run_policy }}
+          IN_POLICY_BELIEFS: ${{ github.event.inputs.policy_beliefs }}
+          IN_POLICY_BELIEFS_REAL: ${{ github.event.inputs.policy_beliefs_real }}
+          IN_POLICY_SEEDS: ${{ github.event.inputs.policy_seeds }}
+          IN_POLICY_BUDGET: ${{ github.event.inputs.policy_budget_ms }}
+          IN_POLICY_SHARDS: ${{ github.event.inputs.policy_shards }}
+          IN_RUN_CONTINUE: ${{ github.event.inputs.run_continue }}
+          IN_CONTINUE_POLICY: ${{ github.event.inputs.continue_policy }}
+          IN_CONTINUE_SEEDS: ${{ github.event.inputs.continue_seeds }}
+          IN_CONTINUE_BUDGET: ${{ github.event.inputs.continue_budget_ms }}
+          IN_CONTINUE_SHARDS: ${{ github.event.inputs.continue_shards }}
+          IN_CONTINUE_REPLICATES: ${{ github.event.inputs.continue_replicates }}
+          IN_EXP_CAND: ${{ github.event.inputs.expect_candidate }}
+          IN_EXP_SEED: ${{ github.event.inputs.expect_match_seed }}
+          IN_EXP_COMMIT: ${{ github.event.inputs.expect_commit }}
+          IN_EXP_GAMES: ${{ github.event.inputs.expect_games }}
+          IN_EXP_SHARDS: ${{ github.event.inputs.expect_shards }}
+        run: |
+          set -euo pipefail
+          req='.github/ci/check-belief.request.json'
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            run_id="${IN_RUN_ID:-}"
+            opponents="${IN_OPPONENTS:-estimator_v13 estimator_v14}"
+            probe_seeds="${IN_PROBE_SEEDS:-3}"
+            probe_budget="${IN_PROBE_BUDGET:-2000}"
+            probe_shards="${IN_PROBE_SHARDS:-8}"
+            run_policy="${IN_RUN_POLICY:-false}"
+            policy_beliefs="${IN_POLICY_BELIEFS:-}"
+            policy_beliefs_real="${IN_POLICY_BELIEFS_REAL:-oracle@kinf}"
+            policy_seeds="${IN_POLICY_SEEDS:-3}"
+            policy_budget="${IN_POLICY_BUDGET:-2000}"
+            policy_shards="${IN_POLICY_SHARDS:-6}"
+            run_continue="${IN_RUN_CONTINUE:-false}"
+            continue_policy="${IN_CONTINUE_POLICY:-oracle@kinf@real}"
+            continue_seeds="${IN_CONTINUE_SEEDS:-4}"
+            continue_budget="${IN_CONTINUE_BUDGET:-2000}"
+            continue_shards="${IN_CONTINUE_SHARDS:-8}"
+            continue_reps="${IN_CONTINUE_REPLICATES:-2}"
+            exp_cand="${IN_EXP_CAND-estimator}"
+            exp_seed="${IN_EXP_SEED:-}"
+            exp_commit="${IN_EXP_COMMIT:-}"
+            exp_games="${IN_EXP_GAMES:-}"
+            exp_shards="${IN_EXP_SHARDS:-}"
+          else
+            if [ ! -f "$req" ]; then
+              # push の paths フィルタは削除にも一致する。計測後に $req を消す
+              # commit は後片付けの正常系なので、赤い run を残さず全部スキップ
+              echo "リクエストファイルが削除された push（後片付け）なので何もしない"
+              {
+                echo "skip=true"
+                echo "arena_run_id="
+                echo 'opponents=[""]'
+                echo "probe_seeds=3"
+                echo "probe_budget_ms=2000"
+                echo 'probe_shards=[0]'
+                echo "probe_shard_count=1"
+                echo "run_policy=false"
+                echo "policy_beliefs="
+                echo "policy_beliefs_real="
+                echo "policy_seeds=3"
+                echo "policy_budget_ms=2000"
+                echo 'policy_shards=[0]'
+                echo "policy_shard_count=1"
+                echo "run_continue=false"
+                echo "continue_policy="
+                echo "continue_seeds=4"
+                echo "continue_budget_ms=2000"
+                echo 'continue_shards=[0]'
+                echo "continue_shard_count=1"
+                echo 'continue_replicate_list=[0]'
+                echo "expect_candidate="
+                echo "expect_match_seed="
+                echo "expect_commit="
+                echo "expect_games="
+                echo "expect_shards="
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            run_id=$(jq -r '.arena_run_id // ""' "$req")
+            opponents=$(jq -r 'if (.opponents | type) == "array" then (.opponents | join(" ")) else (.opponents // "estimator_v13 estimator_v14") end' "$req")
+            probe_seeds=$(jq -r '.probe_seeds // 3' "$req")
+            probe_budget=$(jq -r '.probe_budget_ms // 2000' "$req")
+            probe_shards=$(jq -r '.probe_shards // 8' "$req")
+            run_policy=$(jq -r '.run_policy // false | tostring' "$req")
+            policy_beliefs=$(jq -r '.policy_beliefs // ""' "$req")
+            policy_beliefs_real=$(jq -r '.policy_beliefs_real // "oracle@kinf"' "$req")
+            policy_seeds=$(jq -r '.policy_seeds // 3' "$req")
+            policy_budget=$(jq -r '.policy_budget_ms // 2000' "$req")
+            policy_shards=$(jq -r '.policy_shards // 6' "$req")
+            run_continue=$(jq -r '.run_continue // false | tostring' "$req")
+            continue_policy=$(jq -r '.continue_policy // "oracle@kinf@real"' "$req")
+            continue_seeds=$(jq -r '.continue_seeds // 4' "$req")
+            continue_budget=$(jq -r '.continue_budget_ms // 2000' "$req")
+            continue_shards=$(jq -r '.continue_shards // 8' "$req")
+            continue_reps=$(jq -r '.continue_replicates // 2' "$req")
+            exp_cand=$(jq -r 'if has("expect_candidate") then .expect_candidate else "estimator" end' "$req")
+            exp_seed=$(jq -r '.expect_match_seed // ""' "$req")
+            exp_commit=$(jq -r '.expect_commit // ""' "$req")
+            exp_games=$(jq -r '.expect_games // ""' "$req")
+            exp_shards=$(jq -r '.expect_shards // ""' "$req")
+          fi
+          # 記録元が無い（リポジトリの records/ を使う）ときは1ジョブだけ回す
+          if [ -z "$run_id" ]; then
+            opponents=""
+          fi
+          {
+            echo "skip=false"
+            echo "arena_run_id=$run_id"
+            echo "opponents=$(jq -n -c --arg s "$opponents" 'if $s == "" then [""] else ($s | split(" ") | map(select(. != ""))) end')"
+            echo "probe_seeds=$probe_seeds"
+            echo "probe_budget_ms=$probe_budget"
+            echo "probe_shards=$(jq -n -c --argjson n "$probe_shards" '[range($n)]')"
+            echo "probe_shard_count=$probe_shards"
+            echo "run_policy=$run_policy"
+            echo "policy_beliefs=$policy_beliefs"
+            echo "policy_beliefs_real=$policy_beliefs_real"
+            echo "policy_seeds=$policy_seeds"
+            echo "policy_budget_ms=$policy_budget"
+            echo "policy_shards=$(jq -n -c --argjson n "$policy_shards" '[range($n)]')"
+            echo "policy_shard_count=$policy_shards"
+            echo "run_continue=$run_continue"
+            echo "continue_policy=$continue_policy"
+            echo "continue_seeds=$continue_seeds"
+            echo "continue_budget_ms=$continue_budget"
+            echo "continue_shards=$(jq -n -c --argjson n "$continue_shards" '[range($n)]')"
+            echo "continue_shard_count=$continue_shards"
+            echo "continue_replicate_list=$(jq -n -c --argjson n "$continue_reps" '[range($n)]')"
+            echo "expect_candidate=$exp_cand"
+            echo "expect_match_seed=$exp_seed"
+            echo "expect_commit=$exp_commit"
+            echo "expect_games=$exp_games"
+            echo "expect_shards=$exp_shards"
+          } >> "$GITHUB_OUTPUT"
+
+  probe:
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        opponent: ${{ fromJSON(needs.plan.outputs.opponents) }}
+        shard: ${{ fromJSON(needs.plan.outputs.probe_shards) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Download arena records
+        if: needs.plan.outputs.arena_run_id != ''
+        uses: actions/download-artifact@v7
+        with:
+          pattern: arena-records-${{ matrix.opponent }}-*
+          path: records-in
+          run-id: ${{ needs.plan.outputs.arena_run_id }}
+          github-token: ${{ github.token }}
+      - name: Download arena summaries
+        if: needs.plan.outputs.arena_run_id != ''
+        uses: actions/download-artifact@v7
+        with:
+          pattern: arena-result-${{ matrix.opponent }}-*
+          path: summaries-in
+          run-id: ${{ needs.plan.outputs.arena_run_id }}
+          github-token: ${{ github.token }}
+      - name: Download arena combined
+        if: needs.plan.outputs.arena_run_id != ''
+        uses: actions/download-artifact@v7
+        with:
+          name: arena-combined
+          path: combined-in
+          run-id: ${{ needs.plan.outputs.arena_run_id }}
+          github-token: ${{ github.token }}
+      - name: Verify arena provenance
+        if: needs.plan.outputs.arena_run_id != ''
+        env:
+          OPPONENT: ${{ matrix.opponent }}
+          RUN_ID: ${{ needs.plan.outputs.arena_run_id }}
+          GH_TOKEN: ${{ github.token }}
+          EXPECT_CANDIDATE: ${{ needs.plan.outputs.expect_candidate }}
+          EXPECT_MATCH_SEED: ${{ needs.plan.outputs.expect_match_seed }}
+          EXPECT_COMMIT: ${{ needs.plan.outputs.expect_commit }}
+          EXPECT_GAMES: ${{ needs.plan.outputs.expect_games }}
+          EXPECT_SHARDS: ${{ needs.plan.outputs.expect_shards }}
+        run: bash scripts/ci/verify_arena_provenance.sh
+      - name: P0-1 transmission
+        env:
+          TSUITATE_THINK_BUDGET_MS: ${{ needs.plan.outputs.probe_budget_ms }}
+        run: |
+          set -euo pipefail
+          run_id='${{ needs.plan.outputs.arena_run_id }}'
+          if [ -n "$run_id" ]; then
+            src=records-in
+            if [ -z "$(find "$src" -name '*.jsonl' 2>/dev/null | head -1)" ]; then
+              echo "run $run_id から相手 '${{ matrix.opponent }}' の記録を取得できませんでした" >&2
+              exit 1
+            fi
+          else
+            src=records
+          fi
+          files=$(find "$src" -name '*.jsonl' | sort)
+          opp='${{ matrix.opponent }}'
+          [ -n "$opp" ] && set -- --opponent "$opp" || set --
+          # シャード単独では母集団が揃わないので集計は aggregate に任せる
+          cargo run --release --bin check_belief_probe -- "$@" \
+            --seeds '${{ needs.plan.outputs.probe_seeds }}' \
+            --shard '${{ matrix.shard }}/${{ needs.plan.outputs.probe_shard_count }}' \
+            --allow-incomplete \
+            --out "check-belief-${{ matrix.opponent }}-s${{ matrix.shard }}.jsonl" \
+            $files | tee probe.txt
+      - uses: actions/upload-artifact@v6
+        with:
+          name: check-belief-${{ matrix.opponent }}-s${{ matrix.shard }}
+          path: |
+            check-belief-*.jsonl
+            probe.txt
+            provenance.env
+          if-no-files-found: error
+
+  probe-aggregate:
+    needs: [plan, probe]
+    if: needs.plan.outputs.skip != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        opponent: ${{ fromJSON(needs.plan.outputs.opponents) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: check-belief-${{ matrix.opponent }}-s*
+          path: shards
+      - name: Aggregate
+        run: |
+          set -euo pipefail
+          files=$(find shards -name 'check-belief-*.jsonl' | sort)
+          if [ -z "$files" ]; then
+            echo "シャードの JSONL がありません" >&2
+            exit 1
+          fi
+          # **シャードが欠けたら失敗**（母集団の分母が縮む）
+          cargo run --release --bin check_belief_probe -- report $files | tee report.txt
+          {
+            echo "## P0-1 伝達の分解（相手 ${{ matrix.opponent }}）"
+            echo '```'
+            cat report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: check-belief-report-${{ matrix.opponent }}
+          path: report.txt
+          if-no-files-found: error
+
+  policy:
+    needs: plan
+    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_policy == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        opponent: ${{ fromJSON(needs.plan.outputs.opponents) }}
+        shard: ${{ fromJSON(needs.plan.outputs.policy_shards) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Download arena records
+        if: needs.plan.outputs.arena_run_id != ''
+        uses: actions/download-artifact@v7
+        with:
+          pattern: arena-records-${{ matrix.opponent }}-*
+          path: records-in
+          run-id: ${{ needs.plan.outputs.arena_run_id }}
+          github-token: ${{ github.token }}
+      - name: P0-2 oracle arms
+        env:
+          TSUITATE_THINK_BUDGET_MS: ${{ needs.plan.outputs.policy_budget_ms }}
+        run: |
+          set -euo pipefail
+          run_id='${{ needs.plan.outputs.arena_run_id }}'
+          if [ -n "$run_id" ]; then
+            src=records-in
+            if [ -z "$(find "$src" -name '*.jsonl' 2>/dev/null | head -1)" ]; then
+              echo "記録を取得できませんでした" >&2
+              exit 1
+            fi
+          else
+            src=records
+          fi
+          files=$(find "$src" -name '*.jsonl' | sort)
+          opp='${{ matrix.opponent }}'
+          [ -n "$opp" ] && set -- --opponent "$opp" || set --
+          beliefs='${{ needs.plan.outputs.policy_beliefs }}'
+          [ -n "$beliefs" ] && set -- "$@" --belief "$beliefs" || true
+          real='${{ needs.plan.outputs.policy_beliefs_real }}'
+          set -- "$@" --belief-real "$real"
+          cargo run --release --bin check_policy -- "$@" \
+            --seeds '${{ needs.plan.outputs.policy_seeds }}' \
+            --shard '${{ matrix.shard }}/${{ needs.plan.outputs.policy_shard_count }}' \
+            --allow-incomplete \
+            --out "check-policy-${{ matrix.opponent }}-s${{ matrix.shard }}.jsonl" \
+            $files | tee policy.txt
+      - uses: actions/upload-artifact@v6
+        with:
+          name: check-belief-policy-${{ matrix.opponent }}-s${{ matrix.shard }}
+          path: |
+            check-policy-*.jsonl
+            policy.txt
+          if-no-files-found: error
+
+  policy-aggregate:
+    needs: [plan, policy]
+    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_policy == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        opponent: ${{ fromJSON(needs.plan.outputs.opponents) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: check-belief-policy-${{ matrix.opponent }}-s*
+          path: shards
+      - name: Aggregate
+        run: |
+          set -euo pipefail
+          files=$(find shards -name 'check-policy-*.jsonl' | sort)
+          [ -n "$files" ] || { echo "シャードの JSONL がありません" >&2; exit 1; }
+          # **シャードが欠けたら失敗**（決定点の分母が狂う）
+          cargo run --release --bin check_policy -- report \
+            --shards '${{ needs.plan.outputs.policy_shard_count }}' $files | tee report.txt
+          {
+            echo "## P0-2 オラクル arm（相手 ${{ matrix.opponent }}）"
+            echo '```'
+            cat report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: check-belief-policy-report-${{ matrix.opponent }}
+          path: report.txt
+          if-no-files-found: error
+
+  continue:
+    needs: plan
+    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_continue == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        opponent: ${{ fromJSON(needs.plan.outputs.opponents) }}
+        shard: ${{ fromJSON(needs.plan.outputs.continue_shards) }}
+        replicate: ${{ fromJSON(needs.plan.outputs.continue_replicate_list) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Download arena records
+        if: needs.plan.outputs.arena_run_id != ''
+        uses: actions/download-artifact@v7
+        with:
+          pattern: arena-records-${{ matrix.opponent }}-*
+          path: records-in
+          run-id: ${{ needs.plan.outputs.arena_run_id }}
+          github-token: ${{ github.token }}
+      - name: P0-2b oracle continuation
+        env:
+          TSUITATE_THINK_BUDGET_MS: ${{ needs.plan.outputs.continue_budget_ms }}
+        run: |
+          set -euo pipefail
+          run_id='${{ needs.plan.outputs.arena_run_id }}'
+          if [ -n "$run_id" ]; then
+            src=records-in
+            if [ -z "$(find "$src" -name '*.jsonl' 2>/dev/null | head -1)" ]; then
+              echo "記録を取得できませんでした" >&2
+              exit 1
+            fi
+          else
+            src=records
+          fi
+          files=$(find "$src" -name '*.jsonl' | sort)
+          opp='${{ matrix.opponent }}'
+          [ -n "$opp" ] && set -- --opponent "$opp" || set --
+          cargo run --release --bin check_continue -- "$@" \
+            --policy '${{ needs.plan.outputs.continue_policy }}' \
+            --seeds '${{ needs.plan.outputs.continue_seeds }}' \
+            --replicate '${{ matrix.replicate }}' \
+            --shard '${{ matrix.shard }}/${{ needs.plan.outputs.continue_shard_count }}' \
+            --allow-incomplete \
+            --out "check-continue-${{ matrix.opponent }}-r${{ matrix.replicate }}-s${{ matrix.shard }}.jsonl" \
+            $files | tee continue.txt
+      - uses: actions/upload-artifact@v6
+        with:
+          name: check-belief-continue-${{ matrix.opponent }}-r${{ matrix.replicate }}-s${{ matrix.shard }}
+          path: |
+            check-continue-*.jsonl
+            continue.txt
+          if-no-files-found: error
+
+  continue-aggregate:
+    needs: [plan, continue]
+    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_continue == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        opponent: ${{ fromJSON(needs.plan.outputs.opponents) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: check-belief-continue-${{ matrix.opponent }}-*
+          path: shards
+      - name: Aggregate
+        run: |
+          set -euo pipefail
+          files=$(find shards -name 'check-continue-*.jsonl' | sort)
+          [ -n "$files" ] || { echo "シャードの JSONL がありません" >&2; exit 1; }
+          # **対照は `current@real`**（shadow の current と比べると
+          # 「オラクル」と「指し直したこと」の効果が混ざる）
+          cargo run --release --bin check_continue -- report \
+            --baseline current@real $files | tee report.txt
+          {
+            echo "## P0-2b オラクルの継続上限（相手 ${{ matrix.opponent }}）"
+            echo '```'
+            cat report.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: check-belief-continue-report-${{ matrix.opponent }}
+          path: report.txt
+          if-no-files-found: error

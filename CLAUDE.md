@@ -1045,6 +1045,66 @@
   距離重み（`origin_weights`）・`adj_share`・主特徴量は発見セットで固定してから、
   **未使用の `match_seed` で取り直した Arena 実行**を指す別の起動で検証する
   （P0-2 の出力が `--origin-weights` / `--adj-share` をそのまま貼れる形で実測値を出す）
+- `TSUITATE_THINK_BUDGET_MS=2000 cargo run --release --bin check_belief_probe -- [--seeds 3]
+  [--jobs N] [--limit N] [--shard i/n] [--opponent estimator_v14]
+  [--out data/check_belief.jsonl] <records...>` /
+  `check_belief_probe report [--allow-incomplete] <jsonl...>` —
+  **王手駒仮説の希釈 P0-1: runtime の伝達の分解**（issue #36、2026-08-29）。
+  #31 P0-3 の「真の王手駒の重みシェア 0.035」は
+  `CheckSolver::new(&view, &[], &[], &log)` = **粒子投票なしのソルバー単体の事前**で、
+  runtime では `ソルバー q → 粒子投票後 q → prior_legal との積 → blend_p_legal →
+  cap/min → score → rank` と6段を通って初めて選択に届く。**仮説シェアは選択への
+  伝達量ではない**ので、ここは各段を並べるだけで**中止の門を置かない**
+  （因果はオラクル arm = P0-2 でしか言えない）。**runtime には何も入らない**。
+  - 各段は `ShadowUpdater::stages_after`（`p_after` の各段を残した版。`p_after` は
+    これの `final_p` そのもの）で取る。**分解と本番を別実装にすると「どこで消えたか」の
+    記述が嘘になる**
+  - 注目手は「**真の王手駒を玉以外で取る手**」と「**誤仮説マスへの捕獲の最大値**」の対。
+    前者が候補に無い手番は欠測にせず **coverage failure** として数える
+    （候補に無ければ完璧な信念でも救えない = この issue の上限の外）
+  - 層は `particles_vote_check` の有無 × 厳密/taint × 反則あり/なし × 初反則の手種 ×
+    王手駒の種別（打ち／盤上／捕獲つき）× 終端手番。**両王手は別層**
+  - 母集団は **bot の全王手中手番**（反則0も、**反則だけ積んで受理手なしで終局した
+    終端手番**も含む）。`for_each_decision_full` は受理手を単位に回すので終端を返さない
+    （#34 の `check_prep::decision_snapshots` を再利用）。復元できない手番は
+    **attrition として本数を出す**（改善対象の最悪ケースが系統的に欠測すると門が甘くなる）
+  - 順位は**乱数を除いたスコア**で付け直し、同点は USI の辞書順（issue #24 の教訓②）
+- **オラクル arm**（issue #36 P0-2 / P0-2b、2026-08-29）: `CheckSolver` に
+  **診断専用の仮説フック**（`scoped_hypothesis_diag`。列挙の直後に
+  `(マス, 駒種) → 倍率` と、直前手の演繹による除去）を足し、`bin/check_policy` の
+  `--belief` / `--belief-real` と `bin/check_continue` の `--policy` から設置する。
+  **設置しなければ分岐の中身を1度も実行しない**ので既定挙動は完全に不変
+  （`cargo test 診断フックは既定では何もしない`）。arm 名の規約は両バイナリ共通で
+  `[belief|policy][@shadow|@real]`（`check_belief::ArmSpec`）:
+  - `oracle@k{2,4,8,inf}@shadow` = issue の **`oracle_p_only@k`**（p だけを付け替え、
+    gain・`removal_term` は初回ランキングの値に固定する。**上限とは呼ばない**）
+  - **`oracle@kinf@real` = 主 arm `oracle_full_score@real`**（初回ランキングも
+    オラクルの下で作り直し、反則ごとに実再決定して `removal_term` まで作り直す）
+  - `oracle_misdirected@k{4,inf}` = adversarial stress test（真でない最大重みの仮説 ×k。
+    **学習事前の誤りの分布とは一致しない**ので許容誤り率への換算はしない）
+  - `deduce_last_move` = H1 ① の演繹（学習なし）。「(a) 直前の相手手で q へ着地した駒」
+    でも「(b) 元マスが空いて線が開いた静止飛び駒」でもない仮説だけを落とす。
+    捕獲つきの王手は着地点が観測で分かるので `prune_infeasible_discovered_checks` の
+    領分（何もしない）。落とそうとした仮説は **全滅 fallback の前に**記録する
+  - **`oracle@k1` は恒等対照**。`current@shadow` と bit-exact でなければ配管が壊れて
+    いるので `report` が止める。`deduce_last_move` が真仮説を落としたときも止める
+    （どちらも issue #36 の「判定以前」の中止条件）
+  - `bin/check_policy` の `ROW_SCHEMA` は **2**（schema 1 = 恒等対照と演繹の列が
+    無い時期の記録は集計から弾く。**欠けた列を「問題なし」と読むと両方の関門が
+    素通りする**ので、版の拒否と `REQUIRED_ROW_KEYS` の存在検査の両方で止める）
+  - P0-2b（`bin/check_continue`）の**対照は `current@real`**（`report --baseline
+    current@real`）。shadow の `current` と比べると「オラクル」と「指し直したこと」の
+    効果が混ざる。実再決定 arm を混ぜたら `current@real` を自動で足す。
+    思考予算は **2000ms**（ランキング段と継続段の両方に効く。700ms は別の treatment）
+- **王手駒仮説の希釈の CI**（`.github/workflows/check-belief.yml`、**通常のコード push
+  では走らない**）: `gh workflow run check-belief.yml -f arena_run_id=<Arena実行ID>`、
+  `gh` が無ければ `.github/ci/check-belief.request.json` を置いて push（削除の push は
+  全ジョブがスキップされる）。相手ごとに別ジョブ・元対局単位のシャード・**欠けたら
+  aggregate が失敗**。P0-1 は既定で走り、**P0-2（`run_policy`）と P0-2b
+  （`run_continue`）は既定オフ**（同時に有効化しない）。元 Arena 実行の実験条件の
+  検査は `scripts/ci/verify_arena_provenance.sh` に**一本化**した（`check-prep.yml`
+  から切り出した共通の関門。ワークフローごとに書くと片方だけ緩くなる）。
+  設計・契約・中止条件は `docs/check-belief-p0.md`
 - **王手中の反則経済の CI**（`.github/workflows/check-economy.yml`、**通常のコード
   push では走らない**）: `gh workflow run check-economy.yml -f arena_run_id=<Arena実行ID>
   -f opponents="estimator_v13 estimator_v14"`、`gh` が無ければ
@@ -2763,6 +2823,14 @@
   数えるための場所。手番開始時（反則0）の状態の復元（`entry_replayed`。
   `for_each_decision_full` が渡すのは反則を食った後なので、両者のログ末尾から
   反則の観測を落とす）も P0-4 / P0-5 で共有する
+- `check_belief.rs` — **王手駒仮説の希釈の共有定義**（issue #36、2026-08-29。
+  runtime には入らない診断だけ）。仮説重みへの介入 arm（`Belief`: オラクル・誤誘導・
+  直前手の演繹）と arm 名の規約（`ArmSpec` = `[belief|policy][@shadow|@real]`）・
+  1 arm を回す配管（`run_arm`。p-only と実再決定の**両方が1か所**にある）・
+  母集団の取り出し（`decision_points`。**終端手番を含む**全王手中手番と `Attrition`）・
+  伝達の分解の注目手（`focus`）。`bin/check_belief_probe`（P0-1）・
+  `bin/check_policy`（P0-2）・`bin/check_continue`（P0-2b）が**同じ arm 名で同じ配管**を
+  指すための場所（別々に書くと、削減量と勝率差が別物の測定になる）
 - `check_policy.rs` — **王手中の反則経済 P0-5 の共有定義**（issue #31、2026-08-28。
   runtime には入らない診断だけ）。1候補の最小の入力（`PolicyMove`。**p と価格の
   両方**を付け替えて score を引き直せる。`check_economy::PricedMove` は価格しか

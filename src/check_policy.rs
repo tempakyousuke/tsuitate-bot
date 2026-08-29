@@ -149,6 +149,18 @@ impl ShadowUpdater {
     /// 空なら手番開始時の p を返す（初回ランキングの p と一致するはずで、
     /// その一致率が「式を正しく再現できているか」の健全性検査になる）。
     pub fn p_after(&self, moves: &[PolicyMove], fouls: &[ShogiMove]) -> Vec<f64> {
+        self.stages_after(moves, fouls)
+            .per_move
+            .into_iter()
+            .map(|s| s.final_p)
+            .collect()
+    }
+
+    /// [`ShadowUpdater::p_after`] の**各段を残した版**（issue #36 P0-1）。
+    ///
+    /// `p_after` はこれの `final_p` そのものなので、分解と本番の値が
+    /// 食い違うことはない（別実装にすると「どこで消えたか」の記述が嘘になる）。
+    pub fn stages_after(&self, moves: &[PolicyMove], fouls: &[ShogiMove]) -> Stages {
         // 反則は「その手が真実で非合法だった」ことの証拠なので、その手が
         // 合法な粒子は物理的に棄却される（taint 粒子も物理制約は守っている）
         let keep = |pool: &[(Position, f64)]| -> Vec<(Position, f64)> {
@@ -170,6 +182,7 @@ impl ShadowUpdater {
         let mut view = self.view.clone();
         view.fouls.you = self.fouls_before + fouls.len() as u32;
         view.fouls.opponent = self.opp_fouls;
+        let can_vote = crate::check::particles_can_vote(&votes, view.your_color);
         let mut solver = CheckSolver::new(&view, &votes, fouls, &self.log);
         // 王手中の反則が積もるほど事前（CheckSolver）を信じる（`choose` と同じ）
         let mut params = self.params.clone();
@@ -178,20 +191,21 @@ impl ShadowUpdater {
         params.prior_weight_degen *= f;
 
         let n: f64 = pool.iter().map(|(_, w)| w).sum();
-        moves
+        let per_move = moves
             .iter()
             .map(|m| {
-                let mut prior = prior_legal(&view, &m.mv, self.opp_board_n);
-                prior *= match solver.as_mut() {
+                let base_prior = prior_legal(&view, &m.mv, self.opp_board_n);
+                let solver_p = match solver.as_mut() {
                     Some(s) => s.resolve_probability(&m.mv).clamp(0.02, 1.0),
                     None => strategy::in_check_prior(&view, &m.mv),
                 };
+                let prior = base_prior * solver_p;
                 let legal: f64 = pool
                     .iter()
                     .filter(|(p, _)| p.is_legal(&m.mv))
                     .map(|(_, w)| w)
                     .sum();
-                let mut p = blend_p_legal(
+                let blended = blend_p_legal(
                     legal,
                     n,
                     prior,
@@ -200,16 +214,70 @@ impl ShadowUpdater {
                     &params,
                 );
                 // 既知敵駒がカバーする玉の行き先の上限（`choose` と同じ min 専用）
-                if let Some(cap) = solver
+                let cap = solver
                     .as_ref()
-                    .and_then(|s| s.known_covered_king_move_cap(&m.mv))
-                {
-                    p = p.min(cap);
+                    .and_then(|s| s.known_covered_king_move_cap(&m.mv));
+                let mut p = blended;
+                if let Some(c) = cap {
+                    p = p.min(c);
                 }
-                p.clamp(0.0, 1.0)
+                PStage {
+                    base_prior,
+                    solver_p,
+                    prior,
+                    particle_legal: if n > 0.0 { legal / n } else { f64::NAN },
+                    blended,
+                    cap,
+                    final_p: p.clamp(0.0, 1.0),
+                }
             })
-            .collect()
+            .collect();
+        Stages {
+            hypotheses: solver
+                .as_ref()
+                .map(|s| s.hypotheses_debug())
+                .unwrap_or_default(),
+            can_vote,
+            use_taint,
+            strict_n: strict.len(),
+            pool_weight: n,
+            per_move,
+        }
     }
+}
+
+/// `p_legal` が作られる各段（issue #36 P0-1 の伝達の分解）。
+#[derive(Clone, Copy, Debug)]
+pub struct PStage {
+    /// `prior_legal`（王手を見ない経路・打ちマスの事前）
+    pub base_prior: f64,
+    /// `CheckSolver::resolve_probability`（clamp 後）
+    pub solver_p: f64,
+    /// 上2つの積 = ブレンドへ渡る事前
+    pub prior: f64,
+    /// 粒子の合法率（プールが空なら NaN）
+    pub particle_legal: f64,
+    /// `blend_p_legal` の出力
+    pub blended: f64,
+    /// 既知敵駒カバーの上限（掛かったときだけ Some）
+    pub cap: Option<f64>,
+    /// 最終 p（`p_after` の値）
+    pub final_p: f64,
+}
+
+/// 1決定ぶんの分解（[`ShadowUpdater::stages_after`] の出力）
+#[derive(Clone, Debug)]
+pub struct Stages {
+    /// 仮説集合（マス・駒種・重み。**runtime と同じ**投票・ブースト適用後）
+    pub hypotheses: Vec<(crate::board::Coord, crate::protocol::Role, f64)>,
+    /// 粒子が王手を投票できたか（`particles_vote_check`）
+    pub can_vote: bool,
+    /// taint フォールバックで評価したか
+    pub use_taint: bool,
+    pub strict_n: usize,
+    /// 評価に使ったプールの重み合計
+    pub pool_weight: f64,
+    pub per_move: Vec<PStage>,
 }
 
 /// 手番開始時（反則0）の決定を作り直した結果（P0-5 と P0-6 で共有する）。
@@ -224,6 +292,8 @@ pub struct EntrySetup {
     /// 初回ランキングの p_legal（`moves` と同じ並び）
     pub p0: Vec<f64>,
     pub updater: ShadowUpdater,
+    /// ランキングを作ったのと**同じ粒子**（issue #36 P0-1 の投票者の集計に使う）
+    pub snapshot: crate::strategy::ParticleSnapshot,
 }
 
 /// 手番開始時の状態からランキング・粒子・候補を作る。
@@ -263,7 +333,7 @@ pub fn entry_setup(
         params,
         eval_particles,
     );
-    Some(EntrySetup { strat, view, log, moves, p0, updater })
+    Some(EntrySetup { strat, view, log, moves, p0, updater, snapshot })
 }
 
 /// 相手の盤上駒数の見積り（`prior_legal` の引数。`choose` と同じ式）

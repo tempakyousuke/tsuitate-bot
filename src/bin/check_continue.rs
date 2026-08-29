@@ -45,7 +45,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tsuitate_bot::check_economy::entry_replayed;
-use tsuitate_bot::check_policy::{EntrySetup, Policy, UpdateRule, entry_setup, simulate};
+use tsuitate_bot::check_belief::{self, ArmSpec, entry_hypotheses};
+use tsuitate_bot::check_policy::entry_setup;
 use tsuitate_bot::checkpoint::stable_hash;
 use tsuitate_bot::mate_economy::force_move;
 use tsuitate_bot::observation::Observation;
@@ -326,15 +327,19 @@ fn main() {
     if !policy_tags.iter().any(|t| t == "current") {
         policy_tags.insert(0, "current".into());
     }
-    let policies: Vec<(String, Policy)> = policy_tags
+    // arm 名は `bin/check_policy` と共通の規約（`[belief|policy][@shadow|@real]`）。
+    // issue #36 P0-2b の主 arm は `oracle@kinf@real`（= `oracle_full_score@real`）
+    let mut policies: Vec<ArmSpec> = policy_tags
         .iter()
-        .map(|t| {
-            (
-                t.clone(),
-                Policy::parse(t).unwrap_or_else(|| die(&format!("未知の方策: {t}"))),
-            )
-        })
+        .map(|t| ArmSpec::parse(t).unwrap_or_else(|| die(&format!("未知の arm: {t}"))))
         .collect();
+    // **実再決定 arm を混ぜたら `current@real` も必ず取る**: shadow の `current` と
+    // 比べると「オラクル」と「指し直したこと」の効果が混ざる（#31 P0-6 の教訓と同型）
+    if policies.iter().any(|a| a.real) && !policies.iter().any(|a| a.tag == "current@real") {
+        policies.push(ArmSpec::parse("current@real").expect("既定 arm"));
+    }
+    policies.sort_by(|a, b| a.tag.cmp(&b.tag));
+    policies.dedup_by(|a, b| a.tag == b.tag);
     let files = collect_records(&specs);
     if files.is_empty() {
         die("記録ファイルが見つかりません");
@@ -469,7 +474,7 @@ fn main() {
     );
     println!(
         "相手 {opponent} / 方策 {} / 思考予算 {}ms / seeds {seeds} / jobs {jobs} / shard {}/{}",
-        policy_tags.join(","),
+        policies.iter().map(|a| a.tag.as_str()).collect::<Vec<_>>().join(","),
         cfg.think_budget_ms,
         shard.0,
         shard.1,
@@ -490,26 +495,26 @@ fn main() {
     run_parallel(jobs, policy_units.len(), |ui| {
         let (pi, seed) = policy_units[ui];
         let p = &points[pi];
-        let Some(EntrySetup { moves, p0, updater, .. }) =
-            entry_setup(&p.entry, &p.truth, seed, &params, eval_particles)
-        else {
+        let Some(setup) = entry_setup(&p.entry, &p.truth, seed, &params, eval_particles) else {
             return;
         };
-        let fouls_before = p.entry.fouls[side_idx(p.entry.pos.turn())];
-        let opp_fouls = p.entry.fouls[side_idx(p.entry.pos.turn().other())];
+        let entry_hyps = entry_hypotheses(&setup);
         let mut by_arm: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (tag, policy) in &policies {
-            let out = simulate(
-                policy,
-                &moves,
-                &p0,
+        for spec in &policies {
+            // 配管は `bin/check_policy`（P0-2）と共有する
+            let Some(run) = check_belief::run_arm(
+                &setup,
+                &p.entry,
+                &p.truth,
+                p.bot,
+                spec,
+                &entry_hyps,
                 &params,
-                fouls_before,
-                opp_fouls,
-                UpdateRule::Shadow(&updater),
-            );
-            if !out.sequence.is_empty() {
-                by_arm.insert(tag.clone(), out.sequence);
+            ) else {
+                continue;
+            };
+            if !run.out.sequence.is_empty() {
+                by_arm.insert(spec.tag.clone(), run.out.sequence);
             }
         }
         orders.lock().unwrap().insert((pi, seed), by_arm);
@@ -591,7 +596,9 @@ fn main() {
         "opponent": opponent,
         "budget_ms": cfg.think_budget_ms,
         "seeds": seeds,
-        "policies": policy_tags,
+        // **解決後の arm 名**を残す（`current@real` の自動追加を含む。
+        // 宣言と実際がずれると完全性検査が空振りする）
+        "policies": policies.iter().map(|a| a.tag.clone()).collect::<Vec<_>>(),
         "policy_jobs": policy_jobs,
         "continuation_jobs": continuation_jobs,
         "games": games,
@@ -739,6 +746,17 @@ fn delta_ci(
 }
 
 fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incomplete: bool) {
+    report_vs(metas, rows, allow_incomplete, "current")
+}
+
+/// 対照 arm を指定できる版（issue #36 P0-2b は `current@real` と比べる:
+/// shadow の `current` と比べると「オラクル」と「指し直したこと」が混ざる）
+fn report_vs(
+    metas: &[serde_json::Value],
+    rows: &[serde_json::Value],
+    allow_incomplete: bool,
+    baseline: &str,
+) {
     for msg in check_inputs(metas, rows) {
         if allow_incomplete {
             eprintln!("警告: {msg}");
@@ -803,6 +821,12 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
             .iter()
             .map(|r| r["arm"].as_str().unwrap_or("?").to_string())
             .collect();
+        // 対照 arm が無いと `Δ − Δ対照` が黙って「対照 0」になる
+        if !arms.contains(baseline) {
+            die(&format!(
+                "対照 arm {baseline} の行がありません（estimand {estimand}）: {arms:?}"
+            ));
+        }
         let score = contributions(&sel, &|r| r["score"].as_f64().unwrap_or(0.0));
         let fouls = contributions(&sel, &|r| r["immediate_fouls"].as_f64().unwrap_or(0.0));
         // **bot 側の反則負けだけ**を数える（相手の反則負け＝bot の勝ちを混ぜない）
@@ -827,14 +851,14 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
         );
         for arm in &arms {
             let (d, _, _) = delta_ci(&score, arm, None, games_total);
-            let (dd, lo, hi) = delta_ci(&score, arm, Some("current"), games_total);
+            let (dd, lo, hi) = delta_ci(&score, arm, Some(baseline), games_total);
             let (f, _, _) = delta_ci(&fouls, arm, None, games_total);
             let (c, _, _) = delta_ci(&cat, arm, None, games_total);
             let (fl, _, _) = delta_ci(&loss, arm, None, games_total);
             let (fw, _, _) = delta_ci(&win, arm, None, games_total);
             println!(
                 "  {arm:<18} {d:>+9.4} {:>26} {f:>9.3} {:>9.1} {:>9.1} {:>9.1}",
-                if arm == "current" {
+                if arm.as_str() == baseline {
                     "—".to_string()
                 } else {
                     format!("{dd:+.4} [{lo:+.4}, {hi:+.4}]")
@@ -849,11 +873,11 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
         }
         // 門（issue #31 で事前登録）
         println!("  判定:");
-        for arm in arms.iter().filter(|a| *a != "current" && *a != "baseline") {
-            let (dd, lo, hi) = delta_ci(&score, arm, Some("current"), games_total);
-            let (df, _, _) = delta_ci(&fouls, arm, Some("current"), games_total);
-            let (dl, _, _) = delta_ci(&loss, arm, Some("current"), games_total);
-            let (dc, _, _) = delta_ci(&cat, arm, Some("current"), games_total);
+        for arm in arms.iter().filter(|a| a.as_str() != baseline && *a != "baseline") {
+            let (dd, lo, hi) = delta_ci(&score, arm, Some(baseline), games_total);
+            let (df, _, _) = delta_ci(&fouls, arm, Some(baseline), games_total);
+            let (dl, _, _) = delta_ci(&loss, arm, Some(baseline), games_total);
+            let (dc, _, _) = delta_ci(&cat, arm, Some(baseline), games_total);
             // **full β だけが反則増を許される**（β-order は反則経済施策なので
             // 即時反則の非増加が必須。issue #31 の事前登録）
             let full_beta = arm.starts_with("beta@");
@@ -1161,11 +1185,27 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
 
 fn run_report(args: &[String]) {
     let allow_incomplete = args.iter().any(|a| a == "--allow-incomplete");
-    let paths: Vec<String> = args
-        .iter()
-        .filter(|a| !a.starts_with("--"))
-        .cloned()
-        .collect();
+    // 対照 arm（既定 `current`）。issue #36 P0-2b は `--baseline current@real`
+    let mut baseline = "current".to_string();
+    let mut paths: Vec<String> = vec![];
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--allow-incomplete" => i += 1,
+            "--baseline" => {
+                baseline = args
+                    .get(i + 1)
+                    .cloned()
+                    .unwrap_or_else(|| die("--baseline には arm 名が必要です"));
+                i += 2;
+            }
+            a if a.starts_with("--") => die(&format!("未知のオプション: {a}")),
+            a => {
+                paths.push(a.to_string());
+                i += 1;
+            }
+        }
+    }
     if paths.is_empty() {
         die("report には JSONL を指定してください");
     }
@@ -1193,8 +1233,8 @@ fn run_report(args: &[String]) {
             }
         }
     }
-    println!("JSONL {} 本 / 行 {}", paths.len(), rows.len());
-    report(&metas, &rows, allow_incomplete);
+    println!("JSONL {} 本 / 行 {} / 対照 {baseline}", paths.len(), rows.len());
+    report_vs(&metas, &rows, allow_incomplete, &baseline);
 }
 
 #[cfg(test)]
