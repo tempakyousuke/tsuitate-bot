@@ -988,7 +988,13 @@
     `match_seed_base=20260829` を記録するのに対局は 7 由来）。3値のどれか1つでも
     指定されたら3値が揃い `match_seed == base + shard` であることを要求し、
     違えば run 自体を落とす（数値 env が指定されているのに parse できないときも
-    黙って未指定扱いにしない）。**`match_seed_base` は PR #35 で足したフィールド**
+    黙って未指定扱いにしない）。**この照合を `jq` の数値演算で書いてはいけない**
+    （jq は IEEE-754 倍精度なので 2^53 超の `u64` seed を正確に加算できず、正常な run を
+    拒否する。実測で `arena-summary.json` に base=9007199254740993 / shard=1 /
+    env=9007199254740994 が正確に残っているのに jq の `base + shard` は MISMATCH を出す）。
+    workflow 側の検査は `scripts/ci/verify_seed_provenance.py` に切り出して Python の
+    `json` で整数のまま読み、CI が毎回 `--self-test` を先に走らせる。
+    **`match_seed_base` は PR #35 で足したフィールド**
     なので、それより前の commit で回した run（発見セットの 32697854659 /
     33179939954 など）には `expect_match_seed` を指定できず、
     **検証セットには使えない**

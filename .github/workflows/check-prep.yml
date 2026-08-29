@@ -339,44 +339,41 @@ jobs:
           # `arena-games.jsonl` / `arena-summary.json` の `match_seed` は
           # 「base + shard」をさらに**基準ごとに XOR した実効値**なので、
           # シャードごとに違うし base とも一致しない（PR #35 レビュー2巡目 [P1]）。
-          # 照合は arena が明示的に残す `match_seed_base` で行う（式を複製しない）
-          base=$(jq -r '.match_seed_base // empty | tostring' shard-summaries.jsonl | sort -u)
-          shards_rec=$(jq -r '.match_seed_shard // empty | tostring' shard-summaries.jsonl | sort -n | tr '\n' ' ')
-          if [ -n "$base" ]; then
-            if [ "$(echo "$base" | wc -l)" -ne 1 ]; then
-              echo "::error::シャード間で match_seed_base が食い違います: $(echo $base)"
+          # 照合は arena が明示的に残す `match_seed_base` で行う（式を複製しない）。
+          #
+          # **この段は jq で数値を触らない**（PR #35 レビュー4巡目 [P2]）: jq の
+          # 数値演算は IEEE-754 倍精度なので、seed の型（`u64`）が 2^53 を超えると
+          # 加算が壊れ、**正常な run を拒否する**（実測: base=9007199254740993 /
+          # shard=1 / env=9007199254740994 は Rust 側の検査を正しく通り summary にも
+          # 正確に残るのに、jq の `base + shard` は 9007199254740992 になって不一致に
+          # なる）。標準的な 64-bit 乱数 seed で検証セットへ進めなくなるので、
+          # **Python の json で整数のまま**読んで任意精度で比べる
+          # 自己検査を先に通す（この段の門はここにしか無いので、毎回走らせる）
+          python3 scripts/ci/verify_seed_provenance.py --self-test
+          seed_out=$(python3 scripts/ci/verify_seed_provenance.py \
+            shard-summaries.jsonl "$EXPECT_MATCH_SEED" "$n")
+          case "$seed_out" in
+            OK:*)
+              rest=${seed_out#OK:}
+              printf 'match_seed_base=%s\nmatch_seed_shards=%s\n' \
+                "${rest%%:*}" "${rest#*:}" >> provenance.env
+              ;;
+            ERR:*)
+              echo "::error::${seed_out#ERR:}"
               exit 1
-            fi
-            printf 'match_seed_base=%s\nmatch_seed_shards=%s\n' "$base" "$shards_rec" >> provenance.env
-            # 記録された shard 番号の集合も 0..n-1 で完備か（artifact 名とは独立の裏取り）
-            want_rec=$(seq 0 $((n - 1)) | tr '\n' ' ')
-            if [ "$shards_rec" != "$want_rec" ]; then
-              echo "::error::記録の match_seed_shard が 0..$((n-1)) で完備ではありません（$shards_rec）"
+              ;;
+            NOBASE)
+              if [ -n "$EXPECT_MATCH_SEED" ]; then
+                echo "::error::arena-summary.json に match_seed_base がありません（元 run の commit がこのフィールドより前か、match_seed 無しで回した run）。どちらにせよ検証セットの独立 seed を機械的に固定できません"
+                exit 1
+              fi
+              echo "::warning::arena-summary.json に match_seed_base がありません（元 run が古いか match_seed 無し）。match_seed を記録から確かめられないので**検証セットには使えません**"
+              ;;
+            *)
+              echo "::error::seed の検査が想定外の出力を返しました: $seed_out"
               exit 1
-            fi
-            if [ -n "$EXPECT_MATCH_SEED" ] && [ "$base" != "$EXPECT_MATCH_SEED" ]; then
-              echo "::error::match_seed_base が期待と違います（期待 $EXPECT_MATCH_SEED / 実際 $base）"
-              exit 1
-            fi
-            # **ラベルと実物の一致**（PR #35 レビュー3巡目 [P2]）。本来の関門は
-            # `bin/arena` の起動時検査（`check_seed_provenance`）で、そこを通った
-            # binary なら必ず `match_seed_env == base + shard`。ここは
-            # **その検査より前の binary で回した run**（base は残るが未検査）を
-            # 弾くための裏取りで、XOR の式は複製していない（単純な加算のみ）
-            bad=$(jq -r 'select((.match_seed_base != null) and (.match_seed_shard != null) and (.match_seed_env != null))
-                         | select(.match_seed_env != (.match_seed_base + .match_seed_shard))
-                         | "shard \(.match_seed_shard): env=\(.match_seed_env) != base=\(.match_seed_base)+shard=\(.match_seed_shard)"' \
-                  shard-summaries.jsonl)
-            if [ -n "$bad" ]; then
-              echo "::error::match_seed_base のラベルが実際の対局 seed と一致しません: $bad"
-              exit 1
-            fi
-          elif [ -n "$EXPECT_MATCH_SEED" ]; then
-            echo "::error::arena-summary.json に match_seed_base がありません（元 run の commit がこのフィールドより前か、match_seed 無しで回した run）。どちらにせよ検証セットの独立 seed を機械的に固定できません"
-            exit 1
-          else
-            echo "::warning::arena-summary.json に match_seed_base がありません（元 run が古いか match_seed 無し）。match_seed を記録から確かめられないので**検証セットには使えません**"
-          fi
+              ;;
+          esac
           printf 'games=%s\nshards=%s\n' "$games" "$n" >> provenance.env
           echo "検証済みの実験条件:"; cat provenance.env
           {

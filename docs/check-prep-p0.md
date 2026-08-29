@@ -125,7 +125,7 @@
 `expect_match_seed` を必ず渡す**（発見セットと独立な seed であることを機械的に
 固定するため）。どれか1つでも外れたら解析を進めない。
 
-3点、実装で踏んだ落とし穴がある（PR #35 レビュー2〜3巡目）:
+4点、実装で踏んだ落とし穴がある（PR #35 レビュー2〜4巡目）:
 
 - **`match_seed` の照合は `match_seed_base` で行う**。記録に残る `match_seed` は
   arena.yml が付ける**シャードずらし**（`base + shard`）に、さらに `bin/arena` が
@@ -155,6 +155,17 @@
   この検査をすり抜けるため）。workflow 側の
   `match_seed_env == base + shard` は、**この検査より前の binary で回した run**
   （base は残るが未検査）を弾くための裏取り
+- **その裏取りを `jq` の数値演算で書いてはいけない**。jq は IEEE-754 倍精度なので
+  2^53 を超える整数を正確に加算できず、seed の型（`u64`）が普通に踏む範囲で
+  **正常な run を拒否する**（実測: 実際の `arena-summary.json` に
+  base=9007199254740993 / shard=1 / env=9007199254740994 が正確に残っているのに、
+  `jq 'select(.match_seed_env != (.match_seed_base + .match_seed_shard))'` は
+  MISMATCH を出す。標準的な 64-bit 乱数 seed で検証セットへ進めなくなる）。
+  この段は `scripts/ci/verify_seed_provenance.py` に切り出し、Python の `json` で
+  **整数のまま**読んで任意精度で比べる。関門がここにしか無いので
+  `--self-test`（2^53 超・u64 上限近く・ラベル食い違い・シャード欠落・base 無し）を
+  CI が毎回先に走らせる。**`jq ... | tostring` は jq 1.7 の number preservation で
+  桁落ちしない**が、演算を1回でも通すと壊れるので、この段では読み出しごと Python へ寄せた
 
 ## 実測（発見セット: Arena run 32697854659 = main vs v13 / v14 各104局、`match_seed=20260815`）
 
