@@ -934,6 +934,10 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
     );
 }
 
+/// 完全性検査の単位: `(replicate, game, move_number, estimand, seed, arm)`。
+/// meta が宣言した集合と行の集合をこの粒度で厳密一致させる
+type Key = (u64, String, u64, String, u64, String);
+
 fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<String> {
     let mut out = vec![];
     if metas.is_empty() {
@@ -1037,8 +1041,11 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
             }
         }
     }
-    // 重複行（**replicate をキーに含める**。2回実行の同じ決定点は重複ではない）
-    let mut keys: HashSet<(u64, String, u64, u64, String)> = HashSet::new();
+    // 重複行（**replicate をキーに含める**。2回実行の同じ決定点は重複ではない）。
+    // 重複の判定に `estimand` は入れない: 同じ unit の行が estimand 違いで2本あるのは
+    // 重複（二重計上）であって別の決定点ではない
+    let mut dup_keys: HashSet<(u64, String, u64, u64, String)> = HashSet::new();
+    let mut keys: HashSet<Key> = HashSet::new();
     let mut dups = 0;
     for r in rows {
         let k = (
@@ -1048,7 +1055,20 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
             r["seed"].as_u64().unwrap_or(0),
             r["arm"].as_str().unwrap_or("?").to_string(),
         );
-        if !keys.insert(k) {
+        // **`estimand` も実キーに入れる**（PR #33 レビュー6巡目 [P1]）。
+        // `report` は**行側の** `estimand` で有効性側（foul）と非劣性側（nofoul）へ
+        // 分けるので、meta と行で値が食い違うと片方の replicate が別の関門へ移り、
+        // 結論が静かに変わる。未知の estimand も期待キーに無いので同時に弾ける
+        let full = (
+            k.0,
+            k.1.clone(),
+            k.2,
+            r["estimand"].as_str().unwrap_or("?").to_string(),
+            k.3,
+            k.4.clone(),
+        );
+        keys.insert(full);
+        if !dup_keys.insert(k) {
             dups += 1;
         }
     }
@@ -1068,21 +1088,21 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
     for p in first["policies"].as_array().into_iter().flatten() {
         want.push(p.as_str().unwrap_or("?").to_string());
     }
-    let mut want_keys: HashSet<(u64, String, u64, u64, String)> = HashSet::new();
+    let mut want_keys: HashSet<Key> = HashSet::new();
     for m in metas {
         let rep = m["replicate"].as_u64().unwrap_or(0);
         for d in m["points_detail"].as_array().into_iter().flatten() {
             let g = d["game"].as_str().unwrap_or("?").to_string();
             let mn = d["move_number"].as_u64().unwrap_or(0);
+            let es = d["estimand"].as_str().unwrap_or("?").to_string();
             for arm in &want {
                 for seed in 0..seeds {
-                    want_keys.insert((rep, g.clone(), mn, seed, arm.clone()));
+                    want_keys.insert((rep, g.clone(), mn, es.clone(), seed, arm.clone()));
                 }
             }
         }
     }
-    let show =
-        |k: &(u64, String, u64, u64, String)| format!("rep{} {}#{} {} seed{}", k.0, k.1, k.2, k.4, k.3);
+    let show = |k: &Key| format!("rep{} {}#{}[{}] {} seed{}", k.0, k.1, k.2, k.3, k.5, k.4);
     let head = |v: &[String]| {
         format!(
             "{}{}",
@@ -1103,7 +1123,7 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
     extras.sort();
     if !extras.is_empty() {
         out.push(format!(
-            "meta が宣言していない行が {} 件あります（範囲外の seed・未宣言の決定点・meta に無い replicate）: {}",
+            "meta が宣言していない行が {} 件あります（範囲外の seed・未宣言の決定点・meta と食い違う estimand・meta に無い replicate）: {}",
             extras.len(),
             head(&extras)
         ));
@@ -1383,6 +1403,32 @@ mod tests {
             problems.iter().any(|p| p.contains("決定点母集団")),
             "別の標本を 2 replicate として受理した: {problems:?}"
         );
+    }
+
+    /// **行の `estimand` は meta と照合する**（PR #33 レビュー6巡目 [P1]）。
+    /// `report` は**行側の** `estimand` で有効性側（foul）と非劣性側（nofoul）へ
+    /// 分けるので、meta を変えずに行の estimand だけ入れ替えると、片方の replicate が
+    /// 別の関門へ移って結論が静かに変わる。未知の estimand も同じ経路で弾く
+    #[test]
+    fn 行のestimandがmetaと違ったら止まる() {
+        for swapped in ["nofoul", "unknown"] {
+            let rows: Vec<serde_json::Value> = full()
+                .into_iter()
+                .map(|mut r| {
+                    r["estimand"] = serde_json::json!(swapped);
+                    r
+                })
+                .collect();
+            let problems = check_inputs(&[meta(exp(), 0)], &rows);
+            assert!(
+                problems.iter().any(|p| p.contains("宣言していない")),
+                "estimand {swapped} への入れ替えが素通りした: {problems:?}"
+            );
+            assert!(
+                problems.iter().any(|p| p.contains("欠けています")),
+                "meta が宣言した estimand の行が欠けたことを検出できていない: {problems:?}"
+            );
+        }
     }
 
     /// 未宣言の決定点・meta に無い replicate ラベルの行も拒否する
