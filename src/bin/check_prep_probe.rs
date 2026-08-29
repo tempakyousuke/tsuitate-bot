@@ -807,94 +807,149 @@ fn report_k_defs(rows: &[Row]) {
     );
 }
 
-/// 段1: **構成概念検証**。F1 の起点別被覆が oracle（実際の王手駒を玉以外で
-/// 真に合法に取れたか）をどれだけ再現するか。ここで落ちたら次へ進まない
+/// 構成概念検証の層（issue #34: **F1 は距離2以上・隣接は F3 の領分・両王手は別層**）。
+///
+/// 実測で王手の 8 割が隣接から来るので、層を分けずに1つの適合率を出すと
+/// **F1 の門を隣接（別概念）が支配する**（PR #35 レビュー [P1]）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Layer {
+    /// C(K)（距離2以上）から来た王手 = F1 の領分
+    Far,
+    /// 隣接（距離1）から来た王手 = F3 の領分
+    Adjacent,
+    /// 両王手（「全王手駒を除去可能か」を手番単位で判定する別層）
+    Double,
+}
+
+impl Layer {
+    fn label(self) -> &'static str {
+        match self {
+            Layer::Far => "F1（C(K) = 距離2以上）",
+            Layer::Adjacent => "隣接（F3 の領分）",
+            Layer::Double => "両王手（別層）",
+        }
+    }
+    fn of(r: &Row) -> Option<Layer> {
+        if !r.next_is_check {
+            return None;
+        }
+        match (r.double_check, r.origin_in_c) {
+            (Some(true), _) => Some(Layer::Double),
+            (_, Some(true)) => Some(Layer::Far),
+            (_, Some(false)) => Some(Layer::Adjacent),
+            _ => None,
+        }
+    }
+}
+
+/// その層の (被覆あり件数, うち oracle 陽性, 被覆なし件数, うち oracle 陽性)
+fn layer_counts(rows: &[&Row], layer: Layer) -> (u32, u32, u32, u32) {
+    let (mut on, mut off) = ((0u32, 0u32), (0u32, 0u32));
+    for r in rows.iter().filter(|r| Layer::of(r) == Some(layer)) {
+        let (Some(c), Some(o)) = (r.origin_covered, r.oracle_nonking_capture) else {
+            continue;
+        };
+        let s = if c { &mut on } else { &mut off };
+        s.0 += 1;
+        s.1 += u32::from(o);
+    }
+    (on.0, on.1, off.0, off.1)
+}
+
+fn layer_precision(rows: &[&Row], layer: Layer) -> Option<f64> {
+    let (n, k, _, _) = layer_counts(rows, layer);
+    (n > 0).then(|| f64::from(k) / f64::from(n))
+}
+
+fn layer_lift(rows: &[&Row], layer: Layer) -> Option<f64> {
+    let (n1, k1, n0, k0) = layer_counts(rows, layer);
+    (n1 > 0 && n0 > 0)
+        .then(|| f64::from(k1) / f64::from(n1) - f64::from(k0) / f64::from(n0))
+}
+
+/// 段1: **構成概念検証**。起点の被覆が oracle（実際の王手駒を玉以外で真に合法に
+/// 取れたか）をどれだけ再現するか。**層ごとに独立の門**を出し、
+/// **段3へ進む条件は F1 層の門**（主 estimand が F1 由来だから）。
 fn report_construct(rows: &[Row], cl: &[Vec<Row>]) -> bool {
+    let refs: Vec<&Row> = rows.iter().collect();
     let checked: Vec<&Row> = rows.iter().filter(|r| r.next_is_check).collect();
-    println!("\n## 段1: 構成概念検証（王手起点の被覆 vs oracle）");
+    println!("\n## 段1: 構成概念検証（王手起点の被覆 vs oracle。**層ごとに独立の門**）");
     if checked.is_empty() {
         println!("  被王手の事例がありません");
         return false;
     }
-    let mut tab = [[0u32; 2]; 2]; // [被覆][oracle]
-    for r in &checked {
-        let (Some(c), Some(o)) = (r.origin_covered, r.oracle_nonking_capture) else { continue };
-        tab[usize::from(c)][usize::from(o)] += 1;
-    }
-    let n: u32 = tab.iter().flatten().sum();
+    let oracle_pos = checked.iter().filter(|r| r.oracle_nonking_capture == Some(true)).count();
     println!(
         "  被王手 {} 件 / oracle 陽性（玉以外で王手駒を真に合法に取れた）{} 件 ({:.1}%)",
         checked.len(),
-        tab[0][1] + tab[1][1],
-        ratio(tab[0][1] + tab[1][1], n) * 100.0,
+        oracle_pos,
+        ratio(oracle_pos as u32, checked.len() as u32) * 100.0,
     );
-    // **適合率が主指標**。「被覆なし → oracle 陰性」はほぼ論理的帰結（被覆は
-    // 真の利きの楽観上限なので、被覆が無ければ真の取り手も無い）で、
-    // handoff から entry の間に王手手が形を壊した場合にだけ例外が出る。
-    // したがってリフトは下駄を履いており、実質の中身は適合率のほう
-    let prec = |rs: &[&Row], sure: bool| -> Option<f64> {
+    println!(
+        "  注: 「被覆なし → oracle 陰性」はほぼ**論理的帰結**（被覆は真の利きの楽観上限）なので、\n     リフトではなく**適合率**が構成概念検証の中身。例外は handoff から entry の間に王手手が形を壊した場合"
+    );
+
+    let mut f1_pass = false;
+    for layer in [Layer::Far, Layer::Adjacent, Layer::Double] {
+        let (n1, k1, n0, k0) = layer_counts(&refs, layer);
+        let n = n1 + n0;
+        if n == 0 {
+            println!("  {}: 0件", layer.label());
+            continue;
+        }
+        println!(
+            "  {} {n}件: 被覆あり {n1}（→ oracle 陽性 {k1}）/ 被覆なし {n0}（→ 陽性 {k0}）",
+            layer.label()
+        );
+        let Some(prec) = layer_precision(&refs, layer) else {
+            println!("    適合率: 判定不能（被覆ありが 0 件）");
+            continue;
+        };
+        let (plo, phi) =
+            cluster_bootstrap(cl, |rs| layer_precision(rs, layer), 0.05, 0x2034_0001);
+        print!("    適合率 {prec:.3} [95% CI {plo:.3}, {phi:.3}]");
+        match layer_lift(&refs, layer) {
+            Some(l) => {
+                let (llo, lhi) =
+                    cluster_bootstrap(cl, |rs| layer_lift(rs, layer), 0.05, 0x2034_0011);
+                println!(" / リフト {l:+.3} [{llo:+.3}, {lhi:+.3}]");
+                if layer == Layer::Far {
+                    f1_pass = plo > 0.5 && llo > 0.0;
+                }
+            }
+            None => {
+                println!(" / リフト: 判定不能（被覆あり/なしの片側が空）");
+                if layer == Layer::Far {
+                    f1_pass = false;
+                }
+            }
+        }
+    }
+    // 確定利きだけに絞った適合率（楽観レイの上乗せぶんの誤りを見る。層は F1）
+    let sure = |rs: &[&Row]| -> Option<f64> {
         let (mut n, mut k) = (0u32, 0u32);
-        for r in rs.iter().filter(|r| r.next_is_check) {
-            let flag = if sure { r.origin_covered_sure } else { r.origin_covered };
-            let (Some(true), Some(o)) = (flag, r.oracle_nonking_capture) else { continue };
+        for r in rs.iter().filter(|r| Layer::of(r) == Some(Layer::Far)) {
+            let (Some(true), Some(o)) = (r.origin_covered_sure, r.oracle_nonking_capture) else {
+                continue;
+            };
             n += 1;
             k += u32::from(o);
         }
         (n > 0).then(|| f64::from(k) / f64::from(n))
     };
-    let refs: Vec<&Row> = rows.iter().collect();
-    let sure_n = checked.iter().filter(|r| r.origin_covered_sure == Some(true)).count();
-    println!(
-        "  被覆あり {} 件（うち確定利き {sure_n} 件）→ oracle 陽性 {} / 被覆なし {} 件 → oracle 陽性 {}",
-        tab[1][0] + tab[1][1],
-        tab[1][1],
-        tab[0][0] + tab[0][1],
-        tab[0][1],
-    );
-    println!(
-        "  注: 「被覆なし → oracle 陰性」はほぼ**論理的帰結**（被覆は真の利きの楽観上限）なので、\n     リフトではなく**適合率**が構成概念検証の中身。例外は handoff から entry の間に王手手が形を壊した場合"
-    );
-    for (label, sure) in [("被覆あり（確定＋レイ）", false), ("確定利きのみ", true)] {
-        match prec(&refs, sure) {
-            Some(v) => {
-                let (lo, hi) =
-                    cluster_bootstrap(cl, |rs| prec(rs, sure), 0.05, 0x2034_0001 + u64::from(sure));
-                println!("  適合率 {label}: {:.3} [95% CI {lo:.3}, {hi:.3}]", v);
-            }
-            None => println!("  適合率 {label}: 判定不能（該当なし）"),
-        }
+    if let Some(v) = sure(&refs) {
+        let (lo, hi) = cluster_bootstrap(cl, sure, 0.05, 0x2034_0002);
+        println!("  F1 層のうち**確定利きのみ**での適合率: {v:.3} [95% CI {lo:.3}, {hi:.3}]");
     }
-    let lift = |rs: &[&Row]| -> Option<f64> {
-        let (mut on, mut off) = ((0u32, 0u32), (0u32, 0u32));
-        for r in rs.iter().filter(|r| r.next_is_check) {
-            let (Some(c), Some(o)) = (r.origin_covered, r.oracle_nonking_capture) else {
-                continue;
-            };
-            let s = if c { &mut on } else { &mut off };
-            s.0 += 1;
-            s.1 += u32::from(o);
-        }
-        (on.0 > 0 && off.0 > 0)
-            .then(|| f64::from(on.1) / f64::from(on.0) - f64::from(off.1) / f64::from(off.0))
-    };
-    let (Some(p), Some(l)) = (prec(&refs, false), lift(&refs)) else {
-        println!("  → 構成概念検証: **判定不能**（片側が空。反則回帰へ進まない）");
-        return false;
-    };
-    let (plo, _) = cluster_bootstrap(cl, |rs| prec(rs, false), 0.05, 0x2034_0001);
-    let (llo, lhi) = cluster_bootstrap(cl, |rs| lift(rs), 0.05, 0x2034_0011);
-    println!("  リフト（参考）: {l:+.3} [95% CI {llo:+.3}, {lhi:+.3}]");
-    // 事前登録の門: 適合率の CI 下限 > 0.5 かつ リフトの CI 下限 > 0
-    let pass = plo > 0.5 && llo > 0.0;
     println!(
-        "  → 構成概念検証（門: 適合率の CI 下限 > 0.5 かつ リフトの CI 下限 > 0）: {}",
-        if pass {
-            format!("通過（適合率 {p:.3}・下限 {plo:.3}）")
+        "  → 構成概念検証（門: **F1 層**の適合率 CI 下限 > 0.5 かつ リフト CI 下限 > 0）: {}",
+        if f1_pass {
+            "通過"
         } else {
-            format!("**不通過**（適合率 {p:.3}・下限 {plo:.3} / リフト下限 {llo:+.3}）→ 反則回帰へ進まない")
+            "**不通過** → 反則回帰へ進まない（隣接層が通っていても F1 の門にはならない）"
         }
     );
-    pass
+    f1_pass
 }
 
 /// 段2: **発火母数**。改善可能でなければ、相関があっても項にできない
@@ -988,11 +1043,17 @@ fn report_decomposition(rows: &[Row]) {
     );
 }
 
-/// 主 estimand と secondary（Holm 補正）
+/// 主 estimand と secondary（Holm 補正）。
+///
+/// **主特徴量は名前で保持する**（PR #35 レビュー [P2]）: 当てはめが落ちた特徴量を
+/// 結果列から詰めてしまうと、`results[0]` に繰り上がった secondary が
+/// 「事前登録の主」として無補正で表示され、Holm 補正も免れる。
+/// **主が判定不能なら secondary を昇格させず、段3ごと判定不能にする**。
 fn report_estimand(rows: &[Row], cl: &[Vec<Row>], boots: usize) {
     println!("\n## 段3: 主 estimand（層を固定した Q90 − Q10 の周辺平均差）");
+    const PRIMARY: &str = "f1_cov_w（主）";
     let feats: Vec<(&str, fn(&Row) -> f64)> = vec![
-        ("f1_cov_w（主）", |r: &Row| r.f1_cov_w),
+        (PRIMARY, |r: &Row| r.f1_cov_w),
         ("f1_cov_sure/total", |r: &Row| {
             if r.f1_total == 0 { 0.0 } else { f64::from(r.f1_cov_sure) / f64::from(r.f1_total) }
         }),
@@ -1005,63 +1066,106 @@ fn report_estimand(rows: &[Row], cl: &[Vec<Row>], boots: usize) {
         ("f2_open_len", |r: &Row| f64::from(r.f2_open_len)),
         ("f2_flight_all", |r: &Row| f64::from(r.f2_flight_all)),
     ];
-    let mut results: Vec<(String, f64, f64, f64, f64)> = vec![];
+    let mut results: Vec<Est> = vec![];
     for (name, f) in &feats {
-        let build = |rs: &[&Row]| -> Vec<hurdle::Row> {
-            rs.iter()
-                .map(|r| hurdle::Row {
-                    x: f(r),
-                    z: covariates_with(r, None),
-                    y: r.fouls_in_check.min(r.remaining),
-                    cap: r.remaining,
-                })
-                .collect()
-        };
-        let refs: Vec<&Row> = rows.iter().collect();
-        let all = build(&refs);
-        let mut xs: Vec<f64> = all.iter().map(|r| r.x).collect();
-        let lo_q = hurdle::quantile(&mut xs.clone(), 0.1);
-        let hi_q = hurdle::quantile(&mut xs, 0.9);
-        if (hi_q - lo_q).abs() < 1e-12 {
-            println!("  {name}: Q10 と Q90 が同じ値（変動が無い）ので判定不能");
-            continue;
-        }
-        let Some(point) = hurdle::contrast(&all, lo_q, hi_q, 1e-4) else {
-            println!("  {name}: 当てはめが収束しませんでした");
-            continue;
-        };
-        let stat = |rs: &[&Row]| hurdle::contrast(&build(rs), lo_q, hi_q, 1e-4);
-        let (blo, bhi) = bootstrap_n(cl, stat, 0.05, 0x2034_0003, boots);
-        // 両側のブートストラップ p 値（0 を跨ぐ側の割合の2倍）
-        let p = boot_p(cl, stat, 0x2034_0003, boots);
-        results.push((format!("{name}"), point, blo, bhi, p));
+        results.push(estimate(rows, cl, boots, name, *name == PRIMARY, |r| f(r), None));
     }
-    // Holm 補正（主特徴量は事前登録の1本なので補正の対象は secondary）
-    let mut order: Vec<usize> = (1..results.len()).collect();
-    order.sort_by(|a, b| results[*a].4.total_cmp(&results[*b].4));
+    // Holm 補正は **secondary だけ**（主は事前登録の1本なので補正しない）
+    let mut adj = vec![1.0f64; results.len()];
+    let mut order: Vec<usize> = (0..results.len())
+        .filter(|i| !results[*i].primary && results[*i].got.is_some())
+        .collect();
+    order.sort_by(|a, b| results[*a].got.unwrap().3.total_cmp(&results[*b].got.unwrap().3));
     let m = order.len();
-    let mut adj = vec![0.0; results.len()];
     let mut running: f64 = 0.0;
     for (rank, idx) in order.iter().enumerate() {
-        running = running.max(results[*idx].4 * (m - rank) as f64);
+        running = running.max(results[*idx].got.unwrap().3 * (m - rank) as f64);
         adj[*idx] = running.min(1.0);
     }
-    for (i, (name, point, lo, hi, p)) in results.iter().enumerate() {
-        if i == 0 {
-            println!(
-                "  **{name}**: {point:+.4} 反則/手番 [95% CI {lo:+.4}, {hi:+.4}] / p={p:.4}（事前登録の主 estimand。補正なし）"
-            );
-        } else {
-            println!(
-                "  {name}: {point:+.4} [95% CI {lo:+.4}, {hi:+.4}] / p={p:.4} → Holm 補正後 p={:.4}",
-                adj[i]
-            );
+    for (i, e) in results.iter().enumerate() {
+        match e.got {
+            Some((point, lo, hi, p)) if e.primary => println!(
+                "  **{}**: {point:+.4} 反則/手番 [95% CI {lo:+.4}, {hi:+.4}] / p={p:.4}（事前登録の主 estimand。補正なし）",
+                e.name
+            ),
+            Some((point, lo, hi, p)) => println!(
+                "  {}: {point:+.4} [95% CI {lo:+.4}, {hi:+.4}] / p={p:.4} → Holm 補正後 p={:.4}",
+                e.name, adj[i]
+            ),
+            None => println!(
+                "  {}{}: **判定不能**（{}）",
+                if e.primary { "**主** " } else { "" },
+                e.name,
+                e.why
+            ),
         }
+    }
+    if results.iter().any(|e| e.primary && e.got.is_none()) {
+        println!(
+            "  → **段3は判定不能**（事前登録の主特徴量が当てはまらなかった。secondary を主へ昇格させない）"
+        );
     }
     println!(
         "  （**符号の向きは事前に仮定しない**。指導2「逃げる」と指導3「固める」は逆向きに働きうるので、\n    発見セットで符号を確かめてから検証セットで固定する）"
     );
     report_joint(rows, cl, boots);
+}
+
+/// 1特徴量ぶんの結果。**落ちた特徴量も `None` として位置と名前を保つ**
+struct Est {
+    name: String,
+    primary: bool,
+    /// (点推定, CI 下限, CI 上限, 両側 p)
+    got: Option<(f64, f64, f64, f64)>,
+    why: &'static str,
+}
+
+/// 1特徴量の周辺平均差と cluster bootstrap CI。
+/// `extra` を渡すと**その特徴量を共変量に追加**した調整済み効果になる
+fn estimate(
+    rows: &[Row],
+    cl: &[Vec<Row>],
+    boots: usize,
+    name: &str,
+    primary: bool,
+    x: impl Fn(&Row) -> f64 + Copy,
+    extra: Option<fn(&Row) -> f64>,
+) -> Est {
+    let build = |rs: &[&Row]| -> Vec<hurdle::Row> {
+        rs.iter()
+            .map(|r| hurdle::Row {
+                x: x(r),
+                z: covariates_with(r, extra),
+                y: r.fouls_in_check.min(r.remaining),
+                cap: r.remaining,
+            })
+            .collect()
+    };
+    let refs: Vec<&Row> = rows.iter().collect();
+    let all = build(&refs);
+    let mut xs: Vec<f64> = all.iter().map(|r| r.x).collect();
+    let lo_q = hurdle::quantile(&mut xs.clone(), 0.1);
+    let hi_q = hurdle::quantile(&mut xs, 0.9);
+    let mut est = Est { name: name.to_string(), primary, got: None, why: "" };
+    if (hi_q - lo_q).abs() < 1e-12 {
+        est.why = "Q10 と Q90 が同じ値（変動が無い）";
+        return est;
+    }
+    let Some(point) = hurdle::contrast(&all, lo_q, hi_q, 1e-4) else {
+        est.why = "当てはめが収束しなかった";
+        return est;
+    };
+    let stat = |rs: &[&Row]| hurdle::contrast(&build(rs), lo_q, hi_q, 1e-4);
+    let draws = boot_draws(cl, stat, 0x2034_0003, boots);
+    // **有効 draw が少なすぎる bootstrap は CI を出さない**（PR #35 レビュー [P2]）:
+    // 非収束で落ちた draw だけが消えると CI が楽観側へ寄る
+    if draws.len() * 2 < boots {
+        est.why = "bootstrap の有効 draw が半数未満（当てはめが不安定）";
+        return est;
+    }
+    let (blo, bhi) = percentile_ci(&draws, 0.05);
+    est.got = Some((point, blo, bhi, two_sided_p(&draws)));
+    est
 }
 
 /// **F1（距離2以上の起点）と隣接を同時に入れた調整済み効果**（secondary・探索的）。
@@ -1080,38 +1184,14 @@ fn report_joint(rows: &[Row], cl: &[Vec<Row>], boots: usize) {
         ("f1_cov_w | 隣接被覆を固定", f1 as fn(&Row) -> f64, adj as fn(&Row) -> f64),
         ("adj_cov_frac | F1 を固定", adj, f1),
     ] {
-        let build = |rs: &[&Row]| -> Vec<hurdle::Row> {
-            rs.iter()
-                .map(|r| hurdle::Row {
-                    x: x(r),
-                    z: covariates_with(r, Some(other)),
-                    y: r.fouls_in_check.min(r.remaining),
-                    cap: r.remaining,
-                })
-                .collect()
-        };
-        let refs: Vec<&Row> = rows.iter().collect();
-        let all = build(&refs);
-        let mut xs: Vec<f64> = all.iter().map(|r| r.x).collect();
-        let lo_q = hurdle::quantile(&mut xs.clone(), 0.1);
-        let hi_q = hurdle::quantile(&mut xs, 0.9);
-        if (hi_q - lo_q).abs() < 1e-12 {
-            println!("  {name}: 変動が無いので判定不能");
-            continue;
-        }
-        match hurdle::contrast(&all, lo_q, hi_q, 1e-4) {
-            Some(point) => {
-                let stat = |rs: &[&Row]| hurdle::contrast(&build(rs), lo_q, hi_q, 1e-4);
-                let (blo, bhi) = bootstrap_n(cl, stat, 0.05, 0x2034_0004, boots);
-                println!("  {name}: {point:+.4} [95% CI {blo:+.4}, {bhi:+.4}]");
-            }
-            None => println!("  {name}: 当てはめが収束しませんでした"),
+        let e = estimate(rows, cl, boots, name, false, x, Some(other));
+        match e.got {
+            Some((point, lo, hi, _)) => println!("  {name}: {point:+.4} [95% CI {lo:+.4}, {hi:+.4}]"),
+            None => println!("  {name}: 判定不能（{}）", e.why),
         }
     }
 }
 
-/// 層・共変量（総効果の回帰で調整する。**`K_def_*` と機構列は入れない** =
-/// 狙っている媒介変数と結果側の変数だから）
 fn covariates_with(r: &Row, extra: Option<fn(&Row) -> f64>) -> Vec<f64> {
     let mut v = covariates(r);
     if let Some(f) = extra {
@@ -1134,14 +1214,7 @@ fn covariates(r: &Row) -> Vec<f64> {
     ]
 }
 
-fn bootstrap_n(
-    cl: &[Vec<Row>],
-    stat: impl Fn(&[&Row]) -> Option<f64>,
-    alpha: f64,
-    seed: u64,
-    reps: usize,
-) -> (f64, f64) {
-    let draws = boot_draws(cl, stat, seed, reps);
+fn percentile_ci(draws: &[f64], alpha: f64) -> (f64, f64) {
     if draws.is_empty() {
         return (f64::NAN, f64::NAN);
     }
@@ -1150,6 +1223,10 @@ fn bootstrap_n(
     (draws[lo], draws[hi])
 }
 
+/// 局を復元抽出して `stat` を計算した draw の**昇順**の列。
+///
+/// `stat` が `None`（当てはめが収束しない等）の draw は落ちるので、
+/// 呼び出し側は**有効 draw の本数**も見ること（`estimate` が半数未満で止める）。
 fn boot_draws(
     cl: &[Vec<Row>],
     stat: impl Fn(&[&Row]) -> Option<f64>,
@@ -1178,13 +1255,8 @@ fn boot_draws(
     draws
 }
 
-fn boot_p(
-    cl: &[Vec<Row>],
-    stat: impl Fn(&[&Row]) -> Option<f64>,
-    seed: u64,
-    reps: usize,
-) -> f64 {
-    let draws = boot_draws(cl, stat, seed, reps);
+/// 両側のブートストラップ p 値（0 を跨ぐ側の割合の2倍）
+fn two_sided_p(draws: &[f64]) -> f64 {
     if draws.is_empty() {
         return 1.0;
     }

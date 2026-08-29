@@ -928,6 +928,7 @@ pub mod hurdle {
     fn fit_logistic(d: &[Vec<f64>], y: &[bool], ridge: f64) -> Option<Vec<f64>> {
         let p = d.first()?.len();
         let mut beta = vec![0.0; p];
+        let mut converged = false;
         for _ in 0..40 {
             let mut h = vec![vec![0.0; p]; p];
             let mut g = vec![0.0; p];
@@ -952,10 +953,14 @@ pub mod hurdle {
                 *b += s;
             }
             if delta < 1e-9 {
+                converged = true;
                 break;
             }
         }
-        beta.iter().all(|v| v.is_finite()).then_some(beta)
+        // **収束しなかった当てはめは `None`**（PR #35 レビュー [P2]）。
+        // 有限な値を返すだけでは、途中で止まった点が有効な fit として
+        // bootstrap の draw に混ざり、CI が静かに歪む
+        (converged && beta.iter().all(|v| v.is_finite())).then_some(beta)
     }
 
     fn pois_pmf(k: u32, lam: f64) -> f64 {
@@ -1007,9 +1012,11 @@ pub mod hurdle {
             g
         };
         let mut beta = vec![0.0; p];
+        let mut converged = false;
         for _ in 0..60 {
             let g0 = grad(&beta);
             if g0.iter().all(|v| v.abs() < 1e-8) {
+                converged = true;
                 break;
             }
             // 数値ヘッシアン（p は 10 程度なので十分安い）
@@ -1026,9 +1033,11 @@ pub mod hurdle {
             for (a, hr) in h.iter_mut().enumerate() {
                 hr[a] += ridge + 1e-6;
             }
-            let Some(step) = solve(h, g0.clone()) else { break };
+            // 線形系が解けなければ**失敗**（有限な beta を返して成功に見せない）
+            let Some(step) = solve(h, g0.clone()) else { return None };
             // ステップ半減（数値ヘッシアンが不定になる領域での暴走を防ぐ）
             let mut scale = 1.0;
+            let mut accepted = false;
             for _ in 0..8 {
                 let cand: Vec<f64> =
                     beta.iter().zip(&step).map(|(b, s)| b + scale * s).collect();
@@ -1038,16 +1047,21 @@ pub mod hurdle {
                     let nc: f64 = gc.iter().map(|v| v * v).sum();
                     if nc <= n0 {
                         beta = cand;
+                        accepted = true;
                         break;
                     }
                 }
                 scale *= 0.5;
             }
-            if scale < 1.0 / 256.0 {
-                break;
+            // **line search が全候補を拒否したら失敗**（PR #35 レビュー [P2]）。
+            // 旧実装は `scale == 1/256` で `<` を満たさず、同じ点のまま
+            // 最大反復まで回ってから「成功」として返していた
+            if !accepted {
+                return None;
             }
         }
-        beta.iter().all(|v| v.is_finite()).then_some(beta)
+        // 最大反復に達した（勾配が閾値以下にならなかった）ものも失敗にする
+        (converged && beta.iter().all(|v| v.is_finite())).then_some(beta)
     }
 
     pub fn fit(prep: &Prepared, ridge: f64) -> Option<Fit> {
@@ -1073,10 +1087,38 @@ pub mod hurdle {
         Some(Fit { logit, count })
     }
 
+    /// **観測される回数の条件付き期待値** `E[min(Y, cap) | Y > 0]`
+    /// （ゼロ切断 Poisson・上側打ち切り）。
+    ///
+    /// 観測するのは `min(Y, cap)`（`cap` 回目で反則負けになりそこで手番が終わる）
+    /// なので、必要なのは
+    /// `Σ_{k=1}^{cap-1} k·P(Y=k|Y>0) + cap·P(Y≥cap|Y>0)`。
+    ///
+    /// **`min(E[Y|Y>0], cap)` とは一般に一致しない**（PR #35 レビュー [P1]）:
+    /// λ=1 / cap=2 なら正しくは 1.4180、頭打ち版は 1.5820。尤度側は上側打ち切りを
+    /// 扱っているので、g-computation でだけ別の量へ戻ってはいけない。
+    pub fn censored_ztp_mean(lam: f64, cap: u32) -> f64 {
+        if cap == 0 {
+            return 0.0;
+        }
+        let denom = (1.0 - (-lam).exp()).max(1e-12);
+        // `P(Y=k)` を k=1 から積み上げ、cap 未満までを重み k で足す
+        let mut pmf = (-lam).exp(); // P(Y=0)
+        let mut acc = 0.0;
+        let mut below = 0.0; // Σ_{k=1}^{cap-1} P(Y=k)
+        for k in 1..cap {
+            pmf *= lam / f64::from(k);
+            acc += f64::from(k) * pmf / denom;
+            below += pmf / denom;
+        }
+        // 残りは全部 `Y >= cap`（条件付き確率の残差として取ると数値的に安定）
+        acc + f64::from(cap) * (1.0 - below).max(0.0)
+    }
+
     /// 主特徴量を `x_raw` に置いたときの**周辺平均**（層は各行のまま）。
     ///
-    /// `P(反則>0) × E[反則 | 反則>0]`。第2段の平均は上限（残り反則）で頭打ちに
-    /// する（打ち切りの下でゼロ切断 Poisson の素の平均は上限を超えうる）。
+    /// `P(反則>0) × E[min(反則, 残り反則) | 反則>0]`。第2段は
+    /// `censored_ztp_mean` で**打ち切りつきの期待値そのもの**を出す。
     pub fn marginal_mean(prep: &Prepared, fit: &Fit, x_raw: f64) -> f64 {
         let xs = (x_raw - prep.x_mean) / prep.x_sd;
         let mut acc = 0.0;
@@ -1085,8 +1127,7 @@ pub mod hurdle {
             r[1] = xs;
             let p = sigmoid(dot(&r, &fit.logit));
             let lam = dot(&r, &fit.count).clamp(-8.0, 8.0).exp();
-            let m = lam / (1.0 - (-lam).exp()).max(1e-12);
-            acc += p * m.min(f64::from(cap));
+            acc += p * censored_ztp_mean(lam, cap);
         }
         acc / prep.d.len() as f64
     }
@@ -1402,6 +1443,49 @@ mod tests {
         let fhi = hurdle::quantile(&mut fx, 0.9);
         let d0 = hurdle::contrast(&flat, flo, fhi, 1e-6).expect("収束する");
         assert!(d0.abs() < 0.08, "効果なしは 0 付近: {d0}");
+    }
+
+    #[test]
+    fn 打ち切りつき期待値は頭打ちと一致しない() {
+        // レビューの反例（PR #35 [P1]）: λ=1 / cap=2 なら
+        // E[min(Y,2)|Y>0] = 1·P(1|>0) + 2·P(Y≥2|>0) = 1.4180
+        // 頭打ち版 min(E[Y|Y>0], 2) = 1.5820 とは一致しない
+        let lam = 1.0f64;
+        let denom = 1.0 - (-lam).exp();
+        let p1 = (-lam).exp() * lam / denom;
+        let want = p1 + 2.0 * (1.0 - p1);
+        let got = hurdle::censored_ztp_mean(lam, 2);
+        assert!((got - want).abs() < 1e-12, "{got} vs {want}");
+        assert!((got - 1.418_0).abs() < 1e-3, "{got}");
+        let capped = (lam / denom).min(2.0);
+        assert!((capped - 1.582_0).abs() < 1e-3, "頭打ち版: {capped}");
+        assert!(got < capped, "打ち切りつきは頭打ちより必ず小さいか等しい");
+
+        // cap が十分大きければ素の切断平均へ収束する
+        let plain = lam / denom;
+        assert!((hurdle::censored_ztp_mean(lam, 60) - plain).abs() < 1e-9);
+        // 上限は必ず cap 以下・1 以上（Y>0 の条件付きなので）
+        for cap in 1..=6u32 {
+            for l in [0.01, 0.5, 3.0, 12.0] {
+                let m = hurdle::censored_ztp_mean(l, cap);
+                assert!((1.0..=f64::from(cap) + 1e-9).contains(&m), "cap={cap} λ={l}: {m}");
+            }
+        }
+        assert_eq!(hurdle::censored_ztp_mean(1.0, 0), 0.0);
+    }
+
+    #[test]
+    fn 収束しない当てはめは判定不能になる() {
+        // 反則ありの行が第2段の自由度に足りなければ当てはめない
+        let few: Vec<hurdle::Row> = (0..20)
+            .map(|i| hurdle::Row { x: f64::from(i), z: vec![0.0], y: u32::from(i == 0), cap: 3 })
+            .collect();
+        let prep = hurdle::prepare(&few).unwrap();
+        assert!(hurdle::fit(&prep, 1e-6).is_none(), "同定できない当てはめは判定不能");
+        // 収束する合成データでは Some（この関門が常に None を返してはいけない）
+        let ok = synth(1.0, 10);
+        let prep = hurdle::prepare(&ok).unwrap();
+        assert!(hurdle::fit(&prep, 1e-6).is_some());
     }
 
     #[test]

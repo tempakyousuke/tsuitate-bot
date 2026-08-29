@@ -5,5 +5,9 @@
   "opponents": ["estimator_v14"],
   "origin_weights": "",
   "adj_share": 0.5,
-  "bootstrap": 500
+  "bootstrap": 500,
+  "_provenance": "元 Arena 実行の実験条件は arena-result-*/arena-summary.json（実効設定の指紋・局数・時計・予算）と arena-games.jsonl（commit と match_seed）で機械的に検査する。expect_* を入れておくと部分失敗した run や別条件の run で解析が進まない",
+  "expect_candidate": "estimator",
+  "expect_match_seed": "20260815",
+  "expect_games": 104
 }
