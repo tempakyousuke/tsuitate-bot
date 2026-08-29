@@ -1007,7 +1007,6 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
             ));
         }
     }
-    let replicates = by_rep.len();
     // 重複行（**replicate をキーに含める**。2回実行の同じ決定点は重複ではない）
     let mut keys: HashSet<(u64, String, u64, u64, String)> = HashSet::new();
     let mut dups = 0;
@@ -1026,55 +1025,57 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
     if dups > 0 {
         out.push(format!("重複行が {dups} 件あります"));
     }
-    // **meta が宣言した決定点に対して行が揃っているか**（ある seed の全 arm が
-    // まとめて欠けても検出する。issue #28 PR #30 レビュー2巡目 [P1]）
+    // **期待キー集合と実キー集合を厳密に一致させる**（PR #33 レビュー4巡目 [P1]）。
+    // 「(game, move_number, arm) の行数を**全 replicate 合算**で seeds × replicate 数と
+    // 比べる」形だと、replicate 0 の欠測を replicate 1 の**範囲外 seed の余分行**が
+    // 埋め合わせて通る（片方は欠測・片方は不正なのに「2 replicate の平均」が出る）。
+    // 各 meta の `points_detail` × arm × seed 0..seeds × replicate を期待キー集合にして、
+    // 欠測だけでなく**余分**（範囲外の seed・未宣言の決定点・meta に無い replicate
+    // ラベル）も拒否する。シャードの完全性検査は meta の本数にしか掛からないので、
+    // 行の完全性はここで replicate ごとに閉じる必要がある
     let seeds = first["seeds"].as_u64().unwrap_or(0);
     let mut want: Vec<String> = vec!["baseline".into()];
     for p in first["policies"].as_array().into_iter().flatten() {
         want.push(p.as_str().unwrap_or("?").to_string());
     }
-    let mut seen_rows: BTreeMap<(String, u64, String), usize> = BTreeMap::new();
-    for r in rows {
-        *seen_rows
-            .entry((
-                r["game"].as_str().unwrap_or("?").to_string(),
-                r["move_number"].as_u64().unwrap_or(0),
-                r["arm"].as_str().unwrap_or("?").to_string(),
-            ))
-            .or_default() += 1;
-    }
-    let mut lacks: Vec<String> = vec![];
-    let first_rep = metas
-        .iter()
-        .map(|m| m["replicate"].as_u64().unwrap_or(0))
-        .min()
-        .unwrap_or(0);
-    for m in metas
-        .iter()
-        .filter(|m| m["replicate"].as_u64().unwrap_or(0) == first_rep)
-    {
+    let mut want_keys: HashSet<(u64, String, u64, u64, String)> = HashSet::new();
+    for m in metas {
+        let rep = m["replicate"].as_u64().unwrap_or(0);
         for d in m["points_detail"].as_array().into_iter().flatten() {
             let g = d["game"].as_str().unwrap_or("?").to_string();
             let mn = d["move_number"].as_u64().unwrap_or(0);
             for arm in &want {
-                let got = seen_rows
-                    .get(&(g.clone(), mn, arm.clone()))
-                    .copied()
-                    .unwrap_or(0) as u64;
-                // replicate をまたいで同じ決定点を数えるので、期待値は seeds × replicate 数
-                let want_n = seeds * replicates as u64;
-                if got != want_n {
-                    lacks.push(format!("{g}#{mn} {arm}: {got}/{want_n}"));
+                for seed in 0..seeds {
+                    want_keys.insert((rep, g.clone(), mn, seed, arm.clone()));
                 }
             }
         }
     }
+    let show =
+        |k: &(u64, String, u64, u64, String)| format!("rep{} {}#{} {} seed{}", k.0, k.1, k.2, k.4, k.3);
+    let head = |v: &[String]| {
+        format!(
+            "{}{}",
+            v.iter().take(3).cloned().collect::<Vec<_>>().join(" / "),
+            if v.len() > 3 { " ..." } else { "" }
+        )
+    };
+    let mut lacks: Vec<String> = want_keys.difference(&keys).map(show).collect();
+    lacks.sort();
     if !lacks.is_empty() {
         out.push(format!(
-            "meta が宣言した決定点に対して行が {} 箇所欠けています（Δ の分子が欠ける）: {}{}",
+            "meta が宣言した決定点に対して行が {} 件欠けています（Δ の分子が欠ける）: {}",
             lacks.len(),
-            lacks.iter().take(3).cloned().collect::<Vec<_>>().join(" / "),
-            if lacks.len() > 3 { " ..." } else { "" }
+            head(&lacks)
+        ));
+    }
+    let mut extras: Vec<String> = keys.difference(&want_keys).map(show).collect();
+    extras.sort();
+    if !extras.is_empty() {
+        out.push(format!(
+            "meta が宣言していない行が {} 件あります（範囲外の seed・未宣言の決定点・meta に無い replicate）: {}",
+            extras.len(),
+            head(&extras)
         ));
     }
     out
@@ -1286,6 +1287,69 @@ mod tests {
             .collect();
         let problems = check_inputs(&[meta(exp(), 0)], &rows);
         assert!(problems.iter().any(|p| p.contains("alpha@k2")), "{problems:?}");
+    }
+
+    /// **欠測と余分を相殺させない**（PR #33 レビュー4巡目 [P1]）。
+    /// replicate 0 から1行落とし、replicate 1 へ**範囲外の seed** の行を1本足すと、
+    /// 「(game, move_number, arm) の行数を全 replicate 合算で seeds × replicate 数と
+    /// 比べる」形では総数が合って素通りする（片方は欠測・片方は不正なのに
+    /// 「2 replicate の平均」まで出る）。replicate ごと・seed ごとの集合で比べる
+    #[test]
+    fn 欠測を範囲外seedの余分行で埋め合わせられない() {
+        let mk = |rep: u64| -> Vec<serde_json::Value> {
+            full()
+                .into_iter()
+                .map(|mut r| {
+                    r["replicate"] = serde_json::json!(rep);
+                    r
+                })
+                .collect()
+        };
+        // replicate 0 は (seed 0, alpha@k2) が欠測
+        let mut rows: Vec<serde_json::Value> = mk(0)
+            .into_iter()
+            .filter(|r| !(r["arm"] == "alpha@k2" && r["seed"] == 0))
+            .collect();
+        rows.extend(mk(1));
+        // replicate 1 に範囲外 seed の行を1本（合算の行数だけは辻褄が合う）
+        let mut extra = row("alpha@k2", 99, 1.0);
+        extra["replicate"] = serde_json::json!(1);
+        rows.push(extra);
+        let mut m0 = meta(exp(), 0);
+        m0["replicate"] = serde_json::json!(0);
+        let mut m1 = meta(exp(), 0);
+        m1["replicate"] = serde_json::json!(1);
+        let problems = check_inputs(&[m0, m1], &rows);
+        assert!(
+            problems.iter().any(|p| p.contains("欠けています")),
+            "replicate 0 の欠測を検出できていない: {problems:?}"
+        );
+        assert!(
+            problems.iter().any(|p| p.contains("宣言していない")),
+            "範囲外 seed の余分行を検出できていない: {problems:?}"
+        );
+    }
+
+    /// 未宣言の決定点・meta に無い replicate ラベルの行も拒否する
+    #[test]
+    fn 未宣言の決定点とreplicateの行を拒否する() {
+        for (label, mut bad) in [
+            ("決定点", row("alpha@k2", 0, 1.0)),
+            ("replicate", row("alpha@k2", 0, 1.0)),
+        ] {
+            if label == "決定点" {
+                bad["move_number"] = serde_json::json!(99);
+            } else {
+                bad["replicate"] = serde_json::json!(7);
+            }
+            let mut rows = full();
+            rows.push(bad);
+            let problems = check_inputs(&[meta(exp(), 0)], &rows);
+            assert!(
+                problems.iter().any(|p| p.contains("宣言していない")),
+                "未宣言の{label}が素通りした: {problems:?}"
+            );
+        }
     }
 
     #[test]
