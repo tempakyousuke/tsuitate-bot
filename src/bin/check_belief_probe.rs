@@ -483,7 +483,10 @@ fn run_unit(
     for (r, (i, _)) in scored.iter().enumerate() {
         rank_of[*i] = r + 1;
     }
-    let f = focus(&moves, &p.truth, p.bot);
+    // 誤仮説マスは**その決定の仮説集合**から取る（真実で敵駒がいるマス全部へ
+    // 広げると、信念とは無関係な捕獲を代表にしてしまう）
+    let hyp_squares: Vec<_> = stages.hypotheses.iter().map(|(s, _, _)| *s).collect();
+    let f = focus(&moves, &p.truth, p.bot, &hyp_squares);
     let focus_json = |idx: Option<usize>| -> serde_json::Value {
         match idx {
             Some(i) => stage_json(

@@ -317,8 +317,9 @@ pub fn entry_hypotheses(setup: &crate::check_policy::EntrySetup) -> Vec<(Coord, 
 /// - `true_capture` … **真の王手駒を玉以外で取る手**のうち現行順位が最上位のもの。
 ///   無ければ **coverage failure**（候補に無ければ完璧な信念でも救えない =
 ///   この issue の上限の外）
-/// - `false_capture` … 真の王手駒**以外**のマスへの捕獲のうち最上位のもの
-///   （希釈が「どこへ質量を配ってしまっているか」の代表）
+/// - `false_capture` … **誤仮説マス**（仮説には載っているが真の王手駒ではない
+///   マス）への手のうち最上位のもの。希釈が「どこへ質量を配ってしまって
+///   いるか」の代表で、真捕獲と対にして各段を並べる
 #[derive(Clone, Debug, Default)]
 pub struct Focus {
     pub true_capture: Option<usize>,
@@ -326,10 +327,15 @@ pub struct Focus {
 }
 
 /// `moves` から [`Focus`] を作る。`moves` は現行順位の順に並んでいること。
+///
+/// `hyp_squares` は**その決定でソルバーが持っている仮説のマス**（誤仮説マスを
+/// 「ソルバーが王手駒がいると思っているマス」に限るため。真実で敵駒がいるマス
+/// 全部へ広げると、信念とは無関係な捕獲まで代表にしてしまう）。
 pub fn focus(
     moves: &[crate::check_policy::PolicyMove],
     truth: &Position,
     bot: Color,
+    hyp_squares: &[Coord],
 ) -> Focus {
     let checkers = true_checkers(truth, bot);
     let mut out = Focus::default();
@@ -338,15 +344,11 @@ pub fn focus(
             continue; // 玉での捕獲は `legal_under` の盲点の領分（非目的）
         }
         let ShogiMove::Board { to, .. } = m.mv else { continue };
-        let hits_checker = checkers.iter().any(|(s, _)| *s == to);
-        // 「取る手」= 真実で相手の駒がいるマスへの移動（裁定側の情報なので
-        // 方策には渡さない。分解の注目手を選ぶためだけに使う）
-        let is_capture = truth
-            .piece_at(to)
-            .is_some_and(|p| p.color == bot.other());
-        if hits_checker && out.true_capture.is_none() {
-            out.true_capture = Some(i);
-        } else if is_capture && !hits_checker && out.false_capture.is_none() {
+        if checkers.iter().any(|(s, _)| *s == to) {
+            if out.true_capture.is_none() {
+                out.true_capture = Some(i);
+            }
+        } else if out.false_capture.is_none() && hyp_squares.contains(&to) {
             out.false_capture = Some(i);
         }
     }

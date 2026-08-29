@@ -204,8 +204,8 @@ impl HypothesisDiag {
 thread_local! {
     static HYP_DIAG: std::cell::RefCell<Option<std::rc::Rc<HypothesisDiag>>> =
         const { std::cell::RefCell::new(None) };
-    /// 直近の `CheckSolver::new` で `deduce_last_move` が落とそうとした仮説
-    /// （**全滅 fallback を掛ける前**）と、fallback が発動したか
+    /// `deduce_last_move` のスコープ内で落とそうとした仮説の**延べ**
+    /// （**全滅 fallback を掛ける前**）と、fallback が1度でも発動したか
     static DEDUCE_DROPPED: std::cell::RefCell<(Vec<(Coord, Role)>, bool)> =
         const { std::cell::RefCell::new((Vec::new(), false)) };
 }
@@ -217,6 +217,10 @@ thread_local! {
 /// 入れ子は「内側が勝つ」ではなく**内側だけが見える**ので、arm の scope を
 /// 二重に張らないこと。
 pub fn scoped_hypothesis_diag<R>(diag: &HypothesisDiag, f: impl FnOnce() -> R) -> R {
+    if diag.deduce_last_move {
+        // スコープごとに記録を閉じる（前の arm の残りが混ざらない）
+        DEDUCE_DROPPED.with(|c| *c.borrow_mut() = (Vec::new(), false));
+    }
     let rc = std::rc::Rc::new(diag.clone());
     let prev = HYP_DIAG.with(|c| c.borrow_mut().replace(rc));
     let out = f();
@@ -224,8 +228,12 @@ pub fn scoped_hypothesis_diag<R>(diag: &HypothesisDiag, f: impl FnOnce() -> R) -
     out
 }
 
-/// 直近の `CheckSolver::new` の `deduce_last_move` の記録を取り出す
-/// （`(落とそうとした仮説, 全滅 fallback が発動したか)`）。取り出すと消える。
+/// `deduce_last_move` の記録を取り出す（`(落とそうとした仮説の延べ,
+/// 全滅 fallback が1度でも発動したか)`）。取り出すと消える。
+///
+/// **スコープ内の全構築ぶんを累積する**: 1つの arm は手番開始時だけでなく
+/// 反則を食うたびにソルバーを作り直すので、最後の構築だけを見ると
+/// 「途中で真仮説を落とした」健全性違反を取りこぼす。
 pub fn take_deduce_dropped() -> (Vec<(Coord, Role)>, bool) {
     DEDUCE_DROPPED.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
@@ -613,7 +621,12 @@ impl CheckSolver {
         let mut captured_at: Option<Option<String>> = None;
         for e in log.events().iter().rev() {
             match e {
-                Observation::Check { .. } | Observation::OpponentFoul { .. } => continue,
+                // 王手宣言・相手の反則・**自分の反則**は局面を変えないので読み飛ばす
+                // （実再決定 arm はログの末尾へ `MyFoul` を積むが、直前の相手手が
+                // 変わったわけではないので演繹はそのまま成立する）
+                Observation::Check { .. }
+                | Observation::OpponentFoul { .. }
+                | Observation::MyFoul { .. } => continue,
                 Observation::OpponentMoved { captured_my_piece_at, .. } => {
                     captured_at = Some(captured_my_piece_at.clone());
                     break;
@@ -646,7 +659,11 @@ impl CheckSolver {
             dropped.push((q, role));
         }
         let fallback = keep.iter().all(|k| !k);
-        DEDUCE_DROPPED.with(|c| *c.borrow_mut() = (dropped, fallback));
+        DEDUCE_DROPPED.with(|c| {
+            let mut g = c.borrow_mut();
+            g.0.extend(dropped);
+            g.1 |= fallback;
+        });
         if fallback {
             return; // 全滅は健全性の最後の砦（元の集合を残す）
         }
@@ -668,9 +685,11 @@ impl CheckSolver {
         let opp = self.my_color.other();
         let base_role = unpromote_role(role);
         // 打ち
+        // 既知敵駒のマーカーが `q` にあっても打ちを否定しない（そのマーカー自体が
+        // 陳腐化している可能性がある = **落とすのは「どんな真実でも1手では説明
+        // できない」仮説だけ**という原則。自駒のマスは enumerate が既に除いている）
         if role == base_role
             && opp_hand.get(&role).copied().unwrap_or(0) > 0
-            && self.base.piece_at(q).is_none()
             && !crate::board::dead_end_rank(role, q.rank, opp)
         {
             return true;
