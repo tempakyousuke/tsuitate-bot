@@ -63,6 +63,13 @@ use tsuitate_bot::truth_replay::{for_each_decision_full, parse_bot_and_end};
 /// 版の拒否と**必須列の存在検査**（`REQUIRED_ROW_KEYS`）の両方で止める。
 const ROW_SCHEMA: u32 = 2;
 
+/// estimand の全量。**集計が走査するのはこの2つだけ**なので、meta がこれ以外を
+/// 宣言したら期待キーを作る前に拒否する（PR #33 レビュー7巡目 [P1]）。
+/// meta と行が**同じ未知の値**で揃っていると、キーの厳密一致は通るのに集計の
+/// ループから外れて、その決定点が層から無言で消える（= 任意の決定点を除外して
+/// 点推定と安全性判定を動かせる）
+const ESTIMANDS: [&str; 2] = ["foul", "nofoul"];
+
 /// 継続1本の行に必ず入っていなければならない列。1つでも欠けたら集計しない
 /// （欠測を「悪化なし」と読むのが一番危ない失敗の仕方なので、既定では降格させない）
 const REQUIRED_ROW_KEYS: [&str; 10] = [
@@ -419,7 +426,7 @@ fn main() {
         games += 1;
         // **estimand ごとに最初の1つだけ**（同じ元対局の相互排他的な未来を
         // 足し合わせない。issue #28 P0-6 の契約と同じ）
-        for estimand in ["foul", "nofoul"] {
+        for estimand in ESTIMANDS {
             if let Some(p) = found.iter().position(|p| p.estimand == estimand) {
                 points.push(found.remove(p));
             }
@@ -786,7 +793,7 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
         return;
     }
 
-    for estimand in ["foul", "nofoul"] {
+    for estimand in ESTIMANDS {
         let sel: Vec<&serde_json::Value> =
             rows.iter().filter(|r| r["estimand"] == estimand).collect();
         if sel.is_empty() {
@@ -1010,6 +1017,27 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
                 "replicate {rep} のシャードが欠けています（{sh:?} / 全 {total}）: Δ の分子だけが落ちる"
             ));
         }
+    }
+    // **meta が宣言する estimand を列挙として検査する**（PR #33 レビュー7巡目 [P1]）。
+    // 期待キーは meta の値から作るので、meta と行が**同じ未知の値**で揃っていると
+    // キーの厳密一致は通る。ところが集計が走査するのは `ESTIMANDS` の2つだけなので、
+    // その決定点の全行が判定対象から無言で落ちる（実測: 1決定点を `unknown` に
+    // 揃えると nofoul の層が 11局→10局・継続 352→320本 に減ったまま判定が出た）。
+    // 任意の決定点を層から除外して点推定と安全性判定を動かせるので、ここで止める
+    let mut bad_es: BTreeSet<String> = BTreeSet::new();
+    for m in metas {
+        for d in m["points_detail"].as_array().into_iter().flatten() {
+            let es = d["estimand"].as_str().unwrap_or("?");
+            if !ESTIMANDS.contains(&es) {
+                bad_es.insert(es.to_string());
+            }
+        }
+    }
+    if !bad_es.is_empty() {
+        out.push(format!(
+            "meta が宣言した estimand に未知の値があります（{:?} / 既知は {ESTIMANDS:?}）: 集計の層から無言で落ちる",
+            bad_es
+        ));
     }
     // **replicate 間で決定点の母集団が同じか**（PR #33 レビュー5巡目 [P1]）。
     // 実験キーの一致検査が見るのは `experiment` だけで、`points_detail` はその外にある。
@@ -1402,6 +1430,29 @@ mod tests {
         assert!(
             problems.iter().any(|p| p.contains("決定点母集団")),
             "別の標本を 2 replicate として受理した: {problems:?}"
+        );
+    }
+
+    /// **meta が宣言する estimand も列挙として検査する**（PR #33 レビュー7巡目 [P1]）。
+    /// meta と行が**同じ未知の値**で揃っているとキーの厳密一致は通るが、集計は
+    /// `ESTIMANDS` の2つしか走査しないので、その決定点が層から無言で消える
+    #[test]
+    fn metaの未知のestimandを拒否する() {
+        let mut m = meta(exp(), 0);
+        m["points_detail"] =
+            serde_json::json!([{"game": "g1", "move_number": 41, "estimand": "unknown"}]);
+        let rows: Vec<serde_json::Value> = full()
+            .into_iter()
+            .map(|mut r| {
+                r["estimand"] = serde_json::json!("unknown");
+                r
+            })
+            .collect();
+        // meta と行が揃っているのでキーの一致検査は通る = ここで止めるしかない
+        let problems = check_inputs(&[m], &rows);
+        assert!(
+            problems.iter().any(|p| p.contains("未知の値")),
+            "meta ごと未知の estimand にした決定点が素通りした: {problems:?}"
         );
     }
 
