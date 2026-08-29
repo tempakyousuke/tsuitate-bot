@@ -1,17 +1,18 @@
 {
   "_comment": "このファイルを .github/ci/check-prep.request.json という名前でコミットして push すると Check prep（issue #34 P0-1 / P0-2）が起動する。キーは workflow_dispatch の inputs と同じ。計測後に消す push は全ジョブがスキップされる",
-  "_discovery": "発見セット = 既存の Arena 実行（例 33179939954 / 32697854659）。検証セットは未使用の match_seed で取り直した別の Arena 実行を指す別の起動で回し、origin_weights と adj_share は発見セットの実測値で固定する",
-  "arena_run_id": "33179939954",
+  "_discovery": "発見セット = 既存の Arena 実行。この例は実際に通した構成そのもの（run 32697854659 = main vs v13 / v14 各104局・commit 886ef75 → Check prep run 33252380305）。検証セットは未使用の match_seed で取り直した別の Arena 実行を指す別の起動で回し、origin_weights と adj_share は発見セットの実測値で固定する",
+  "arena_run_id": "32697854659",
   "opponents": [
+    "estimator_v13",
     "estimator_v14"
   ],
   "origin_weights": "",
   "adj_share": 0.5,
-  "bootstrap": 500,
+  "bootstrap": 1000,
   "_provenance": "元 Arena 実行の実験条件は arena-result-*/arena-summary.json（実効設定の指紋・局数・時計・予算・match_seed_base / match_seed_shard）と arena-combined/combined.json（合算局数 = 末尾シャード欠落の唯一の検査）、および API から取る元 run の head_sha / conclusion で機械的に検査する。expect_* を入れておくと部分失敗した run や別条件の run で解析が進まない",
   "expect_candidate": "estimator",
-  "expect_match_seed": "20260828",
   "expect_games": 104,
-  "_expect_match_seed": "**shard ずらしと基準ごとの XOR を掛ける前の base seed**（arena.yml の match_seed 入力そのもの）。記録に残る match_seed は実効値なのでシャードごとに違う",
-  "expect_shards": 4
+  "expect_commit": "886ef75dca443462696604eeea132f3a1cd5c3ef",
+  "_no_match_seed": "**この例には expect_match_seed を指定できない**。照合先の arena-summary.json の match_seed_base は PR #35 で足したフィールドなので、それより前の commit（886ef75）で回したこの run には無く、指定すると『match_seed_base がありません』で必ず失敗する。発見セットには seed の独立性は要らないが、逆に言うとこの run は**検証セットには使えない**",
+  "_validation_set": "検証セットで回すときは _no_match_seed を消し、expect_match_seed に **shard ずらしと基準ごとの XOR を掛ける前の base seed**（arena.yml の match_seed 入力そのもの）を、expect_shards にシャード数を書く。記録に残る match_seed は実効値なのでシャードごとに違うが、arena-summary.json の match_seed_base はそのまま base seed。実際に通した新形式の例は run 33258158262（4局×2シャード・match_seed=20260829）→ Check prep run 33258439571"
 }

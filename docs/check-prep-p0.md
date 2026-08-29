@@ -125,7 +125,7 @@
 `expect_match_seed` を必ず渡す**（発見セットと独立な seed であることを機械的に
 固定するため）。どれか1つでも外れたら解析を進めない。
 
-2点、実装で踏んだ落とし穴がある（PR #35 レビュー2巡目）:
+3点、実装で踏んだ落とし穴がある（PR #35 レビュー2〜3巡目）:
 
 - **`match_seed` の照合は `match_seed_base` で行う**。記録に残る `match_seed` は
   arena.yml が付ける**シャードずらし**（`base + shard`）に、さらに `bin/arena` が
@@ -142,6 +142,19 @@
   `arena-records-*` が対で落ちると「局数 == 記録本数」も通ってしまう
   （実測: 78 == 78 で通過）。合算局数との照合が唯一の fail-closed な経路なので、
   取れなければ止める
+- **base seed の「ラベル」と実際の対局条件の一致は `bin/arena` の起動時に検査する**。
+  `ARENA_MATCH_SEED_BASE` / `ARENA_SHARD` は下流へ渡すラベルでしかなく、対局条件を
+  決めるのは `ARENA_MATCH_SEED` だけ。関門はラベル側（`match_seed_base`）しか見ないので、
+  食い違うと `expect_match_seed` を指定しても通ってしまう（実測:
+  `ARENA_MATCH_SEED=7 ARENA_MATCH_SEED_BASE=20260829 ARENA_SHARD=0` で
+  summary は `match_seed_base=20260829` を記録するのに対局は 7 由来）。
+  `check_seed_provenance` が「3値のどれか1つでも指定されたら3値が揃い
+  `match_seed == base + shard`」を要求し、違えば run 自体を落とす
+  （**式を check-prep へ複製しない**ための場所でもある。数値 env が指定されているのに
+  parse できないときも黙って `None` にせず落とす = 「指定していない」と区別できないと
+  この検査をすり抜けるため）。workflow 側の
+  `match_seed_env == base + shard` は、**この検査より前の binary で回した run**
+  （base は残るが未検査）を弾くための裏取り
 
 ## 実測（発見セット: Arena run 32697854659 = main vs v13 / v14 各104局、`match_seed=20260815`）
 

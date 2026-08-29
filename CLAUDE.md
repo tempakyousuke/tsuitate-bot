@@ -979,7 +979,19 @@
     シャードずらし ＋ 基準ごとの XOR を掛けた**実効値**なので、4シャードなら4値になり
     base とも一致しない。`bin/arena` が base と shard を summary へ明示的に残す）。
     **`arena-combined` は必須**（シャード番号の連続性も「局数 == 記録本数」も
-    **末尾**の欠落を通してしまう。合算局数との照合が唯一の fail-closed な経路）
+    **末尾**の欠落を通してしまう。合算局数との照合が唯一の fail-closed な経路）。
+    **base seed の「ラベル」と実際の対局条件の一致は `bin/arena` の起動時に検査する**
+    （`check_seed_provenance`）: `ARENA_MATCH_SEED_BASE` / `ARENA_SHARD` は下流へ渡す
+    ラベルでしかなく対局条件を決めるのは `ARENA_MATCH_SEED` だけなので、食い違うと
+    関門はラベル側しか見ずに通ってしまう（実測: `ARENA_MATCH_SEED=7
+    ARENA_MATCH_SEED_BASE=20260829 ARENA_SHARD=0` で summary は
+    `match_seed_base=20260829` を記録するのに対局は 7 由来）。3値のどれか1つでも
+    指定されたら3値が揃い `match_seed == base + shard` であることを要求し、
+    違えば run 自体を落とす（数値 env が指定されているのに parse できないときも
+    黙って未指定扱いにしない）。**`match_seed_base` は PR #35 で足したフィールド**
+    なので、それより前の commit で回した run（発見セットの 32697854659 /
+    33179939954 など）には `expect_match_seed` を指定できず、
+    **検証セットには使えない**
   - **実測（発見セット run 32697854659 = main vs v13 / v14 各104局・commit 886ef75、
     Check prep run 33252380305）の判定は「この形のままでは検証セットへ
     送らない」**: 段1（**F1 層**の適合率 v13 0.897 [0.795, 0.980] / v14 0.879

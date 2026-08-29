@@ -30,8 +30,8 @@ name: Check prep
 # **元 Arena 実行の実験条件は機械的に検査する**（PR #35 レビュー [P1]）: 記録の
 # `match` / `end` にあるのは戦略名と相手名だけで、CSV meta の `source_fingerprint` は
 # 解析バイナリの版でしかない。同じ run の `arena-result-*`（`arena-summary.json` =
-# candidate / baseline / 実効設定の指紋 / 局数 / 時計 / 予算、`arena-games.jsonl` =
-# commit と match_seed）と `arena-combined` も取り、**シャード集合が 0..n-1 で完備・
+# candidate / baseline / 実効設定の指紋 / 局数 / 時計 / 予算 / match_seed_base、
+# `arena-games.jsonl` = commit）と `arena-combined` も取り、**シャード集合が 0..n-1 で完備・
 # 実効設定が全シャード一致・局数と記録本数が一致・合算局数と一致**を確かめてから
 # 解析する。`expect_candidate` / `expect_match_seed` / `expect_games` を渡すと
 # 期待値との照合も入る（**検証セットでは `expect_match_seed` を必ず渡す** =
@@ -64,7 +64,7 @@ on:
         required: false
         default: "estimator"
       expect_match_seed:
-        description: "元 Arena 実行の match_seed（arena-games.jsonl と照合。**検証セットでは必ず指定する** = 発見セットと独立な seed であることを機械的に固定するため）"
+        description: "元 Arena 実行の match_seed（**shard ずらしと基準ごとの XOR を掛ける前の base seed** = arena.yml の match_seed 入力そのもの。arena-summary.json の match_seed_base と照合する。**検証セットでは必ず指定する** = 発見セットと独立な seed であることを機械的に固定するため。`match_seed_base` は PR #35 で足したフィールドなので、それより前の commit で回した run には指定できない）"
         required: false
         default: ""
       expect_commit:
@@ -199,7 +199,7 @@ jobs:
           github-token: ${{ github.token }}
       # **記録だけでは実験条件を検査できない**（記録の match/end にあるのは戦略名と
       # 相手名だけ）。同じ run の `arena-result-*`（`arena-summary.json` =
-      # 実効設定の指紋・局数・時計・予算、`arena-games.jsonl` = commit と match_seed）と
+      # 実効設定の指紋・局数・時計・予算・match_seed_base、`arena-games.jsonl` = commit）と
       # `arena-combined`（全シャード合算の局数）も取って照合する
       - name: Download arena summaries
         if: needs.plan.outputs.arena_run_id != ''
@@ -356,6 +356,19 @@ jobs:
             fi
             if [ -n "$EXPECT_MATCH_SEED" ] && [ "$base" != "$EXPECT_MATCH_SEED" ]; then
               echo "::error::match_seed_base が期待と違います（期待 $EXPECT_MATCH_SEED / 実際 $base）"
+              exit 1
+            fi
+            # **ラベルと実物の一致**（PR #35 レビュー3巡目 [P2]）。本来の関門は
+            # `bin/arena` の起動時検査（`check_seed_provenance`）で、そこを通った
+            # binary なら必ず `match_seed_env == base + shard`。ここは
+            # **その検査より前の binary で回した run**（base は残るが未検査）を
+            # 弾くための裏取りで、XOR の式は複製していない（単純な加算のみ）
+            bad=$(jq -r 'select((.match_seed_base != null) and (.match_seed_shard != null) and (.match_seed_env != null))
+                         | select(.match_seed_env != (.match_seed_base + .match_seed_shard))
+                         | "shard \(.match_seed_shard): env=\(.match_seed_env) != base=\(.match_seed_base)+shard=\(.match_seed_shard)"' \
+                  shard-summaries.jsonl)
+            if [ -n "$bad" ]; then
+              echo "::error::match_seed_base のラベルが実際の対局 seed と一致しません: $bad"
               exit 1
             fi
           elif [ -n "$EXPECT_MATCH_SEED" ]; then

@@ -95,6 +95,65 @@ fn baseline_match_seed(seed_env: u64, opp_idx: usize) -> u64 {
     seed_env ^ (opp_idx as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
+/// `ARENA_MATCH_SEED` / `ARENA_MATCH_SEED_BASE` / `ARENA_SHARD` の整合性検査。
+///
+/// **base と shard は下流へ渡すラベルでしかなく、実際に対局条件を決めるのは
+/// `ARENA_MATCH_SEED` だけ**。provenance 関門（check-prep.yml）は summary の
+/// `match_seed_base` を見るので、ラベルと実物が食い違うと
+/// 「`expect_match_seed=20260829` を指定したのに対局は別の seed で回っていた」を
+/// 通してしまう（PR #35 レビュー3巡目 [P2]。実際に
+/// `ARENA_MATCH_SEED=7 ARENA_MATCH_SEED_BASE=20260829 ARENA_SHARD=0` で再現した）。
+///
+/// そこで **3値のどれか1つでも指定されたら**（＝CI 経路だと分かったら）3値が揃い
+/// `match_seed == base + shard` であることを要求し、違えば run 自体を落とす。
+/// **式の複製を check-prep 側へ増やさない**ための場所でもある: 照合は
+/// 「起動時にここで検査済み」という不変量に乗る。
+///
+/// base / shard を渡さないローカル実行（`ARENA_MATCH_SEED` だけ・何も無し）は従来どおり。
+fn check_seed_provenance(
+    match_seed: Option<u64>,
+    base: Option<u64>,
+    shard: Option<u64>,
+) -> Result<(), String> {
+    if base.is_none() && shard.is_none() {
+        // ラベルを名乗っていないので検査対象外（ローカル実行）
+        return Ok(());
+    }
+    let (Some(seed), Some(base), Some(shard)) = (match_seed, base, shard) else {
+        return Err(format!(
+            "ARENA_MATCH_SEED / _BASE / ARENA_SHARD は3つ揃えて指定してください\
+             （片欠けだと記録の match_seed_base が実際の対局条件と対応しません）: \
+             match_seed={match_seed:?} base={base:?} shard={shard:?}"
+        ));
+    };
+    let expect = base.checked_add(shard).ok_or_else(|| {
+        format!("ARENA_MATCH_SEED_BASE + ARENA_SHARD が桁あふれします: {base} + {shard}")
+    })?;
+    if seed != expect {
+        return Err(format!(
+            "ARENA_MATCH_SEED が base + shard と一致しません: \
+             match_seed={seed} だが base={base} + shard={shard} = {expect}。\
+             記録される match_seed_base は実際の対局条件と対応しないので中止します"
+        ));
+    }
+    Ok(())
+}
+
+/// 数値 env を読む。**指定されているのに parse できないときは None で黙らない**
+/// （黙って None にすると「指定していない」と区別できず、上の整合性検査を
+/// すり抜ける）。
+fn env_u64(key: &str) -> Result<Option<u64>, String> {
+    match std::env::var(key) {
+        Err(_) => Ok(None),
+        Ok(v) if v.trim().is_empty() => Ok(None),
+        Ok(v) => v
+            .trim()
+            .parse()
+            .map(Some)
+            .map_err(|_| format!("{key} は非負整数で指定してください: {v:?}")),
+    }
+}
+
 /// 1マッチアップの集計を機械可読に書き出す（CIのシャード集約用）。
 /// think時間は生配列を持ち回れないため、シャード内の要約値だけを残す
 ///
@@ -325,16 +384,23 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     // ARENA_MATCH_SEED: 対局条件（定跡・推定器シード等）を決定論化する共通seed。
     // アブレーション比較（版Aと版Bを同じ対局条件列で戦わせて差分を見る）用
-    let match_seed: Option<u64> = std::env::var("ARENA_MATCH_SEED")
-        .ok()
-        .and_then(|v| v.parse().ok());
     // **shard ずらしの前の base seed と shard 番号**（CI が渡す。ローカル実行では
     // 空でよい）。記録に残るのは XOR 済みの実効値なので、これが無いと下流の診断は
-    // 「どの base seed で回した run か」を式の複製なしには照合できない
-    let match_seed_base: Option<u64> = std::env::var("ARENA_MATCH_SEED_BASE")
-        .ok()
-        .and_then(|v| v.parse().ok());
-    let shard_index: Option<u64> = std::env::var("ARENA_SHARD").ok().and_then(|v| v.parse().ok());
+    // 「どの base seed で回した run か」を式の複製なしには照合できない。
+    // **ラベルと実物の一致は起動時にここで検査する**（PR #35 レビュー3巡目 [P2]）
+    let (match_seed, match_seed_base, shard_index) = match (|| {
+        let seed = env_u64("ARENA_MATCH_SEED")?;
+        let base = env_u64("ARENA_MATCH_SEED_BASE")?;
+        let shard = env_u64("ARENA_SHARD")?;
+        check_seed_provenance(seed, base, shard)?;
+        Ok::<_, String>((seed, base, shard))
+    })() {
+        Ok(v) => v,
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(1);
+        }
+    };
     let games: u32 = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(100);
     let candidate = args.get(2).cloned().unwrap_or_else(|| "heuristic".into());
     let opponents: Vec<String> = if args.len() > 3 {
@@ -534,6 +600,31 @@ mod tests {
         }
         // 定数そのもの（過去の記録との互換）
         assert_eq!(baseline_match_seed(0, 0), 0x9E37_79B9_7F4A_7C15);
+    }
+
+    /// **base seed のラベルと実際の対局条件の一致を起動時に検査する**
+    /// （PR #35 レビュー3巡目 [P2]）。
+    ///
+    /// provenance 関門は summary の `match_seed_base` しか見ないので、
+    /// ラベルだけ正しく実物が違う run を通せてしまう。レビューが再現した
+    /// `ARENA_MATCH_SEED=7 ARENA_MATCH_SEED_BASE=20260829 ARENA_SHARD=0` を
+    /// ここで固定する。
+    #[test]
+    fn base_seedのラベルと実効seedの食い違いは起動時に落ちる() {
+        // レビューの再現ケース: ラベルは 20260829 なのに対局は 7 由来
+        assert!(check_seed_provenance(Some(7), Some(20260829), Some(0)).is_err());
+        // 正しい組（arena.yml が渡す形）
+        assert!(check_seed_provenance(Some(20260829), Some(20260829), Some(0)).is_ok());
+        assert!(check_seed_provenance(Some(20260831), Some(20260829), Some(2)).is_ok());
+        // **片欠けも落とす**（base だけ名乗って shard を渡さない等）
+        assert!(check_seed_provenance(Some(20260829), Some(20260829), None).is_err());
+        assert!(check_seed_provenance(Some(20260829), None, Some(0)).is_err());
+        assert!(check_seed_provenance(None, Some(20260829), Some(0)).is_err());
+        // 桁あふれは通さない
+        assert!(check_seed_provenance(Some(0), Some(u64::MAX), Some(1)).is_err());
+        // ローカル実行（ラベルを名乗らない）は従来どおり
+        assert!(check_seed_provenance(None, None, None).is_ok());
+        assert!(check_seed_provenance(Some(20260829), None, None).is_ok());
     }
 
     /// **summary に base seed と shard が残る**。これが無いと、下流は
