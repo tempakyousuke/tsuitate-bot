@@ -542,7 +542,9 @@ fn main() {
 // ---- 集計 ------------------------------------------------------------------
 
 /// 1ペアの観測。`treatment_first` は「その unit で treatment が先に走ったか」
-/// （`arm_order == 0`）で、実行順効果が推定へ漏れていないかの検査に使う
+/// （`arm_order == 0`）で、AB/BA の均衡と半分ごとの影の価格を出すのに使う
+/// （相殺が保証されるのは加法的な主効果までで、交互作用は識別できない。
+/// `order_balance` の doc を参照）
 struct Pair {
     game: String,
     delta: f64,
@@ -763,7 +765,7 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
     };
     match order_effect {
         Some((n, (d, lo, hi))) => println!(
-            "  実行順効果（先に走った arm − 後、n={n}）: {d:+.4} [{lo:+.4}, {hi:+.4}]（**環境に実行順効果が有るか**の量。均衡していれば推定からは相殺されるので、漏れの関門は上の「実行順の均衡」の2行）"
+            "  実行順効果（先に走った arm − 後、n={n}）: {d:+.4} [{lo:+.4}, {hi:+.4}]（**環境に実行順効果が有るか**の量。均衡が相殺できるのは**加法的な主効果まで**で、実行順 × treatment の交互作用はこの設計では識別できない = 上の2行も関門ではない）"
         ),
         None => println!(
             "  実行順効果: **測れない**（`arm_order` が無い = schema 1 の記録。control / treatment を同時実行していたのでペア差にスケジューリング差が混ざる）"
