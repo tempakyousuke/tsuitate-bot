@@ -67,6 +67,10 @@ on:
         description: "元 Arena 実行の match_seed（arena-games.jsonl と照合。**検証セットでは必ず指定する** = 発見セットと独立な seed であることを機械的に固定するため）"
         required: false
         default: ""
+      expect_commit:
+        description: "元 Arena 実行の commit（head_sha）。空なら照合せず記録だけする"
+        required: false
+        default: ""
       expect_games:
         description: "相手ごとの期待局数（空なら照合しない。104 などを入れると部分失敗した run を弾ける）"
         required: false
@@ -87,6 +91,7 @@ jobs:
       bootstrap: ${{ steps.split.outputs.bootstrap }}
       expect_candidate: ${{ steps.split.outputs.expect_candidate }}
       expect_match_seed: ${{ steps.split.outputs.expect_match_seed }}
+      expect_commit: ${{ steps.split.outputs.expect_commit }}
       expect_games: ${{ steps.split.outputs.expect_games }}
     steps:
       - uses: actions/checkout@v5
@@ -100,6 +105,7 @@ jobs:
           IN_BOOT: ${{ github.event.inputs.bootstrap }}
           IN_EXP_CAND: ${{ github.event.inputs.expect_candidate }}
           IN_EXP_SEED: ${{ github.event.inputs.expect_match_seed }}
+          IN_EXP_COMMIT: ${{ github.event.inputs.expect_commit }}
           IN_EXP_GAMES: ${{ github.event.inputs.expect_games }}
         run: |
           set -euo pipefail
@@ -112,6 +118,7 @@ jobs:
             boot="${IN_BOOT:-500}"
             exp_cand="${IN_EXP_CAND-estimator}"
             exp_seed="${IN_EXP_SEED:-}"
+            exp_commit="${IN_EXP_COMMIT:-}"
             exp_games="${IN_EXP_GAMES:-}"
           else
             if [ ! -f "$req" ]; then
@@ -127,6 +134,7 @@ jobs:
                 echo "bootstrap=500"
                 echo "expect_candidate="
                 echo "expect_match_seed="
+                echo "expect_commit="
                 echo "expect_games="
               } >> "$GITHUB_OUTPUT"
               exit 0
@@ -138,6 +146,7 @@ jobs:
             boot=$(jq -r '.bootstrap // 500' "$req")
             exp_cand=$(jq -r 'if has("expect_candidate") then .expect_candidate else "estimator" end' "$req")
             exp_seed=$(jq -r '.expect_match_seed // ""' "$req")
+            exp_commit=$(jq -r '.expect_commit // ""' "$req")
             exp_games=$(jq -r '.expect_games // ""' "$req")
           fi
           # 記録元が無い（リポジトリの records/ を使う）ときは1ジョブだけ回す
@@ -153,6 +162,7 @@ jobs:
             echo "bootstrap=$boot"
             echo "expect_candidate=$exp_cand"
             echo "expect_match_seed=$exp_seed"
+            echo "expect_commit=$exp_commit"
             echo "expect_games=$exp_games"
           } >> "$GITHUB_OUTPUT"
 
@@ -202,12 +212,38 @@ jobs:
         if: needs.plan.outputs.arena_run_id != ''
         env:
           OPPONENT: ${{ matrix.opponent }}
+          RUN_ID: ${{ needs.plan.outputs.arena_run_id }}
+          GH_TOKEN: ${{ github.token }}
           EXPECT_CANDIDATE: ${{ needs.plan.outputs.expect_candidate }}
           EXPECT_MATCH_SEED: ${{ needs.plan.outputs.expect_match_seed }}
+          EXPECT_COMMIT: ${{ needs.plan.outputs.expect_commit }}
           EXPECT_GAMES: ${{ needs.plan.outputs.expect_games }}
         run: |
           set -euo pipefail
           shopt -s nullglob globstar
+          # --- 0. 元 run そのものの状態（commit と結末）を API から取る ---
+          # **artifact だけでは commit が分からない**（`arena-games.jsonl` が
+          # 無い run もある）。部分的に失敗した run の残骸で解析しないためにも
+          # `conclusion == success` を要求する
+          meta=$(curl -sSf -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}")
+          run_sha=$(echo "$meta" | jq -r '.head_sha')
+          run_concl=$(echo "$meta" | jq -r '.conclusion')
+          run_name=$(echo "$meta" | jq -r '.name')
+          if [ "$run_name" != "Arena" ]; then
+            echo "::error::run $RUN_ID は Arena ではありません（$run_name）"
+            exit 1
+          fi
+          if [ "$run_concl" != "success" ]; then
+            echo "::error::元 Arena 実行が success で終わっていません（$run_concl）。部分的に失敗した run の記録では解析しない"
+            exit 1
+          fi
+          printf 'arena_run_id=%s\narena_head_sha=%s\n' "$RUN_ID" "$run_sha" >> provenance.env
+          if [ -n "$EXPECT_COMMIT" ] && [ "$run_sha" != "$EXPECT_COMMIT" ]; then
+            echo "::error::元 Arena 実行の commit が期待と違います（期待 $EXPECT_COMMIT / 実際 $run_sha）"
+            exit 1
+          fi
           # --- 1. シャード集合が 0..n-1 で完備か（途中が欠けた run を弾く）---
           parts=(summaries-in/**/arena-summary.json)
           if [ ${#parts[@]} -eq 0 ]; then
