@@ -668,6 +668,38 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
         }
     }
     println!("\n## P0-1 伝達の分解（記述のみ。中止の門は置かない）\n");
+    // **母集団の attrition**（issue #36 の契約: 改善対象の最悪ケース = 終端手番が
+    // 系統的に欠測すると門が甘くなるので、集計にも必ず出す）。
+    // `decision_points` はシャードで割る**前**の全記録を数えるので、全シャードの
+    // meta が同じ値を持つはず。食い違ったら別の記録集合を混ぜている
+    let attritions: BTreeSet<(u64, u64, u64)> = metas
+        .iter()
+        .map(|m| {
+            (
+                m["attrition"]["check_turns"].as_u64().unwrap_or(0),
+                m["attrition"]["terminal"].as_u64().unwrap_or(0),
+                m["attrition"]["unreplayable"].as_u64().unwrap_or(0),
+            )
+        })
+        .collect();
+    match attritions.len() {
+        1 => {
+            let (turns, term, un) = *attritions.iter().next().expect("1件");
+            println!(
+                "母集団: 王手中の bot の手番 {turns}（うち終端 {term} / **復元できず {un}**）"
+            );
+            if un > 0 {
+                println!(
+                    "  復元できない手番があります（attrition）。改善対象の最悪ケースが\
+                     欠測していないか確認すること"
+                );
+            }
+        }
+        0 => println!("母集団: meta に attrition がありません（古い JSONL）"),
+        n => println!(
+            "母集団: シャード間で attrition が {n} 種類あります（別の記録集合を混ぜている）"
+        ),
+    }
     println!("健全性: 分解の final_p と初回ランキングの p_legal の最大差 {repro:.4}");
     if repro > 1e-9 {
         println!("  **ずれている**: `evaluate` の経路（cap / min 系）を取りこぼしている可能性");
