@@ -1025,7 +1025,6 @@ pub mod hurdle {
             }
             for (a, hr) in h.iter_mut().enumerate() {
                 hr[a] += ridge + 1e-6;
-                let _ = a;
             }
             let Some(step) = solve(h, g0.clone()) else { break };
             // ステップ半減（数値ヘッシアンが不定になる領域での暴走を防ぐ）
