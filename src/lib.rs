@@ -10,6 +10,7 @@ pub mod bridge;
 pub mod check;
 pub mod check_economy;
 pub mod check_policy;
+pub mod check_prep;
 pub mod checkpoint;
 pub mod client;
 pub mod config;
