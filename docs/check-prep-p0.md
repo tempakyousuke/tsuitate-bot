@@ -117,11 +117,31 @@
 - `arena-result-<相手>-s*/arena-games.jsonl`: commit と `match_seed`
 - `arena-combined/combined.json`: 全シャード合算の局数
 
-も取り、**シャード集合が 0..n-1 で完備・実効設定が全シャードで一致・
-局数と記録の本数が一致・合算局数と一致**を確かめてから解析する。
-`expect_candidate` / `expect_match_seed` / `expect_games` を渡せば期待値との照合も
-入る。**検証セットでは `expect_match_seed` を必ず渡す**（発見セットと独立な seed で
-あることを機械的に固定するため）。どれか1つでも外れたら解析を進めない。
+と、**API から取る元 run の `head_sha` / `conclusion`** も使い、
+**シャード集合が 0..n-1 で完備・実効設定が全シャードで一致・局数と記録の本数が一致・
+合算局数と一致・元 run が success 終了**を確かめてから解析する。
+`expect_candidate` / `expect_match_seed` / `expect_commit` / `expect_games` /
+`expect_shards` を渡せば期待値との照合も入る。**検証セットでは
+`expect_match_seed` を必ず渡す**（発見セットと独立な seed であることを機械的に
+固定するため）。どれか1つでも外れたら解析を進めない。
+
+2点、実装で踏んだ落とし穴がある（PR #35 レビュー2巡目）:
+
+- **`match_seed` の照合は `match_seed_base` で行う**。記録に残る `match_seed` は
+  arena.yml が付ける**シャードずらし**（`base + shard`）に、さらに `bin/arena` が
+  基準ごとの定数を **XOR** した**実効値**なので、4シャードなら4値になるし base とも
+  一致しない（実測: base 20260828 の4シャードで
+  `11400714819309886408`〜`...411`）。`bin/arena` が `match_seed_base` /
+  `match_seed_shard` / `match_seed_env` / `match_seed`（実効値）を
+  `arena-summary.json` へ明示的に残すようにして、**式を複製せずに**照合する
+  （実効 seed の式は `baseline_match_seed` の1箇所で、`cargo test` が定数ごと固定する）。
+  記録された `match_seed_shard` の集合が `0..n-1` で完備かも、artifact 名とは
+  独立の裏取りとして検査する
+- **`arena-combined` は必須**。シャード番号の連続性だけでは**末尾**の欠落
+  （`{0,1,2}` は `0..n-1` に見える）を拾えず、末尾シャードの `arena-result-*` と
+  `arena-records-*` が対で落ちると「局数 == 記録本数」も通ってしまう
+  （実測: 78 == 78 で通過）。合算局数との照合が唯一の fail-closed な経路なので、
+  取れなければ止める
 
 ## 実測（発見セット: Arena run 32697854659 = main vs v13 / v14 各104局、`match_seed=20260815`）
 
@@ -292,6 +312,10 @@ v13 `knight:29,line:31,diag:26;d2:65,d3:13,d4:4,d5+:4` / `--adj-share 0.84`）�
   CSV meta の `source_fingerprint` は解析バイナリの版。元 Arena 実行の
   `arena-summary.json` / `arena-games.jsonl` / `combined.json` と、API から取る
   `head_sha` / `conclusion` まで照合する。
+  **記録の `match_seed` は実効値**（シャードずらし ＋ 基準ごとの XOR）なので、
+  base seed と直接比べてはいけない（`match_seed_base` を明示的に残して照合する）。
+  **完備検査は末尾の欠落に効くものを選ぶ**: シャード番号の連続性も
+  「局数 == 記録本数」も末尾欠落を通してしまうので、合算局数との照合を必須にする。
   **発見セットの run 32697854659 は commit 886ef75 が `ARENA_GAMES_JSON` より前で
   `arena-games.jsonl` を持たない**ので、`match_seed` を記録から確かめられない
   （CLAUDE.md の `match_seed=20260815` の裏は artifact からは取れない）。

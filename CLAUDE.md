@@ -971,10 +971,15 @@
   - **元 Arena 実行の実験条件は機械的に検査してから解析する**（PR #35 レビュー [P1]）。
     記録の `match` / `end` にあるのは戦略名と相手名だけで、CSV meta の
     `source_fingerprint` は解析バイナリの版でしかない。`check-prep.yml` が同じ run の
-    `arena-result-*`（実効設定の指紋・局数・時計・予算）と `arena-games.jsonl`
-    （commit / match_seed）・`arena-combined`（合算局数）を取り、API から元 run の
-    `head_sha` / `conclusion` も引いて、**シャード集合の完備・実効設定の一致・
-    局数と記録本数の一致・合算局数の一致・success 終了**を確かめる
+    `arena-result-*`（実効設定の指紋・局数・時計・予算・`match_seed_base` /
+    `match_seed_shard`）と `arena-games.jsonl`（commit）・`arena-combined`（合算局数）を
+    取り、API から元 run の `head_sha` / `conclusion` も引いて、**シャード集合の完備・
+    実効設定の一致・局数と記録本数の一致・合算局数の一致・success 終了**を確かめる。
+    **`match_seed` の照合は `match_seed_base` で行う**（記録に残る `match_seed` は
+    シャードずらし ＋ 基準ごとの XOR を掛けた**実効値**なので、4シャードなら4値になり
+    base とも一致しない。`bin/arena` が base と shard を summary へ明示的に残す）。
+    **`arena-combined` は必須**（シャード番号の連続性も「局数 == 記録本数」も
+    **末尾**の欠落を通してしまう。合算局数との照合が唯一の fail-closed な経路）
   - **実測（発見セット run 32697854659 = main vs v13 / v14 各104局・commit 886ef75、
     Check prep run 33252380305）の判定は「この形のままでは検証セットへ
     送らない」**: 段1（**F1 層**の適合率 v13 0.897 [0.795, 0.980] / v14 0.879

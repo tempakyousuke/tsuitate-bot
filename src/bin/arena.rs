@@ -85,9 +85,29 @@ fn print_match(stats: &MatchStats, name_a: &str, name_b: &str) {
     );
 }
 
+/// 基準ごとにずらした**実効 match seed**。
+///
+/// `ARENA_MATCH_SEED` をそのまま使うと、ガントレットの全基準が同じ対局条件列に
+/// なる（同じ基準に対してだけ同一条件列にしたい）。**式はここ1箇所**に置く:
+/// 対局の生成（`run_match_with_seeds`）と記録（`ARENA_GAMES_JSON` / `ARENA_JSON`）で
+/// 食い違うと、記録された seed から対局条件を復元できなくなる。
+fn baseline_match_seed(seed_env: u64, opp_idx: usize) -> u64 {
+    seed_env ^ (opp_idx as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+}
+
 /// 1マッチアップの集計を機械可読に書き出す（CIのシャード集約用）。
 /// think時間は生配列を持ち回れないため、シャード内の要約値だけを残す
-fn summary_json(candidate: &str, baseline: &str, stats: &MatchStats) -> serde_json::Value {
+///
+/// `seed` は `(ARENA_MATCH_SEED_BASE, ARENA_SHARD, ARENA_MATCH_SEED, 実効 seed)`。
+/// **base と shard を明示して残す**のが要点（PR #35 レビュー2巡目 [P1]）:
+/// 記録に残るのは XOR 済みの実効値なので、下流の診断が
+/// 「この run はどの base seed で回したか」を式の複製なしに照合できるようにする。
+fn summary_json(
+    candidate: &str,
+    baseline: &str,
+    stats: &MatchStats,
+    seed: (Option<u64>, Option<u64>, Option<u64>, Option<u64>),
+) -> serde_json::Value {
     let quant = |us: &[u64]| -> (f64, f64) {
         if us.is_empty() {
             return (0.0, 0.0);
@@ -147,6 +167,13 @@ fn summary_json(candidate: &str, baseline: &str, stats: &MatchStats) -> serde_js
         // 共有モデルの pin から作る）。現行 config の指紋をそのまま入れると
         // 全 baseline で同じ値になり、実効設定を表さない（PR #22 レビュー指摘4）
         "baseline_behavior": behavior_of(baseline, &tsuitate_bot::config::ambient()),
+        // **対局条件列の出どころ**（下流の診断が実験条件を機械的に照合するのに使う）。
+        // `match_seed_env` は shard ずらし後の `ARENA_MATCH_SEED`、
+        // `match_seed` はそこから基準ごとにずらした実効値
+        "match_seed_base": seed.0,
+        "match_seed_shard": seed.1,
+        "match_seed_env": seed.2,
+        "match_seed": seed.3,
     })
 }
 
@@ -301,6 +328,13 @@ fn main() {
     let match_seed: Option<u64> = std::env::var("ARENA_MATCH_SEED")
         .ok()
         .and_then(|v| v.parse().ok());
+    // **shard ずらしの前の base seed と shard 番号**（CI が渡す。ローカル実行では
+    // 空でよい）。記録に残るのは XOR 済みの実効値なので、これが無いと下流の診断は
+    // 「どの base seed で回した run か」を式の複製なしには照合できない
+    let match_seed_base: Option<u64> = std::env::var("ARENA_MATCH_SEED_BASE")
+        .ok()
+        .and_then(|v| v.parse().ok());
+    let shard_index: Option<u64> = std::env::var("ARENA_SHARD").ok().and_then(|v| v.parse().ok());
     let games: u32 = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(100);
     let candidate = args.get(2).cloned().unwrap_or_else(|| "heuristic".into());
     let opponents: Vec<String> = if args.len() > 3 {
@@ -331,7 +365,7 @@ fn main() {
             Some(seed) => run_match_with_seeds(
                 games,
                 // 基準ごとにずらす（同じ基準に対してだけ同一条件列になる）
-                seed ^ (opp_idx as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15),
+                baseline_match_seed(seed, opp_idx),
                 &|gs| make_candidate(&candidate, Some(gs.seed)),
                 &|gs| strategy::make_seeded(opp, gs.seed).expect("検証済みの戦略名"),
             ),
@@ -368,9 +402,8 @@ fn main() {
                     let commit = git_commit();
                     let mut lines: Vec<String> = vec![];
                     for (opp_idx, (opp, stats)) in results.iter().enumerate() {
-                        // 基準ごとのずらしは run_match_with_seeds の呼び出しと同じ式
-                        let match_seed_eff =
-                            seed ^ (opp_idx as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                        // 基準ごとのずらしは run_match_with_seeds の呼び出しと同じ関数
+                        let match_seed_eff = baseline_match_seed(seed, opp_idx);
                         let mut games: Vec<&_> = stats.per_game.iter().collect();
                         games.sort_by_key(|g| g.game_no);
                         for g in games {
@@ -431,7 +464,16 @@ fn main() {
         if !path.is_empty() {
             let lines: Vec<String> = results
                 .iter()
-                .map(|(opp, stats)| summary_json(&candidate, opp, stats).to_string())
+                .enumerate()
+                .map(|(opp_idx, (opp, stats))| {
+                    let seed = (
+                        match_seed_base,
+                        shard_index,
+                        match_seed,
+                        match_seed.map(|s| baseline_match_seed(s, opp_idx)),
+                    );
+                    summary_json(&candidate, opp, stats, seed).to_string()
+                })
                 .collect();
             std::fs::write(&path, lines.join("\n") + "\n")
                 .unwrap_or_else(|e| eprintln!("ARENA_JSON を書き込めません（{path}）: {e}"));
@@ -472,6 +514,47 @@ fn main() {
 mod tests {
     use super::*;
     use tsuitate_bot::config::EnvSource;
+
+    /// **実効 seed の式は1箇所**（PR #35 レビュー2巡目 [P1]）。
+    ///
+    /// 記録に残るのは XOR 済みの実効値なので、対局生成と記録で式が食い違うと
+    /// 「記録された seed から対局条件を復元する」ができなくなる。定数が動いたら
+    /// 過去の記録と突き合わせられなくなるので、ここで固定する。
+    #[test]
+    fn 実効match_seedは基準ごとにずれる() {
+        // 同じ base でも基準が違えば別の条件列
+        assert_ne!(baseline_match_seed(20260828, 0), baseline_match_seed(20260828, 1));
+        // 同じ (base, 基準) なら決定論的
+        assert_eq!(baseline_match_seed(20260828, 0), baseline_match_seed(20260828, 0));
+        // **XOR なので base を復元できる**（下流の診断はこの性質に乗る）
+        for opp_idx in 0..4 {
+            let eff = baseline_match_seed(20260828, opp_idx);
+            let m = eff ^ 20260828u64;
+            assert_eq!(m, (opp_idx as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        }
+        // 定数そのもの（過去の記録との互換）
+        assert_eq!(baseline_match_seed(0, 0), 0x9E37_79B9_7F4A_7C15);
+    }
+
+    /// **summary に base seed と shard が残る**。これが無いと、下流は
+    /// XOR 済みの実効値しか見られず `expect_match_seed` と照合できない
+    #[test]
+    fn summaryはbase_seedとshardを残す() {
+        let stats = MatchStats::default();
+        let v = summary_json(
+            "estimator",
+            "estimator_v14",
+            &stats,
+            (Some(20260828), Some(2), Some(20260830), Some(baseline_match_seed(20260830, 0))),
+        );
+        assert_eq!(v["match_seed_base"], 20260828);
+        assert_eq!(v["match_seed_shard"], 2);
+        assert_eq!(v["match_seed_env"], 20260830);
+        assert_eq!(v["match_seed"], baseline_match_seed(20260830, 0));
+        // seed 無しの run では null（欠測として下流が扱えるように）
+        let v = summary_json("estimator", "estimator_v14", &stats, (None, None, None, None));
+        assert!(v["match_seed_base"].is_null() && v["match_seed"].is_null());
+    }
 
     /// **記録は候補の種別に合った実効値になる**（PR #22 再レビュー P2 の適用範囲）。
     ///

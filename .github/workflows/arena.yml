@@ -217,6 +217,12 @@ jobs:
           seed='${{ needs.plan.outputs.match_seed }}'
           if [ -n "$seed" ]; then
             export ARENA_MATCH_SEED=$(( seed + ${{ matrix.shard }} ))
+            # **ずらす前の base と shard 番号も渡す**（PR #35 レビュー2巡目 [P1]）。
+            # 記録に残る match_seed は「base + shard」をさらに基準ごとに XOR した
+            # 実効値なので、下流の診断はこれが無いと「どの base seed で回した run か」を
+            # 式の複製なしには照合できない
+            export ARENA_MATCH_SEED_BASE="$seed"
+            export ARENA_SHARD='${{ matrix.shard }}'
           fi
           # 時計（審判側の設定なので ARENA_*。両者に等しく効く）
           if [ -n "$ARENA_CLOCK" ]; then

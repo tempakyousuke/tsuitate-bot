@@ -75,6 +75,10 @@ on:
         description: "相手ごとの期待局数（空なら照合しない。104 などを入れると部分失敗した run を弾ける）"
         required: false
         default: ""
+      expect_shards:
+        description: "元 Arena 実行のシャード数（空なら照合しない。合算局数の照合と合わせて末尾シャードの欠落を確実に弾ける）"
+        required: false
+        default: ""
   push:
     paths:
       - ".github/ci/check-prep.request.json"
@@ -93,6 +97,7 @@ jobs:
       expect_match_seed: ${{ steps.split.outputs.expect_match_seed }}
       expect_commit: ${{ steps.split.outputs.expect_commit }}
       expect_games: ${{ steps.split.outputs.expect_games }}
+      expect_shards: ${{ steps.split.outputs.expect_shards }}
     steps:
       - uses: actions/checkout@v5
       - id: split
@@ -107,6 +112,7 @@ jobs:
           IN_EXP_SEED: ${{ github.event.inputs.expect_match_seed }}
           IN_EXP_COMMIT: ${{ github.event.inputs.expect_commit }}
           IN_EXP_GAMES: ${{ github.event.inputs.expect_games }}
+          IN_EXP_SHARDS: ${{ github.event.inputs.expect_shards }}
         run: |
           set -euo pipefail
           req='.github/ci/check-prep.request.json'
@@ -120,6 +126,7 @@ jobs:
             exp_seed="${IN_EXP_SEED:-}"
             exp_commit="${IN_EXP_COMMIT:-}"
             exp_games="${IN_EXP_GAMES:-}"
+            exp_shards="${IN_EXP_SHARDS:-}"
           else
             if [ ! -f "$req" ]; then
               # push の paths フィルタは削除にも一致する。計測後に $req を消す
@@ -136,6 +143,7 @@ jobs:
                 echo "expect_match_seed="
                 echo "expect_commit="
                 echo "expect_games="
+                echo "expect_shards="
               } >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -148,6 +156,7 @@ jobs:
             exp_seed=$(jq -r '.expect_match_seed // ""' "$req")
             exp_commit=$(jq -r '.expect_commit // ""' "$req")
             exp_games=$(jq -r '.expect_games // ""' "$req")
+            exp_shards=$(jq -r '.expect_shards // ""' "$req")
           fi
           # 記録元が無い（リポジトリの records/ を使う）ときは1ジョブだけ回す
           if [ -z "$run_id" ]; then
@@ -164,6 +173,7 @@ jobs:
             echo "expect_match_seed=$exp_seed"
             echo "expect_commit=$exp_commit"
             echo "expect_games=$exp_games"
+            echo "expect_shards=$exp_shards"
           } >> "$GITHUB_OUTPUT"
 
   prep:
@@ -199,9 +209,11 @@ jobs:
           path: summaries-in
           run-id: ${{ needs.plan.outputs.arena_run_id }}
           github-token: ${{ github.token }}
+      # **必須**（PR #35 レビュー2巡目 [P2]）: シャード番号の連続性だけでは
+      # **末尾**の欠落（`{0,1,2}` は 0..n-1 に見える）を拾えない。合算局数との
+      # 照合が唯一の fail-closed な検査なので、取れなければ止める
       - name: Download arena combined
         if: needs.plan.outputs.arena_run_id != ''
-        continue-on-error: true
         uses: actions/download-artifact@v7
         with:
           name: arena-combined
@@ -218,6 +230,7 @@ jobs:
           EXPECT_MATCH_SEED: ${{ needs.plan.outputs.expect_match_seed }}
           EXPECT_COMMIT: ${{ needs.plan.outputs.expect_commit }}
           EXPECT_GAMES: ${{ needs.plan.outputs.expect_games }}
+          EXPECT_SHARDS: ${{ needs.plan.outputs.expect_shards }}
         run: |
           set -euo pipefail
           shopt -s nullglob globstar
@@ -296,34 +309,60 @@ jobs:
             echo "::error::局数が期待と違います（期待 $EXPECT_GAMES / 実際 $games）"
             exit 1
           fi
-          # --- 4. aggregate が見た局数と一致するか（末尾シャードの欠落を拾う）---
-          if [ -f combined-in/combined.json ]; then
-            cg=$(jq -r --arg b "$OPPONENT" '.[] | select(.baseline == $b) | .games' combined-in/combined.json)
-            if [ -n "$cg" ] && [ "$cg" != "$games" ]; then
-              echo "::error::arena-combined の局数 $cg と取得した $games が違います（シャードの取り逃し）"
-              exit 1
-            fi
-          else
-            echo "::warning::arena-combined が無いので合算局数との照合はできません"
+          # --- 4. aggregate が見た局数と一致するか（**末尾シャードの欠落を拾う
+          # 唯一の経路**。シャード番号の連続性検査は末尾欠落を検出できない）---
+          if [ ! -f combined-in/combined.json ]; then
+            echo "::error::arena-combined/combined.json がありません。末尾シャードの欠落を検査できないので解析しない"
+            exit 1
           fi
-          # --- 5. commit と match_seed が単一か（検証セットの独立 seed の固定）---
+          cg=$(jq -r --arg b "$OPPONENT" '.[] | select(.baseline == $b) | .games' combined-in/combined.json)
+          if [ -z "$cg" ]; then
+            echo "::error::arena-combined に相手 $OPPONENT の行がありません"
+            exit 1
+          fi
+          if [ "$cg" != "$games" ]; then
+            echo "::error::arena-combined の局数 $cg と取得した $games が違います（シャードの取り逃し）"
+            exit 1
+          fi
+          if [ -n "$EXPECT_SHARDS" ] && [ "$n" -ne "$EXPECT_SHARDS" ]; then
+            echo "::error::シャード数が期待と違います（期待 $EXPECT_SHARDS / 実際 $n）"
+            exit 1
+          fi
+          # --- 5. commit（記録側）---
           gj=(summaries-in/**/arena-games.jsonl)
           if [ ${#gj[@]} -gt 0 ]; then
             commit=$(jq -r '.commit' "${gj[@]}" | sort -u)
-            seed=$(jq -r '.match_seed | tostring' "${gj[@]}" | sort -u)
-            for v in "$commit" "$seed"; do
-              [ "$(echo "$v" | wc -l)" -eq 1 ] || { echo "::error::commit / match_seed が単一でありません"; exit 1; }
-            done
-            printf 'commit=%s\nmatch_seed=%s\n' "$commit" "$seed" >> provenance.env
-            if [ -n "$EXPECT_MATCH_SEED" ] && [ "$seed" != "$EXPECT_MATCH_SEED" ]; then
-              echo "::error::match_seed が期待と違います（期待 $EXPECT_MATCH_SEED / 実際 $seed）"
+            [ "$(echo "$commit" | wc -l)" -eq 1 ] || { echo "::error::記録の commit が単一でありません"; exit 1; }
+            printf 'record_commit=%s\n' "$commit" >> provenance.env
+          fi
+          # --- 6. match_seed の照合（**base seed で見る**）---------------------
+          # `arena-games.jsonl` / `arena-summary.json` の `match_seed` は
+          # 「base + shard」をさらに**基準ごとに XOR した実効値**なので、
+          # シャードごとに違うし base とも一致しない（PR #35 レビュー2巡目 [P1]）。
+          # 照合は arena が明示的に残す `match_seed_base` で行う（式を複製しない）
+          base=$(jq -r '.match_seed_base // empty | tostring' shard-summaries.jsonl | sort -u)
+          shards_rec=$(jq -r '.match_seed_shard // empty | tostring' shard-summaries.jsonl | sort -n | tr '\n' ' ')
+          if [ -n "$base" ]; then
+            if [ "$(echo "$base" | wc -l)" -ne 1 ]; then
+              echo "::error::シャード間で match_seed_base が食い違います: $(echo $base)"
+              exit 1
+            fi
+            printf 'match_seed_base=%s\nmatch_seed_shards=%s\n' "$base" "$shards_rec" >> provenance.env
+            # 記録された shard 番号の集合も 0..n-1 で完備か（artifact 名とは独立の裏取り）
+            want_rec=$(seq 0 $((n - 1)) | tr '\n' ' ')
+            if [ "$shards_rec" != "$want_rec" ]; then
+              echo "::error::記録の match_seed_shard が 0..$((n-1)) で完備ではありません（$shards_rec）"
+              exit 1
+            fi
+            if [ -n "$EXPECT_MATCH_SEED" ] && [ "$base" != "$EXPECT_MATCH_SEED" ]; then
+              echo "::error::match_seed_base が期待と違います（期待 $EXPECT_MATCH_SEED / 実際 $base）"
               exit 1
             fi
           elif [ -n "$EXPECT_MATCH_SEED" ]; then
-            echo "::error::arena-games.jsonl がありません（match_seed 無しで回したか、元 run の commit が ARENA_GAMES_JSON より前）。どちらにせよ検証セットの独立 seed を機械的に固定できません"
+            echo "::error::arena-summary.json に match_seed_base がありません（元 run の commit がこのフィールドより前か、match_seed 無しで回した run）。どちらにせよ検証セットの独立 seed を機械的に固定できません"
             exit 1
           else
-            echo "::warning::arena-games.jsonl がありません（match_seed 無しで回したか、元 run の commit が ARENA_GAMES_JSON より前）。match_seed を記録から確かめられないので**検証セットには使えません**"
+            echo "::warning::arena-summary.json に match_seed_base がありません（元 run が古いか match_seed 無し）。match_seed を記録から確かめられないので**検証セットには使えません**"
           fi
           printf 'games=%s\nshards=%s\n' "$games" "$n" >> provenance.env
           echo "検証済みの実験条件:"; cat provenance.env
