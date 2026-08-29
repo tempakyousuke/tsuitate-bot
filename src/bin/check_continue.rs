@@ -1007,6 +1007,36 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
             ));
         }
     }
+    // **replicate 間で決定点の母集団が同じか**（PR #33 レビュー5巡目 [P1]）。
+    // 実験キーの一致検査が見るのは `experiment` だけで、`points_detail` はその外にある。
+    // 期待キー集合は各 replicate が**自分の meta**から作るので、replicate ごとに行が
+    // 完全でも、**別々の決定点母集団**の2本を「同じ実験の 2 replicate」として平均できる
+    // （点推定も cluster bootstrap も「同じ標本を2回測った」前提なので契約が崩れる）。
+    // 全シャードを合わせた `(game, move_number, estimand)` の集合が
+    // replicate 間で完全一致することを要求する
+    let mut pop: BTreeMap<u64, BTreeSet<(String, u64, String)>> = BTreeMap::new();
+    for m in metas {
+        let rep = m["replicate"].as_u64().unwrap_or(0);
+        let e = pop.entry(rep).or_default();
+        for d in m["points_detail"].as_array().into_iter().flatten() {
+            e.insert((
+                d["game"].as_str().unwrap_or("?").to_string(),
+                d["move_number"].as_u64().unwrap_or(0),
+                d["estimand"].as_str().unwrap_or("?").to_string(),
+            ));
+        }
+    }
+    if let Some((base_rep, base)) = pop.iter().next() {
+        for (rep, s) in pop.iter().skip(1) {
+            if s != base {
+                let lack = base.difference(s).count();
+                let more = s.difference(base).count();
+                out.push(format!(
+                    "replicate {rep} の決定点母集団が replicate {base_rep} と違います（欠け {lack} / 余分 {more}）: 別の標本を同じ実験の replicate として平均できない"
+                ));
+            }
+        }
+    }
     // 重複行（**replicate をキーに含める**。2回実行の同じ決定点は重複ではない）
     let mut keys: HashSet<(u64, String, u64, u64, String)> = HashSet::new();
     let mut dups = 0;
@@ -1327,6 +1357,31 @@ mod tests {
         assert!(
             problems.iter().any(|p| p.contains("宣言していない")),
             "範囲外 seed の余分行を検出できていない: {problems:?}"
+        );
+    }
+
+    /// **別々の標本を同じ実験の replicate として平均できない**（PR #33 レビュー5巡目 [P1]）。
+    /// 実験キーの一致検査は `experiment` しか見ず `points_detail` はその外にあるので、
+    /// replicate 1 の meta と全行の `game` に接頭辞を付けて母集団を完全に分離しても、
+    /// **各 replicate 内の行は完全なまま**なので素通りしていた
+    #[test]
+    fn replicate間で決定点の母集団が違ったら止まる() {
+        let mut m0 = meta(exp(), 0);
+        m0["replicate"] = serde_json::json!(0);
+        let mut m1 = meta(exp(), 0);
+        m1["replicate"] = serde_json::json!(1);
+        m1["points_detail"] =
+            serde_json::json!([{"game": "other-g1", "move_number": 41, "estimand": "foul"}]);
+        let mut rows = full();
+        for mut r in full() {
+            r["replicate"] = serde_json::json!(1);
+            r["game"] = serde_json::json!("other-g1");
+            rows.push(r);
+        }
+        let problems = check_inputs(&[m0, m1], &rows);
+        assert!(
+            problems.iter().any(|p| p.contains("決定点母集団")),
+            "別の標本を 2 replicate として受理した: {problems:?}"
         );
     }
 
