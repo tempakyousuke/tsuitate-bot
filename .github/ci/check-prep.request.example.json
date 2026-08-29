@@ -1,0 +1,9 @@
+{
+  "_comment": "このファイルを .github/ci/check-prep.request.json という名前でコミットして push すると Check prep（issue #34 P0-1 / P0-2）が起動する。キーは workflow_dispatch の inputs と同じ。計測後に消す push は全ジョブがスキップされる",
+  "_discovery": "発見セット = 既存の Arena 実行（例 33179939954 / 32697854659）。検証セットは未使用の match_seed で取り直した別の Arena 実行を指す別の起動で回し、origin_weights と adj_share は発見セットの実測値で固定する",
+  "arena_run_id": "33179939954",
+  "opponents": ["estimator_v14"],
+  "origin_weights": "",
+  "adj_share": 0.5,
+  "bootstrap": 500
+}

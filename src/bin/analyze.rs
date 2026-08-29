@@ -23,6 +23,9 @@ use tsuitate_bot::check_economy::{
     CheckFoulReason, CheckMoveKind, CheckTurn, TurnType, check_turns, classify_check_foul,
     cluster_ratio_ci, sq as sq_name, true_checkers, view_from_model,
 };
+use tsuitate_bot::check_prep::{
+    ChaseClass, ChaseEvent, bot_foul_counts, chase_contribution, chase_events, cluster_bootstrap,
+};
 use tsuitate_bot::mate::{mate_moves_in_1, mate_moves_in_1_fast};
 use tsuitate_bot::mate_economy::{MateKind, fold_episodes, threat_turns};
 use tsuitate_bot::model::GameModel;
@@ -382,6 +385,131 @@ impl CheckEconomy {
                 "  捕獲試みの方向つき較正誤差（平均予測 − 合法率）: {gap:+.3} [95% CI {lo:+.3}, {hi:+.3}]（n={n:.0}手 / {}局。門: CI下限 > 0.1 かつ v13/v14 で同方向）",
                 self.capture_gap_clusters.len(),
             );
+        }
+    }
+}
+
+/// **被王手の前の準備 P0-1**（issue #34）: 連続王手の起点の分類。
+///
+/// ユーザーの指導4「王手されて逃げた後に連続で王手をかけられた場合、**玉がいた
+/// 位置に王手の原因の駒がいることが多い**」の実測。粒子を回さないので
+/// `bin/analyze` に常設できる。
+///
+/// **門は「(a)+(b) が過半」ではない**（頻度が高くても、被覆の有無で反則が
+/// 変わらないなら形を変える意味が無い）。`(a) の頻度 × F4 有無による反則差`
+/// と `(b) の頻度 × 実王手駒マス被覆の有無による反則差`を**別々に**出し、
+/// 元対局 cluster CI を付けて合算も出す。
+#[derive(Default)]
+struct ChasePrep {
+    /// 局ごとのイベント（cluster bootstrap の単位は元対局）
+    clusters: Vec<Vec<ChaseEvent>>,
+    /// 玉の手で王手を解消した bot の手番（連続王手の分母）
+    king_resolves: u32,
+    /// 相手が人間かどうかで分けた (イベント数, クラス別) — 人間の王手と
+    /// アリーナの王手は質が違う（`K_attack` の分布が違う）ので混ぜない
+    by_human: [(u32, [u32; 3]); 2],
+}
+
+impl ChasePrep {
+    fn add_game(&mut self, events: Vec<ChaseEvent>, king_resolves: u32, human: bool) {
+        self.king_resolves += king_resolves;
+        let slot = &mut self.by_human[usize::from(human)];
+        for e in &events {
+            slot.0 += 1;
+            slot.1[ChaseClass::ALL.iter().position(|c| *c == e.class).unwrap()] += 1;
+        }
+        self.clusters.push(events);
+    }
+
+    fn report(&self) {
+        let n: usize = self.clusters.iter().map(|c| c.len()).sum();
+        if n == 0 {
+            return;
+        }
+        println!("\n--- 被王手の前の準備: 連続王手の起点（issue #34 P0-1）---");
+        println!(
+            "  玉の手で王手を解消した手番 {} → うち次の相手手番で再び王手 {n} ({:.1}%)",
+            self.king_resolves,
+            if self.king_resolves == 0 {
+                0.0
+            } else {
+                n as f64 * 100.0 / f64::from(self.king_resolves)
+            },
+        );
+        let all: Vec<&ChaseEvent> = self.clusters.iter().flatten().collect();
+        for class in ChaseClass::ALL {
+            let ev: Vec<&&ChaseEvent> = all.iter().filter(|e| e.class == class).collect();
+            if ev.is_empty() {
+                println!("  {:<22} 0件", class.label());
+                continue;
+            }
+            let fouls: u32 = ev.iter().map(|e| e.fouls).sum();
+            let covered = ev
+                .iter()
+                .filter(|e| {
+                    if class == ChaseClass::AtPrevKing {
+                        e.prev_king_covered
+                    } else {
+                        e.checkers_covered
+                    }
+                })
+                .count();
+            println!(
+                "  {:<22} {:>4}件 ({:>4.1}%) / 反則 {:>4}（{:.2}/件）/ 対応する被覆あり {covered} / 同じ駒が追った {} / 両王手 {}",
+                class.label(),
+                ev.len(),
+                ev.len() as f64 * 100.0 / n as f64,
+                fouls,
+                f64::from(fouls) / ev.len() as f64,
+                ev.iter().filter(|e| e.same_piece).count(),
+                ev.iter().filter(|e| e.double_check).count(),
+            );
+        }
+        for (slot, name) in [(1usize, "人間の王手"), (0, "bot の王手")] {
+            let (cnt, by_class) = self.by_human[slot];
+            if cnt > 0 {
+                println!(
+                    "  {name}: {cnt}件（(a) {} / (b) {} / (c) {}）",
+                    by_class[0], by_class[1], by_class[2]
+                );
+            }
+        }
+        // 門: 寄与量（頻度 × 被覆の有無による反則差）を (a) と (b) で別々に
+        for (class, what) in [
+            (ChaseClass::AtPrevKing, "F4（前の玉位置の被覆）"),
+            (ChaseClass::AdjacentPrevKing, "実王手駒マスの被覆"),
+        ] {
+            match chase_contribution(&all, class) {
+                Some(v) => {
+                    let (lo, hi) = cluster_bootstrap(
+                        &self.clusters,
+                        |e| chase_contribution(e, class),
+                        0.05,
+                        0x2026_0829,
+                    );
+                    println!(
+                        "  寄与量 {} × {what}: {v:+.3} 反則/件 [95% CI {lo:+.3}, {hi:+.3}]",
+                        class.label()
+                    );
+                }
+                None => println!(
+                    "  寄与量 {} × {what}: 判定不能（被覆あり/なしの片側が空）",
+                    class.label()
+                ),
+            }
+        }
+        let total = |e: &[&ChaseEvent]| -> Option<f64> {
+            Some(
+                chase_contribution(e, ChaseClass::AtPrevKing)?
+                    + chase_contribution(e, ChaseClass::AdjacentPrevKing)?,
+            )
+        };
+        match total(&all) {
+            Some(v) => {
+                let (lo, hi) = cluster_bootstrap(&self.clusters, total, 0.05, 0x2026_0830);
+                println!("  寄与量の合算 (a)+(b): {v:+.3} 反則/件 [95% CI {lo:+.3}, {hi:+.3}]");
+            }
+            None => println!("  寄与量の合算 (a)+(b): 判定不能（どちらかのセルが空）"),
         }
     }
 }
@@ -1169,6 +1297,8 @@ fn main() {
     let mut mate_cost = MateCost::default();
     // issue #31 P0-1〜P0-3: 王手中の反則経済（粒子不要）
     let mut check_econ = CheckEconomy::default();
+    // issue #34 P0-1: 連続王手の起点（被王手の前の準備）
+    let mut chase_prep = ChasePrep::default();
     let mut catastrophes = SolverCatastrophes::default();
     let mut total_check_turns = 0;
     let mut total_check_actual_fouls = 0;
@@ -1672,6 +1802,40 @@ fn main() {
         }
         check_econ.add_game(&econ_turns);
 
+        // issue #34 P0-1: 連続王手（玉の手で解消 → 次の相手手番で再び王手）の
+        // 2回目の王手駒を「前の玉位置 / その隣接 / それ以外」で分ける
+        let fouls_at = bot_foul_counts(&rec.end, bot);
+        let king_resolves = rec
+            .end
+            .moves
+            .iter()
+            .enumerate()
+            .filter(|(k, m)| {
+                m.by_color == bot
+                    && positions.get(*k).is_some_and(|p| {
+                        p.in_check(bot)
+                            && matches!(
+                                (parse_usi(&m.usi), p.king_square(bot)),
+                                (Some(ShogiMove::Board { from, .. }), Some(k)) if from == k
+                            )
+                    })
+            })
+            .count() as u32;
+        let chases = chase_events(&rec.end, &positions, bot, &fouls_at);
+        for e in &chases {
+            println!(
+                "  連続王手 {}手目: 玉 {} → {} / 2回目の王手駒は {} / 前の玉位置の被覆 {} / 王手駒マスの被覆 {} / 反則 {}",
+                e.move_number,
+                sq_name(e.prev_king),
+                sq_name(e.new_king),
+                e.class.label(),
+                if e.prev_king_covered { "あり" } else { "なし" },
+                if e.checkers_covered { "あり" } else { "なし" },
+                e.fouls,
+            );
+        }
+        chase_prep.add_game(chases, king_resolves, !rec.end.opponent.is_bot);
+
         // 王手ソルバーの再現検証（王手中に反則した手番それぞれを指し直す）
         let (tested, actual, sim) = simulate_check_solver(&rec, &positions, bot, &mut catastrophes);
         total_check_turns += tested;
@@ -2015,6 +2179,7 @@ fn main() {
         }
     }
     check_econ.report();
+    chase_prep.report();
     catastrophes.report(SOLVER_CATASTROPHE);
 
     // p_legal の較正（C-7 P3）: 選択手の合法確率予測 vs 実際の受理/反則。

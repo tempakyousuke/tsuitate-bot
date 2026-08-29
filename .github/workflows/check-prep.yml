@@ -1,0 +1,195 @@
+name: Check prep
+
+# **issue #34 の P0-1 / P0-2**: 被王手の**前**の準備（王手耐性）を、過去の Arena
+# 実行の棋譜（`arena-records-*`）に対して測る診断。**runtime の挙動は変えない**
+# （`bin/analyze` の集計セクションと `bin/check_prep_probe` を足しただけで、
+# 粒子も回さない）。#31 の Check economy と同じ形で**相手ごとに別ジョブ**で
+# 集計する（判定が「v13 / v14 の両相手で同方向」なので混ぜてはいけない）。
+#
+#   - P0-1 連続王手の起点（`bin/analyze` の常設セクション）: bot が玉の手で
+#     王手を解消した直後に再び王手されたとき、2回目の王手駒が
+#     「前の玉位置 / その隣接 / それ以外」のどこから来たか。門は頻度ではなく
+#     **`頻度 × 被覆の有無による反則差`** とその元対局 cluster CI
+#   - P0-2 較正プローブ（`bin/check_prep_probe`）: **単位は bot の全 handoff**
+#     （被王手手番だけに条件づけると collider が開く）。段は3つで、前が落ちたら
+#     次へ進まない — ①構成概念検証（F1 の起点別被覆 vs 「玉以外で王手駒を真に
+#     合法に取れたか」）②発火母数 ③主 estimand（層を固定した Q90 − Q10 の
+#     周辺平均差。hurdle 分解）
+#
+# どちらも粒子を回さないので軽い（実測: 59局で抽出 0.6 秒 + bootstrap 数十秒）。
+# **通常のコード push では走らない**。起動は2通り:
+#   1. Actions UI / `gh workflow run check-prep.yml -f arena_run_id=<Arena実行ID>`
+#   2. `.github/ci/check-prep.request.json` を含む push
+#      （リクエストファイルを消す push は plan が「削除された push」と判定して
+#        全ジョブをスキップするので、後片付けで赤い run は残らない）
+#
+# **発見セットと検証セットを分ける**（issue #34）: 特徴量の定義・距離重み
+# （`origin_weights`）・`adj_share`・主特徴量・主目的変数は発見セットで固定してから、
+# **未使用の `match_seed` で取り直した Arena 実行**を指す別の起動で検証する。
+on:
+  workflow_dispatch:
+    inputs:
+      arena_run_id:
+        description: "棋譜の取得元 Arena 実行ID（空ならリポジトリの records/ を使う）"
+        required: false
+        default: ""
+      opponents:
+        description: "相手ごとに分けて集計する（空白区切り。artifact 名 arena-records-<相手>-* を引く）。records/ を使うときは無視される"
+        required: false
+        default: "estimator_v13 estimator_v14"
+      origin_weights:
+        description: "王手起点の重み（例 knight:1,line:1,diag:1;d2:4,d3:2,d4:1,d5+:1）。空なら一様。**発見セットの実測分布から決めて検証セットでは固定する**"
+        required: false
+        default: ""
+      adj_share:
+        description: "f13_cov の隣接シェア（0〜1）。**発見セットの実測（隣接から来た王手の割合）で固定する**"
+        required: false
+        default: "0.5"
+      bootstrap:
+        description: "元対局 cluster bootstrap の反復数（主 estimand の CI と p 値）"
+        required: false
+        default: "500"
+  push:
+    paths:
+      - ".github/ci/check-prep.request.json"
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      skip: ${{ steps.split.outputs.skip }}
+      arena_run_id: ${{ steps.split.outputs.arena_run_id }}
+      opponents: ${{ steps.split.outputs.opponents }}
+      origin_weights: ${{ steps.split.outputs.origin_weights }}
+      adj_share: ${{ steps.split.outputs.adj_share }}
+      bootstrap: ${{ steps.split.outputs.bootstrap }}
+    steps:
+      - uses: actions/checkout@v5
+      - id: split
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          IN_RUN_ID: ${{ github.event.inputs.arena_run_id }}
+          IN_OPPONENTS: ${{ github.event.inputs.opponents }}
+          IN_WEIGHTS: ${{ github.event.inputs.origin_weights }}
+          IN_ADJ: ${{ github.event.inputs.adj_share }}
+          IN_BOOT: ${{ github.event.inputs.bootstrap }}
+        run: |
+          set -euo pipefail
+          req='.github/ci/check-prep.request.json'
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            run_id="${IN_RUN_ID:-}"
+            opponents="${IN_OPPONENTS:-estimator_v13 estimator_v14}"
+            weights="${IN_WEIGHTS:-}"
+            adj="${IN_ADJ:-0.5}"
+            boot="${IN_BOOT:-500}"
+          else
+            if [ ! -f "$req" ]; then
+              # push の paths フィルタは削除にも一致する。計測後に $req を消す
+              # commit は後片付けの正常系なので、赤い run を残さず全部スキップ
+              echo "リクエストファイルが削除された push（後片付け）なので何もしない"
+              {
+                echo "skip=true"
+                echo "arena_run_id="
+                echo 'opponents=[""]'
+                echo "origin_weights="
+                echo "adj_share=0.5"
+                echo "bootstrap=500"
+              } >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            run_id=$(jq -r '.arena_run_id // ""' "$req")
+            opponents=$(jq -r 'if (.opponents | type) == "array" then (.opponents | join(" ")) else (.opponents // "estimator_v13 estimator_v14") end' "$req")
+            weights=$(jq -r '.origin_weights // ""' "$req")
+            adj=$(jq -r '.adj_share // 0.5' "$req")
+            boot=$(jq -r '.bootstrap // 500' "$req")
+          fi
+          # 記録元が無い（リポジトリの records/ を使う）ときは1ジョブだけ回す
+          if [ -z "$run_id" ]; then
+            opponents=""
+          fi
+          {
+            echo "skip=false"
+            echo "arena_run_id=$run_id"
+            echo "opponents=$(jq -n -c --arg s "$opponents" 'if $s == "" then [""] else ($s | split(" ") | map(select(. != ""))) end')"
+            echo "origin_weights=$weights"
+            echo "adj_share=$adj"
+            echo "bootstrap=$boot"
+          } >> "$GITHUB_OUTPUT"
+
+  prep:
+    needs: plan
+    if: needs.plan.outputs.skip != 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        opponent: ${{ fromJSON(needs.plan.outputs.opponents) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Download arena records
+        if: needs.plan.outputs.arena_run_id != ''
+        uses: actions/download-artifact@v7
+        with:
+          pattern: arena-records-${{ matrix.opponent }}-*
+          path: records-in
+          run-id: ${{ needs.plan.outputs.arena_run_id }}
+          github-token: ${{ github.token }}
+      - name: P0-1 / P0-2
+        run: |
+          set -euo pipefail
+          # **artifact が落ちてこなかったときに records/（人対局）へ黙って落ちない**。
+          # 相手ごとのラベルの下で別の母集団を報告してしまう
+          run_id='${{ needs.plan.outputs.arena_run_id }}'
+          if [ -n "$run_id" ]; then
+            src=records-in
+            if [ -z "$(find "$src" -name '*.jsonl' 2>/dev/null | head -1)" ]; then
+              echo "run $run_id から相手 '${{ matrix.opponent }}' の記録を取得できませんでした（artifact 名を確認）" >&2
+              exit 1
+            fi
+          else
+            src=records
+          fi
+          files=$(find "$src" -name '*.jsonl' | sort)
+          if [ -z "$files" ]; then
+            echo "記録が1つも見つかりません" >&2
+            exit 1
+          fi
+          echo "記録 $(echo "$files" | wc -l) 局（相手 ${{ matrix.opponent }}）"
+          opp='${{ matrix.opponent }}'
+          # 記録の相手を二重に検査する（artifact のパターンだけに頼らない）
+          [ -n "$opp" ] && set -- --opponent "$opp" || set --
+          w='${{ needs.plan.outputs.origin_weights }}'
+          [ -n "$w" ] && set -- "$@" --origin-weights "$w" || true
+          cargo run --release --bin analyze -- $files > analyze-full.txt
+          # **P0-1 の集計行だけを拾う**（局ごとの明細が大半）。
+          # analyze に集計行を足したら arena.yml / check-economy.yml の
+          # フィルタも直すこと
+          grep -E "^(--- 被王手の前の準備|  玉の手で王手を解消した手番|  \(a\) |  \(b\) |  \(c\) |  人間の王手|  bot の王手|  寄与量)" \
+            analyze-full.txt > check-prep-p01.txt || true
+          cat check-prep-p01.txt
+          cargo run --release --bin check_prep_probe -- "$@" \
+            --adj-share '${{ needs.plan.outputs.adj_share }}' \
+            --bootstrap '${{ needs.plan.outputs.bootstrap }}' \
+            --out "check-prep-${{ matrix.opponent }}.csv" \
+            $files | tee "check-prep-p02.txt"
+          {
+            echo "## P0-1 連続王手の起点（相手 ${{ matrix.opponent }}）"
+            echo '```'
+            cat check-prep-p01.txt
+            echo '```'
+            echo "## P0-2 較正プローブ（相手 ${{ matrix.opponent }}）"
+            echo '```'
+            cat check-prep-p02.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: check-prep-${{ matrix.opponent }}
+          path: |
+            check-prep-p01.txt
+            check-prep-p02.txt
+            check-prep-${{ matrix.opponent }}.csv
+            analyze-full.txt
