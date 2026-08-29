@@ -437,6 +437,9 @@ struct Extract {
     games: u32,
     broken: u32,
     mismatched: u32,
+    /// `entry_state` の復元が `decision_snapshots` の局面と食い違った回数。
+    /// 構造上ゼロのはずなので、1件でも出たら観測規約がずれている
+    entry_mismatch: u32,
     opponents: BTreeMap<String, u32>,
 }
 
@@ -454,6 +457,7 @@ fn extract(
         games: 0,
         broken: 0,
         mismatched: 0,
+        entry_mismatch: 0,
         opponents: BTreeMap::new(),
     };
     for path in files {
@@ -509,7 +513,13 @@ fn extract(
             let Some(king) = hand_f.king else { continue };
 
             let (entry_pos, entry_logs) = entry_state(next, &opp_mv);
-            debug_assert_eq!(entry_pos.fingerprint(), entry_snap.pos.fingerprint());
+            // **復元の整合性検査**（release でも回す）。`entry_state` は
+            // `truth_replay` の共有関数だけで作るので構造上一致するはずで、
+            // 食い違ったら観測規約がずれている = 行の意味が変わる
+            if entry_pos.fingerprint() != entry_snap.pos.fingerprint() {
+                out.entry_mismatch += 1;
+                continue;
+            }
             let in_check = entry_pos.in_check(bot);
             let entry_pieces = entry_pos.pieces_of(bot);
             let entry_f =
@@ -745,8 +755,32 @@ fn report_origin_distribution(rows: &[Row]) {
         checked.iter().filter(|r| r.checker_capture == Some(true)).count(),
         checked.iter().filter(|r| r.double_check == Some(true)).count(),
     );
+    // **検証セットへそのまま渡せる形**で出す（発見セットで測って固定する、を
+    // 手作業の転記に頼らない）
+    let cls = |c: OriginClass| -> u32 {
+        checked.iter().filter(|r| r.origin_class == Some(c)).count() as u32
+    };
+    let dst = |lo: u32, hi: u32| -> u32 {
+        checked
+            .iter()
+            .filter(|r| r.origin_dist.is_some_and(|d| d >= lo && d <= hi))
+            .count() as u32
+    };
+    // 重みは 0 を避ける（0 だとそのクラスが分母から消えて分母操作と同じになる）
+    let w = |v: u32| v.max(1);
     println!(
-        "  → **この分布が主特徴量の形を決める**。隣接が多数なら、F1（距離2以上）単独では\n     実王手起点の大半を分母に持たない（`f13_cov` の `--adj-share` を実測値で固定して検証セットへ送る）"
+        "  → 検証セットへ渡す値: --origin-weights \"knight:{},line:{},diag:{};d2:{},d3:{},d4:{},d5+:{}\" --adj-share {:.2}",
+        w(cls(OriginClass::Knight)),
+        w(cls(OriginClass::Line)),
+        w(cls(OriginClass::Diag)),
+        w(dst(2, 2)),
+        w(dst(3, 3)),
+        w(dst(4, 4)),
+        w(dst(5, 99)),
+        ratio(adjacent as u32, checked.len() as u32),
+    );
+    println!(
+        "     **この分布が主特徴量の形を決める**。隣接が多数なら、F1（距離2以上）単独では\n     実王手起点の大半を分母に持たない（F1 と隣接は別の構成概念として分けて扱う）"
     );
 }
 
@@ -975,7 +1009,7 @@ fn report_estimand(rows: &[Row], cl: &[Vec<Row>], boots: usize) {
             rs.iter()
                 .map(|r| hurdle::Row {
                     x: f(r),
-                    z: covariates(r),
+                    z: covariates_with(r, None),
                     y: r.fouls_in_check.min(r.remaining),
                     cap: r.remaining,
                 })
@@ -1025,10 +1059,65 @@ fn report_estimand(rows: &[Row], cl: &[Vec<Row>], boots: usize) {
     println!(
         "  （**符号の向きは事前に仮定しない**。指導2「逃げる」と指導3「固める」は逆向きに働きうるので、\n    発見セットで符号を確かめてから検証セットで固定する）"
     );
+    report_joint(rows, cl, boots);
+}
+
+/// **F1（距離2以上の起点）と隣接を同時に入れた調整済み効果**（secondary・探索的）。
+///
+/// 上の主 estimand はどれも**総効果**（他の F は共変量に入れない = issue #34 の
+/// 事前登録どおり）なので、F1 と隣接が相関していると互いに交絡する。
+/// 実測で両者の符号が逆を向いたので、**片方を固定したときの限界効果**を別に出す。
+/// 事前登録の判定には使わない（見てから作った量）。
+fn report_joint(rows: &[Row], cl: &[Vec<Row>], boots: usize) {
+    println!("\n### 参考: F1 と隣接を同時に入れた調整済み効果（secondary・事前登録外）");
+    let f1 = |r: &Row| r.f1_cov_w;
+    let adj = |r: &Row| -> f64 {
+        if r.adj_total == 0 { 0.0 } else { f64::from(r.adj_covered) / f64::from(r.adj_total) }
+    };
+    for (name, x, other) in [
+        ("f1_cov_w | 隣接被覆を固定", f1 as fn(&Row) -> f64, adj as fn(&Row) -> f64),
+        ("adj_cov_frac | F1 を固定", adj, f1),
+    ] {
+        let build = |rs: &[&Row]| -> Vec<hurdle::Row> {
+            rs.iter()
+                .map(|r| hurdle::Row {
+                    x: x(r),
+                    z: covariates_with(r, Some(other)),
+                    y: r.fouls_in_check.min(r.remaining),
+                    cap: r.remaining,
+                })
+                .collect()
+        };
+        let refs: Vec<&Row> = rows.iter().collect();
+        let all = build(&refs);
+        let mut xs: Vec<f64> = all.iter().map(|r| r.x).collect();
+        let lo_q = hurdle::quantile(&mut xs.clone(), 0.1);
+        let hi_q = hurdle::quantile(&mut xs, 0.9);
+        if (hi_q - lo_q).abs() < 1e-12 {
+            println!("  {name}: 変動が無いので判定不能");
+            continue;
+        }
+        match hurdle::contrast(&all, lo_q, hi_q, 1e-4) {
+            Some(point) => {
+                let stat = |rs: &[&Row]| hurdle::contrast(&build(rs), lo_q, hi_q, 1e-4);
+                let (blo, bhi) = bootstrap_n(cl, stat, 0.05, 0x2034_0004, boots);
+                println!("  {name}: {point:+.4} [95% CI {blo:+.4}, {bhi:+.4}]");
+            }
+            None => println!("  {name}: 当てはめが収束しませんでした"),
+        }
+    }
 }
 
 /// 層・共変量（総効果の回帰で調整する。**`K_def_*` と機構列は入れない** =
 /// 狙っている媒介変数と結果側の変数だから）
+fn covariates_with(r: &Row, extra: Option<fn(&Row) -> f64>) -> Vec<f64> {
+    let mut v = covariates(r);
+    if let Some(f) = extra {
+        v.push(f(r));
+    }
+    v
+}
+
 fn covariates(r: &Row) -> Vec<f64> {
     vec![
         f64::from(r.move_number),
@@ -1214,6 +1303,12 @@ fn main() {
         ex.broken,
         ex.mismatched,
     );
+    if ex.entry_mismatch > 0 {
+        die(&format!(
+            "entry の復元が決定点の局面と {} 件食い違いました（観測規約のずれ）。判定を出さない",
+            ex.entry_mismatch
+        ));
+    }
     if ex.opponents.len() > 1 {
         eprintln!("  記録の相手: {:?}（--opponent で絞ること）", ex.opponents);
     }
