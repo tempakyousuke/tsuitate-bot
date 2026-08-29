@@ -9,6 +9,7 @@ pub mod board;
 pub mod bridge;
 pub mod check;
 pub mod check_economy;
+pub mod check_policy;
 pub mod checkpoint;
 pub mod client;
 pub mod config;

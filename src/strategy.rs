@@ -468,6 +468,15 @@ fn eval_taint_fallback() -> bool {
     crate::config::current(|c| c.strategy.eval_taint_fallback)
 }
 
+/// 診断（issue #31 P0-5）が `evaluate` と同じ粒子プールの選び方を再現するための入口。
+///
+/// `eval_pool` は「厳密粒子が空 かつ taint があり かつ このノブが有効」のときだけ
+/// taint に落ちる（既定は無効 = 厳密のみ）。`p_legal` のブレンドが
+/// `particles_are_taint` で分岐するので、診断側も同じ判定を引く必要がある。
+pub fn eval_taint_fallback_enabled() -> bool {
+    eval_taint_fallback()
+}
+
 /// taint フォールバック中の**攻め項の倍率**（`TSUITATE_EVAL_TAINT_ATTACK`、
 /// 既定 0 = 攻め項は供給しない）。
 ///
@@ -3818,8 +3827,51 @@ impl EvalOut {
 /// 割り引くと「合法確率が低いほどスコアが高い」= わざと反則に寄る手が
 /// 選ばれてしまう。反則しても手番は残るので悪い局面からは逃げられず、
 /// 反則の価値は「次善手の価値 − 反則コスト」でしかない
-pub(crate) fn combine_score(gain: f64, p_legal: f64, foul_cost: f64) -> f64 {
+pub fn combine_score(gain: f64, p_legal: f64, foul_cost: f64) -> f64 {
     (p_legal * gain).min(gain) - (1.0 - p_legal) * foul_cost
+}
+
+/// 粒子の合法性投票と事前確率のブレンド（`p_legal` の本体）。
+///
+/// `legal` = その手が合法だった粒子の重み和 / `n` = 粒子の重み和 /
+/// `prior` = 観測ゼロの事前確率（王手中は CheckSolver の解消確率を掛けたもの）。
+/// 粒子が退化している（実効重みが評価上限 `eval_particles` に届かない）ほど
+/// 事前の重みを増やし、少数の偏った粒子への過信を防ぐ。
+///
+/// **`evaluate` と、issue #31 P0-5 の p-only shadow update が同じ式を使う**ため
+/// に切り出してある（別々に書くと「仮想更新が実再決定とずれた」のか
+/// 「式が食い違っていた」のかを分けられない）。ここは抽出しただけで
+/// 挙動は変わらない。
+pub fn blend_p_legal(
+    legal: f64,
+    n: f64,
+    prior: f64,
+    particles_are_taint: bool,
+    eval_particles: usize,
+    params: &EvalParams,
+) -> f64 {
+    if particles_are_taint {
+        // taint 粒子は「反則の説明」を持たないので合法性の投票には使わない
+        return prior;
+    }
+    let degen = 1.0 - (n / eval_particles as f64).min(1.0);
+    let w = params.prior_weight + params.prior_weight_degen * degen;
+    (legal + prior * w) / (n + w)
+}
+
+/// 思考予算 `ms` のときの評価粒子数の上限（`blend_p_legal` の退化度の分母）。
+///
+/// 診断（issue #31 P0-5）が `evaluate` と同じ退化度を再現するために公開する。
+pub fn eval_particles_for_budget(ms: u64) -> usize {
+    SearchBudget::from_ms(ms).eval_particles
+}
+
+/// 王手中の反則1回あたりの `prior_weight` 倍率（診断が同じ boost を掛けるため）。
+///
+/// `choose` は `foul_tried` の本数だけこの倍率を `prior_weight` /
+/// `prior_weight_degen` へ掛ける（2026-08-20 の「被王手の確かめの経済」）。
+pub fn check_foul_prior_factor(fouls_this_turn: usize) -> f64 {
+    1.0 + check_foul_prior_boost() * fouls_this_turn as f64
 }
 
 /// evaluate() まわりの調整可能パラメータ。Default が現行の手調整値。
@@ -7752,6 +7804,29 @@ fn apply_foul_budget_floors(fouls_left: f64, mut foul_cost: f64) -> f64 {
     foul_cost
 }
 
+/// 反則コストの**床適用前の基準値**（P1-α の `max(k × base, 床)` の base）。
+///
+/// 診断（issue #31 の P0-4 / P0-5）が価格を付け替えるときに、
+/// `evaluate` と同じ式を引くための入口。
+pub fn base_foul_cost_for(params: &EvalParams, you: u32, opponent: u32) -> f64 {
+    let fouls_left = f64::from((10u32.saturating_sub(you)).max(1));
+    let opp_fouls_left = f64::from((10u32.saturating_sub(opponent)).max(1));
+    params.foul_cost_base
+        * (10.0 / fouls_left).powf(params.foul_cost_pow)
+        * (opp_fouls_left / 10.0).powf(params.foul_diff_pow)
+}
+
+/// 残り反則数に応じたガード床（`last_foul_guard` 系）だけを返す。
+pub fn foul_cost_floor_for(you: u32) -> f64 {
+    apply_foul_budget_floors(f64::from((10u32.saturating_sub(you)).max(1)), 0.0)
+}
+
+/// 反則コストの実効値（床適用後）＝ `evaluate` が使う値そのもの。
+pub fn foul_cost_for(params: &EvalParams, you: u32, opponent: u32) -> f64 {
+    let fouls_left = f64::from((10u32.saturating_sub(you)).max(1));
+    apply_foul_budget_floors(fouls_left, base_foul_cost_for(params, you, opponent))
+}
+
 /// ブラインドの home 占有による**打ちの p_legal 割引**の重み
 /// （`TSUITATE_BLIND_HOME_DROP_OCC_W`、既定 0 = 無効）。
 /// ブラインド決定では打ちの p_legal が事前確率のみ（マスに依らずほぼ定数）に
@@ -8539,7 +8614,7 @@ fn may_resolve_check(view: &PlayerView, mv: &ShogiMove) -> bool {
 
 /// 王手中の p(合法) 補正係数。玉移動が最も解消しやすく、
 /// 取り/合駒は王手駒の位置に当たっている必要があるので低め
-fn in_check_prior(view: &PlayerView, mv: &ShogiMove) -> f64 {
+pub fn in_check_prior(view: &PlayerView, mv: &ShogiMove) -> f64 {
     match *mv {
         ShogiMove::Board { from, .. } if Some(from) == king_square(view) => 0.5,
         _ => 0.25,
@@ -8549,7 +8624,7 @@ fn in_check_prior(view: &PlayerView, mv: &ShogiMove) -> f64 {
 /// 観測ゼロでも成り立つ p(合法) の事前確率。
 /// 経路上の「中身の見えないマス」1つごとに空である確率 q を掛ける。
 /// 打ちは着地点が空である確率 q（隠れた相手駒の上に打つのが典型的な反則源）
-fn prior_legal(view: &PlayerView, mv: &ShogiMove, opp_board_n: f64) -> f64 {
+pub fn prior_legal(view: &PlayerView, mv: &ShogiMove, opp_board_n: f64) -> f64 {
     let my_n = view.your_pieces.len() as f64;
     let q = (1.0 - opp_board_n / (81.0 - my_n)).clamp(0.05, 1.0);
     match *mv {
@@ -9149,13 +9224,14 @@ fn evaluate(
     // 増やし、少数の偏った粒子への過信を防ぐ。ソフト粒子は重みぶんしか
     // 数えないので、退化度にも自然に反映される
     let n: f64 = particles.iter().map(|(_, w)| w).sum();
-    let degen = 1.0 - (n / budget.eval_particles as f64).min(1.0);
-    let w = params.prior_weight + params.prior_weight_degen * degen;
-    let mut p_legal = if particles_are_taint {
-        prior
-    } else {
-        (legal + prior * w) / (n + w)
-    };
+    let mut p_legal = blend_p_legal(
+        legal,
+        n,
+        prior,
+        particles_are_taint,
+        budget.eval_particles,
+        params,
+    );
     // taint 占有合意で打ちの反則確率を締める（`taint_occ_legal_w`）。
     // 打ちマスが埋まっていれば必ず反則なので、合意占有率をそのまま反則確率に
     // 使える。**安全方向のみ**（min）: 空きマスの打ちを押し上げはしない
@@ -9487,16 +9563,11 @@ fn evaluate(
     // 勝敗は反則レース（先に10回）なので、コストは絶対値でなく**残数差の相対価値**:
     // 相手が上限間際（残数小）なら自分の1反則は相対的に安い（foul_diff_pow で調整。
     // 0 = 従来どおり自分の残数のみ。tune-round3 の分析でスコアと反則差の相関0.75）
-    let fouls_left = (10u32.saturating_sub(view.fouls.you)).max(1) as f64;
-    let opp_fouls_left = (10u32.saturating_sub(view.fouls.opponent)).max(1) as f64;
-    let foul_cost = params.foul_cost_base
-        * (10.0 / fouls_left).powf(params.foul_cost_pow)
-        * (opp_fouls_left / 10.0).powf(params.foul_diff_pow);
     // 残り反則が少ないときのガード。既定の急峻化は残り1回でも約13点、
     // 残り2回で約5.4点にしかならず、gain 5〜8 の手が「10%反則でも指す」
     // 計算を通して反則負けまで打ち尽くす（アリーナの ~76% が foul_limit）。
     // 床は材料スケールでは正当化できないが、粒子合意の詰み（〜1000×q）は通る。
-    let foul_cost = apply_foul_budget_floors(fouls_left, foul_cost);
+    let foul_cost = foul_cost_for(params, view.fouls.you, view.fouls.opponent);
 
     // 前進の弱い事前バイアス（推定が薄い序盤に駒をぶつけに行くため）
     // 成りの固定ボーナス（`promote_bias`）の駒種分け（2026-08-10）:

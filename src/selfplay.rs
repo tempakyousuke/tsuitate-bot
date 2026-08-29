@@ -862,6 +862,69 @@ mod tests {
         assert_eq!(out.added_plies, 0);
     }
 
+    /// 常に同じ手を返す戦略（累積反則の配線を確かめるテスト用）。
+    /// `seen_fouls` に「その手番で自分の視界に見えた累計反則」を積む
+    struct Fixed {
+        usi: &'static str,
+        seen_fouls: std::sync::Arc<Mutex<Vec<u32>>>,
+    }
+    impl Strategy for Fixed {
+        fn choose(
+            &mut self,
+            view: &PlayerView,
+            _log: &ObservationLog,
+            _foul_tried: &HashSet<String>,
+        ) -> Option<String> {
+            self.seen_fouls.lock().unwrap().push(view.fouls.you);
+            Some(self.usi.to_string())
+        }
+        fn name(&self) -> &'static str {
+            "fixed"
+        }
+    }
+
+    /// **継続対局の累積反則数は `StartState.fouls` からしか読まない**
+    /// （issue #31 P0-7 の契約）。
+    ///
+    /// 影の価格は「ログに存在しない反則を審判の累積数だけ +1 した」反実仮想なので、
+    /// 累積数をログから復元する経路が混ざっていると treatment が成立しない
+    /// （ログには `MyFoul` が1つも無いのに 9 反則の状態から始める）。
+    /// ここで固定するのは2点: ①審判の反則負け判定が開始状態の累計を見る
+    /// ②戦略へ渡る `PlayerView.fouls.you` も開始状態の累計から始まる
+    #[test]
+    fn 継続の累積反則数は開始状態から読む() {
+        // 先手の 1九香が 1一へ跳ぶ手は擬似合法ですらない = 必ず反則
+        let seen = std::sync::Arc::new(Mutex::new(vec![]));
+        let start = StartState {
+            pos: Position::initial(),
+            // **ログは空**（反則の観測は1つも無い）。累計は fouls からだけ来る
+            logs: [ObservationLog::default(), ObservationLog::default()],
+            fouls: [MAX_FOULS - 1, 0],
+            plies: 0,
+        };
+        let out = play_continuation(
+            [
+                Box::new(Fixed { usi: "1i1a", seen_fouls: std::sync::Arc::clone(&seen) }),
+                Box::new(Resigner),
+            ],
+            start,
+            0,
+        );
+        assert_eq!(
+            out.result,
+            GameResult::Win(Color::Gote),
+            "9反則の状態から1つ積めば反則負け"
+        );
+        assert_eq!(out.reason, "foul_limit");
+        assert_eq!(out.fouls[0], MAX_FOULS, "累計は開始状態から数える");
+        assert_eq!(out.added_fouls[0], 1, "継続で増えたのは1つだけ");
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [MAX_FOULS - 1],
+            "戦略の視界にも開始状態の累計が見えている"
+        );
+    }
+
     /// 同じ match_seed なら、スレッド数や実行順に関係なく
     /// 各対局・各プレイヤーに同じシードが割り当てられる（共通乱数法の土台）
     #[test]

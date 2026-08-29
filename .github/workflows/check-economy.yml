@@ -8,9 +8,25 @@ name: Check economy
 #   - P0-2 手種別・順番別の p_legal 較正と、捕獲試みの方向つき較正誤差
 #     （**元対局 cluster bootstrap CI**。Brier では H1 と H3 を分けられない）
 #   - P0-3 ソルバー方策の破滅手番（8反則以上）の原因
-#   - P0-4 w\* 監査（`bin/check_probe`。**粒子を回すのでここだけ重い**）:
+#   - P0-4 w\* 監査（`bin/check_probe`。**粒子を回すので重い**）:
 #     玉の手が首位になる反則コスト倍率 k\* と、実戦の反則列を食わせた
 #     **実再決定**が静的な次点と違う手を選ぶか
+#   - P0-5 方策シミュレーション（`bin/check_policy`。粒子を回す）:
+#     現行 / α（価格）/ β（動的継続価値）/ β-order / ソルバー貪欲を
+#     **真実に対して裁定**し、反則数・破滅率・受理直後の真実指標で比べる。
+#     `current@shadow` と `current@real` の差が**近似通過条件**
+#   - P0-6 継続の局所効果（`bin/check_continue`。継続対局を回す）:
+#     王手中の1手番を方策どおりに指させてから終局まで指し継ぎ、勝敗へ変換する。
+#     **検証セット（未使用の match_seed で取り直した Arena 実行）でだけ回す**
+#   - P0-7 反則トークンの影の価格（`bin/check_price`。**継続対局を回すので最も重い**）:
+#     王手手番の直後で審判の累積反則だけ +1 した paired continuation
+#
+# **P0-4 / P0-5 / P0-6 / P0-7 は既定では走らない**（`run_probe` / `run_policy` /
+# `run_continue` / `run_price`）。P0-1〜P0-3 は粒子を回さないので常に走る。
+# `reaggregate_run_id` を渡すと**シャードは回さず既存 run の artifact を集計し直す**
+# （集計側のバグを直したときの当て直し。シャード数は元の run と揃えること）。
+# **全部を同時に有効化しない**（相手2 × シャードでジョブが 30 を超えて詰まる）。
+# P0-6 は主 arm を P0-4 / P0-5 で固定してから、**検証セットを指す別の起動**で回す。
 #
 # **相手ごとに別ジョブで回す**のが要点（`opponents`）: 判定は「v13 / v14 の
 # 両相手で同方向」なので、両者の記録を混ぜて1つの数字にしてはいけない。
@@ -52,6 +68,70 @@ on:
         description: "P0-4 の分割数（元対局単位で割る。欠けたら aggregate が失敗する）"
         required: false
         default: "4"
+      run_policy:
+        description: "P0-5（方策シミュレーション）も走らせるか。粒子を回す"
+        required: false
+        default: "false"
+      policy_seeds:
+        description: "P0-5 の決定点あたり seed 数"
+        required: false
+        default: "4"
+      policy_budget_ms:
+        description: "P0-5 の思考予算（ms。記録を取ったアリーナと揃えること）"
+        required: false
+        default: "2000"
+      policy_shards:
+        description: "P0-5 の分割数（元対局単位。欠けたら aggregate が失敗する）"
+        required: false
+        default: "6"
+      run_price:
+        description: "P0-7（反則トークンの影の価格）も走らせるか。**継続対局を回すので最も重い**"
+        required: false
+        default: "false"
+      price_seeds:
+        description: "P0-7 の決定点あたり seed 数（control / treatment のペアを共通乱数で回す）"
+        required: false
+        default: "2"
+      price_budget_ms:
+        description: "P0-7 の思考予算（ms。継続対局なので mate-economy と同じ 700 が既定）"
+        required: false
+        default: "700"
+      price_per_game:
+        description: "P0-7 で1局から採る決定点の本数（同じ局の相互排他的な未来を足し合わせない）"
+        required: false
+        default: "2"
+      price_shards:
+        description: "P0-7 の分割数（元対局単位。欠けたら aggregate が失敗する）"
+        required: false
+        default: "8"
+      reaggregate_run_id:
+        description: "既存の Check economy 実行のシャード artifact を使って**集計だけ**やり直す（対局もランキングも回さない）。集計側を直したときの当て直し用。有効な run_* の aggregate だけが走る"
+        required: false
+        default: ""
+      run_continue:
+        description: "P0-6（継続の局所効果）も走らせるか。**検証セットの Arena 実行を arena_run_id に指定した別の起動で回すこと**（発見セットで回すと選定バイアスが入る）"
+        required: false
+        default: "false"
+      continue_policy:
+        description: "P0-6 の方策（カンマ区切り。current は自動で入る）。**P0-4 / P0-5 を見てから主 arm を1本に固定する**"
+        required: false
+        default: "current"
+      continue_seeds:
+        description: "P0-6 の決定点あたり seed 数"
+        required: false
+        default: "4"
+      continue_budget_ms:
+        description: "P0-6 の思考予算（ms。ランキングも継続も同じ動作点に揃う）"
+        required: false
+        default: "700"
+      continue_shards:
+        description: "P0-6 の分割数（元対局単位。欠けたら判定を出さない）"
+        required: false
+        default: "8"
+      continue_replicates:
+        description: "P0-6 を何回実行して平均するか（issue #31 の再実行規則。門付近なら 2。**同じ run の中で回すので build と設定が厳密に一致する**）"
+        required: false
+        default: "1"
   push:
     paths:
       - ".github/ci/check-economy.request.json"
@@ -69,6 +149,26 @@ jobs:
       probe_types: ${{ steps.split.outputs.probe_types }}
       probe_shards: ${{ steps.split.outputs.probe_shards }}
       probe_shard_count: ${{ steps.split.outputs.probe_shard_count }}
+      run_policy: ${{ steps.split.outputs.run_policy }}
+      policy_seeds: ${{ steps.split.outputs.policy_seeds }}
+      policy_budget_ms: ${{ steps.split.outputs.policy_budget_ms }}
+      policy_shards: ${{ steps.split.outputs.policy_shards }}
+      policy_shard_count: ${{ steps.split.outputs.policy_shard_count }}
+      run_price: ${{ steps.split.outputs.run_price }}
+      price_seeds: ${{ steps.split.outputs.price_seeds }}
+      price_budget_ms: ${{ steps.split.outputs.price_budget_ms }}
+      price_per_game: ${{ steps.split.outputs.price_per_game }}
+      price_shards: ${{ steps.split.outputs.price_shards }}
+      price_shard_count: ${{ steps.split.outputs.price_shard_count }}
+      reaggregate_run_id: ${{ steps.split.outputs.reaggregate_run_id }}
+      run_continue: ${{ steps.split.outputs.run_continue }}
+      continue_policy: ${{ steps.split.outputs.continue_policy }}
+      continue_seeds: ${{ steps.split.outputs.continue_seeds }}
+      continue_budget_ms: ${{ steps.split.outputs.continue_budget_ms }}
+      continue_shards: ${{ steps.split.outputs.continue_shards }}
+      continue_shard_count: ${{ steps.split.outputs.continue_shard_count }}
+      continue_replicate_list: ${{ steps.split.outputs.continue_replicate_list }}
+      continue_replicate_count: ${{ steps.split.outputs.continue_replicate_count }}
     steps:
       - uses: actions/checkout@v5
       - id: split
@@ -81,6 +181,22 @@ jobs:
           IN_PROBE_BUDGET: ${{ github.event.inputs.probe_budget_ms }}
           IN_PROBE_TYPES: ${{ github.event.inputs.probe_types }}
           IN_PROBE_SHARDS: ${{ github.event.inputs.probe_shards }}
+          IN_RUN_POLICY: ${{ github.event.inputs.run_policy }}
+          IN_POLICY_SEEDS: ${{ github.event.inputs.policy_seeds }}
+          IN_POLICY_BUDGET: ${{ github.event.inputs.policy_budget_ms }}
+          IN_POLICY_SHARDS: ${{ github.event.inputs.policy_shards }}
+          IN_RUN_PRICE: ${{ github.event.inputs.run_price }}
+          IN_PRICE_SEEDS: ${{ github.event.inputs.price_seeds }}
+          IN_PRICE_BUDGET: ${{ github.event.inputs.price_budget_ms }}
+          IN_PRICE_PER_GAME: ${{ github.event.inputs.price_per_game }}
+          IN_PRICE_SHARDS: ${{ github.event.inputs.price_shards }}
+          IN_REAGGREGATE: ${{ github.event.inputs.reaggregate_run_id }}
+          IN_RUN_CONTINUE: ${{ github.event.inputs.run_continue }}
+          IN_CONTINUE_POLICY: ${{ github.event.inputs.continue_policy }}
+          IN_CONTINUE_REPLICATES: ${{ github.event.inputs.continue_replicates }}
+          IN_CONTINUE_SEEDS: ${{ github.event.inputs.continue_seeds }}
+          IN_CONTINUE_BUDGET: ${{ github.event.inputs.continue_budget_ms }}
+          IN_CONTINUE_SHARDS: ${{ github.event.inputs.continue_shards }}
         run: |
           set -euo pipefail
           req='.github/ci/check-economy.request.json'
@@ -92,6 +208,22 @@ jobs:
             probe_budget="${IN_PROBE_BUDGET:-2000}"
             probe_types="${IN_PROBE_TYPES:-nonking_king,nonking_nonking}"
             probe_shards="${IN_PROBE_SHARDS:-4}"
+            run_policy="${IN_RUN_POLICY:-false}"
+            policy_seeds="${IN_POLICY_SEEDS:-4}"
+            policy_budget="${IN_POLICY_BUDGET:-2000}"
+            policy_shards="${IN_POLICY_SHARDS:-6}"
+            run_price="${IN_RUN_PRICE:-false}"
+            price_seeds="${IN_PRICE_SEEDS:-2}"
+            price_budget="${IN_PRICE_BUDGET:-700}"
+            price_per_game="${IN_PRICE_PER_GAME:-2}"
+            price_shards="${IN_PRICE_SHARDS:-8}"
+            reaggregate="${IN_REAGGREGATE:-}"
+            run_continue="${IN_RUN_CONTINUE:-false}"
+            continue_policy="${IN_CONTINUE_POLICY:-current}"
+            continue_seeds="${IN_CONTINUE_SEEDS:-4}"
+            continue_budget="${IN_CONTINUE_BUDGET:-700}"
+            continue_shards="${IN_CONTINUE_SHARDS:-8}"
+            continue_replicates="${IN_CONTINUE_REPLICATES:-1}"
           else
             if [ ! -f "$req" ]; then
               # push の paths フィルタは削除にも一致する。計測後に $req を消す
@@ -107,6 +239,26 @@ jobs:
                 echo "probe_types=nonking_king,nonking_nonking"
                 echo 'probe_shards=[0]'
                 echo "probe_shard_count=1"
+                echo "run_policy=false"
+                echo "policy_seeds=4"
+                echo "policy_budget_ms=2000"
+                echo 'policy_shards=[0]'
+                echo "policy_shard_count=1"
+                echo "run_price=false"
+                echo "price_seeds=2"
+                echo "price_budget_ms=700"
+                echo "price_per_game=2"
+                echo 'price_shards=[0]'
+                echo "price_shard_count=1"
+                echo "reaggregate_run_id="
+                echo "run_continue=false"
+                echo "continue_policy=current"
+                echo "continue_seeds=4"
+                echo "continue_budget_ms=700"
+                echo 'continue_shards=[0]'
+                echo "continue_shard_count=1"
+                echo 'continue_replicate_list=[0]'
+                echo "continue_replicate_count=1"
               } >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -119,6 +271,22 @@ jobs:
             probe_budget=$(jq -r '.probe_budget_ms // 2000' "$req")
             probe_types=$(jq -r 'if (.probe_types | type) == "array" then (.probe_types | join(",")) else (.probe_types // "nonking_king,nonking_nonking") end' "$req")
             probe_shards=$(jq -r '.probe_shards // 4' "$req")
+            run_policy=$(jq -r 'if has("run_policy") then .run_policy else false end | tostring' "$req")
+            policy_seeds=$(jq -r '.policy_seeds // 4' "$req")
+            policy_budget=$(jq -r '.policy_budget_ms // 2000' "$req")
+            policy_shards=$(jq -r '.policy_shards // 6' "$req")
+            run_price=$(jq -r 'if has("run_price") then .run_price else false end | tostring' "$req")
+            price_seeds=$(jq -r '.price_seeds // 2' "$req")
+            price_budget=$(jq -r '.price_budget_ms // 700' "$req")
+            price_per_game=$(jq -r '.price_per_game // 2' "$req")
+            price_shards=$(jq -r '.price_shards // 8' "$req")
+            reaggregate=$(jq -r '.reaggregate_run_id // ""' "$req")
+            run_continue=$(jq -r 'if has("run_continue") then .run_continue else false end | tostring' "$req")
+            continue_policy=$(jq -r 'if (.continue_policy | type) == "array" then (.continue_policy | join(",")) else (.continue_policy // "current") end' "$req")
+            continue_seeds=$(jq -r '.continue_seeds // 4' "$req")
+            continue_budget=$(jq -r '.continue_budget_ms // 700' "$req")
+            continue_shards=$(jq -r '.continue_shards // 8' "$req")
+            continue_replicates=$(jq -r '.continue_replicates // 1' "$req")
           fi
           # 記録元が無い（リポジトリの records/ を使う）ときは1ジョブだけ回す
           if [ -z "$run_id" ]; then
@@ -134,6 +302,26 @@ jobs:
             echo "probe_types=$probe_types"
             echo "probe_shards=$(jq -n -c "[range(0; ${probe_shards})]")"
             echo "probe_shard_count=$probe_shards"
+            echo "run_policy=$run_policy"
+            echo "policy_seeds=$policy_seeds"
+            echo "policy_budget_ms=$policy_budget"
+            echo "policy_shards=$(jq -n -c "[range(0; ${policy_shards})]")"
+            echo "policy_shard_count=$policy_shards"
+            echo "run_price=$run_price"
+            echo "price_seeds=$price_seeds"
+            echo "price_budget_ms=$price_budget"
+            echo "price_per_game=$price_per_game"
+            echo "price_shards=$(jq -n -c "[range(0; ${price_shards})]")"
+            echo "price_shard_count=$price_shards"
+            echo "reaggregate_run_id=$reaggregate"
+            echo "run_continue=$run_continue"
+            echo "continue_policy=$continue_policy"
+            echo "continue_seeds=$continue_seeds"
+            echo "continue_budget_ms=$continue_budget"
+            echo "continue_shards=$(jq -n -c "[range(0; ${continue_shards})]")"
+            echo "continue_shard_count=$continue_shards"
+            echo "continue_replicate_list=$(jq -n -c "[range(0; ${continue_replicates})]")"
+            echo "continue_replicate_count=$continue_replicates"
           } >> "$GITHUB_OUTPUT"
 
   analyze:
@@ -199,7 +387,9 @@ jobs:
 
   probe:
     needs: plan
-    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_probe == 'true'
+    if: >-
+      needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_probe == 'true'
+      && needs.plan.outputs.reaggregate_run_id == ''
     strategy:
       fail-fast: false
       matrix:
@@ -260,7 +450,12 @@ jobs:
 
   probe-aggregate:
     needs: [plan, probe]
-    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_probe == 'true'
+    # **シャード matrix が skip されても走る**（`reaggregate_run_id` で既存 run の
+    # artifact を集計し直す経路）。`probe` が失敗したときだけ止める
+    if: >-
+      !cancelled() && needs.plan.outputs.skip != 'true'
+      && needs.plan.outputs.run_probe == 'true'
+      && (needs.probe.result == 'success' || needs.probe.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
@@ -274,6 +469,9 @@ jobs:
         with:
           pattern: check-probe-${{ matrix.opponent }}-s*
           path: shards
+          # 空なら現在の run（既定）。`reaggregate_run_id` があればその run から拾う
+          run-id: ${{ needs.plan.outputs.reaggregate_run_id || github.run_id }}
+          github-token: ${{ github.token }}
       - name: Report
         run: |
           set -euo pipefail
@@ -300,4 +498,348 @@ jobs:
           name: check-probe-combined-${{ matrix.opponent }}
           path: |
             check-probe-${{ matrix.opponent }}.txt
+            shards/
+
+  # ---- P0-5 方策シミュレーション（粒子を回す）----------------------------
+  policy:
+    needs: plan
+    if: >-
+      needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_policy == 'true'
+      && needs.plan.outputs.reaggregate_run_id == ''
+    strategy:
+      fail-fast: false
+      matrix:
+        opponent: ${{ fromJSON(needs.plan.outputs.opponents) }}
+        shard: ${{ fromJSON(needs.plan.outputs.policy_shards) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Download arena records
+        if: needs.plan.outputs.arena_run_id != ''
+        uses: actions/download-artifact@v7
+        with:
+          pattern: arena-records-${{ matrix.opponent }}-*
+          path: records-in
+          run-id: ${{ needs.plan.outputs.arena_run_id }}
+          github-token: ${{ github.token }}
+      - name: Policy simulation
+        env:
+          # **思考予算は記録を取ったアリーナと揃える**（違うと粒子数が変わり、
+          # 「その決定点で実際に見えていたランキング」ではなくなる）
+          TSUITATE_THINK_BUDGET_MS: ${{ needs.plan.outputs.policy_budget_ms }}
+        run: |
+          set -euo pipefail
+          run_id='${{ needs.plan.outputs.arena_run_id }}'
+          if [ -n "$run_id" ]; then
+            src=records-in
+            if [ -z "$(find "$src" -name '*.jsonl' 2>/dev/null | head -1)" ]; then
+              echo "run $run_id から相手 '${{ matrix.opponent }}' の記録を取得できませんでした（artifact 名を確認）" >&2
+              exit 1
+            fi
+          else
+            src=records
+          fi
+          cargo build --release --bin check_policy
+          jobs=$(( $(nproc) - 1 )); [ "$jobs" -ge 1 ] || jobs=1
+          n=${{ needs.plan.outputs.policy_shard_count }}
+          opp='${{ matrix.opponent }}'
+          [ -n "$opp" ] && set -- --opponent "$opp" || set --
+          ./target/release/check_policy "$@" \
+            --seeds "${{ needs.plan.outputs.policy_seeds }}" \
+            --jobs "$jobs" \
+            --shard "${{ matrix.shard }}/$n" \
+            --allow-incomplete \
+            --out "check-policy-${{ matrix.opponent }}-s${{ matrix.shard }}.jsonl" \
+            "$src" | tee "check-policy-${{ matrix.opponent }}-s${{ matrix.shard }}.txt"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: check-policy-${{ matrix.opponent }}-s${{ matrix.shard }}
+          path: |
+            check-policy-${{ matrix.opponent }}-s${{ matrix.shard }}.jsonl
+            check-policy-${{ matrix.opponent }}-s${{ matrix.shard }}.txt
+
+  policy-aggregate:
+    needs: [plan, policy]
+    # **シャード matrix が skip されても走る**（`reaggregate_run_id` で既存 run の
+    # artifact を集計し直す経路）。`policy` が失敗したときだけ止める
+    if: >-
+      !cancelled() && needs.plan.outputs.skip != 'true'
+      && needs.plan.outputs.run_policy == 'true'
+      && (needs.policy.result == 'success' || needs.policy.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        opponent: ${{ fromJSON(needs.plan.outputs.opponents) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: check-policy-${{ matrix.opponent }}-s*
+          path: shards
+          # 空なら現在の run（既定）。`reaggregate_run_id` があればその run から拾う
+          run-id: ${{ needs.plan.outputs.reaggregate_run_id || github.run_id }}
+          github-token: ${{ github.token }}
+      - name: Report
+        run: |
+          set -euo pipefail
+          # **欠けたシャードを黙って少ない分母で報告しない**（issue #19 / #28 の教訓）
+          n=${{ needs.plan.outputs.policy_shard_count }}
+          found=$(find shards -name 'check-policy-*.jsonl' | wc -l)
+          if [ "$found" -ne "$n" ]; then
+            echo "シャードが欠けています（$found / $n）: 決定点の分母が狂うので中止" >&2
+            exit 1
+          fi
+          cargo run --release --bin check_policy -- report --shards "$n" \
+            $(find shards -name '*.jsonl' | sort) \
+            | tee "check-policy-${{ matrix.opponent }}.txt"
+          {
+            echo "## P0-5 方策シミュレーション（相手 ${{ matrix.opponent }}）"
+            echo '```'
+            cat "check-policy-${{ matrix.opponent }}.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: check-policy-combined-${{ matrix.opponent }}
+          path: |
+            check-policy-${{ matrix.opponent }}.txt
+            shards/
+
+  # ---- P0-7 反則トークンの影の価格（継続対局を回すので最も重い）----------
+  price:
+    needs: plan
+    if: >-
+      needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_price == 'true'
+      && needs.plan.outputs.reaggregate_run_id == ''
+    strategy:
+      fail-fast: false
+      matrix:
+        opponent: ${{ fromJSON(needs.plan.outputs.opponents) }}
+        shard: ${{ fromJSON(needs.plan.outputs.price_shards) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Download arena records
+        if: needs.plan.outputs.arena_run_id != ''
+        uses: actions/download-artifact@v7
+        with:
+          pattern: arena-records-${{ matrix.opponent }}-*
+          path: records-in
+          run-id: ${{ needs.plan.outputs.arena_run_id }}
+          github-token: ${{ github.token }}
+      - name: Shadow price
+        env:
+          # 継続対局なので mate-economy と同じ 700ms が既定。
+          # **両側に同じ値が効く**（凍結相手も同じ env を読む）
+          TSUITATE_THINK_BUDGET_MS: ${{ needs.plan.outputs.price_budget_ms }}
+        run: |
+          set -euo pipefail
+          run_id='${{ needs.plan.outputs.arena_run_id }}'
+          if [ -n "$run_id" ]; then
+            src=records-in
+            if [ -z "$(find "$src" -name '*.jsonl' 2>/dev/null | head -1)" ]; then
+              echo "run $run_id から相手 '${{ matrix.opponent }}' の記録を取得できませんでした（artifact 名を確認）" >&2
+              exit 1
+            fi
+          else
+            src=records
+          fi
+          cargo build --release --bin check_price
+          jobs=$(( $(nproc) - 1 )); [ "$jobs" -ge 1 ] || jobs=1
+          n=${{ needs.plan.outputs.price_shard_count }}
+          # **継続対局の相手は元対局の相手と揃える**（違うと影の価格が
+          # 「相手が変わった効果」と混ざる）。空なら records/ を使う実行なので
+          # 既定の相手のまま走らせる
+          opp='${{ matrix.opponent }}'
+          [ -n "$opp" ] && set -- --opponent "$opp" || set -- --allow-opponent-mismatch
+          ./target/release/check_price "$@" \
+            --seeds "${{ needs.plan.outputs.price_seeds }}" \
+            --per-game "${{ needs.plan.outputs.price_per_game }}" \
+            --jobs "$jobs" \
+            --shard "${{ matrix.shard }}/$n" \
+            --allow-incomplete \
+            --out "check-price-${{ matrix.opponent }}-s${{ matrix.shard }}.jsonl" \
+            "$src" | tee "check-price-${{ matrix.opponent }}-s${{ matrix.shard }}.txt"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: check-price-${{ matrix.opponent }}-s${{ matrix.shard }}
+          path: |
+            check-price-${{ matrix.opponent }}-s${{ matrix.shard }}.jsonl
+            check-price-${{ matrix.opponent }}-s${{ matrix.shard }}.txt
+
+  price-aggregate:
+    needs: [plan, price]
+    # **シャード matrix が skip されても走る**（`reaggregate_run_id` で既存 run の
+    # artifact を集計し直す経路）。`price` が失敗したときだけ止める
+    if: >-
+      !cancelled() && needs.plan.outputs.skip != 'true'
+      && needs.plan.outputs.run_price == 'true'
+      && (needs.price.result == 'success' || needs.price.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        opponent: ${{ fromJSON(needs.plan.outputs.opponents) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: check-price-${{ matrix.opponent }}-s*
+          path: shards
+          # 空なら現在の run（既定）。`reaggregate_run_id` があればその run から拾う
+          run-id: ${{ needs.plan.outputs.reaggregate_run_id || github.run_id }}
+          github-token: ${{ github.token }}
+      - name: Report
+        run: |
+          set -euo pipefail
+          n=${{ needs.plan.outputs.price_shard_count }}
+          found=$(find shards -name 'check-price-*.jsonl' | wc -l)
+          if [ "$found" -ne "$n" ]; then
+            echo "シャードが欠けています（$found / $n）: ペアの分母が狂うので中止" >&2
+            exit 1
+          fi
+          cargo run --release --bin check_price -- report \
+            $(find shards -name '*.jsonl' | sort) \
+            | tee "check-price-${{ matrix.opponent }}.txt"
+          {
+            echo "## P0-7 反則トークンの影の価格（相手 ${{ matrix.opponent }}）"
+            echo '```'
+            cat "check-price-${{ matrix.opponent }}.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: check-price-combined-${{ matrix.opponent }}
+          path: |
+            check-price-${{ matrix.opponent }}.txt
+            shards/
+
+  # ---- P0-6 継続の局所効果（**検証セットでだけ回す**）--------------------
+  # `arena_run_id` に**未使用の match_seed で取り直した Arena 実行**を指定した
+  # 別の起動で回すこと。発見セット（P0-1〜P0-5 / P0-7 を回した記録）で回すと、
+  # 主 arm を選んだのと同じデータで検証することになり選定バイアスが入る。
+  continue:
+    needs: plan
+    if: >-
+      needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_continue == 'true'
+      && needs.plan.outputs.reaggregate_run_id == ''
+    strategy:
+      fail-fast: false
+      matrix:
+        opponent: ${{ fromJSON(needs.plan.outputs.opponents) }}
+        shard: ${{ fromJSON(needs.plan.outputs.continue_shards) }}
+        replicate: ${{ fromJSON(needs.plan.outputs.continue_replicate_list) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Download arena records
+        if: needs.plan.outputs.arena_run_id != ''
+        uses: actions/download-artifact@v7
+        with:
+          pattern: arena-records-${{ matrix.opponent }}-*
+          path: records-in
+          run-id: ${{ needs.plan.outputs.arena_run_id }}
+          github-token: ${{ github.token }}
+      - name: Local continuation
+        env:
+          # ランキングも継続も**同じ動作点**に揃える（プロセス env）
+          TSUITATE_THINK_BUDGET_MS: ${{ needs.plan.outputs.continue_budget_ms }}
+        run: |
+          set -euo pipefail
+          run_id='${{ needs.plan.outputs.arena_run_id }}'
+          if [ -n "$run_id" ]; then
+            src=records-in
+            if [ -z "$(find "$src" -name '*.jsonl' 2>/dev/null | head -1)" ]; then
+              echo "run $run_id から相手 '${{ matrix.opponent }}' の記録を取得できませんでした（artifact 名を確認）" >&2
+              exit 1
+            fi
+          else
+            src=records
+          fi
+          cargo build --release --bin check_continue
+          jobs=$(( $(nproc) - 1 )); [ "$jobs" -ge 1 ] || jobs=1
+          n=${{ needs.plan.outputs.continue_shard_count }}
+          opp='${{ matrix.opponent }}'
+          [ -n "$opp" ] && set -- --opponent "$opp" || set -- --allow-opponent-mismatch
+          ./target/release/check_continue "$@" \
+            --seeds "${{ needs.plan.outputs.continue_seeds }}" \
+            --policy "${{ needs.plan.outputs.continue_policy }}" \
+            --jobs "$jobs" \
+            --shard "${{ matrix.shard }}/$n" \
+            --replicate "${{ matrix.replicate }}" \
+            --allow-incomplete \
+            --out "check-continue-${{ matrix.opponent }}-r${{ matrix.replicate }}-s${{ matrix.shard }}.jsonl" \
+            "$src" | tee "check-continue-${{ matrix.opponent }}-r${{ matrix.replicate }}-s${{ matrix.shard }}.txt"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: check-continue-${{ matrix.opponent }}-r${{ matrix.replicate }}-s${{ matrix.shard }}
+          path: |
+            check-continue-${{ matrix.opponent }}-r${{ matrix.replicate }}-s${{ matrix.shard }}.jsonl
+            check-continue-${{ matrix.opponent }}-r${{ matrix.replicate }}-s${{ matrix.shard }}.txt
+
+  continue-aggregate:
+    needs: [plan, continue]
+    # **シャード matrix が skip されても走る**（`reaggregate_run_id` で既存 run の
+    # artifact を集計し直す経路）。`continue` が失敗したときだけ止める
+    if: >-
+      !cancelled() && needs.plan.outputs.skip != 'true'
+      && needs.plan.outputs.run_continue == 'true'
+      && (needs.continue.result == 'success' || needs.continue.result == 'skipped')
+    strategy:
+      fail-fast: false
+      matrix:
+        opponent: ${{ fromJSON(needs.plan.outputs.opponents) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: check-continue-${{ matrix.opponent }}-r*
+          path: shards
+          # 空なら現在の run（既定）。`reaggregate_run_id` があればその run から拾う
+          run-id: ${{ needs.plan.outputs.reaggregate_run_id || github.run_id }}
+          github-token: ${{ github.token }}
+      - name: Report
+        run: |
+          set -euo pipefail
+          # Δ の分母は全対局数なので、シャードが欠けると分子だけが落ちて Δ が過小に出る。
+          # **replicate ごとに全シャードが要る**（2回実行して平均する経路）。
+          # 本判定は check_continue report の check_inputs（replicate ごとの完全性 +
+          # 全 replicate で実験キー = 同じ build が一致）で、ここは本数の粗い関門
+          n=$(( ${{ needs.plan.outputs.continue_shard_count }} * ${{ needs.plan.outputs.continue_replicate_count }} ))
+          found=$(find shards -name 'check-continue-*.jsonl' | wc -l)
+          if [ "$found" -ne "$n" ]; then
+            echo "シャード/replicate が欠けています（$found / $n）: Δ の分子だけが落ちるので中止" >&2
+            exit 1
+          fi
+          cargo run --release --bin check_continue -- report \
+            $(find shards -name '*.jsonl' | sort) \
+            | tee "check-continue-${{ matrix.opponent }}.txt"
+          {
+            echo "## P0-6 継続の局所効果（相手 ${{ matrix.opponent }}）"
+            echo '```'
+            cat "check-continue-${{ matrix.opponent }}.txt"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: check-continue-combined-${{ matrix.opponent }}
+          path: |
+            check-continue-${{ matrix.opponent }}.txt
             shards/

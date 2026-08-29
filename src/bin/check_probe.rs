@@ -27,10 +27,10 @@ use std::sync::{Arc, Mutex};
 
 use tsuitate_bot::check::CheckSolver;
 use tsuitate_bot::check_economy::{
-    CheckMoveKind, PricedMove, classify_move_kind, hypothesis_stats, k_star, priced_moves,
+    CheckMoveKind, PricedMove, classify_move_kind, entry_replayed, hypothesis_stats, k_star,
+    priced_moves,
 };
-use tsuitate_bot::observation::{Observation, ObservationLog};
-use tsuitate_bot::protocol::Color;
+use tsuitate_bot::observation::Observation;
 use tsuitate_bot::scenario_core::{Replayed, clone_log, make_view, prewarm_for_trial, side_idx};
 use tsuitate_bot::shogi::parse_usi;
 use tsuitate_bot::strategy::{self, EvalParams};
@@ -161,58 +161,6 @@ fn collect_records(specs: &[String]) -> Vec<PathBuf> {
     out.dedup();
     out
 }
-
-/// 反則コストの**床適用前の基準値**（`strategy::evaluate` と同じ式）。
-///
-/// `CandidateScore::foul_cost` は床（`last_foul_guard`）を適用した後の値なので、
-/// P1-α の `max(k × base, 床)` を再現するには基準値のほうが要る。
-fn base_foul_cost(params: &EvalParams, you: u32, opp: u32) -> f64 {
-    let fouls_left = (10u32.saturating_sub(you)).max(1) as f64;
-    let opp_left = (10u32.saturating_sub(opp)).max(1) as f64;
-    params.foul_cost_base
-        * (10.0 / fouls_left).powf(params.foul_cost_pow)
-        * (opp_left / 10.0).powf(params.foul_diff_pow)
-}
-
-/// 手番開始時（反則0）の状態を作る。
-///
-/// `for_each_decision_full` が渡すのは**その手番の反則を全部食った後**の状態
-/// なので、両者のログ末尾から反則の観測を `fouls_this_turn` 本だけ落とす
-/// （手番側は `MyFoul`・相手側は `OpponentFoul`。`add_foul_obs` が対で積む）。
-/// 反則は局面を変えないので `pos` はそのまま。
-fn entry_replayed(post: &Replayed, side: Color, fouls_this_turn: u32) -> Option<Replayed> {
-    let n = fouls_this_turn as usize;
-    let mut logs = [ObservationLog::default(), ObservationLog::default()];
-    for (idx, log) in logs.iter_mut().enumerate() {
-        let events = post.logs[idx].events();
-        let keep = events.len().checked_sub(n)?;
-        // 落とす末尾が本当に反則の観測かを確かめる（規約が変わったら止める）
-        for e in &events[keep..] {
-            let ok = if idx == side_idx(side) {
-                matches!(e, Observation::MyFoul { .. })
-            } else {
-                matches!(e, Observation::OpponentFoul { .. })
-            };
-            if !ok {
-                return None;
-            }
-        }
-        for e in &events[..keep] {
-            log.record(e.clone());
-        }
-    }
-    let mut fouls = post.fouls;
-    fouls[side_idx(side)] = fouls[side_idx(side)].checked_sub(fouls_this_turn)?;
-    Some(Replayed {
-        pos: post.pos.clone(),
-        logs,
-        fouls,
-        plies: post.plies,
-        injected_fouls: vec![],
-        oracle: None,
-    })
-}
-
 
 /// 型（粗い束）のタグ。P0-1 の表と同じ分類
 fn type_tag(first: CheckMoveKind, accepted: CheckMoveKind) -> &'static str {
@@ -552,7 +500,9 @@ fn main() {
                         continue;
                     };
                     let king_best = priced.iter().find(|m| m.is_king);
-                    let base = base_foul_cost(
+                    // 床適用前の基準値は `strategy` と共有する（P0-5 の α と
+                    // 同じ base を使う。別々に書くと k* の意味が食い違う）
+                    let base = strategy::base_foul_cost_for(
                         params,
                         p.entry.fouls[side_idx(side)],
                         p.entry.fouls[side_idx(side.other())],
