@@ -1,0 +1,14 @@
+{
+  "_comment": "PR #35 レビュー2巡目 [P1] の検証用の**小さい** Arena 実行。強さの計測ではなく、arena が新しく残す match_seed_base / match_seed_shard を check-prep の provenance 関門が実際に通せるかを確かめるためだけのもの（4局×2シャード）",
+  "games": 4,
+  "candidate": "estimator",
+  "baselines": "estimator_v14",
+  "match_seed": 20260829,
+  "shards": 2,
+  "oracle": "",
+  "clock": "",
+  "env": "",
+  "cand_env": "",
+  "pair_with": "",
+  "games_from_run_id": ""
+}
