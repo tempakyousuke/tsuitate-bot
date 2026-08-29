@@ -10,5 +10,6 @@
   "_no_match_seed": "run 32697854659 は commit 886ef75（arena-summary.json に match_seed_base が入る前）なので expect_match_seed は指定できない。発見セットなので seed の独立性は要らない",
   "expect_candidate": "estimator",
   "expect_games": 104,
-  "expect_commit": "886ef75dca443462696604eeea132f3a1cd5c3ef"
+  "expect_commit": "886ef75dca443462696604eeea132f3a1cd5c3ef",
+  "_rerun": "自己レビュー3点（演繹の健全性・誤仮説マスの定義）を入れた commit で取り直す"
 }
