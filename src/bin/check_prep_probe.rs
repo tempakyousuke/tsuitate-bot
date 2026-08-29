@@ -108,6 +108,8 @@ struct Row {
     k_def_gen: Option<u32>,
     k_def_runtime: Option<u32>,
     // --- 機構（被王手条件付き。総効果の回帰には入れない）---
+    /// 王手駒の駒種。**CSV へ書くだけで集計は使わない**（オフライン分析用の列。
+    /// `report` は読み戻さないので `from_csv` では None のまま）
     checker_role: Option<Role>,
     checker_drop: Option<bool>,
     checker_capture: Option<bool>,
@@ -332,7 +334,7 @@ impl Row {
             k_def_truth: opt_int("k_def_truth"),
             k_def_gen: opt_int("k_def_gen"),
             k_def_runtime: opt_int("k_def_runtime"),
-            checker_role: None,
+            checker_role: None, // 集計は使わない（上記 doc）
             checker_drop: opt_bool("checker_drop"),
             checker_capture: opt_bool("checker_capture"),
             checker_dist: opt_int("checker_dist"),
