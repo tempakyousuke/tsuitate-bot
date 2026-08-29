@@ -1,0 +1,8 @@
+{
+  "_comment": "issue #34 P0-1 / P0-2 の発見セット計測。既存の Arena 実行（run 32697854659 = main vs v13 / v14 各104局、match_seed=20260815）の棋譜を再利用するので追加の対局コストはゼロ",
+  "arena_run_id": "32697854659",
+  "opponents": ["estimator_v13", "estimator_v14"],
+  "origin_weights": "",
+  "adj_share": 0.5,
+  "bootstrap": 500
+}
