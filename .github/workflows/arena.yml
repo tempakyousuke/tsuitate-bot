@@ -216,7 +216,16 @@ jobs:
           # 同じ入力なら版をまたいで同じ対局条件列になる）
           seed='${{ needs.plan.outputs.match_seed }}'
           if [ -n "$seed" ]; then
-            export ARENA_MATCH_SEED=$(( seed + ${{ matrix.shard }} ))
+            # **Bash の `$(( ))` は符号付き 64-bit** なので、seed の型（`u64`）の
+            # 上半分で折り返す（PR #35 レビュー5巡目 [P2]。実測: base
+            # 18446744073709551612 が shard 1 で `-3` になり、`bin/arena` の
+            # `env_u64` が「非負整数でない」として run を止める）。producer /
+            # checker / テストの3者が同じ `u64` 全域を扱えるように、加算は
+            # 任意精度＋範囲検査へ寄せる。**素の代入で受ける**こと:
+            # `export VAR=$(...)` は export の終了状態になるので失敗を握り潰す
+            ms=$(python3 scripts/ci/verify_seed_provenance.py \
+                   --shard-seed "$seed" '${{ matrix.shard }}')
+            export ARENA_MATCH_SEED="$ms"
             # **ずらす前の base と shard 番号も渡す**（PR #35 レビュー2巡目 [P1]）。
             # 記録に残る match_seed は「base + shard」をさらに基準ごとに XOR した
             # 実効値なので、下流の診断はこれが無いと「どの base seed で回した run か」を

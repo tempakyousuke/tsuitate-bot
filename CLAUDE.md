@@ -994,6 +994,13 @@
     env=9007199254740994 が正確に残っているのに jq の `base + shard` は MISMATCH を出す）。
     workflow 側の検査は `scripts/ci/verify_seed_provenance.py` に切り出して Python の
     `json` で整数のまま読み、CI が毎回 `--self-test` を先に走らせる。
+    **producer 側の加算も同じ範囲を扱う**（`arena.yml` の
+    `ARENA_MATCH_SEED=$(( seed + shard ))` は Bash の符号付き 64-bit なので `u64` の
+    上半分で折り返す。実測: base 18446744073709551612 が shard 1 で `-3`。
+    `--shard-seed` へ寄せて任意精度＋範囲検査にした）。
+    **欠測は「一致」ではない**: base を持つ run では各行に
+    `match_seed_base` / `_shard` / `_env` が u64 範囲の整数として揃っていることを
+    必須にし、欠測・型違い・範囲外・base を持つ行と持たない行の混在は ERR にする。
     **`match_seed_base` は PR #35 で足したフィールド**
     なので、それより前の commit で回した run（発見セットの 32697854659 /
     33179939954 など）には `expect_match_seed` を指定できず、

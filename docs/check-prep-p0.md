@@ -125,7 +125,7 @@
 `expect_match_seed` を必ず渡す**（発見セットと独立な seed であることを機械的に
 固定するため）。どれか1つでも外れたら解析を進めない。
 
-4点、実装で踏んだ落とし穴がある（PR #35 レビュー2〜4巡目）:
+5点、実装で踏んだ落とし穴がある（PR #35 レビュー2〜5巡目）:
 
 - **`match_seed` の照合は `match_seed_base` で行う**。記録に残る `match_seed` は
   arena.yml が付ける**シャードずらし**（`base + shard`）に、さらに `bin/arena` が
@@ -166,6 +166,23 @@
   `--self-test`（2^53 超・u64 上限近く・ラベル食い違い・シャード欠落・base 無し）を
   CI が毎回先に走らせる。**`jq ... | tostring` は jq 1.7 の number preservation で
   桁落ちしない**が、演算を1回でも通すと壊れるので、この段では読み出しごと Python へ寄せた
+- **producer / checker / テストの扱える範囲を揃える**。checker を任意精度にしても、
+  棋譜を作る側（`arena.yml`）が `ARENA_MATCH_SEED=$(( seed + shard ))` と
+  **Bash の符号付き 64-bit 演算**のままだと、`u64` の上半分が折り返して
+  `bin/arena` の `env_u64` に「非負整数でない」と止められる（実測: base
+  18446744073709551612 が shard 0/1 で `-4` / `-3`）。checker のテストだけが
+  u64 全域を正常系として主張する、という食い違いになるので、加算も
+  `verify_seed_provenance.py --shard-seed` へ寄せて任意精度＋`u64` 範囲検査にした
+  （`bin/arena` 側の `checked_add` と同じく桁あふれは producer でも拒否する。
+  受けるときは `ms=$(...)` の素の代入にすること — `export VAR=$(...)` は
+  export の終了状態になるので失敗を握り潰す）
+- **欠測は「一致」ではない**。`match_seed_env` を持つ行だけ不一致検査して欠けた行を
+  飛ばしていたので、`base` と `shard` は揃っているが実際の対局 seed との対応を
+  証明できない入力が `OK` になっていた（実測: env が null/欠落の2行で
+  `OK:20260829:0 1`）。base を持つ run では各行に `base` / `shard` / `env` が
+  **`u64` 範囲の整数として揃っている**ことを必須にし、欠測・型違い（`bool` は
+  `int` の派生なので明示的に弾く）・範囲外・**base を持つ行と持たない行の混在**
+  （別 binary で回したシャードの証拠）はすべて ERR にする
 
 ## 実測（発見セット: Arena run 32697854659 = main vs v13 / v14 各104局、`match_seed=20260815`）
 
