@@ -103,10 +103,11 @@ issue の arm 名との対応:
 - `deduce_last_move` が真仮説を落としたら `die`（fallback 前で数える）
 - オラクルが介入できた行数（真の王手駒が仮説にある単王手）と両王手の本数を出す
 
-`bin/check_continue` の `ROW_SCHEMA` は **5**（schema 1 = 恒等対照と演繹の列が無い時期、
+`bin/check_continue` の `ROW_SCHEMA` は **6**（schema 1 = 恒等対照と演繹の列が無い時期、
 schema 2 = 母集団に終端手番が入る前、schema 3 = **実行順を巡回で回していた時期**、
 schema 4 = **`continuation_group` が無く「畳まれた unit」を `arm_order` の一致で
-代用していた時期**の記録は集計から弾く。
+代用していた時期**、schema 5 = **対照と treatment を畳んでいた時期**（指紋の値が違う）の
+記録は集計から弾く。
 **欠けた列を「問題なし」と読むと両方の関門が素通りする**ので、版の拒否と
 `REQUIRED_ROW_KEYS` の存在検査の両方で止める）。
 
@@ -489,6 +490,30 @@ v14 951 / 1761 行（54.0%）・v13 693 / 1590 行（43.6%）**。仮説重み�
     - **同じ `continuation_group` なら継続の結果（score・終局理由・手数・即時反則・
       反則負け・破滅）が完全一致**することも要求する（畳まれた組は同じ継続1本を
       配ったはずなので、違っていれば配線が壊れているか細工されている）
+
+## レビュー10巡目で直した2点（除外経路の fail-open）
+
+28. **[P1] `continuation_group` の型を変えるだけで全検査を空集合にできた**。
+    必須列検査は non-null しか見ず、`unit_index` は文字列でない値を黙って skip
+    していたので、**完全な JSONL の全 `continuation_group` を数値へ置き換える**と、
+    行の完全性は通ったまま均衡検査も主判定も空集合になり exit 0 で終わった
+    （レビューの再現どおり）。**16桁の小文字 hex** を要求し、
+    **期待した行がすべて索引へ入ったこと**（`indexed == rows.len()`）まで照合する
+29. **[P1] 事後の除外そのものが fail-open だった**。9巡目の `retained_units` は
+    釣り合わない seed 対を主推定から落として順序を閉じたが、これは**arm の選択結果で
+    事前登録した母集団を条件づける post-treatment な操作**で、全 seed 対が落ちれば
+    `report` は estimand を1つも出さずに成功する（部分的な除外でも「全王手手番」という
+    母集団が変わる）。
+    - **生成側で閉じる**: 対照と treatment は**強制列が同じでも畳まない**
+      （畳むのは `baseline` と shadow arm どうしだけ）。こうすると全 unit が
+      常に分離するので、偶数 seed の反転だけで**除外なしに**順序が閉じる。
+      `continuation_group` は「強制列 ＋ 主比較 arm なら arm 名」の指紋になった
+    - **事後の除外は撤去**し、閉じていない入力は `check_inputs` が落とす（fail-closed）
+    - **meta が宣言した estimand に行が無ければ `die`**（「行が無ければ黙って
+      `continue`」だと母集団が空になったときに +0.04 門も安全性 veto も
+      評価せずに終われる）
+    - コスト: 対照と treatment の強制列が一致する unit では継続が1本増える。
+      **測定の妥当性と引き換えにできない**ので受け入れる
 
 > **run 33306228500 の JSONL は schema 5 なので、schema 6 の `report` では
 > 再集計できない**（fail-closed の設計上、`points_detail.double_check` を
