@@ -711,6 +711,10 @@ fn main() {
         "policy_jobs": policy_jobs,
         "continuation_jobs": continuation_jobs,
         "games": games,
+        // **読めなかった元対局は採否経路では致命**（PR #37 レビュー13巡目 [P1]）。
+        // 黙って落とすと `games`（＝ Δ の分母）が縮んだ選択標本になり、
+        // v13 / v14 で同数だけ失敗すれば相手間の `games` 一致検査も通ってしまう
+        "broken": broken,
         "shard_total": shard.1,
         "config": cfg.fingerprint(),
         "source_fingerprint": env!("TSUITATE_SOURCE_FINGERPRINT"),
@@ -1121,6 +1125,23 @@ fn check_inputs(
     let first = &metas[0]["experiment"];
     if first["seeds"].as_u64().unwrap_or(0) == 0 {
         out.push("meta の seeds が 0 です（継続 0 局のまま Δ を 0 にできてしまう）".into());
+    }
+    // **読めなかった元対局があれば採否経路では落とす**（PR #37 レビュー13巡目 [P1]）。
+    // `broken` は表示されるだけで meta にも失敗条件にも入っておらず、
+    // 縮んだ `games` がそのまま Δ の分母になっていた（v13 / v14 で同数だけ
+    // 失敗すれば相手間の `games` 一致検査も通る）。**欠測を「不明」で通さない**ので、
+    // 列そのものが無い記録（schema 6 より前の生成）も落とす
+    for m in metas {
+        match m["experiment"]["broken"].as_u64() {
+            Some(0) => {}
+            Some(n) => out.push(format!(
+                "読めなかった元対局が {n} 件あります（Δ の分母が縮んだ選択標本になる。記録を揃えてから測り直すこと）"
+            )),
+            None => out.push(
+                "meta の experiment に broken がありません（壊れた元対局の本数が分からない記録です）"
+                    .into(),
+            ),
+        }
     }
     // **必須列の欠落を「悪化なし」と読ませない**（schema の版だけに頼らない二重の関門）。
     // 安全性の列が欠けた行を 0 と読むと、反則負けも破滅も常に非悪化に見えて門を通せる
@@ -2015,8 +2036,8 @@ mod tests {
             "opponent": "estimator_v14", "budget_ms": 700, "seeds": 2,
             "policies": ["current", "alpha@k2"], "policy_jobs": 3, "continuation_jobs": 3,
             "schedule_control": "current",
-            "games": 104, "shard_total": 1, "config": "c", "source_fingerprint": "s",
-            "records": "r",
+            "games": 104, "broken": 0, "shard_total": 1, "config": "c",
+            "source_fingerprint": "s", "records": "r",
         })
     }
 
@@ -2334,6 +2355,26 @@ mod tests {
         assert!(
             problems.iter().any(|m| m.contains("継続の結果が違う")),
             "畳まれた組の結果不一致は検出されるべき: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn 読めなかった元対局があれば止まる() {
+        // 縮んだ `games` がそのまま Δ の分母になる（レビュー13巡目 [P1]）
+        let mut e = exp();
+        e["broken"] = serde_json::json!(3);
+        let problems = check_inputs(&[meta(e, 0)], &full(), "current");
+        assert!(
+            problems.iter().any(|m| m.contains("読めなかった元対局")),
+            "壊れた元対局は拒否されるべき: {problems:?}"
+        );
+        // 列そのものが無い記録も落とす（「不明」で通さない）
+        let mut e2 = exp();
+        e2.as_object_mut().unwrap().remove("broken");
+        let problems = check_inputs(&[meta(e2, 0)], &full(), "current");
+        assert!(
+            problems.iter().any(|m| m.contains("broken がありません")),
+            "欠測は拒否されるべき: {problems:?}"
         );
     }
 

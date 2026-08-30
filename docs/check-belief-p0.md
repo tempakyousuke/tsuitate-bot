@@ -564,6 +564,29 @@ v14 951 / 1761 行（54.0%）・v13 693 / 1590 行（43.6%）**。仮説重み�
     **片方の arm しか寄与を持たない局**も落とす（対象の手番が無かった局を
     ゼロ寄与の cluster として数える padding とは別物）
 
+## レビュー13巡目で直した3点（元標本の完全性と公開入力）
+
+36. **[P1] 読めなかった元対局が採否の母集団から黙って消えていた**。
+    `read_to_string` / `parse_bot_and_end` / `decision_points` の失敗は
+    `broken += 1; continue` で、`broken` は標準出力に出るだけで meta にも
+    失敗条件にも入っていなかった。**`games`（＝ Δ の分母）が縮んだ選択標本**に
+    なり、しかも v13 / v14 で同数だけ失敗すれば 34. で足した相手間の `games`
+    一致検査も通る。`broken` を meta へ残し、**採否経路では `broken > 0` を
+    即失敗**にする（列そのものが無い記録も「不明」で通さず落とす）
+37. **[P2] `opponents` 入力と `combined` の期待相手が接続されていなかった**。
+    `continue-combined` は `--expect-opponents` を渡していなかったので、
+    バイナリ既定の `{estimator_v13, estimator_v14}` を必ず要求する。
+    **カスタム相手・単一相手・リポジトリ `records/` のどの経路も、最長 350 分の
+    continuation matrix を完走した後に確定で失敗する**。plan の相手集合を
+    `--expect-opponents` へ渡す（`records/` モードの `[""]` は空文字になり、
+    `combined` 側は空なら照合しない）
+38. **[P2] `continue_policy` は複数 arm なのに `--main` へ丸ごと渡していた**。
+    生成側はカンマで分割して複数 arm を走らせる一方、`combined` は
+    `oracle@k2@real,oracle@kinf@real` という名前の arm を探して欠落扱いにするので、
+    これも全 continuation を完走した後に必ず失敗する。**主 arm は
+    `continue_main` として独立に持ち**、plan で「1本であること」と
+    「`continue_policy` に含まれること」を検査する
+
 > **run 33306228500 の JSONL は schema 5 なので、schema 6 の `report` では
 > 再集計できない**（fail-closed の設計上、`points_detail.double_check` を
 > 既定値で補う逃げ道は作らない）。下の数字は**その run 自身の集計**であり、

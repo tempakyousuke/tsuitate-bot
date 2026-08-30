@@ -1228,7 +1228,12 @@
     `combined` は **相手間の実験条件の同一性**（`opponent` / `records` を除いた
     experiment key）と **対照・主 arm の存在**も fail-closed で検査する
     （欠落を `unwrap_or(0)` で補うと「暗黙のゼロ対照」と比べて合格しうる。
-    対象の手番が無かった局をゼロ寄与の cluster として数える padding とは別物）
+    対象の手番が無かった局をゼロ寄与の cluster として数える padding とは別物）。
+    **読めなかった元対局（`broken`）があれば採否経路では即失敗**（同 13巡目 [P1]。
+    `games` が縮んだ選択標本になり、相手間で同数だけ失敗すると `games` 一致検査も
+    通る）。**主 arm は `continue_main`、期待する相手集合は plan の `opponents`**
+    から渡す（`continue_policy` はカンマ区切りなので `--main` へ丸ごと渡すと、
+    最長 350 分の matrix を完走した後に確定で失敗する）
   - P0-2b（`bin/check_continue`）の**対照は `current@real`**（`report --baseline
     current@real`）。shadow の `current` と比べると「オラクル」と「指し直したこと」の
     効果が混ざる。実再決定 arm を混ぜたら `current@real` を自動で足す。
