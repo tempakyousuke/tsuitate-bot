@@ -1,5 +1,5 @@
 {
-  "_comment": "issue #36 P0-2（オラクル arm）を発見セット run 32697854659 に対して回す。P0-1 は run 33268085486 で済んでいるので run_probe=false。計測後にこのファイルを消す push は全ジョブがスキップされる",
+  "_comment": "issue #36 P0-2（オラクル arm）を発見セット run 32697854659 に対して回す。P0-1 は run 33268085486 で済んでいるので run_probe=false。この run は commit 886ef75 = 476483d より前なので think_budget_ms_a が null （旧形式は「env の生値・未設定なら null」＝上書きなしの既定 2000ms）。allow_legacy_think_budget で既定値として解決させる。計測後にこのファイルを消す push は全ジョブがスキップされる",
   "arena_run_id": "32697854659",
   "opponents": "estimator_v13 estimator_v14",
   "run_probe": false,
@@ -10,5 +10,6 @@
   "policy_budget_ms": 2000,
   "policy_shards": 6,
   "run_continue": false,
+  "allow_legacy_think_budget": true,
   "expect_candidate": "estimator"
 }

@@ -210,6 +210,40 @@ issue の arm 名との対応:
 `bin/check_policy` の `ROW_SCHEMA` は **4**（schema 2 = 1. の修正前、schema 3 = 6. の
 修正前の記録は集計から弾く）。
 
+## 予算 provenance の旧形式（P0-2 を起動して初めて踏んだ）
+
+3. で足した `EXPECT_THINK_BUDGET_MS` の関門は、**P0-1 の実行より後に入った**ので
+P0-2 の起動（run 33298188365）で初めて動き、**全 28 ジョブが即座に落ちた**:
+
+    この phase の思考予算 2000ms が元 Arena の nullms と違います
+
+原因は関門の側ではなく**記録側の形式**だった。`arena-summary.json` の
+`think_budget_ms_a` は commit `476483d`（2026-08-24 11:25）より前は
+
+```rust
+"think_budget_ms_a": env::var("TSUITATE_CAND_THINK_BUDGET_MS")
+    .or_else(|_| env::var("TSUITATE_THINK_BUDGET_MS")).ok(),
+```
+
+= **env の生値、どちらも未設定なら `null`**。476483d 以降は `budget_of(...)` の
+実効値なので null にならない。**発見セット run 32697854659 は commit `886ef75`
+（同日 06:33）= 476483d より前**なので null になる（#34 で「この run は
+`arena-games.jsonl` を持たない」と記録した制約と**同じ commit 境界**）。
+
+要点は **`null` は「不明」ではなく「上書きなし = その build の既定値」**という
+こと。`strategy::DEFAULT_THINK_BUDGET_MS` は 886ef75 でも現在でも **2000** なので、
+この発見セットは 2000ms で走っている。対応:
+
+- `null` は**既定では落とす**（黙って通すと関門が意味を失う）。既定値として
+  解決させるには `ALLOW_LEGACY_THINK_BUDGET=1`（workflow の
+  `allow_legacy_think_budget`）を**明示的に**渡す。解決の出所は
+  `think_budget_ms_a_source=legacy_default` として provenance へ残す
+- 旧形式を既定値として解決したときは、記録の `think_avg_ms_a` が主張した予算
+  **未満**であることも要求する。**この裏取りは非対称**で、「実際はもっと大きい
+  予算だったのに小さい予算を主張した」側しか捕まらない（逆向きは捕まらない）ので
+  単独の証拠にはしない。実測では発見セットの思考平均は 1204〜1232ms で、
+  700ms の run の 418ms とは明確に分かれる
+
 ## 契約（先に固定した）
 
 - 母集団は **bot の全王手中手番**（反則0も終端手番も含む）。落ちた本数は attrition

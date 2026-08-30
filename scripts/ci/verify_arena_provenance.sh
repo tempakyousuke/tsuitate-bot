@@ -27,6 +27,10 @@
 #                       `think_budget_ms_a` と一致しなければ落とす。
 #                       「記録時に実際に見えていたランキング」でない測定を
 #                       採否に使わせないための関門（PR #37 レビュー [P1]）
+#   ALLOW_LEGACY_THINK_BUDGET
+#                       `1` のとき、**旧形式の `think_budget_ms_a: null`** を
+#                       「その build の既定値」として解決する（下記）。既定は
+#                       落とす（null を黙って通すと関門が意味を失う）
 set -euo pipefail
 shopt -s nullglob globstar
 
@@ -40,6 +44,16 @@ EXPECT_COMMIT=${EXPECT_COMMIT:-}
 EXPECT_GAMES=${EXPECT_GAMES:-}
 EXPECT_SHARDS=${EXPECT_SHARDS:-}
 EXPECT_THINK_BUDGET_MS=${EXPECT_THINK_BUDGET_MS:-}
+ALLOW_LEGACY_THINK_BUDGET=${ALLOW_LEGACY_THINK_BUDGET:-}
+# `think_budget_ms_a` が **null になりうる** のは commit 476483d より前の
+# 記録だけで、そこでの定義は
+#   env::var("TSUITATE_CAND_THINK_BUDGET_MS")
+#     .or_else(|_| env::var("TSUITATE_THINK_BUDGET_MS")).ok()
+# = 「env の生値、どちらも未設定なら null」。**null は「上書きなし = その
+# build の既定値」という意味であって「不明」ではない**（476483d 以降は
+# `budget_of(...)` で実効値を必ず入れるので null にならない）。
+# 既定値は 886ef75 でも現在でも `strategy::DEFAULT_THINK_BUDGET_MS = 2000`
+LEGACY_DEFAULT_THINK_BUDGET_MS=2000
 : > "$OUT"
 
 # --- 0. 元 run そのものの状態（commit と結末）を API から取る ---
@@ -102,11 +116,38 @@ done
 # 「その決定点で実際に見えていたランキング」ではない
 if [ -n "$EXPECT_THINK_BUDGET_MS" ]; then
   budget=$(jq -r '.think_budget_ms_a | tostring' shard-summaries.jsonl | sort -u)
+  budget_src=recorded
+  if [ "$budget" = "null" ]; then
+    # 旧形式（476483d より前）。null は「不明」ではなく「上書きなし = 既定値」
+    if [ "$ALLOW_LEGACY_THINK_BUDGET" != "1" ]; then
+      echo "::error::元 Arena は think_budget_ms_a を実効値で記録していません（commit 476483d より前の旧形式で、上書きが無いと null になる）。既定値 ${LEGACY_DEFAULT_THINK_BUDGET_MS}ms として解決してよいなら ALLOW_LEGACY_THINK_BUDGET=1 を渡してください"
+      exit 1
+    fi
+    budget=$LEGACY_DEFAULT_THINK_BUDGET_MS
+    budget_src=legacy_default
+  fi
   if [ "$budget" != "$EXPECT_THINK_BUDGET_MS" ]; then
-    echo "::error::この phase の思考予算 ${EXPECT_THINK_BUDGET_MS}ms が元 Arena の ${budget}ms と違います。粒子数が変わるので「記録時に実際に見えていたランキング」になりません"
+    echo "::error::この phase の思考予算 ${EXPECT_THINK_BUDGET_MS}ms が元 Arena の ${budget}ms（${budget_src}）と違います。粒子数が変わるので「記録時に実際に見えていたランキング」になりません"
     exit 1
   fi
+  # 旧形式を既定値として解決したときは、**記録の思考時間で裏を取る**。
+  # 予算より平均が大きいことは起こりえないので、「実際はもっと大きい予算
+  # だったのに小さい予算を主張した」側は必ず捕まる（逆向き＝実際より大きい
+  # 予算を主張した場合は捕まらない。**非対称なので単独の証拠にはしない**）
+  if [ "$budget_src" = legacy_default ]; then
+    avg=$(jq -r '.think_avg_ms_a | tostring' shard-summaries.jsonl | sort -u)
+    if [ "$(echo "$avg" | wc -l)" -ne 1 ] || [ "$avg" = null ]; then
+      echo "::error::旧形式の予算を裏づける think_avg_ms_a がシャード間で揃いません: $(echo $avg)"
+      exit 1
+    fi
+    if ! awk -v a="$avg" -v b="$EXPECT_THINK_BUDGET_MS" 'BEGIN{exit !(a+0 < b+0)}'; then
+      echo "::error::記録の思考平均 ${avg}ms が主張した予算 ${EXPECT_THINK_BUDGET_MS}ms 以上です。元 Arena は既定値では走っていません"
+      exit 1
+    fi
+    printf 'think_avg_ms_a=%s\n' "$avg" >> "$OUT"
+  fi
   printf 'phase_think_budget_ms=%s\n' "$EXPECT_THINK_BUDGET_MS" >> "$OUT"
+  printf 'think_budget_ms_a_source=%s\n' "$budget_src" >> "$OUT"
 fi
 base=$(jq -r '.baseline' shard-summaries.jsonl | sort -u)
 if [ "$base" != "$OPPONENT" ]; then

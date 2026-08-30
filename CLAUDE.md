@@ -1182,7 +1182,15 @@
   「その phase の実効予算 == 元 Arena の `think_budget_ms_a`」も検査する**
   （PR #37 レビュー [P1]。probe だけを検査していた頃は、元2000ms の正常な run に
   policy 700ms を指定しても緑になり、記録と違う粒子数で引いたランキングを採否に
-  使えた）。設計・契約・中止条件は `docs/check-belief-p0.md`
+  使えた）。**`think_budget_ms_a` は commit 476483d より前は「env の生値・どちらも
+  未設定なら null」**で、null は「不明」ではなく**「上書きなし = その build の既定値」**
+  （886ef75 でも現在でも `DEFAULT_THINK_BUDGET_MS = 2000`）。476483d 以降は
+  `budget_of(...)` の実効値なので null にならない。**発見セット run 32697854659
+  （commit 886ef75）はこの旧形式**なので `allow_legacy_think_budget` を渡して既定値と
+  して解決させる（既定は落とす。null を黙って通すと関門が意味を失う）。旧形式のときは
+  記録の `think_avg_ms_a` が主張した予算未満であることも要求する（**非対称**な裏取り:
+  「実際はもっと大きい予算だったのに小さい予算を主張した」側だけが捕まる）。
+  設計・契約・中止条件は `docs/check-belief-p0.md`
 - **王手中の反則経済の CI**（`.github/workflows/check-economy.yml`、**通常のコード
   push では走らない**）: `gh workflow run check-economy.yml -f arena_run_id=<Arena実行ID>
   -f opponents="estimator_v13 estimator_v14"`、`gh` が無ければ

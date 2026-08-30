@@ -111,6 +111,10 @@ on:
         description: "P0-2b を何回実行して平均するか（issue #36 は**常に 2**）"
         required: false
         default: "2"
+      allow_legacy_think_budget:
+        description: "元 Arena が commit 476483d より前で think_budget_ms_a が null のとき、その build の既定値 2000ms として解決してよいか。**発見セット run 32697854659 がこれに該当する**"
+        required: false
+        default: "false"
       expect_candidate:
         description: "元 Arena 実行の候補戦略（空なら照合しない）"
         required: false
@@ -161,6 +165,7 @@ jobs:
       continue_shards: ${{ steps.split.outputs.continue_shards }}
       continue_shard_count: ${{ steps.split.outputs.continue_shard_count }}
       continue_replicate_list: ${{ steps.split.outputs.continue_replicate_list }}
+      allow_legacy_think_budget: ${{ steps.split.outputs.allow_legacy_think_budget }}
       expect_candidate: ${{ steps.split.outputs.expect_candidate }}
       expect_match_seed: ${{ steps.split.outputs.expect_match_seed }}
       expect_commit: ${{ steps.split.outputs.expect_commit }}
@@ -189,6 +194,7 @@ jobs:
           IN_CONTINUE_BUDGET: ${{ github.event.inputs.continue_budget_ms }}
           IN_CONTINUE_SHARDS: ${{ github.event.inputs.continue_shards }}
           IN_CONTINUE_REPLICATES: ${{ github.event.inputs.continue_replicates }}
+          IN_ALLOW_LEGACY_BUDGET: ${{ github.event.inputs.allow_legacy_think_budget }}
           IN_EXP_CAND: ${{ github.event.inputs.expect_candidate }}
           IN_EXP_SEED: ${{ github.event.inputs.expect_match_seed }}
           IN_EXP_COMMIT: ${{ github.event.inputs.expect_commit }}
@@ -216,6 +222,7 @@ jobs:
             continue_budget="${IN_CONTINUE_BUDGET:-2000}"
             continue_shards="${IN_CONTINUE_SHARDS:-8}"
             continue_reps="${IN_CONTINUE_REPLICATES:-2}"
+            allow_legacy_budget="${IN_ALLOW_LEGACY_BUDGET:-false}"
             exp_cand="${IN_EXP_CAND-estimator}"
             exp_seed="${IN_EXP_SEED:-}"
             exp_commit="${IN_EXP_COMMIT:-}"
@@ -249,6 +256,7 @@ jobs:
                 echo 'continue_shards=[0]'
                 echo "continue_shard_count=1"
                 echo 'continue_replicate_list=[0]'
+                echo "allow_legacy_think_budget=false"
                 echo "expect_candidate="
                 echo "expect_match_seed="
                 echo "expect_commit="
@@ -277,6 +285,7 @@ jobs:
             continue_budget=$(jq -r '.continue_budget_ms // 2000' "$req")
             continue_shards=$(jq -r '.continue_shards // 8' "$req")
             continue_reps=$(jq -r '.continue_replicates // 2' "$req")
+            allow_legacy_budget=$(jq -r 'if has("allow_legacy_think_budget") then .allow_legacy_think_budget else false end | tostring' "$req")
             exp_cand=$(jq -r 'if has("expect_candidate") then .expect_candidate else "estimator" end' "$req")
             exp_seed=$(jq -r '.expect_match_seed // ""' "$req")
             exp_commit=$(jq -r '.expect_commit // ""' "$req")
@@ -310,6 +319,7 @@ jobs:
             echo "continue_shards=$(jq -n -c --argjson n "$continue_shards" '[range($n)]')"
             echo "continue_shard_count=$continue_shards"
             echo "continue_replicate_list=$(jq -n -c --argjson n "$continue_reps" '[range($n)]')"
+            echo "allow_legacy_think_budget=$allow_legacy_budget"
             echo "expect_candidate=$exp_cand"
             echo "expect_match_seed=$exp_seed"
             echo "expect_commit=$exp_commit"
@@ -370,6 +380,7 @@ jobs:
           # （PR #37 レビュー [P1]。違う予算で引き直したランキングは
           #  「記録時に実際に見えていたランキング」ではない）
           EXPECT_THINK_BUDGET_MS: ${{ needs.plan.outputs.probe_budget_ms }}
+          ALLOW_LEGACY_THINK_BUDGET: ${{ needs.plan.outputs.allow_legacy_think_budget == 'true' && '1' || '' }}
         run: bash scripts/ci/verify_arena_provenance.sh
       - name: P0-1 transmission
         env:
@@ -497,6 +508,7 @@ jobs:
           EXPECT_GAMES: ${{ needs.plan.outputs.expect_games }}
           EXPECT_SHARDS: ${{ needs.plan.outputs.expect_shards }}
           EXPECT_THINK_BUDGET_MS: ${{ needs.plan.outputs.policy_budget_ms }}
+          ALLOW_LEGACY_THINK_BUDGET: ${{ needs.plan.outputs.allow_legacy_think_budget == 'true' && '1' || '' }}
         run: bash scripts/ci/verify_arena_provenance.sh
       - name: P0-2 oracle arms
         env:
@@ -661,6 +673,7 @@ jobs:
           EXPECT_GAMES: ${{ needs.plan.outputs.expect_games }}
           EXPECT_SHARDS: ${{ needs.plan.outputs.expect_shards }}
           EXPECT_THINK_BUDGET_MS: ${{ needs.plan.outputs.continue_budget_ms }}
+          ALLOW_LEGACY_THINK_BUDGET: ${{ needs.plan.outputs.allow_legacy_think_budget == 'true' && '1' || '' }}
         run: bash scripts/ci/verify_arena_provenance.sh
       - name: P0-2b oracle continuation
         env:
