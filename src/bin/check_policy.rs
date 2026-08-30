@@ -58,13 +58,13 @@ use tsuitate_bot::check_economy::{
     CheckMoveKind, classify_move_kind, cluster_ratio_ci, entry_replayed, true_checkers,
 };
 use tsuitate_bot::check_policy::{
-    CalibrationSums, EntrySetup, Policy, PolicyMove, SimOutcome, UpdateRule,
-    entry_setup as check_policy_entry, fmt_num, policy_moves, simulate, truth_after,
+    CalibrationSums, EntrySetup, Policy, SimOutcome, UpdateRule,
+    entry_setup as check_policy_entry, fmt_num, simulate, truth_after,
 };
 use tsuitate_bot::observation::Observation;
 use tsuitate_bot::protocol::Color;
 use tsuitate_bot::scenario_core::{Replayed, clone_log, make_view, side_idx};
-use tsuitate_bot::shogi::{Position, ShogiMove, parse_usi};
+use tsuitate_bot::shogi::{Position, parse_usi};
 use tsuitate_bot::strategy::{self, EvalParams};
 use tsuitate_bot::truth_replay::{for_each_decision_full, parse_bot_and_end};
 
@@ -706,13 +706,14 @@ fn run_unit(
     with_real: bool,
 ) -> Option<Vec<serde_json::Value>> {
     let side = p.entry.pos.turn();
-    let king = p.entry.pos.king_square(side);
     // **ランキングを作ったのと同じ粒子**で仮想更新する（issue #28 P0-3 の教訓）。
     // prewarm は1回だけで、実再決定はこの instance の clone に反則を食わせた継続
     let setup = check_policy_entry(&p.entry, &p.truth, seed, params, eval_particles)?;
     // `setup` は**丸ごと**持っておく（issue #36 の arm は `check_belief::run_arm`
     // が同じ instance から clone して実再決定するため）
-    let EntrySetup { strat, log: entry_log, moves, p0, updater, .. } = &setup;
+    // `setup` を分解せず丸ごと持つ（実再決定 arm は `check_belief::run_arm` が
+    // この instance から clone するので、ここでは読むだけ）
+    let EntrySetup { moves, p0, updater, .. } = &setup;
     // **健全性**: 反則0での仮想更新は初回ランキングの p_legal を再現するはず。
     // ずれるなら `evaluate` の経路（min キャップや別のノブ）を取りこぼしている
     let p_repro = updater.p_after(&moves, &[]);
