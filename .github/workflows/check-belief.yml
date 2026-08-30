@@ -259,7 +259,9 @@ jobs:
             fi
             run_id=$(jq -r '.arena_run_id // ""' "$req")
             opponents=$(jq -r 'if (.opponents | type) == "array" then (.opponents | join(" ")) else (.opponents // "estimator_v13 estimator_v14") end' "$req")
-            run_probe=$(jq -r '.run_probe // true | tostring' "$req")
+            # `// true` は **false も既定値扱いになる**（jq の `//` は null と false を
+            # 同じに扱う）。has() で「キーがあるか」を見る（mate-economy.yml と同じ）
+            run_probe=$(jq -r 'if has("run_probe") then .run_probe else true end | tostring' "$req")
             probe_seeds=$(jq -r '.probe_seeds // 3' "$req")
             probe_budget=$(jq -r '.probe_budget_ms // 2000' "$req")
             probe_shards=$(jq -r '.probe_shards // 8' "$req")
