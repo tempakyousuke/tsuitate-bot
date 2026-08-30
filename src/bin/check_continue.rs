@@ -75,8 +75,15 @@ use tsuitate_bot::truth_replay::parse_bot_and_end;
 /// 決まるので、g グループ・距離 d なら A が先になるのは g 回中 (g − d) 回）。
 /// `schedule_groups` の**反転**へ変え、meta に `schedule_control` を残して
 /// 集計側でも釣り合いを検査する。schema 3 の記録は主差に実行順効果を
-/// 残したまま緑になるので弾く
-const ROW_SCHEMA: u32 = 4;
+/// 残したまま緑になるので弾く。
+///
+/// **5 …** レビュー9巡目 [P1] で、① 分離した unit の前後差を 1 まで許すと
+/// 加法的な実行順効果が丸ごと主差へ残る（対の片方だけが分離した決定点）
+/// ② 「畳まれた unit」を `arm_order` の一致で判定していたので、order を
+/// 書き換えるだけで均衡検査を空集合にできた、の2点を直した。
+/// 行に `continuation_group`（強制列の指紋）を足し、主推定は
+/// **釣り合った seed 対だけ**で作る
+const ROW_SCHEMA: u32 = 5;
 
 /// estimand の全量。**集計が走査するのはこの2つだけ**なので、meta がこれ以外を
 /// 宣言したら期待キーを作る前に拒否する（PR #33 レビュー7巡目 [P1]）。
@@ -87,7 +94,7 @@ const ESTIMANDS: [&str; 2] = ["foul", "nofoul"];
 
 /// 継続1本の行に必ず入っていなければならない列。1つでも欠けたら集計しない
 /// （欠測を「悪化なし」と読むのが一番危ない失敗の仕方なので、既定では降格させない）
-const REQUIRED_ROW_KEYS: [&str; 10] = [
+const REQUIRED_ROW_KEYS: [&str; 11] = [
     "arm",
     "estimand",
     "score",
@@ -100,6 +107,8 @@ const REQUIRED_ROW_KEYS: [&str; 10] = [
     "arm_order",
     // 欠測を 0 と読むと**別々の実行が同じ replicate に潰れて**重複検査を素通りする
     "replicate",
+    // 「畳まれた unit」の判定を `arm_order` の一致で代用させないための指紋
+    "continuation_group",
 ];
 
 fn die(msg: &str) -> ! {
@@ -196,6 +205,17 @@ fn schedule_groups(
         group.reverse();
     }
     group
+}
+
+/// 強制列の指紋（`continuation_group`）。同じ指紋 = 同じ継続1本を共有した組。
+fn group_fingerprint(order: &[String]) -> String {
+    use sha2::Digest as _;
+    let mut h = sha2::Sha256::new();
+    for m in order {
+        sha2::Digest::update(&mut h, m.as_bytes());
+        sha2::Digest::update(&mut h, b"\n");
+    }
+    h.finalize().iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
 fn run_arm(p: &Point, order: &[String], seed: u64, opponent: &str) -> serde_json::Value {
@@ -614,6 +634,11 @@ fn main() {
                     r["arm"] = serde_json::json!(arm);
                     // 何番目に走ったか（実行順効果の監査用）
                     r["arm_order"] = serde_json::json!(k);
+                    // **どの継続1本を共有したか**（PR #37 レビュー9巡目 [P1]）。
+                    // 「畳まれた（＝実行順効果を持たない）」の判定を `arm_order` の
+                    // 一致で代用すると、order を書き換えるだけで均衡検査を
+                    // 空集合にできる。強制列そのものの指紋を行に残して照合する
+                    r["continuation_group"] = serde_json::json!(group_fingerprint(order));
                     r["replicate"] = serde_json::json!(replicate);
                     rows.push(r);
                 }
@@ -822,6 +847,37 @@ fn report_vs(
             die(&msg);
         }
     }
+    // **釣り合わない seed 対を主推定から落とす**（PR #37 レビュー9巡目 [P1]）。
+    // 完全性検査（欠落・余分）は**元の行**へ掛けてから落とすので、
+    // 除外が「行が欠けている」と誤判定されることはない
+    let treatments: Vec<String> = metas
+        .first()
+        .and_then(|m| m["experiment"]["policies"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .filter(|t| *t != baseline)
+        .map(|t| t.to_string())
+        .collect();
+    let (keep, dropped_units) = retained_units(rows, &treatments, baseline);
+    let rows: Vec<serde_json::Value> = rows
+        .iter()
+        .filter(|r| {
+            keep.contains(&(
+                r["replicate"].as_u64().unwrap_or(u64::MAX),
+                r["game"].as_str().unwrap_or("?").to_string(),
+                r["move_number"].as_u64().unwrap_or(0),
+                r["seed"].as_u64().unwrap_or(u64::MAX),
+            ))
+        })
+        .cloned()
+        .collect();
+    if dropped_units > 0 {
+        println!(
+            "  実行順が閉じない seed 対を主推定から除外: {dropped_units} unit（片方だけが強制列を共有していて AB/BA を作れない組）"
+        );
+    }
+    let rows: &[serde_json::Value] = &rows;
     let exp = metas
         .first()
         .map(|m| m["experiment"].clone())
@@ -1252,26 +1308,56 @@ fn check_inputs(
             head(&extras)
         ));
     }
-    out.extend(check_arm_order_balance(metas, rows, baseline));
+    // **均衡検査は主推定に残る集合へ掛ける**（`report_vs` と同じ規則で落とす）。
+    // 元の行に掛けると、除外予定の seed 対で必ず落ちてしまう
+    let treatments: Vec<String> = first["policies"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .filter(|t| *t != baseline)
+        .map(|t| t.to_string())
+        .collect();
+    let (keep, _) = retained_units(rows, &treatments, baseline);
+    let kept: Vec<serde_json::Value> = rows
+        .iter()
+        .filter(|r| {
+            keep.contains(&(
+                r["replicate"].as_u64().unwrap_or(u64::MAX),
+                r["game"].as_str().unwrap_or("?").to_string(),
+                r["move_number"].as_u64().unwrap_or(0),
+                r["seed"].as_u64().unwrap_or(u64::MAX),
+            ))
+        })
+        .cloned()
+        .collect();
+    // `arm_order` そのものの健全性は**全行**へ掛ける（除外した行の細工を
+    // 見逃さない）
+    out.extend(check_arm_order_balance(metas, rows, &kept, baseline));
     out
 }
 
-/// **実行順が決定点の中で釣り合っているか**（PR #37 レビュー8巡目 [P1]）。
+/// **実行順が決定点の中で釣り合っているか**（PR #37 レビュー8〜9巡目 [P1]）。
 ///
 /// `plan` の「seed が偶数なら AB/BA が閉じる」という契約は、生成規則
 /// （`schedule_groups` の反転）と**この集計側の検査**が揃って初めて意味を持つ。
+///
 /// 数えるのは `(replicate, game, move_number, treatment)` ごとの
 /// 「treatment 先 / 対照 先」で、**同じ強制列に畳まれた unit は数えない**
-/// （同じ継続1本を共有するので `arm_order` が等しく、実行順効果を持たない）。
+/// （同じ継続1本を共有するのでペア差が厳密に 0 = 実行順効果を持たない）。
+/// 畳まれたかどうかは **`continuation_group` の一致**で見る:
+/// `arm_order` の一致で代用すると、order を書き換えるだけで検査を空集合にできる
+/// （レビュー9巡目 [P1]）。
 ///
-/// 畳まれ方は seed ごとの選択手で変わるので、ある決定点で分かれた unit が
-/// **奇数個**なら完全な釣り合いは原理的に作れない。そこで門は
-/// **|treatment 先 − 対照 先| ≤ 1**（奇数ぶんの端数だけ許す）とし、
-/// 端数の総和は情報として出す。差が 2 以上ある決定点は、反転が効いていないか
-/// 前向きの並びが seed ごとに変わっている印なので落とす。
+/// **差は完全一致を要求する**（同 [P1]）。±1 を許すと、対の片方だけが分離した
+/// 決定点で「先 1 / 後 0」が通り、ペア差が非ゼロになりうる唯一の unit が
+/// treatment 先だけになるので、加法的な実行順効果が丸ごと主差へ残る。
+/// 釣り合わない seed 対は `retained_units` が**主推定から落とす**ので、
+/// ここへ渡ってくるのは釣り合っているはずの集合だけ。
 fn check_arm_order_balance(
     metas: &[serde_json::Value],
     rows: &[serde_json::Value],
+    kept: &[serde_json::Value],
     baseline: &str,
 ) -> Vec<String> {
     let mut out = vec![];
@@ -1289,21 +1375,72 @@ fn check_arm_order_balance(
                 .into(),
         ),
     }
-    // (rep, game, move_number, seed) → arm → arm_order
-    type Unit = (u64, String, u64, u64);
-    let mut order: BTreeMap<Unit, BTreeMap<String, u64>> = BTreeMap::new();
+    // ---- `arm_order` そのものの健全性（レビュー9巡目 [P1]）--------------------
+    // 型と unit 内の構造を検査しない限り、order を文字列にする・treatment と
+    // 対照へ同じ値を入れる、だけで下の均衡検査を空集合にできる
+    let mut non_int = 0usize;
     for r in rows {
-        let Some(o) = r["arm_order"].as_u64() else { continue };
-        order
-            .entry((
-                r["replicate"].as_u64().unwrap_or(u64::MAX),
-                r["game"].as_str().unwrap_or("?").to_string(),
-                r["move_number"].as_u64().unwrap_or(0),
-                r["seed"].as_u64().unwrap_or(u64::MAX),
-            ))
-            .or_default()
-            .insert(r["arm"].as_str().unwrap_or("?").to_string(), o);
+        if !r["arm_order"].is_u64() {
+            non_int += 1;
+        }
     }
+    if non_int > 0 {
+        out.push(format!(
+            "arm_order が整数でない行が {non_int} 件あります（型を変えるだけで実行順の検査を素通りできる）"
+        ));
+    }
+    let units = unit_index(rows);
+    let mut struct_bad: Vec<String> = vec![];
+    let mut shared_bad: Vec<String> = vec![];
+    for (u, arms) in &units {
+        // `arm_order` と `continuation_group` は1対1（同じ継続を共有した組だけが
+        // 同じ order）。順位の集合は 0..グループ数 と厳密に一致する
+        let mut by_group: BTreeMap<&str, BTreeSet<u64>> = BTreeMap::new();
+        let mut by_order: BTreeMap<u64, BTreeSet<&str>> = BTreeMap::new();
+        for a in arms.values() {
+            by_group.entry(a.group.as_str()).or_default().insert(a.order);
+            by_order.entry(a.order).or_default().insert(a.group.as_str());
+        }
+        let orders: BTreeSet<u64> = by_order.keys().copied().collect();
+        let want: BTreeSet<u64> = (0..by_group.len() as u64).collect();
+        if orders != want
+            || by_group.values().any(|o| o.len() != 1)
+            || by_order.values().any(|g| g.len() != 1)
+        {
+            struct_bad.push(format!("rep{} {}#{} seed{}", u.0, u.1, u.2, u.3));
+        }
+        // 同じ継続を共有したなら、継続の結果は arm によらず完全一致するはず
+        let mut seen: BTreeMap<&str, &ArmRow> = BTreeMap::new();
+        for a in arms.values() {
+            match seen.get(a.group.as_str()) {
+                None => {
+                    seen.insert(a.group.as_str(), a);
+                }
+                Some(prev) if prev.outcome != a.outcome => {
+                    shared_bad.push(format!("rep{} {}#{} seed{}", u.0, u.1, u.2, u.3));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    struct_bad.dedup();
+    shared_bad.dedup();
+    if !struct_bad.is_empty() {
+        out.push(format!(
+            "arm_order と continuation_group が1対1でない unit が {} 件あります（順位は 0..グループ数 と一致し、同じ order は同じ強制列でなければならない）: {}",
+            struct_bad.len(),
+            struct_bad.iter().take(3).cloned().collect::<Vec<_>>().join(" / ")
+        ));
+    }
+    if !shared_bad.is_empty() {
+        out.push(format!(
+            "同じ continuation_group なのに継続の結果が違う unit が {} 件あります（畳まれた組は同じ継続1本を配ったはず）: {}",
+            shared_bad.len(),
+            shared_bad.iter().take(3).cloned().collect::<Vec<_>>().join(" / ")
+        ));
+    }
+    // ---- 決定点の中で前後が完全に釣り合っているか ---------------------------
+    let kept_units = unit_index(kept);
     let treatments: Vec<String> = first["policies"]
         .as_array()
         .into_iter()
@@ -1313,17 +1450,16 @@ fn check_arm_order_balance(
         .map(|t| t.to_string())
         .collect();
     for treat in &treatments {
-        // (rep, game, move_number) → (treatment 先, 対照 先)
         let mut per_point: BTreeMap<(u64, String, u64), (usize, usize)> = BTreeMap::new();
-        let mut merged = 0usize;
-        for ((rep, g, mn, _seed), m) in &order {
-            let (Some(a), Some(b)) = (m.get(treat), m.get(baseline)) else { continue };
-            if a == b {
-                merged += 1; // 同じ強制列 = 同じ継続1本（実行順効果を持たない）
+        for (u, arms) in &kept_units {
+            let (Some(a), Some(b)) = (arms.get(treat.as_str()), arms.get(baseline)) else {
                 continue;
+            };
+            if a.group == b.group {
+                continue; // 同じ継続1本（ペア差は厳密に 0）
             }
-            let e = per_point.entry((*rep, g.clone(), *mn)).or_default();
-            if a < b {
+            let e = per_point.entry((u.0, u.1.clone(), u.2)).or_default();
+            if a.order < b.order {
                 e.0 += 1
             } else {
                 e.1 += 1
@@ -1331,7 +1467,7 @@ fn check_arm_order_balance(
         }
         let bad: Vec<String> = per_point
             .iter()
-            .filter(|(_, (f, s))| f.abs_diff(*s) > 1)
+            .filter(|(_, (f, s))| f != s)
             .map(|((rep, g, mn), (f, s))| format!("rep{rep} {g}#{mn}（先 {f} / 後 {s}）"))
             .collect();
         if !bad.is_empty() {
@@ -1342,14 +1478,100 @@ fn check_arm_order_balance(
                 if bad.len() > 3 { " ..." } else { "" }
             ));
         }
-        let odd = per_point.values().filter(|(f, s)| (f + s) % 2 == 1).count();
-        if odd > 0 || merged > 0 {
-            eprintln!(
-                "  実行順: {treat} vs {baseline} — 強制列が同じで畳まれた unit {merged} / 分かれた unit が奇数個の決定点 {odd}（端数は原理的に相殺できない）"
-            );
-        }
     }
     out
+}
+
+/// 実行順の監査に要る1行ぶんの情報
+struct ArmRow {
+    order: u64,
+    group: String,
+    /// 継続の結果（同じ `group` なら arm によらず一致するはず）
+    outcome: String,
+}
+
+type UnitKey = (u64, String, u64, u64);
+
+/// `(replicate, game, move_number, seed)` → arm → 実行順・グループ・結果
+fn unit_index(rows: &[serde_json::Value]) -> BTreeMap<UnitKey, BTreeMap<String, ArmRow>> {
+    let mut units: BTreeMap<UnitKey, BTreeMap<String, ArmRow>> = BTreeMap::new();
+    for r in rows {
+        let Some(order) = r["arm_order"].as_u64() else { continue };
+        let Some(group) = r["continuation_group"].as_str() else { continue };
+        units
+            .entry((
+                r["replicate"].as_u64().unwrap_or(u64::MAX),
+                r["game"].as_str().unwrap_or("?").to_string(),
+                r["move_number"].as_u64().unwrap_or(0),
+                r["seed"].as_u64().unwrap_or(u64::MAX),
+            ))
+            .or_default()
+            .insert(
+                r["arm"].as_str().unwrap_or("?").to_string(),
+                ArmRow {
+                    order,
+                    group: group.to_string(),
+                    outcome: [
+                        "score",
+                        "reason",
+                        "plies",
+                        "immediate_fouls",
+                        "foul_limit_loss",
+                        "foul_limit_win",
+                        "immediate_catastrophe",
+                    ]
+                    .iter()
+                    .map(|k| r[*k].to_string())
+                    .collect::<Vec<_>>()
+                    .join("|"),
+                },
+            );
+    }
+    units
+}
+
+/// **主推定に入れてよい unit**（PR #37 レビュー9巡目 [P1]）。
+///
+/// 反転は seed 2k / 2k+1 で前後を入れ替えるので、その対の**両方**で
+/// treatment と対照が別グループなら AB/BA が閉じ、**両方**で同じグループなら
+/// どちらもペア差 0 で無害。片方だけが分離していると、非ゼロになりうる
+/// unit が一方向にしか無く、加法的な実行順効果が丸ごと主差へ残る。
+/// そういう seed 対は**対ごと落とす**（片方だけ落とすと分母が非対称になる）。
+///
+/// 落とす単位が seed 対なので、どの treatment から見ても同じ集合になる
+/// （arm ごとに違う集合で集計すると Δ の分母が arm ごとに変わる）。
+fn retained_units(
+    rows: &[serde_json::Value],
+    treatments: &[String],
+    baseline: &str,
+) -> (BTreeSet<UnitKey>, usize) {
+    let units = unit_index(rows);
+    let split = |u: &UnitKey, treat: &str| -> Option<bool> {
+        let arms = units.get(u)?;
+        let a = arms.get(treat)?;
+        let b = arms.get(baseline)?;
+        Some(a.group != b.group)
+    };
+    let mut keep: BTreeSet<UnitKey> = BTreeSet::new();
+    let mut dropped = 0usize;
+    for u in units.keys() {
+        let partner = (u.0, u.1.clone(), u.2, u.3 ^ 1);
+        let ok = units.contains_key(&partner)
+            && treatments
+                .iter()
+                .all(|t| match (split(u, t), split(&partner, t)) {
+                    (Some(x), Some(y)) => x == y,
+                    // その treatment の行がどちらにも無いなら比較対象でない
+                    (None, None) => true,
+                    _ => false,
+                });
+        if ok {
+            keep.insert(u.clone());
+        } else {
+            dropped += 1;
+        }
+    }
+    (keep, dropped)
 }
 
 fn run_report(args: &[String]) {
@@ -1437,8 +1659,20 @@ mod tests {
             "plies": 90, "added_plies": 10, "immediate_fouls": 1, "added_fouls_me": 1,
             "think_mean_ms": 700.0, "foul_limit": false,
             "foul_limit_loss": false, "foul_limit_win": false,
-            "immediate_catastrophe": false, "arm_order": 0, "replicate": 0,
+            "immediate_catastrophe": false, "replicate": 0,
+            // 実行順とグループは arm ごとの slot に紐づける（強制列が違えば
+            // グループも違う、という本番の関係を再現する）
+            "arm_order": arm_slot(arm), "continuation_group": format!("grp{}", arm_slot(arm)),
         })
+    }
+
+    /// 固定の arm 優先順位（`schedule_groups` の前向きの並び）
+    fn arm_slot(arm: &str) -> usize {
+        match arm {
+            "baseline" => 0,
+            "current" => 1,
+            _ => 2,
+        }
     }
 
     /// **2回実行の平均は集計器が取る**（PR #33 レビュー3巡目 [P1]）。
@@ -1450,7 +1684,10 @@ mod tests {
             let mut v = vec![];
             for seed in 0..2u64 {
                 for (arm, sc) in [("baseline", 0.5), ("current", 0.5), ("alpha@k2", score)] {
-                    let mut r = row(arm, seed, sc);
+                    // 偶数 seed は前向き、奇数は反転（本番の `schedule_groups` と同じ）
+                    let slot = arm_slot(arm);
+                    let order = if seed % 2 == 0 { slot } else { 2 - slot };
+                    let mut r = row_ord(arm, seed, sc, order);
                     r["replicate"] = serde_json::json!(rep);
                     v.push(r);
                 }
@@ -1531,8 +1768,8 @@ mod tests {
     #[test]
     fn 旧schemaは現行の版と一致しない() {
         assert_eq!(
-            ROW_SCHEMA, 4,
-            "安全性の列・終端手番の母集団に加えて、実行順の生成規則を巡回から反転へ変えたので版を上げてある"
+            ROW_SCHEMA, 5,
+            "安全性の列・終端手番の母集団・実行順の反転に加えて、continuation_group を足したので版を上げてある"
         );
     }
 
@@ -1556,7 +1793,8 @@ mod tests {
         assert_eq!(lose["foul_limit_loss"], serde_json::json!(true));
     }
 
-    /// 実行順つきの行（`schedule_groups` と同じ形: seed の偶奇で並びを反転する）
+    /// 実行順つきの行（`schedule_groups` と同じ形: seed の偶奇で並びを反転する）。
+    /// `continuation_group` は**強制列**の指紋なので反転では変わらない
     fn row_ord(arm: &str, seed: u64, score: f64, order: usize) -> serde_json::Value {
         let mut r = row(arm, seed, score);
         r["arm_order"] = serde_json::json!(order);
@@ -1602,6 +1840,96 @@ mod tests {
         assert!(
             problems.iter().any(|m| m.contains("決定点の中で均衡していません")),
             "固定順は検出されるべき: {problems:?}"
+        );
+    }
+
+    /// **片方だけが強制列を共有した seed 対は主推定へ入れない**
+    /// （PR #37 レビュー9巡目 [P1]）。±1 を許すと「先 1 / 後 0」が通り、
+    /// ペア差が非ゼロになりうる唯一の unit が treatment 先だけになるので、
+    /// 加法的な実行順効果が丸ごと主差へ残る
+    fn 片側だけ畳まれた行() -> Vec<serde_json::Value> {
+        let mut v = vec![];
+        // seed 0: 3グループ（前向き）= alpha@k2 と current は別の継続
+        for arm in ["baseline", "current", "alpha@k2"] {
+            v.push(row_ord(arm, 0, if arm == "alpha@k2" { 1.0 } else { 0.0 }, arm_slot(arm)));
+        }
+        // seed 1: alpha@k2 が current と同じ強制列に畳まれた（＝ペア差 0）
+        for arm in ["baseline", "current", "alpha@k2"] {
+            let slot = if arm == "baseline" { 0 } else { 1 };
+            let mut r = row_ord(arm, 1, 0.0, 1 - slot);
+            r["continuation_group"] = serde_json::json!(format!("grp{slot}"));
+            v.push(r);
+        }
+        v
+    }
+
+    #[test]
+    fn 片側だけ畳まれたseed対は主推定から外す() {
+        let rows = 片側だけ畳まれた行();
+        let treatments = vec!["alpha@k2".to_string()];
+        let (keep, dropped) = retained_units(&rows, &treatments, "current");
+        assert_eq!(dropped, 2, "seed 0/1 の両方を落とす（対ごと落とす）");
+        assert!(keep.is_empty(), "残るのは釣り合った対だけ: {keep:?}");
+        // 除外したうえでなら契約を通る（残りが空なので均衡違反も出ない）
+        let problems = check_inputs(&[meta(exp(), 0)], &rows, "current");
+        assert!(
+            !problems.iter().any(|m| m.contains("均衡していません")),
+            "除外後は均衡違反にならない: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn 同じ順位なのに継続の結果が違えば止まる() {
+        // treatment と対照の `arm_order` を同値にすると、以前は「畳まれた」と
+        // 無条件に扱われて均衡検査が空集合になった（レビュー9巡目 [P1]）
+        let rows: Vec<serde_json::Value> = full()
+            .into_iter()
+            .map(|mut r| {
+                if r["arm"] == "alpha@k2" || r["arm"] == "current" {
+                    r["arm_order"] = serde_json::json!(1);
+                }
+                r
+            })
+            .collect();
+        let problems = check_inputs(&[meta(exp(), 0)], &rows, "current");
+        assert!(
+            problems.iter().any(|m| m.contains("1対1でない")),
+            "order とグループの食い違いは検出されるべき: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn 順位が整数でなければ止まる() {
+        let rows: Vec<serde_json::Value> = full()
+            .into_iter()
+            .map(|mut r| {
+                r["arm_order"] = serde_json::json!(r["arm_order"].to_string());
+                r
+            })
+            .collect();
+        let problems = check_inputs(&[meta(exp(), 0)], &rows, "current");
+        assert!(
+            problems.iter().any(|m| m.contains("整数でない")),
+            "型を変えて検査を素通りできてはいけない: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn 畳まれた組の継続結果が違えば止まる() {
+        // 同じ `continuation_group` なら同じ継続1本を配ったはずなので、
+        // score が違うのは配線が壊れている（または細工されている）印
+        let mut rows = full();
+        for r in &mut rows {
+            if r["arm"] == "alpha@k2" {
+                // current と同じグループ・同じ順位にするが score は違う
+                r["continuation_group"] = serde_json::json!("grp1");
+                r["arm_order"] = serde_json::json!(1);
+            }
+        }
+        let problems = check_inputs(&[meta(exp(), 0)], &rows, "current");
+        assert!(
+            problems.iter().any(|m| m.contains("継続の結果が違う")),
+            "畳まれた組の結果不一致は検出されるべき: {problems:?}"
         );
     }
 

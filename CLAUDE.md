@@ -1217,7 +1217,8 @@
     current@real`）。shadow の `current` と比べると「オラクル」と「指し直したこと」の
     効果が混ざる。実再決定 arm を混ぜたら `current@real` を自動で足す。
     思考予算は **2000ms**（ランキング段と継続段の両方に効く。700ms は別の treatment）。
-    `ROW_SCHEMA` は **4**（schema 3 = **実行順を巡回で回していた時期**の記録は弾く）
+    `ROW_SCHEMA` は **5**（schema 3 = **実行順を巡回で回していた時期**、
+    schema 4 = **`continuation_group` が無い時期**の記録は弾く）
   - **P0-2b の実行順は「巡回」ではなく「反転」**（PR #37 レビュー8巡目 [P1]）。
     arm は**選んだ強制列ごと**にグループへ畳まれる（同じ列なら継続1本を共有する）が、
     それを `(決定点番号 + seed) % グループ数` で cyclic rotate しても **AB/BA には
@@ -1236,6 +1237,20 @@
     `schedule_control` と `report --baseline` が違えば「AB/BA が閉じているのは
     別のペア」として落とす。**生成規則・実行時の契約・集計の検査は3点セット**で、
     どれか1つでも欠けると workflow 側の偶奇検査は空手形になる
+  - **前後差は完全一致を要求し、釣り合わない seed 対は主推定から落とす**
+    （同 9巡目 [P1]）。`|差| ≤ 1` を許すと、対の片方だけが分離した決定点で
+    「先 1 / 後 0」が通り、**ペア差が非ゼロになりうる唯一の unit が treatment 先
+    だけ**になるので実行順効果が丸ごと主差へ残る。`retained_units` は seed
+    2k / 2k+1 の**両方**が分離（または両方が共有）の対だけを残す。落とす単位を
+    seed 対にするのは、どの treatment から見ても同じ集合にするため
+    （arm ごとに違う集合で集計すると Δ の分母が arm ごとに変わる）。
+    完全性検査は**元の行**へ掛けてから落とす
+  - **「畳まれた unit」は `continuation_group`（強制列の指紋）で判定する**
+    （同 [P1]）。`arm_order` の一致で代用していたので、**全行を文字列にする /
+    order を同値にするだけ**で均衡検査を空集合にできた。`arm_order` は整数で
+    あること・unit 内で「順位の集合 == 0..グループ数」「同じ順位 ⟺ 同じグループ」・
+    **同じグループなら継続の結果が完全一致**することを検査する。
+    `ROW_SCHEMA` は **5**（schema 4 = `continuation_group` が無い時期は弾く）
 - **王手駒仮説の希釈の CI**（`.github/workflows/check-belief.yml`、**通常のコード push
   では走らない**）: `gh workflow run check-belief.yml -f arena_run_id=<Arena実行ID>`、
   `gh` が無ければ `.github/ci/check-belief.request.json` を置いて push（削除の push は
