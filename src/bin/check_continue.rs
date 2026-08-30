@@ -68,7 +68,15 @@ use tsuitate_bot::truth_replay::parse_bot_and_end;
 /// schema 2 の記録（終端が系統的に欠けている）を新しい gate へ混ぜると
 /// オラクル効果も safety 指標も楽観側へ偏る。meta の `points_detail` に
 /// `terminal` があることも要求する
-const ROW_SCHEMA: u32 = 3;
+///
+/// **4 …** PR #37 レビュー8巡目で**実行順の生成規則が変わった**: schema 3 までは
+/// arm 群を `(決定点番号 + seed) % グループ数` で **cyclic rotate** していたが、
+/// 巡回は AB/BA にならない（固定の2 arm の前後は「切れ目がその間に入るか」だけで
+/// 決まるので、g グループ・距離 d なら A が先になるのは g 回中 (g − d) 回）。
+/// `schedule_groups` の**反転**へ変え、meta に `schedule_control` を残して
+/// 集計側でも釣り合いを検査する。schema 3 の記録は主差に実行順効果を
+/// 残したまま緑になるので弾く
+const ROW_SCHEMA: u32 = 4;
 
 /// estimand の全量。**集計が走査するのはこの2つだけ**なので、meta がこれ以外を
 /// 宣言したら期待キーを作る前に拒否する（PR #33 レビュー7巡目 [P1]）。
@@ -155,6 +163,41 @@ fn continuation_seeds(game: &str, ply: u32, seed: u64) -> (u64, u64) {
 }
 
 /// 手番を `order` の順に強制して指させ、そのあとを終局まで指し継ぐ
+/// **unit（決定点 × seed）の中での実行順**（PR #37 レビュー8巡目 [P1]）。
+///
+/// 以前は `(決定点番号 + seed) % グループ数` の **cyclic rotate** だったが、これは
+/// AB/BA にならない: 巡回では固定の2 arm `A, B` の前後は「切れ目が A と B の間に
+/// 入るか」だけで決まるので、グループ数 g・距離 d のとき A が先になるのは g 回中
+/// (g − d) 回。3グループ・4 seed なら shift が `0,1,2,0` で、しかもグループ数と
+/// 並びは seed ごとの強制列で変わり、`replicate` は shift に入らない。
+///
+/// **反転なら全ペアの前後が同時に入れ替わる**（`bin/check_policy` の実再決定
+/// ブロックと同じ形）ので、`(決定点番号 + seed) % 2` で反転する。前向きの並びは
+/// **arm の優先順位**（`baseline` → `policies` のタグ順）で決める: 強制列の
+/// 辞書順で並べると seed ごとに前向きの並びそのものが変わり、反転しても
+/// 決定点の中で釣り合わない。
+///
+/// 同じ強制列に畳まれた arm どうしは**同じ継続1本**を共有する（`arm_order` も
+/// 同じ）ので、その組は実行順効果を持たない。したがって釣り合いを検査するのは
+/// 「別グループに分かれた unit」だけでよく、それは `report` 側が数える。
+fn schedule_groups(
+    mut group: Vec<(Vec<String>, Vec<String>)>,
+    arm_rank: &BTreeMap<String, usize>,
+    point_index: usize,
+    seed: u64,
+) -> Vec<(Vec<String>, Vec<String>)> {
+    group.sort_by_key(|(order, arms)| {
+        (
+            arms.iter().map(|a| arm_rank.get(a).copied().unwrap_or(usize::MAX)).min(),
+            order.clone(),
+        )
+    });
+    if (point_index + seed as usize) % 2 == 1 {
+        group.reverse();
+    }
+    group
+}
+
 fn run_arm(p: &Point, order: &[String], seed: u64, opponent: &str) -> serde_json::Value {
     let me_i = side_idx(p.bot);
     let logs = [clone_log(&p.entry.logs[0]), clone_log(&p.entry.logs[1])];
@@ -349,6 +392,16 @@ fn main() {
     }
     policies.sort_by(|a, b| a.tag.cmp(&b.tag));
     policies.dedup_by(|a, b| a.tag == b.tag);
+    // **実再決定 arm を回すなら seed は偶数**（PR #37 レビュー8巡目 [P1]）。
+    // 実行順は `schedule_groups` が seed の偶奇で**反転**させるので、奇数だと
+    // 決定点ごとに AB/BA が閉じない。`check-belief.yml` の plan はこの契約を
+    // 検査していたが、生成側にその規則が無ければ検査は空手形だった
+    if policies.iter().any(|a| a.real) && seeds % 2 != 0 {
+        die("--seeds は 2 以上の偶数にしてください（実再決定 arm の AB/BA は seed の偶奇で閉じるので、奇数だと実行順効果がペア差に残る）");
+    }
+    // **主比較の対照**（`report --baseline` と同じ規約で解決する）。スケジュールは
+    // この arm と各 treatment の前後を決定点の中で反転させる
+    let control_tag = if policies.iter().any(|a| a.real) { "current@real" } else { "current" };
     let files = collect_records(&specs);
     if files.is_empty() {
         die("記録ファイルが見つかりません");
@@ -512,9 +565,13 @@ fn main() {
     // ---- 継続（同じ強制列は1回だけ走らせて該当 arm へ配る）-----------------
     // **1 unit = 1つの `(決定点, seed)` の全 arm**。同じ worker が背中合わせに
     // 走らせるので、壁時計予算のもとでの CPU 競合と開始順の差が arm 間の Δ へ
-    // 混ざらない。arm の並びは `(決定点番号 + seed)` で回転させ、
-    // 「いつも current が先」に偏らないようにする
-    // （`bin/check_price` と同じ契約。PR #33 レビュー [P1] の一般化）
+    // 混ざらない。並びは `schedule_groups` が決める（seed の偶奇で**反転**）。
+    // arm の優先順位は「`baseline` → `policies` のタグ順」で固定する
+    let arm_rank: BTreeMap<String, usize> = std::iter::once("baseline".to_string())
+        .chain(policies.iter().map(|a| a.tag.clone()))
+        .enumerate()
+        .map(|(i, t)| (t, i))
+        .collect();
     type Unit = (usize, u64, Vec<(Vec<String>, Vec<String>)>);
     let mut units: Vec<Unit> = vec![];
     for (pi, p) in points.iter().enumerate() {
@@ -534,11 +591,7 @@ fn main() {
                     by_order.entry(order.clone()).or_default().push(arm.clone());
                 }
             }
-            let mut group: Vec<(Vec<String>, Vec<String>)> = by_order.into_iter().collect();
-            if !group.is_empty() {
-                let shift = (pi + seed as usize) % group.len();
-                group.rotate_left(shift);
-            }
+            let group = schedule_groups(by_order.into_iter().collect(), &arm_rank, pi, seed);
             units.push((pi, seed, group));
         }
     }
@@ -592,6 +645,10 @@ fn main() {
         // **解決後の arm 名**を残す（`current@real` の自動追加を含む。
         // 宣言と実際がずれると完全性検査が空振りする）
         "policies": policies.iter().map(|a| a.tag.clone()).collect::<Vec<_>>(),
+        // **スケジュールが前後を反転させた対照**（PR #37 レビュー8巡目 [P1]）。
+        // `report --baseline` がこれと違う arm を指したら、AB/BA が閉じているのは
+        // 別のペアなので集計側で気づけるようにしておく
+        "schedule_control": control_tag,
         "policy_jobs": policy_jobs,
         "continuation_jobs": continuation_jobs,
         "games": games,
@@ -758,7 +815,7 @@ fn report_vs(
     allow_incomplete: bool,
     baseline: &str,
 ) {
-    for msg in check_inputs(metas, rows) {
+    for msg in check_inputs(metas, rows, baseline) {
         if allow_incomplete {
             eprintln!("警告: {msg}");
         } else {
@@ -970,7 +1027,11 @@ fn report_vs(
 /// meta が宣言した集合と行の集合をこの粒度で厳密一致させる
 type Key = (u64, String, u64, String, u64, String);
 
-fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<String> {
+fn check_inputs(
+    metas: &[serde_json::Value],
+    rows: &[serde_json::Value],
+    baseline: &str,
+) -> Vec<String> {
     let mut out = vec![];
     if metas.is_empty() {
         return vec!["meta 行がありません（Δ の分母が取れない）".into()];
@@ -1191,6 +1252,103 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
             head(&extras)
         ));
     }
+    out.extend(check_arm_order_balance(metas, rows, baseline));
+    out
+}
+
+/// **実行順が決定点の中で釣り合っているか**（PR #37 レビュー8巡目 [P1]）。
+///
+/// `plan` の「seed が偶数なら AB/BA が閉じる」という契約は、生成規則
+/// （`schedule_groups` の反転）と**この集計側の検査**が揃って初めて意味を持つ。
+/// 数えるのは `(replicate, game, move_number, treatment)` ごとの
+/// 「treatment 先 / 対照 先」で、**同じ強制列に畳まれた unit は数えない**
+/// （同じ継続1本を共有するので `arm_order` が等しく、実行順効果を持たない）。
+///
+/// 畳まれ方は seed ごとの選択手で変わるので、ある決定点で分かれた unit が
+/// **奇数個**なら完全な釣り合いは原理的に作れない。そこで門は
+/// **|treatment 先 − 対照 先| ≤ 1**（奇数ぶんの端数だけ許す）とし、
+/// 端数の総和は情報として出す。差が 2 以上ある決定点は、反転が効いていないか
+/// 前向きの並びが seed ごとに変わっている印なので落とす。
+fn check_arm_order_balance(
+    metas: &[serde_json::Value],
+    rows: &[serde_json::Value],
+    baseline: &str,
+) -> Vec<String> {
+    let mut out = vec![];
+    let Some(m0) = metas.first() else { return out };
+    let first = &m0["experiment"];
+    // スケジュールが反転させた対照と、集計が使う対照が違えば AB/BA が
+    // 閉じているのは別のペア
+    match first["schedule_control"].as_str() {
+        Some(c) if c == baseline => {}
+        Some(c) => out.push(format!(
+            "スケジュールの対照は {c} ですが集計の対照は {baseline} です（AB/BA が閉じているのは別のペアなので、この主差には実行順効果が残ります）"
+        )),
+        None => out.push(
+            "meta に schedule_control がありません（実行順の生成規則が分からない schema 3 以前の記録です）"
+                .into(),
+        ),
+    }
+    // (rep, game, move_number, seed) → arm → arm_order
+    type Unit = (u64, String, u64, u64);
+    let mut order: BTreeMap<Unit, BTreeMap<String, u64>> = BTreeMap::new();
+    for r in rows {
+        let Some(o) = r["arm_order"].as_u64() else { continue };
+        order
+            .entry((
+                r["replicate"].as_u64().unwrap_or(u64::MAX),
+                r["game"].as_str().unwrap_or("?").to_string(),
+                r["move_number"].as_u64().unwrap_or(0),
+                r["seed"].as_u64().unwrap_or(u64::MAX),
+            ))
+            .or_default()
+            .insert(r["arm"].as_str().unwrap_or("?").to_string(), o);
+    }
+    let treatments: Vec<String> = first["policies"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .filter(|t| *t != baseline)
+        .map(|t| t.to_string())
+        .collect();
+    for treat in &treatments {
+        // (rep, game, move_number) → (treatment 先, 対照 先)
+        let mut per_point: BTreeMap<(u64, String, u64), (usize, usize)> = BTreeMap::new();
+        let mut merged = 0usize;
+        for ((rep, g, mn, _seed), m) in &order {
+            let (Some(a), Some(b)) = (m.get(treat), m.get(baseline)) else { continue };
+            if a == b {
+                merged += 1; // 同じ強制列 = 同じ継続1本（実行順効果を持たない）
+                continue;
+            }
+            let e = per_point.entry((*rep, g.clone(), *mn)).or_default();
+            if a < b {
+                e.0 += 1
+            } else {
+                e.1 += 1
+            }
+        }
+        let bad: Vec<String> = per_point
+            .iter()
+            .filter(|(_, (f, s))| f.abs_diff(*s) > 1)
+            .map(|((rep, g, mn), (f, s))| format!("rep{rep} {g}#{mn}（先 {f} / 後 {s}）"))
+            .collect();
+        if !bad.is_empty() {
+            out.push(format!(
+                "{treat} と {baseline} の実行順が決定点の中で均衡していません（{} 決定点）: {}{}。AB/BA が閉じていないと実行順効果がペア差に残ります",
+                bad.len(),
+                bad.iter().take(3).cloned().collect::<Vec<_>>().join(" / "),
+                if bad.len() > 3 { " ..." } else { "" }
+            ));
+        }
+        let odd = per_point.values().filter(|(f, s)| (f + s) % 2 == 1).count();
+        if odd > 0 || merged > 0 {
+            eprintln!(
+                "  実行順: {treat} vs {baseline} — 強制列が同じで畳まれた unit {merged} / 分かれた unit が奇数個の決定点 {odd}（端数は原理的に相殺できない）"
+            );
+        }
+    }
     out
 }
 
@@ -1256,6 +1414,7 @@ mod tests {
         serde_json::json!({
             "opponent": "estimator_v14", "budget_ms": 700, "seeds": 2,
             "policies": ["current", "alpha@k2"], "policy_jobs": 3, "continuation_jobs": 3,
+            "schedule_control": "current",
             "games": 104, "shard_total": 1, "config": "c", "source_fingerprint": "s",
             "records": "r",
         })
@@ -1306,7 +1465,7 @@ mod tests {
         let mut m1 = meta(exp(), 0);
         m1["replicate"] = serde_json::json!(1);
         assert!(
-            check_inputs(&[m0, m1], &rows).is_empty(),
+            check_inputs(&[m0, m1], &rows, "current").is_empty(),
             "同じ実験の2 replicate は契約を通る"
         );
         let sel: Vec<&serde_json::Value> = rows.iter().collect();
@@ -1330,7 +1489,7 @@ mod tests {
         // replicate 1 はシャード 0 しか無い
         let mut m1 = meta(e, 0);
         m1["replicate"] = serde_json::json!(1);
-        let problems = check_inputs(&[m0a, m0b, m1], &[]);
+        let problems = check_inputs(&[m0a, m0b, m1], &[], "current");
         assert!(
             problems.iter().any(|p| p.contains("replicate 1")),
             "replicate 1 の欠落を検出できていない: {problems:?}"
@@ -1359,7 +1518,7 @@ mod tests {
                     r
                 })
                 .collect();
-            let problems = check_inputs(&[meta(exp(), 0)], &rows);
+            let problems = check_inputs(&[meta(exp(), 0)], &rows, "current");
             assert!(
                 problems.iter().any(|p| p.contains(key)),
                 "{key} が欠けても素通りした: {problems:?}"
@@ -1372,8 +1531,8 @@ mod tests {
     #[test]
     fn 旧schemaは現行の版と一致しない() {
         assert_eq!(
-            ROW_SCHEMA, 3,
-            "安全性の列を足し、さらに母集団へ終端手番を入れたので版を上げてある"
+            ROW_SCHEMA, 4,
+            "安全性の列・終端手番の母集団に加えて、実行順の生成規則を巡回から反転へ変えたので版を上げてある"
         );
     }
 
@@ -1397,19 +1556,113 @@ mod tests {
         assert_eq!(lose["foul_limit_loss"], serde_json::json!(true));
     }
 
+    /// 実行順つきの行（`schedule_groups` と同じ形: seed の偶奇で並びを反転する）
+    fn row_ord(arm: &str, seed: u64, score: f64, order: usize) -> serde_json::Value {
+        let mut r = row(arm, seed, score);
+        r["arm_order"] = serde_json::json!(order);
+        r
+    }
+
     fn full() -> Vec<serde_json::Value> {
         let mut v = vec![];
-        for seed in 0..2 {
-            v.push(row("baseline", seed, 0.0));
-            v.push(row("current", seed, 0.0));
-            v.push(row("alpha@k2", seed, 1.0));
+        for seed in 0..2u64 {
+            // 偶数 seed は [baseline, current, alpha@k2]、奇数はその反転
+            let fwd = seed % 2 == 0;
+            let ord = |k: usize| if fwd { k } else { 2 - k };
+            v.push(row_ord("baseline", seed, 0.0, ord(0)));
+            v.push(row_ord("current", seed, 0.0, ord(1)));
+            v.push(row_ord("alpha@k2", seed, 1.0, ord(2)));
         }
         v
     }
 
     #[test]
     fn 揃った入力は契約を通る() {
-        assert!(check_inputs(&[meta(exp(), 0)], &full()).is_empty());
+        let problems = check_inputs(&[meta(exp(), 0)], &full(), "current");
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn 実行順が決定点の中で偏っていたら止まる() {
+        // 全 seed で `alpha@k2` が `current` より後 = 反転が効いていない
+        // （schema 3 までの cyclic rotate で実際に起きていた形）
+        let rows: Vec<serde_json::Value> = full()
+            .into_iter()
+            .map(|mut r| {
+                let o = match r["arm"].as_str().unwrap() {
+                    "baseline" => 0,
+                    "current" => 1,
+                    _ => 2,
+                };
+                r["arm_order"] = serde_json::json!(o);
+                r
+            })
+            .collect();
+        let problems = check_inputs(&[meta(exp(), 0)], &rows, "current");
+        assert!(
+            problems.iter().any(|m| m.contains("決定点の中で均衡していません")),
+            "固定順は検出されるべき: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn スケジュールの対照と集計の対照が違えば止まる() {
+        // AB/BA が閉じているのは `current` とのペアなので、`baseline` を対照に
+        // すると主差には実行順効果が残る
+        let problems = check_inputs(&[meta(exp(), 0)], &full(), "baseline");
+        assert!(
+            problems.iter().any(|m| m.contains("スケジュールの対照")),
+            "対照の食い違いは検出されるべき: {problems:?}"
+        );
+    }
+
+    /// **巡回では AB/BA にならない**（レビュー8巡目 [P1] の反例そのもの）:
+    /// 3グループ・4 seed の shift は `0,1,2,0` で、固定ペアの前後は釣り合わない。
+    /// 反転なら全ペアが同時に入れ替わる
+    #[test]
+    fn 反転は全ペアの前後を入れ替えるが巡回は入れ替えない() {
+        let rank: BTreeMap<String, usize> = ["baseline", "current", "alpha@k2"]
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (a.to_string(), i))
+            .collect();
+        let groups: Vec<(Vec<String>, Vec<String>)> = vec![
+            (vec!["m3".into()], vec!["alpha@k2".into()]),
+            (vec!["m1".into()], vec!["baseline".into()]),
+            (vec!["m2".into()], vec!["current".into()]),
+        ];
+        // 前向きの並びは**強制列の辞書順ではなく arm の優先順位**で決まる
+        let fwd = schedule_groups(groups.clone(), &rank, 0, 0);
+        let arms = |g: &[(Vec<String>, Vec<String>)]| -> Vec<String> {
+            g.iter().map(|(_, a)| a[0].clone()).collect()
+        };
+        assert_eq!(arms(&fwd), ["baseline", "current", "alpha@k2"]);
+        // seed の偶奇で反転する
+        let rev = schedule_groups(groups.clone(), &rank, 0, 1);
+        assert_eq!(arms(&rev), ["alpha@k2", "current", "baseline"]);
+        // 4 seed で `alpha@k2` と `current` の前後がちょうど半々になる
+        let mut first = 0;
+        for seed in 0..4u64 {
+            let g = arms(&schedule_groups(groups.clone(), &rank, 0, seed));
+            let ia = g.iter().position(|a| a == "alpha@k2").unwrap();
+            let ic = g.iter().position(|a| a == "current").unwrap();
+            if ia < ic {
+                first += 1;
+            }
+        }
+        assert_eq!(first, 2, "反転なら 4 seed で 2/2 になる");
+        // 旧実装（巡回）は同じ条件で 1/3 にしかならない
+        let mut cyc_first = 0;
+        for seed in 0..4usize {
+            let mut g: Vec<String> = vec!["baseline".into(), "current".into(), "alpha@k2".into()];
+            g.rotate_left(seed % 3);
+            let ia = g.iter().position(|a| a == "alpha@k2").unwrap();
+            let ic = g.iter().position(|a| a == "current").unwrap();
+            if ia < ic {
+                cyc_first += 1;
+            }
+        }
+        assert_eq!(cyc_first, 1, "巡回は 4 seed で 1/3 に偏る");
     }
 
     #[test]
@@ -1418,7 +1671,7 @@ mod tests {
             .into_iter()
             .filter(|r| !(r["arm"] == "alpha@k2" && r["seed"] == 1))
             .collect();
-        let problems = check_inputs(&[meta(exp(), 0)], &rows);
+        let problems = check_inputs(&[meta(exp(), 0)], &rows, "current");
         assert!(problems.iter().any(|p| p.contains("alpha@k2")), "{problems:?}");
     }
 
@@ -1452,7 +1705,7 @@ mod tests {
         m0["replicate"] = serde_json::json!(0);
         let mut m1 = meta(exp(), 0);
         m1["replicate"] = serde_json::json!(1);
-        let problems = check_inputs(&[m0, m1], &rows);
+        let problems = check_inputs(&[m0, m1], &rows, "current");
         assert!(
             problems.iter().any(|p| p.contains("欠けています")),
             "replicate 0 の欠測を検出できていない: {problems:?}"
@@ -1481,7 +1734,7 @@ mod tests {
                 rows.push(r);
             }
         }
-        let problems = check_inputs(&[m], &rows);
+        let problems = check_inputs(&[m], &rows, "current");
         assert!(
             !problems.iter().any(|p| p.contains("baseline")),
             "baseline の欠測を咎めない: {problems:?}"
@@ -1506,7 +1759,7 @@ mod tests {
             r["game"] = serde_json::json!("other-g1");
             rows.push(r);
         }
-        let problems = check_inputs(&[m0, m1], &rows);
+        let problems = check_inputs(&[m0, m1], &rows, "current");
         assert!(
             problems.iter().any(|p| p.contains("決定点母集団")),
             "別の標本を 2 replicate として受理した: {problems:?}"
@@ -1530,7 +1783,7 @@ mod tests {
             })
             .collect();
         // meta と行が揃っているのでキーの一致検査は通る = ここで止めるしかない
-        let problems = check_inputs(&[m], &rows);
+        let problems = check_inputs(&[m], &rows, "current");
         assert!(
             problems.iter().any(|p| p.contains("未知の値")),
             "meta ごと未知の estimand にした決定点が素通りした: {problems:?}"
@@ -1551,7 +1804,7 @@ mod tests {
                     r
                 })
                 .collect();
-            let problems = check_inputs(&[meta(exp(), 0)], &rows);
+            let problems = check_inputs(&[meta(exp(), 0)], &rows, "current");
             assert!(
                 problems.iter().any(|p| p.contains("宣言していない")),
                 "estimand {swapped} への入れ替えが素通りした: {problems:?}"
@@ -1577,7 +1830,7 @@ mod tests {
             }
             let mut rows = full();
             rows.push(bad);
-            let problems = check_inputs(&[meta(exp(), 0)], &rows);
+            let problems = check_inputs(&[meta(exp(), 0)], &rows, "current");
             assert!(
                 problems.iter().any(|p| p.contains("宣言していない")),
                 "未宣言の{label}が素通りした: {problems:?}"
@@ -1589,7 +1842,7 @@ mod tests {
     fn シャードが欠けたら止まる() {
         let mut e = exp();
         e["shard_total"] = serde_json::json!(2);
-        let problems = check_inputs(&[meta(e, 0)], &full());
+        let problems = check_inputs(&[meta(e, 0)], &full(), "current");
         assert!(
             problems.iter().any(|p| p.contains("シャードが欠けて")),
             "{problems:?}"

@@ -1216,7 +1216,26 @@
   - P0-2b（`bin/check_continue`）の**対照は `current@real`**（`report --baseline
     current@real`）。shadow の `current` と比べると「オラクル」と「指し直したこと」の
     効果が混ざる。実再決定 arm を混ぜたら `current@real` を自動で足す。
-    思考予算は **2000ms**（ランキング段と継続段の両方に効く。700ms は別の treatment）
+    思考予算は **2000ms**（ランキング段と継続段の両方に効く。700ms は別の treatment）。
+    `ROW_SCHEMA` は **4**（schema 3 = **実行順を巡回で回していた時期**の記録は弾く）
+  - **P0-2b の実行順は「巡回」ではなく「反転」**（PR #37 レビュー8巡目 [P1]）。
+    arm は**選んだ強制列ごと**にグループへ畳まれる（同じ列なら継続1本を共有する）が、
+    それを `(決定点番号 + seed) % グループ数` で cyclic rotate しても **AB/BA には
+    ならない**: 固定の2 arm の前後は「切れ目がその間に入るか」だけで決まるので、
+    g グループ・距離 d なら A が先になるのは g 回中 (g − d) 回（3グループ・4 seed の
+    shift は `0,1,2,0`）。しかもグループ数と並びは seed ごとの強制列で変わり、
+    `replicate` は shift に入らない。**反転は全ペアの前後を同時に入れ替える**ので、
+    `schedule_groups` が前向きの並びを **arm の優先順位**（`baseline` → `policies` の
+    タグ順。強制列の辞書順だと前向きの並び自体が seed ごとに変わる）で決めてから
+    `(決定点番号 + seed) % 2` で反転する。実再決定 arm があるなら `--seeds` は
+    **2 以上の偶数**（`check_policy` と同じ）。集計側は
+    `(replicate, game, move_number, treatment)` ごとに前後を数えて
+    **|treatment 先 − 対照 先| ≤ 1** を要求する（**同じ強制列に畳まれた unit は
+    数えない** = `arm_order` が等しく実行順効果を持たない。畳まれ方は seed ごとに
+    変わるので、分かれた unit が奇数個の決定点では端数が残る）。meta の
+    `schedule_control` と `report --baseline` が違えば「AB/BA が閉じているのは
+    別のペア」として落とす。**生成規則・実行時の契約・集計の検査は3点セット**で、
+    どれか1つでも欠けると workflow 側の偶奇検査は空手形になる
 - **王手駒仮説の希釈の CI**（`.github/workflows/check-belief.yml`、**通常のコード push
   では走らない**）: `gh workflow run check-belief.yml -f arena_run_id=<Arena実行ID>`、
   `gh` が無ければ `.github/ci/check-belief.request.json` を置いて push（削除の push は
