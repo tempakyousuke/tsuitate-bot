@@ -124,7 +124,7 @@ issue の arm 名との対応:
 元 Arena 実行の実験条件の検査は `scripts/ci/verify_arena_provenance.sh`（`check-prep.yml`
 から切り出して**共通化**した。ワークフローごとに書くと片方だけ緩くなる）。
 
-## PR #37 レビューで直した4点（同種の測定をやり直すときは先にここを読む）
+## PR #37 レビューで直した6点（同種の測定をやり直すときは先にここを読む）
 
 1. **[P1] 介入対象を「別の仮説集合」から作っていた**。倍率表を粒子なしの
    `CheckSolver` から作って渡していたが、粒子多数決は `known_loaded` の駒種と
@@ -148,7 +148,27 @@ issue の arm 名との対応:
    オラクル arm を宣言した実験では**起動時と集計時の両方**で `oracle@k1` と
    非 null の `identity_err` を必須にした
 
-`bin/check_policy` の `ROW_SCHEMA` は **3**（schema 2 = 1. の修正前の記録は集計から弾く）。
+## レビュー2巡目で直した2点
+
+5. **[P1] 主 arm と対照が別の初期粒子サンプルを比べていた**。`entry_setup` は既に
+   1回 `choose` して `moves/p0` を作るので、`current@real` がその `p0` を初手に使う
+   一方でオラクルの real arm は `setup.strat` を clone してもう一度 `choose` する =
+   RNG が進んだ次のサンプルで初期ランキングを作っていた。主差に「介入」と
+   「粒子の引き直し」が混ざる（介入なしの `oracle@k1@real` で p の最大差 0.0071）。
+   **`current@real` も同じ `run_arm` の再ランキング経路へ寄せた**
+   - ただし**実再決定側の恒等対照を bit-exact の門にはできない**: `choose` は
+     壁時計デッドラインまで粒子を若返らせるので、同じ状態から clone しても集合が
+     変わる（同じ入力の4回で 0.006 / 0.085 / 0.045 / 0.032 と揺れた。#31 P0-4 の
+     「再決定そのもののノイズ床」と同じ現象）。`oracle@k1@real` は**必ず回して
+     床を測り**、主 arm の差はその床と並べて読む。bit-exact の門は shadow の
+     `oracle@k1` だけ（決定的なので 0.000000）
+6. **[P2] 診断が arm ごとでなく最後の1本で全行を上書きしていた**。`--belief-real` は
+   複数指定できるので、`oracle@kinf,oracle@k2` を回すと全行の `oracle.arm` が
+   `oracle@k2@real` になり、`report` がそれを主 arm の被覆・fallback として表示した。
+   `deduce` / `oracle` を**その arm の行にだけ**入れ、`report` も arm ごとに集計する
+
+`bin/check_policy` の `ROW_SCHEMA` は **4**（schema 2 = 1. の修正前、schema 3 = 6. の
+修正前の記録は集計から弾く）。
 
 ## 契約（先に固定した）
 

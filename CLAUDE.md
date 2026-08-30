@@ -1111,6 +1111,20 @@
   - **恒等対照は外せない**（同レビュー [P2]）。`--belief` から `oracle@k1` を
     抜くと `identity_err` が null のままになり `report` の関門が「数値が0件」で
     素通りするので、オラクル arm を宣言した実験では起動時と集計時の両方で必須にする
+  - **実再決定 arm はすべて同じ `run_arm` 経路を通す**（レビュー2巡目 [P1]）。
+    `entry_setup` は既に1回 `choose` しているので、その instance を clone して
+    もう一度引く arm と、`entry_setup` の `moves/p0` をそのまま初手に使う arm では
+    **別の粒子サンプルを比べる**ことになる（実測: 介入なしの `oracle@k1@real` で
+    p の最大差 0.0071）。`current@real` も同じ経路へ寄せた
+  - **実再決定側の恒等対照は「門」ではなく再決定のノイズ床**（同）。両 arm を
+    同じ経路へ寄せても `choose` は壁時計デッドラインまで粒子を若返らせるので
+    bit-exact にはならない（同じ入力の4回で 0.006 / 0.085 / 0.045 / 0.032）。
+    `oracle@k1@real` は**必ず回して床を測り**、主 arm の差はその床と並べて読む
+    （床が測れていない実験は `report` が弾く）。bit-exact の門は shadow の
+    `oracle@k1` だけ（こちらは決定的なので 0.000000）
+  - **診断は arm ごとに持つ**（同 [P2]）。単一変数だと `--belief-real` に複数
+    指定したとき最後の1本が全行を上書きし、`report` が別 arm の被覆・fallback を
+    主 arm のものとして表示する
   - `deduce_last_move` = H1 ① の演繹（学習なし）。「(a) 直前の相手手で q へ着地した駒」
     でも「(b) 元マスが空いて線が開いた静止飛び駒」でもない仮説だけを落とす。
     捕獲つきの王手は着地点が観測で分かるので `prune_infeasible_discovered_checks` の
@@ -1118,8 +1132,9 @@
   - **`oracle@k1` は恒等対照**。`current@shadow` と bit-exact でなければ配管が壊れて
     いるので `report` が止める。`deduce_last_move` が真仮説を落としたときも止める
     （どちらも issue #36 の「判定以前」の中止条件）
-  - `bin/check_policy` の `ROW_SCHEMA` は **3**（schema 1 = 恒等対照と演繹の列が
-    無い時期、schema 2 = **介入対象と被覆を粒子なしのソルバーで決めていた時期**の
+  - `bin/check_policy` の `ROW_SCHEMA` は **4**（schema 1 = 恒等対照と演繹の列が
+    無い時期、schema 2 = **介入対象と被覆を粒子なしのソルバーで決めていた時期**、
+    schema 3 = **診断が arm ごとでなく最後の1本で全行を上書きしていた時期**の
     記録は集計から弾く。**欠けた列を「問題なし」と読むと両方の関門が素通りする**ので、
     版の拒否と `REQUIRED_ROW_KEYS` の存在検査の両方で止める）
   - P0-2b（`bin/check_continue`）の**対照は `current@real`**（`report --baseline

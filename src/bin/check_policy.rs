@@ -73,15 +73,21 @@ use tsuitate_bot::truth_replay::{for_each_decision_full, parse_bot_and_end};
 /// - 1 … issue #31 の P0-5（オラクル arm と恒等対照の列が無い）
 /// - 2 … issue #36 P0-2 の初版。**介入対象と被覆を「粒子なしのソルバー」で
 ///   決めていた**（実評価の集合と別物になりうる）ので集計から弾く
-/// - 3 … PR #37 レビュー [P1] を反映。倍率も被覆も**その arm が実際に列挙した
-///   集合**に対して適用・記録する（`oracle` オブジェクト）。**欠けた列を
-///   「問題なし」と読むと恒等対照も演繹の健全性も素通りする**ので、版の拒否と
-///   必須列の存在検査の両方で止める
-const ROW_SCHEMA: u32 = 3;
+/// - 3 … PR #37 レビュー1巡目 [P1] を反映。倍率も被覆も**その arm が実際に列挙した
+///   集合**に対して適用・記録する。ただし診断が **arm ごとでなく最後の1本で全行を
+///   上書き**していた（`--belief-real` に複数指定すると別 arm の被覆を主 arm の
+///   ものとして表示する）ので集計から弾く
+/// - 4 … レビュー2巡目。`deduce` / `oracle` は**その arm の行にだけ**入り、
+///   `current@real` も他の実再決定 arm と同じ再ランキング経路を通る
+///   （初期粒子サンプルを揃える）。`identity_err_real` はその実再決定側の恒等対照。
+///   **欠けた列を「問題なし」と読むと恒等対照も演繹の健全性も素通りする**ので、
+///   版の拒否と必須列の存在検査の両方で止める
+const ROW_SCHEMA: u32 = 4;
 
-/// schema 3 の行に必ずある列（欠測を既定値で埋めて門を通せてはいけない）
-const REQUIRED_ROW_KEYS: [&str; 6] = [
+/// schema 4 の行に必ずある列（欠測を既定値で埋めて門を通せてはいけない）
+const REQUIRED_ROW_KEYS: [&str; 7] = [
     "identity_err",
+    "identity_err_real",
     "deduce",
     "oracle",
     "double_check",
@@ -118,6 +124,10 @@ struct ArmOut {
     arm: String,
     out: SimOutcome,
     truth: tsuitate_bot::check_policy::TruthAfter,
+    /// `deduce_last_move` の健全性記録（その arm のものだけ。他は null）
+    deduce: serde_json::Value,
+    /// オラクル arm の被覆・fallback（**arm ごと**。他は null）
+    oracle: serde_json::Value,
     /// この arm のシミュレーションに掛かった実時間（µs。P1 のコスト見積り）
     sim_us: u64,
 }
@@ -726,6 +736,8 @@ fn run_unit(
             arm,
             out,
             truth,
+            deduce: serde_json::Value::Null,
+            oracle: serde_json::Value::Null,
             sim_us: t.elapsed().as_micros() as u64,
         });
     };
@@ -735,45 +747,6 @@ fn run_unit(
     for (tag, policy) in policies {
         run(format!("{tag}@shadow"), policy, UpdateRule::Shadow(&updater));
     }
-    // 3. 実再決定（正解基準。呼び出しごとに思考予算をまるごと使う）
-    if with_real {
-        let mut real = |fouls: &[ShogiMove]| -> Option<Vec<PolicyMove>> {
-            let mut b = strat.clone_boxed()?;
-            let mut post_log = clone_log(&entry_log);
-            let mut post_fouls = p.entry.fouls;
-            for m in fouls {
-                post_fouls[side_idx(side)] += 1;
-                post_log.record(Observation::MyFoul {
-                    move_number: p.entry.pos.move_number(),
-                    usi: m.to_usi(),
-                });
-            }
-            let post_view = make_view(&p.entry.pos, side, &post_fouls);
-            let tried: HashSet<String> = fouls.iter().map(ShogiMove::to_usi).collect();
-            b.choose(&post_view, &post_log, &tried)?;
-            let r = b.last_ranking()?.to_vec();
-            let mut s = CheckSolver::new(&post_view, &[], fouls, &post_log);
-            Some(policy_moves(&r, &post_view, &p.truth, s.as_mut(), king))
-        };
-        let t = std::time::Instant::now();
-        let out = simulate(
-            &Policy::Current,
-            &moves,
-            &p0,
-            params,
-            fouls_before,
-            opp_fouls,
-            UpdateRule::Real(&mut real),
-        );
-        let truth = truth_after(&p.truth, p.bot, out.accepted.as_deref());
-        arms.push(ArmOut {
-            arm: "current@real".into(),
-            out,
-            truth,
-            sim_us: t.elapsed().as_micros() as u64,
-        });
-    }
-
     // ---- issue #36 P0-2: 仮説重みへの介入 arm --------------------------------
     // 配管は `check_belief::run_arm` に一本化してある（`bin/check_continue` の
     // P0-2b と**同じ arm 名が同じ配管を指す**ようにするため）。
@@ -782,11 +755,30 @@ fn run_unit(
     // 変わったときに実評価側にしか無い誤仮説へ ×0 が付かない = PR #37 レビュー [P1]）
     let checkers = true_checkers(&p.truth, p.bot);
     let mut identity_err: Option<f64> = None;
-    let mut deduce_note = serde_json::Value::Null;
-    let mut oracle_note = serde_json::Value::Null;
     let mut belief_specs: Vec<(ArmSpec, bool)> =
         beliefs.iter().map(|b| (spec_for(b, false), *b == Belief::DeduceLastMove)).collect();
+    // **実再決定 arm はすべて同じ `run_arm` 経路を通す**（PR #37 レビュー2巡目 [P1]）。
+    // `entry_setup` は既に1回 `choose` しているので、その instance を clone して
+    // もう一度 `choose` する arm と、`entry_setup` の初回 `moves/p0` をそのまま
+    // 初手に使う arm では**別の粒子サンプル**を比べることになる。`current@real` も
+    // 同じ再ランキング経路へ通せば、主差に残るのは介入だけになる
+    if with_real {
+        belief_specs.push((
+            ArmSpec::parse("current@real").expect("既定 arm"),
+            false,
+        ));
+    }
     belief_specs.extend(beliefs_real.iter().map(|b| (spec_for(b, true), false)));
+    // 実再決定の**恒等対照**（`oracle@k1@real`）: shadow の k=1 は再ランキングを
+    // 通らないので、この交絡を検出できない
+    if beliefs_real.iter().any(|b| matches!(b, Belief::Oracle { .. })) && with_real {
+        belief_specs.push((
+            ArmSpec::parse("oracle@k1@real").expect("既定 arm"),
+            false,
+        ));
+    }
+    let mut p_real_current: Option<Vec<f64>> = None;
+    let mut p_real_identity: Option<Vec<f64>> = None;
     for (spec, is_deduce) in &belief_specs {
         let t = std::time::Instant::now();
         let Some(run) =
@@ -796,6 +788,11 @@ fn run_unit(
         };
         // **その arm の全構築ぶん**の記録（1 arm = 1 scope）
         let rec = tsuitate_bot::check::take_diag_record();
+        // **診断は arm ごとに持つ**（PR #37 レビュー2巡目 [P2]）。単一変数だと
+        // `--belief-real` に複数指定したとき最後の1本が全行を上書きし、report が
+        // 別 arm の被覆・fallback を主 arm のものとして表示する
+        let mut deduce_note = serde_json::Value::Null;
+        let mut oracle_note = serde_json::Value::Null;
         if *is_deduce {
             // **全滅 fallback の前**に「落とそうとした真仮説」を数える
             deduce_note = serde_json::json!({
@@ -807,7 +804,7 @@ fn run_unit(
                 "constructions": rec.constructions,
             });
         }
-        // 主 arm（実再決定のオラクル）の被覆は**実評価の集合**で数える
+        // 実再決定のオラクル arm の被覆は**実評価の集合**で数える
         if spec.real && matches!(spec.belief, Belief::Oracle { .. }) {
             oracle_note = serde_json::json!({
                 "arm": spec.tag,
@@ -819,7 +816,7 @@ fn run_unit(
             });
         }
         if spec.belief == (Belief::Oracle { k: 1.0 }) && !spec.real {
-            // **恒等対照**: `current@shadow` と bit-exact でなければ配管が壊れている
+            // **恒等対照（shadow）**: `current@shadow` と bit-exact でなければ壊れている
             identity_err = Some(
                 p0.iter()
                     .zip(&run.p_entry)
@@ -827,14 +824,32 @@ fn run_unit(
                     .fold(0.0f64, f64::max),
             );
         }
+        // 実再決定側の恒等対照は `current@real` との差で見る（両方とも再ランキング）
+        if spec.real && spec.belief == Belief::Current {
+            p_real_current = Some(run.p_entry.clone());
+        }
+        if spec.real && spec.belief == (Belief::Oracle { k: 1.0 }) {
+            p_real_identity = Some(run.p_entry.clone());
+        }
         let truth = truth_after(&p.truth, p.bot, run.out.accepted.as_deref());
         arms.push(ArmOut {
             arm: spec.tag.clone(),
             out: run.out,
             truth,
+            deduce: deduce_note,
+            oracle: oracle_note,
             sim_us: t.elapsed().as_micros() as u64,
         });
     }
+    let identity_err_real = match (&p_real_current, &p_real_identity) {
+        (Some(a), Some(b)) if a.len() == b.len() => Some(
+            a.iter()
+                .zip(b)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f64, f64::max),
+        ),
+        _ => None,
+    };
 
     Some(
         arms.into_iter()
@@ -868,10 +883,12 @@ fn run_unit(
                     "truth_accepted": a.truth.accepted,
                     "candidates": moves.len(),
                     "repro_err": repro_err,
-                    // issue #36 P0-2 の恒等対照と演繹の健全性（unit 単位）
+                    // issue #36 P0-2 の恒等対照（unit 単位）と、**arm ごと**の
+                    // 演繹の健全性・オラクルの被覆（レビュー2巡目 [P2]）
                     "identity_err": identity_err,
-                    "deduce": deduce_note.clone(),
-                    "oracle": oracle_note.clone(),
+                    "identity_err_real": identity_err_real,
+                    "deduce": a.deduce,
+                    "oracle": a.oracle,
                     "double_check": checkers.len() > 1,
                     "calibration": cal.to_json(),
                 })
@@ -1111,14 +1128,21 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
     }
     // **オラクルが実際に介入できた行**（真の王手駒がその arm の列挙集合にある）。
     // 粒子なしのソルバーではなく `DiagRecord` の実測なので、「被覆ありと報告した
-    // のに実評価の集合には無かった」が起きない（PR #37 レビュー [P1]）
-    // `oracle` は unit 単位の記録なので、**1 unit 1行**（`current@static`）で数える
-    // （arm ごとの行で数えると arm 数だけ水増しされる）
-    let cov: Vec<&serde_json::Value> = rows
+    // のに実評価の集合には無かった」が起きない（PR #37 レビュー1巡目 [P1]）。
+    // **arm ごとに集計する**（同2巡目 [P2]: 単一変数だと最後の1本が全行を上書きする）
+    let oracle_arms: BTreeSet<String> = rows
         .iter()
-        .filter(|r| r["arm"] == "current@static" && !r["oracle"].is_null())
+        .filter(|r| !r["oracle"].is_null())
+        .map(|r| r["arm"].as_str().unwrap_or("?").to_string())
         .collect();
-    if !cov.is_empty() {
+    let dbl = rows
+        .iter()
+        .filter(|r| r["arm"] == "current@static")
+        .filter(|r| r["double_check"].as_bool().unwrap_or(false))
+        .count();
+    for arm in &oracle_arms {
+        let cov: Vec<&serde_json::Value> =
+            rows.iter().filter(|r| r["arm"].as_str() == Some(arm.as_str())).collect();
         let all = cov
             .iter()
             .filter(|r| r["oracle"]["covered_all"].as_bool().unwrap_or(false))
@@ -1135,22 +1159,45 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
             .iter()
             .filter_map(|r| r["oracle"]["weight_fallback"].as_u64())
             .sum();
-        let dbl = rows
-            .iter()
-            .filter(|r| r["arm"] == "current@static")
-            .filter(|r| r["double_check"].as_bool().unwrap_or(false))
-            .count();
         println!(
-            "  オラクルが全構築で介入できた行 {all} / {}（一部の構築だけ {part} / \
+            "  {arm}: 全構築で介入できた行 {all} / {}（一部の構築だけ {part} / \
              倍率が全滅して元へ戻した構築 {fb} / 両王手 {dbl} は別層・介入しない）",
             cov.len()
         );
         if part > 0 {
             println!(
                 "    **一部の構築でしか真仮説が列挙されていない行がある**: その行の \
-                 `oracle@kinf@real` は full oracle ではない（判定の前にここを見る）"
+                 {arm} は full oracle ではない（判定の前にここを見る）"
             );
         }
+    }
+    // **実再決定側の恒等対照 = 再決定のノイズ床**（`oracle@k1@real` vs
+    // `current@real`。PR #37 レビュー2巡目 [P1]）。
+    //
+    // 両 arm は同じ instance を clone して同じ再ランキング経路を通る（= 系統的な
+    // 「別の粒子サンプルを比べる」交絡は無い）が、**bit-exact にはならない**:
+    // `choose` は壁時計デッドラインまで粒子を若返らせるので、同じ状態から引き直しても
+    // 集合が変わる（#31 P0-4 の「再決定そのもののノイズ床」）。実測でも同じ入力の
+    // 4回の実行で 0.006 / 0.085 / 0.045 / 0.032 と揺れた。したがってここは
+    // **門ではなく水準の報告**で、主 arm の差をこの床と並べて読むためにある。
+    // 床が測れていない（`oracle@k1@real` が無い）ことのほうを入力契約で弾く
+    let ident_real: Vec<f64> = rows
+        .iter()
+        .filter(|r| r["arm"] == "current@static")
+        .filter_map(|r| r["identity_err_real"].as_f64())
+        .collect();
+    if !ident_real.is_empty() {
+        println!(
+            "  再決定のノイズ床（oracle@k1@real vs current@real の p の差）: \
+             平均 {:.4} / p95 {:.4} / 最大 {:.4}",
+            mean(&ident_real),
+            pct(&ident_real, 0.95),
+            ident_real.iter().cloned().fold(0.0f64, f64::max),
+        );
+        println!(
+            "    （**門ではない**: 壁時計予算のせいで同じ状態から引き直しても集合が\
+             変わる。主 arm の差はこの床と並べて読む）"
+        );
     }
 
     for estimand in ["foul", "nofoul"] {
@@ -1483,12 +1530,24 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
     for b in first["beliefs"].as_array().into_iter().flatten() {
         want_arms.push(format!("{}@shadow", b.as_str().unwrap_or("?")));
     }
-    for b in first["beliefs_real"].as_array().into_iter().flatten() {
-        want_arms.push(format!("{}@real", b.as_str().unwrap_or("?")));
+    let real_beliefs: Vec<&str> = first["beliefs_real"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|b| b.as_str())
+        .collect();
+    for b in &real_beliefs {
+        want_arms.push(format!("{b}@real"));
     }
     if first["with_real"].as_bool().unwrap_or(false) {
         want_arms.push("current@real".into());
+        // 実再決定のオラクル arm があれば、その恒等対照も必ず走る
+        if real_beliefs.iter().any(|b| b.starts_with("oracle@k")) {
+            want_arms.push("oracle@k1@real".into());
+        }
     }
+    want_arms.sort();
+    want_arms.dedup();
     // **必須列の存在検査**（`identity_err` が無い行を「差 0」と読むと
     // 恒等対照の関門が素通りする）
     let mut missing: BTreeMap<&str, usize> = BTreeMap::new();
@@ -1528,6 +1587,17 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
         if !has_ident {
             out.push(
                 "identity_err が全行 null です（恒等対照が1度も走っていない）".into(),
+            );
+        }
+        // 実再決定のオラクル arm を回したなら、**再決定のノイズ床**も必ず測る
+        // （主 arm の差をこの床と並べないと「介入の効果」に見えてしまう）
+        if reals.iter().any(|b| b.starts_with("oracle@k"))
+            && first["with_real"].as_bool().unwrap_or(false)
+            && !rows.iter().any(|r| r["identity_err_real"].as_f64().is_some())
+        {
+            out.push(
+                "identity_err_real が全行 null です（実再決定のノイズ床                  oracle@k1@real vs current@real が測れていない）"
+                    .into(),
             );
         }
     }
@@ -1679,6 +1749,7 @@ mod tests {
             // schema 2 の必須列（issue #36 P0-2）
             "identity_err": 0.0, "deduce": serde_json::Value::Null,
             "oracle": serde_json::Value::Null, "double_check": false,
+            "identity_err_real": 0.0,
         })
     }
 
@@ -1690,6 +1761,54 @@ mod tests {
             }
         }
         v
+    }
+
+    /// オラクル arm 一式（恒等対照・実再決定・その床）を含む行
+    fn full_oracle() -> Vec<serde_json::Value> {
+        let mut v = full();
+        for seed in 0..2 {
+            for arm in ["oracle@k1@shadow", "oracle@kinf@real", "oracle@k1@real"] {
+                v.push(row(arm, seed, 1));
+            }
+        }
+        v
+    }
+
+    fn oracle_exp() -> serde_json::Value {
+        let mut e = exp("estimator_v14");
+        e["beliefs"] = serde_json::json!(["oracle@k1"]);
+        e["beliefs_real"] = serde_json::json!(["oracle@kinf"]);
+        e
+    }
+
+    #[test]
+    fn 実再決定のオラクルには恒等対照とノイズ床が要る() {
+        // `current@real` と同じ再ランキング経路を通る `oracle@k1@real` が無いと、
+        // 主 arm の差を再決定のノイズ床と並べて読めない（PR #37 レビュー2巡目 [P1]）
+        assert!(
+            check_inputs(&[meta(oracle_exp(), 0)], &full_oracle()).is_empty(),
+            "揃っていれば通る"
+        );
+        let mut rows = full_oracle();
+        rows.retain(|r| r["arm"] != "oracle@k1@real");
+        let problems = check_inputs(&[meta(oracle_exp(), 0)], &rows);
+        assert!(
+            problems.iter().any(|p| p.contains("oracle@k1@real")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn ノイズ床が測れていない実験は集計させない() {
+        let mut rows = full_oracle();
+        for r in &mut rows {
+            r["identity_err_real"] = serde_json::Value::Null;
+        }
+        let problems = check_inputs(&[meta(oracle_exp(), 0)], &rows);
+        assert!(
+            problems.iter().any(|p| p.contains("identity_err_real")),
+            "{problems:?}"
+        );
     }
 
     #[test]
