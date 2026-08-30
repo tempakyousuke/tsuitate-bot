@@ -1196,11 +1196,19 @@
   - **`oracle@k1` は恒等対照**。`current@shadow` と bit-exact でなければ配管が壊れて
     いるので `report` が止める。`deduce_last_move` が真仮説を落としたときも止める
     （どちらも issue #36 の「判定以前」の中止条件）
-  - `bin/check_policy` の `ROW_SCHEMA` は **4**（schema 1 = 恒等対照と演繹の列が
+  - `bin/check_policy` の `ROW_SCHEMA` は **6**（schema 1 = 恒等対照と演繹の列が
     無い時期、schema 2 = **介入対象と被覆を粒子なしのソルバーで決めていた時期**、
-    schema 3 = **診断が arm ごとでなく最後の1本で全行を上書きしていた時期**の
+    schema 3 = **診断が arm ごとでなく最後の1本で全行を上書きしていた時期**、
+    schema 4 = **終端手番・`weight`・`arm_order` が無い時期**、
+    schema 5 = **`double_check` が meta と照合されていなかった時期**の
     記録は集計から弾く。**欠けた列を「問題なし」と読むと両方の関門が素通りする**ので、
-    版の拒否と `REQUIRED_ROW_KEYS` の存在検査の両方で止める）
+    版の拒否と `REQUIRED_ROW_KEYS` の存在検査の両方で止める）。
+    **分母を決める列（`estimand` / `terminal` / `weight` / `double_check`）は
+    meta の `points_detail` にも固定し、全 arm の行と照合する**（PR #37
+    レビュー6巡目 [P1]。行にしか無かった `double_check` は、v13 の 6 シャードで
+    全行を `false` へ書き換えると両王手 8 行が分母へ戻って `report` が通った）。
+    **AB/BA の均衡は決定点ごとに検査する**（同 [P1]。全決定点の総数で見ると
+    「決定点 A は全 seed が treatment 先・B は全 seed が対照 先」が相殺で通る）
   - P0-2b（`bin/check_continue`）の**対照は `current@real`**（`report --baseline
     current@real`）。shadow の `current` と比べると「オラクル」と「指し直したこと」の
     効果が混ざる。実再決定 arm を混ぜたら `current@real` を自動で足す。

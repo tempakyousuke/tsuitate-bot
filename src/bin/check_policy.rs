@@ -88,9 +88,14 @@ use tsuitate_bot::truth_replay::parse_bot_and_end;
 ///   自然頻度として読んでしまう ③実行順が固定でしかも監査できない、の3点で
 ///   新しい gate へ通してはいけない（レビュー5巡目 [P1]: 実際に 102cc1a の
 ///   schema 4 JSONL が最新バイナリの `report` を exit 0 で通っていた）
-const ROW_SCHEMA: u32 = 5;
+/// schema 6 では **`double_check` を決定点の属性として meta に固定**した。
+/// これは主 estimand の**分母**（両王手は介入が no-op なので除く）を決める列で、
+/// schema 5 では行にしか無く meta と照合していなかったため、全 arm の行で
+/// `false` へ書き換えると除外されていた手番が分母へ戻って主 CI が動いた
+/// （PR #37 レビュー6巡目 [P1]: 実際に v13 の 6 シャードで再現した）。
+const ROW_SCHEMA: u32 = 6;
 
-/// schema 5 の行に必ずある列（欠測を既定値で埋めて門を通せてはいけない）。
+/// schema 6 の行に必ずある列（欠測を既定値で埋めて門を通せてはいけない）。
 ///
 /// `terminal` / `weight` / `estimand` は**母集団と分母**を決める列、
 /// `arm_order` は**実行順の均衡**を検査する列なので、欠測を既定値で
@@ -136,6 +141,11 @@ struct Point {
     terminal: bool,
     /// 自然頻度へ戻すための包含重み（間引かなければ 1.0）
     weight: f64,
+    /// **両王手**（介入が no-op なので主 estimand の分母から除く）。
+    /// 真実局面だけで決まるので決定点の属性として持ち、meta にも残す
+    /// （行だけに書くと分母を決める列が meta と照合されない。
+    /// PR #37 レビュー6巡目 [P1]）
+    double_check: bool,
 }
 
 /// 1 arm の結果（決定点 × seed × arm）
@@ -450,6 +460,7 @@ fn main() {
                 None => "no_foul".to_string(),
             };
             let estimand = cp.estimand();
+            let double_check = true_checkers(&cp.truth, bot).len() > 1;
             let point = Point {
                 game: short.clone(),
                 move_number: cp.move_number,
@@ -462,6 +473,7 @@ fn main() {
                 bot,
                 terminal: cp.terminal,
                 weight: 1.0,
+                double_check,
             };
             if estimand == "foul" { fouled.push(point) } else { clean.push(point) }
         }
@@ -706,6 +718,7 @@ fn main() {
                 "type": p.type_tag,
                 "terminal": p.terminal,
                 "weight": p.weight,
+                "double_check": p.double_check,
                 "record_fouls": p.record_fouls.len(),
             }))
             .collect::<Vec<_>>(),
@@ -979,7 +992,8 @@ fn run_unit(
                     "identity_only_real": identity_only_real,
                     "deduce": a.deduce,
                     "oracle": a.oracle,
-                    "double_check": checkers.len() > 1,
+                    // 決定点の属性をそのまま出す（`check_inputs` が meta と照合する）
+                    "double_check": p.double_check,
                     // **この unit の中での実行順**（実再決定 arm は AB/BA で反転）
                     "arm_order": a.arm_order,
                     "calibration": cal.to_json(),
@@ -1998,21 +2012,42 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
     }
     // 点属性（分母と対象集合を決める列）は meta の宣言と一致していること。
     // 片方だけ書き換えて分母を変えられてはいけない
-    let mut point_attrs: BTreeMap<(String, u64), (String, bool, String)> = BTreeMap::new();
+    // **`double_check` も点属性**（PR #37 レビュー6巡目 [P1]）: 両王手は主 estimand の
+    // 分母から外れるので、行だけに書いてあると全 arm ぶん `false` へ書き換えるだけで
+    // 除外されていた手番が分母へ戻る。meta 側の欠測は既定値で埋めず**失敗**させる
+    // （埋めると schema を上げた意味が消える）
+    let mut point_attrs: BTreeMap<(String, u64), (String, bool, String, bool)> = BTreeMap::new();
+    let mut meta_missing: Vec<String> = vec![];
     for m in metas {
         for d in m["points_detail"].as_array().into_iter().flatten() {
+            let key = (
+                d["game"].as_str().unwrap_or("?").to_string(),
+                d["move_number"].as_u64().unwrap_or(0),
+            );
+            let (Some(terminal), Some(double_check)) =
+                (d["terminal"].as_bool(), d["double_check"].as_bool())
+            else {
+                meta_missing.push(format!("{}#{}", key.0, key.1));
+                continue;
+            };
             point_attrs.insert(
-                (
-                    d["game"].as_str().unwrap_or("?").to_string(),
-                    d["move_number"].as_u64().unwrap_or(0),
-                ),
+                key,
                 (
                     d["estimand"].as_str().unwrap_or("?").to_string(),
-                    d["terminal"].as_bool().unwrap_or(false),
+                    terminal,
                     fmt_num(d["weight"].as_f64().unwrap_or(f64::NAN)),
+                    double_check,
                 ),
             );
         }
+    }
+    if !meta_missing.is_empty() {
+        out.push(format!(
+            "meta の points_detail に terminal / double_check がありません（{} 件）: {}{}",
+            meta_missing.len(),
+            meta_missing.iter().take(3).cloned().collect::<Vec<_>>().join(" / "),
+            if meta_missing.len() > 3 { " ..." } else { "" }
+        ));
     }
     let mut attr_bad: Vec<String> = vec![];
     for r in rows {
@@ -2020,28 +2055,29 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
             r["game"].as_str().unwrap_or("?").to_string(),
             r["move_number"].as_u64().unwrap_or(0),
         );
-        let Some((estimand, terminal, weight)) = point_attrs.get(&key) else {
+        let Some(want) = point_attrs.get(&key) else {
             continue; // 未宣言の点は下の厳密一致で捕まる
         };
         let got = (
             r["estimand"].as_str().unwrap_or("?").to_string(),
             r["terminal"].as_bool().unwrap_or(false),
             fmt_num(r["weight"].as_f64().unwrap_or(f64::NAN)),
+            r["double_check"].as_bool().unwrap_or(false),
         );
-        if got != (estimand.clone(), *terminal, weight.clone()) {
+        if got != *want {
             attr_bad.push(format!(
                 "{}#{} {}: 行 {:?} vs meta {:?}",
                 key.0,
                 key.1,
                 r["arm"].as_str().unwrap_or("?"),
                 got,
-                (estimand, terminal, weight)
+                want
             ));
         }
     }
     if !attr_bad.is_empty() {
         out.push(format!(
-            "行の点属性（estimand / terminal / weight）が meta の宣言と食い違います（{} 件）: {}{}",
+            "行の点属性（estimand / terminal / weight / double_check）が meta の宣言と食い違います（{} 件）: {}{}",
             attr_bad.len(),
             attr_bad.iter().take(3).cloned().collect::<Vec<_>>().join(" / "),
             if attr_bad.len() > 3 { " ..." } else { "" }
@@ -2095,41 +2131,70 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
             if extra.len() > 3 { " ..." } else { "" }
         ));
     }
-    // **実再決定 arm の AB/BA が閉じているか**（レビュー5巡目 [P1]）。
+    // **実再決定 arm の AB/BA が閉じているか**（レビュー5巡目 [P1]、
+    // 検査単位はレビュー6巡目 [P1] で決定点ごとへ）。
     // `arm_order` は unit 内の実行順なので、主対 (`oracle@kinf@real` /
-    // `current@real`) が「先」になった決定点×seed の本数が釣り合っていること
+    // `current@real`) が「先」になった seed の本数が釣り合っていること。
+    // **全決定点の総数で見てはいけない**: 実装は
+    // `treatment_first = (決定点番号 + seed) % 2` で cluster の内側に均衡を閉じるので、
+    // 「決定点 A は全 seed が treatment 先・決定点 B は全 seed が対照 先」でも総数は
+    // 釣り合ってしまい、決定点ごとの実行順効果がペア差に残る
     if want_arms.iter().any(|a| a == "current@real") {
+        // unit（決定点 × seed）ごとの実 arm の実行順
+        let mut order: BTreeMap<(String, u64, u64), BTreeMap<String, u64>> = BTreeMap::new();
+        for r in rows {
+            let arm = r["arm"].as_str().unwrap_or("?");
+            if !arm.ends_with("@real") {
+                continue;
+            }
+            let Some(o) = r["arm_order"].as_u64() else { continue };
+            order
+                .entry((
+                    r["game"].as_str().unwrap_or("?").to_string(),
+                    r["move_number"].as_u64().unwrap_or(0),
+                    r["seed"].as_u64().unwrap_or(u64::MAX),
+                ))
+                .or_default()
+                .insert(arm.to_string(), o);
+        }
+        // 同じ unit の実 arm が同じ `arm_order` を持っていたら前後関係が決まらない
+        let dup: Vec<String> = order
+            .iter()
+            .filter(|(_, m)| m.values().collect::<BTreeSet<_>>().len() != m.len())
+            .map(|((g, mn, s), _)| format!("{g}#{mn} seed{s}"))
+            .collect();
+        if !dup.is_empty() {
+            out.push(format!(
+                "実再決定 arm の arm_order が unit 内で重複しています（{} 件）: {}{}",
+                dup.len(),
+                dup.iter().take(3).cloned().collect::<Vec<_>>().join(" / "),
+                if dup.len() > 3 { " ..." } else { "" }
+            ));
+        }
         for treat in want_arms.iter().filter(|a| a.ends_with("@real") && *a != "current@real") {
-            let mut first = 0usize;
-            let mut second = 0usize;
-            for m in metas {
-                for d in m["points_detail"].as_array().into_iter().flatten() {
-                    let g = d["game"].as_str().unwrap_or("?").to_string();
-                    let mn = d["move_number"].as_u64().unwrap_or(0);
-                    for seed in 0..seeds {
-                        let o = |arm: &str| {
-                            rows.iter()
-                                .find(|r| {
-                                    r["game"].as_str() == Some(g.as_str())
-                                        && r["move_number"].as_u64() == Some(mn)
-                                        && r["seed"].as_u64() == Some(seed)
-                                        && r["arm"].as_str() == Some(arm)
-                                })
-                                .and_then(|r| r["arm_order"].as_u64())
-                        };
-                        if let (Some(a), Some(b)) = (o(treat), o("current@real")) {
-                            if a < b {
-                                first += 1
-                            } else {
-                                second += 1
-                            }
-                        }
+            // (game, move_number) ごとに treatment 先 / 対照 先 を数える
+            let mut per_point: BTreeMap<(String, u64), (usize, usize)> = BTreeMap::new();
+            for ((g, mn, _seed), m) in &order {
+                if let (Some(a), Some(b)) = (m.get(treat), m.get("current@real")) {
+                    let e = per_point.entry((g.clone(), *mn)).or_default();
+                    if a < b {
+                        e.0 += 1
+                    } else {
+                        e.1 += 1
                     }
                 }
             }
-            if first != second {
+            let bad: Vec<String> = per_point
+                .iter()
+                .filter(|(_, (f, s))| f != s)
+                .map(|((g, mn), (f, s))| format!("{g}#{mn}（先 {f} / 後 {s}）"))
+                .collect();
+            if !bad.is_empty() {
                 out.push(format!(
-                    "{treat} と current@real の実行順が均衡していません（treatment 先 {first} / 対照 先 {second}）。AB/BA が閉じていないと実行順効果がペア差に残ります"
+                    "{treat} と current@real の実行順が決定点の中で均衡していません（{} 決定点）: {}{}。AB/BA が閉じていないと実行順効果がペア差に残ります",
+                    bad.len(),
+                    bad.iter().take(3).cloned().collect::<Vec<_>>().join(" / "),
+                    if bad.len() > 3 { " ..." } else { "" }
                 ));
             }
         }
@@ -2409,7 +2474,7 @@ mod tests {
             "games": 10, "points": 1,
             "points_detail": [{"game": "g1", "move_number": 41, "estimand": "foul",
                                "type": "nonking_king", "record_fouls": 2,
-                               "terminal": false, "weight": 1.0}],
+                               "terminal": false, "weight": 1.0, "double_check": false}],
         })
     }
 
@@ -2453,7 +2518,7 @@ mod tests {
         }
         let problems = check_inputs(&[meta(oracle_exp(), 0)], &rows);
         assert!(
-            problems.iter().any(|m| m.contains("実行順が均衡していません")),
+            problems.iter().any(|m| m.contains("均衡していません")),
             "固定順は検出されるべき: {problems:?}"
         );
     }
@@ -2505,6 +2570,80 @@ mod tests {
         assert!(
             problems.iter().any(|m| m.contains("点属性")),
             "meta と食い違う terminal は拒否されるべき: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn 両王手フラグがmetaと違えば拒否する() {
+        // `double_check` は主 estimand の**分母**を決める（両王手は介入が no-op なので
+        // 除く）。全 arm の行で `false` へ書き換えると、除外されていた手番が分母へ
+        // 戻って主 CI が動く（PR #37 レビュー6巡目 [P1]）
+        let mut m = meta(oracle_exp(), 0);
+        m["points_detail"][0]["double_check"] = serde_json::json!(true);
+        let problems = check_inputs(&[m], &full_oracle());
+        assert!(
+            problems.iter().any(|p| p.contains("点属性")),
+            "meta と食い違う double_check は拒否されるべき: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn metaに両王手の宣言が無ければ拒否する() {
+        // schema を上げずに列だけ落とされたときに既定値で埋めない
+        let mut m = meta(oracle_exp(), 0);
+        m["points_detail"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("double_check");
+        let problems = check_inputs(&[m], &full_oracle());
+        assert!(
+            problems.iter().any(|p| p.contains("double_check")),
+            "meta の欠測は拒否されるべき: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn 実行順が決定点をまたいで相殺されても検出する() {
+        // 決定点 A は全 seed が treatment 先・決定点 B は全 seed が対照 先。
+        // **総数は釣り合う**ので全体集計の検査は通ってしまうが、決定点ごとの
+        // 実行順効果はペア差に残る（PR #37 レビュー6巡目 [P1]）
+        let mut m = meta(oracle_exp(), 0);
+        let d1 = m["points_detail"][0].clone();
+        let mut d2 = d1.clone();
+        d2["move_number"] = serde_json::json!(51);
+        m["points_detail"] = serde_json::json!([d1, d2]);
+        m["points"] = serde_json::json!(2);
+
+        let mut rows = vec![];
+        for (mn, treat_first) in [(41u64, true), (51u64, false)] {
+            for seed in 0..2u64 {
+                for (i, arm) in
+                    ["current@static", "current@shadow", "alpha@k2@shadow", "oracle@k1@shadow"]
+                        .iter()
+                        .enumerate()
+                {
+                    let mut r = row_ord(arm, seed, 1, i);
+                    r["move_number"] = serde_json::json!(mn);
+                    rows.push(r);
+                }
+                let block: [&str; 3] = if treat_first {
+                    ["oracle@k1@real", "oracle@kinf@real", "current@real"]
+                } else {
+                    ["oracle@k1@real", "current@real", "oracle@kinf@real"]
+                };
+                for (i, arm) in block.iter().enumerate() {
+                    let mut r = row_ord(arm, seed, 1, 4 + i);
+                    r["move_number"] = serde_json::json!(mn);
+                    rows.push(r);
+                }
+            }
+        }
+        let problems = check_inputs(&[m], &rows);
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("oracle@kinf@real") && p.contains("決定点の中で均衡していません")),
+            "決定点ごとの偏りは検出されるべき: {problems:?}"
         );
     }
 
