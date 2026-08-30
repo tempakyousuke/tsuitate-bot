@@ -21,7 +21,9 @@ name: Check belief
 #     （shadow の `current` と比べると「オラクル」と「指し直したこと」が混ざる）
 #
 # **P0-2 / P0-2b は既定では走らない**（`run_policy` / `run_continue`）。
-# P0-1 は粒子を回すが1決定点あたり1回の `choose` で済むので軽い。
+# P0-1 は粒子を回すが1決定点あたり1回の `choose` で済むので軽く、既定で走る
+# （`run_probe=false` で切れる。済んだ phase を再実行して 16 ジョブを無駄に
+# 埋めないため。check-economy.yml の `run_probe` と同じ規約）。
 # **全部を同時に有効化しない**（相手2 × シャードでジョブが詰まる）。
 #
 # 起動は arena.yml / check-prep.yml と同じ2通り（**通常のコード push では走らない**）:
@@ -45,6 +47,10 @@ on:
         description: "相手ごとに分けて集計する（空白区切り）。records/ を使うときは無視される"
         required: false
         default: "estimator_v13 estimator_v14"
+      run_probe:
+        description: "P0-1（伝達の分解）を走らせるか。済んだ phase を再実行しないために切れる"
+        required: false
+        default: "true"
       probe_seeds:
         description: "P0-1 の決定点あたり seed 数"
         required: false
@@ -136,6 +142,7 @@ jobs:
       skip: ${{ steps.split.outputs.skip }}
       arena_run_id: ${{ steps.split.outputs.arena_run_id }}
       opponents: ${{ steps.split.outputs.opponents }}
+      run_probe: ${{ steps.split.outputs.run_probe }}
       probe_seeds: ${{ steps.split.outputs.probe_seeds }}
       probe_budget_ms: ${{ steps.split.outputs.probe_budget_ms }}
       probe_shards: ${{ steps.split.outputs.probe_shards }}
@@ -166,6 +173,7 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           IN_RUN_ID: ${{ github.event.inputs.arena_run_id }}
           IN_OPPONENTS: ${{ github.event.inputs.opponents }}
+          IN_RUN_PROBE: ${{ github.event.inputs.run_probe }}
           IN_PROBE_SEEDS: ${{ github.event.inputs.probe_seeds }}
           IN_PROBE_BUDGET: ${{ github.event.inputs.probe_budget_ms }}
           IN_PROBE_SHARDS: ${{ github.event.inputs.probe_shards }}
@@ -192,6 +200,7 @@ jobs:
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             run_id="${IN_RUN_ID:-}"
             opponents="${IN_OPPONENTS:-estimator_v13 estimator_v14}"
+            run_probe="${IN_RUN_PROBE:-true}"
             probe_seeds="${IN_PROBE_SEEDS:-3}"
             probe_budget="${IN_PROBE_BUDGET:-2000}"
             probe_shards="${IN_PROBE_SHARDS:-8}"
@@ -221,6 +230,7 @@ jobs:
                 echo "skip=true"
                 echo "arena_run_id="
                 echo 'opponents=[""]'
+                echo "run_probe=false"
                 echo "probe_seeds=3"
                 echo "probe_budget_ms=2000"
                 echo 'probe_shards=[0]'
@@ -249,6 +259,7 @@ jobs:
             fi
             run_id=$(jq -r '.arena_run_id // ""' "$req")
             opponents=$(jq -r 'if (.opponents | type) == "array" then (.opponents | join(" ")) else (.opponents // "estimator_v13 estimator_v14") end' "$req")
+            run_probe=$(jq -r '.run_probe // true | tostring' "$req")
             probe_seeds=$(jq -r '.probe_seeds // 3' "$req")
             probe_budget=$(jq -r '.probe_budget_ms // 2000' "$req")
             probe_shards=$(jq -r '.probe_shards // 8' "$req")
@@ -278,6 +289,7 @@ jobs:
             echo "skip=false"
             echo "arena_run_id=$run_id"
             echo "opponents=$(jq -n -c --arg s "$opponents" 'if $s == "" then [""] else ($s | split(" ") | map(select(. != ""))) end')"
+            echo "run_probe=$run_probe"
             echo "probe_seeds=$probe_seeds"
             echo "probe_budget_ms=$probe_budget"
             echo "probe_shards=$(jq -n -c --argjson n "$probe_shards" '[range($n)]')"
@@ -305,7 +317,7 @@ jobs:
 
   probe:
     needs: plan
-    if: needs.plan.outputs.skip != 'true'
+    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_probe == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -393,7 +405,7 @@ jobs:
 
   probe-aggregate:
     needs: [plan, probe]
-    if: needs.plan.outputs.skip != 'true'
+    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_probe == 'true'
     strategy:
       fail-fast: false
       matrix:

@@ -1173,8 +1173,9 @@
   では走らない**）: `gh workflow run check-belief.yml -f arena_run_id=<Arena実行ID>`、
   `gh` が無ければ `.github/ci/check-belief.request.json` を置いて push（削除の push は
   全ジョブがスキップされる）。相手ごとに別ジョブ・元対局単位のシャード・**欠けたら
-  aggregate が失敗**。P0-1 は既定で走り、**P0-2（`run_policy`）と P0-2b
-  （`run_continue`）は既定オフ**（同時に有効化しない）。元 Arena 実行の実験条件の
+  aggregate が失敗**。P0-1 は既定で走り（`run_probe=false` で切れる。済んだ phase を
+  再実行して16ジョブを無駄に埋めないため。check-economy.yml と同じ規約）、
+  **P0-2（`run_policy`）と P0-2b（`run_continue`）は既定オフ**（同時に有効化しない）。元 Arena 実行の実験条件の
   検査は `scripts/ci/verify_arena_provenance.sh` に**一本化**した（`check-prep.yml`
   から切り出した共通の関門。ワークフローごとに書くと片方だけ緩くなる）。
   **3つの phase すべてを検証済み provenance に依存させ、`EXPECT_THINK_BUDGET_MS` で

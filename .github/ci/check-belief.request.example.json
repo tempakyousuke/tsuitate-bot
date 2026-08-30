@@ -2,6 +2,8 @@
   "_comment": "issue #36（王手駒仮説の希釈）の CI 起動リクエスト。このファイルを .github/ci/check-belief.request.json という名前で置いて push すると Check belief が走る。計測後に消す push は全ジョブがスキップされる（赤い run は残らない）。キーは workflow_dispatch の inputs と同じ",
   "arena_run_id": "32697854659",
   "opponents": "estimator_v13 estimator_v14",
+  "_comment_probe": "P0-1（伝達の分解）。済んだ phase を再実行しないときは run_probe を false にする",
+  "run_probe": true,
   "probe_seeds": 3,
   "probe_budget_ms": 2000,
   "probe_shards": 8,
