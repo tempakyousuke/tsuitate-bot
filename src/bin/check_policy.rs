@@ -81,10 +81,21 @@ use tsuitate_bot::truth_replay::parse_bot_and_end;
 ///   （初期粒子サンプルを揃える）。`identity_err_real` はその実再決定側の恒等対照。
 ///   **欠けた列を「問題なし」と読むと恒等対照も演繹の健全性も素通りする**ので、
 ///   版の拒否と必須列の存在検査の両方で止める
-const ROW_SCHEMA: u32 = 4;
+/// - 5 … レビュー4〜5巡目。**母集団と重みの意味が変わった**（終端手番を含む全王手中
+///   手番・自然頻度へ戻す `weight`）うえ、実再決定 arm を **AB/BA で背中合わせに**
+///   走らせて `arm_order` を残すようになった。schema 4 の記録は
+///   ①終端手番が欠けている ②`weight` が無いので「間引いた均衡標本」を
+///   自然頻度として読んでしまう ③実行順が固定でしかも監査できない、の3点で
+///   新しい gate へ通してはいけない（レビュー5巡目 [P1]: 実際に 102cc1a の
+///   schema 4 JSONL が最新バイナリの `report` を exit 0 で通っていた）
+const ROW_SCHEMA: u32 = 5;
 
-/// schema 4 の行に必ずある列（欠測を既定値で埋めて門を通せてはいけない）
-const REQUIRED_ROW_KEYS: [&str; 8] = [
+/// schema 5 の行に必ずある列（欠測を既定値で埋めて門を通せてはいけない）。
+///
+/// `terminal` / `weight` / `estimand` は**母集団と分母**を決める列、
+/// `arm_order` は**実行順の均衡**を検査する列なので、欠測を既定値で
+/// 埋めると gate の意味が変わる
+const REQUIRED_ROW_KEYS: [&str; 12] = [
     "identity_err",
     "identity_err_real",
     "identity_only_real",
@@ -93,6 +104,10 @@ const REQUIRED_ROW_KEYS: [&str; 8] = [
     "double_check",
     "repro_err",
     "arm",
+    "terminal",
+    "weight",
+    "estimand",
+    "arm_order",
 ];
 
 fn die(msg: &str) -> ! {
@@ -134,6 +149,10 @@ struct ArmOut {
     oracle: serde_json::Value,
     /// この arm のシミュレーションに掛かった実時間（µs。P1 のコスト見積り）
     sim_us: u64,
+    /// **この unit の中で何番目に走ったか**（実行順効果の監査用。
+    /// PR #37 レビュー5巡目 [P1]）。実再決定 arm は AB/BA で反転するので、
+    /// `report` がこの列で均衡を検査する
+    arm_order: usize,
 }
 
 fn walk_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -352,6 +371,13 @@ fn main() {
     // （issue #28 が `mate_continue` で塞いだ穴と同じ: 空の集計で判定を偽造できる）
     if seeds == 0 {
         die("--seeds は 1 以上にしてください（0 だと1本もシミュレーションせずに集計が空になる）");
+    }
+    // **実再決定 arm を回すなら seed は偶数**（PR #37 レビュー5巡目 [P1]）。
+    // 実行順は `(決定点番号 + seed) % 2` で反転するので、奇数だと決定点ごとに
+    // AB/BA が閉じず、実行順効果がペア差の平均に残る（#31 P0-7 と同じ理由）。
+    // shadow だけの実験（`--no-real`）は決定論的なので偶数を要求しない
+    if with_real && seeds % 2 != 0 {
+        die("--seeds は 2 以上の偶数にしてください（実再決定 arm の AB/BA は seed の偶奇で閉じるので、奇数だと実行順効果がペア差に残る）");
     }
     let files = collect_records(&specs);
     if files.is_empty() {
@@ -593,6 +619,7 @@ fn main() {
                     let (pi, seed) = units[ui];
                     match run_unit(
                         &points[pi],
+                        pi,
                         seed,
                         &policies,
                         &beliefs,
@@ -713,6 +740,7 @@ fn main() {
 #[allow(clippy::too_many_arguments)]
 fn run_unit(
     p: &Point,
+    point_index: usize,
     seed: u64,
     policies: &[(String, Policy)],
     beliefs: &[Belief],
@@ -747,6 +775,7 @@ fn run_unit(
     let mut arms: Vec<ArmOut> = vec![];
     let mut run = |arm: String, policy: &Policy, rule: UpdateRule<'_>| {
         let t = std::time::Instant::now();
+        let order = arms.len();
         let out = simulate(policy, &moves, &p0, params, fouls_before, opp_fouls, rule);
         let truth = truth_after(&p.truth, p.bot, out.accepted.as_deref());
         arms.push(ArmOut {
@@ -756,6 +785,7 @@ fn run_unit(
             deduce: serde_json::Value::Null,
             oracle: serde_json::Value::Null,
             sim_us: t.elapsed().as_micros() as u64,
+            arm_order: order,
         });
     };
     // 2. 静的方策（現行 `combine_score` が暗黙に置く仮定そのもの）
@@ -799,6 +829,35 @@ fn run_unit(
     // 「重複行があります」で落ちる。長時間実験の末尾で落とさない
     belief_specs.sort_by(|a, b| a.0.tag.cmp(&b.0.tag));
     belief_specs.dedup_by(|a, b| a.0.tag == b.0.tag);
+    // **実再決定 arm は AB/BA で背中合わせに走らせる**（PR #37 レビュー5巡目 [P1]）。
+    //
+    // shadow arm は `ShadowUpdater` が初回ランキングから決定論的に計算するので
+    // 実行順に依存しない（恒等対照が bit-exact なのがその証拠）。**実再決定だけが
+    // 壁時計デッドラインまで粒子を回すので順序と負荷の影響を受ける**。タグ順に
+    // 固定して並べると `current@real` は常に先・`oracle@kinf@real` は複数 arm を
+    // 挟んだ後になり、主差に実行順効果が残る。
+    //
+    // そこで実再決定 arm だけを1つの連続ブロックにまとめ、**`current@real` を
+    // その中央へ置いてから、`(決定点番号 + seed) % 2 == 1` のときブロックごと
+    // 反転する**。反転は各 treatment の「対照から見た側」を入れ替えるので、
+    // 偶数 seed の内側で主対 (`oracle@kinf@real` vs `current@real`) も
+    // ノイズ床の対 (`oracle@k1@real` vs `current@real`) も AB/BA が閉じる
+    // （#31 P0-7 の `check_price` と同じ設計。`--seeds` が偶数であることは
+    // 起動時に要求する）。実行順は `arm_order` として全行に残し、`report` が
+    // 均衡を検査する
+    let (mut shadow_specs, mut real_specs): (Vec<_>, Vec<_>) =
+        belief_specs.into_iter().partition(|(sp, _)| !sp.real);
+    if !real_specs.is_empty() {
+        if let Some(ci) = real_specs.iter().position(|(sp, _)| sp.tag == "current@real") {
+            let cur = real_specs.remove(ci);
+            real_specs.insert(real_specs.len() / 2, cur);
+        }
+        if (point_index + seed as usize) % 2 == 1 {
+            real_specs.reverse();
+        }
+    }
+    shadow_specs.append(&mut real_specs);
+    let belief_specs = shadow_specs;
     let mut p_real_current: Option<Vec<(String, f64)>> = None;
     let mut p_real_identity: Option<Vec<(String, f64)>> = None;
     for (spec, is_deduce) in &belief_specs {
@@ -856,6 +915,7 @@ fn run_unit(
             p_real_identity = Some(run.p_entry.clone());
         }
         let truth = truth_after(&p.truth, p.bot, run.out.accepted.as_deref());
+        let order = arms.len();
         arms.push(ArmOut {
             arm: spec.tag.clone(),
             out: run.out,
@@ -863,6 +923,7 @@ fn run_unit(
             deduce: deduce_note,
             oracle: oracle_note,
             sim_us: t.elapsed().as_micros() as u64,
+            arm_order: order,
         });
     }
     // **USI で突き合わせる**（PR #37 レビュー3巡目 [P2]）: 実再決定は候補リストごと
@@ -919,6 +980,8 @@ fn run_unit(
                     "deduce": a.deduce,
                     "oracle": a.oracle,
                     "double_check": checkers.len() > 1,
+                    // **この unit の中での実行順**（実再決定 arm は AB/BA で反転）
+                    "arm_order": a.arm_order,
                     "calibration": cal.to_json(),
                 })
             })
@@ -1079,7 +1142,12 @@ fn natural_clusters(
         if r["double_check"].as_bool().unwrap_or(false) {
             continue; // 両王手は別層（介入しない）
         }
-        let w = r["weight"].as_f64().unwrap_or(1.0);
+        // **欠測を 1.0 で埋めない**（レビュー5巡目 [P1]）。`weight` は自然頻度へ
+        // 戻す包含重みなので、無い行を 1.0 と読むと「間引いた均衡標本」が
+        // そのまま自然頻度の表になる。必須列検査で弾いているが、ここでも止める
+        let w = r["weight"]
+            .as_f64()
+            .unwrap_or_else(|| die("weight の無い行が自然頻度の集計に入りました（schema 5 未満の記録が混ざっています）"));
         let e = by
             .entry((
                 r["game"].as_str().unwrap_or("?").to_string(),
@@ -1912,15 +1980,72 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
             );
         }
     }
-    let mut seen: BTreeMap<(String, u64, String), usize> = BTreeMap::new();
+    // **実キー集合と期待キー集合を厳密一致させる**（PR #37 レビュー5巡目 [P1]）。
+    // 欠落しか見ないと、meta が宣言していない決定点や範囲外 seed の行を全 arm ぶん
+    // 足しても検査を通り、自然頻度 gate は `rows` を全部読むので主 CI を動かせる。
+    // seed もキーに入れる（`got != seeds` の本数比較では範囲外 seed が
+    // 別の欠落と相殺しうる）
+    let mut seen: BTreeMap<(String, u64, u64, String), usize> = BTreeMap::new();
     for r in rows {
         *seen
             .entry((
                 r["game"].as_str().unwrap_or("?").to_string(),
                 r["move_number"].as_u64().unwrap_or(0),
+                r["seed"].as_u64().unwrap_or(u64::MAX),
                 r["arm"].as_str().unwrap_or("?").to_string(),
             ))
             .or_default() += 1;
+    }
+    // 点属性（分母と対象集合を決める列）は meta の宣言と一致していること。
+    // 片方だけ書き換えて分母を変えられてはいけない
+    let mut point_attrs: BTreeMap<(String, u64), (String, bool, String)> = BTreeMap::new();
+    for m in metas {
+        for d in m["points_detail"].as_array().into_iter().flatten() {
+            point_attrs.insert(
+                (
+                    d["game"].as_str().unwrap_or("?").to_string(),
+                    d["move_number"].as_u64().unwrap_or(0),
+                ),
+                (
+                    d["estimand"].as_str().unwrap_or("?").to_string(),
+                    d["terminal"].as_bool().unwrap_or(false),
+                    fmt_num(d["weight"].as_f64().unwrap_or(f64::NAN)),
+                ),
+            );
+        }
+    }
+    let mut attr_bad: Vec<String> = vec![];
+    for r in rows {
+        let key = (
+            r["game"].as_str().unwrap_or("?").to_string(),
+            r["move_number"].as_u64().unwrap_or(0),
+        );
+        let Some((estimand, terminal, weight)) = point_attrs.get(&key) else {
+            continue; // 未宣言の点は下の厳密一致で捕まる
+        };
+        let got = (
+            r["estimand"].as_str().unwrap_or("?").to_string(),
+            r["terminal"].as_bool().unwrap_or(false),
+            fmt_num(r["weight"].as_f64().unwrap_or(f64::NAN)),
+        );
+        if got != (estimand.clone(), *terminal, weight.clone()) {
+            attr_bad.push(format!(
+                "{}#{} {}: 行 {:?} vs meta {:?}",
+                key.0,
+                key.1,
+                r["arm"].as_str().unwrap_or("?"),
+                got,
+                (estimand, terminal, weight)
+            ));
+        }
+    }
+    if !attr_bad.is_empty() {
+        out.push(format!(
+            "行の点属性（estimand / terminal / weight）が meta の宣言と食い違います（{} 件）: {}{}",
+            attr_bad.len(),
+            attr_bad.iter().take(3).cloned().collect::<Vec<_>>().join(" / "),
+            if attr_bad.len() > 3 { " ..." } else { "" }
+        ));
     }
     let dropped: HashSet<(String, u64)> = metas
         .iter()
@@ -1932,7 +2057,7 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
             )
         })
         .collect();
-    let mut lacks: Vec<String> = vec![];
+    let mut want: BTreeSet<(String, u64, u64, String)> = BTreeSet::new();
     for m in metas {
         for d in m["points_detail"].as_array().into_iter().flatten() {
             let g = d["game"].as_str().unwrap_or("?").to_string();
@@ -1942,13 +2067,15 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
                 continue;
             }
             for arm in &want_arms {
-                let got = seen.get(&(g.clone(), mn, arm.clone())).copied().unwrap_or(0) as u64;
-                if got != seeds {
-                    lacks.push(format!("{g}#{mn} {arm}: {got}/{seeds}"));
+                for seed in 0..seeds {
+                    want.insert((g.clone(), mn, seed, arm.clone()));
                 }
             }
         }
     }
+    let got: BTreeSet<(String, u64, u64, String)> = seen.keys().cloned().collect();
+    let fmt = |k: &(String, u64, u64, String)| format!("{}#{} s{} {}", k.0, k.1, k.2, k.3);
+    let lacks: Vec<String> = want.difference(&got).map(fmt).collect();
     if !lacks.is_empty() {
         out.push(format!(
             "meta が宣言した決定点に対して行が {} 箇所欠けています: {}{}",
@@ -1956,6 +2083,56 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
             lacks.iter().take(3).cloned().collect::<Vec<_>>().join(" / "),
             if lacks.len() > 3 { " ..." } else { "" }
         ));
+    }
+    // **余分な行も拒否する**（レビュー5巡目 [P1]）。自然頻度 gate は `rows` を
+    // 全部読むので、未宣言の決定点や範囲外 seed を足せば主 CI を動かせる
+    let extra: Vec<String> = got.difference(&want).map(fmt).collect();
+    if !extra.is_empty() {
+        out.push(format!(
+            "meta が宣言していない行が {} 件あります（未宣言の決定点か範囲外の seed）: {}{}",
+            extra.len(),
+            extra.iter().take(3).cloned().collect::<Vec<_>>().join(" / "),
+            if extra.len() > 3 { " ..." } else { "" }
+        ));
+    }
+    // **実再決定 arm の AB/BA が閉じているか**（レビュー5巡目 [P1]）。
+    // `arm_order` は unit 内の実行順なので、主対 (`oracle@kinf@real` /
+    // `current@real`) が「先」になった決定点×seed の本数が釣り合っていること
+    if want_arms.iter().any(|a| a == "current@real") {
+        for treat in want_arms.iter().filter(|a| a.ends_with("@real") && *a != "current@real") {
+            let mut first = 0usize;
+            let mut second = 0usize;
+            for m in metas {
+                for d in m["points_detail"].as_array().into_iter().flatten() {
+                    let g = d["game"].as_str().unwrap_or("?").to_string();
+                    let mn = d["move_number"].as_u64().unwrap_or(0);
+                    for seed in 0..seeds {
+                        let o = |arm: &str| {
+                            rows.iter()
+                                .find(|r| {
+                                    r["game"].as_str() == Some(g.as_str())
+                                        && r["move_number"].as_u64() == Some(mn)
+                                        && r["seed"].as_u64() == Some(seed)
+                                        && r["arm"].as_str() == Some(arm)
+                                })
+                                .and_then(|r| r["arm_order"].as_u64())
+                        };
+                        if let (Some(a), Some(b)) = (o(treat), o("current@real")) {
+                            if a < b {
+                                first += 1
+                            } else {
+                                second += 1
+                            }
+                        }
+                    }
+                }
+            }
+            if first != second {
+                out.push(format!(
+                    "{treat} と current@real の実行順が均衡していません（treatment 先 {first} / 対照 先 {second}）。AB/BA が閉じていないと実行順効果がペア差に残ります"
+                ));
+            }
+        }
     }
     out
 }
@@ -1971,9 +2148,18 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
 fn run_combined(args: &[String]) {
     let mut allow_incomplete = false;
     let mut paths: Vec<String> = vec![];
-    for a in args {
+    // 契約の既定（issue #36 は v13 / v14 の2相手）。空文字で照合を切れる
+    let mut expect_opponents = "estimator_v13,estimator_v14".to_string();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
         match a.as_str() {
             "--allow-incomplete" => allow_incomplete = true,
+            "--expect-opponents" => {
+                expect_opponents = it
+                    .next()
+                    .unwrap_or_else(|| die("--expect-opponents に値がありません"))
+                    .clone()
+            }
             x if x.starts_with("--") => die(&format!("未知のオプション: {x}")),
             x => paths.push(x.to_string()),
         }
@@ -2020,6 +2206,64 @@ fn run_combined(args: &[String]) {
             by_opp.len()
         );
         if allow_incomplete { eprintln!("警告: {msg}") } else { die(&msg) }
+    }
+    // **期待する相手集合を明示的に固定する**（PR #37 レビュー5巡目 [P2]）。
+    // 「2種類以上」だけでは任意の2相手・3相手以上でも表示が
+    // `(Δv13+Δv14)/2` になってしまう
+    let want_opps: BTreeSet<String> = expect_opponents
+        .split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .collect();
+    if !want_opps.is_empty() {
+        let got_opps: BTreeSet<String> = by_opp.keys().cloned().collect();
+        if got_opps != want_opps {
+            let msg = format!(
+                "相手集合が期待と違います: 期待 {:?} / 実際 {:?}（--expect-opponents で変えられる）",
+                want_opps, got_opps
+            );
+            if allow_incomplete { eprintln!("警告: {msg}") } else { die(&msg) }
+        }
+    }
+    // **相手以外の treatment 定義が相手間で同一であること**（同 [P2]）。
+    // 契約上「相手だけが違う」ので、片方を別の build / 別の予算 / 別の seed 数で
+    // 測った JSONL を平均してはいけない。`opponent` と、相手ごとに必ず違う
+    // 記録の指紋（`records`）だけを除いて比較する
+    {
+        let key_of = |metas: &Vec<serde_json::Value>| -> serde_json::Value {
+            let mut e = metas
+                .first()
+                .map(|m| m["experiment"].clone())
+                .unwrap_or(serde_json::Value::Null);
+            if let Some(o) = e.as_object_mut() {
+                o.remove("opponent");
+                o.remove("records");
+            }
+            e
+        };
+        let mut it = by_opp.iter();
+        if let Some((first_opp, (first_metas, _))) = it.next() {
+            let base = key_of(first_metas);
+            for (opp, (metas, _)) in it {
+                let k = key_of(metas);
+                if k != base {
+                    let diffs: Vec<String> = base
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .filter(|(key, v)| k.get(key.as_str()) != Some(*v))
+                        .map(|(key, v)| {
+                            format!("{key}: {first_opp}={v} vs {opp}={}", k[key.as_str()])
+                        })
+                        .collect();
+                    let msg = format!(
+                        "相手間で treatment の定義が違います（相手以外は同一でなければならない）: {}",
+                        diffs.join(" / ")
+                    );
+                    if allow_incomplete { eprintln!("警告: {msg}") } else { die(&msg) }
+                }
+            }
+        }
     }
     println!("\n=== P0-2 の最終判定（opponent-balanced 合算）===");
     let main_arm = "oracle@kinf@real";
@@ -2164,7 +2408,8 @@ mod tests {
             "schema": ROW_SCHEMA, "type": "meta", "experiment": e, "shard": shard,
             "games": 10, "points": 1,
             "points_detail": [{"game": "g1", "move_number": 41, "estimand": "foul",
-                               "type": "nonking_king", "record_fouls": 2}],
+                               "type": "nonking_king", "record_fouls": 2,
+                               "terminal": false, "weight": 1.0}],
         })
     }
 
@@ -2180,25 +2425,123 @@ mod tests {
             "oracle": serde_json::Value::Null, "double_check": false,
             "identity_err_real": 0.0, "identity_only_real": 0,
             "terminal": false, "weight": 1.0,
+            // schema 5 の必須列（実行順の監査）
+            "arm_order": 0,
         })
+    }
+
+    /// 実行順つきの行（AB/BA の均衡検査を通すため、実再決定 arm は seed の
+    /// 偶奇で `current@real` との前後を入れ替える）
+    fn row_ord(arm: &str, seed: u64, fouls: u32, order: usize) -> serde_json::Value {
+        let mut r = row(arm, seed, fouls);
+        r["arm_order"] = serde_json::json!(order);
+        r
+    }
+
+    #[test]
+    fn 実行順が固定なら均衡していないと分かる() {
+        // 全 arm が同じ順（= レビュー5巡目 [P1] の修正前の姿）だと、
+        // `oracle@kinf@real` は常に `current@real` の後ろに来る
+        let mut rows = full_oracle();
+        for r in &mut rows {
+            if r["arm"] == "oracle@kinf@real" {
+                r["arm_order"] = serde_json::json!(9);
+            }
+            if r["arm"] == "current@real" {
+                r["arm_order"] = serde_json::json!(4);
+            }
+        }
+        let problems = check_inputs(&[meta(oracle_exp(), 0)], &rows);
+        assert!(
+            problems.iter().any(|m| m.contains("実行順が均衡していません")),
+            "固定順は検出されるべき: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn metaが宣言していない行は拒否する() {
+        // 未宣言の決定点を全 arm ぶん足すと、自然頻度 gate は読むのに
+        // 欠落検査は素通りする（修正前の穴）
+        let mut rows = full_oracle();
+        let mut extra = row_ord("current@real", 0, 9, 4);
+        extra["move_number"] = serde_json::json!(99);
+        rows.push(extra);
+        let problems = check_inputs(&[meta(oracle_exp(), 0)], &rows);
+        assert!(
+            problems.iter().any(|m| m.contains("meta が宣言していない行")),
+            "未宣言の行は拒否されるべき: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn 範囲外のseedの行も拒否する() {
+        let mut rows = full_oracle();
+        rows.push(row_ord("current@real", 7, 9, 4));
+        let problems = check_inputs(&[meta(oracle_exp(), 0)], &rows);
+        assert!(
+            problems.iter().any(|m| m.contains("meta が宣言していない行")),
+            "範囲外 seed は拒否されるべき: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn 行の重みがmetaと違えば拒否する() {
+        // `weight` は自然頻度の分母を決めるので、片方だけ書き換えて
+        // 主 CI を動かせてはいけない
+        let mut rows = full_oracle();
+        rows[0]["weight"] = serde_json::json!(7.0);
+        let problems = check_inputs(&[meta(oracle_exp(), 0)], &rows);
+        assert!(
+            problems.iter().any(|m| m.contains("点属性")),
+            "meta と食い違う weight は拒否されるべき: {problems:?}"
+        );
+    }
+
+    #[test]
+    fn 終端フラグがmetaと違えば拒否する() {
+        let mut rows = full_oracle();
+        rows[0]["terminal"] = serde_json::json!(true);
+        let problems = check_inputs(&[meta(oracle_exp(), 0)], &rows);
+        assert!(
+            problems.iter().any(|m| m.contains("点属性")),
+            "meta と食い違う terminal は拒否されるべき: {problems:?}"
+        );
     }
 
     fn full() -> Vec<serde_json::Value> {
         let mut v = vec![];
         for seed in 0..2 {
-            for arm in ["current@static", "current@shadow", "alpha@k2@shadow", "current@real"] {
-                v.push(row(arm, seed, 1));
+            for (i, arm) in
+                ["current@static", "current@shadow", "alpha@k2@shadow", "current@real"]
+                    .iter()
+                    .enumerate()
+            {
+                v.push(row_ord(arm, seed, 1, i));
             }
         }
         v
     }
 
-    /// オラクル arm 一式（恒等対照・実再決定・その床）を含む行
+    /// オラクル arm 一式（恒等対照・実再決定・その床）を含む行。
+    /// **実再決定 arm は seed の偶奇で `current@real` との前後を入れ替える**
+    /// （本番の AB/BA と同じ形。均衡検査を通るのはこの形だけ）
     fn full_oracle() -> Vec<serde_json::Value> {
-        let mut v = full();
+        let mut v = vec![];
         for seed in 0..2 {
-            for arm in ["oracle@k1@shadow", "oracle@kinf@real", "oracle@k1@real"] {
-                v.push(row(arm, seed, 1));
+            for (i, arm) in ["current@static", "current@shadow", "alpha@k2@shadow", "oracle@k1@shadow"]
+                .iter()
+                .enumerate()
+            {
+                v.push(row_ord(arm, seed, 1, i));
+            }
+            // 実再決定ブロック: 偶数 seed は [k1, current, kinf]、奇数は反転
+            let block: [&str; 3] = if seed % 2 == 0 {
+                ["oracle@k1@real", "current@real", "oracle@kinf@real"]
+            } else {
+                ["oracle@kinf@real", "current@real", "oracle@k1@real"]
+            };
+            for (i, arm) in block.iter().enumerate() {
+                v.push(row_ord(arm, seed, 1, 4 + i));
             }
         }
         v

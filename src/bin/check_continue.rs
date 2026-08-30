@@ -60,7 +60,15 @@ use tsuitate_bot::truth_replay::parse_bot_and_end;
 /// `arm_order` が無く、しかも arm を別 unit として並走させていた。欠けた列を
 /// `unwrap_or(false)` で 0 と読むと**反則負けも破滅も常に非悪化に見えて門を通せる**ので、
 /// 版の拒否と**必須列の存在検査**（`REQUIRED_ROW_KEYS`）の両方で止める。
-const ROW_SCHEMA: u32 = 2;
+///
+/// **3 …** PR #37 レビュー4〜5巡目で**母集団が変わった**: `check_belief::decision_points`
+/// へ寄せて、反則だけ積んで受理手なしで終局した**終端手番**も含めるようになった
+/// （それまでの `for_each_decision_full` は受理手を単位に回すので終端を返さない）。
+/// 終端手番は改善対象の最悪ケースであり即時反則負けの分子でもあるので、
+/// schema 2 の記録（終端が系統的に欠けている）を新しい gate へ混ぜると
+/// オラクル効果も safety 指標も楽観側へ偏る。meta の `points_detail` に
+/// `terminal` があることも要求する
+const ROW_SCHEMA: u32 = 3;
 
 /// estimand の全量。**集計が走査するのはこの2つだけ**なので、meta がこれ以外を
 /// 宣言したら期待キーを作る前に拒否する（PR #33 レビュー7巡目 [P1]）。
@@ -1140,7 +1148,12 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
             let g = d["game"].as_str().unwrap_or("?").to_string();
             let mn = d["move_number"].as_u64().unwrap_or(0);
             let es = d["estimand"].as_str().unwrap_or("?").to_string();
-            let terminal = d["terminal"].as_bool().unwrap_or(false);
+            // **`terminal` の欠測を false と読まない**（schema 3 の必須項目）。
+            // 終端手番を「受理手のある手番」として扱うと `baseline` の行を
+            // 期待してしまい、母集団の違いが欠落として現れて読み違える
+            let Some(terminal) = d["terminal"].as_bool() else {
+                die("meta の points_detail に terminal がありません（schema 3 未満の記録です）");
+            };
             for arm in &want {
                 // 終端手番は受理手が無いので `baseline` の行が存在しない
                 if terminal && arm == "baseline" {
@@ -1358,7 +1371,10 @@ mod tests {
     /// 読み直したときに、欠けた列を 0 と読んで門を通すのを防ぐ二重の関門の片方）
     #[test]
     fn 旧schemaは現行の版と一致しない() {
-        assert_eq!(ROW_SCHEMA, 2, "安全性の列を足したので版を上げてある");
+        assert_eq!(
+            ROW_SCHEMA, 3,
+            "安全性の列を足し、さらに母集団へ終端手番を入れたので版を上げてある"
+        );
     }
 
     /// **`reason == "foul_limit"` は bot の負けとは限らない**（PR #33 レビュー [P1]）。
@@ -1482,7 +1498,8 @@ mod tests {
         let mut m1 = meta(exp(), 0);
         m1["replicate"] = serde_json::json!(1);
         m1["points_detail"] =
-            serde_json::json!([{"game": "other-g1", "move_number": 41, "estimand": "foul"}]);
+            serde_json::json!([{"game": "other-g1", "move_number": 41, "estimand": "foul",
+                               "terminal": false}]);
         let mut rows = full();
         for mut r in full() {
             r["replicate"] = serde_json::json!(1);
@@ -1503,7 +1520,8 @@ mod tests {
     fn metaの未知のestimandを拒否する() {
         let mut m = meta(exp(), 0);
         m["points_detail"] =
-            serde_json::json!([{"game": "g1", "move_number": 41, "estimand": "unknown"}]);
+            serde_json::json!([{"game": "g1", "move_number": 41, "estimand": "unknown",
+                               "terminal": false}]);
         let rows: Vec<serde_json::Value> = full()
             .into_iter()
             .map(|mut r| {
