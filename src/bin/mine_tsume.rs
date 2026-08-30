@@ -46,8 +46,9 @@
 //! **1対局・1攻め方から採るのは1問だけ**（`--max-per-game`、既定 1）。詰みのある
 //! 局面は一度現れると、攻め方が見逃したまま数手続くことが多く、その各手番の局面を
 //! 全部採ると「同じ対局の2手違い」のほとんど同じ問題が並んでしまう。盤面の署名
-//! による重複排除では別局面なので落ちない。対局内で**最初に詰みが現れた局面**
-//! （最も手前の決定点）を採る。攻め方が違えば（先手に詰みがあった後、見逃して
+//! による重複排除では別局面なので落ちない。対局内で**詰み手数が最も長い局面**
+//! （同手数なら最も手前の決定点）を採る。全候補はソルバーを通しているので
+//! 追加コストは無い。攻め方が違えば（先手に詰みがあった後、見逃して
 //! 後手に詰みが回った等）盤の向きも駒の構成も別なので、別問題として許容する。
 
 use std::collections::{HashMap, HashSet};
@@ -362,23 +363,36 @@ fn accept(args: &Args, result: &Value) -> bool {
 
 /// 採用済みの問題から、対局×攻め方ごとの上限（`--max-per-game`）を超えるものを落とす。
 ///
-/// 候補は対局内で手番順に並んでいるので、残るのは**最初に詰みが現れた局面**。
+/// 残すのは**詰み手数が最も長い局面**（同手数なら手番順で手前のもの）。
 /// 詰みは一度現れると攻め方が見逃したまま数手続くことが多く、盤面署名の
 /// 重複排除だけでは「同じ対局の2手違い」がほとんど同じ問題として並んでしまう。
+/// 全候補は既にソルバーを通っていて手数が分かっているので、ここで長いものを
+/// 選んでも追加コストは無い（長手数ほど詰めチャレでは価値が高い）。
 /// 攻め方が違えば別問題として許容する（先手の詰みと後手の詰みは盤の向きも
-/// 駒の構成も別物）
-fn take_per_game<T>(args: &Args, accepted: Vec<T>, game_of: impl Fn(&T) -> String) -> Vec<T> {
-    let mut per_game: HashMap<String, usize> = HashMap::new();
+/// 駒の構成も別物）。出力の並びは元の手番順のまま
+fn take_per_game<T>(
+    args: &Args,
+    accepted: Vec<T>,
+    game_of: impl Fn(&T) -> String,
+    depth_of: impl Fn(&T) -> u64,
+) -> Vec<T> {
+    if args.max_per_game == 0 {
+        return accepted;
+    }
+    // 対局×攻め方ごとに (手数の降順, 手番順の昇順) で上位 max_per_game 件の index を選ぶ
+    let mut by_game: HashMap<String, Vec<(u64, usize)>> = HashMap::new();
+    for (idx, item) in accepted.iter().enumerate() {
+        by_game.entry(game_of(item)).or_default().push((depth_of(item), idx));
+    }
+    let mut keep: HashSet<usize> = HashSet::new();
+    for entries in by_game.values_mut() {
+        entries.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        keep.extend(entries.iter().take(args.max_per_game).map(|(_, idx)| *idx));
+    }
     accepted
         .into_iter()
-        .filter(|item| {
-            let count = per_game.entry(game_of(item)).or_insert(0);
-            if args.max_per_game > 0 && *count >= args.max_per_game {
-                return false;
-            }
-            *count += 1;
-            true
-        })
+        .enumerate()
+        .filter_map(|(idx, item)| keep.contains(&idx).then_some(item))
         .collect()
 }
 
@@ -453,7 +467,12 @@ fn main() {
         })
         .collect();
     let accepted_total = accepted.len();
-    let accepted = take_per_game(&args, accepted, |(candidate, _)| candidate.game.clone());
+    let accepted = take_per_game(
+        &args,
+        accepted,
+        |(candidate, _)| candidate.game.clone(),
+        |(_, result)| result["depth"].as_u64().unwrap_or(0),
+    );
     if accepted.len() < accepted_total {
         eprintln!(
             "同じ対局・同じ攻め方の問題を間引き: {}件 → {}件（--max-per-game {}）",
@@ -618,42 +637,50 @@ mod tests {
         ));
     }
 
-    /// 同じ対局・同じ攻め方からは最初に詰みが現れた局面だけを採る
+    /// 同じ対局・同じ攻め方からは詰み手数が最も長い局面だけを採る
     /// （詰みは見逃されたまま数手続くので、全部採るとほぼ同じ問題が並ぶ）。
-    /// 攻め方が違えば別問題
+    /// 同手数なら手前の決定点、攻め方が違えば別問題。出力は手番順を保つ
     #[test]
-    fn only_the_first_mate_of_each_game_and_attacker_is_taken() {
+    fn only_the_longest_mate_of_each_game_and_attacker_is_taken() {
+        // (対局/攻め方, 手目, 詰み手数)
         let accepted = vec![
-            ("game-a/sente", 40),
-            ("game-a/sente", 42),
-            ("game-b/gote", 51),
-            ("game-a/sente", 44),
-            ("game-a/gote", 45),
-            ("game-b/gote", 53),
-            ("game-a/gote", 47),
+            ("game-a/sente", 40, 5),
+            ("game-a/sente", 42, 9),
+            ("game-b/gote", 51, 7),
+            ("game-a/sente", 44, 9),
+            ("game-a/gote", 45, 3),
+            ("game-b/gote", 53, 5),
+            ("game-a/gote", 47, 3),
         ];
+        let game_of = |(game, _, _): &(&str, u32, u64)| game.to_string();
+        let depth_of = |(_, _, depth): &(&str, u32, u64)| *depth;
         let mut args = parse_args_for_test();
-        let taken = take_per_game(&args, accepted.clone(), |(game, _)| game.to_string());
-        assert_eq!(taken, vec![("game-a/sente", 40), ("game-b/gote", 51), ("game-a/gote", 45)]);
+        let taken = take_per_game(&args, accepted.clone(), game_of, depth_of);
+        // game-a/sente は 9手詰が2つあるので手前の 42手目、game-b/gote は 7手詰の 51手目、
+        // game-a/gote は同手数なので手前の 45手目
+        assert_eq!(
+            taken,
+            vec![("game-a/sente", 42, 9), ("game-b/gote", 51, 7), ("game-a/gote", 45, 3)]
+        );
 
-        // 上限を広げれば手番順にその数だけ採る
+        // 上限を広げれば手数の長い順にその数だけ採る（並びは手番順のまま）
         args.max_per_game = 2;
-        let taken = take_per_game(&args, accepted.clone(), |(game, _)| game.to_string());
+        let taken = take_per_game(&args, accepted.clone(), game_of, depth_of);
         assert_eq!(
             taken,
             vec![
-                ("game-a/sente", 40),
-                ("game-a/sente", 42),
-                ("game-b/gote", 51),
-                ("game-a/gote", 45),
-                ("game-b/gote", 53),
-                ("game-a/gote", 47),
+                ("game-a/sente", 42, 9),
+                ("game-b/gote", 51, 7),
+                ("game-a/sente", 44, 9),
+                ("game-a/gote", 45, 3),
+                ("game-b/gote", 53, 5),
+                ("game-a/gote", 47, 3),
             ]
         );
 
         // 0 は無制限（従来の挙動）
         args.max_per_game = 0;
-        let taken = take_per_game(&args, accepted.clone(), |(game, _)| game.to_string());
+        let taken = take_per_game(&args, accepted.clone(), game_of, depth_of);
         assert_eq!(taken, accepted);
     }
 
