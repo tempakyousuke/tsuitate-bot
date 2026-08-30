@@ -44,18 +44,16 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use tsuitate_bot::check_economy::entry_replayed;
-use tsuitate_bot::check_belief::{self, ArmSpec};
+use tsuitate_bot::check_belief::{self, ArmSpec, Attrition, decision_points};
 use tsuitate_bot::check_policy::entry_setup;
 use tsuitate_bot::checkpoint::stable_hash;
 use tsuitate_bot::mate_economy::force_move;
-use tsuitate_bot::observation::Observation;
 use tsuitate_bot::protocol::Color;
 use tsuitate_bot::scenario_core::{Replayed, clone_log, make_view, side_idx};
 use tsuitate_bot::selfplay::{GameResult, StartState, mix, play_continuation};
 use tsuitate_bot::shogi::Position;
 use tsuitate_bot::strategy::{self, EvalParams};
-use tsuitate_bot::truth_replay::{for_each_decision_full, parse_bot_and_end};
+use tsuitate_bot::truth_replay::parse_bot_and_end;
 
 /// 行の契約の版。**schema 1 は集計から弾く**（PR #33 レビュー2巡目 [P1]）:
 /// 1 には安全性の列（`foul_limit_loss` / `foul_limit_win` / `immediate_catastrophe`）と
@@ -102,8 +100,11 @@ struct Point {
     /// 決定点の真実局面（裁定用。方策には渡さない）
     truth: Position,
     bot: Color,
-    /// 実戦の反則列＋受理手（`baseline` arm が強制する列）
+    /// 実戦の反則列＋受理手（`baseline` arm が強制する列）。
+    /// **終端手番では受理手が無い**ので反則列だけ（`baseline` は走らせない）
     record_order: Vec<String>,
+    /// 終端手番（反則だけ積んで受理手なしで終局した手番）
+    terminal: bool,
 }
 
 fn walk_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -354,6 +355,7 @@ fn main() {
     let mut points: Vec<Point> = vec![];
     let mut games = 0u32;
     let mut broken = 0u32;
+    let mut attrition = Attrition::default();
     let mut record_opponents: BTreeMap<String, u32> = BTreeMap::new();
     let mut mismatched = 0u32;
     for path in &files {
@@ -382,51 +384,31 @@ fn main() {
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or(name.clone());
         let mut found: Vec<Point> = vec![];
-        let ok = for_each_decision_full(&end, |d| {
-            if d.side != bot || !d.pos.in_check(bot) {
-                return;
-            }
-            let post = Replayed {
-                pos: d.pos.clone(),
-                logs: [clone_log(&d.logs[0]), clone_log(&d.logs[1])],
-                fouls: *d.fouls,
-                plies: d.plies,
-                injected_fouls: vec![],
-                oracle: None,
-            };
-            let Some(entry) = entry_replayed(&post, d.side, d.fouls_this_turn) else {
-                return;
-            };
-            let events = post.logs[side_idx(d.side)].events();
-            let mut record_order: Vec<String> = events
-                [events.len() - d.fouls_this_turn as usize..]
-                .iter()
-                .filter_map(|e| match e {
-                    Observation::MyFoul { usi, .. } => Some(usi.clone()),
-                    _ => None,
-                })
-                .collect();
-            let estimand = if record_order.is_empty() { "nofoul" } else { "foul" };
-            // **受理手を持たない手番（その手番で終局した）は対象外**。
-            // baseline が「反則列だけを強制して受理手が無い」列になり、
-            // 実際には別の理由で終わった局を反則負け 0 点として数えてしまう
-            let Some(accepted) = end.moves.get(d.decision_id as usize) else {
-                return;
-            };
-            record_order.push(accepted.usi.clone());
-            found.push(Point {
-                game: short.clone(),
-                move_number: d.pos.move_number(),
-                estimand,
-                truth: d.pos.clone(),
-                entry,
-                bot,
-                record_order,
-            });
-        });
-        if !ok {
+        // **母集団は共通の `check_belief::decision_points`**（PR #37 レビュー4巡目 [P1]）。
+        // 終端手番（反則だけ積んで受理手なしで終局）は改善対象の最悪ケースなので
+        // 落とさない。ただし `baseline`（実戦の反則列＋受理手を強制）は受理手が
+        // 無いと組めないので、その arm だけ終端手番では走らせない
+        let Some(raw) = decision_points(&end, bot, &mut attrition) else {
             broken += 1;
             continue;
+        };
+        for cp in raw {
+            let estimand = cp.estimand();
+            let mut record_order = cp.record_fouls.clone();
+            let terminal = cp.record_accepted.is_none();
+            if let Some(a) = &cp.record_accepted {
+                record_order.push(a.clone());
+            }
+            found.push(Point {
+                game: short.clone(),
+                move_number: cp.move_number,
+                estimand,
+                truth: cp.truth,
+                entry: cp.entry,
+                bot,
+                record_order,
+                terminal,
+            });
         }
         games += 1;
         // **estimand ごとに最初の1つだけ**（同じ元対局の相互排他的な未来を
@@ -530,10 +512,15 @@ fn main() {
     for (pi, p) in points.iter().enumerate() {
         for seed in 0..seeds {
             let mut by_order: BTreeMap<Vec<String>, Vec<String>> = BTreeMap::new();
-            by_order
-                .entry(p.record_order.clone())
-                .or_default()
-                .push("baseline".to_string());
+            // 終端手番は受理手が無いので `baseline` を組めない（反則列だけを
+            // 強制すると、別の理由で終わった局を反則負け 0 点として数えてしまう）。
+            // 方策 arm は自分で選ぶので終端手番でも走る
+            if !p.terminal {
+                by_order
+                    .entry(p.record_order.clone())
+                    .or_default()
+                    .push("baseline".to_string());
+            }
             if let Some(by_arm) = orders.get(&(pi, seed)) {
                 for (arm, order) in by_arm {
                     by_order.entry(order.clone()).or_default().push(arm.clone());
@@ -613,12 +600,20 @@ fn main() {
         "replicate": replicate,
         "games": games,
         "points": points.len(),
+        // 母集団の attrition（終端手番が系統的に欠測すると門が甘くなる）
+        "attrition": {
+            "check_turns": attrition.turns,
+            "terminal": attrition.terminal,
+            "unreplayable": attrition.unreplayable,
+        },
         "points_detail": points
             .iter()
             .map(|p| serde_json::json!({
                 "game": p.game,
                 "move_number": p.move_number,
                 "estimand": p.estimand,
+                // 終端手番は `baseline` を組めない（期待キーから外す）
+                "terminal": p.terminal,
             }))
             .collect::<Vec<_>>(),
         "record_opponents": record_opponents,
@@ -1145,7 +1140,12 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
             let g = d["game"].as_str().unwrap_or("?").to_string();
             let mn = d["move_number"].as_u64().unwrap_or(0);
             let es = d["estimand"].as_str().unwrap_or("?").to_string();
+            let terminal = d["terminal"].as_bool().unwrap_or(false);
             for arm in &want {
+                // 終端手番は受理手が無いので `baseline` の行が存在しない
+                if terminal && arm == "baseline" {
+                    continue;
+                }
                 for seed in 0..seeds {
                     want_keys.insert((rep, g.clone(), mn, es.clone(), seed, arm.clone()));
                 }
@@ -1253,7 +1253,8 @@ mod tests {
             "schema": ROW_SCHEMA, "type": "meta", "experiment": e, "shard": shard,
             "replicate": 0,
             "games": 104, "points": 1,
-            "points_detail": [{"game": "g1", "move_number": 41, "estimand": "foul"}],
+            "points_detail": [{"game": "g1", "move_number": 41, "estimand": "foul",
+                               "terminal": false}],
         })
     }
 
@@ -1447,6 +1448,30 @@ mod tests {
     }
 
     /// **別々の標本を同じ実験の replicate として平均できない**（PR #33 レビュー5巡目 [P1]）。
+    #[test]
+    fn 終端手番はbaselineの行を期待しない() {
+        // 終端手番（受理手なし）は `baseline` を組めない。期待キーに入れると
+        // 「欠測」で落ちてしまうし、逆に母集団から外すと最悪ケースが消える
+        // （PR #37 レビュー4巡目 [P1]）
+        let mut m = meta(exp(), 0);
+        m["points_detail"] = serde_json::json!([
+            {"game": "g1", "move_number": 41, "estimand": "foul", "terminal": true}
+        ]);
+        let mut rows = vec![];
+        for seed in 0..2 {
+            for arm in ["current", "alpha@k2"] {
+                let mut r = row(arm, seed, 0.5);
+                r["estimand"] = serde_json::json!("foul");
+                rows.push(r);
+            }
+        }
+        let problems = check_inputs(&[m], &rows);
+        assert!(
+            !problems.iter().any(|p| p.contains("baseline")),
+            "baseline の欠測を咎めない: {problems:?}"
+        );
+    }
+
     /// 実験キーの一致検査は `experiment` しか見ず `points_detail` はその外にあるので、
     /// replicate 1 の meta と全行の `game` に接頭辞を付けて母集団を完全に分離しても、
     /// **各 replicate 内の行は完全なまま**なので素通りしていた

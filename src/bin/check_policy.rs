@@ -53,20 +53,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tsuitate_bot::check::CheckSolver;
-use tsuitate_bot::check_belief::{self, ArmSpec, Belief};
+use tsuitate_bot::check_belief::{self, ArmSpec, Attrition, Belief, decision_points};
 use tsuitate_bot::check_economy::{
-    CheckMoveKind, classify_move_kind, cluster_ratio_ci, entry_replayed, true_checkers,
+    CheckMoveKind, classify_move_kind, cluster_ratio_ci, true_checkers,
 };
 use tsuitate_bot::check_policy::{
     CalibrationSums, EntrySetup, Policy, SimOutcome, UpdateRule,
     entry_setup as check_policy_entry, fmt_num, simulate, truth_after,
 };
-use tsuitate_bot::observation::Observation;
 use tsuitate_bot::protocol::Color;
-use tsuitate_bot::scenario_core::{Replayed, clone_log, make_view, side_idx};
+use tsuitate_bot::scenario_core::{Replayed, make_view, side_idx};
 use tsuitate_bot::shogi::{Position, parse_usi};
 use tsuitate_bot::strategy::{self, EvalParams};
-use tsuitate_bot::truth_replay::{for_each_decision_full, parse_bot_and_end};
+use tsuitate_bot::truth_replay::parse_bot_and_end;
 
 /// JSONL の契約バージョン。**古い schema は集計から弾く**（issue #28 / #31 の契約）。
 ///
@@ -118,6 +117,10 @@ struct Point {
     /// 決定点の真実局面（裁定用。方策には渡さない）
     truth: Position,
     bot: Color,
+    /// **終端手番**（反則だけ積んで受理手なしで終局した手番）。改善対象の最悪ケース
+    terminal: bool,
+    /// 自然頻度へ戻すための包含重み（間引かなければ 1.0）
+    weight: f64,
 }
 
 /// 1 arm の結果（決定点 × seed × arm）
@@ -214,6 +217,10 @@ fn main() {
         run_report(&args[1..]);
         return;
     }
+    if args.first().is_some_and(|a| a == "combined") {
+        run_combined(&args[1..]);
+        return;
+    }
     let mut seeds: u64 = 4;
     let mut jobs: usize =
         std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(2).max(1));
@@ -224,6 +231,8 @@ fn main() {
     let mut beta_lambdas = vec![0.5, 1.0];
     let mut beta_k = 1.0f64;
     let mut with_real = true;
+    // 反則0の手番を間引く上限（0 = 間引かない。主 estimand は自然頻度なので既定 0）
+    let mut nofoul_cap: usize = 0;
     // **issue #36 P0-2 のオラクル arm**（既定で回す。issue #31 の arm はそのまま）。
     // `oracle@k1` は恒等対照（`current@shadow` と bit-exact でなければ配管が壊れている）
     let mut beliefs: Vec<Belief> = ["oracle@k1", "oracle@k2", "oracle@k4", "oracle@k8",
@@ -297,6 +306,12 @@ fn main() {
                 with_real = false;
                 i += 1;
             }
+            "--nofoul-cap" => {
+                nofoul_cap = need(args.get(i + 1), "--nofoul-cap")
+                    .parse()
+                    .unwrap_or_else(|_| die("--nofoul-cap は整数（0 = 間引かない）"));
+                i += 2;
+            }
             "--belief" => {
                 beliefs = parse_beliefs(&need(args.get(i + 1), "--belief"));
                 i += 2;
@@ -353,7 +368,7 @@ fn main() {
     let mut games = 0u32;
     let mut broken = 0u32;
     let mut mismatched = 0u32;
-    let mut skipped = 0u32;
+    let mut attrition = Attrition::default();
     let mut record_opponents: BTreeMap<String, u32> = BTreeMap::new();
     // **解析に渡したのと同じ bytes** から記録集合の指紋を作る（ディスクを読み直すと
     // TOCTOU。issue #28 PR #30 レビュー3巡目の教訓）
@@ -382,79 +397,62 @@ fn main() {
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or(name.clone());
-        let mut found: Vec<Point> = vec![];
-        let ok = for_each_decision_full(&end, |d| {
-            if d.side != bot || !d.pos.in_check(bot) {
-                return;
-            }
-            let post = Replayed {
-                pos: d.pos.clone(),
-                logs: [clone_log(&d.logs[0]), clone_log(&d.logs[1])],
-                fouls: *d.fouls,
-                plies: d.plies,
-                injected_fouls: vec![],
-                oracle: None,
-            };
-            let Some(entry) = entry_replayed(&post, d.side, d.fouls_this_turn) else {
-                skipped += 1;
-                return;
-            };
-            let events = post.logs[side_idx(d.side)].events();
-            let record_fouls: Vec<String> = events[events.len() - d.fouls_this_turn as usize..]
-                .iter()
-                .filter_map(|e| match e {
-                    Observation::MyFoul { usi, .. } => Some(usi.clone()),
-                    _ => None,
-                })
-                .collect();
+        // **母集団は共通の `check_belief::decision_points`**（PR #37 レビュー4巡目 [P1]）。
+        // `for_each_decision_full` は受理手を単位に回すので**終端手番を返さない**:
+        // 改善対象の最悪ケースであり即時反則負けの分子でもある手番が系統的に
+        // 消えると、オラクル効果も safety 指標も楽観側へ偏る
+        let Some(found_raw) = decision_points(&end, bot, &mut attrition) else {
+            broken += 1;
+            continue;
+        };
+        games += 1;
+        for cp in found_raw {
             // 型は P0-1 と同じ規約（bot の意図 = `captures_checker` で分ける）
-            let view = make_view(&entry.pos, d.side, &entry.fouls);
-            let log = &entry.logs[side_idx(d.side)];
+            let view = make_view(&cp.entry.pos, bot, &cp.entry.fouls);
+            let log = &cp.entry.logs[side_idx(bot)];
             let mut solver = CheckSolver::new(&view, &[], &[], log);
-            let accepted = end.moves.get(d.decision_id as usize).map(|m| m.usi.clone());
-            let acc_kind = accepted
+            let acc_kind = cp
+                .record_accepted
                 .as_deref()
                 .and_then(parse_usi)
                 .map(|m| classify_move_kind(&m, &view, solver.as_mut()));
-            let tag = match record_fouls.first().and_then(|u| parse_usi(u)) {
+            let tag = match cp.record_fouls.first().and_then(|u| parse_usi(u)) {
                 Some(first) => {
                     let k = classify_move_kind(&first, &view, solver.as_mut());
                     type_tag(k, acc_kind)
                 }
                 None => "no_foul".to_string(),
             };
+            let estimand = cp.estimand();
             let point = Point {
                 game: short.clone(),
-                move_number: d.pos.move_number(),
-                estimand: if record_fouls.is_empty() { "nofoul" } else { "foul" },
+                move_number: cp.move_number,
+                estimand,
                 type_tag: tag,
-                record_accepted: accepted.clone().unwrap_or_default(),
-                record_fouls,
-                truth: d.pos.clone(),
-                entry,
+                record_accepted: cp.record_accepted.clone().unwrap_or_default(),
+                record_fouls: cp.record_fouls,
+                truth: cp.truth,
+                entry: cp.entry,
                 bot,
+                terminal: cp.terminal,
+                weight: 1.0,
             };
-            found.push(point);
-        });
-        if !ok {
-            broken += 1;
-            continue;
-        }
-        games += 1;
-        for p in found {
-            if p.estimand == "foul" { fouled.push(p) } else { clean.push(p) }
+            if estimand == "foul" { fouled.push(point) } else { clean.push(point) }
         }
     }
-    // **反則0の対照は「同数」を決定論的に抽出する**（issue #31 の非劣性 estimand）。
-    // 現行方策の順位で選ぶと対照が方策に引きずられるので、(局, 手数) の辞書順で
-    // 等間隔に取る。全記録を見てから割るので、シャードが違っても同じ標本になる
+    // **既定は間引かない**（PR #37 レビュー4巡目 [P1]）。issue #36 の主 estimand は
+    // 「全王手手番の自然頻度」なので、反則0の手番を foul と同数まで落とすと
+    // 少数の foul 層を過大に重み付けしたまま合算することになる。
+    // `--nofoul-cap N` で間引くときは**包含重み**（元の層頻度 ÷ 残した本数）を
+    // 各点に残し、自然頻度の表はその重みで戻す
     fouled.sort_by(|a, b| (&a.game, a.move_number).cmp(&(&b.game, b.move_number)));
     clean.sort_by(|a, b| (&a.game, a.move_number).cmp(&(&b.game, b.move_number)));
-    let want = fouled.len();
-    if clean.len() > want && want > 0 {
-        let step = clean.len() as f64 / want as f64;
+    let clean_total = clean.len();
+    let want = if nofoul_cap == 0 { clean_total } else { nofoul_cap.min(clean_total) };
+    if clean_total > want && want > 0 {
+        let step = clean_total as f64 / want as f64;
         let keep: BTreeSet<usize> = (0..want)
-            .map(|k| ((k as f64 * step) as usize).min(clean.len() - 1))
+            .map(|k| ((k as f64 * step) as usize).min(clean_total - 1))
             .collect();
         clean = clean
             .into_iter()
@@ -462,6 +460,10 @@ fn main() {
             .filter(|(i, _)| keep.contains(i))
             .map(|(_, p)| p)
             .collect();
+        let w = clean_total as f64 / clean.len().max(1) as f64;
+        for p in &mut clean {
+            p.weight = w;
+        }
     }
     let mut points: Vec<Point> = fouled;
     points.extend(clean);
@@ -500,7 +502,7 @@ fn main() {
     policies.push(("solver_greedy".into(), Policy::SolverGreedy));
 
     println!(
-        "記録 {} 件（壊れ {broken} / 相手不一致 {mismatched} / 復元できず {skipped}）/ 局 {games}",
+        "記録 {} 件（壊れ {broken} / 相手不一致 {mismatched}）/ 局 {games}",
         files.len()
     );
     println!(
@@ -512,7 +514,11 @@ fn main() {
             .join(" / ")
     );
     println!(
-        "決定点 {}（反則あり {} / 反則0の対照 {}）/ seeds {seeds} / jobs {jobs} / shard {}/{}",
+        "王手中の bot の手番 {}（うち終端 {} / 復元できず {}）",
+        attrition.turns, attrition.terminal, attrition.unreplayable
+    );
+    println!(
+        "決定点 {}（反則あり {} / 反則0 {}）/ seeds {seeds} / jobs {jobs} / shard {}/{}",
         points.len(),
         points.iter().filter(|p| p.estimand == "foul").count(),
         points.iter().filter(|p| p.estimand == "nofoul").count(),
@@ -641,6 +647,7 @@ fn main() {
         "with_real": with_real,
         "beliefs": beliefs.iter().map(|b| b.tag()).collect::<Vec<_>>(),
         "beliefs_real": beliefs_real.iter().map(|b| b.tag()).collect::<Vec<_>>(),
+        "nofoul_cap": nofoul_cap,
         "beta_k": fmt_num(beta_k),
         "jobs": effective_jobs,
         "shard_total": shard.1,
@@ -655,6 +662,12 @@ fn main() {
         "shard": shard.0,
         "games": games,
         "points": points.len(),
+        // 母集団の attrition（終端手番が系統的に欠測すると門が甘くなる）
+        "attrition": {
+            "check_turns": attrition.turns,
+            "terminal": attrition.terminal,
+            "unreplayable": attrition.unreplayable,
+        },
         // **期待する行の骨格を meta 自身に残す**（ある seed の全 arm がまとめて
         // 欠けても検出できるように。issue #28 PR #30 レビュー2巡目 [P1]）
         "points_detail": points
@@ -664,6 +677,8 @@ fn main() {
                 "move_number": p.move_number,
                 "estimand": p.estimand,
                 "type": p.type_tag,
+                "terminal": p.terminal,
+                "weight": p.weight,
                 "record_fouls": p.record_fouls.len(),
             }))
             .collect::<Vec<_>>(),
@@ -869,6 +884,9 @@ fn run_unit(
                     "move_number": p.move_number,
                     "estimand": p.estimand,
                     "type": p.type_tag,
+                    "terminal": p.terminal,
+                    // 自然頻度へ戻す包含重み（間引かなければ 1.0）
+                    "weight": p.weight,
                     "seed": seed,
                     "arm": a.arm,
                     "fouls": a.out.fouls,
@@ -1041,6 +1059,137 @@ fn paired_with(
     (point, lo, hi)
 }
 
+/// **自然頻度の元対局 cluster**（`(局 → (重み付き差の和, 重みの和))`）。
+///
+/// issue #36 の主 estimand は「**全王手手番の自然頻度**」なので、
+///
+/// - `--nofoul-cap` で間引いたぶんは行の `weight`（元の層頻度 ÷ 残した本数）で戻す
+/// - **両王手は除く**（介入が no-op なので効果量の分母に入れると薄まる）
+///
+/// 返り値をそのまま渡せば、相手をまたいだ層化 bootstrap（`combined`）も同じ
+/// 定義の上で計算できる。
+fn natural_clusters(
+    rows: &[&serde_json::Value],
+    arm: &str,
+    base: &str,
+    key: &dyn Fn(&serde_json::Value) -> f64,
+) -> BTreeMap<String, (f64, f64)> {
+    let mut by: BTreeMap<(String, u64, u64), (BTreeMap<String, f64>, f64)> = BTreeMap::new();
+    for r in rows {
+        if r["double_check"].as_bool().unwrap_or(false) {
+            continue; // 両王手は別層（介入しない）
+        }
+        let w = r["weight"].as_f64().unwrap_or(1.0);
+        let e = by
+            .entry((
+                r["game"].as_str().unwrap_or("?").to_string(),
+                r["move_number"].as_u64().unwrap_or(0),
+                r["seed"].as_u64().unwrap_or(0),
+            ))
+            .or_insert_with(|| (BTreeMap::new(), w));
+        e.1 = w;
+        e.0.insert(r["arm"].as_str().unwrap_or("?").to_string(), key(r));
+    }
+    let mut clusters: BTreeMap<String, (f64, f64)> = BTreeMap::new();
+    for ((game, _, _), (m, w)) in &by {
+        if let (Some(a), Some(b)) = (m.get(arm), m.get(base)) {
+            let e = clusters.entry(game.clone()).or_default();
+            e.0 += w * (a - b);
+            e.1 += w;
+        }
+    }
+    clusters
+}
+
+/// 層（相手）ごとの cluster を**層の内側で**再標本化し、層平均の percentile CI を返す。
+///
+/// issue #36 の契約: `Δcombined = (Δv13 + Δv14) / 2`、bootstrap は各相手の内側で
+/// 元対局を別々に引き直す（opponent-balanced な層化 cluster bootstrap）。
+fn stratified_mean_ci(strata: &[Vec<(f64, f64)>], alpha: f64, seed: u64) -> (f64, f64, f64) {
+    let ratio = |v: &[(f64, f64)]| -> Option<f64> {
+        let den: f64 = v.iter().map(|(_, d)| d).sum();
+        (den > 0.0).then(|| v.iter().map(|(n, _)| n).sum::<f64>() / den)
+    };
+    let per: Vec<f64> = strata.iter().filter_map(|v| ratio(v)).collect();
+    if per.len() != strata.len() || per.is_empty() {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
+    let point = per.iter().sum::<f64>() / per.len() as f64;
+    let mut state = seed | 1;
+    let mut draws: Vec<f64> = vec![];
+    for _ in 0..2000 {
+        let mut acc = 0.0;
+        let mut ok = true;
+        for v in strata {
+            if v.is_empty() {
+                ok = false;
+                break;
+            }
+            let mut boot: Vec<(f64, f64)> = Vec::with_capacity(v.len());
+            for _ in 0..v.len() {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                boot.push(v[(state >> 33) as usize % v.len()]);
+            }
+            match ratio(&boot) {
+                Some(r) => acc += r,
+                None => {
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok {
+            draws.push(acc / strata.len() as f64);
+        }
+    }
+    if draws.is_empty() {
+        return (point, f64::NAN, f64::NAN);
+    }
+    draws.sort_by(f64::total_cmp);
+    let idx = |q: f64| -> f64 {
+        let i = ((draws.len() - 1) as f64 * q).round() as usize;
+        draws[i.min(draws.len() - 1)]
+    };
+    (point, idx(alpha / 2.0), idx(1.0 - alpha / 2.0))
+}
+
+/// 事前登録した safety margin（issue #36 の P0-2）。
+const MARGIN_CATASTROPHE: f64 = 0.005; // 破滅率（≥8 反則）+0.5pt まで
+const MARGIN_ACCEPT: f64 = -0.01; // 受理率 −1pt まで
+const MARGIN_FOUL_LIMIT: f64 = 0.005; // 即時反則負け +0.5pt まで
+
+/// 主 arm の判定に使う量（1相手ぶん）。`combined` は同じ関数で層を作る
+struct GateInput {
+    /// `current@real − oracle@kinf@real` の反則/手番（**正 = 改善**）
+    reduction: Vec<(f64, f64)>,
+    /// arm − base（悪化が正）の安全性3種
+    catastrophe: Vec<(f64, f64)>,
+    accept: Vec<(f64, f64)>,
+    foul_limit: Vec<(f64, f64)>,
+}
+
+fn gate_input(rows: &[&serde_json::Value], arm: &str, base: &str) -> GateInput {
+    let vals = |k: &dyn Fn(&serde_json::Value) -> f64, flip: bool| -> Vec<(f64, f64)> {
+        let (a, b) = if flip { (base, arm) } else { (arm, base) };
+        natural_clusters(rows, a, b, k).into_values().collect()
+    };
+    GateInput {
+        // R = current − treatment（正 = 反則が減った）
+        reduction: vals(&|r| r["fouls"].as_f64().unwrap_or(0.0), true),
+        catastrophe: vals(&|r| f64::from(u8::from(r["fouls"].as_f64().unwrap_or(0.0) >= 8.0)), false),
+        accept: vals(
+            &|r| f64::from(u8::from(r["truth_accepted"].as_bool().unwrap_or(false))),
+            false,
+        ),
+        foul_limit: vals(
+            &|r| f64::from(u8::from(r["foul_limit"].as_bool().unwrap_or(false))),
+            false,
+        ),
+    }
+}
+
 fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incomplete: bool) {
     for msg in check_inputs(metas, rows) {
         if allow_incomplete {
@@ -1194,6 +1343,89 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
         println!(
             "    （**門ではない**: 壁時計予算のせいで同じ状態から引き直しても集合が\
              変わる。主 arm の差はこの床と並べて読む）"
+        );
+    }
+
+    // ---- 主 estimand: **全王手手番の自然頻度**（issue #36 の事前登録）----------
+    // `foul` / `nofoul` の2表は層の記述で、合算に使うと少数の foul 層を
+    // 過大に重み付けする（PR #37 レビュー4巡目 [P1]）
+    let all: Vec<&serde_json::Value> = rows.iter().collect();
+    let dbl_rows = rows
+        .iter()
+        .filter(|r| r["arm"] == "current@static" && r["double_check"].as_bool().unwrap_or(false))
+        .count();
+    let term_rows = rows
+        .iter()
+        .filter(|r| r["arm"] == "current@static" && r["terminal"].as_bool().unwrap_or(false))
+        .count();
+    let arms_all: BTreeSet<String> = rows
+        .iter()
+        .map(|r| r["arm"].as_str().unwrap_or("?").to_string())
+        .collect();
+    println!(
+        "\n--- 主 estimand: 全王手手番の自然頻度（単王手のみ。両王手 {dbl_rows} 行は別層 / 終端手番 {term_rows} 行を含む）---"
+    );
+    println!("  {:<22} {:>10} {:>26}", "arm", "反則/手番差", "[元対局 cluster CI]");
+    for arm in &arms_all {
+        let base = baseline_for(arm);
+        if arm == base {
+            continue;
+        }
+        let v: Vec<(f64, f64)> =
+            natural_clusters(&all, arm, base, &|r| r["fouls"].as_f64().unwrap_or(0.0))
+                .into_values()
+                .collect();
+        let den: f64 = v.iter().map(|(_, d)| d).sum();
+        if den <= 0.0 {
+            continue;
+        }
+        let point = v.iter().map(|(n, _)| n).sum::<f64>() / den;
+        let (lo, hi) = cluster_ratio_ci(&v, 0.05, 0x36_2026);
+        println!("  {arm:<22} {point:>+10.3} {:>26}", format!("[{lo:+.3}, {hi:+.3}] vs {base}"));
+    }
+    // ---- P0-2 の事前登録した採否規則 ----------------------------------------
+    let main_arm = "oracle@kinf@real";
+    if arms_all.contains(main_arm) && arms_all.contains("current@real") {
+        let g = gate_input(&all, main_arm, "current@real");
+        let show = |label: &str, v: &[(f64, f64)], margin: f64, higher_is_bad: bool| -> bool {
+            let den: f64 = v.iter().map(|(_, d)| d).sum();
+            if den <= 0.0 {
+                println!("    {label:<26} 判定不能（母数 0）");
+                return false;
+            }
+            let point = v.iter().map(|(n, _)| n).sum::<f64>() / den;
+            let (lo, hi) = cluster_ratio_ci(v, 0.05, 0x36_2027);
+            let ok = if higher_is_bad { point <= margin } else { point >= margin };
+            println!(
+                "    {label:<26} {point:+.4} [{lo:+.4}, {hi:+.4}]  margin {margin:+.4}  {}",
+                if ok { "OK" } else { "**NG**" }
+            );
+            ok
+        };
+        println!("\n--- P0-2 の採否判定（主 arm {main_arm} vs current@real、自然頻度）---");
+        let rden: f64 = g.reduction.iter().map(|(_, d)| d).sum();
+        let (rpoint, rlo, rhi) = if rden > 0.0 {
+            let p = g.reduction.iter().map(|(n, _)| n).sum::<f64>() / rden;
+            let (lo, hi) = cluster_ratio_ci(&g.reduction, 0.05, 0x36_2028);
+            (p, lo, hi)
+        } else {
+            (f64::NAN, f64::NAN, f64::NAN)
+        };
+        println!(
+            "    {:<26} {rpoint:+.4} [{rlo:+.4}, {rhi:+.4}]  門 CI 下限 > 0  {}",
+            "R_foul（current − oracle）",
+            if rlo > 0.0 { "OK" } else { "**NG**" }
+        );
+        let s1 = show("破滅率（≥8反則）", &g.catastrophe, MARGIN_CATASTROPHE, true);
+        let s2 = show("受理率", &g.accept, MARGIN_ACCEPT, false);
+        let s3 = show("即時反則負け", &g.foul_limit, MARGIN_FOUL_LIMIT, true);
+        println!(
+            "    → この相手だけの判定: {}（**採否は相手をまたいだ合算** = `check_policy combined`）",
+            if rlo > 0.0 && s1 && s2 && s3 { "通過" } else { "不通過" }
+        );
+    } else {
+        println!(
+            "\n（主 arm {main_arm} か current@real が無いので P0-2 の採否判定は出さない）"
         );
     }
 
@@ -1728,6 +1960,124 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
     out
 }
 
+/// **相手をまたいだ最終集約**（issue #36 の契約）。
+///
+/// `Δcombined = (Δv13 + Δv14) / 2` を層化 cluster bootstrap（各相手の内側で
+/// 元対局を引き直す）で出し、veto `Δv13 > 0 && Δv14 > 0` と安全性 margin を
+/// **fail-closed** で判定する。相手ごとの report を並べるだけでは、主 CI 下限も
+/// veto も検査されない（PR #37 レビュー4巡目 [P1]）。
+///
+/// 入力は各相手の JSONL（`experiment.opponent` で層に分ける）。
+fn run_combined(args: &[String]) {
+    let mut allow_incomplete = false;
+    let mut paths: Vec<String> = vec![];
+    for a in args {
+        match a.as_str() {
+            "--allow-incomplete" => allow_incomplete = true,
+            x if x.starts_with("--") => die(&format!("未知のオプション: {x}")),
+            x => paths.push(x.to_string()),
+        }
+    }
+    if paths.is_empty() {
+        die("combined には各相手の JSONL を指定してください");
+    }
+    // 相手ごとに meta / rows を分ける
+    let mut by_opp: BTreeMap<String, (Vec<serde_json::Value>, Vec<serde_json::Value>)> =
+        BTreeMap::new();
+    // **1ファイル = 1シャード = 1相手**（meta の `experiment.opponent` が層のラベル）。
+    // 行そのものは相手を持たないので、同じファイルの meta から引く
+    for p in &paths {
+        let text =
+            std::fs::read_to_string(p).unwrap_or_else(|e| die(&format!("{p} を読めません: {e}")));
+        let mut metas = vec![];
+        let mut rows = vec![];
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let v: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|_| die(&format!("{p}: JSON として読めない行があります")));
+            if v["schema"].as_u64() != Some(ROW_SCHEMA as u64) {
+                die(&format!(
+                    "{p}: schema {} は集計できません（現行 {ROW_SCHEMA}）",
+                    v["schema"]
+                ));
+            }
+            if v["type"] == "meta" { metas.push(v) } else { rows.push(v) }
+        }
+        let opp = metas
+            .first()
+            .and_then(|m| m["experiment"]["opponent"].as_str())
+            .unwrap_or_else(|| die(&format!("{p}: meta が無い（相手が分からない）")))
+            .to_string();
+        if opp.is_empty() {
+            die(&format!("{p}: meta の opponent が空です（--opponent 無しで回した記録は層に分けられない）"));
+        }
+        let e = by_opp.entry(opp).or_insert_with(|| (vec![], vec![]));
+        e.0.extend(metas);
+        e.1.extend(rows);
+    }
+    if by_opp.len() < 2 {
+        let msg = format!(
+            "相手が {} 種類しかありません（opponent-balanced 合算には v13 / v14 の両方が要る）",
+            by_opp.len()
+        );
+        if allow_incomplete { eprintln!("警告: {msg}") } else { die(&msg) }
+    }
+    println!("\n=== P0-2 の最終判定（opponent-balanced 合算）===");
+    let main_arm = "oracle@kinf@real";
+    let mut strata_r: Vec<Vec<(f64, f64)>> = vec![];
+    let mut strata_c: Vec<Vec<(f64, f64)>> = vec![];
+    let mut strata_a: Vec<Vec<(f64, f64)>> = vec![];
+    let mut strata_f: Vec<Vec<(f64, f64)>> = vec![];
+    let mut per_opp: Vec<(String, f64)> = vec![];
+    for (opp, (metas, rows)) in &by_opp {
+        // 相手ごとに**入力契約を通す**（欠けたシャード・別実験の混入をここで弾く）
+        for msg in check_inputs(metas, rows) {
+            let m = format!("[{opp}] {msg}");
+            if allow_incomplete { eprintln!("警告: {m}") } else { die(&m) }
+        }
+        let all: Vec<&serde_json::Value> = rows.iter().collect();
+        let g = gate_input(&all, main_arm, "current@real");
+        let den: f64 = g.reduction.iter().map(|(_, d)| d).sum();
+        if den <= 0.0 {
+            let m = format!("[{opp}] 主 arm {main_arm} の行がありません");
+            if allow_incomplete { eprintln!("警告: {m}"); continue } else { die(&m) }
+        }
+        let point = g.reduction.iter().map(|(n, _)| n).sum::<f64>() / den;
+        let (lo, hi) = cluster_ratio_ci(&g.reduction, 0.05, 0x36_2029);
+        println!("  {opp}: R_foul {point:+.4} [{lo:+.4}, {hi:+.4}]（局 {}）", g.reduction.len());
+        per_opp.push((opp.clone(), point));
+        strata_r.push(g.reduction);
+        strata_c.push(g.catastrophe);
+        strata_a.push(g.accept);
+        strata_f.push(g.foul_limit);
+    }
+    if strata_r.len() < 2 && !allow_incomplete {
+        die("層が2つ揃っていないので合算しません");
+    }
+    let (r, rlo, rhi) = stratified_mean_ci(&strata_r, 0.05, 0x36_2030);
+    let (c, _, chi) = stratified_mean_ci(&strata_c, 0.05, 0x36_2031);
+    let (a, alo, _) = stratified_mean_ci(&strata_a, 0.05, 0x36_2032);
+    let (f, _, fhi) = stratified_mean_ci(&strata_f, 0.05, 0x36_2033);
+    println!("  合算 R_foul（(Δv13+Δv14)/2）: {r:+.4} [{rlo:+.4}, {rhi:+.4}]");
+    println!("  破滅率 {c:+.4}（上限 {MARGIN_CATASTROPHE:+.4}、CI 上限 {chi:+.4}）");
+    println!("  受理率 {a:+.4}（下限 {MARGIN_ACCEPT:+.4}、CI 下限 {alo:+.4}）");
+    println!("  即時反則負け {f:+.4}（上限 {MARGIN_FOUL_LIMIT:+.4}、CI 上限 {fhi:+.4}）");
+    let veto = per_opp.iter().all(|(_, p)| *p > 0.0);
+    println!(
+        "  veto（各相手で R_foul > 0）: {}",
+        if veto { "OK" } else { "**NG**" }
+    );
+    let pass = rlo > 0.0
+        && veto
+        && c <= MARGIN_CATASTROPHE
+        && a >= MARGIN_ACCEPT
+        && f <= MARGIN_FOUL_LIMIT;
+    println!("\n  **判定: {}**", if pass { "通過（P0-2b へ進む）" } else { "不通過" });
+    if !pass && !allow_incomplete {
+        // fail-closed: 判定が通らない実験を緑で終わらせない
+        std::process::exit(3);
+    }
+}
+
 fn run_report(args: &[String]) {
     let mut allow_incomplete = false;
     let mut want_shards: Option<usize> = None;
@@ -1829,6 +2179,7 @@ mod tests {
             "identity_err": 0.0, "deduce": serde_json::Value::Null,
             "oracle": serde_json::Value::Null, "double_check": false,
             "identity_err_real": 0.0, "identity_only_real": 0,
+            "terminal": false, "weight": 1.0,
         })
     }
 
@@ -1858,6 +2209,54 @@ mod tests {
         e["beliefs"] = serde_json::json!(["oracle@k1"]);
         e["beliefs_real"] = serde_json::json!(["oracle@kinf"]);
         e
+    }
+
+    /// 自然頻度の cluster を作る最小の行（`weight` と `double_check` を効かせる）
+    fn nat_row(game: &str, mn: u64, arm: &str, fouls: f64, w: f64, dbl: bool) -> serde_json::Value {
+        serde_json::json!({
+            "schema": ROW_SCHEMA, "game": game, "move_number": mn, "seed": 0,
+            "arm": arm, "fouls": fouls, "weight": w, "double_check": dbl,
+            "truth_accepted": true, "foul_limit": false,
+        })
+    }
+
+    #[test]
+    fn 自然頻度は包含重みで戻し両王手を除く() {
+        // 間引いた反則0の手番は `weight` で元の層頻度へ戻す。両王手は介入が
+        // no-op なので分母に入れない（PR #37 レビュー4巡目 [P1]）
+        let rows = vec![
+            // 反則あり（weight 1）: arm は 1 少ない
+            nat_row("g1", 10, "current@real", 3.0, 1.0, false),
+            nat_row("g1", 10, "oracle@kinf@real", 2.0, 1.0, false),
+            // 反則0を 3 本のうち 1 本に間引いた（weight 3）: 差 0
+            nat_row("g1", 20, "current@real", 0.0, 3.0, false),
+            nat_row("g1", 20, "oracle@kinf@real", 0.0, 3.0, false),
+            // 両王手（除外されるので分母に入らない）
+            nat_row("g1", 30, "current@real", 9.0, 1.0, true),
+            nat_row("g1", 30, "oracle@kinf@real", 0.0, 1.0, true),
+        ];
+        let sel: Vec<&serde_json::Value> = rows.iter().collect();
+        let c = natural_clusters(&sel, "oracle@kinf@real", "current@real", &|r| {
+            r["fouls"].as_f64().unwrap_or(0.0)
+        });
+        let (num, den) = c["g1"];
+        assert!((den - 4.0).abs() < 1e-9, "重み 1 + 3（両王手は除く）: {den}");
+        assert!((num - (-1.0)).abs() < 1e-9, "差 −1 × 重み 1: {num}");
+        // 均衡標本のまま合算すると −0.5 に見えるが、自然頻度では −0.25
+        assert!((num / den - (-0.25)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn 合算は相手ごとの層の平均になる() {
+        // `(Δv13 + Δv14) / 2`。層の内側で元対局を引き直す
+        let a = vec![(-1.0, 1.0), (-1.0, 1.0)];
+        let b = vec![(1.0, 1.0), (1.0, 1.0)];
+        let (p, lo, hi) = stratified_mean_ci(&[a, b], 0.05, 7);
+        assert!(p.abs() < 1e-9, "+1 と −1 の平均は 0: {p}");
+        assert!(lo <= p && p <= hi);
+        // 片方の層が空なら判定不能（NaN）にする
+        let (p2, _, _) = stratified_mean_ci(&[vec![(-1.0, 1.0)], vec![]], 0.05, 7);
+        assert!(p2.is_nan());
     }
 
     #[test]

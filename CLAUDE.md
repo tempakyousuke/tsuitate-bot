@@ -1135,6 +1135,24 @@
     片側にしか無い候補は `identity_only_real` として別に数える
   - `--belief-real` に `oracle@k1` を明示しても自動追加と衝突しない（arm を
     タグで正規化する。**長時間実験の末尾で「重複行があります」で落とさない**）
+  - **母集団は `check_belief::decision_points`（3バイナリ共通）**（レビュー4巡目 [P1]）。
+    `for_each_decision_full` は受理手を単位に回すので**終端手番を返さない**:
+    改善対象の最悪ケースであり即時反則負けの分子でもある手番が系統的に消えると、
+    オラクル効果も safety 指標も楽観側へ偏る。`bin/check_continue` は終端手番も
+    母集団に入れ、受理手が無くて組めない `baseline` arm だけをその手番で外す
+    （期待キーからも外す）
+  - **主 estimand は「全王手手番の自然頻度」**（同 [P1]）。反則0の手番は**既定で
+    間引かない**（`--nofoul-cap N` で間引くときは包含重み = 元の層頻度 ÷ 残した本数を
+    行に残し、自然頻度の表がそれで戻す）。**両王手は分母から除く**（介入が no-op）。
+    `foul` / `nofoul` の2表は層の記述で、そのまま合算すると少数の foul 層を過大に
+    重み付けする
+  - **採否規則は集約経路に実装する**（同 [P1]）。`report` は主 arm
+    （`oracle@kinf@real` vs `current@real`）の `R_foul = current − treatment` を
+    自然頻度で出し、破滅率 +0.5pt / 受理率 −1pt / 即時反則負け +0.5pt の margin と
+    ともに判定する。**採否は相手をまたいだ合算**で、`check_policy combined` が
+    `(Δv13 + Δv14)/2` の層化 cluster bootstrap（各相手の内側で元対局を引き直す）と
+    veto `Δv13 > 0 && Δv14 > 0` を **fail-closed**（不通過なら exit 3）で判定する。
+    CI の `policy-combined` ジョブがこれを回す
   - `deduce_last_move` = H1 ① の演繹（学習なし）。「(a) 直前の相手手で q へ着地した駒」
     でも「(b) 元マスが空いて線が開いた静止飛び駒」でもない仮説だけを落とす。
     捕獲つきの王手は着地点が観測で分かるので `prune_infeasible_discovered_checks` の

@@ -124,7 +124,7 @@ issue の arm 名との対応:
 元 Arena 実行の実験条件の検査は `scripts/ci/verify_arena_provenance.sh`（`check-prep.yml`
 から切り出して**共通化**した。ワークフローごとに書くと片方だけ緩くなる）。
 
-## PR #37 レビューで直した10点（同種の測定をやり直すときは先にここを読む）
+## PR #37 レビューで直した13点（同種の測定をやり直すときは先にここを読む）
 
 1. **[P1] 介入対象を「別の仮説集合」から作っていた**。倍率表を粒子なしの
    `CheckSolver` から作って渡していたが、粒子多数決は `known_loaded` の駒種と
@@ -184,6 +184,28 @@ issue の arm 名との対応:
    **手で突き合わせ**、片側にしか無い候補は `identity_only_real` として数える
 10. **[P2] `--belief-real oracle@k1` が自動追加と重複して完走後に落ちた**。
     arm をタグで正規化して、長時間実験の末尾で「重複行があります」で落とさない
+
+## レビュー4巡目で直した3点（事前登録した契約を集約経路へ）
+
+11. **[P1] P0-2 / P0-2b が共通母集団を使っていなかった**。`for_each_decision_full` は
+    受理手を単位に回すので**終端手番を返さない**（`decision_points` は
+    `bin/check_belief_probe` からしか呼ばれていなかった）。改善対象の最悪ケースで
+    あり即時反則負けの分子でもある手番が消えると、オラクル効果も safety 指標も
+    楽観側へ偏る。3バイナリとも `check_belief::decision_points` へ寄せ、
+    attrition を meta と完全性検査に残した。`bin/check_continue` は終端手番も
+    母集団に入れ、**受理手が無くて組めない `baseline` arm だけ**をその手番で外す
+12. **[P1] 主 estimand「全王手手番の自然頻度」を JSONL から復元できなかった**。
+    反則0の手番を foul と同数まで間引いて包含重みを残していなかったので、
+    均衡標本をそのまま合算すると少数の foul 層を過大に重み付けする。
+    **既定で間引かない**ようにし（`--nofoul-cap` で間引くときは重みを行に残す）、
+    **単王手だけの自然頻度表**を主 estimand として出す（両王手は介入が no-op なので
+    分母から除く）
+13. **[P1] 事前登録した採否規則が集約経路に無かった**。`report` に
+    `R_foul = current@real − oracle@kinf@real`（自然頻度・元対局 cluster CI）と
+    安全性 margin（破滅率 +0.5pt / 受理率 −1pt / 即時反則負け +0.5pt）の判定を足し、
+    **相手をまたいだ最終判定**を `check_policy combined` として実装した
+    （`(Δv13 + Δv14)/2` の層化 cluster bootstrap ＋ veto `Δv13 > 0 && Δv14 > 0`、
+    不通過なら **exit 3**）。CI に `policy-combined` ジョブを足して fail-closed にした
 
 `bin/check_policy` の `ROW_SCHEMA` は **4**（schema 2 = 1. の修正前、schema 3 = 6. の
 修正前の記録は集計から弾く）。

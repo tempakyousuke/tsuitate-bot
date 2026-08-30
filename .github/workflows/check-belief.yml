@@ -558,6 +558,43 @@ jobs:
           path: report.txt
           if-no-files-found: error
 
+  # **相手をまたいだ最終判定**（issue #36 の契約）。相手ごとの report を並べる
+  # だけでは、主 CI 下限も veto も安全性 margin も検査されない
+  # （PR #37 レビュー4巡目 [P1]）。fail-closed（判定が通らなければ赤）
+  policy-combined:
+    needs: [plan, policy]
+    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_policy == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: check-belief-policy-*-s*
+          path: shards
+      - name: Combined gate
+        run: |
+          set -euo pipefail
+          files=$(find shards -name 'check-policy-*.jsonl' | sort)
+          [ -n "$files" ] || { echo "シャードの JSONL がありません" >&2; exit 1; }
+          # `combined` は相手ごとに入力契約（シャードの完全性・実験キー）を通してから
+          # (Δv13 + Δv14)/2 の層化 cluster bootstrap と veto を判定する
+          cargo run --release --bin check_policy -- combined $files | tee combined.txt
+          {
+            echo "## P0-2 の最終判定（opponent-balanced 合算）"
+            echo '```'
+            cat combined.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: check-belief-policy-combined
+          path: combined.txt
+          if-no-files-found: warn
+
   continue:
     needs: plan
     if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_continue == 'true'
