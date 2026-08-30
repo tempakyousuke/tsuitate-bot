@@ -135,16 +135,20 @@ if [ -n "$EXPECT_THINK_BUDGET_MS" ]; then
   # だったのに小さい予算を主張した」側は必ず捕まる（逆向き＝実際より大きい
   # 予算を主張した場合は捕まらない。**非対称なので単独の証拠にはしない**）
   if [ "$budget_src" = legacy_default ]; then
-    avg=$(jq -r '.think_avg_ms_a | tostring' shard-summaries.jsonl | sort -u)
-    if [ "$(echo "$avg" | wc -l)" -ne 1 ] || [ "$avg" = null ]; then
-      echo "::error::旧形式の予算を裏づける think_avg_ms_a がシャード間で揃いません: $(echo $avg)"
+    # **`think_avg_ms_a` は実測値なのでシャードごとに違う**（設定値と違って
+    # 「全シャードで一致」を要求してはいけない）。全シャードが主張した予算
+    # 未満であることだけを見るので、**最大値**で判定する
+    avgs=$(jq -r '.think_avg_ms_a | tostring' shard-summaries.jsonl)
+    if [ -z "$avgs" ] || echo "$avgs" | grep -qx null; then
+      echo "::error::旧形式の予算を裏づける think_avg_ms_a が記録にありません"
       exit 1
     fi
-    if ! awk -v a="$avg" -v b="$EXPECT_THINK_BUDGET_MS" 'BEGIN{exit !(a+0 < b+0)}'; then
-      echo "::error::記録の思考平均 ${avg}ms が主張した予算 ${EXPECT_THINK_BUDGET_MS}ms 以上です。元 Arena は既定値では走っていません"
+    avg_max=$(echo "$avgs" | sort -g | tail -1)
+    if ! awk -v a="$avg_max" -v b="$EXPECT_THINK_BUDGET_MS" 'BEGIN{exit !(a+0 < b+0)}'; then
+      echo "::error::記録の思考平均の最大 ${avg_max}ms が主張した予算 ${EXPECT_THINK_BUDGET_MS}ms 以上です。元 Arena は既定値では走っていません"
       exit 1
     fi
-    printf 'think_avg_ms_a=%s\n' "$avg" >> "$OUT"
+    printf 'think_avg_ms_a_max=%s\n' "$avg_max" >> "$OUT"
   fi
   printf 'phase_think_budget_ms=%s\n' "$EXPECT_THINK_BUDGET_MS" >> "$OUT"
   printf 'think_budget_ms_a_source=%s\n' "$budget_src" >> "$OUT"
