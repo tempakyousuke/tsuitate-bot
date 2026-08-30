@@ -77,7 +77,7 @@ use tsuitate_bot::truth_replay::{for_each_decision_full, parse_bot_and_end};
 ///   集合**に対して適用・記録する。ただし診断が **arm ごとでなく最後の1本で全行を
 ///   上書き**していた（`--belief-real` に複数指定すると別 arm の被覆を主 arm の
 ///   ものとして表示する）ので集計から弾く
-/// - 4 … レビュー2巡目。`deduce` / `oracle` は**その arm の行にだけ**入り、
+/// - 4 … レビュー2〜3巡目。`deduce` / `oracle` は**その arm の行にだけ**入り、
 ///   `current@real` も他の実再決定 arm と同じ再ランキング経路を通る
 ///   （初期粒子サンプルを揃える）。`identity_err_real` はその実再決定側の恒等対照。
 ///   **欠けた列を「問題なし」と読むと恒等対照も演繹の健全性も素通りする**ので、
@@ -85,9 +85,10 @@ use tsuitate_bot::truth_replay::{for_each_decision_full, parse_bot_and_end};
 const ROW_SCHEMA: u32 = 4;
 
 /// schema 4 の行に必ずある列（欠測を既定値で埋めて門を通せてはいけない）
-const REQUIRED_ROW_KEYS: [&str; 7] = [
+const REQUIRED_ROW_KEYS: [&str; 8] = [
     "identity_err",
     "identity_err_real",
+    "identity_only_real",
     "deduce",
     "oracle",
     "double_check",
@@ -778,8 +779,13 @@ fn run_unit(
             false,
         ));
     }
-    let mut p_real_current: Option<Vec<f64>> = None;
-    let mut p_real_identity: Option<Vec<f64>> = None;
+    // **重複を正規化する**（PR #37 レビュー3巡目 [P2]）。`--belief-real oracle@k1` を
+    // 明示すると自動追加と衝突し、同じ arm の行が2本出て**完走後**に
+    // 「重複行があります」で落ちる。長時間実験の末尾で落とさない
+    belief_specs.sort_by(|a, b| a.0.tag.cmp(&b.0.tag));
+    belief_specs.dedup_by(|a, b| a.0.tag == b.0.tag);
+    let mut p_real_current: Option<Vec<(String, f64)>> = None;
+    let mut p_real_identity: Option<Vec<(String, f64)>> = None;
     for (spec, is_deduce) in &belief_specs {
         let t = std::time::Instant::now();
         let Some(run) =
@@ -817,13 +823,15 @@ fn run_unit(
             });
         }
         if spec.belief == (Belief::Oracle { k: 1.0 }) && !spec.real {
-            // **恒等対照（shadow）**: `current@shadow` と bit-exact でなければ壊れている
-            identity_err = Some(
-                p0.iter()
-                    .zip(&run.p_entry)
-                    .map(|(a, b)| (a - b).abs())
-                    .fold(0.0f64, f64::max),
-            );
+            // **恒等対照（shadow）**: `current@shadow` と bit-exact でなければ壊れている。
+            // shadow は候補リストが `setup.moves` のままなので USI の並びも同じ
+            let base: Vec<(String, f64)> = setup
+                .moves
+                .iter()
+                .map(|m| m.usi.clone())
+                .zip(p0.iter().copied())
+                .collect();
+            identity_err = Some(p_gap(&base, &run.p_entry).0);
         }
         // 実再決定側の恒等対照は `current@real` との差で見る（両方とも再ランキング）
         if spec.real && spec.belief == Belief::Current {
@@ -842,14 +850,14 @@ fn run_unit(
             sim_us: t.elapsed().as_micros() as u64,
         });
     }
-    let identity_err_real = match (&p_real_current, &p_real_identity) {
-        (Some(a), Some(b)) if a.len() == b.len() => Some(
-            a.iter()
-                .zip(b)
-                .map(|(x, y)| (x - y).abs())
-                .fold(0.0f64, f64::max),
-        ),
-        _ => None,
+    // **USI で突き合わせる**（PR #37 レビュー3巡目 [P2]）: 実再決定は候補リストごと
+    // 作り直すので、添字で zip すると別の手の p を比べてしまう
+    let (identity_err_real, identity_only_real) = match (&p_real_current, &p_real_identity) {
+        (Some(a), Some(b)) => {
+            let (d, only) = p_gap(a, b);
+            (Some(d), Some(only))
+        }
+        _ => (None, None),
     };
 
     Some(
@@ -888,6 +896,8 @@ fn run_unit(
                     // 演繹の健全性・オラクルの被覆（レビュー2巡目 [P2]）
                     "identity_err": identity_err,
                     "identity_err_real": identity_err_real,
+                    // 片側にしか無い候補の本数（順位入れ替えでなく候補集合の差）
+                    "identity_only_real": identity_only_real,
                     "deduce": a.deduce,
                     "oracle": a.oracle,
                     "double_check": checkers.len() > 1,
@@ -1101,29 +1111,15 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
             die("恒等対照が current と一致しません（issue #36 の中止条件: 判定以前）");
         }
     }
-    // **`deduce_last_move` が真仮説を落としたら中止**（fallback 前で数える）
-    let ded: Vec<&serde_json::Value> = rows
-        .iter()
-        .filter(|r| r["arm"] == "current@static" && !r["deduce"].is_null())
-        .collect();
-    if !ded.is_empty() {
-        let bad = ded
-            .iter()
-            .filter(|r| r["deduce"]["dropped_true"].as_bool().unwrap_or(false))
-            .count();
-        let fb = ded
-            .iter()
-            .filter(|r| r["deduce"]["fallback"].as_bool().unwrap_or(false))
-            .count();
-        let dropped: Vec<f64> = ded
-            .iter()
-            .filter_map(|r| r["deduce"]["dropped"].as_f64())
-            .collect();
+    // **`deduce_last_move` が真仮説を落としたら中止**（fallback 前で数える）。
+    // 診断は arm ごとの行に入るので、**その arm の行から**集める
+    // （`current@static` で絞ると常に空振りする。PR #37 レビュー3巡目 [P1]）
+    if let Some(d) = deduce_summary(rows) {
         println!(
-            "  deduce_last_move: 落とした仮説 平均 {:.1} 本 / 全滅 fallback {fb} / **真仮説を落とした {bad}**",
-            mean(&dropped)
+            "  deduce_last_move: {} 行 / 落とした仮説 平均 {:.1} 本 / 全滅 fallback {} / **真仮説を落とした {}**",
+            d.rows, d.dropped_mean, d.fallback, d.dropped_true
         );
-        if bad > 0 && !allow_incomplete {
+        if d.dropped_true > 0 && !allow_incomplete {
             die("deduce_last_move が真の王手駒の仮説を落としました（健全性違反 = 中止条件）");
         }
     }
@@ -1241,12 +1237,13 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
         );
         for (arm, st) in &by_arm {
             let n = st.n.max(1) as f64;
-            let (d, lo, hi) = if arm == "current@shadow" {
+            // **実再決定 arm の対照は `current@real`**（PR #37 レビュー3巡目 [P1]）。
+            // shadow を対照にすると、介入に「shadow → 実再決定」の差が混ざる
+            let base = baseline_for(arm);
+            let (d, lo, hi) = if arm == base {
                 (0.0, 0.0, 0.0)
             } else {
-                paired_ci(&sel, arm, "current@shadow", &|r| {
-                    r["fouls"].as_f64().unwrap_or(0.0)
-                })
+                paired_ci(&sel, arm, base, &|r| r["fouls"].as_f64().unwrap_or(0.0))
             };
             println!(
                 "  {:<22} {:>7.2} {:>+8.2} {:>7.1} {:>7.1} {:>8.1} {:>8.1} {:>9.2} {:>9.2}{}",
@@ -1259,20 +1256,39 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
                 100.0 * st.mated as f64 / n,
                 mean(&st.material),
                 mean(&st.updates),
-                if arm == "current@shadow" {
+                if arm == base {
                     String::new()
                 } else {
-                    format!("  [{lo:+.2}, {hi:+.2}]")
+                    format!("  [{lo:+.2}, {hi:+.2}] vs {base}")
                 }
             );
         }
-        // 受理直後の被一手詰め（真実ベース。受理手の gain は自己正当化するので主指標）
-        println!("  被一手詰めのペア差（vs current@shadow、元対局 cluster CI）:");
-        for arm in by_arm.keys().filter(|a| *a != "current@shadow") {
-            let (d, lo, hi) = paired_ci(&sel, arm, "current@shadow", &|r| {
+        // 受理直後の被一手詰め（真実ベース。受理手の gain は自己正当化するので主指標）。
+        // 対照は arm ごと（実再決定 arm は `current@real`）
+        println!("  被一手詰めのペア差（対照は arm ごと、元対局 cluster CI）:");
+        for arm in by_arm.keys() {
+            let base = baseline_for(arm);
+            if arm == base {
+                continue;
+            }
+            let (d, lo, hi) = paired_ci(&sel, arm, base, &|r| {
                 f64::from(u8::from(r["mated_in_1"].as_bool().unwrap_or(false)))
             });
-            println!("    {arm:<22} {d:+.4} [{lo:+.4}, {hi:+.4}]");
+            println!("    {arm:<22} {d:+.4} [{lo:+.4}, {hi:+.4}] vs {base}");
+        }
+        // **ノイズ床**: 介入なしの実再決定 arm（`oracle@k1@real`）の同じ endpoint。
+        // 主 arm の差はこれと並べて読む（再決定そのもののばらつき）
+        if by_arm.contains_key("oracle@k1@real") {
+            let (d, lo, hi) = paired_ci(&sel, "oracle@k1@real", "current@real", &|r| {
+                r["fouls"].as_f64().unwrap_or(0.0)
+            });
+            let (m, mlo, mhi) = paired_ci(&sel, "oracle@k1@real", "current@real", &|r| {
+                f64::from(u8::from(r["mated_in_1"].as_bool().unwrap_or(false)))
+            });
+            println!(
+                "  再決定のノイズ床（oracle@k1@real − current@real）: 反則/番 {d:+.2} \
+                 [{lo:+.2}, {hi:+.2}] / 被一手詰め {m:+.4} [{mlo:+.4}, {mhi:+.4}]"
+            );
         }
         // 型別の反則（α を型で切らずに一律に掛けると型2 が沈む、を見る）
         let mut types: BTreeSet<String> = BTreeSet::new();
@@ -1460,6 +1476,68 @@ fn calibration(rows: &[serde_json::Value]) {
             (psum - legal) / n
         );
     }
+}
+
+/// 2つの `(USI, p)` 列を**手で突き合わせて**最大差と「片側にしか無い候補の本数」を返す。
+///
+/// 実再決定は候補リストごと作り直すので、添字で `zip` すると順位が入れ替わった
+/// ときに別の手の p を比べる（PR #37 レビュー3巡目 [P2]）。共通候補で差を取り、
+/// 片側だけの候補は数えて明示する（0 でなければ候補集合そのものが違う）。
+fn p_gap(a: &[(String, f64)], b: &[(String, f64)]) -> (f64, usize) {
+    let ma: BTreeMap<&str, f64> = a.iter().map(|(u, p)| (u.as_str(), *p)).collect();
+    let mb: BTreeMap<&str, f64> = b.iter().map(|(u, p)| (u.as_str(), *p)).collect();
+    let mut worst = 0.0f64;
+    let mut only = 0usize;
+    for (u, pa) in &ma {
+        match mb.get(u) {
+            Some(pb) => worst = worst.max((pa - pb).abs()),
+            None => only += 1,
+        }
+    }
+    only += mb.keys().filter(|u| !ma.contains_key(*u)).count();
+    (worst, only)
+}
+
+/// その arm の対照（**実再決定 arm は `current@real`**、それ以外は `current@shadow`）。
+///
+/// 実再決定は「shadow → 粒子を引き直しての再ランキング」の差を含むので、
+/// shadow を対照にすると介入の効果と混ざる（PR #37 レビュー3巡目 [P1]）。
+fn baseline_for(arm: &str) -> &'static str {
+    if arm.ends_with("@real") { "current@real" } else { "current@shadow" }
+}
+
+/// `deduce_last_move` の健全性の集計（`report` の関門とテストが同じ経路を通る）。
+#[derive(Debug, PartialEq)]
+struct DeduceSummary {
+    rows: usize,
+    dropped_mean: f64,
+    fallback: usize,
+    /// **真の王手駒の仮説を落とした行数**（1つでもあれば中止）
+    dropped_true: usize,
+}
+
+/// 診断は **`deduce_last_move` arm の行**に入る（`current@static` ではない）。
+fn deduce_summary(rows: &[serde_json::Value]) -> Option<DeduceSummary> {
+    let ded: Vec<&serde_json::Value> = rows.iter().filter(|r| !r["deduce"].is_null()).collect();
+    if ded.is_empty() {
+        return None;
+    }
+    let dropped: Vec<f64> = ded
+        .iter()
+        .filter_map(|r| r["deduce"]["dropped"].as_f64())
+        .collect();
+    Some(DeduceSummary {
+        rows: ded.len(),
+        dropped_mean: mean(&dropped),
+        fallback: ded
+            .iter()
+            .filter(|r| r["deduce"]["fallback"].as_bool().unwrap_or(false))
+            .count(),
+        dropped_true: ded
+            .iter()
+            .filter(|r| r["deduce"]["dropped_true"].as_bool().unwrap_or(false))
+            .count(),
+    })
 }
 
 /// `report` の入力契約。破っている点を全部返す
@@ -1750,7 +1828,7 @@ mod tests {
             // schema 2 の必須列（issue #36 P0-2）
             "identity_err": 0.0, "deduce": serde_json::Value::Null,
             "oracle": serde_json::Value::Null, "double_check": false,
-            "identity_err_real": 0.0,
+            "identity_err_real": 0.0, "identity_only_real": 0,
         })
     }
 
@@ -1780,6 +1858,48 @@ mod tests {
         e["beliefs"] = serde_json::json!(["oracle@k1"]);
         e["beliefs_real"] = serde_json::json!(["oracle@kinf"]);
         e
+    }
+
+    #[test]
+    fn deduceの健全性はdeduce_armの行から数える() {
+        // **診断は arm ごとの行に入る**ので、`current@static` で絞ると常に空振りし、
+        // 「真仮説を落としたら中止」が発動しない（PR #37 レビュー3巡目 [P1]）
+        let mut rows = full();
+        assert_eq!(deduce_summary(&rows), None, "診断が無ければ None");
+        for seed in 0..2 {
+            let mut r = row("deduce_last_move@shadow", seed, 1);
+            r["deduce"] = serde_json::json!({
+                "dropped": 3, "fallback": false, "dropped_true": seed == 0,
+                "constructions": 2,
+            });
+            rows.push(r);
+        }
+        let d = deduce_summary(&rows).expect("deduce arm の行から集める");
+        assert_eq!(d.rows, 2);
+        assert_eq!(d.dropped_true, 1, "真仮説を落とした行を数える = 中止条件");
+        assert!((d.dropped_mean - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn 実再決定armの対照はcurrent_real() {
+        // shadow を対照にすると介入に「shadow → 実再決定」の差が混ざる
+        assert_eq!(baseline_for("oracle@kinf@real"), "current@real");
+        assert_eq!(baseline_for("oracle@k1@real"), "current@real");
+        assert_eq!(baseline_for("alpha@k2@shadow"), "current@shadow");
+        assert_eq!(baseline_for("current@static"), "current@shadow");
+    }
+
+    #[test]
+    fn pの差は添字でなく指し手で突き合わせる() {
+        // 実再決定は候補リストごと作り直すので、順位が入れ替わると添字 zip は
+        // 別の手の p を比べる（PR #37 レビュー3巡目 [P2]）
+        let a = vec![("5i5h".to_string(), 0.9), ("5i4h".to_string(), 0.4)];
+        let b = vec![("5i4h".to_string(), 0.4), ("5i5h".to_string(), 0.9)];
+        assert_eq!(p_gap(&a, &b), (0.0, 0), "並びが違っても同じ手同士なら差 0");
+        let c = vec![("5i4h".to_string(), 0.4), ("5i6h".to_string(), 0.9)];
+        let (d, only) = p_gap(&a, &c);
+        assert!((d - 0.0).abs() < 1e-9, "共通候補は 5i4h だけ");
+        assert_eq!(only, 2, "片側にしか無い候補を数える");
     }
 
     #[test]

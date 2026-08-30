@@ -178,8 +178,11 @@ impl ArmSpec {
 /// 1 arm ぶんの結果（`run_arm`）。
 pub struct ArmRun {
     pub out: crate::check_policy::SimOutcome,
-    /// その arm が手番開始時に見た p_legal（恒等対照の検査に使う）
-    pub p_entry: Vec<f64>,
+    /// その arm が手番開始時に見た `(USI, p_legal)`。
+    ///
+    /// **USI を持つ**のが要点（PR #37 レビュー3巡目 [P2]）: 実再決定は候補リストごと
+    /// 作り直すので、添字で突き合わせると再決定のたびに別の手の p を比べてしまう。
+    pub p_entry: Vec<(String, f64)>,
 }
 
 /// 1 arm を回す（**P0-2 と P0-2b で同じ配管**）。
@@ -222,7 +225,13 @@ pub fn run_arm(
                 opp_fouls,
                 UpdateRule::Shadow(&setup.updater),
             );
-            Some(ArmRun { out, p_entry: p })
+            let p_entry = setup
+                .moves
+                .iter()
+                .map(|m| m.usi.clone())
+                .zip(p.iter().copied())
+                .collect();
+            Some(ArmRun { out, p_entry })
         });
     }
     // 実再決定: 初回ランキングも arm の信念の下で作り直す
@@ -266,7 +275,12 @@ pub fn run_arm(
             opp_fouls,
             UpdateRule::Real(&mut real),
         );
-        Some(ArmRun { out, p_entry: p0 })
+        let p_entry = moves
+            .iter()
+            .map(|m| m.usi.clone())
+            .zip(p0.iter().copied())
+            .collect();
+        Some(ArmRun { out, p_entry })
     })
 }
 

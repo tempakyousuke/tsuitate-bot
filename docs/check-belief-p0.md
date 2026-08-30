@@ -124,7 +124,7 @@ issue の arm 名との対応:
 元 Arena 実行の実験条件の検査は `scripts/ci/verify_arena_provenance.sh`（`check-prep.yml`
 から切り出して**共通化**した。ワークフローごとに書くと片方だけ緩くなる）。
 
-## PR #37 レビューで直した6点（同種の測定をやり直すときは先にここを読む）
+## PR #37 レビューで直した10点（同種の測定をやり直すときは先にここを読む）
 
 1. **[P1] 介入対象を「別の仮説集合」から作っていた**。倍率表を粒子なしの
    `CheckSolver` から作って渡していたが、粒子多数決は `known_loaded` の駒種と
@@ -166,6 +166,24 @@ issue の arm 名との対応:
    複数指定できるので、`oracle@kinf,oracle@k2` を回すと全行の `oracle.arm` が
    `oracle@k2@real` になり、`report` がそれを主 arm の被覆・fallback として表示した。
    `deduce` / `oracle` を**その arm の行にだけ**入れ、`report` も arm ごとに集計する
+
+## レビュー3巡目で直した4点
+
+7. **[P1] 演繹の健全性関門が常に空振りしていた**。6. で診断を arm ごとの行へ移した
+   のに、`report` 側は `current@static` の行から集めたままだったので、
+   `dropped_true=true` が出ても中止条件が発動しない。集計を **`deduce` を持つ行**
+   （= `deduce_last_move@shadow`）から取るようにし、純関数 `deduce_summary` へ切り出して
+   「真仮説を落とした行を数える」ことをテストで固定した
+8. **[P1] 主 arm の効果量が `current@shadow` を対照にしていた**。実再決定 arm は
+   「shadow → 粒子を引き直しての再ランキング」の差を含むので、shadow を対照にすると
+   介入の効果と混ざる。反則/手番も被一手詰めも **arm ごとに対照を選ぶ**
+   （`@real` は `current@real`）ようにし、`oracle@k1@real − current@real` の同じ
+   endpoint を**ノイズ床**として同じ表に並べた
+9. **[P2] `identity_err_real` が添字で突き合わせていた**。実再決定は候補リストごと
+   作り直すので、順位が入れ替わると別の手の p を比べる。`(USI, p)` を持ち回って
+   **手で突き合わせ**、片側にしか無い候補は `identity_only_real` として数える
+10. **[P2] `--belief-real oracle@k1` が自動追加と重複して完走後に落ちた**。
+    arm をタグで正規化して、長時間実験の末尾で「重複行があります」で落とさない
 
 `bin/check_policy` の `ROW_SCHEMA` は **4**（schema 2 = 1. の修正前、schema 3 = 6. の
 修正前の記録は集計から弾く）。
