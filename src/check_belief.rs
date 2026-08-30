@@ -21,10 +21,9 @@
 //! 0.05 でも粒子ブレンドに消されることもある）ので、P0-1 に中止の門は置かない。
 //! 因果はオラクル arm（P0-2）でしか言えない。
 
-use std::collections::HashMap;
 
 use crate::board::Coord;
-use crate::check::HypothesisDiag;
+use crate::check::{DiagMode, HypothesisDiag};
 use crate::check_economy::true_checkers;
 use crate::protocol::{Color, Role};
 use crate::shogi::{Position, ShogiMove};
@@ -88,75 +87,41 @@ impl Belief {
         matches!(self, Belief::Oracle { .. } | Belief::Misdirected { .. })
     }
 
-    /// この arm の診断フック。`hyps` は**現行の**仮説（誤誘導 arm の
-    /// 「最大重みの誤仮説」を決めるのに要る。順序は決定論的）
-    pub fn diag(
-        &self,
-        truth: &Position,
-        bot: Color,
-        hyps: &[(Coord, Role, f64)],
-    ) -> HypothesisDiag {
-        let mut factors: HashMap<(Coord, Role), f64> = HashMap::new();
+    /// この arm の診断フック。
+    ///
+    /// **対象の決定は `CheckSolver` 側**（`check::apply_diag`）に任せる:
+    /// 倍率表をここで作って渡すと、粒子投票の有無で列挙集合が変わったときに
+    /// 実評価側にしか無い誤仮説へ ×0 が付かず、full oracle でないものを
+    /// `oracle@kinf` として集計してしまう（PR #37 レビュー [P1]）。
+    pub fn diag(&self, truth: &Position, bot: Color) -> HypothesisDiag {
+        // **単王手のみ主 estimand**（両王手は 2 仮説をともに ×k しても
+        // 重みが半々になるだけで、一方しか解消しない非合法手に ≈0.5 が付く）
+        let checkers = true_checkers(truth, bot);
+        let single: Vec<(Coord, Role)> = if checkers.len() == 1 { checkers } else { vec![] };
         match self {
-            Belief::Current => {}
-            Belief::DeduceLastMove => {
-                return HypothesisDiag { factors, deduce_last_move: true };
-            }
-            Belief::Oracle { k } => {
-                let checkers = true_checkers(truth, bot);
-                // **単王手のみ主 estimand**（両王手は 2 仮説をともに ×k しても
-                // 重みが半々になるだけで、一方しか解消しない非合法手に ≈0.5 が付く）
-                if checkers.len() == 1 {
-                    for c in checkers {
-                        factors.insert(c, *k);
-                    }
-                    // k=∞ は「真仮説以外を潰す」= 他を ×0（全滅時は
-                    // `apply_diag` が元へ戻す）
-                    if *k >= ORACLE_INF {
-                        for (s, r, _) in hyps {
-                            if !factors.contains_key(&(*s, *r)) {
-                                factors.insert((*s, *r), 0.0);
-                            }
-                        }
-                    }
-                }
-            }
-            Belief::Misdirected { k } => {
-                let checkers = true_checkers(truth, bot);
-                let worst = hyps
-                    .iter()
-                    .filter(|(s, r, _)| !checkers.iter().any(|(cs, cr)| cs == s && cr == r))
-                    // 同点は (マス, 駒種) の辞書順で決める（乱数を入れない）
-                    .max_by(|a, b| {
-                        a.2.total_cmp(&b.2)
-                            .then_with(|| (b.0.file, b.0.rank).cmp(&(a.0.file, a.0.rank)))
-                    });
-                if let Some((s, r, _)) = worst {
-                    factors.insert((*s, *r), *k);
-                    if *k >= ORACLE_INF {
-                        for (hs, hr, _) in hyps {
-                            if (*hs, *hr) != (*s, *r) {
-                                factors.insert((*hs, *hr), 0.0);
-                            }
-                        }
-                    }
-                }
-            }
+            Belief::Current => HypothesisDiag::default(),
+            Belief::DeduceLastMove => HypothesisDiag {
+                deduce_last_move: true,
+                ..HypothesisDiag::default()
+            },
+            Belief::Oracle { k } => HypothesisDiag {
+                truth: single,
+                mode: DiagMode::Oracle { k: *k },
+                deduce_last_move: false,
+            },
+            Belief::Misdirected { k } => HypothesisDiag {
+                truth: single,
+                mode: DiagMode::Misdirected { k: *k },
+                deduce_last_move: false,
+            },
         }
-        HypothesisDiag { factors, deduce_last_move: false }
     }
 
     /// この arm の診断フックを設置して `f` を走らせる。
     /// `Belief::Current` は**フックを設置しない**（恒等対照が bit-exact に
     /// なるように、no-op のスコープすら張らない）
-    pub fn scoped<R>(
-        &self,
-        truth: &Position,
-        bot: Color,
-        hyps: &[(Coord, Role, f64)],
-        f: impl FnOnce() -> R,
-    ) -> R {
-        let d = self.diag(truth, bot, hyps);
+    pub fn scoped<R>(&self, truth: &Position, bot: Color, f: impl FnOnce() -> R) -> R {
+        let d = self.diag(truth, bot);
         if d.is_noop() {
             return f();
         }
@@ -227,7 +192,6 @@ pub fn run_arm(
     truth: &Position,
     bot: Color,
     spec: &ArmSpec,
-    entry_hyps: &[(Coord, Role, f64)],
     params: &crate::strategy::EvalParams,
 ) -> Option<ArmRun> {
     use std::collections::HashSet;
@@ -242,13 +206,14 @@ pub fn run_arm(
     let fouls_before = entry.fouls[side_idx(side)];
     let opp_fouls = entry.fouls[side_idx(side.other())];
     let b = &spec.belief;
+    // **1 arm = 1 scope**（PR #37 レビュー [P1]）: scope に入るたびに
+    // `DiagRecord` を空にするので、初回ランキングと simulate を別々の scope に
+    // 割ると「最初の構築で真仮説を落とした」記録が消える
     if !spec.real {
         // p-only: gain・`removal_term` は初回ランキングの値のまま
-        let p = b.scoped(truth, bot, entry_hyps, || {
-            setup.updater.p_after(&setup.moves, &[])
-        });
-        let out = b.scoped(truth, bot, entry_hyps, || {
-            simulate(
+        return b.scoped(truth, bot, || {
+            let p = setup.updater.p_after(&setup.moves, &[]);
+            let out = simulate(
                 &spec.policy,
                 &setup.moves,
                 &p,
@@ -256,43 +221,43 @@ pub fn run_arm(
                 fouls_before,
                 opp_fouls,
                 UpdateRule::Shadow(&setup.updater),
-            )
+            );
+            Some(ArmRun { out, p_entry: p })
         });
-        return Some(ArmRun { out, p_entry: p });
     }
     // 実再決定: 初回ランキングも arm の信念の下で作り直す
     let entry_view = make_view(&entry.pos, side, &entry.fouls);
     let mut b0 = setup.strat.clone_boxed()?;
-    let moves = b.scoped(truth, bot, entry_hyps, || {
-        b0.choose(&entry_view, &setup.log, &HashSet::new())?;
-        let r = b0.last_ranking()?.to_vec();
-        let mut s = CheckSolver::new(&entry_view, &[], &[], &setup.log);
-        Some(policy_moves(&r, &entry_view, truth, s.as_mut(), king))
-    })?;
-    if moves.is_empty() {
-        return None;
-    }
-    let p0: Vec<f64> = moves.iter().map(|m| m.p_legal).collect();
-    let mut real = |fouls: &[ShogiMove]| -> Option<Vec<crate::check_policy::PolicyMove>> {
-        let mut c = setup.strat.clone_boxed()?;
-        let mut post_log = clone_log(&setup.log);
-        let mut post_fouls = entry.fouls;
-        for m in fouls {
-            post_fouls[side_idx(side)] += 1;
-            post_log.record(Observation::MyFoul {
-                move_number: entry.pos.move_number(),
-                usi: m.to_usi(),
-            });
+    b.scoped(truth, bot, || {
+        let moves = {
+            b0.choose(&entry_view, &setup.log, &HashSet::new())?;
+            let r = b0.last_ranking()?.to_vec();
+            let mut s = CheckSolver::new(&entry_view, &[], &[], &setup.log);
+            policy_moves(&r, &entry_view, truth, s.as_mut(), king)
+        };
+        if moves.is_empty() {
+            return None;
         }
-        let post_view = make_view(&entry.pos, side, &post_fouls);
-        let tried: HashSet<String> = fouls.iter().map(ShogiMove::to_usi).collect();
-        c.choose(&post_view, &post_log, &tried)?;
-        let r = c.last_ranking()?.to_vec();
-        let mut s = CheckSolver::new(&post_view, &[], fouls, &post_log);
-        Some(policy_moves(&r, &post_view, truth, s.as_mut(), king))
-    };
-    let out = b.scoped(truth, bot, entry_hyps, || {
-        simulate(
+        let p0: Vec<f64> = moves.iter().map(|m| m.p_legal).collect();
+        let mut real = |fouls: &[ShogiMove]| -> Option<Vec<crate::check_policy::PolicyMove>> {
+            let mut c = setup.strat.clone_boxed()?;
+            let mut post_log = clone_log(&setup.log);
+            let mut post_fouls = entry.fouls;
+            for m in fouls {
+                post_fouls[side_idx(side)] += 1;
+                post_log.record(Observation::MyFoul {
+                    move_number: entry.pos.move_number(),
+                    usi: m.to_usi(),
+                });
+            }
+            let post_view = make_view(&entry.pos, side, &post_fouls);
+            let tried: HashSet<String> = fouls.iter().map(ShogiMove::to_usi).collect();
+            c.choose(&post_view, &post_log, &tried)?;
+            let r = c.last_ranking()?.to_vec();
+            let mut s = CheckSolver::new(&post_view, &[], fouls, &post_log);
+            Some(policy_moves(&r, &post_view, truth, s.as_mut(), king))
+        };
+        let out = simulate(
             &spec.policy,
             &moves,
             &p0,
@@ -300,16 +265,9 @@ pub fn run_arm(
             fouls_before,
             opp_fouls,
             UpdateRule::Real(&mut real),
-        )
-    });
-    Some(ArmRun { out, p_entry: p0 })
-}
-
-/// 手番開始時の**ソルバー単体**の仮説（`run_arm` の `entry_hyps`）
-pub fn entry_hypotheses(setup: &crate::check_policy::EntrySetup) -> Vec<(Coord, Role, f64)> {
-    crate::check::CheckSolver::new(&setup.view, &[], &[], &setup.log)
-        .map(|s| s.hypotheses_debug())
-        .unwrap_or_default()
+        );
+        Some(ArmRun { out, p_entry: p0 })
+    })
 }
 
 /// 注目する2手（P0-1 の伝達の分解の単位）。
@@ -509,12 +467,35 @@ mod tests {
 
     #[test]
     fn 恒等対照は介入しない() {
-        // `oracle@k1` は「真仮説 ×1」= 何も変えない。`current` と同じく
-        // フックの中身が空であることを型で確かめる（bit-exact の前提）
+        // `oracle@k1` は「真仮説 ×1」= 何も変えない。介入対象の決定は
+        // `CheckSolver` 側なので、ここでは倍率と演繹フラグだけを確かめる
         let truth = Position::initial();
-        let d = Belief::Oracle { k: 1.0 }.diag(&truth, Color::Sente, &[]);
-        assert!(d.factors.values().all(|v| *v == 1.0));
+        let d = Belief::Oracle { k: 1.0 }.diag(&truth, Color::Sente);
+        assert_eq!(d.mode, DiagMode::Oracle { k: 1.0 });
         assert!(!d.deduce_last_move);
-        assert!(Belief::Current.diag(&truth, Color::Sente, &[]).is_noop());
+        assert!(Belief::Current.diag(&truth, Color::Sente).is_noop());
     }
+
+    #[test]
+    fn 両王手にはオラクルを掛けない() {
+        // 2仮説をともに ×k しても重みが半々になるだけで、一方しか解消しない
+        // 非合法手に ≈0.5 が付く。単王手が主 estimand（issue #36 の契約）
+        use crate::protocol::Color;
+        use crate::shogi::{Piece, Position};
+        let mut pos = Position::empty(Color::Sente);
+        let set = |p: &mut Position, sq: &str, color, role| {
+            p.set(
+                crate::board::parse_usi_square(sq).unwrap(),
+                Some(Piece { color, role }),
+            );
+        };
+        set(&mut pos, "5e", Color::Sente, Role::King);
+        set(&mut pos, "5a", Color::Gote, Role::Rook);
+        set(&mut pos, "1a", Color::Gote, Role::Bishop);
+        set(&mut pos, "5i", Color::Gote, Role::King);
+        assert_eq!(crate::check_economy::true_checkers(&pos, Color::Sente).len(), 2);
+        let d = Belief::Oracle { k: 4.0 }.diag(&pos, Color::Sente);
+        assert!(d.truth.is_empty(), "両王手では介入対象を渡さない");
+    }
+
 }

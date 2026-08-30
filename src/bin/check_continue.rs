@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tsuitate_bot::check_economy::entry_replayed;
-use tsuitate_bot::check_belief::{self, ArmSpec, entry_hypotheses};
+use tsuitate_bot::check_belief::{self, ArmSpec};
 use tsuitate_bot::check_policy::entry_setup;
 use tsuitate_bot::checkpoint::stable_hash;
 use tsuitate_bot::mate_economy::force_move;
@@ -498,7 +498,6 @@ fn main() {
         let Some(setup) = entry_setup(&p.entry, &p.truth, seed, &params, eval_particles) else {
             return;
         };
-        let entry_hyps = entry_hypotheses(&setup);
         let mut by_arm: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for spec in &policies {
             // 配管は `bin/check_policy`（P0-2）と共有する
@@ -508,7 +507,6 @@ fn main() {
                 &p.truth,
                 p.bot,
                 spec,
-                &entry_hyps,
                 &params,
             ) else {
                 continue;

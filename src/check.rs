@@ -183,44 +183,86 @@ struct Hypothesis {
 /// [`scoped_hypothesis_diag`] だけで、既定（未設置）では
 /// **1回も分岐の中身を実行しない**ので挙動は完全に不変。
 ///
-/// - `factors` … `(マス, 駒種) → 倍率`。オラクル arm（真の王手駒 × k）と
-///   誤誘導 arm（真でない最大重みの仮説 × k）が使う。倍率を掛けた結果
-///   総重みが 0 以下になったら**元に戻す**（仮説を全滅させない）
-/// - `deduce_last_move` … H1 ① の演繹（直前の相手手の1手で説明できない仮説の
-///   除去）。落とそうとした仮説は [`take_deduce_dropped`] で**fallback の前に**
-///   取れる（真仮説を落としたかを健全性として数えるため）
+/// **介入は「その `CheckSolver` が実際に列挙した集合」に対して解決する**
+/// （PR #37 レビュー [P1]）。倍率表を外で作って渡すと、粒子投票の有無で
+/// `known_loaded` の駒種とマーカーの載せ方が変わって列挙集合そのものが変わる
+/// ため、実評価側にしか無い誤仮説に ×0 が付かず「full oracle ではないもの」を
+/// `oracle@kinf` として集計してしまう。だからここには**選択規則**だけを渡し、
+/// 対象の決定・被覆の記録・全滅 fallback は列挙後の集合の上で行う。
 #[derive(Clone, Default, Debug)]
 pub struct HypothesisDiag {
-    pub factors: HashMap<(Coord, Role), f64>,
+    /// 真の王手駒（マス・駒種）。**単王手のときだけ渡す**
+    /// （両王手は2仮説をともに ×k しても重みが半々になるだけ）
+    pub truth: Vec<(Coord, Role)>,
+    pub mode: DiagMode,
+    /// H1 ① の演繹（直前の相手手の1手で説明できない仮説の除去）。
+    /// 落とそうとした仮説は [`take_diag_record`] で**fallback の前に**取れる
     pub deduce_last_move: bool,
 }
 
+/// 仮説重みへの介入の種類（[`HypothesisDiag`]）。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum DiagMode {
+    #[default]
+    None,
+    /// 真の王手駒 × k（`k` が [`ORACLE_INF`] 以上なら**それ以外を ×0**）
+    Oracle { k: f64 },
+    /// 真でない仮説のうち**その集合で**重みが最大のもの × k
+    /// （adversarial stress test）。同点は (マス, 駒種) の辞書順で決める
+    Misdirected { k: f64 },
+}
+
+/// `k = ∞`（真仮説以外を潰す）の内部表現。`f64::INFINITY` を掛けると
+/// 正規化が NaN になるので有限の巨大値にする
+pub const ORACLE_INF: f64 = 1e9;
+
 impl HypothesisDiag {
     pub fn is_noop(&self) -> bool {
-        self.factors.is_empty() && !self.deduce_last_move
+        self.mode == DiagMode::None && !self.deduce_last_move
     }
+}
+
+/// スコープ内の**全 `CheckSolver` 構築ぶん**の診断記録。
+///
+/// 1つの arm は手番開始時だけでなく反則を食うたびにソルバーを作り直すので、
+/// 最後の構築だけを見ると「途中で真仮説を落とした」健全性違反も
+/// 「実評価の集合に真仮説が無かった」も取りこぼす（PR #37 レビュー [P1]）。
+#[derive(Clone, Debug, Default)]
+pub struct DiagRecord {
+    /// フックを見た `CheckSolver::new` の回数
+    pub constructions: u32,
+    /// そのうち**真の王手駒が実際に列挙されていた**回数（= オラクルが介入できた）
+    pub truth_present: u32,
+    /// 倍率で総重みが 0 以下になり元へ戻した回数（介入が効かなかった構築）
+    pub weight_fallback: u32,
+    /// `deduce_last_move` が落とそうとした仮説の**延べ**（全滅 fallback の前）
+    pub deduce_dropped: Vec<(Coord, Role)>,
+    /// `deduce_last_move` の全滅 fallback が1度でも発動したか
+    pub deduce_fallback: bool,
 }
 
 thread_local! {
     static HYP_DIAG: std::cell::RefCell<Option<std::rc::Rc<HypothesisDiag>>> =
         const { std::cell::RefCell::new(None) };
-    /// `deduce_last_move` のスコープ内で落とそうとした仮説の**延べ**
-    /// （**全滅 fallback を掛ける前**）と、fallback が1度でも発動したか
-    static DEDUCE_DROPPED: std::cell::RefCell<(Vec<(Coord, Role)>, bool)> =
-        const { std::cell::RefCell::new((Vec::new(), false)) };
+    static DIAG_RECORD: std::cell::RefCell<DiagRecord> =
+        const { std::cell::RefCell::new(DiagRecord {
+            constructions: 0,
+            truth_present: 0,
+            weight_fallback: 0,
+            deduce_dropped: Vec::new(),
+            deduce_fallback: false,
+        }) };
 }
 
 /// 診断フックを設置して `f` を走らせる（**この関数を runtime から呼ばない**）。
 ///
 /// スレッドローカルなので、`Strategy::choose` の内側で作られる `CheckSolver`
 /// にも効く（= 実再決定 arm が gain / `removal_term` まで作り直せる）。
-/// 入れ子は「内側が勝つ」ではなく**内側だけが見える**ので、arm の scope を
-/// 二重に張らないこと。
+/// **1 arm は1つの scope で回すこと**: scope に入るたびに記録を空にするので、
+/// arm を複数の scope に割ると最初の構築の記録（真仮説を落としたか・被覆）が
+/// 消える（PR #37 レビュー [P1]）。
 pub fn scoped_hypothesis_diag<R>(diag: &HypothesisDiag, f: impl FnOnce() -> R) -> R {
-    if diag.deduce_last_move {
-        // スコープごとに記録を閉じる（前の arm の残りが混ざらない）
-        DEDUCE_DROPPED.with(|c| *c.borrow_mut() = (Vec::new(), false));
-    }
+    DIAG_RECORD.with(|c| *c.borrow_mut() = DiagRecord::default());
     let rc = std::rc::Rc::new(diag.clone());
     let prev = HYP_DIAG.with(|c| c.borrow_mut().replace(rc));
     let out = f();
@@ -228,14 +270,9 @@ pub fn scoped_hypothesis_diag<R>(diag: &HypothesisDiag, f: impl FnOnce() -> R) -
     out
 }
 
-/// `deduce_last_move` の記録を取り出す（`(落とそうとした仮説の延べ,
-/// 全滅 fallback が1度でも発動したか)`）。取り出すと消える。
-///
-/// **スコープ内の全構築ぶんを累積する**: 1つの arm は手番開始時だけでなく
-/// 反則を食うたびにソルバーを作り直すので、最後の構築だけを見ると
-/// 「途中で真仮説を落とした」健全性違反を取りこぼす。
-pub fn take_deduce_dropped() -> (Vec<(Coord, Role)>, bool) {
-    DEDUCE_DROPPED.with(|c| std::mem::take(&mut *c.borrow_mut()))
+/// スコープ内の診断記録を取り出す（取り出すと消える）。
+pub fn take_diag_record() -> DiagRecord {
+    DIAG_RECORD.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
 /// 粒子のうち自玉が王手されているものが1つでもあるか（P0-1 の層分けで
@@ -575,24 +612,76 @@ impl CheckSolver {
         opp_hand_possible: &HashMap<Role, i32>,
         log: &ObservationLog,
     ) {
-        if !diag.factors.is_empty() {
-            let saved: Vec<f64> = self.hypotheses.iter().map(|h| h.weight).collect();
-            for h in &mut self.hypotheses {
-                if let Some(k) = diag.factors.get(&(h.square, h.role)) {
-                    h.weight *= k.max(0.0);
+        // **介入対象は「この `CheckSolver` が実際に列挙した集合」から選ぶ**
+        // （倍率表を外で作ると、粒子投票の有無で列挙集合が変わったときに
+        // 実評価側にしか無い誤仮説へ ×0 が付かない。PR #37 レビュー [P1]）
+        let is_truth = |h: &Hypothesis| {
+            diag.truth
+                .iter()
+                .any(|(s, r)| *s == h.square && *r == h.role)
+        };
+        let truth_present = self.hypotheses.iter().any(is_truth);
+        let mut fallback = false;
+        match diag.mode {
+            DiagMode::None => {}
+            DiagMode::Oracle { k } => {
+                if !diag.truth.is_empty() {
+                    fallback = self.rescale(k, k >= ORACLE_INF, is_truth);
                 }
             }
-            let total: f64 = self.hypotheses.iter().map(|h| h.weight.max(0.0)).sum();
-            if !(total > 0.0) {
-                // 真仮説が集合に無い（coverage failure）ときに ×0 で全滅させない
-                for (h, w) in self.hypotheses.iter_mut().zip(saved) {
-                    h.weight = w;
+            DiagMode::Misdirected { k } => {
+                // 真でない仮説のうち**この集合で**重みが最大のもの。
+                // 同点は (マス, 駒種) の辞書順で決める（乱数を入れない）
+                let worst = self
+                    .hypotheses
+                    .iter()
+                    .filter(|h| !is_truth(h))
+                    .max_by(|a, b| {
+                        a.weight.total_cmp(&b.weight).then_with(|| {
+                            (b.square.file, b.square.rank, b.role as u8)
+                                .cmp(&(a.square.file, a.square.rank, a.role as u8))
+                        })
+                    })
+                    .map(|h| (h.square, h.role));
+                if let Some(target) = worst {
+                    fallback = self.rescale(k, k >= ORACLE_INF, |h| {
+                        (h.square, h.role) == target
+                    });
                 }
             }
         }
+        DIAG_RECORD.with(|c| {
+            let mut g = c.borrow_mut();
+            g.constructions += 1;
+            g.truth_present += u32::from(truth_present);
+            g.weight_fallback += u32::from(fallback);
+        });
         if diag.deduce_last_move {
             self.prune_by_last_move(opp_hand_possible, log);
         }
+    }
+
+    /// `keep` が真の仮説を ×k し、`zero_others` なら残りを ×0 にする。
+    ///
+    /// 総重みが 0 以下になったら**元へ戻して** `true`（fallback）を返す
+    /// （真仮説がこの集合に無いときに ×0 で全滅させない = 健全性）。
+    fn rescale(&mut self, k: f64, zero_others: bool, keep: impl Fn(&Hypothesis) -> bool) -> bool {
+        let saved: Vec<f64> = self.hypotheses.iter().map(|h| h.weight).collect();
+        for h in &mut self.hypotheses {
+            if keep(h) {
+                h.weight *= k.max(0.0);
+            } else if zero_others {
+                h.weight = 0.0;
+            }
+        }
+        let total: f64 = self.hypotheses.iter().map(|h| h.weight.max(0.0)).sum();
+        if total > 0.0 {
+            return false;
+        }
+        for (h, w) in self.hypotheses.iter_mut().zip(saved) {
+            h.weight = w;
+        }
+        true
     }
 
     /// **H1 ① の演繹**（issue #36。`deduce_last_move` arm でのみ有効）。
@@ -612,7 +701,7 @@ impl CheckSolver {
     /// 見えない敵駒による遮蔽は**楽観**（遮られない完成局面もありうる）なので、
     /// 落とすのは「どんな真実でも1手では説明できない」仮説だけになる。
     ///
-    /// 落とそうとした仮説は [`take_deduce_dropped`] で**全滅 fallback の前に**
+    /// 落とそうとした仮説は [`take_diag_record`] で**全滅 fallback の前に**
     /// 記録する（fallback 後だけ見ると健全性違反を隠せる）。
     fn prune_by_last_move(&mut self, opp_hand: &HashMap<Role, i32>, log: &ObservationLog) {
         use crate::observation::Observation;
@@ -659,10 +748,10 @@ impl CheckSolver {
             dropped.push((q, role));
         }
         let fallback = keep.iter().all(|k| !k);
-        DEDUCE_DROPPED.with(|c| {
+        DIAG_RECORD.with(|c| {
             let mut g = c.borrow_mut();
-            g.0.extend(dropped);
-            g.1 |= fallback;
+            g.deduce_dropped.extend(dropped);
+            g.deduce_fallback |= fallback;
         });
         if fallback {
             return; // 全滅は健全性の最後の砦（元の集合を残す）
@@ -1308,9 +1397,11 @@ mod tests {
         let log = log_after_opp_quiet_check();
         let base = CheckSolver::new(&view, &[], &[], &log).unwrap();
         let (sq, role, w0) = base.hypotheses_debug()[0];
-        let mut factors = HashMap::new();
-        factors.insert((sq, role), 8.0);
-        let diag = HypothesisDiag { factors, deduce_last_move: false };
+        let diag = HypothesisDiag {
+            truth: vec![(sq, role)],
+            mode: DiagMode::Oracle { k: 8.0 },
+            deduce_last_move: false,
+        };
         let boosted =
             scoped_hypothesis_diag(&diag, || CheckSolver::new(&view, &[], &[], &log)).unwrap();
         for ((s1, r1, w1), (s2, r2, w2)) in
@@ -1323,21 +1414,108 @@ mod tests {
     }
 
     #[test]
+    fn オラクルは各ソルバーが列挙した集合に対して解決する() {
+        // **倍率表を外で作ってはいけない**（PR #37 レビュー [P1]）: 粒子投票の
+        // 有無で `known_loaded` の駒種とマーカーの載せ方が変わり、列挙集合そのものが
+        // 変わる。`kinf` は「真仮説以外を ×0」なので、**その構築の集合**に対して
+        // 解決していないと、実評価側にしか無い誤仮説が重みを持ったまま残る
+        let view = view_with(vec![("5e", Role::King)]);
+        let log = log_after_opp_quiet_check();
+        let base = CheckSolver::new(&view, &[], &[], &log).unwrap();
+        let (sq, role, _) = base.hypotheses_debug()[0];
+        let diag = HypothesisDiag {
+            truth: vec![(sq, role)],
+            mode: DiagMode::Oracle { k: ORACLE_INF },
+            deduce_last_move: false,
+        };
+        // 粒子の有無で別々に構築しても、**どちらでも**真仮説だけが残る
+        let mut pos = crate::shogi::Position::empty(Color::Sente);
+        pos.set(
+            Coord { file: 5, rank: 5 },
+            Some(crate::shogi::Piece { color: Color::Sente, role: Role::King }),
+        );
+        let particles: Vec<(&Position, f64)> = vec![(&pos, 1.0)];
+        for parts in [&[][..], &particles[..]] {
+            let s = scoped_hypothesis_diag(&diag, || {
+                CheckSolver::new(&view, parts, &[], &log)
+            })
+            .unwrap();
+            let nonzero: Vec<(Coord, Role)> = s
+                .hypotheses_debug()
+                .into_iter()
+                .filter(|(_, _, w)| *w > 0.0)
+                .map(|(s, r, _)| (s, r))
+                .collect();
+            assert_eq!(nonzero, vec![(sq, role)], "真仮説だけが残る");
+        }
+    }
+
+    #[test]
+    fn 診断記録はスコープ内の全構築を数える() {
+        // 1 arm は反則を食うたびにソルバーを作り直す。**scope に入るたびに記録を
+        // 空にする**ので、arm を複数の scope に割ると最初の構築の記録が消える
+        // （PR #37 レビュー [P1]）
+        let view = view_with(vec![("5e", Role::King), ("5c", Role::Gold)]);
+        let log = log_after_opp_quiet_check();
+        let diag = HypothesisDiag {
+            deduce_last_move: true,
+            ..HypothesisDiag::default()
+        };
+        let rec = scoped_hypothesis_diag(&diag, || {
+            let _ = CheckSolver::new(&view, &[], &[], &log);
+            let _ = CheckSolver::new(&view, &[], &[], &log);
+            take_diag_record()
+        });
+        assert_eq!(rec.constructions, 2);
+        assert!(
+            rec.deduce_dropped.len() >= 2,
+            "2回ぶんの延べが残る: {:?}",
+            rec.deduce_dropped
+        );
+        // 取り出すと消える（次の arm に持ち越さない）
+        assert_eq!(take_diag_record().constructions, 0);
+    }
+
+    #[test]
+    fn 誤誘導は真でない最大重みをその集合から選ぶ() {
+        let view = view_with(vec![("5e", Role::King)]);
+        let log = log_after_opp_quiet_check();
+        let base = CheckSolver::new(&view, &[], &[], &log).unwrap();
+        let hyps = base.hypotheses_debug();
+        let (tsq, trole, _) = hyps[0];
+        let diag = HypothesisDiag {
+            truth: vec![(tsq, trole)],
+            mode: DiagMode::Misdirected { k: ORACLE_INF },
+            deduce_last_move: false,
+        };
+        let s = scoped_hypothesis_diag(&diag, || CheckSolver::new(&view, &[], &[], &log)).unwrap();
+        let nonzero: Vec<(Coord, Role)> = s
+            .hypotheses_debug()
+            .into_iter()
+            .filter(|(_, _, w)| *w > 0.0)
+            .map(|(s, r, _)| (s, r))
+            .collect();
+        assert_eq!(nonzero.len(), 1, "誤仮説1本だけが残る");
+        assert_ne!(nonzero[0], (tsq, trole), "真仮説は選ばない");
+    }
+
+    #[test]
     fn 倍率ゼロで全滅するときは元へ戻す() {
         // coverage failure（真仮説が集合に無い）で ×0 を全部に掛けても
         // 仮説を殺さない（健全性）
         let view = view_with(vec![("5e", Role::King)]);
         let log = log_after_opp_quiet_check();
         let base = CheckSolver::new(&view, &[], &[], &log).unwrap();
-        let factors: HashMap<(Coord, Role), f64> = base
-            .hypotheses_debug()
-            .iter()
-            .map(|(s, r, _)| ((*s, *r), 0.0))
-            .collect();
-        let diag = HypothesisDiag { factors, deduce_last_move: false };
+        // 真仮説がこの集合に無い（coverage failure）状態で kinf を掛ける
+        let diag = HypothesisDiag {
+            truth: vec![(Coord { file: 5, rank: 5 }, Role::Rook)],
+            mode: DiagMode::Oracle { k: ORACLE_INF },
+            deduce_last_move: false,
+        };
         let zeroed =
             scoped_hypothesis_diag(&diag, || CheckSolver::new(&view, &[], &[], &log)).unwrap();
         assert_eq!(base.hypotheses_debug(), zeroed.hypotheses_debug());
+        assert_eq!(take_diag_record().weight_fallback, 1, "介入できなかったと記録する");
     }
 
     #[test]
@@ -1357,10 +1535,11 @@ mod tests {
                 .any(|(s, r, _)| *s == five_d && *r == Role::Pawn),
             "5四の歩は素の列挙には載る"
         );
-        let diag = HypothesisDiag { factors: HashMap::new(), deduce_last_move: true };
+        let diag = HypothesisDiag { deduce_last_move: true, ..HypothesisDiag::default() };
         let pruned =
             scoped_hypothesis_diag(&diag, || CheckSolver::new(&view, &[], &[], &log)).unwrap();
-        let (dropped, fallback) = take_deduce_dropped();
+        let rec = take_diag_record();
+        let (dropped, fallback) = (rec.deduce_dropped, rec.deduce_fallback);
         assert!(!fallback, "全滅していない");
         assert!(
             dropped.contains(&(five_d, Role::Pawn)),
@@ -1419,10 +1598,10 @@ mod tests {
         log.record(crate::observation::Observation::Check {
             in_check: Color::Sente,
         });
-        let diag = HypothesisDiag { factors: HashMap::new(), deduce_last_move: true };
+        let diag = HypothesisDiag { deduce_last_move: true, ..HypothesisDiag::default() };
         let pruned =
             scoped_hypothesis_diag(&diag, || CheckSolver::new(&view, &[], &[], &log)).unwrap();
-        let (dropped, _) = take_deduce_dropped();
+        let dropped = take_diag_record().deduce_dropped;
         let five_d = Coord { file: 5, rank: 4 };
         // 5七で取られた自駒（駒種は観測されないので上界は全駒種）に歩が含まれる
         // ので、5四の歩は打ちで説明できる = 落とさない
@@ -1448,7 +1627,7 @@ mod tests {
             in_check: Color::Sente,
         });
         let base = CheckSolver::new(&view, &[], &[], &log).unwrap();
-        let diag = HypothesisDiag { factors: HashMap::new(), deduce_last_move: true };
+        let diag = HypothesisDiag { deduce_last_move: true, ..HypothesisDiag::default() };
         let pruned =
             scoped_hypothesis_diag(&diag, || CheckSolver::new(&view, &[], &[], &log)).unwrap();
         assert_eq!(base.hypotheses_debug(), pruned.hypotheses_debug());

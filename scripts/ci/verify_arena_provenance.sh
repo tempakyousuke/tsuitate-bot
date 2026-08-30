@@ -22,6 +22,11 @@
 #   OUT                 検証済みの実験条件の書き出し先（既定 provenance.env）
 #   EXPECT_CANDIDATE / EXPECT_MATCH_SEED / EXPECT_COMMIT / EXPECT_GAMES / EXPECT_SHARDS
 #                       期待値（空なら照合しない）
+#   EXPECT_THINK_BUDGET_MS
+#                       **この phase が実際に使う思考予算**。元 Arena の
+#                       `think_budget_ms_a` と一致しなければ落とす。
+#                       「記録時に実際に見えていたランキング」でない測定を
+#                       採否に使わせないための関門（PR #37 レビュー [P1]）
 set -euo pipefail
 shopt -s nullglob globstar
 
@@ -34,6 +39,7 @@ EXPECT_MATCH_SEED=${EXPECT_MATCH_SEED:-}
 EXPECT_COMMIT=${EXPECT_COMMIT:-}
 EXPECT_GAMES=${EXPECT_GAMES:-}
 EXPECT_SHARDS=${EXPECT_SHARDS:-}
+EXPECT_THINK_BUDGET_MS=${EXPECT_THINK_BUDGET_MS:-}
 : > "$OUT"
 
 # --- 0. 元 run そのものの状態（commit と結末）を API から取る ---
@@ -91,6 +97,17 @@ for k in candidate baseline cand_config baseline_behavior think_budget_ms_a \
   fi
   printf '%s=%s\n' "$k" "$u" >> "$OUT"
 done
+# **この phase の思考予算が元 Arena と一致するか**（PR #37 レビュー [P1]）。
+# 粒子数は予算に比例するので、違う予算で引き直したランキングは
+# 「その決定点で実際に見えていたランキング」ではない
+if [ -n "$EXPECT_THINK_BUDGET_MS" ]; then
+  budget=$(jq -r '.think_budget_ms_a | tostring' shard-summaries.jsonl | sort -u)
+  if [ "$budget" != "$EXPECT_THINK_BUDGET_MS" ]; then
+    echo "::error::この phase の思考予算 ${EXPECT_THINK_BUDGET_MS}ms が元 Arena の ${budget}ms と違います。粒子数が変わるので「記録時に実際に見えていたランキング」になりません"
+    exit 1
+  fi
+  printf 'phase_think_budget_ms=%s\n' "$EXPECT_THINK_BUDGET_MS" >> "$OUT"
+fi
 base=$(jq -r '.baseline' shard-summaries.jsonl | sort -u)
 if [ "$base" != "$OPPONENT" ]; then
   echo "::error::記録の相手が一致しません（artifact=$OPPONENT / summary=$base）"

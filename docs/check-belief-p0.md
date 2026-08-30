@@ -124,6 +124,32 @@ issue の arm 名との対応:
 元 Arena 実行の実験条件の検査は `scripts/ci/verify_arena_provenance.sh`（`check-prep.yml`
 から切り出して**共通化**した。ワークフローごとに書くと片方だけ緩くなる）。
 
+## PR #37 レビューで直した4点（同種の測定をやり直すときは先にここを読む）
+
+1. **[P1] 介入対象を「別の仮説集合」から作っていた**。倍率表を粒子なしの
+   `CheckSolver` から作って渡していたが、粒子多数決は `known_loaded` の駒種と
+   「そのマーカーを載せるか」を変えるので**列挙集合そのものが変わる**。すると
+   実評価側にしか無い誤仮説へ ×0 が付かず、被覆も「あり」と報告されるのに実評価の
+   集合には真仮説が無い、が成立する（= full oracle でないものを `oracle@kinf@real`
+   として集計する）。**フックへ渡すのは選択規則だけ**にし、対象の決定・被覆・
+   全滅 fallback は各 `CheckSolver` が列挙した集合の上で行う（`check::DiagRecord`）
+2. **[P1] 演繹の健全性記録が手番開始時の構築を落としていた**。`scoped_hypothesis_diag`
+   は scope 開始のたびに記録を空にするので、1 arm を「初回 p」と「simulate」の2つの
+   scope に割ると最初の構築で落とした真仮説が消える。初手がそのまま受理されて
+   shadow update が走らなければ記録は空になり、「真仮説を1つでも落としたら中止」の
+   関門を通過できてしまう。**1 arm = 1 scope**にした
+3. **[P1] 元 Arena と再ランキングの予算を揃える契約が CI で検査されていなかった**。
+   provenance 検査は probe job にしかなく、policy / continue は records だけを取って
+   独立の予算で走れた。**3 phase すべてを検証済み provenance に依存させ**、
+   `EXPECT_THINK_BUDGET_MS` で「phase の実効予算 == 元 Arena の `think_budget_ms_a`」を
+   検査する
+4. **[P2] 恒等対照が機械的に外せた**。`--belief` から `oracle@k1` を抜くと
+   `identity_err` が null のままになり、`report` の関門は「数値が0件」でスキップした。
+   オラクル arm を宣言した実験では**起動時と集計時の両方**で `oracle@k1` と
+   非 null の `identity_err` を必須にした
+
+`bin/check_policy` の `ROW_SCHEMA` は **3**（schema 2 = 1. の修正前の記録は集計から弾く）。
+
 ## 契約（先に固定した）
 
 - 母集団は **bot の全王手中手番**（反則0も終端手番も含む）。落ちた本数は attrition

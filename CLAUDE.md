@@ -1099,6 +1099,18 @@
     オラクルの下で作り直し、反則ごとに実再決定して `removal_term` まで作り直す）
   - `oracle_misdirected@k{4,inf}` = adversarial stress test（真でない最大重みの仮説 ×k。
     **学習事前の誤りの分布とは一致しない**ので許容誤り率への換算はしない）
+  - **介入対象・被覆・fallback は「その `CheckSolver` が実際に列挙した集合」で
+    解決・記録する**（PR #37 レビュー [P1]）。倍率表を外（粒子なしのソルバー）で
+    作って渡すと、粒子多数決が `known_loaded` の駒種とマーカーの載せ方を変えて
+    **列挙集合そのものが変わる**ため、実評価側にしか無い誤仮説に ×0 が付かず
+    「full oracle でないもの」を `oracle@kinf@real` として集計してしまう。
+    フックへ渡すのは**選択規則**（真の王手駒と `DiagMode`）だけにしてある
+  - **1 arm = 1 scope**（同レビュー [P1]）。scope に入るたびに `DiagRecord` を
+    空にするので、初回ランキングと simulate を別々の scope に割ると
+    「最初の構築で真仮説を落とした」記録が消え、健全性の関門が素通りする
+  - **恒等対照は外せない**（同レビュー [P2]）。`--belief` から `oracle@k1` を
+    抜くと `identity_err` が null のままになり `report` の関門が「数値が0件」で
+    素通りするので、オラクル arm を宣言した実験では起動時と集計時の両方で必須にする
   - `deduce_last_move` = H1 ① の演繹（学習なし）。「(a) 直前の相手手で q へ着地した駒」
     でも「(b) 元マスが空いて線が開いた静止飛び駒」でもない仮説だけを落とす。
     捕獲つきの王手は着地点が観測で分かるので `prune_infeasible_discovered_checks` の
@@ -1106,9 +1118,10 @@
   - **`oracle@k1` は恒等対照**。`current@shadow` と bit-exact でなければ配管が壊れて
     いるので `report` が止める。`deduce_last_move` が真仮説を落としたときも止める
     （どちらも issue #36 の「判定以前」の中止条件）
-  - `bin/check_policy` の `ROW_SCHEMA` は **2**（schema 1 = 恒等対照と演繹の列が
-    無い時期の記録は集計から弾く。**欠けた列を「問題なし」と読むと両方の関門が
-    素通りする**ので、版の拒否と `REQUIRED_ROW_KEYS` の存在検査の両方で止める）
+  - `bin/check_policy` の `ROW_SCHEMA` は **3**（schema 1 = 恒等対照と演繹の列が
+    無い時期、schema 2 = **介入対象と被覆を粒子なしのソルバーで決めていた時期**の
+    記録は集計から弾く。**欠けた列を「問題なし」と読むと両方の関門が素通りする**ので、
+    版の拒否と `REQUIRED_ROW_KEYS` の存在検査の両方で止める）
   - P0-2b（`bin/check_continue`）の**対照は `current@real`**（`report --baseline
     current@real`）。shadow の `current` と比べると「オラクル」と「指し直したこと」の
     効果が混ざる。実再決定 arm を混ぜたら `current@real` を自動で足す。
@@ -1121,7 +1134,11 @@
   （`run_continue`）は既定オフ**（同時に有効化しない）。元 Arena 実行の実験条件の
   検査は `scripts/ci/verify_arena_provenance.sh` に**一本化**した（`check-prep.yml`
   から切り出した共通の関門。ワークフローごとに書くと片方だけ緩くなる）。
-  設計・契約・中止条件は `docs/check-belief-p0.md`
+  **3つの phase すべてを検証済み provenance に依存させ、`EXPECT_THINK_BUDGET_MS` で
+  「その phase の実効予算 == 元 Arena の `think_budget_ms_a`」も検査する**
+  （PR #37 レビュー [P1]。probe だけを検査していた頃は、元2000ms の正常な run に
+  policy 700ms を指定しても緑になり、記録と違う粒子数で引いたランキングを採否に
+  使えた）。設計・契約・中止条件は `docs/check-belief-p0.md`
 - **王手中の反則経済の CI**（`.github/workflows/check-economy.yml`、**通常のコード
   push では走らない**）: `gh workflow run check-economy.yml -f arena_run_id=<Arena実行ID>
   -f opponents="estimator_v13 estimator_v14"`、`gh` が無ければ

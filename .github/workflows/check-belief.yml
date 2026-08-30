@@ -352,6 +352,10 @@ jobs:
           EXPECT_COMMIT: ${{ needs.plan.outputs.expect_commit }}
           EXPECT_GAMES: ${{ needs.plan.outputs.expect_games }}
           EXPECT_SHARDS: ${{ needs.plan.outputs.expect_shards }}
+          # **この phase の実効予算が元 Arena と一致することを検査する**
+          # （PR #37 レビュー [P1]。違う予算で引き直したランキングは
+          #  「記録時に実際に見えていたランキング」ではない）
+          EXPECT_THINK_BUDGET_MS: ${{ needs.plan.outputs.probe_budget_ms }}
         run: bash scripts/ci/verify_arena_provenance.sh
       - name: P0-1 transmission
         env:
@@ -448,6 +452,38 @@ jobs:
           path: records-in
           run-id: ${{ needs.plan.outputs.arena_run_id }}
           github-token: ${{ github.token }}
+      - name: Download arena summaries
+        if: needs.plan.outputs.arena_run_id != ''
+        uses: actions/download-artifact@v7
+        with:
+          pattern: arena-result-${{ matrix.opponent }}-*
+          path: summaries-in
+          run-id: ${{ needs.plan.outputs.arena_run_id }}
+          github-token: ${{ github.token }}
+      - name: Download arena combined
+        if: needs.plan.outputs.arena_run_id != ''
+        uses: actions/download-artifact@v7
+        with:
+          name: arena-combined
+          path: combined-in
+          run-id: ${{ needs.plan.outputs.arena_run_id }}
+          github-token: ${{ github.token }}
+      # **どの phase も検証済み provenance に依存させる**（PR #37 レビュー [P1]）。
+      # probe だけを検査していた頃は、元2000ms の正常な run に policy 700ms を
+      # 指定しても緑になり、記録と違う粒子数で引いたランキングを採否に使えた
+      - name: Verify arena provenance
+        if: needs.plan.outputs.arena_run_id != ''
+        env:
+          OPPONENT: ${{ matrix.opponent }}
+          RUN_ID: ${{ needs.plan.outputs.arena_run_id }}
+          GH_TOKEN: ${{ github.token }}
+          EXPECT_CANDIDATE: ${{ needs.plan.outputs.expect_candidate }}
+          EXPECT_MATCH_SEED: ${{ needs.plan.outputs.expect_match_seed }}
+          EXPECT_COMMIT: ${{ needs.plan.outputs.expect_commit }}
+          EXPECT_GAMES: ${{ needs.plan.outputs.expect_games }}
+          EXPECT_SHARDS: ${{ needs.plan.outputs.expect_shards }}
+          EXPECT_THINK_BUDGET_MS: ${{ needs.plan.outputs.policy_budget_ms }}
+        run: bash scripts/ci/verify_arena_provenance.sh
       - name: P0-2 oracle arms
         env:
           TSUITATE_THINK_BUDGET_MS: ${{ needs.plan.outputs.policy_budget_ms }}
@@ -482,6 +518,7 @@ jobs:
           path: |
             check-policy-*.jsonl
             policy.txt
+            provenance.env
           if-no-files-found: error
 
   policy-aggregate:
@@ -544,6 +581,36 @@ jobs:
           path: records-in
           run-id: ${{ needs.plan.outputs.arena_run_id }}
           github-token: ${{ github.token }}
+      - name: Download arena summaries
+        if: needs.plan.outputs.arena_run_id != ''
+        uses: actions/download-artifact@v7
+        with:
+          pattern: arena-result-${{ matrix.opponent }}-*
+          path: summaries-in
+          run-id: ${{ needs.plan.outputs.arena_run_id }}
+          github-token: ${{ github.token }}
+      - name: Download arena combined
+        if: needs.plan.outputs.arena_run_id != ''
+        uses: actions/download-artifact@v7
+        with:
+          name: arena-combined
+          path: combined-in
+          run-id: ${{ needs.plan.outputs.arena_run_id }}
+          github-token: ${{ github.token }}
+      # ランキング段は記録と同じ予算でなければならない（継続段も同じ env を使う）
+      - name: Verify arena provenance
+        if: needs.plan.outputs.arena_run_id != ''
+        env:
+          OPPONENT: ${{ matrix.opponent }}
+          RUN_ID: ${{ needs.plan.outputs.arena_run_id }}
+          GH_TOKEN: ${{ github.token }}
+          EXPECT_CANDIDATE: ${{ needs.plan.outputs.expect_candidate }}
+          EXPECT_MATCH_SEED: ${{ needs.plan.outputs.expect_match_seed }}
+          EXPECT_COMMIT: ${{ needs.plan.outputs.expect_commit }}
+          EXPECT_GAMES: ${{ needs.plan.outputs.expect_games }}
+          EXPECT_SHARDS: ${{ needs.plan.outputs.expect_shards }}
+          EXPECT_THINK_BUDGET_MS: ${{ needs.plan.outputs.continue_budget_ms }}
+        run: bash scripts/ci/verify_arena_provenance.sh
       - name: P0-2b oracle continuation
         env:
           TSUITATE_THINK_BUDGET_MS: ${{ needs.plan.outputs.continue_budget_ms }}
@@ -576,6 +643,7 @@ jobs:
           path: |
             check-continue-*.jsonl
             continue.txt
+            provenance.env
           if-no-files-found: error
 
   continue-aggregate:

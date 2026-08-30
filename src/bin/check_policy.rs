@@ -53,7 +53,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use tsuitate_bot::check::CheckSolver;
-use tsuitate_bot::check_belief::{self, ArmSpec, Belief, entry_hypotheses};
+use tsuitate_bot::check_belief::{self, ArmSpec, Belief};
 use tsuitate_bot::check_economy::{
     CheckMoveKind, classify_move_kind, cluster_ratio_ci, entry_replayed, true_checkers,
 };
@@ -71,16 +71,19 @@ use tsuitate_bot::truth_replay::{for_each_decision_full, parse_bot_and_end};
 /// JSONL の契約バージョン。**古い schema は集計から弾く**（issue #28 / #31 の契約）。
 ///
 /// - 1 … issue #31 の P0-5（オラクル arm と恒等対照の列が無い）
-/// - 2 … issue #36 P0-2。`identity_err` / `deduce` / `oracle_coverage` /
-///   `double_check` が加わった。**欠けた列を「問題なし」と読むと恒等対照も
-///   演繹の健全性も素通りする**ので、版の拒否と必須列の存在検査の両方で止める
-const ROW_SCHEMA: u32 = 2;
+/// - 2 … issue #36 P0-2 の初版。**介入対象と被覆を「粒子なしのソルバー」で
+///   決めていた**（実評価の集合と別物になりうる）ので集計から弾く
+/// - 3 … PR #37 レビュー [P1] を反映。倍率も被覆も**その arm が実際に列挙した
+///   集合**に対して適用・記録する（`oracle` オブジェクト）。**欠けた列を
+///   「問題なし」と読むと恒等対照も演繹の健全性も素通りする**ので、版の拒否と
+///   必須列の存在検査の両方で止める
+const ROW_SCHEMA: u32 = 3;
 
-/// schema 2 の行に必ずある列（欠測を既定値で埋めて門を通せてはいけない）
+/// schema 3 の行に必ずある列（欠測を既定値で埋めて門を通せてはいけない）
 const REQUIRED_ROW_KEYS: [&str; 6] = [
     "identity_err",
     "deduce",
-    "oracle_coverage",
+    "oracle",
     "double_check",
     "repro_err",
     "arm",
@@ -308,6 +311,16 @@ fn main() {
     }
     if specs.is_empty() {
         die("記録ファイル（またはディレクトリ）を指定してください");
+    }
+    // **恒等対照は外せない**（PR #37 レビュー [P2]）。`report` 側でも検査するが、
+    // 3時間走らせてから集計で落ちるより起動時に止めるほうがよい
+    if (!beliefs.is_empty() || !beliefs_real.is_empty())
+        && !beliefs.contains(&Belief::Oracle { k: 1.0 })
+    {
+        die(
+            "--belief に恒等対照 oracle@k1 を入れてください\
+             （オラクル arm が `current@shadow` と bit-exact であることを毎回確かめる契約）",
+        );
     }
     // **`--seeds 0` で「対象なし」を成功終了にできてはいけない**
     // （issue #28 が `mate_continue` で塞いだ穴と同じ: 空の集計で判定を偽造できる）
@@ -764,42 +777,45 @@ fn run_unit(
     // ---- issue #36 P0-2: 仮説重みへの介入 arm --------------------------------
     // 配管は `check_belief::run_arm` に一本化してある（`bin/check_continue` の
     // P0-2b と**同じ arm 名が同じ配管を指す**ようにするため）。
-    // 誤誘導 arm の「現行重みが最大の誤仮説」は手番開始時の**ソルバー単体**の
-    // 重みで決める（決定論的。粒子投票込みだと seed ごとに対象が変わる）
-    let entry_hyps = entry_hypotheses(&setup);
+    // **介入対象・被覆・fallback はその arm が実際に列挙した集合から記録する**
+    // （`check::DiagRecord`。外で作った倍率表を使うと、粒子投票の有無で列挙集合が
+    // 変わったときに実評価側にしか無い誤仮説へ ×0 が付かない = PR #37 レビュー [P1]）
     let checkers = true_checkers(&p.truth, p.bot);
-    // 真の王手駒（単王手）が仮説集合に載っているか = オラクルが介入できるか
-    let oracle_coverage = checkers.len() == 1
-        && entry_hyps
-            .iter()
-            .any(|(hs, hr, _)| checkers.iter().any(|(s, r)| s == hs && r == hr));
     let mut identity_err: Option<f64> = None;
     let mut deduce_note = serde_json::Value::Null;
+    let mut oracle_note = serde_json::Value::Null;
     let mut belief_specs: Vec<(ArmSpec, bool)> =
         beliefs.iter().map(|b| (spec_for(b, false), *b == Belief::DeduceLastMove)).collect();
     belief_specs.extend(beliefs_real.iter().map(|b| (spec_for(b, true), false)));
     for (spec, is_deduce) in &belief_specs {
         let t = std::time::Instant::now();
-        let Some(run) = check_belief::run_arm(
-            &setup,
-            &p.entry,
-            &p.truth,
-            p.bot,
-            spec,
-            &entry_hyps,
-            params,
-        ) else {
+        let Some(run) =
+            check_belief::run_arm(&setup, &p.entry, &p.truth, p.bot, spec, params)
+        else {
             continue;
         };
+        // **その arm の全構築ぶん**の記録（1 arm = 1 scope）
+        let rec = tsuitate_bot::check::take_diag_record();
         if *is_deduce {
             // **全滅 fallback の前**に「落とそうとした真仮説」を数える
-            let (dropped, fallback) = tsuitate_bot::check::take_deduce_dropped();
             deduce_note = serde_json::json!({
-                "dropped": dropped.len(),
-                "fallback": fallback,
-                "dropped_true": dropped
+                "dropped": rec.deduce_dropped.len(),
+                "fallback": rec.deduce_fallback,
+                "dropped_true": rec.deduce_dropped
                     .iter()
                     .any(|(ds, dr)| checkers.iter().any(|(s, r)| s == ds && r == dr)),
+                "constructions": rec.constructions,
+            });
+        }
+        // 主 arm（実再決定のオラクル）の被覆は**実評価の集合**で数える
+        if spec.real && matches!(spec.belief, Belief::Oracle { .. }) {
+            oracle_note = serde_json::json!({
+                "arm": spec.tag,
+                "constructions": rec.constructions,
+                "truth_present": rec.truth_present,
+                // 全構築で真仮説が列挙されていたか（1つでも欠ければ full oracle ではない）
+                "covered_all": rec.constructions > 0 && rec.truth_present == rec.constructions,
+                "weight_fallback": rec.weight_fallback,
             });
         }
         if spec.belief == (Belief::Oracle { k: 1.0 }) && !spec.real {
@@ -855,7 +871,7 @@ fn run_unit(
                     // issue #36 P0-2 の恒等対照と演繹の健全性（unit 単位）
                     "identity_err": identity_err,
                     "deduce": deduce_note.clone(),
-                    "oracle_coverage": oracle_coverage,
+                    "oracle": oracle_note.clone(),
                     "double_check": checkers.len() > 1,
                     "calibration": cal.to_json(),
                 })
@@ -1093,24 +1109,48 @@ fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incompl
             die("deduce_last_move が真の王手駒の仮説を落としました（健全性違反 = 中止条件）");
         }
     }
-    // オラクルが介入できた手番（真の王手駒が仮説集合にある単王手）
+    // **オラクルが実際に介入できた行**（真の王手駒がその arm の列挙集合にある）。
+    // 粒子なしのソルバーではなく `DiagRecord` の実測なので、「被覆ありと報告した
+    // のに実評価の集合には無かった」が起きない（PR #37 レビュー [P1]）
+    // `oracle` は unit 単位の記録なので、**1 unit 1行**（`current@static`）で数える
+    // （arm ごとの行で数えると arm 数だけ水増しされる）
     let cov: Vec<&serde_json::Value> = rows
         .iter()
-        .filter(|r| r["arm"] == "current@static")
+        .filter(|r| r["arm"] == "current@static" && !r["oracle"].is_null())
         .collect();
     if !cov.is_empty() {
-        let ok = cov
+        let all = cov
             .iter()
-            .filter(|r| r["oracle_coverage"].as_bool().unwrap_or(false))
+            .filter(|r| r["oracle"]["covered_all"].as_bool().unwrap_or(false))
             .count();
-        let dbl = cov
+        let part = cov
             .iter()
+            .filter(|r| {
+                let t = r["oracle"]["truth_present"].as_u64().unwrap_or(0);
+                let n = r["oracle"]["constructions"].as_u64().unwrap_or(0);
+                t > 0 && t < n
+            })
+            .count();
+        let fb: u64 = cov
+            .iter()
+            .filter_map(|r| r["oracle"]["weight_fallback"].as_u64())
+            .sum();
+        let dbl = rows
+            .iter()
+            .filter(|r| r["arm"] == "current@static")
             .filter(|r| r["double_check"].as_bool().unwrap_or(false))
             .count();
         println!(
-            "  オラクルが介入できた行 {ok} / {}（両王手 {dbl} は別層・介入しない）",
+            "  オラクルが全構築で介入できた行 {all} / {}（一部の構築だけ {part} / \
+             倍率が全滅して元へ戻した構築 {fb} / 両王手 {dbl} は別層・介入しない）",
             cov.len()
         );
+        if part > 0 {
+            println!(
+                "    **一部の構築でしか真仮説が列挙されていない行がある**: その行の \
+                 `oracle@kinf@real` は full oracle ではない（判定の前にここを見る）"
+            );
+        }
     }
 
     for estimand in ["foul", "nofoul"] {
@@ -1462,6 +1502,35 @@ fn check_inputs(metas: &[serde_json::Value], rows: &[serde_json::Value]) -> Vec<
     for (k, n) in missing {
         out.push(format!("必須列 {k} が {n} 行で欠けています（schema {ROW_SCHEMA} の契約違反）"));
     }
+    // **恒等対照は外せない**（PR #37 レビュー [P2]）: `--belief` から `oracle@k1` を
+    // 抜くと `identity_err` が null のままになり、`report` の関門が「数値が0件」で
+    // 素通りする。オラクル arm を1つでも宣言した実験では恒等対照を必須にする
+    let beliefs: Vec<String> = first["beliefs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|b| b.as_str().map(str::to_string))
+        .collect();
+    let reals: Vec<String> = first["beliefs_real"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|b| b.as_str().map(str::to_string))
+        .collect();
+    if !beliefs.is_empty() || !reals.is_empty() {
+        if !beliefs.iter().any(|b| b == "oracle@k1") {
+            out.push(
+                "オラクル arm を宣言した実験に恒等対照 oracle@k1 がありません                 （`current@shadow` と bit-exact であることを毎回確かめる契約）"
+                    .into(),
+            );
+        }
+        let has_ident = rows.iter().any(|r| r["identity_err"].as_f64().is_some());
+        if !has_ident {
+            out.push(
+                "identity_err が全行 null です（恒等対照が1度も走っていない）".into(),
+            );
+        }
+    }
     let mut seen: BTreeMap<(String, u64, String), usize> = BTreeMap::new();
     for r in rows {
         *seen
@@ -1609,7 +1678,7 @@ mod tests {
             "material": 0.0, "updates": 1, "sim_us": 100, "repro_err": 0.0,
             // schema 2 の必須列（issue #36 P0-2）
             "identity_err": 0.0, "deduce": serde_json::Value::Null,
-            "oracle_coverage": true, "double_check": false,
+            "oracle": serde_json::Value::Null, "double_check": false,
         })
     }
 
@@ -1652,6 +1721,41 @@ mod tests {
         let problems = check_inputs(&[meta(e, 0)], &full());
         assert!(
             problems.iter().any(|p| p.contains("oracle@k1@shadow")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn 恒等対照なしのオラクル実験は集計させない() {
+        // **`--belief` から `oracle@k1` を抜くと `identity_err` が null のままになり、
+        // 関門が「数値が0件」で素通りする**（PR #37 レビュー [P2]）
+        let mut e = exp("estimator_v14");
+        e["beliefs"] = serde_json::json!(["oracle@kinf"]);
+        e["beliefs_real"] = serde_json::json!([]);
+        let problems = check_inputs(&[meta(e, 0)], &full());
+        assert!(
+            problems.iter().any(|p| p.contains("oracle@k1")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn identity_errが全行nullなら集計させない() {
+        let mut e = exp("estimator_v14");
+        e["beliefs"] = serde_json::json!(["oracle@k1"]);
+        let mut rows = full();
+        for r in &mut rows {
+            r["identity_err"] = serde_json::Value::Null;
+        }
+        // 恒等対照 arm の行も足しておく（欠測の指摘と区別するため）
+        for seed in 0..2 {
+            let mut x = row("oracle@k1@shadow", seed, 1);
+            x["identity_err"] = serde_json::Value::Null;
+            rows.push(x);
+        }
+        let problems = check_inputs(&[meta(e, 0)], &rows);
+        assert!(
+            problems.iter().any(|p| p.contains("identity_err が全行 null")),
             "{problems:?}"
         );
     }
