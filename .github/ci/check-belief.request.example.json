@@ -11,7 +11,7 @@
   "run_policy": false,
   "policy_beliefs": "oracle@k1,oracle@k2,oracle@k4,oracle@k8,oracle@kinf,oracle_misdirected@k4,oracle_misdirected@kinf,deduce_last_move",
   "policy_beliefs_real": "oracle@kinf",
-  "policy_seeds": 3,
+  "policy_seeds": 4,
   "policy_budget_ms": 2000,
   "policy_shards": 6,
   "_comment_continue": "P0-2b（継続上限）。継続対局を回すので最も重い。issue #36 は思考予算 2000ms・2 replicate",

@@ -76,9 +76,9 @@ on:
         required: false
         default: "oracle@kinf"
       policy_seeds:
-        description: "P0-2 の決定点あたり seed 数"
+        description: "P0-2 の決定点あたり seed 数（実再決定 arm の AB/BA は seed の偶奇で閉じるので **2 以上の偶数**）"
         required: false
-        default: "3"
+        default: "4"
       policy_budget_ms:
         description: "P0-2 の思考予算（ms）"
         required: false
@@ -213,7 +213,7 @@ jobs:
             run_policy="${IN_RUN_POLICY:-false}"
             policy_beliefs="${IN_POLICY_BELIEFS:-}"
             policy_beliefs_real="${IN_POLICY_BELIEFS_REAL:-oracle@kinf}"
-            policy_seeds="${IN_POLICY_SEEDS:-3}"
+            policy_seeds="${IN_POLICY_SEEDS:-4}"
             policy_budget="${IN_POLICY_BUDGET:-2000}"
             policy_shards="${IN_POLICY_SHARDS:-6}"
             run_continue="${IN_RUN_CONTINUE:-false}"
@@ -245,7 +245,7 @@ jobs:
                 echo "run_policy=false"
                 echo "policy_beliefs="
                 echo "policy_beliefs_real="
-                echo "policy_seeds=3"
+                echo "policy_seeds=4"
                 echo "policy_budget_ms=2000"
                 echo 'policy_shards=[0]'
                 echo "policy_shard_count=1"
@@ -276,7 +276,7 @@ jobs:
             run_policy=$(jq -r '.run_policy // false | tostring' "$req")
             policy_beliefs=$(jq -r '.policy_beliefs // ""' "$req")
             policy_beliefs_real=$(jq -r '.policy_beliefs_real // "oracle@kinf"' "$req")
-            policy_seeds=$(jq -r '.policy_seeds // 3' "$req")
+            policy_seeds=$(jq -r '.policy_seeds // 4' "$req")
             policy_budget=$(jq -r '.policy_budget_ms // 2000' "$req")
             policy_shards=$(jq -r '.policy_shards // 6' "$req")
             run_continue=$(jq -r '.run_continue // false | tostring' "$req")
@@ -296,6 +296,21 @@ jobs:
           if [ -z "$run_id" ]; then
             opponents=""
           fi
+          # **seed の偶奇は plan で落とす**（PR #37 レビュー7巡目 [P1]）。
+          # `bin/check_policy` / `bin/check_continue` は実再決定・継続を回すときに
+          # 2 以上の偶数を要求する（AB/BA が seed の偶奇で閉じる）ので、奇数だと
+          # matrix の全ジョブが起動直後に落ちる。ここで1回だけ失敗させる
+          for pair in "policy:$run_policy:$policy_seeds" "continue:$run_continue:$continue_seeds"; do
+            phase=${pair%%:*}; rest=${pair#*:}; on=${rest%%:*}; n=${rest#*:}
+            [ "$on" = "true" ] || continue
+            case "$n" in
+              ''|*[!0-9]*) echo "::error::${phase}_seeds が数値ではありません: $n"; exit 1 ;;
+            esac
+            if [ "$n" -lt 2 ] || [ $((n % 2)) -ne 0 ]; then
+              echo "::error::${phase}_seeds は 2 以上の偶数にしてください（実再決定 arm の AB/BA は seed の偶奇で閉じる）: $n"
+              exit 1
+            fi
+          done
           {
             echo "skip=false"
             echo "arena_run_id=$run_id"

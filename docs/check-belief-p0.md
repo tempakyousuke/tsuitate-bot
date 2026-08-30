@@ -404,6 +404,29 @@ v14 951 / 1761 行（54.0%）・v13 693 / 1590 行（43.6%）**。仮説重み�
     主張を「取り直しても効果量はほぼ同じだった」へ落とし、実行順効果を言うなら
     同じ run の中で `arm_order` により主ペア差を分けた対比と CI が要る、と明記した
 
+## レビュー7巡目で直した3点（運用経路の残件）
+
+22. **[P1] workflow の `policy_seeds` 既定が 3 のままで、偶数 seed 契約と矛盾していた**。
+    レビュー5巡目で `bin/check_policy` が実再決定時に「2 以上の偶数」を要求するように
+    なったのに、`check-belief.yml` の4か所（dispatch 既定 / dispatch fallback /
+    削除 push 用出力 / request fallback）と `check-belief.request.example.json` は
+    3 のままだった。**`run_policy=true` だけを指定する標準操作では全 policy job が
+    起動直後に落ちる**（実測 run 33306228500 が通ったのは明示的に 4 を渡したから）。
+    5か所とも 4 へ更新し、さらに **`plan` ジョブで seed の偶奇を1回だけ落とす**
+    ようにした（policy / continue とも。matrix 12〜16 ジョブが同じ理由で落ちるより、
+    plan で1回失敗するほうが読める）
+23. **[P2] `--no-real` が実再決定を止めていなかった**。`with_real=false` は
+    「`current@real` と恒等対照を自動で足すか」しか見ていないので、既定の
+    `beliefs_real`（`oracle@kinf`）はそのまま走っていた。つまり `--no-real --seeds 1`
+    で**対照も AB/BA も無い壁時計ベースの real arm** が unit ごとに回る（偶数 seed の
+    検査も `with_real` しか見ないので素通りする）。ログと `approximation_gate` は
+    「実再決定の arm がありません」と扱うので、コストも結果もオプション名と
+    食い違っていた。`--no-real` は `beliefs_real` も空にし、明示的な `--belief-real`
+    との併用は**起動時に落とす**。偶数 seed の検査は**解決後の real arm 集合**を見る
+24. **[P2] `CLAUDE.md` に 21. の取り下げが反映されていなかった**。一次運用資料の側は
+    まだ「実行順効果は実質ゼロだった」と断定していたので、`docs/` と同じ
+    「取り直しても総効果量はほぼ同じだった」まで下げた
+
 > **run 33306228500 の JSONL は schema 5 なので、schema 6 の `report` では
 > 再集計できない**（fail-closed の設計上、`points_detail.double_check` を
 > 既定値で補う逃げ道は作らない）。下の数字は**その run 自身の集計**であり、

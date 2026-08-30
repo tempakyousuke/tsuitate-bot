@@ -115,6 +115,31 @@ const REQUIRED_ROW_KEYS: [&str; 12] = [
     "arm_order",
 ];
 
+/// `--no-real` と `--belief-real` の解決（**起動時**の契約）。
+///
+/// `--no-real` は「実再決定 arm を1本も回さない」の意味なので、`beliefs_real` も
+/// 空にする。`with_real` は `current@real` と恒等対照を自動で足すかしか見ていない
+/// ので、これをやらないと既定の `beliefs_real`（`oracle@kinf`）が**対照も AB/BA も
+/// 無いまま**走り、しかも偶数 seed の検査を素通りする（PR #37 レビュー7巡目 [P2]）。
+/// 明示的な `--belief-real` との併用は矛盾なので `Err`。
+///
+/// 返り値は「解決後に実再決定 arm が1本でもあるか」＝偶数 seed を要求するか。
+fn resolve_real_arms(
+    with_real: bool,
+    beliefs_real: &mut Vec<Belief>,
+    explicit: bool,
+) -> Result<bool, &'static str> {
+    if !with_real {
+        if explicit && !beliefs_real.is_empty() {
+            return Err(
+                "--no-real と --belief-real は同時に指定できません（実再決定を止めるのか回すのかが決まらない）",
+            );
+        }
+        beliefs_real.clear();
+    }
+    Ok(with_real || !beliefs_real.is_empty())
+}
+
 fn die(msg: &str) -> ! {
     eprintln!("{msg}");
     std::process::exit(2);
@@ -272,6 +297,9 @@ fn main() {
     // 実再決定まで回す belief（主 arm = `oracle@kinf@real` = issue の
     // `oracle_full_score@real`）。1本あたり思考予算をまるごと使うので既定は1つ
     let mut beliefs_real: Vec<Belief> = vec![Belief::parse("oracle@kinf").unwrap()];
+    // `--belief-real` を**明示したか**（既定の `oracle@kinf` と区別する）。
+    // `--no-real` との衝突を起動時に落とすのに要る
+    let mut beliefs_real_explicit = false;
     let mut allow_incomplete = false;
     let mut out_path: Option<String> = None;
     let mut specs: Vec<String> = vec![];
@@ -347,6 +375,7 @@ fn main() {
             }
             "--belief-real" => {
                 beliefs_real = parse_beliefs(&need(args.get(i + 1), "--belief-real"));
+                beliefs_real_explicit = true;
                 i += 2;
             }
             "--allow-incomplete" => {
@@ -382,11 +411,15 @@ fn main() {
     if seeds == 0 {
         die("--seeds は 1 以上にしてください（0 だと1本もシミュレーションせずに集計が空になる）");
     }
+    let has_real = resolve_real_arms(with_real, &mut beliefs_real, beliefs_real_explicit)
+        .unwrap_or_else(|m| die(m));
     // **実再決定 arm を回すなら seed は偶数**（PR #37 レビュー5巡目 [P1]）。
     // 実行順は `(決定点番号 + seed) % 2` で反転するので、奇数だと決定点ごとに
     // AB/BA が閉じず、実行順効果がペア差の平均に残る（#31 P0-7 と同じ理由）。
-    // shadow だけの実験（`--no-real`）は決定論的なので偶数を要求しない
-    if with_real && seeds % 2 != 0 {
+    // shadow だけの実験（`--no-real`）は決定論的なので偶数を要求しない。
+    // **判定は解決後の real arm 集合で行う**（`with_real` だけを見ると、
+    // `beliefs_real` 経由で入る real arm が検査を素通りする。レビュー7巡目 [P2]）
+    if has_real && seeds % 2 != 0 {
         die("--seeds は 2 以上の偶数にしてください（実再決定 arm の AB/BA は seed の偶奇で閉じるので、奇数だと実行順効果がペア差に残る）");
     }
     let files = collect_records(&specs);
@@ -2571,6 +2604,25 @@ mod tests {
             problems.iter().any(|m| m.contains("点属性")),
             "meta と食い違う terminal は拒否されるべき: {problems:?}"
         );
+    }
+
+    #[test]
+    fn no_realは実再決定armを1本も残さない() {
+        // 既定の `beliefs_real`（`oracle@kinf`）が残っていると、対照も AB/BA も
+        // 無い壁時計ベースの real arm が unit ごとに回る（レビュー7巡目 [P2]）
+        let mut br = vec![Belief::parse("oracle@kinf").unwrap()];
+        assert_eq!(resolve_real_arms(false, &mut br, false), Ok(false));
+        assert!(br.is_empty(), "--no-real なら beliefs_real も空になるべき");
+        // その結果、奇数 seed の検査対象からも外れる（shadow は決定論的）
+        let mut br2 = vec![Belief::parse("oracle@kinf").unwrap()];
+        assert_eq!(resolve_real_arms(true, &mut br2, false), Ok(true));
+        assert_eq!(br2.len(), 1);
+        // 明示指定との併用は矛盾なので起動時に落とす
+        let mut br3 = vec![Belief::parse("oracle@kinf").unwrap()];
+        assert!(resolve_real_arms(false, &mut br3, true).is_err());
+        // `--belief-real` を明示していても空なら矛盾しない
+        let mut br4: Vec<Belief> = vec![];
+        assert_eq!(resolve_real_arms(false, &mut br4, true), Ok(false));
     }
 
     #[test]
