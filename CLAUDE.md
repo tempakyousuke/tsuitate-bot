@@ -1045,6 +1045,271 @@
   距離重み（`origin_weights`）・`adj_share`・主特徴量は発見セットで固定してから、
   **未使用の `match_seed` で取り直した Arena 実行**を指す別の起動で検証する
   （P0-2 の出力が `--origin-weights` / `--adj-share` をそのまま貼れる形で実測値を出す）
+- `TSUITATE_THINK_BUDGET_MS=2000 cargo run --release --bin check_belief_probe -- [--seeds 3]
+  [--jobs N] [--limit N] [--shard i/n] [--opponent estimator_v14]
+  [--out data/check_belief.jsonl] <records...>` /
+  `check_belief_probe report [--allow-incomplete] <jsonl...>` —
+  **王手駒仮説の希釈 P0-1: runtime の伝達の分解**（issue #36、2026-08-29）。
+  #31 P0-3 の「真の王手駒の重みシェア 0.035」は
+  `CheckSolver::new(&view, &[], &[], &log)` = **粒子投票なしのソルバー単体の事前**で、
+  runtime では `ソルバー q → 粒子投票後 q → prior_legal との積 → blend_p_legal →
+  cap/min → score → rank` と6段を通って初めて選択に届く。**仮説シェアは選択への
+  伝達量ではない**ので、ここは各段を並べるだけで**中止の門を置かない**
+  （因果はオラクル arm = P0-2 でしか言えない）。**runtime には何も入らない**。
+  - 各段は `ShadowUpdater::stages_after`（`p_after` の各段を残した版。`p_after` は
+    これの `final_p` そのもの）で取る。**分解と本番を別実装にすると「どこで消えたか」の
+    記述が嘘になる**
+  - 注目手は「**真の王手駒を玉以外で取る手**」と「**誤仮説マスへの捕獲の最大値**」の対。
+    前者が候補に無い手番は欠測にせず **coverage failure** として数える
+    （候補に無ければ完璧な信念でも救えない = この issue の上限の外）
+  - 層は `particles_vote_check` の有無 × 厳密/taint × 反則あり/なし × 初反則の手種 ×
+    王手駒の種別（打ち／盤上／捕獲つき）× 終端手番。**両王手は別層**
+  - 母集団は **bot の全王手中手番**（反則0も、**反則だけ積んで受理手なしで終局した
+    終端手番**も含む）。`for_each_decision_full` は受理手を単位に回すので終端を返さない
+    （#34 の `check_prep::decision_snapshots` を再利用）。復元できない手番は
+    **attrition として本数を出す**（改善対象の最悪ケースが系統的に欠測すると門が甘くなる）
+  - 順位は**乱数を除いたスコア**で付け直し、同点は USI の辞書順（issue #24 の教訓②）
+  - **実測（run 33268085486、発見セット = Arena run 32697854659・3 seed・2000ms）**:
+    母集団は v14 587 手番（終端 43 / 復元できず 0）/ v13 530（終端 38）。
+    健全性は両相手とも最大差 **0.0000**。
+    - **#31 P0-3 の 0.035〜0.037 は再現するが、それはソルバー単体の値**。
+      runtime では粒子投票が同じ手番で **0.037 → 0.078（v14）/ 0.034 → 0.071（v13）**
+      まで戻す（全体では 0.064 → 0.176 / 0.069 → 0.166 の 2.4〜2.8 倍）＝
+      **仮説シェアは選択への伝達量ではない**
+    - **捕獲つきの王手はもう解けている**（q 0.125 → 0.351、真捕獲の最終 p 0.93・
+      平均1位）。残るのは**打ち**（p 0.31 / 順位 6.4）と**盤上移動**（0.41 / 5.4）
+    - **消えているのはソルバー q そのもの**で blend / cap ではない（真捕獲の
+      ソルバー p 0.51 → 最終 p 0.56 とむしろ上がる）。P1 の置き場所は列挙重み側
+    - 反則あり手番は真捕獲の最終 p 0.24・順位 7.4（反則0は 0.69 / 3.2）。
+      **ただし選択効果でもある**ので因果はオラクル arm でしか言えない
+    - **coverage failure（真の王手駒を玉以外で取る候補が無い）が 54.0%（v14）/
+      43.6%（v13）**＝仮説重みをどう直してもその手番は救えない（この issue の上限の外）
+    - 粒子が投票できない手番は 4.7% / 8.6% しかない＝**H2 の「厳密ゼロ = 投票が
+      無情報」は成り立たない**（厳密ゼロでも taint が投票する）
+  - **P0-2 の実測（run 33306228500、AB/BA を閉じた schema 5・4 seed・2000ms・
+    相手ごと6シャード）は事前登録した門を通過**（`policy-combined` は fail-closed で
+    exit 3 なので、ジョブが緑であること自体が判定）:
+    - 主 estimand（**全王手手番の自然頻度**・単王手のみ・元対局 cluster CI）
+      `R_foul = current@real − oracle@kinf@real` が
+      **v13 +0.3329 [+0.2676, +0.4003]（94局）/ v14 +0.3350 [+0.2790, +0.3949]（99局）**、
+      **合算 +0.3340 [+0.2905, +0.3788]**、veto OK。安全性3つは margin の内側どころか
+      **改善側**（破滅率 +0.0000・受理率 +1.95pt・即時反則負け −1.95pt）
+    - **反則した手番では 1.39 → 0.36 反則/手番**（v14、Δ −1.03 [−1.18, −0.90]、
+      受理率 91.3 → 97.8%）。**k に単調**（k2 −0.12 / k4 −0.30 / k8 −0.49 / kinf −1.03）
+    - **実再決定は p-only より強い**（0.36 vs 0.50）＝ gain と `removal_term` の
+      作り直しぶんが効くので、**P1 を p だけに入れる設計は上限を取り逃がす**
+    - **#31 の α が動かせなかった型2（kakutori）が信念側からは 1.31 → 0.17**
+      （v13 は 1.38 → 0.06）。型1 は 1.60 → 0.36（v13 1.80 → 0.26）。
+      「一律に掛けると型2 の捕獲プローブまで沈む」という #31 の懸念は、
+      **沈めるのでなく当てにいく信念側では起きない**
+    - **誤誘導 arm は壊す**（+1.48 [+1.11, +1.82]・破滅 8.1%）＝効いているのは
+      「真の仮説を強めたから」であって倍率のせいではない、の対照
+    - 反則0の手番は **0.47 → 0.44（v14、Δ −0.03 [−0.07, +0.01]）/ 0.31 → 0.28（v13）**で
+      非劣性〜弱く改善。新しい介入を足す害は無い
+    - 判定以前の関門は全通過: 恒等対照 `oracle@k1@shadow` が **bit-exact +0.00**、
+      **再決定のノイズ床が −0.00 [−0.00, +0.00]（v14）/ +0.00 [+0.00, +0.01]（v13）**、
+      **AB/BA の均衡**（`arm_order` で「treatment 先」と「対照 先」の本数一致を検査）、
+      `deduce_last_move` の真仮説落としは 0
+    - **初回 run 33298525370 は撤回済み**（PR #37 レビュー5巡目 [P1]。実再決定 arm を
+      タグ順の固定順で回していたので主差に実行順効果が残りえ、`arm_order` が無いので
+      事後監査もできなかった）。取り直しの合算 +0.3340 は撤回値 +0.3294 と
+      CI 半幅の 1/10 しか違わない = **取り直しても総効果量はほぼ同じだった**。
+      **ここから実行順効果の大きさは言えない**（レビュー6巡目 [P2]）: 2つの run は
+      配管も seed 数も違うので、点推定の差には run 間ノイズ・seed 数・実行順効果が
+      分離できないまま混ざっている。実行順効果を主張するなら**同じ run の中で**
+      `arm_order` により主ペア差を「treatment 先」/「対照 先」へ分けた対比と CI が要る
+      （#31 P0-7 の `check_price report` と同じ形。未計測）。撤回は撤回のまま
+    - **これはオラクル = 上限**であって、学習可能な事前がここへ届くとは言っていない。
+      P0-1 の coverage failure 54.0% / 43.6% を分母に含めたままこの効果量である点が
+      むしろ所見（救えない半分を含めて +0.33）
+    - 副産物: **β の近似通過条件は今回も不通過**（|shadow − real| 0.147 / 0.086 に対し
+      β の改善量 +0.063 / +0.007 で比 2.33 / 12.00、門は 0.25 以下。#31 の 1.88 / 2.14 と
+      同じ結論）。**候補分布上の較正も #31 P0-5 と一致**（捕獲試み +0.034 / +0.027、
+      最も過信なのは玉の手 +0.091 / +0.073）で **γ は引き続き指示されない**
+- **オラクル arm**（issue #36 P0-2 / P0-2b、2026-08-29）: `CheckSolver` に
+  **診断専用の仮説フック**（`scoped_hypothesis_diag`。列挙の直後に
+  `(マス, 駒種) → 倍率` と、直前手の演繹による除去）を足し、`bin/check_policy` の
+  `--belief` / `--belief-real` と `bin/check_continue` の `--policy` から設置する。
+  **設置しなければ分岐の中身を1度も実行しない**ので既定挙動は完全に不変
+  （`cargo test 診断フックは既定では何もしない`）。arm 名の規約は両バイナリ共通で
+  `[belief|policy][@shadow|@real]`（`check_belief::ArmSpec`）:
+  - `oracle@k{2,4,8,inf}@shadow` = issue の **`oracle_p_only@k`**（p だけを付け替え、
+    gain・`removal_term` は初回ランキングの値に固定する。**上限とは呼ばない**）
+  - **`oracle@kinf@real` = 主 arm `oracle_full_score@real`**（初回ランキングも
+    オラクルの下で作り直し、反則ごとに実再決定して `removal_term` まで作り直す）
+  - `oracle_misdirected@k{4,inf}` = adversarial stress test（真でない最大重みの仮説 ×k。
+    **学習事前の誤りの分布とは一致しない**ので許容誤り率への換算はしない）
+  - **介入対象・被覆・fallback は「その `CheckSolver` が実際に列挙した集合」で
+    解決・記録する**（PR #37 レビュー [P1]）。倍率表を外（粒子なしのソルバー）で
+    作って渡すと、粒子多数決が `known_loaded` の駒種とマーカーの載せ方を変えて
+    **列挙集合そのものが変わる**ため、実評価側にしか無い誤仮説に ×0 が付かず
+    「full oracle でないもの」を `oracle@kinf@real` として集計してしまう。
+    フックへ渡すのは**選択規則**（真の王手駒と `DiagMode`）だけにしてある
+  - **1 arm = 1 scope**（同レビュー [P1]）。scope に入るたびに `DiagRecord` を
+    空にするので、初回ランキングと simulate を別々の scope に割ると
+    「最初の構築で真仮説を落とした」記録が消え、健全性の関門が素通りする
+  - **恒等対照は外せない**（同レビュー [P2]）。`--belief` から `oracle@k1` を
+    抜くと `identity_err` が null のままになり `report` の関門が「数値が0件」で
+    素通りするので、オラクル arm を宣言した実験では起動時と集計時の両方で必須にする
+  - **実再決定 arm はすべて同じ `run_arm` 経路を通す**（レビュー2巡目 [P1]）。
+    `entry_setup` は既に1回 `choose` しているので、その instance を clone して
+    もう一度引く arm と、`entry_setup` の `moves/p0` をそのまま初手に使う arm では
+    **別の粒子サンプルを比べる**ことになる（実測: 介入なしの `oracle@k1@real` で
+    p の最大差 0.0071）。`current@real` も同じ経路へ寄せた
+  - **実再決定側の恒等対照は「門」ではなく再決定のノイズ床**（同）。両 arm を
+    同じ経路へ寄せても `choose` は壁時計デッドラインまで粒子を若返らせるので
+    bit-exact にはならない（同じ入力の4回で 0.006 / 0.085 / 0.045 / 0.032）。
+    `oracle@k1@real` は**必ず回して床を測り**、主 arm の差はその床と並べて読む
+    （床が測れていない実験は `report` が弾く）。bit-exact の門は shadow の
+    `oracle@k1` だけ（こちらは決定的なので 0.000000）
+  - **診断は arm ごとに持つ**（同 [P2]）。単一変数だと `--belief-real` に複数
+    指定したとき最後の1本が全行を上書きし、`report` が別 arm の被覆・fallback を
+    主 arm のものとして表示する。**集計も arm ごとの行から集める**
+    （レビュー3巡目 [P1]: `current@static` で絞ると演繹の健全性関門が常に空振りする）
+  - **実再決定 arm の対照は `current@real`**（同 [P1]）。反則/手番も被一手詰めも
+    shadow を対照にすると、介入に「shadow → 粒子を引き直しての再ランキング」の差が
+    混ざる。`oracle@k1@real − current@real` の同じ endpoint を**ノイズ床**として
+    同じ表に並べる
+  - **p の突き合わせは添字でなく USI**（同 [P2]）。実再決定は候補リストごと
+    作り直すので、順位が入れ替わると添字の zip は別の手の p を比べる。
+    片側にしか無い候補は `identity_only_real` として別に数える
+  - `--belief-real` に `oracle@k1` を明示しても自動追加と衝突しない（arm を
+    タグで正規化する。**長時間実験の末尾で「重複行があります」で落とさない**）
+  - **母集団は `check_belief::decision_points`（3バイナリ共通）**（レビュー4巡目 [P1]）。
+    `for_each_decision_full` は受理手を単位に回すので**終端手番を返さない**:
+    改善対象の最悪ケースであり即時反則負けの分子でもある手番が系統的に消えると、
+    オラクル効果も safety 指標も楽観側へ偏る。`bin/check_continue` は終端手番も
+    母集団に入れ、受理手が無くて組めない `baseline` arm だけをその手番で外す
+    （期待キーからも外す）
+  - **主 estimand は「全王手手番の自然頻度」**（同 [P1]）。反則0の手番は**既定で
+    間引かない**（`--nofoul-cap N` で間引くときは包含重み = 元の層頻度 ÷ 残した本数を
+    行に残し、自然頻度の表がそれで戻す）。**両王手は分母から除く**（介入が no-op）。
+    `foul` / `nofoul` の2表は層の記述で、そのまま合算すると少数の foul 層を過大に
+    重み付けする
+  - **採否規則は集約経路に実装する**（同 [P1]）。`report` は主 arm
+    （`oracle@kinf@real` vs `current@real`）の `R_foul = current − treatment` を
+    自然頻度で出し、破滅率 +0.5pt / 受理率 −1pt / 即時反則負け +0.5pt の margin と
+    ともに判定する。**採否は相手をまたいだ合算**で、`check_policy combined` が
+    `(Δv13 + Δv14)/2` の層化 cluster bootstrap（各相手の内側で元対局を引き直す）と
+    veto `Δv13 > 0 && Δv14 > 0` を **fail-closed**（不通過なら exit 3）で判定する。
+    CI の `policy-combined` ジョブがこれを回す
+  - `deduce_last_move` = H1 ① の演繹（学習なし）。「(a) 直前の相手手で q へ着地した駒」
+    でも「(b) 元マスが空いて線が開いた静止飛び駒」でもない仮説だけを落とす。
+    捕獲つきの王手は着地点が観測で分かるので `prune_infeasible_discovered_checks` の
+    領分（何もしない）。落とそうとした仮説は **全滅 fallback の前に**記録する
+  - **`oracle@k1` は恒等対照**。`current@shadow` と bit-exact でなければ配管が壊れて
+    いるので `report` が止める。`deduce_last_move` が真仮説を落としたときも止める
+    （どちらも issue #36 の「判定以前」の中止条件）
+  - `bin/check_policy` の `ROW_SCHEMA` は **6**（schema 1 = 恒等対照と演繹の列が
+    無い時期、schema 2 = **介入対象と被覆を粒子なしのソルバーで決めていた時期**、
+    schema 3 = **診断が arm ごとでなく最後の1本で全行を上書きしていた時期**、
+    schema 4 = **終端手番・`weight`・`arm_order` が無い時期**、
+    schema 5 = **`double_check` が meta と照合されていなかった時期**の
+    記録は集計から弾く。**欠けた列を「問題なし」と読むと両方の関門が素通りする**ので、
+    版の拒否と `REQUIRED_ROW_KEYS` の存在検査の両方で止める）。
+    **分母を決める列（`estimand` / `terminal` / `weight` / `double_check`）は
+    meta の `points_detail` にも固定し、全 arm の行と照合する**（PR #37
+    レビュー6巡目 [P1]。行にしか無かった `double_check` は、v13 の 6 シャードで
+    全行を `false` へ書き換えると両王手 8 行が分母へ戻って `report` が通った）。
+    **AB/BA の均衡は決定点ごとに検査する**（同 [P1]。全決定点の総数で見ると
+    「決定点 A は全 seed が treatment 先・B は全 seed が対照 先」が相殺で通る）
+  - **P0-2b の合否は `combined` でしか執行されない**（同 11巡目 [P1]）。
+    `report` は表示するだけだったので、`Δ差 = −1.0000 → 不合格` でも exit 0 だった。
+    門を `gate_foul` / `gate_nofoul` へ切り出し、**`report --main <arm>` はその arm が
+    落ちたら exit 3**、`check_continue combined` が `check_policy combined` と同じ契約
+    （相手ごとに入力契約 → `(Δv13 + Δv14)/2` の層化 cluster bootstrap → 同符号 veto →
+    安全性 veto、不通過は exit 3）で最終判定する。CI の `continue-combined` が回す。
+    **`foul` と `nofoul` は両方とも門**なので、片方に有効標本が無ければ「通過」でなく
+    **判定不能**として落とす。**継続は常に2 replicate**（plan が 2 以外を拒否し、
+    `combined --expect-replicates 2` が replicate ラベルの本数を検査する）。
+    **相手別の集計に `--main` を渡してはいけない**（同 12巡目 [P1]）: 事前登録は
+    「合算で +0.04・合算 CI 下限 > 0」＋「相手別は**点推定の符号** veto だけ」で、
+    104局×2 で相手別の CI 下限まで正にするのは強すぎると明記されている。
+    `combined` は **相手間の実験条件の同一性**（`opponent` / `records` を除いた
+    experiment key）と **対照・主 arm の存在**も fail-closed で検査する
+    （欠落を `unwrap_or(0)` で補うと「暗黙のゼロ対照」と比べて合格しうる。
+    対象の手番が無かった局をゼロ寄与の cluster として数える padding とは別物）。
+    **読めなかった元対局（`broken`）があれば採否経路では即失敗**（同 13巡目 [P1]。
+    `games` が縮んだ選択標本になり、相手間で同数だけ失敗すると `games` 一致検査も
+    通る）。**主 arm は `continue_main`、期待する相手集合は plan の `opponents`**
+    から渡す（`continue_policy` はカンマ区切りなので `--main` へ丸ごと渡すと、
+    最長 350 分の matrix を完走した後に確定で失敗する）。
+    **P0-2b の採否は held-out 検証セットに固定する**（同 14巡目 [P1]）:
+    plan が `run_continue=true` で**非空の `arena_run_id` と `expect_match_seed`**、
+    および**相手集合ちょうど `{estimator_v13, estimator_v14}`** を要求し、
+    生成側は `--arena-run-id` / `--match-seed-base` を meta へ焼き込んで
+    `combined` がどちらかが空なら判定を出さない。`continue-combined` は
+    `--expect-opponents` を渡さない（バイナリ既定の2相手固定のまま。
+    任意の相手集合を渡すと `opponents=estimator_v14` の1層だけで「通過」を返せる）。
+    カスタム相手・`records/` は診断（`report`）でなら従来どおり使える
+  - P0-2b（`bin/check_continue`）の**対照は `current@real`**（`report --baseline
+    current@real`）。shadow の `current` と比べると「オラクル」と「指し直したこと」の
+    効果が混ざる。実再決定 arm を混ぜたら `current@real` を自動で足す。
+    思考予算は **2000ms**（ランキング段と継続段の両方に効く。700ms は別の treatment）。
+    `ROW_SCHEMA` は **6**（schema 3 = **実行順を巡回で回していた時期**、
+    schema 4 = **`continuation_group` が無い時期**、schema 5 = **対照と treatment を
+    畳んでいた時期**の記録は弾く）
+  - **P0-2b の実行順は「巡回」ではなく「反転」**（PR #37 レビュー8巡目 [P1]）。
+    arm は**選んだ強制列ごと**にグループへ畳まれる（同じ列なら継続1本を共有する）が、
+    それを `(決定点番号 + seed) % グループ数` で cyclic rotate しても **AB/BA には
+    ならない**: 固定の2 arm の前後は「切れ目がその間に入るか」だけで決まるので、
+    g グループ・距離 d なら A が先になるのは g 回中 (g − d) 回（3グループ・4 seed の
+    shift は `0,1,2,0`）。しかもグループ数と並びは seed ごとの強制列で変わり、
+    `replicate` は shift に入らない。**反転は全ペアの前後を同時に入れ替える**ので、
+    `schedule_groups` が前向きの並びを **arm の優先順位**（`baseline` → `policies` の
+    タグ順。強制列の辞書順だと前向きの並び自体が seed ごとに変わる）で決めてから
+    `(決定点番号 + seed) % 2` で反転する。実再決定 arm があるなら `--seeds` は
+    **2 以上の偶数**（`check_policy` と同じ）。集計側は
+    `(replicate, game, move_number, treatment)` ごとに前後を数えて
+    **|treatment 先 − 対照 先| ≤ 1** を要求する（**同じ強制列に畳まれた unit は
+    数えない** = `arm_order` が等しく実行順効果を持たない。畳まれ方は seed ごとに
+    変わるので、分かれた unit が奇数個の決定点では端数が残る）。meta の
+    `schedule_control` と `report --baseline` が違えば「AB/BA が閉じているのは
+    別のペア」として落とす。**生成規則・実行時の契約・集計の検査は3点セット**で、
+    どれか1つでも欠けると workflow 側の偶奇検査は空手形になる
+  - **前後差は完全一致**（同 9巡目 [P1]）。`|差| ≤ 1` を許すと、対の片方だけが
+    分離した決定点で「先 1 / 後 0」が通り、**ペア差が非ゼロになりうる唯一の unit が
+    treatment 先だけ**になるので実行順効果が丸ごと主差へ残る
+  - **対照と treatment は強制列が同じでも畳まない**（同 10巡目 [P1]）。畳むと
+    その unit が「実行順を持たない」側へ落ち、畳まれるかが seed ごとに変わるので
+    AB/BA が閉じない。9巡目はそれを**事後に除外**して閉じたが、除外は arm の
+    選択結果で事前登録した母集団を条件づける post-treatment な操作で、
+    全部落ちれば門を一度も評価せずに成功しうる。**全 unit を保持したまま**
+    偶数 seed の反転だけで閉じる設計にし、閉じていない入力は落とす（fail-closed）。
+    畳むのは `baseline` と shadow arm どうしだけ。コストは「対照と treatment の
+    強制列が一致する unit で継続が1本増える」ぶん
+  - **「畳まれた unit」は `continuation_group`（強制列＋主比較 arm の指紋）で
+    判定する**（同 [P1]）。`arm_order` の一致で代用していたので、**全行を
+    文字列にする / order を同値にするだけ**で均衡検査を空集合にできた。
+    `arm_order` は整数・`continuation_group` は**16桁の小文字 hex**であること、
+    unit 内で「順位の集合 == 0..グループ数」「同じ順位 ⟺ 同じグループ」、
+    **同じグループなら継続の結果が完全一致**、**期待した行がすべて索引へ入った**
+    ことを検査する。**meta が宣言した estimand に行が無ければ `die`**
+    （黙って `continue` すると門を評価せずに成功できる）。
+    `ROW_SCHEMA` は **6**（schema 4 = `continuation_group` が無い時期、
+    schema 5 = 対照と treatment を畳んでいた時期は弾く）
+- **王手駒仮説の希釈の CI**（`.github/workflows/check-belief.yml`、**通常のコード push
+  では走らない**）: `gh workflow run check-belief.yml -f arena_run_id=<Arena実行ID>`、
+  `gh` が無ければ `.github/ci/check-belief.request.json` を置いて push（削除の push は
+  全ジョブがスキップされる）。相手ごとに別ジョブ・元対局単位のシャード・**欠けたら
+  aggregate が失敗**。P0-1 は既定で走り（`run_probe=false` で切れる。済んだ phase を
+  再実行して16ジョブを無駄に埋めないため。check-economy.yml と同じ規約）、
+  **P0-2（`run_policy`）と P0-2b（`run_continue`）は既定オフ**（同時に有効化しない）。元 Arena 実行の実験条件の
+  検査は `scripts/ci/verify_arena_provenance.sh` に**一本化**した（`check-prep.yml`
+  から切り出した共通の関門。ワークフローごとに書くと片方だけ緩くなる）。
+  **3つの phase すべてを検証済み provenance に依存させ、`EXPECT_THINK_BUDGET_MS` で
+  「その phase の実効予算 == 元 Arena の `think_budget_ms_a`」も検査する**
+  （PR #37 レビュー [P1]。probe だけを検査していた頃は、元2000ms の正常な run に
+  policy 700ms を指定しても緑になり、記録と違う粒子数で引いたランキングを採否に
+  使えた）。**`think_budget_ms_a` は commit 476483d より前は「env の生値・どちらも
+  未設定なら null」**で、null は「不明」ではなく**「上書きなし = その build の既定値」**
+  （886ef75 でも現在でも `DEFAULT_THINK_BUDGET_MS = 2000`）。476483d 以降は
+  `budget_of(...)` の実効値なので null にならない。**発見セット run 32697854659
+  （commit 886ef75）はこの旧形式**なので `allow_legacy_think_budget` を渡して既定値と
+  して解決させる（既定は落とす。null を黙って通すと関門が意味を失う）。旧形式のときは
+  記録の `think_avg_ms_a` が主張した予算未満であることも要求する（**非対称**な裏取り:
+  「実際はもっと大きい予算だったのに小さい予算を主張した」側だけが捕まる）。
+  設計・契約・中止条件は `docs/check-belief-p0.md`
 - **王手中の反則経済の CI**（`.github/workflows/check-economy.yml`、**通常のコード
   push では走らない**）: `gh workflow run check-economy.yml -f arena_run_id=<Arena実行ID>
   -f opponents="estimator_v13 estimator_v14"`、`gh` が無ければ
@@ -2765,6 +3030,14 @@
   数えるための場所。手番開始時（反則0）の状態の復元（`entry_replayed`。
   `for_each_decision_full` が渡すのは反則を食った後なので、両者のログ末尾から
   反則の観測を落とす）も P0-4 / P0-5 で共有する
+- `check_belief.rs` — **王手駒仮説の希釈の共有定義**（issue #36、2026-08-29。
+  runtime には入らない診断だけ）。仮説重みへの介入 arm（`Belief`: オラクル・誤誘導・
+  直前手の演繹）と arm 名の規約（`ArmSpec` = `[belief|policy][@shadow|@real]`）・
+  1 arm を回す配管（`run_arm`。p-only と実再決定の**両方が1か所**にある）・
+  母集団の取り出し（`decision_points`。**終端手番を含む**全王手中手番と `Attrition`）・
+  伝達の分解の注目手（`focus`）。`bin/check_belief_probe`（P0-1）・
+  `bin/check_policy`（P0-2）・`bin/check_continue`（P0-2b）が**同じ arm 名で同じ配管**を
+  指すための場所（別々に書くと、削減量と勝率差が別物の測定になる）
 - `check_policy.rs` — **王手中の反則経済 P0-5 の共有定義**（issue #31、2026-08-28。
   runtime には入らない診断だけ）。1候補の最小の入力（`PolicyMove`。**p と価格の
   両方**を付け替えて score を引き直せる。`check_economy::PricedMove` は価格しか

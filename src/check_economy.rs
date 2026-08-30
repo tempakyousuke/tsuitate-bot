@@ -469,12 +469,21 @@ pub fn hypothesis_stats(
     let Some(solver) = solver else {
         return (None, None);
     };
-    let hyps = solver.hypotheses_debug();
+    hypothesis_share(&solver.hypotheses_debug(), &true_checkers(truth, bot))
+}
+
+/// [`hypothesis_stats`] の本体（仮説リストと真の王手駒から直に計算する版）。
+///
+/// issue #36 の P0-1 は runtime と同じ投票つきの仮説を別経路で作るので、
+/// **定義を1か所にしておかないと 0.035 の水準が経路ごとに食い違う**。
+pub fn hypothesis_share(
+    hyps: &[(Coord, Role, f64)],
+    checkers: &[(Coord, Role)],
+) -> (Option<f64>, Option<f64>) {
     let total: f64 = hyps.iter().map(|(_, _, w)| w.max(0.0)).sum();
     if total <= 0.0 {
         return (None, None);
     }
-    let checkers = true_checkers(truth, bot);
     let hit: f64 = hyps
         .iter()
         .filter(|(hs, hr, _)| checkers.iter().any(|(s, r)| s == hs && r == hr))

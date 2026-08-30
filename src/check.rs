@@ -177,6 +177,110 @@ struct Hypothesis {
     weight: f64,
 }
 
+/// **診断専用の仮説フック**（issue #36 P0-2。runtime は絶対に設置しない）。
+///
+/// `CheckSolver::new` は列挙の直後にこれを見る。設置は
+/// [`scoped_hypothesis_diag`] だけで、既定（未設置）では
+/// **1回も分岐の中身を実行しない**ので挙動は完全に不変。
+///
+/// **介入は「その `CheckSolver` が実際に列挙した集合」に対して解決する**
+/// （PR #37 レビュー [P1]）。倍率表を外で作って渡すと、粒子投票の有無で
+/// `known_loaded` の駒種とマーカーの載せ方が変わって列挙集合そのものが変わる
+/// ため、実評価側にしか無い誤仮説に ×0 が付かず「full oracle ではないもの」を
+/// `oracle@kinf` として集計してしまう。だからここには**選択規則**だけを渡し、
+/// 対象の決定・被覆の記録・全滅 fallback は列挙後の集合の上で行う。
+#[derive(Clone, Default, Debug)]
+pub struct HypothesisDiag {
+    /// 真の王手駒（マス・駒種）。**単王手のときだけ渡す**
+    /// （両王手は2仮説をともに ×k しても重みが半々になるだけ）
+    pub truth: Vec<(Coord, Role)>,
+    pub mode: DiagMode,
+    /// H1 ① の演繹（直前の相手手の1手で説明できない仮説の除去）。
+    /// 落とそうとした仮説は [`take_diag_record`] で**fallback の前に**取れる
+    pub deduce_last_move: bool,
+}
+
+/// 仮説重みへの介入の種類（[`HypothesisDiag`]）。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum DiagMode {
+    #[default]
+    None,
+    /// 真の王手駒 × k（`k` が [`ORACLE_INF`] 以上なら**それ以外を ×0**）
+    Oracle { k: f64 },
+    /// 真でない仮説のうち**その集合で**重みが最大のもの × k
+    /// （adversarial stress test）。同点は (マス, 駒種) の辞書順で決める
+    Misdirected { k: f64 },
+}
+
+/// `k = ∞`（真仮説以外を潰す）の内部表現。`f64::INFINITY` を掛けると
+/// 正規化が NaN になるので有限の巨大値にする
+pub const ORACLE_INF: f64 = 1e9;
+
+impl HypothesisDiag {
+    pub fn is_noop(&self) -> bool {
+        self.mode == DiagMode::None && !self.deduce_last_move
+    }
+}
+
+/// スコープ内の**全 `CheckSolver` 構築ぶん**の診断記録。
+///
+/// 1つの arm は手番開始時だけでなく反則を食うたびにソルバーを作り直すので、
+/// 最後の構築だけを見ると「途中で真仮説を落とした」健全性違反も
+/// 「実評価の集合に真仮説が無かった」も取りこぼす（PR #37 レビュー [P1]）。
+#[derive(Clone, Debug, Default)]
+pub struct DiagRecord {
+    /// フックを見た `CheckSolver::new` の回数
+    pub constructions: u32,
+    /// そのうち**真の王手駒が実際に列挙されていた**回数（= オラクルが介入できた）
+    pub truth_present: u32,
+    /// 倍率で総重みが 0 以下になり元へ戻した回数（介入が効かなかった構築）
+    pub weight_fallback: u32,
+    /// `deduce_last_move` が落とそうとした仮説の**延べ**（全滅 fallback の前）
+    pub deduce_dropped: Vec<(Coord, Role)>,
+    /// `deduce_last_move` の全滅 fallback が1度でも発動したか
+    pub deduce_fallback: bool,
+}
+
+thread_local! {
+    static HYP_DIAG: std::cell::RefCell<Option<std::rc::Rc<HypothesisDiag>>> =
+        const { std::cell::RefCell::new(None) };
+    static DIAG_RECORD: std::cell::RefCell<DiagRecord> =
+        const { std::cell::RefCell::new(DiagRecord {
+            constructions: 0,
+            truth_present: 0,
+            weight_fallback: 0,
+            deduce_dropped: Vec::new(),
+            deduce_fallback: false,
+        }) };
+}
+
+/// 診断フックを設置して `f` を走らせる（**この関数を runtime から呼ばない**）。
+///
+/// スレッドローカルなので、`Strategy::choose` の内側で作られる `CheckSolver`
+/// にも効く（= 実再決定 arm が gain / `removal_term` まで作り直せる）。
+/// **1 arm は1つの scope で回すこと**: scope に入るたびに記録を空にするので、
+/// arm を複数の scope に割ると最初の構築の記録（真仮説を落としたか・被覆）が
+/// 消える（PR #37 レビュー [P1]）。
+pub fn scoped_hypothesis_diag<R>(diag: &HypothesisDiag, f: impl FnOnce() -> R) -> R {
+    DIAG_RECORD.with(|c| *c.borrow_mut() = DiagRecord::default());
+    let rc = std::rc::Rc::new(diag.clone());
+    let prev = HYP_DIAG.with(|c| c.borrow_mut().replace(rc));
+    let out = f();
+    HYP_DIAG.with(|c| *c.borrow_mut() = prev);
+    out
+}
+
+/// スコープ内の診断記録を取り出す（取り出すと消える）。
+pub fn take_diag_record() -> DiagRecord {
+    DIAG_RECORD.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+/// 粒子のうち自玉が王手されているものが1つでもあるか（P0-1 の層分けで
+/// runtime と同じ判定を使うため公開する）。
+pub fn particles_can_vote(particles: &[(&Position, f64)], my_color: Color) -> bool {
+    particles_vote_check(particles, my_color)
+}
+
 pub struct CheckSolver {
     /// 自駒＋持ち駒だけを置いたスパース盤面（手番=自分）。仮説の駒を載せて使う
     base: Position,
@@ -266,6 +370,9 @@ impl CheckSolver {
             return None;
         }
         solver.threat_cache = vec![None; solver.hypotheses.len()];
+        // **診断フック**（issue #36 P0-2。既定では設置されていないので何も起きない）。
+        // 列挙の直後 = 捕獲ブースト・粒子投票・反則減衰より前に掛ける
+        let diag = HYP_DIAG.with(|c| c.borrow().clone());
         // 王手宣言と同時に自駒が取られた（= 直前の相手手がそのマスへ来た）なら、
         // そのマスの仮説を強める。粒子投票より前ではなく後でもよい（乗算なので
         // 順序は結果に影響しない）が、粒子が退化していて投票が無情報でも
@@ -289,6 +396,9 @@ impl CheckSolver {
                 _ => None,
             })
             .flatten();
+        if let Some(d) = &diag {
+            solver.apply_diag(d, &opp_hand_possible, log);
+        }
         if let Some(sq) = last_opp_capture {
             // 捕獲マス以外の仮説は「開き王手」としてしか成立しない。自駒配置だけで
             // 開き王手が幾何学的に不可能な仮説は**除去**する（健全な演繹）
@@ -493,6 +603,232 @@ impl CheckSolver {
             self.hypotheses = kept;
             self.threat_cache = vec![None; self.hypotheses.len()];
         }
+    }
+
+    /// 診断フックの適用（issue #36 P0-2。`HYP_DIAG` が設置されているときだけ呼ばれる）。
+    fn apply_diag(
+        &mut self,
+        diag: &HypothesisDiag,
+        opp_hand_possible: &HashMap<Role, i32>,
+        log: &ObservationLog,
+    ) {
+        // **介入対象は「この `CheckSolver` が実際に列挙した集合」から選ぶ**
+        // （倍率表を外で作ると、粒子投票の有無で列挙集合が変わったときに
+        // 実評価側にしか無い誤仮説へ ×0 が付かない。PR #37 レビュー [P1]）
+        let is_truth = |h: &Hypothesis| {
+            diag.truth
+                .iter()
+                .any(|(s, r)| *s == h.square && *r == h.role)
+        };
+        let truth_present = self.hypotheses.iter().any(is_truth);
+        let mut fallback = false;
+        match diag.mode {
+            DiagMode::None => {}
+            DiagMode::Oracle { k } => {
+                if !diag.truth.is_empty() {
+                    fallback = self.rescale(k, k >= ORACLE_INF, is_truth);
+                }
+            }
+            DiagMode::Misdirected { k } => {
+                // 真でない仮説のうち**この集合で**重みが最大のもの。
+                // 同点は (マス, 駒種) の辞書順で決める（乱数を入れない）
+                let worst = self
+                    .hypotheses
+                    .iter()
+                    .filter(|h| !is_truth(h))
+                    .max_by(|a, b| {
+                        a.weight.total_cmp(&b.weight).then_with(|| {
+                            (b.square.file, b.square.rank, b.role as u8)
+                                .cmp(&(a.square.file, a.square.rank, a.role as u8))
+                        })
+                    })
+                    .map(|h| (h.square, h.role));
+                if let Some(target) = worst {
+                    fallback = self.rescale(k, k >= ORACLE_INF, |h| {
+                        (h.square, h.role) == target
+                    });
+                }
+            }
+        }
+        DIAG_RECORD.with(|c| {
+            let mut g = c.borrow_mut();
+            g.constructions += 1;
+            g.truth_present += u32::from(truth_present);
+            g.weight_fallback += u32::from(fallback);
+        });
+        if diag.deduce_last_move {
+            self.prune_by_last_move(opp_hand_possible, log);
+        }
+    }
+
+    /// `keep` が真の仮説を ×k し、`zero_others` なら残りを ×0 にする。
+    ///
+    /// 総重みが 0 以下になったら**元へ戻して** `true`（fallback）を返す
+    /// （真仮説がこの集合に無いときに ×0 で全滅させない = 健全性）。
+    fn rescale(&mut self, k: f64, zero_others: bool, keep: impl Fn(&Hypothesis) -> bool) -> bool {
+        let saved: Vec<f64> = self.hypotheses.iter().map(|h| h.weight).collect();
+        for h in &mut self.hypotheses {
+            if keep(h) {
+                h.weight *= k.max(0.0);
+            } else if zero_others {
+                h.weight = 0.0;
+            }
+        }
+        let total: f64 = self.hypotheses.iter().map(|h| h.weight.max(0.0)).sum();
+        if total > 0.0 {
+            return false;
+        }
+        for (h, w) in self.hypotheses.iter_mut().zip(saved) {
+            h.weight = w;
+        }
+        true
+    }
+
+    /// **H1 ① の演繹**（issue #36。`deduce_last_move` arm でのみ有効）。
+    ///
+    /// 自分の直前の受理手の直後は王手が解消済みで、そのあと相手が指したのは
+    /// 一手だけ。したがって今の王手駒は
+    ///
+    /// - (a) 直前の相手手で `q` へ着地した駒（移動・成り・打ち）か、
+    /// - (b) 相手の駒が出て行って線が開いた**静止した飛び駒**
+    ///
+    /// のどちらか。**両方が不可能な仮説だけ**を落とす（連続王手でも毎回いったん
+    /// 合法に解消されてから再発生するので破綻しない。自分の直前手で玉が動いた
+    /// 場合も「新しい玉位置が合法だった」を出発点にすれば成立する）。
+    ///
+    /// 捕獲つきの王手（着地点が観測で分かる）は
+    /// [`CheckSolver::prune_infeasible_discovered_checks`] の領分なので何もしない。
+    /// 見えない敵駒による遮蔽は**楽観**（遮られない完成局面もありうる）なので、
+    /// 落とすのは「どんな真実でも1手では説明できない」仮説だけになる。
+    ///
+    /// 落とそうとした仮説は [`take_diag_record`] で**全滅 fallback の前に**
+    /// 記録する（fallback 後だけ見ると健全性違反を隠せる）。
+    fn prune_by_last_move(&mut self, opp_hand: &HashMap<Role, i32>, log: &ObservationLog) {
+        use crate::observation::Observation;
+        // 直前の相手手を取る。末尾が王手宣言・相手反則以外の何かなら（規約が
+        // 変わった・自分の手番が始まっていない）**何もしない**
+        let mut captured_at: Option<Option<String>> = None;
+        for e in log.events().iter().rev() {
+            match e {
+                // 王手宣言・相手の反則・**自分の反則**は局面を変えないので読み飛ばす
+                // （実再決定 arm はログの末尾へ `MyFoul` を積むが、直前の相手手が
+                // 変わったわけではないので演繹はそのまま成立する）
+                Observation::Check { .. }
+                | Observation::OpponentFoul { .. }
+                | Observation::MyFoul { .. } => continue,
+                Observation::OpponentMoved { captured_my_piece_at, .. } => {
+                    captured_at = Some(captured_my_piece_at.clone());
+                    break;
+                }
+                _ => break,
+            }
+        }
+        let Some(captured_at) = captured_at else { return };
+        if captured_at.is_some() {
+            return; // 着地点が既知 = 捕獲つきの開き王手判定の領分
+        }
+        let king = self.base.king_square(self.my_color).expect("new で確認済み");
+        let hyps: Vec<(Coord, Role)> = self
+            .hypotheses
+            .iter()
+            .map(|h| (h.square, h.role))
+            .collect();
+        let mut keep = vec![true; hyps.len()];
+        let mut dropped = vec![];
+        for (i, &(q, role)) in hyps.iter().enumerate() {
+            let df = q.file - king.file;
+            let dr = q.rank - king.rank;
+            let aligned = df == 0 || dr == 0 || df.abs() == dr.abs();
+            // (b) 開き王手: 玉と直線で並び、間に1マス以上ある（そこから駒が出た）
+            let discovered = aligned && df.abs().max(dr.abs()) >= 2;
+            if discovered || self.arrival_possible(q, role, opp_hand) {
+                continue;
+            }
+            keep[i] = false;
+            dropped.push((q, role));
+        }
+        let fallback = keep.iter().all(|k| !k);
+        DIAG_RECORD.with(|c| {
+            let mut g = c.borrow_mut();
+            g.deduce_dropped.extend(dropped);
+            g.deduce_fallback |= fallback;
+        });
+        if fallback {
+            return; // 全滅は健全性の最後の砦（元の集合を残す）
+        }
+        let mut i = 0;
+        self.hypotheses.retain(|_| {
+            let k = keep[i];
+            i += 1;
+            k
+        });
+        self.threat_cache = vec![None; self.hypotheses.len()];
+    }
+
+    /// (a) 直前の相手手で `(q, role)` の駒が `q` へ来られたか。
+    ///
+    /// 打ち（生駒・持ち駒上界・行き所）か、盤上のどこか `O` からの1手
+    /// （成る前の駒種で幾何を判定し、強制成り・成りゾーンも見る。経路は
+    /// **自駒だけ**を障害に数える = 見えない敵駒には楽観）。
+    fn arrival_possible(&mut self, q: Coord, role: Role, opp_hand: &HashMap<Role, i32>) -> bool {
+        let opp = self.my_color.other();
+        let base_role = unpromote_role(role);
+        // 打ち
+        // 既知敵駒のマーカーが `q` にあっても打ちを否定しない（そのマーカー自体が
+        // 陳腐化している可能性がある = **落とすのは「どんな真実でも1手では説明
+        // できない」仮説だけ**という原則。自駒のマスは enumerate が既に除いている）
+        if role == base_role
+            && opp_hand.get(&role).copied().unwrap_or(0) > 0
+            && !crate::board::dead_end_rank(role, q.rank, opp)
+        {
+            return true;
+        }
+        // 盤上移動 O → q
+        let movers: Vec<Role> = if role == base_role {
+            vec![role]
+        } else {
+            vec![role, base_role]
+        };
+        let saved_q = self.base.piece_at(q);
+        for file in 1..=9i8 {
+            for rank in 1..=9i8 {
+                let o = Coord { file, rank };
+                if o == q {
+                    continue;
+                }
+                if self
+                    .base
+                    .piece_at(o)
+                    .is_some_and(|p| p.color == self.my_color)
+                {
+                    continue; // 自駒がいたマスから相手の駒は出られない
+                }
+                for &mover in &movers {
+                    use crate::board::Promotion;
+                    let promo = crate::board::promotion_choice(mover, o, q, opp);
+                    if mover == role {
+                        // 成らずに来た（成駒はそのまま。生駒は強制成りに掛からないこと）
+                        if role == base_role && promo == Promotion::Forced {
+                            continue;
+                        }
+                    } else if promo == Promotion::None {
+                        continue; // 成れない位置関係
+                    }
+                    let saved_o = self.base.piece_at(o);
+                    // 着手前は q が空（取っていないので）。経路判定のため一時的に空ける
+                    self.base.set(q, None);
+                    self.base
+                        .set(o, Some(crate::shogi::Piece { color: opp, role: mover }));
+                    let ok = self.base.attacks(o, q);
+                    self.base.set(o, saved_o);
+                    self.base.set(q, saved_q);
+                    if ok {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
     }
 
     /// **診断専用**の読み取り（issue #31 P0-3）: 仮説集合の (マス, 駒種, 重み)。
@@ -1024,6 +1360,277 @@ mod tests {
 
     fn mv(usi: &str) -> ShogiMove {
         parse_usi(usi).unwrap()
+    }
+
+    /// 直前の相手手が非捕獲だった観測ログ（`prune_by_last_move` の前提）
+    fn log_after_opp_quiet_check() -> ObservationLog {
+        let mut log = ObservationLog::default();
+        log.record(crate::observation::Observation::MyMove {
+            move_number: 1,
+            usi: "5i5h".into(),
+            captured: None,
+        });
+        log.record(crate::observation::Observation::OpponentMoved {
+            move_number: 2,
+            captured_my_piece_at: None,
+        });
+        log.record(crate::observation::Observation::Check {
+            in_check: Color::Sente,
+        });
+        log
+    }
+
+    #[test]
+    fn 診断フックは既定では何もしない() {
+        // 設置しなければ `CheckSolver` は完全に従来どおり（runtime の挙動不変）
+        let view = view_with(vec![("5e", Role::King)]);
+        let log = log_after_opp_quiet_check();
+        let a = CheckSolver::new(&view, &[], &[], &log).unwrap();
+        let noop = HypothesisDiag::default();
+        let b = scoped_hypothesis_diag(&noop, || CheckSolver::new(&view, &[], &[], &log)).unwrap();
+        assert_eq!(a.hypotheses_debug(), b.hypotheses_debug());
+    }
+
+    #[test]
+    fn オラクル倍率は指定した仮説だけを強める() {
+        let view = view_with(vec![("5e", Role::King)]);
+        let log = log_after_opp_quiet_check();
+        let base = CheckSolver::new(&view, &[], &[], &log).unwrap();
+        let (sq, role, w0) = base.hypotheses_debug()[0];
+        let diag = HypothesisDiag {
+            truth: vec![(sq, role)],
+            mode: DiagMode::Oracle { k: 8.0 },
+            deduce_last_move: false,
+        };
+        let boosted =
+            scoped_hypothesis_diag(&diag, || CheckSolver::new(&view, &[], &[], &log)).unwrap();
+        for ((s1, r1, w1), (s2, r2, w2)) in
+            base.hypotheses_debug().iter().zip(boosted.hypotheses_debug())
+        {
+            assert_eq!((*s1, *r1), (s2, r2));
+            let want = if (*s1, *r1) == (sq, role) { w0 * 8.0 } else { *w1 };
+            assert!((want - w2).abs() < 1e-12, "{s1:?} {r1:?}: {want} vs {w2}");
+        }
+    }
+
+    #[test]
+    fn オラクルは各ソルバーが列挙した集合に対して解決する() {
+        // **倍率表を外で作ってはいけない**（PR #37 レビュー [P1]）: 粒子投票の
+        // 有無で `known_loaded` の駒種とマーカーの載せ方が変わり、列挙集合そのものが
+        // 変わる。`kinf` は「真仮説以外を ×0」なので、**その構築の集合**に対して
+        // 解決していないと、実評価側にしか無い誤仮説が重みを持ったまま残る
+        let view = view_with(vec![("5e", Role::King)]);
+        let log = log_after_opp_quiet_check();
+        let base = CheckSolver::new(&view, &[], &[], &log).unwrap();
+        let (sq, role, _) = base.hypotheses_debug()[0];
+        let diag = HypothesisDiag {
+            truth: vec![(sq, role)],
+            mode: DiagMode::Oracle { k: ORACLE_INF },
+            deduce_last_move: false,
+        };
+        // 粒子の有無で別々に構築しても、**どちらでも**真仮説だけが残る
+        let mut pos = crate::shogi::Position::empty(Color::Sente);
+        pos.set(
+            Coord { file: 5, rank: 5 },
+            Some(crate::shogi::Piece { color: Color::Sente, role: Role::King }),
+        );
+        let particles: Vec<(&Position, f64)> = vec![(&pos, 1.0)];
+        for parts in [&[][..], &particles[..]] {
+            let s = scoped_hypothesis_diag(&diag, || {
+                CheckSolver::new(&view, parts, &[], &log)
+            })
+            .unwrap();
+            let nonzero: Vec<(Coord, Role)> = s
+                .hypotheses_debug()
+                .into_iter()
+                .filter(|(_, _, w)| *w > 0.0)
+                .map(|(s, r, _)| (s, r))
+                .collect();
+            assert_eq!(nonzero, vec![(sq, role)], "真仮説だけが残る");
+        }
+    }
+
+    #[test]
+    fn 診断記録はスコープ内の全構築を数える() {
+        // 1 arm は反則を食うたびにソルバーを作り直す。**scope に入るたびに記録を
+        // 空にする**ので、arm を複数の scope に割ると最初の構築の記録が消える
+        // （PR #37 レビュー [P1]）
+        let view = view_with(vec![("5e", Role::King), ("5c", Role::Gold)]);
+        let log = log_after_opp_quiet_check();
+        let diag = HypothesisDiag {
+            deduce_last_move: true,
+            ..HypothesisDiag::default()
+        };
+        let rec = scoped_hypothesis_diag(&diag, || {
+            let _ = CheckSolver::new(&view, &[], &[], &log);
+            let _ = CheckSolver::new(&view, &[], &[], &log);
+            take_diag_record()
+        });
+        assert_eq!(rec.constructions, 2);
+        assert!(
+            rec.deduce_dropped.len() >= 2,
+            "2回ぶんの延べが残る: {:?}",
+            rec.deduce_dropped
+        );
+        // 取り出すと消える（次の arm に持ち越さない）
+        assert_eq!(take_diag_record().constructions, 0);
+    }
+
+    #[test]
+    fn 誤誘導は真でない最大重みをその集合から選ぶ() {
+        let view = view_with(vec![("5e", Role::King)]);
+        let log = log_after_opp_quiet_check();
+        let base = CheckSolver::new(&view, &[], &[], &log).unwrap();
+        let hyps = base.hypotheses_debug();
+        let (tsq, trole, _) = hyps[0];
+        let diag = HypothesisDiag {
+            truth: vec![(tsq, trole)],
+            mode: DiagMode::Misdirected { k: ORACLE_INF },
+            deduce_last_move: false,
+        };
+        let s = scoped_hypothesis_diag(&diag, || CheckSolver::new(&view, &[], &[], &log)).unwrap();
+        let nonzero: Vec<(Coord, Role)> = s
+            .hypotheses_debug()
+            .into_iter()
+            .filter(|(_, _, w)| *w > 0.0)
+            .map(|(s, r, _)| (s, r))
+            .collect();
+        assert_eq!(nonzero.len(), 1, "誤仮説1本だけが残る");
+        assert_ne!(nonzero[0], (tsq, trole), "真仮説は選ばない");
+    }
+
+    #[test]
+    fn 倍率ゼロで全滅するときは元へ戻す() {
+        // coverage failure（真仮説が集合に無い）で ×0 を全部に掛けても
+        // 仮説を殺さない（健全性）
+        let view = view_with(vec![("5e", Role::King)]);
+        let log = log_after_opp_quiet_check();
+        let base = CheckSolver::new(&view, &[], &[], &log).unwrap();
+        // 真仮説がこの集合に無い（coverage failure）状態で kinf を掛ける
+        let diag = HypothesisDiag {
+            truth: vec![(Coord { file: 5, rank: 5 }, Role::Rook)],
+            mode: DiagMode::Oracle { k: ORACLE_INF },
+            deduce_last_move: false,
+        };
+        let zeroed =
+            scoped_hypothesis_diag(&diag, || CheckSolver::new(&view, &[], &[], &log)).unwrap();
+        assert_eq!(base.hypotheses_debug(), zeroed.hypotheses_debug());
+        assert_eq!(take_diag_record().weight_fallback, 1, "介入できなかったと記録する");
+    }
+
+    #[test]
+    fn 直前手の演繹は来られない王手仮説を落とす() {
+        // 玉 5五・自分の金 5三。相手の歩／香が 5四 で王手する仮説は
+        // 「5三から1手」でしか作れないが、そこには自駒がいるので**移動では
+        // 来られない**。取られた自駒が無い（＝相手の持ち駒の上界が空）ので
+        // 打ちもできない = 1手では説明できない仮説として落とせる。
+        // 一方、玉と直線で並ぶ遠距離の飛び駒は**開き王手**で説明できるので残す
+        let view = view_with(vec![("5e", Role::King), ("5c", Role::Gold)]);
+        let log = log_after_opp_quiet_check();
+        let base = CheckSolver::new(&view, &[], &[], &log).unwrap();
+        let five_d = Coord { file: 5, rank: 4 };
+        assert!(
+            base.hypotheses_debug()
+                .iter()
+                .any(|(s, r, _)| *s == five_d && *r == Role::Pawn),
+            "5四の歩は素の列挙には載る"
+        );
+        let diag = HypothesisDiag { deduce_last_move: true, ..HypothesisDiag::default() };
+        let pruned =
+            scoped_hypothesis_diag(&diag, || CheckSolver::new(&view, &[], &[], &log)).unwrap();
+        let rec = take_diag_record();
+        let (dropped, fallback) = (rec.deduce_dropped, rec.deduce_fallback);
+        assert!(!fallback, "全滅していない");
+        assert!(
+            dropped.contains(&(five_d, Role::Pawn)),
+            "来られない歩の仮説を落とす: {dropped:?}"
+        );
+        assert!(
+            !pruned
+                .hypotheses_debug()
+                .iter()
+                .any(|(s, r, _)| *s == five_d && *r == Role::Pawn)
+        );
+        // 落ちたのは「直線で距離2以上」ではない仮説だけ（開き王手は残す）
+        assert!(dropped.iter().all(|(s, _)| {
+            let df = s.file - 5;
+            let dr = s.rank - 5;
+            let aligned = df == 0 || dr == 0 || df.abs() == dr.abs();
+            !(aligned && df.abs().max(dr.abs()) >= 2)
+        }));
+        assert!(
+            pruned
+                .hypotheses_debug()
+                .iter()
+                .any(|(s, _, _)| *s == Coord { file: 1, rank: 5 }),
+            "遠距離の飛び駒仮説（開き王手）は残る"
+        );
+        // **健全性**: 落とした仮説はどれも「相手が1手で作れない」もの。
+        // 5四へ来られる金（4三・6三 から）は残っている
+        assert!(
+            pruned
+                .hypotheses_debug()
+                .iter()
+                .any(|(s, r, _)| *s == five_d && *r == Role::Gold),
+            "1手で来られる仮説は残す"
+        );
+    }
+
+    #[test]
+    fn 直前手の演繹は打てるなら落とさない() {
+        // 同じ形でも「歩を取られている」= 相手が歩を持ちうるなら打ちで説明できる
+        let view = view_with(vec![("5e", Role::King), ("5c", Role::Gold)]);
+        let mut log = ObservationLog::default();
+        log.record(crate::observation::Observation::OpponentMoved {
+            move_number: 2,
+            captured_my_piece_at: Some("5g".into()),
+        });
+        // 捕獲マスが分かる王手は演繹の対象外なので、王手はその次の静かな手で作る
+        log.record(crate::observation::Observation::MyMove {
+            move_number: 3,
+            usi: "5i5h".into(),
+            captured: None,
+        });
+        log.record(crate::observation::Observation::OpponentMoved {
+            move_number: 4,
+            captured_my_piece_at: None,
+        });
+        log.record(crate::observation::Observation::Check {
+            in_check: Color::Sente,
+        });
+        let diag = HypothesisDiag { deduce_last_move: true, ..HypothesisDiag::default() };
+        let pruned =
+            scoped_hypothesis_diag(&diag, || CheckSolver::new(&view, &[], &[], &log)).unwrap();
+        let dropped = take_diag_record().deduce_dropped;
+        let five_d = Coord { file: 5, rank: 4 };
+        // 5七で取られた自駒（駒種は観測されないので上界は全駒種）に歩が含まれる
+        // ので、5四の歩は打ちで説明できる = 落とさない
+        assert!(!dropped.contains(&(five_d, Role::Pawn)), "{dropped:?}");
+        assert!(
+            pruned
+                .hypotheses_debug()
+                .iter()
+                .any(|(s, r, _)| *s == five_d && *r == Role::Pawn)
+        );
+    }
+
+    #[test]
+    fn 直前手の演繹は捕獲つきの王手には手を出さない() {
+        // 着地点が観測で分かる場合は `prune_infeasible_discovered_checks` の領分
+        let view = view_with(vec![("5e", Role::King)]);
+        let mut log = ObservationLog::default();
+        log.record(crate::observation::Observation::OpponentMoved {
+            move_number: 2,
+            captured_my_piece_at: Some("5d".into()),
+        });
+        log.record(crate::observation::Observation::Check {
+            in_check: Color::Sente,
+        });
+        let base = CheckSolver::new(&view, &[], &[], &log).unwrap();
+        let diag = HypothesisDiag { deduce_last_move: true, ..HypothesisDiag::default() };
+        let pruned =
+            scoped_hypothesis_diag(&diag, || CheckSolver::new(&view, &[], &[], &log)).unwrap();
+        assert_eq!(base.hypotheses_debug(), pruned.hypotheses_debug());
     }
 
     #[test]
