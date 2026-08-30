@@ -587,6 +587,33 @@ v14 951 / 1761 行（54.0%）・v13 693 / 1590 行（43.6%）**。仮説重み�
     `continue_main` として独立に持ち**、plan で「1本であること」と
     「`continue_policy` に含まれること」を検査する
 
+## レビュー14巡目で直した3点（採否を held-out 検証セットへ固定する）
+
+39. **[P1] held-out 検証セットであることを最終ゲートが強制していなかった**。
+    `expect_match_seed` の既定は空で、plan の `run_continue` 用検査も
+    `arena_run_id` / `expect_match_seed` の存在を要求していなかった。run ID が
+    あっても seed が空なら provenance は実際の base seed を読むだけで照合せず、
+    run ID が空なら provenance 自体がスキップされる。**発見・学習に使った
+    Arena run でも continuation の最終 gate が緑になれた**（docs の
+    「検証 = 未使用の `match_seed`」を執行していない）。
+    - plan は `run_continue=true` で**非空の `arena_run_id` と `expect_match_seed` を必須**にする
+    - 生成側は `--arena-run-id` / `--match-seed-base` を meta へ焼き込み、
+      `combined` は**どちらかが空なら判定を出さない**
+40. **[P1] 事前登録の v13/v14 固定を、任意の workflow 入力へ弱めていた**。
+    13巡目で「カスタム相手が完走後に落ちる」を直すために plan の任意の `opponents` を
+    `--expect-opponents` へ渡したが、主量は `(Δv13 + Δv14)/2`・veto は
+    `Δv13 > 0 && Δv14 > 0` なので、**`opponents=estimator_v14` なら1層の Δv14 と
+    1相手だけの符号検査で「通過」を返せる**（summary は合算と表示するのに）。
+    - `continue-combined` は `--expect-opponents` を**渡さない**
+      （バイナリ既定の `{estimator_v13, estimator_v14}` のまま）
+    - plan も `run_continue=true` の相手集合をちょうどその2つに固定する（二重の関門）
+    - カスタム相手は診断（`report`）でなら従来どおり使える
+41. **[P2] `records/` 経路は生成段でも成立していなかった**。run ID が空だと
+    `opponents=[""]` で `--opponent` を渡さないので既定の `estimator_v14` が使われるが、
+    現在の `records/` は `管理人` 54局・`tempakyousuke` 5局なので全件が相手不一致で
+    continuation 前に exit 2 になる。39. で `run_continue=true && arena_run_id=空` を
+    plan が即拒否するようにしたので、契約とも実態とも整合する
+
 > **run 33306228500 の JSONL は schema 5 なので、schema 6 の `report` では
 > 再集計できない**（fail-closed の設計上、`points_detail.double_check` を
 > 既定値で補う逃げ道は作らない）。下の数字は**その run 自身の集計**であり、

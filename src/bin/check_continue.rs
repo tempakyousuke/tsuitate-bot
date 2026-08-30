@@ -332,6 +332,8 @@ fn main() {
     // report は replicate ごとにシャードの完全性を検査し、全 replicate で
     // 実験キー（= 同じ build の `source_fingerprint`）が一致することを要求する
     let mut replicate: u64 = 0;
+    let mut arena_run_id = String::new();
+    let mut match_seed_base = String::new();
     let mut out_path: Option<String> = None;
     let mut allow_opponent_mismatch = false;
     let mut allow_incomplete = false;
@@ -366,6 +368,18 @@ fn main() {
                     .parse::<usize>()
                     .unwrap_or_else(|_| die("--jobs は整数"))
                     .max(1);
+                i += 2;
+            }
+            // **検証セットの出所を記録へ焼き込む**（PR #37 レビュー14巡目 [P1]）。
+            // held-out であることは workflow の provenance が検査するが、その結果が
+            // 記録に残らないと `combined` 側では「検証セットで測ったのか」を
+            // 一切確かめられない
+            "--arena-run-id" => {
+                arena_run_id = need(args.get(i + 1), "--arena-run-id");
+                i += 2;
+            }
+            "--match-seed-base" => {
+                match_seed_base = need(args.get(i + 1), "--match-seed-base");
                 i += 2;
             }
             "--replicate" => {
@@ -715,6 +729,9 @@ fn main() {
         // 黙って落とすと `games`（＝ Δ の分母）が縮んだ選択標本になり、
         // v13 / v14 で同数だけ失敗すれば相手間の `games` 一致検査も通ってしまう
         "broken": broken,
+        // 検証セットの出所（`combined` が held-out であることを確かめるのに使う）
+        "arena_run_id": arena_run_id,
+        "match_seed_base": match_seed_base,
         "shard_total": shard.1,
         "config": cfg.fingerprint(),
         "source_fingerprint": env!("TSUITATE_SOURCE_FINGERPRINT"),
@@ -1744,6 +1761,19 @@ fn run_combined(args: &[String]) {
             }
         }
     }
+    // **held-out 検証セットであることを最終ゲートが確かめる**（PR #37 レビュー14巡目 [P1]）。
+    // 事前登録は「検証 = 未使用の `match_seed`」なので、出所が記録に無いまま
+    // 通してはいけない（発見・学習に使った Arena run でも緑になってしまう）
+    for (opp, (metas, _)) in &by_opp {
+        let e = &metas[0]["experiment"];
+        for k in ["arena_run_id", "match_seed_base"] {
+            if e[k].as_str().unwrap_or("").is_empty() {
+                failures.push(format!(
+                    "[{opp}] meta の experiment に {k} がありません（held-out 検証セットで測ったことを確かめられない）"
+                ));
+            }
+        }
+    }
     println!("== P0-2b 合算判定（主 arm {main_arm} vs 対照 {baseline}）==");
     // 相手ごとの検査（入力契約・replicate 数）
     for (opp, (metas, rows)) in &by_opp {
@@ -2356,6 +2386,20 @@ mod tests {
             problems.iter().any(|m| m.contains("継続の結果が違う")),
             "畳まれた組の結果不一致は検出されるべき: {problems:?}"
         );
+    }
+
+    #[test]
+    fn 検証セットの出所が無ければ合算判定を出さない() {
+        // 事前登録は「検証 = 未使用の match_seed」。出所が記録に無いまま
+        // 通すと、発見・学習に使った Arena run でも緑になる（レビュー14巡目 [P1]）
+        let mut e = exp();
+        e["arena_run_id"] = serde_json::json!("");
+        e["match_seed_base"] = serde_json::json!("");
+        let combined_missing = ["arena_run_id", "match_seed_base"]
+            .iter()
+            .filter(|k| e[**k].as_str().unwrap_or("").is_empty())
+            .count();
+        assert_eq!(combined_missing, 2, "空文字は「出所なし」として扱う");
     }
 
     #[test]

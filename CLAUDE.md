@@ -1233,7 +1233,15 @@
     `games` が縮んだ選択標本になり、相手間で同数だけ失敗すると `games` 一致検査も
     通る）。**主 arm は `continue_main`、期待する相手集合は plan の `opponents`**
     から渡す（`continue_policy` はカンマ区切りなので `--main` へ丸ごと渡すと、
-    最長 350 分の matrix を完走した後に確定で失敗する）
+    最長 350 分の matrix を完走した後に確定で失敗する）。
+    **P0-2b の採否は held-out 検証セットに固定する**（同 14巡目 [P1]）:
+    plan が `run_continue=true` で**非空の `arena_run_id` と `expect_match_seed`**、
+    および**相手集合ちょうど `{estimator_v13, estimator_v14}`** を要求し、
+    生成側は `--arena-run-id` / `--match-seed-base` を meta へ焼き込んで
+    `combined` がどちらかが空なら判定を出さない。`continue-combined` は
+    `--expect-opponents` を渡さない（バイナリ既定の2相手固定のまま。
+    任意の相手集合を渡すと `opponents=estimator_v14` の1層だけで「通過」を返せる）。
+    カスタム相手・`records/` は診断（`report`）でなら従来どおり使える
   - P0-2b（`bin/check_continue`）の**対照は `current@real`**（`report --baseline
     current@real`）。shadow の `current` と比べると「オラクル」と「指し直したこと」の
     効果が混ざる。実再決定 arm を混ぜたら `current@real` を自動で足す。

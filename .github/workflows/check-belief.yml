@@ -309,6 +309,27 @@ jobs:
           # `bin/check_policy` / `bin/check_continue` は実再決定・継続を回すときに
           # 2 以上の偶数を要求する（AB/BA が seed の偶奇で閉じる）ので、奇数だと
           # matrix の全ジョブが起動直後に落ちる。ここで1回だけ失敗させる
+          # **P0-2b の採否は held-out 検証セットに固定する**（PR #37 レビュー14巡目 [P1]）。
+          # 事前登録は「検証 = 未使用の `match_seed`」「主量は (Δv13 + Δv14)/2、
+          # veto は Δv13 > 0 && Δv14 > 0」。run ID か seed が空だと provenance が
+          # スキップ／照合なしになり、発見・学習に使った Arena run でも最終 gate が
+          # 緑になる。相手集合も任意にすると、`opponents=estimator_v14` の1層だけで
+          # 「通過」を返せてしまう（summary は合算と表示するのに）
+          if [ "$run_continue" = "true" ]; then
+            if [ -z "$run_id" ]; then
+              echo "::error::run_continue=true には arena_run_id が必須です（records/ 経路は P0-2b の採否に使えない）"
+              exit 1
+            fi
+            if [ -z "$exp_seed" ]; then
+              echo "::error::run_continue=true には expect_match_seed が必須です（held-out 検証セットであることを機械的に固定する）"
+              exit 1
+            fi
+            sorted_opp=$(printf '%s' "$opponents" | tr ' ' '\n' | grep -v '^$' | sort | tr '\n' ' ')
+            if [ "$sorted_opp" != "estimator_v13 estimator_v14 " ]; then
+              echo "::error::run_continue=true の相手集合は {estimator_v13, estimator_v14} 固定です（事前登録の主量が (Δv13+Δv14)/2 なので）: $opponents"
+              exit 1
+            fi
+          fi
           # **主 arm は1本で、`continue_policy` に含まれていること**
           # （PR #37 レビュー13巡目 [P2]）。`continue_policy` はカンマ区切りなので、
           # それをそのまま `--main` へ渡すと「`a,b` という名前の arm」を探して
@@ -741,6 +762,8 @@ jobs:
           cargo run --release --bin check_continue -- "$@" \
             --policy '${{ needs.plan.outputs.continue_policy }}' \
             --seeds '${{ needs.plan.outputs.continue_seeds }}' \
+            --arena-run-id '${{ needs.plan.outputs.arena_run_id }}' \
+            --match-seed-base '${{ needs.plan.outputs.expect_match_seed }}' \
             --replicate '${{ matrix.replicate }}' \
             --shard '${{ matrix.shard }}/${{ needs.plan.outputs.continue_shard_count }}' \
             --allow-incomplete \
@@ -825,16 +848,15 @@ jobs:
           # 相手ごとに入力契約（シャードの完全性・実験キー・**replicate が2本**）を
           # 通してから (Δv13 + Δv14)/2 の層化 cluster bootstrap と veto を判定する。
           # 不通過なら exit 3（fail-closed）
-          # **主 arm と期待する相手集合は plan から渡す**（レビュー13巡目 [P2]）。
-          # `--main` に `continue_policy`（カンマ区切り）をそのまま渡していたし、
-          # `--expect-opponents` は未指定でバイナリ既定の {v13, v14} を必ず要求
-          # していたので、カスタム相手・単一相手・records/ のどの経路でも
-          # 最長 350 分の matrix を完走した後に確定で失敗していた
-          EXPECT_OPP=$(printf '%s' '${{ needs.plan.outputs.opponents }}' \
-            | jq -r 'map(select(. != "")) | join(",")')
+          # **主 arm は plan の `continue_main`**（レビュー13巡目 [P2]。
+          # `continue_policy` はカンマ区切りなので丸ごと渡すと必ず失敗した）。
+          # **相手集合は `--expect-opponents` を渡さずバイナリ既定の
+          # {estimator_v13, estimator_v14} のまま**にする（同 14巡目 [P1]）:
+          # plan の任意の `opponents` を渡すと、`opponents=estimator_v14` の
+          # 1層だけで「通過」を返せてしまう。plan 側でも集合を固定しているので
+          # 二重の関門になる
           cargo run --release --bin check_continue -- combined \
             --baseline current@real --main '${{ needs.plan.outputs.continue_main }}' \
-            --expect-opponents "$EXPECT_OPP" \
             --expect-replicates 2 $files | tee combined.txt
           {
             echo "## P0-2b の最終判定（opponent-balanced 合算）"
