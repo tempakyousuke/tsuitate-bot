@@ -11,5 +11,6 @@
   "policy_shards": 6,
   "run_continue": false,
   "allow_legacy_think_budget": true,
-  "expect_candidate": "estimator"
+  "expect_candidate": "estimator",
+  "_comment_retry": "再投入 3 回目。1回目（run 33298188365）は think_budget_ms_a が旧形式の null で 関門が落とした。2回目（run 33298463268）は裏取りが実測値の think_avg_ms_a に 「全シャードで一致」を要求していて落とした（実測はシャードごとに 1166〜1289 と違う）。どちらも関門側の不具合で、記録の側は 2000ms で正しい"
 }
