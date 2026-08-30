@@ -1213,6 +1213,15 @@
     全行を `false` へ書き換えると両王手 8 行が分母へ戻って `report` が通った）。
     **AB/BA の均衡は決定点ごとに検査する**（同 [P1]。全決定点の総数で見ると
     「決定点 A は全 seed が treatment 先・B は全 seed が対照 先」が相殺で通る）
+  - **P0-2b の合否は `combined` でしか執行されない**（同 11巡目 [P1]）。
+    `report` は表示するだけだったので、`Δ差 = −1.0000 → 不合格` でも exit 0 だった。
+    門を `gate_foul` / `gate_nofoul` へ切り出し、**`report --main <arm>` はその arm が
+    落ちたら exit 3**、`check_continue combined` が `check_policy combined` と同じ契約
+    （相手ごとに入力契約 → `(Δv13 + Δv14)/2` の層化 cluster bootstrap → 同符号 veto →
+    安全性 veto、不通過は exit 3）で最終判定する。CI の `continue-combined` が回す。
+    **`foul` と `nofoul` は両方とも門**なので、片方に有効標本が無ければ「通過」でなく
+    **判定不能**として落とす。**継続は常に2 replicate**（plan が 2 以外を拒否し、
+    `combined --expect-replicates 2` が replicate ラベルの本数を検査する）
   - P0-2b（`bin/check_continue`）の**対照は `current@real`**（`report --baseline
     current@real`）。shadow の `current` と比べると「オラクル」と「指し直したこと」の
     効果が混ざる。実再決定 arm を混ぜたら `current@real` を自動で足す。

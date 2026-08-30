@@ -515,6 +515,30 @@ v14 951 / 1761 行（54.0%）・v13 693 / 1590 行（43.6%）**。仮説重み�
     - コスト: 対照と treatment の強制列が一致する unit では継続が1本増える。
       **測定の妥当性と引き換えにできない**ので受け入れる
 
+## レビュー11巡目で直した3点（事前登録した合否を実際に執行する）
+
+30. **[P1] P0-2b が明確に不合格でも workflow は成功していた**。`report` は各 arm の
+    verdict を**文字列で表示するだけ**で、戻り値にも終了コードにも反映していなかった
+    （`Δ差 = −1.0000 → 不合格` でも exit 0）。しかも相手ごとの `report` までしか無く、
+    事前登録した **`Δcombined = (Δv13 + Δv14)/2` の層化 cluster bootstrap・
+    各相手の同符号 veto・安全性 veto を計算する combined job が存在しなかった**
+    （opponent-balanced な主 endpoint そのものが出ていない）。
+    - 門を純関数 `gate_foul` / `gate_nofoul` へ切り出し、`report --main <arm>` は
+      その arm が落ちたら **exit 3**
+    - `check_continue combined` を `check_policy combined` と同じ契約で実装した
+      （相手ごとに入力契約を通してから合算 CI と veto を一度だけ判定、不通過は exit 3）。
+      CI に `continue-combined` ジョブを足して fail-closed にした
+31. **[P1] `foul` / `nofoul` の片方が標本に無くても合否経路を通せた**。10巡目で足した
+    「meta が宣言した estimand だけを必須にする」は、`points_detail` が foul だけなら
+    nofoul の非劣性を一度も評価せずに終わり、決定点0なら両方 skip する。
+    事前登録は**両方**を門にしているので、有効標本が無ければ「通過」ではなく
+    **判定不能**として落とす
+32. **[P1] 「継続は常に2 replicate」が強制されていなかった**。workflow は
+    `continue_replicates` の任意値から matrix を作るだけで、1を指定しても plan を通り、
+    `check_continue` 側も replicate 集合がちょうど2本かは見ていなかった
+    （1本の壁時計測定でそのまま CI と verdict が出る）。plan で 2 以外を拒否し、
+    `combined` も `--expect-replicates 2` で replicate ラベルの本数を検査する
+
 > **run 33306228500 の JSONL は schema 5 なので、schema 6 の `report` では
 > 再集計できない**（fail-closed の設計上、`points_detail.double_check` を
 > 既定値で補う逃げ道は作らない）。下の数字は**その run 自身の集計**であり、

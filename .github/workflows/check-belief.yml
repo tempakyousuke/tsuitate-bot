@@ -300,6 +300,12 @@ jobs:
           # `bin/check_policy` / `bin/check_continue` は実再決定・継続を回すときに
           # 2 以上の偶数を要求する（AB/BA が seed の偶奇で閉じる）ので、奇数だと
           # matrix の全ジョブが起動直後に落ちる。ここで1回だけ失敗させる
+          # **継続は常に2 replicate**（issue #36 の事前登録。PR #37 レビュー11巡目 [P1]）。
+          # 1本だけの壁時計測定でも CI と verdict は出てしまうので、ここで拒否する
+          if [ "$run_continue" = "true" ] && [ "$continue_reps" != "2" ]; then
+            echo "::error::continue_replicates は 2 固定です（issue #36 の事前登録。2回実行の平均が契約）: $continue_reps"
+            exit 1
+          fi
           for pair in "policy:$run_policy:$policy_seeds" "continue:$run_continue:$continue_seeds"; do
             phase=${pair%%:*}; rest=${pair#*:}; on=${rest%%:*}; n=${rest#*:}
             [ "$on" = "true" ] || continue
@@ -747,10 +753,13 @@ jobs:
           set -euo pipefail
           files=$(find shards -name 'check-continue-*.jsonl' | sort)
           [ -n "$files" ] || { echo "シャードの JSONL がありません" >&2; exit 1; }
+          MAIN_ARM='${{ needs.plan.outputs.continue_policy }}'
           # **対照は `current@real`**（shadow の current と比べると
           # 「オラクル」と「指し直したこと」の効果が混ざる）
+          # **`--main` を渡して fail-closed にする**（レビュー11巡目 [P1]）。
+          # 表示するだけでは不合格でも run が緑のまま終わる
           cargo run --release --bin check_continue -- report \
-            --baseline current@real $files | tee report.txt
+            --baseline current@real --main "$MAIN_ARM" $files | tee report.txt
           {
             echo "## P0-2b オラクルの継続上限（相手 ${{ matrix.opponent }}）"
             echo '```'
@@ -758,7 +767,48 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
       - uses: actions/upload-artifact@v6
+        if: always()
         with:
           name: check-belief-continue-report-${{ matrix.opponent }}
           path: report.txt
           if-no-files-found: error
+
+  # **事前登録した最終判定はここでしか執行されない**（PR #37 レビュー11巡目 [P1]）。
+  # 相手ごとの `report` を並べるだけでは、opponent-balanced な主 endpoint
+  # `Δcombined = (Δv13 + Δv14)/2` も符号 veto も計算されない
+  continue-combined:
+    needs: [plan, continue]
+    if: needs.plan.outputs.skip != 'true' && needs.plan.outputs.run_continue == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: check-belief-continue-*-r*-s*
+          path: shards
+      - name: Combined gate
+        run: |
+          set -euo pipefail
+          files=$(find shards -name 'check-continue-*.jsonl' | sort)
+          [ -n "$files" ] || { echo "シャードの JSONL がありません" >&2; exit 1; }
+          # 相手ごとに入力契約（シャードの完全性・実験キー・**replicate が2本**）を
+          # 通してから (Δv13 + Δv14)/2 の層化 cluster bootstrap と veto を判定する。
+          # 不通過なら exit 3（fail-closed）
+          cargo run --release --bin check_continue -- combined \
+            --baseline current@real --main '${{ needs.plan.outputs.continue_policy }}' \
+            --expect-replicates 2 $files | tee combined.txt
+          {
+            echo "## P0-2b の最終判定（opponent-balanced 合算）"
+            echo '```'
+            cat combined.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: check-belief-continue-combined
+          path: combined.txt
+          if-no-files-found: warn

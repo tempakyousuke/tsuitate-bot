@@ -317,6 +317,10 @@ fn main() {
         run_report(&args[1..]);
         return;
     }
+    if args.first().is_some_and(|a| a == "combined") {
+        run_combined(&args[1..]);
+        return;
+    }
     let mut seeds: u64 = 4;
     let mut opponent = "estimator_v14".to_string();
     // **主 arm は外から固定する**（P0-4 / P0-5 を見てから1本決める）
@@ -859,7 +863,7 @@ fn delta_ci(
 }
 
 fn report(metas: &[serde_json::Value], rows: &[serde_json::Value], allow_incomplete: bool) {
-    report_vs(metas, rows, allow_incomplete, "current")
+    report_vs(metas, rows, allow_incomplete, "current", None)
 }
 
 /// 対照 arm を指定できる版（issue #36 P0-2b は `current@real` と比べる:
@@ -869,6 +873,7 @@ fn report_vs(
     rows: &[serde_json::Value],
     allow_incomplete: bool,
     baseline: &str,
+    main_arm: Option<&str>,
 ) {
     for msg in check_inputs(metas, rows, baseline) {
         if allow_incomplete {
@@ -938,6 +943,8 @@ fn report_vs(
         .flat_map(|m| m["points_detail"].as_array().cloned().unwrap_or_default())
         .filter_map(|d| d["estimand"].as_str().map(str::to_string))
         .collect();
+    let mut failures: Vec<String> = vec![];
+    let mut gated: BTreeSet<String> = BTreeSet::new();
     for estimand in ESTIMANDS {
         let sel: Vec<&serde_json::Value> =
             rows.iter().filter(|r| r["estimand"] == estimand).collect();
@@ -1013,47 +1020,23 @@ fn report_vs(
             // **full β だけが反則増を許される**（β-order は反則経済施策なので
             // 即時反則の非増加が必須。issue #31 の事前登録）
             let full_beta = arm.starts_with("beta@");
-            // 安全性の共通条件: bot の反則負けと破滅率が悪化しない
-            let safe = dl <= 0.0 && dc <= 0.0;
-            let safe_note = match (dl > 0.0, dc > 0.0) {
-                (true, true) => "反則負けと破滅が悪化",
-                (true, false) => "反則負けが悪化",
-                (false, true) => "破滅率が悪化",
-                (false, false) => "",
-            };
-            let verdict = if estimand == "foul" {
-                // 反則あり: Δ差 ≥ +0.04 かつ CI 下限 > 0 かつ foul_limit・破滅が悪化しない
-                match (dd >= 0.04 && lo > 0.0, safe) {
-                    (true, true) => "**門を超える**".to_string(),
-                    (true, false) => format!("改善量は門を超えるが{safe_note}（不合格）"),
-                    (false, _) => "不合格".to_string(),
-                }
+            let v = if estimand == "foul" {
+                gate_foul(dd, lo, dl, dc)
             } else {
-                // 反則0: 非劣性 かつ 即時反則・破滅率・foul_limit が悪化しない。
-                // full β だけは即時反則の増加を許す（勝率と foul_limit で判定）
-                let noninferior = dd >= -0.01 && lo > -0.02;
-                let foul_ok = df <= 0.0 || full_beta;
-                match (noninferior, safe && foul_ok) {
-                    (true, true) if df > 0.0 => {
-                        "**非劣性を満たす**（即時反則は増えているが full β は許容）".to_string()
-                    }
-                    (true, true) => "**非劣性を満たす**".to_string(),
-                    (true, false) => {
-                        let mut why: Vec<&str> = vec![];
-                        if !safe_note.is_empty() {
-                            why.push(safe_note);
-                        }
-                        if df > 0.0 && !full_beta {
-                            why.push("即時反則が増えている");
-                        }
-                        format!("非劣性は満たすが{}（不合格）", why.join("・"))
-                    }
-                    (false, _) => "非劣性を満たさない".to_string(),
-                }
+                gate_nofoul(dd, lo, df, dl, dc, full_beta)
             };
+            // **主 arm を指定した実行は fail-closed**（レビュー11巡目 [P1]）
+            if main_arm == Some(arm.as_str()) {
+                gated.insert(estimand.to_string());
+                if !v.pass {
+                    failures.push(format!("estimand {estimand} / {arm}: {}", v.why));
+                }
+            }
             println!(
                 "    {arm:<18} Δ差 {dd:+.4} [{lo:+.4}, {hi:+.4}] / 即時反則 {df:+.3} / \
-破滅 {dc:+.4} / 反則負け {dl:+.4} → {verdict}"
+破滅 {dc:+.4} / 反則負け {dl:+.4} → {}{}",
+                if v.pass { "**" } else { "" },
+                if v.pass { format!("{}**", v.why) } else { format!("不合格（{}）", v.why) }
             );
         }
     }
@@ -1072,6 +1055,31 @@ fn report_vs(
         "  ※ **一手番の局所効果**であって全局反復適用の下界でも上界でもない\
 （P1 の arena へ進むための有効性確認）"
     );
+    // **主 arm を指定した実行は fail-closed**（PR #37 レビュー11巡目 [P1]）。
+    // 表示するだけでは、不合格でも workflow は緑のまま終わる
+    if let Some(main) = main_arm {
+        // 事前登録は foul の +0.04 と nofoul の非劣性を**両方**門にしている。
+        // 片方が標本に無いなら「通過」ではなく**判定不能**として落とす
+        for estimand in ESTIMANDS {
+            if !gated.contains(estimand) {
+                failures.push(format!(
+                    "estimand {estimand} で {main} の判定が出ていません（有効標本が無いか arm が欠けている = 判定不能。通過ではない）"
+                ));
+            }
+        }
+        if !complete {
+            failures.push("シャードが揃っていません（Δ の分母が狂う）".into());
+        }
+        if failures.is_empty() {
+            println!("\n  **判定: 通過**（主 arm {main}）");
+        } else {
+            println!("\n  **判定: 不通過**（主 arm {main}）");
+            for f in &failures {
+                println!("    - {f}");
+            }
+            std::process::exit(3);
+        }
+    }
     let mut reasons: BTreeMap<(String, String), u32> = BTreeMap::new();
     let mut think: Vec<f64> = vec![];
     for r in rows {
@@ -1547,15 +1555,330 @@ fn unit_index(rows: &[serde_json::Value]) -> BTreeMap<UnitKey, BTreeMap<String, 
 }
 
 
+/// 事前登録した門の判定結果（issue #36 P0-2b）。
+#[derive(Debug, Clone, PartialEq)]
+struct Verdict {
+    pass: bool,
+    why: String,
+}
+
+/// 反則あり estimand の門: `Δ差 ≥ +0.04` かつ CI 下限 > 0 かつ安全性が悪化しない
+fn gate_foul(dd: f64, lo: f64, dl: f64, dc: f64) -> Verdict {
+    let safe = dl <= 0.0 && dc <= 0.0;
+    let effect = dd >= 0.04 && lo > 0.0;
+    let mut why = vec![];
+    if !effect {
+        why.push("改善量か CI が門に届かない".to_string());
+    }
+    if dl > 0.0 {
+        why.push("反則負けが悪化".to_string());
+    }
+    if dc > 0.0 {
+        why.push("破滅率が悪化".to_string());
+    }
+    Verdict {
+        pass: effect && safe,
+        why: if why.is_empty() { "門を超える".into() } else { why.join("・") },
+    }
+}
+
+/// 反則0 estimand の門: 非劣性 かつ 即時反則・安全性が悪化しない
+fn gate_nofoul(dd: f64, lo: f64, df: f64, dl: f64, dc: f64, full_beta: bool) -> Verdict {
+    let noninferior = dd >= -0.01 && lo > -0.02;
+    let safe = dl <= 0.0 && dc <= 0.0;
+    let foul_ok = df <= 0.0 || full_beta;
+    let mut why = vec![];
+    if !noninferior {
+        why.push("非劣性を満たさない".to_string());
+    }
+    if df > 0.0 && !full_beta {
+        why.push("即時反則が増えている".to_string());
+    }
+    if dl > 0.0 {
+        why.push("反則負けが悪化".to_string());
+    }
+    if dc > 0.0 {
+        why.push("破滅率が悪化".to_string());
+    }
+    Verdict {
+        pass: noninferior && safe && foul_ok,
+        why: if why.is_empty() { "非劣性を満たす".into() } else { why.join("・") },
+    }
+}
+
+/// **相手をまたいだ最終判定**（issue #36 P0-2b の事前登録。`check_policy combined`
+/// と同じ契約）。`Δcombined = (Δv13 + Δv14)/2` を**層化 cluster bootstrap**
+/// （各相手の内側で元対局を引き直す）で出し、veto「両相手とも同符号」と
+/// 安全性 veto を **fail-closed**（不通過なら exit 3）で判定する。
+///
+/// 相手ごとの `report` を並べるだけでは、主 CI 下限も veto も検査されない
+/// （PR #37 レビュー11巡目 [P1]）。
+fn run_combined(args: &[String]) {
+    let mut allow_incomplete = false;
+    let mut paths: Vec<String> = vec![];
+    let mut baseline = "current@real".to_string();
+    let mut main_arm = "oracle@kinf@real".to_string();
+    let mut expect_opponents = "estimator_v13,estimator_v14".to_string();
+    // **継続は常に2 replicate**（issue #36 の事前登録。同 [P1]）
+    let mut expect_replicates: usize = 2;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        let mut need = |k: &str| {
+            it.next().unwrap_or_else(|| die(&format!("{k} に値がありません"))).clone()
+        };
+        match a.as_str() {
+            "--allow-incomplete" => allow_incomplete = true,
+            "--baseline" => baseline = need("--baseline"),
+            "--main" => main_arm = need("--main"),
+            "--expect-opponents" => expect_opponents = need("--expect-opponents"),
+            "--expect-replicates" => {
+                expect_replicates = need("--expect-replicates")
+                    .parse()
+                    .unwrap_or_else(|_| die("--expect-replicates は整数"))
+            }
+            x if x.starts_with("--") => die(&format!("未知のオプション: {x}")),
+            x => paths.push(x.to_string()),
+        }
+    }
+    if paths.is_empty() {
+        die("combined には各相手の JSONL を指定してください");
+    }
+    // 相手ごとに meta / rows を分ける（1ファイル = 1シャード = 1相手）
+    let mut by_opp: BTreeMap<String, (Vec<serde_json::Value>, Vec<serde_json::Value>)> =
+        BTreeMap::new();
+    for p in &paths {
+        let text =
+            std::fs::read_to_string(p).unwrap_or_else(|e| die(&format!("{p} を読めません: {e}")));
+        let mut metas = vec![];
+        let mut rows = vec![];
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            let v: serde_json::Value = serde_json::from_str(line)
+                .unwrap_or_else(|_| die(&format!("{p}: JSON として読めない行があります")));
+            if v["schema"].as_u64() != Some(u64::from(ROW_SCHEMA)) {
+                die(&format!(
+                    "{p}: schema {} は集計できません（現行 {ROW_SCHEMA}）",
+                    v["schema"]
+                ));
+            }
+            if v["type"] == "meta" { metas.push(v) } else { rows.push(v) }
+        }
+        let Some(opp) = metas
+            .first()
+            .and_then(|m| m["experiment"]["opponent"].as_str())
+            .map(str::to_string)
+        else {
+            die(&format!("{p}: meta の experiment.opponent がありません"));
+        };
+        let e = by_opp.entry(opp).or_default();
+        e.0.extend(metas);
+        e.1.extend(rows);
+    }
+    let want: BTreeSet<String> = expect_opponents
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    let got: BTreeSet<String> = by_opp.keys().cloned().collect();
+    if !want.is_empty() && want != got {
+        die(&format!("相手が契約と違います: 期待 {want:?} / 実際 {got:?}"));
+    }
+    println!("== P0-2b 合算判定（主 arm {main_arm} vs 対照 {baseline}）==");
+    let mut failures: Vec<String> = vec![];
+    // 相手ごとの検査（入力契約・replicate 数）
+    for (opp, (metas, rows)) in &by_opp {
+        for msg in check_inputs(metas, rows, &baseline) {
+            if allow_incomplete {
+                eprintln!("警告: [{opp}] {msg}");
+            } else {
+                failures.push(format!("[{opp}] {msg}"));
+            }
+        }
+        let reps: BTreeSet<u64> = metas
+            .iter()
+            .map(|m| m["replicate"].as_u64().unwrap_or(0))
+            .collect();
+        if expect_replicates > 0 && reps.len() != expect_replicates {
+            failures.push(format!(
+                "[{opp}] replicate が {} 本しかありません（事前登録は {expect_replicates} 本: {reps:?}）",
+                reps.len()
+            ));
+        }
+    }
+    // estimand ごとに層化 cluster bootstrap
+    for estimand in ESTIMANDS {
+        // **両 estimand とも有効標本が要る**（同 [P1]）。片方が空のまま
+        // 「通過」にすると、foul の +0.04 か nofoul の非劣性のどちらかを
+        // 一度も評価せずに成功できる
+        let mut per_opp: Vec<(String, StratumContrib)> = vec![];
+        for (opp, (metas, rows)) in &by_opp {
+            let sel: Vec<&serde_json::Value> =
+                rows.iter().filter(|r| r["estimand"] == estimand).collect();
+            let games = metas
+                .first()
+                .and_then(|m| m["experiment"]["games"].as_u64())
+                .unwrap_or(0) as usize;
+            if sel.is_empty() || games == 0 {
+                failures.push(format!(
+                    "[{opp}] estimand {estimand} の有効標本がありません（判定不能。通過ではない）"
+                ));
+                continue;
+            }
+            per_opp.push((
+                opp.clone(),
+                StratumContrib {
+                    score: contributions(&sel, &|r| r["score"].as_f64().unwrap_or(0.0)),
+                    fouls: contributions(&sel, &|r| {
+                        r["immediate_fouls"].as_f64().unwrap_or(0.0)
+                    }),
+                    loss: contributions(&sel, &|r| {
+                        f64::from(u8::from(r["foul_limit_loss"].as_bool().unwrap_or(false)))
+                    }),
+                    cat: contributions(&sel, &|r| {
+                        f64::from(u8::from(
+                            r["immediate_catastrophe"].as_bool().unwrap_or(false),
+                        ))
+                    }),
+                    games,
+                },
+            ));
+        }
+        if per_opp.len() != by_opp.len() {
+            continue; // 上で failure を積んである
+        }
+        let (dd, lo, hi) =
+            stratified_delta_ci(&per_opp, |c| &c.score, &main_arm, &baseline);
+        let (df, _, _) = stratified_delta_ci(&per_opp, |c| &c.fouls, &main_arm, &baseline);
+        let (dl, _, _) = stratified_delta_ci(&per_opp, |c| &c.loss, &main_arm, &baseline);
+        let (dc, _, _) = stratified_delta_ci(&per_opp, |c| &c.cat, &main_arm, &baseline);
+        // veto: 相手ごとの点推定が同符号（片方でも逆なら不通過）
+        let signs: Vec<(String, f64)> = per_opp
+            .iter()
+            .map(|(o, c)| {
+                (o.clone(), delta_ci(&c.score, &main_arm, Some(&baseline), c.games).0)
+            })
+            .collect();
+        let v = if estimand == "foul" {
+            gate_foul(dd, lo, dl, dc)
+        } else {
+            gate_nofoul(dd, lo, df, dl, dc, main_arm.starts_with("beta@"))
+        };
+        let veto_ok = if estimand == "foul" {
+            signs.iter().all(|(_, d)| *d > 0.0)
+        } else {
+            true // 非劣性側は符号 veto を掛けない（門そのものが下側の制約）
+        };
+        println!(
+            "  estimand {estimand}: Δ差 {dd:+.4} [{lo:+.4}, {hi:+.4}] / 即時反則 {df:+.3} / \
+破滅 {dc:+.4} / 反則負け {dl:+.4} → {} {}",
+            if v.pass && veto_ok { "通過" } else { "不通過" },
+            v.why
+        );
+        for (o, d) in &signs {
+            println!("    {o}: Δ差 {d:+.4}");
+        }
+        if !v.pass {
+            failures.push(format!("estimand {estimand}: {}", v.why));
+        }
+        if !veto_ok {
+            failures.push(format!(
+                "estimand {estimand}: 相手ごとの符号 veto に掛かりました（{signs:?}）"
+            ));
+        }
+    }
+    if failures.is_empty() {
+        println!("\n  **判定: 通過**");
+    } else {
+        println!("\n  **判定: 不通過**");
+        for f in &failures {
+            println!("    - {f}");
+        }
+        std::process::exit(3);
+    }
+}
+
+/// 1相手ぶんの寄与（層化 bootstrap の1層）
+struct StratumContrib {
+    score: BTreeMap<String, BTreeMap<String, f64>>,
+    fouls: BTreeMap<String, BTreeMap<String, f64>>,
+    loss: BTreeMap<String, BTreeMap<String, f64>>,
+    cat: BTreeMap<String, BTreeMap<String, f64>>,
+    games: usize,
+}
+
+/// `Δcombined = 平均_相手(Δ相手)` の層化 cluster bootstrap
+/// （**各相手の内側で元対局を引き直す**）
+fn stratified_delta_ci(
+    per_opp: &[(String, StratumContrib)],
+    pick: impl Fn(&StratumContrib) -> &BTreeMap<String, BTreeMap<String, f64>>,
+    arm: &str,
+    baseline: &str,
+) -> (f64, f64, f64) {
+    let strata: Vec<Vec<f64>> = per_opp
+        .iter()
+        .map(|(_, c)| {
+            let m = pick(c);
+            let mut v: Vec<f64> = m
+                .values()
+                .map(|per_arm| {
+                    per_arm.get(arm).copied().unwrap_or(0.0)
+                        - per_arm.get(baseline).copied().unwrap_or(0.0)
+                })
+                .collect();
+            // 対象の手番が無かった局も寄与 0 の cluster として入れる
+            v.resize(v.len().max(c.games), 0.0);
+            v
+        })
+        .collect();
+    if strata.iter().any(Vec::is_empty) {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
+    let mean = |vs: &[Vec<f64>]| -> f64 {
+        vs.iter().map(|v| v.iter().sum::<f64>() / v.len() as f64).sum::<f64>() / vs.len() as f64
+    };
+    let point = mean(&strata);
+    let mut state: u64 = 0x5f2b_9c31;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as usize
+    };
+    let reps = 2000;
+    let mut draws: Vec<f64> = Vec::with_capacity(reps);
+    for _ in 0..reps {
+        let resampled: Vec<Vec<f64>> = strata
+            .iter()
+            .map(|v| (0..v.len()).map(|_| v[next() % v.len()]).collect())
+            .collect();
+        draws.push(mean(&resampled));
+    }
+    draws.sort_by(f64::total_cmp);
+    (
+        point,
+        draws[(reps as f64 * 0.025) as usize],
+        draws[(reps as f64 * 0.975) as usize],
+    )
+}
+
 fn run_report(args: &[String]) {
     let allow_incomplete = args.iter().any(|a| a == "--allow-incomplete");
     // 対照 arm（既定 `current`）。issue #36 P0-2b は `--baseline current@real`
     let mut baseline = "current".to_string();
+    // **主 arm を指定したら fail-closed**（PR #37 レビュー11巡目 [P1]）。
+    // 指定しなければ従来どおり情報表示だけ（相手ごとの下見用）
+    let mut main_arm: Option<String> = None;
     let mut paths: Vec<String> = vec![];
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--allow-incomplete" => i += 1,
+            "--main" => {
+                main_arm = Some(
+                    args.get(i + 1).cloned().unwrap_or_else(|| die("--main には arm 名が必要です")),
+                );
+                i += 2;
+            }
             "--baseline" => {
                 baseline = args
                     .get(i + 1)
@@ -1598,7 +1921,7 @@ fn run_report(args: &[String]) {
         }
     }
     println!("JSONL {} 本 / 行 {} / 対照 {baseline}", paths.len(), rows.len());
-    report_vs(&metas, &rows, allow_incomplete, &baseline);
+    report_vs(&metas, &rows, allow_incomplete, &baseline, main_arm.as_deref());
 }
 
 #[cfg(test)]
@@ -1930,6 +2253,21 @@ mod tests {
             problems.iter().any(|m| m.contains("継続の結果が違う")),
             "畳まれた組の結果不一致は検出されるべき: {problems:?}"
         );
+    }
+
+    #[test]
+    fn 門の判定は不合格を不合格として返す() {
+        // 表示するだけでは workflow が緑のまま終わる（レビュー11巡目 [P1]）
+        assert!(gate_foul(0.05, 0.01, 0.0, 0.0).pass, "門を超える");
+        assert!(!gate_foul(-1.0, -1.0, 0.0, 0.0).pass, "改善量が届かない");
+        assert!(!gate_foul(0.05, -0.01, 0.0, 0.0).pass, "CI 下限が 0 を跨ぐ");
+        assert!(!gate_foul(0.05, 0.01, 0.01, 0.0).pass, "反則負けが悪化");
+        assert!(!gate_foul(0.05, 0.01, 0.0, 0.01).pass, "破滅率が悪化");
+        // 反則0 は非劣性＋即時反則の非増加（full β だけ増加を許す）
+        assert!(gate_nofoul(0.0, -0.01, 0.0, 0.0, 0.0, false).pass);
+        assert!(!gate_nofoul(-0.05, -0.09, 0.0, 0.0, 0.0, false).pass, "非劣性を満たさない");
+        assert!(!gate_nofoul(0.0, -0.01, 0.1, 0.0, 0.0, false).pass, "即時反則が増えた");
+        assert!(gate_nofoul(0.0, -0.01, 0.1, 0.0, 0.0, true).pass, "full β は許容");
     }
 
     #[test]
