@@ -1221,7 +1221,14 @@
     安全性 veto、不通過は exit 3）で最終判定する。CI の `continue-combined` が回す。
     **`foul` と `nofoul` は両方とも門**なので、片方に有効標本が無ければ「通過」でなく
     **判定不能**として落とす。**継続は常に2 replicate**（plan が 2 以外を拒否し、
-    `combined --expect-replicates 2` が replicate ラベルの本数を検査する）
+    `combined --expect-replicates 2` が replicate ラベルの本数を検査する）。
+    **相手別の集計に `--main` を渡してはいけない**（同 12巡目 [P1]）: 事前登録は
+    「合算で +0.04・合算 CI 下限 > 0」＋「相手別は**点推定の符号** veto だけ」で、
+    104局×2 で相手別の CI 下限まで正にするのは強すぎると明記されている。
+    `combined` は **相手間の実験条件の同一性**（`opponent` / `records` を除いた
+    experiment key）と **対照・主 arm の存在**も fail-closed で検査する
+    （欠落を `unwrap_or(0)` で補うと「暗黙のゼロ対照」と比べて合格しうる。
+    対象の手番が無かった局をゼロ寄与の cluster として数える padding とは別物）
   - P0-2b（`bin/check_continue`）の**対照は `current@real`**（`report --baseline
     current@real`）。shadow の `current` と比べると「オラクル」と「指し直したこと」の
     効果が混ざる。実再決定 arm を混ぜたら `current@real` を自動で足す。

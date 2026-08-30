@@ -539,6 +539,31 @@ v14 951 / 1761 行（54.0%）・v13 693 / 1590 行（43.6%）**。仮説重み�
     （1本の壁時計測定でそのまま CI と verdict が出る）。plan で 2 以外を拒否し、
     `combined` も `--expect-replicates 2` で replicate ラベルの本数を検査する
 
+## レビュー12巡目で直した3点（採否経路と入力同一性）
+
+33. **[P1] 相手別 `report --main` が事前登録にない条件を課していた**。11巡目で
+    相手別の集計にも `--main` を渡したが、`--main` は「Δ ≥ +0.04 かつ**その標本の**
+    CI 下限 > 0」を要求する。issue #36 の登録条件は「**合算**で +0.04・合算 CI 下限 > 0」
+    ＋「相手別は**点推定の符号** veto だけ」で、**104局×2 で相手別の CI 下限まで
+    正にするのは強すぎる**と本文に明記されている（v13 +0.01 / v14 +0.09 は
+    合算 +0.05・両相手とも正で通過すべきなのに、v13 の相手別ジョブが必ず落ちる）。
+    相手別は informational へ戻し、**合否は `continue-combined` だけが執行する**
+    （docs の「P0-2b の合否は combined でしか執行されない」とも整合する）
+34. **[P1] `combined` が相手間の実験条件の同一性を検査していなかった**。
+    `check_inputs` を相手ごとに別々に呼ぶだけだったので、各相手の内側で replicate が
+    揃っていれば、**v13 と v14 で build・予算・seed 数・policy 構成・実効並列度・
+    局数が違う artifact でも合算判定を通せた**。契約は「相手だけが違う」なので、
+    `check_policy combined` と同じく `opponent` と `records` を除いた experiment key を
+    相手間でも一致検査する
+35. **[P1] `combined` が対照と主 arm の存在を検査していなかった**。期待 arm 集合は
+    summary の `policies` から作るだけで、CLI の `--baseline` がそこに含まれるかは
+    見ておらず、`stratified_delta_ci` は `per_arm.get(baseline).unwrap_or(0.0)` を
+    使っていた。**両相手・両 replicate から `current@real` が一貫して欠けていても
+    入力検査を通り、主 arm を「暗黙のゼロ対照」と比べて合格しうる**。
+    相手 × estimand ごとに baseline と main の存在を先に必須検査し、
+    **片方の arm しか寄与を持たない局**も落とす（対象の手番が無かった局を
+    ゼロ寄与の cluster として数える padding とは別物）
+
 > **run 33306228500 の JSONL は schema 5 なので、schema 6 の `report` では
 > 再集計できない**（fail-closed の設計上、`points_detail.double_check` を
 > 既定値で補う逃げ道は作らない）。下の数字は**その run 自身の集計**であり、

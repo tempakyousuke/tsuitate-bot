@@ -753,13 +753,17 @@ jobs:
           set -euo pipefail
           files=$(find shards -name 'check-continue-*.jsonl' | sort)
           [ -n "$files" ] || { echo "シャードの JSONL がありません" >&2; exit 1; }
-          MAIN_ARM='${{ needs.plan.outputs.continue_policy }}'
           # **対照は `current@real`**（shadow の current と比べると
-          # 「オラクル」と「指し直したこと」の効果が混ざる）
-          # **`--main` を渡して fail-closed にする**（レビュー11巡目 [P1]）。
-          # 表示するだけでは不合格でも run が緑のまま終わる
+          # 「オラクル」と「指し直したこと」の効果が混ざる）。
+          # **相手別 report に `--main` は渡さない**（PR #37 レビュー12巡目 [P1]）:
+          # `--main` は「Δ ≥ +0.04 かつ**その相手の** CI 下限 > 0」を要求するが、
+          # issue #36 の事前登録は「**合算**で +0.04・合算 CI 下限 > 0」＋
+          # 「相手別は**点推定の符号** veto だけ」で、104局×2 で相手別の CI 下限まで
+          # 正にするのは強すぎると明記されている（v13 +0.01 / v14 +0.09 は
+          # 合算 +0.05・両相手とも正で通過すべきなのに v13 の相手別が落ちる）。
+          # **合否は `continue-combined` だけが執行する**
           cargo run --release --bin check_continue -- report \
-            --baseline current@real --main "$MAIN_ARM" $files | tee report.txt
+            --baseline current@real $files | tee report.txt
           {
             echo "## P0-2b オラクルの継続上限（相手 ${{ matrix.opponent }}）"
             echo '```'

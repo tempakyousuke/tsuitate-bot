@@ -1683,8 +1683,47 @@ fn run_combined(args: &[String]) {
     if !want.is_empty() && want != got {
         die(&format!("相手が契約と違います: 期待 {want:?} / 実際 {got:?}"));
     }
-    println!("== P0-2b 合算判定（主 arm {main_arm} vs 対照 {baseline}）==");
+    // **相手以外の実験条件が相手間で同一であること**（PR #37 レビュー12巡目 [P1]）。
+    // 契約上「相手だけが違う」ので、片方を別の build / 別の予算 / 別の seed 数 /
+    // 別の実効並列度で測った JSONL を平均してはいけない。`opponent` と、相手ごとに
+    // 必ず違う記録の指紋（`records`）だけを除いて比較する
     let mut failures: Vec<String> = vec![];
+    {
+        let key_of = |metas: &Vec<serde_json::Value>| -> serde_json::Value {
+            let mut e = metas
+                .first()
+                .map(|m| m["experiment"].clone())
+                .unwrap_or(serde_json::Value::Null);
+            if let Some(o) = e.as_object_mut() {
+                o.remove("opponent");
+                o.remove("records");
+            }
+            e
+        };
+        let mut it = by_opp.iter();
+        if let Some((first_opp, (first_metas, _))) = it.next() {
+            let base = key_of(first_metas);
+            for (opp, (metas, _)) in it {
+                let k = key_of(metas);
+                if k != base {
+                    let diffs: Vec<String> = base
+                        .as_object()
+                        .into_iter()
+                        .flatten()
+                        .filter(|(key, v)| k.get(key.as_str()) != Some(*v))
+                        .map(|(key, v)| {
+                            format!("{key}: {first_opp}={v} vs {opp}={}", k[key.as_str()])
+                        })
+                        .collect();
+                    failures.push(format!(
+                        "相手間で実験条件が違います（相手以外は同一でなければならない）: {}",
+                        diffs.join(" / ")
+                    ));
+                }
+            }
+        }
+    }
+    println!("== P0-2b 合算判定（主 arm {main_arm} vs 対照 {baseline}）==");
     // 相手ごとの検査（入力契約・replicate 数）
     for (opp, (metas, rows)) in &by_opp {
         for msg in check_inputs(metas, rows, &baseline) {
@@ -1724,10 +1763,47 @@ fn run_combined(args: &[String]) {
                 ));
                 continue;
             }
+            // **対照と主 arm の存在を fail-closed で検査する**（同 [P1]）。
+            // 欠落を `unwrap_or(0.0)` で補うと、対照の行が一貫して無い入力でも
+            // 「暗黙のゼロ対照」と比べて合格しうる（対象の手番が無かった局を
+            // ゼロ寄与の cluster として数える padding とは別物）
+            let arms: BTreeSet<&str> =
+                sel.iter().filter_map(|r| r["arm"].as_str()).collect();
+            let mut missing = vec![];
+            if !arms.contains(baseline.as_str()) {
+                missing.push(baseline.clone());
+            }
+            if !arms.contains(main_arm.as_str()) {
+                missing.push(main_arm.clone());
+            }
+            if !missing.is_empty() {
+                failures.push(format!(
+                    "[{opp}] estimand {estimand} に arm {missing:?} の行がありません（暗黙のゼロ対照と比べてはいけない）"
+                ));
+                continue;
+            }
+            // 決定点のある局は**両 arm とも**寄与を持つはず（片方だけの局を
+            // 0 で埋めると差が水増しされる）
+            let sc = contributions(&sel, &|r| r["score"].as_f64().unwrap_or(0.0));
+            let lopsided: Vec<&String> = sc
+                .iter()
+                .filter(|(_, per_arm)| {
+                    per_arm.contains_key(&baseline) != per_arm.contains_key(&main_arm)
+                })
+                .map(|(g, _)| g)
+                .collect();
+            if !lopsided.is_empty() {
+                failures.push(format!(
+                    "[{opp}] estimand {estimand}: 片方の arm しか寄与を持たない局が {} 件あります: {:?}",
+                    lopsided.len(),
+                    lopsided.iter().take(3).collect::<Vec<_>>()
+                ));
+                continue;
+            }
             per_opp.push((
                 opp.clone(),
                 StratumContrib {
-                    score: contributions(&sel, &|r| r["score"].as_f64().unwrap_or(0.0)),
+                    score: sc,
                     fouls: contributions(&sel, &|r| {
                         r["immediate_fouls"].as_f64().unwrap_or(0.0)
                     }),
@@ -1866,7 +1942,13 @@ fn run_report(args: &[String]) {
     // 対照 arm（既定 `current`）。issue #36 P0-2b は `--baseline current@real`
     let mut baseline = "current".to_string();
     // **主 arm を指定したら fail-closed**（PR #37 レビュー11巡目 [P1]）。
-    // 指定しなければ従来どおり情報表示だけ（相手ごとの下見用）
+    // 指定しなければ情報表示だけ。
+    //
+    // **相手別の集計へ渡してはいけない**（同 12巡目 [P1]）: `--main` は
+    // 「Δ ≥ +0.04 かつ**その標本の** CI 下限 > 0」を要求するが、issue #36 の
+    // 事前登録は「**合算**で +0.04・合算 CI 下限 > 0」＋「相手別は**点推定の
+    // 符号** veto だけ」で、104局×2 で相手別の CI 下限まで正にするのは強すぎると
+    // 明記されている。**合否を執行するのは `combined` だけ**
     let mut main_arm: Option<String> = None;
     let mut paths: Vec<String> = vec![];
     let mut i = 0;
