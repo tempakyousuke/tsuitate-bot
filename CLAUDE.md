@@ -1294,7 +1294,19 @@
   全ジョブがスキップされる）。相手ごとに別ジョブ・元対局単位のシャード・**欠けたら
   aggregate が失敗**。P0-1 は既定で走り（`run_probe=false` で切れる。済んだ phase を
   再実行して16ジョブを無駄に埋めないため。check-economy.yml と同じ規約）、
-  **P0-2（`run_policy`）と P0-2b（`run_continue`）は既定オフ**（同時に有効化しない）。元 Arena 実行の実験条件の
+  **P0-2（`run_policy`）と P0-2b（`run_continue`）は既定オフ**（同時に有効化しない）。
+  **P0-2b の `continue_shards` は 24 以上にする**（既定 8 は不足。run 33333948875 で
+  32ジョブ中26が **350分の timeout で cancelled** = aggregate はシャード欠落で
+  fail-closed なので run ごと捨てになった。`timeout-minutes` 350 は hosted runner の
+  6時間上限の直下なので**上げられず、調整できるのはシャード数だけ**）。
+  **継続段のコストは継続対局でなく `entry_setup` の prewarm が支配する**
+  （決定点ごとに棋譜をその手番まで 2000ms で再生するので `決定点 × seed` に比例）ので、
+  #31 P0-6 の 700ms・40分/ジョブから予算比でスケールすると足りない。
+  **v13 / v14 のコスト比は 1.10〜1.24**（P0-2 の policy 段 run 33306228500 の実測。
+  平均 150.2 分 vs 136.3 分・最大 194.9 分 vs 156.9 分）で、
+  「完走が全部 v14 だった」のは 350分の境界をまたいだだけ = **v13 が桁違いに重いのでも、
+  v14 だけでシャード数を決めてよいのでもない**（打ち切られた側は下限しか分からない）。
+  元 Arena 実行の実験条件の
   検査は `scripts/ci/verify_arena_provenance.sh` に**一本化**した（`check-prep.yml`
   から切り出した共通の関門。ワークフローごとに書くと片方だけ緩くなる）。
   **3つの phase すべてを検証済み provenance に依存させ、`EXPECT_THINK_BUDGET_MS` で
