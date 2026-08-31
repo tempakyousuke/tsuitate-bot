@@ -9,7 +9,7 @@
   "continue_main": "oracle@kinf@real",
   "continue_seeds": 4,
   "continue_budget_ms": 2000,
-  "continue_shards": 8,
+  "continue_shards": 24,
   "continue_replicates": 2,
   "_comment_provenance": "検証セットなので expect_* を全部指定して provenance を最も厳しく通す。元 Arena は commit 476483d より後なので think_budget_ms_a は実効値が入る（allow_legacy_think_budget は false のまま）",
   "allow_legacy_think_budget": false,
@@ -17,5 +17,6 @@
   "expect_match_seed": "20260830",
   "expect_commit": "7bbb684605ec693ec83e07b6417c2766b4f8da05",
   "expect_games": "104",
-  "expect_shards": "4"
+  "expect_shards": "4",
+  "_comment_shards": "continue_shards は 8 → 24（run 33333948875 は 8 シャードで 32 ジョブ中 26 が 350 分の timeout に掛かって cancelled。完走した6本も 264〜310 分だった）。シャード数は元対局単位の分割で統計には影響しない実行上の詳細で、事前登録した予算 2000ms / 4 seed / 2 replicate は変えていない"
 }
