@@ -19,7 +19,7 @@
   "continue_policy": "oracle@kinf@real",
   "continue_seeds": 4,
   "continue_budget_ms": 2000,
-  "continue_shards": 8,
+  "continue_shards": 24,
   "continue_replicates": 2,
   "_comment_provenance": "検証セットでは expect_match_seed を必ず入れる（発見セットと独立な seed であることを機械的に固定する）。allow_legacy_think_budget は commit 476483d より前の Arena 実行（think_budget_ms_a が null）でだけ true にする",
   "allow_legacy_think_budget": false,

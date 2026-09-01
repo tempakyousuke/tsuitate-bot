@@ -108,9 +108,9 @@ on:
         required: false
         default: "2000"
       continue_shards:
-        description: "P0-2b の分割数（元対局単位。欠けたら判定を出さない）"
+        description: "P0-2b の分割数（元対局単位。欠けたら判定を出さない）。**24 未満は plan が拒否する**（run 33333948875 の実測: 8 では 32ジョブ中 14 が 350分 timeout）"
         required: false
-        default: "8"
+        default: "24"
       continue_replicates:
         description: "P0-2b を何回実行して平均するか（issue #36 は**常に 2**）"
         required: false
@@ -227,7 +227,7 @@ jobs:
             continue_main="${IN_CONTINUE_MAIN:-oracle@kinf@real}"
             continue_seeds="${IN_CONTINUE_SEEDS:-4}"
             continue_budget="${IN_CONTINUE_BUDGET:-2000}"
-            continue_shards="${IN_CONTINUE_SHARDS:-8}"
+            continue_shards="${IN_CONTINUE_SHARDS:-24}"
             continue_reps="${IN_CONTINUE_REPLICATES:-2}"
             allow_legacy_budget="${IN_ALLOW_LEGACY_BUDGET:-false}"
             exp_cand="${IN_EXP_CAND-estimator}"
@@ -292,7 +292,7 @@ jobs:
             continue_main=$(jq -r '.continue_main // "oracle@kinf@real"' "$req")
             continue_seeds=$(jq -r '.continue_seeds // 4' "$req")
             continue_budget=$(jq -r '.continue_budget_ms // 2000' "$req")
-            continue_shards=$(jq -r '.continue_shards // 8' "$req")
+            continue_shards=$(jq -r '.continue_shards // 24' "$req")
             continue_reps=$(jq -r '.continue_replicates // 2' "$req")
             allow_legacy_budget=$(jq -r 'if has("allow_legacy_think_budget") then .allow_legacy_think_budget else false end | tostring' "$req")
             exp_cand=$(jq -r 'if has("expect_candidate") then .expect_candidate else "estimator" end' "$req")
@@ -341,6 +341,23 @@ jobs:
             esac
             if ! printf '%s' "$continue_policy" | tr ',' '\n' | grep -qxF "$continue_main"; then
               echo "::error::continue_main ($continue_main) が continue_policy ($continue_policy) に含まれていません"
+              exit 1
+            fi
+          fi
+          # **シャード数の下限を実行経路でも守る**（PR #39 レビュー [P1]）。
+          # docs だけで「24 以上」と書いても、`run_continue=true` を既定のまま
+          # 起動すれば不足構成で回ってしまう。run 33333948875（8 シャード）の実測は
+          # **32ジョブ中 14 が 350分 timeout・10 が手動キャンセル・成功 8** で、
+          # aggregate はシャード欠落で fail-closed なので run ごと捨てになった。
+          # `timeout-minutes` 350 は hosted runner の6時間上限の直下で上げられないので、
+          # 調整できるのはシャード数だけ。既定も 24 にしてあるが、明示的に小さい値を
+          # 渡された場合はここで落とす
+          if [ "$run_continue" = "true" ]; then
+            case "$continue_shards" in
+              ''|*[!0-9]*) echo "::error::continue_shards が数値ではありません: $continue_shards"; exit 1 ;;
+            esac
+            if [ "$continue_shards" -lt 24 ]; then
+              echo "::error::continue_shards は 24 以上にしてください（実測: 8 では 32ジョブ中 14 が 350分 timeout で run ごと捨てになった）: $continue_shards"
               exit 1
             fi
           fi
