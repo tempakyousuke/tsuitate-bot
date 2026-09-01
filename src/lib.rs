@@ -29,6 +29,7 @@ pub mod hits;
 pub mod kifu;
 pub mod king_belief_nn;
 pub mod likelihood;
+pub mod marginal_work;
 pub mod mate;
 pub mod mate_economy;
 pub mod model;

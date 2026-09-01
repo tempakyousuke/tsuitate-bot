@@ -1,0 +1,14 @@
+{
+  "_comment": "issue #40 P0-1(b) の W=0 記録用 Arena（頻度・score 由来・shadow 順位の母集団）。診断列（CandidateScore の promote_bias / drop_bias）を実装した現行 commit で取る。新ノブは未実装なので挙動は main と同一 = ガントレット値は読まない記録採取 run。計測後にこのファイルを消す push は全ジョブスキップで緑",
+  "games": 104,
+  "candidate": "estimator",
+  "baselines": "estimator_v13 estimator_v14",
+  "match_seed": 20260901,
+  "shards": 4,
+  "oracle": "",
+  "clock": "",
+  "env": "",
+  "cand_env": "",
+  "pair_with": "",
+  "games_from_run_id": ""
+}

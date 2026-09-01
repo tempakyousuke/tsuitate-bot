@@ -211,6 +211,20 @@
     `--known-arena-delta` に渡す既知値にもなる**。CI では `arena.yml` の
     `-f pair_with=<対照のArena実行ID>` が候補側 run の中でこれを回す。
     ガントレットの記録は `--baseline` で1マッチアップに絞る
+  - **`arena-balance` は issue #40 の opponent-balanced 合算器**（2026-09-01 実装。
+    まだ判定実績なし）。2相手ぶん（既定 v13 / v14 を `--expect-opponents` で検査）の
+    対照・候補 games.jsonl を受け取り、相手ごとに局ペア差を作って
+    **`(Δv13 + Δv14) / 2` を層化 bootstrap**（各相手の内側で局を引き直す）で出し、
+    **事前登録した門**（合算 ≥ +0.04・CI 下限 > 0・相手別符号 veto・反則/局 +0.3
+    以内・時間切れ0・思考平均 +100ms 以内）を **fail-closed（不通過なら exit 3、
+    `--allow-incomplete` で警告へ降格）** で判定する（`check_policy combined` と
+    同じ契約）。入力の同一性検査も fail-closed: arm 内・相手内の一意性
+    （`assert_uniform`）に加え、**相手をまたいだ arm 設定の一致**（candidate /
+    clock / commit / 予算 / cand_config / cand_knobs / shared_env）と**相手ごとの
+    ペア局数の一致**・**arm 間の同一 commit**（issue #40 の対照は同一 commit の
+    W=0。別 commit の main は die）を要求する。予算不一致の override は無い。
+    平均評価粒子数の門（対照比 −10% 超で中止）は games.jsonl に無いので
+    arena-records の `chose.debug` から別途出す
 - `cargo run --release --bin tune -- [反復数] [評価あたり対局数] [基準...]` — 評価パラメータ
   （`strategy::EvalParams`）のSPSA自動チューニング。目的関数はアリーナのスコア率
   （引き分け=0.5勝）。**f+/f− は共通乱数法でペアリングされる**: 同じ対局シード列
@@ -1381,6 +1395,22 @@
   `price_shards`（既定8。**継続対局なので最も重い**）。
   どれも元対局単位で割り、`*-aggregate` が `report` で合算する
   （**シャードが欠けたら失敗**）
+- `cargo run --release --bin investment_probe -- [--dump out.tsv] <records/*.jsonl | dir>...`
+  — **戦力投資の限界効用の頻度・分類**（issue #40 P0-2 の粒子不要側、2026-09-01。
+  まだ計測実績なし）。記録の真実を再生し、bot の受理手ごとに**自駒だけ**の
+  利き枚数マップの差分を「需要帯 × しきい値横断 × gain/loss」で数えて、
+  **link-only drop**（紐は増えるが需要帯への first/second が0の打ち）と
+  **saturated promotion**（非捕獲・非王手の成りで正の利き増分の70%以上が
+  neutral × redundant）を相手別・手数帯別に集計する。粒子を回さないので一瞬。
+  定義の一次資料は `src/marginal_work.rs`（**事前登録**: 帯は own_king >
+  opp_king（deduce 候補 ≤20 の和集合＋距離1）> backed_target（打ち反則・被捕獲の
+  観測裏付け占有 = runtime の `opp_occupancy_evidence` が委譲で同一）>
+  active_own_piece > neutral の排他、しきい値横断は first/second/redundant の
+  3段で飽和、帯マップは決定開始時に手番ごと1回。利き枚数は**玉を除く**が、
+  紐の本数判定だけは runtime の `linked_value` と同じく玉の守りも数える）。
+  score 側の shadow 順位（粒子が要る）は `CandidateScore` に足した
+  `promote_bias` / `drop_bias` 列（score 不変の内訳。rank_probe / rank_dump /
+  hits に表示あり）で取る。`--dump` の TSV は両極端の手の抽出・レビュー用
 - `cargo run --release --bin mine_check -- [--min-fouls N] [--emit <dir> <接頭辞>] <records/*.jsonl...>`
   — **被王手の決定点の採掘**（2026-08-19）。記録の真実を再生し bot 側の被王手
   決定点から「反則を N 回以上した」（foul）と「王手駒を玉以外で取れたのに

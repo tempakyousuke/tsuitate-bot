@@ -672,6 +672,8 @@ mod tests {
             risk: 0.5,
             link: 0.2,
             promo: 0.1,
+            promote_bias: 0.0,
+            drop_bias: 0.0,
             hand_option: 0.0,
             board_discount: 0.0,
             own_zone: 0.0,

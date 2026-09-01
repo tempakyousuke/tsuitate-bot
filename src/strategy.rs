@@ -330,6 +330,13 @@ pub struct CandidateScore {
     /// gain に加算された成りポテンシャルの差分
     /// （promo_potential_w × (着手後 − 現局面)。符号つき）
     pub promo: f64,
+    /// gain（advance_bias 内）に加算された成りの固定ボーナス分
+    /// （`promote_bias`。成る手にだけ非ゼロ。issue #40 P0-2 の
+    /// 「promote の該当寄与を除いた shadow 順位」用の内訳表示。score 不変）
+    pub promote_bias: f64,
+    /// gain に加算された打ちの固定バイアス分（`drop_bias`。打つ手にだけ
+    /// 非ゼロ。同じく issue #40 の shadow 順位用の内訳表示。score 不変）
+    pub drop_bias: f64,
     /// gain から引かれた持ち駒オプションの不足分
     /// （hand_option_w × (その駒の最良打ちポテンシャル − この打ちマスの実現値)。
     /// 打つ手にだけ非ゼロが入る正の値。gain には控除済み）
@@ -3797,6 +3804,11 @@ struct EvalOut {
     link: f64,
     /// gain に加算された成りポテンシャルの差分（符号つき。内訳表示用）
     promo: f64,
+    /// gain（advance_bias 内）に加算された成りの固定ボーナス分
+    /// （`params.promote_bias`。issue #40 P0-2 の shadow 順位用の内訳表示）
+    promote_bias: f64,
+    /// gain に加算された打ちの固定バイアス分（`params.drop_bias`。同上）
+    drop_bias: f64,
     /// gain から引かれた持ち駒オプションの不足分（正の値。内訳表示用）
     hand_option: f64,
     /// gain から引かれた盤上駒の減価（V5。正の値。内訳表示用）
@@ -7307,6 +7319,8 @@ impl Strategy for EstimatorStrategy {
                 risk: out.risk_mean,
                 link: out.link,
                 promo: out.promo,
+                promote_bias: out.promote_bias,
+                drop_bias: out.drop_bias,
                 hand_option: out.hand_option,
                 board_discount: out.board_discount,
                 foul_probe: out.foul_probe,
@@ -7977,31 +7991,9 @@ fn blind_home_position(view: &PlayerView, log: &ObservationLog) -> BlindHome {
 /// 自分が取ったマスは対象外（取った時点で相手駒は消えており、再占有の証拠に
 /// ならない）。歩打ち反則も対象外（二歩の可能性がある）。
 fn opp_occupancy_evidence(view: &PlayerView, log: &ObservationLog) -> [bool; 81] {
-    let mut backed = [false; 81];
-    for e in log.events() {
-        match e {
-            Observation::OpponentMoved {
-                captured_my_piece_at: Some(sq),
-                ..
-            } => {
-                if let Some(c) = parse_usi_square(sq) {
-                    backed[crate::belief_features::sq_index(c)] = true;
-                }
-            }
-            Observation::MyFoul { move_number, usi } if *move_number == view.move_number => {
-                if view.you_in_check {
-                    continue;
-                }
-                if let Some(ShogiMove::Drop { role, to }) = parse_usi(usi) {
-                    if role != Role::Pawn {
-                        backed[crate::belief_features::sq_index(to)] = true;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    backed
+    // 定義の本体は `marginal_work::backed_targets`（issue #40 の需要帯
+    // backed_target と同一であることを委譲で保証する。挙動は移設前と同じ）
+    crate::marginal_work::backed_targets(log, view.move_number, view.you_in_check)
 }
 
 /// 玉接近減点用の脅威マス（`king_known_approach_w`）。
@@ -9578,7 +9570,7 @@ fn evaluate(
     //   **`gen_nonpromote()` が有効なときだけ**付け替える（従来生成は成り一択
     //   なので、付け替えたままだと桂銀香の成りだけ promote_bias を失う）。
     //   発端は quest31 の 4九銀成（3h4i+、不成=10 / 成=2）
-    let advance_bias = match *mv {
+    let (advance_bias, promote_bias_term, drop_bias_term) = match *mv {
         ShogiMove::Board { from, to, promote } => {
             let adv = match me {
                 Color::Sente => (from.rank - to.rank) as f64,
@@ -9605,9 +9597,9 @@ fn evaluate(
             } else {
                 0.0
             };
-            params.advance_w * adv + promo_bonus
+            (params.advance_w * adv + promo_bonus, promo_bonus, 0.0)
         }
-        ShogiMove::Drop { .. } => params.drop_bias,
+        ShogiMove::Drop { .. } => (params.drop_bias, 0.0, params.drop_bias),
     };
 
     // 大駒を初期位置に置き続けるペナルティ（この手の後に残る枚数分）。
@@ -10109,6 +10101,8 @@ fn evaluate(
         },
         link,
         promo,
+        promote_bias: promote_bias_term,
+        drop_bias: drop_bias_term,
         hand_option: hand_option_pen,
         board_discount,
         foul_probe: foul_probe + gold_join,

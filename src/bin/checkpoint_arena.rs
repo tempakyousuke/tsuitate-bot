@@ -269,7 +269,11 @@ fn usage() -> &'static str {
      arena-var --control <games.jsonl...> --candidate <games.jsonl...>\n\
      \x20         [--baseline NAME] [--label NAME] [--alpha 0.05] [--power 0.80] [--boot N]\n\
      \x20         [--allow-budget-diff]\n\
-     \x20         [--markdown OUT] [--json OUT] [--allow-incomplete]"
+     \x20         [--markdown OUT] [--json OUT] [--allow-incomplete]\n\
+     arena-balance --control <games.jsonl...> --candidate <games.jsonl...>\n\
+     \x20             [--expect-opponents \"estimator_v13,estimator_v14\"] [--label NAME]\n\
+     \x20             [--alpha 0.05] [--boot N] [--markdown OUT] [--json OUT]\n\
+     \x20             [--allow-incomplete]"
 }
 
 fn die(msg: &str) -> ! {
@@ -3157,6 +3161,490 @@ fn cmd_arena_var(args: &Args) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// arena-balance: opponent-balanced 合算器（issue #40）
+//
+// 2相手ぶん（既定 v13 / v14）の対照・候補 arena-games.jsonl を読み、
+// 相手ごとに局ペア差を作って `(Δv13 + Δv14) / 2` を**層化 bootstrap**
+// （各相手の内側で局を引き直す）で判定する。`check_policy combined` と
+// 同じ契約: 入力の同一性検査は fail-closed、判定は事前登録した門で、
+// 不通過なら exit 3（`--allow-incomplete` で警告へ降格）。
+// ---------------------------------------------------------------------------
+
+/// issue #40 の held-out 判定の事前登録値（本文「検証 > Arena」の門）。
+/// CLI から動かせない定数にする（門をノブにすると gate-shopping が成立する）
+const BALANCE_MIN_DELTA: f64 = 0.04;
+/// 安全性: 反則/局のペア差の上限
+const BALANCE_MARGIN_FOULS: f64 = 0.3;
+/// 安全性: 思考平均（ms/手）のペア差の上限
+const BALANCE_MARGIN_THINK_MS: f64 = 100.0;
+
+/// 層化 bootstrap: 各層（相手）の内側で標本を引き直し、層平均の平均を分布にする。
+/// 返り値は (点推定, CI下限, CI上限)。点推定は各層の平均の単純平均 =
+/// opponent-balanced な合算そのもの
+fn stratified_boot_mean_ci(
+    strata: &[Vec<f64>],
+    boot: usize,
+    seed: u64,
+    alpha: f64,
+) -> (f64, f64, f64) {
+    if strata.iter().any(|v| v.is_empty()) {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
+    let point = strata.iter().map(|v| mean(v)).sum::<f64>() / strata.len() as f64;
+    let mut state = seed | 1;
+    let mut draws: Vec<f64> = Vec::with_capacity(boot);
+    for _ in 0..boot {
+        let mut acc = 0.0;
+        for v in strata {
+            let mut s = 0.0;
+            for _ in 0..v.len() {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                s += v[(state >> 33) as usize % v.len()];
+            }
+            acc += s / v.len() as f64;
+        }
+        draws.push(acc / strata.len() as f64);
+    }
+    draws.sort_by(f64::total_cmp);
+    let idx = |q: f64| -> f64 {
+        let i = ((draws.len() - 1) as f64 * q).round() as usize;
+        draws[i.min(draws.len() - 1)]
+    };
+    (point, idx(alpha / 2.0), idx(1.0 - alpha / 2.0))
+}
+
+/// 相手ごとに (対照, 候補) の局ペアを作る。ペアの鍵は (match_seed, game_no)。
+/// - 相手集合が両 arm で一致しない・2相手未満は Err
+/// - ペアにならない局は Err（`allow_incomplete` で捨てて続行）
+/// - 先後の食い違いは常に Err（別の条件列）
+/// - 相手ごとのペア数が [`MIN_ARENA_PAIRS`] 未満は Err（自由度は作れない）
+fn pair_by_opponent(
+    ctrl: &[GameRow],
+    cand: &[GameRow],
+    allow_incomplete: bool,
+) -> Result<BTreeMap<String, Vec<(GameRow, GameRow)>>, String> {
+    let opps = |rows: &[GameRow]| -> BTreeSet<String> {
+        rows.iter().map(|r| r.baseline.clone()).collect()
+    };
+    let (co, to) = (opps(ctrl), opps(cand));
+    if co != to {
+        return Err(format!(
+            "相手集合が対照と候補で違います: control={co:?} / candidate={to:?}"
+        ));
+    }
+    if co.len() < 2 {
+        return Err(format!(
+            "相手が {} 種類しかありません（opponent-balanced 合算には2相手以上が要ります。\n            1相手のペア差は arena-var を使ってください）",
+            co.len()
+        ));
+    }
+    let mut out: BTreeMap<String, Vec<(GameRow, GameRow)>> = BTreeMap::new();
+    for opp in &co {
+        let key = |r: &GameRow| (r.match_seed, r.game_no);
+        let cb: BTreeMap<_, _> = ctrl
+            .iter()
+            .filter(|r| &r.baseline == opp)
+            .map(|r| (key(r), r))
+            .collect();
+        let tb: BTreeMap<_, _> = cand
+            .iter()
+            .filter(|r| &r.baseline == opp)
+            .map(|r| (key(r), r))
+            .collect();
+        let unpaired =
+            cb.keys().filter(|k| !tb.contains_key(*k)).count()
+                + tb.keys().filter(|k| !cb.contains_key(*k)).count();
+        if unpaired > 0 {
+            let msg = format!(
+                "{opp}: ペアにならない対局が {unpaired} 局あります。\n            同じ match_seed・同じ局数・同じ shard 構成で取り直してください"
+            );
+            if allow_incomplete {
+                eprintln!("警告: {msg}");
+            } else {
+                return Err(msg);
+            }
+        }
+        let mut pairs: Vec<(GameRow, GameRow)> = vec![];
+        for (k, c) in &cb {
+            let Some(t) = tb.get(k) else { continue };
+            if c.a_is_sente != t.a_is_sente {
+                return Err(format!("{opp} {k:?}: 先後が食い違っています（別の条件列です）"));
+            }
+            pairs.push(((*c).clone(), (*t).clone()));
+        }
+        if pairs.len() < MIN_ARENA_PAIRS {
+            return Err(format!("{opp}: {}", arena_var_pair_error(pairs.len())));
+        }
+        out.insert(opp.clone(), pairs);
+    }
+    // **局数の一致**（fail-closed）: 相手ごとの局数が違うと「合算は 1/2 ずつ」の
+    // 意図（opponent-balanced）は保たれるが、run の設定が事前登録
+    // （games / shards / seed をすべて一致）から外れている兆候なので止める
+    let sizes: BTreeSet<usize> = out.values().map(|v| v.len()).collect();
+    if sizes.len() > 1 {
+        let msg = format!(
+            "相手ごとのペア局数が揃っていません: {:?}",
+            out.iter().map(|(k, v)| (k.clone(), v.len())).collect::<Vec<_>>()
+        );
+        if allow_incomplete {
+            eprintln!("警告: {msg}");
+        } else {
+            return Err(msg);
+        }
+    }
+    Ok(out)
+}
+
+/// 判定に使う量の入れ物（テスト対象）
+#[derive(Clone)]
+struct BalanceGate {
+    combined: f64,
+    ci_lo: f64,
+    /// 相手ごとの Δ 点推定（符号 veto）
+    per_opp: Vec<(String, f64)>,
+    /// 反則/局（fouls_me）の合算ペア差
+    fouls_delta: f64,
+    /// 思考平均（ms/手）の合算ペア差
+    think_delta: f64,
+    /// 候補 arm の時間切れ負け局数
+    cand_timeouts: u64,
+}
+
+/// 事前登録した門の判定。返り値は (通過, 落ちた理由の一覧)
+fn balance_verdict(g: &BalanceGate) -> (bool, Vec<String>) {
+    let mut reasons = vec![];
+    if !(g.combined >= BALANCE_MIN_DELTA) {
+        reasons.push(format!(
+            "合算 Δ {:+.4} < +{BALANCE_MIN_DELTA}",
+            g.combined
+        ));
+    }
+    if !(g.ci_lo > 0.0) {
+        reasons.push(format!("合算 CI 下限 {:+.4} ≤ 0", g.ci_lo));
+    }
+    for (opp, d) in &g.per_opp {
+        if !(*d > 0.0) {
+            reasons.push(format!("{opp} の Δ {d:+.4} ≤ 0（相手別符号 veto）"));
+        }
+    }
+    if !(g.fouls_delta <= BALANCE_MARGIN_FOULS) {
+        reasons.push(format!(
+            "反則/局のペア差 {:+.3} > +{BALANCE_MARGIN_FOULS}",
+            g.fouls_delta
+        ));
+    }
+    if g.cand_timeouts > 0 {
+        reasons.push(format!("候補の時間切れ負け {} 局 > 0", g.cand_timeouts));
+    }
+    if !(g.think_delta <= BALANCE_MARGIN_THINK_MS) {
+        reasons.push(format!(
+            "思考平均のペア差 {:+.1}ms > +{BALANCE_MARGIN_THINK_MS}ms",
+            g.think_delta
+        ));
+    }
+    (reasons.is_empty(), reasons)
+}
+
+fn cmd_arena_balance(args: &Args) {
+    let control_paths = args.all("control");
+    let candidate_paths = args.all("candidate");
+    if control_paths.is_empty() || candidate_paths.is_empty() {
+        die("--control と --candidate に ARENA_GAMES_JSON の JSONL を指定してください");
+    }
+    let boot: usize = args.num("boot", 10000);
+    let alpha: f64 = args.num("alpha", 0.05);
+    let allow_incomplete = args.flag("allow-incomplete");
+    let label = args.get("label").unwrap_or("arena-balance").to_string();
+    // 期待する相手集合（check_policy combined と同じ規約: 空文字で無効化）。
+    // 既定の2相手固定は「片方の相手だけで通過を返せる」穴を塞ぐため
+    let expect_opps: BTreeSet<String> = {
+        let raw = args
+            .get("expect-opponents")
+            .unwrap_or("estimator_v13,estimator_v14");
+        raw.split([',', ' '])
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+
+    let ctrl = parse_game_rows(&control_paths, "control");
+    let cand = parse_game_rows(&candidate_paths, "candidate");
+
+    // arm 内の一意性は**相手ごと**に検査する（assert_uniform は相手混在を
+    // 拒否する設計なので、先に相手で割ってから掛ける）
+    let split = |rows: &[GameRow]| -> BTreeMap<String, Vec<GameRow>> {
+        let mut m: BTreeMap<String, Vec<GameRow>> = BTreeMap::new();
+        for r in rows {
+            m.entry(r.baseline.clone()).or_default().push(r.clone());
+        }
+        m
+    };
+    for (arm, rows) in [("control", &ctrl), ("candidate", &cand)] {
+        for (opp, sub) in split(rows) {
+            assert_uniform(&format!("{arm}({opp})"), &sub);
+        }
+        // **相手をまたいだ arm 設定の一致**（fail-closed）: baseline /
+        // baseline_behavior / match_seed 以外はすべて一致していなければ、
+        // 「2相手で同じ候補を測った」ことにならない
+        let uniq_across = |name: &str, vals: BTreeSet<String>| {
+            if vals.len() > 1 {
+                die(&format!(
+                    "{arm}: 相手をまたいで {name} が違います（{}）。同じ commit・同じ設定の run を渡してください",
+                    vals.into_iter().collect::<Vec<_>>().join(" / ")
+                ));
+            }
+        };
+        uniq_across("candidate", rows.iter().map(|r| r.candidate.clone()).collect());
+        uniq_across("clock", rows.iter().map(|r| r.clock.clone()).collect());
+        uniq_across("commit", rows.iter().map(|r| r.commit.clone()).collect());
+        uniq_across("think_budget_ms_a", rows.iter().map(|r| r.budget.clone()).collect());
+        uniq_across("think_budget_ms_b", rows.iter().map(|r| r.budget_opp.clone()).collect());
+        uniq_across("cand_config", rows.iter().map(|r| r.cand_config.clone()).collect());
+        uniq_across("cand_knobs", rows.iter().map(|r| fmt_env(&r.cand_knobs)).collect());
+        uniq_across("shared_env", rows.iter().map(|r| fmt_env(&r.shared_env)).collect());
+    }
+
+    // arm 間（対照 vs 候補）の実験条件。arena-var と同じ趣旨で fail-closed。
+    // **予算の不一致に override は無い**（issue #40 の検証は予算 2000ms を
+    // 4 run すべてで一致させる契約。予算そのものを比べる用途は arena-var の領分）
+    if ctrl[0].clock != cand[0].clock {
+        die(&format!(
+            "時計が違います: control={} / candidate={}",
+            ctrl[0].clock, cand[0].clock
+        ));
+    }
+    if ctrl[0].budget != cand[0].budget || ctrl[0].budget_opp != cand[0].budget_opp {
+        die(&format!(
+            "思考予算が違います: control=(候補 {} / 相手 {}) / candidate=(候補 {} / 相手 {})",
+            ctrl[0].budget, ctrl[0].budget_opp, cand[0].budget, cand[0].budget_opp
+        ));
+    }
+    if fmt_env(&ctrl[0].shared_env) != fmt_env(&cand[0].shared_env) {
+        die(&format!(
+            "両側に効く env が違います: control=[{}] / candidate=[{}]",
+            fmt_env(&ctrl[0].shared_env),
+            fmt_env(&cand[0].shared_env)
+        ));
+    }
+    if ctrl[0].commit != cand[0].commit {
+        // issue #40 の対照は「同一 commit・W=0」。別 commit の main を指すと
+        // arena-var は警告するだけなので、こちらは**止める**（本文の指示）
+        let msg = format!(
+            "commit が違います: control={} / candidate={}。\n            issue #40 の対照は同一 commit・W=0 の run（別 commit の main は対照にできません）",
+            ctrl[0].commit, cand[0].commit
+        );
+        if allow_incomplete {
+            eprintln!("警告: {msg}");
+        } else {
+            die(&msg);
+        }
+    }
+    // 相手の実効挙動は**相手ごとに** arm 間で一致していること
+    {
+        let by = |rows: &[GameRow]| -> BTreeMap<String, String> {
+            rows.iter()
+                .map(|r| (r.baseline.clone(), r.baseline_behavior.clone()))
+                .collect()
+        };
+        let (cb, tb) = (by(&ctrl), by(&cand));
+        for (opp, beh) in &cb {
+            if tb.get(opp).is_some_and(|b| b != beh) {
+                die(&format!(
+                    "相手 {opp} の実効挙動が対照と候補で違います:\n            control={beh}\n            candidate={}",
+                    tb[opp]
+                ));
+            }
+        }
+    }
+    if ctrl[0].candidate == cand[0].candidate
+        && ctrl[0].cand_config == cand[0].cand_config
+        && ctrl[0].commit == cand[0].commit
+    {
+        eprintln!(
+            "注意: control と candidate の実効設定が一致しています。A/A として読みます（差の期待値は 0）"
+        );
+    }
+
+    let paired = pair_by_opponent(&ctrl, &cand, allow_incomplete).unwrap_or_else(|e| die(&e));
+    let opps: Vec<String> = paired.keys().cloned().collect();
+    if !expect_opps.is_empty() {
+        let got: BTreeSet<String> = opps.iter().cloned().collect();
+        if got != expect_opps {
+            die(&format!(
+                "相手集合が期待と違います: got={got:?} / expect={expect_opps:?}\n            （--expect-opponents で明示するか、空文字で検査を無効化）"
+            ));
+        }
+    }
+
+    // 相手ごと・指標ごとのペア差
+    let mut strata_by_metric: BTreeMap<&'static str, Vec<Vec<f64>>> = BTreeMap::new();
+    let mut arm_means: BTreeMap<&'static str, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    let mut cand_timeouts = 0u64;
+    let mut ctrl_timeouts = 0u64;
+    for opp in &opps {
+        let pairs = &paired[opp];
+        cand_timeouts += pairs
+            .iter()
+            .filter(|(_, t)| t.reason == "timeout" && t.score_a == 0.0)
+            .count() as u64;
+        ctrl_timeouts += pairs
+            .iter()
+            .filter(|(c, _)| c.reason == "timeout" && c.score_a == 0.0)
+            .count() as u64;
+        for (name, _) in METRICS {
+            let mut deltas = vec![];
+            for (c, t) in pairs {
+                let (mc, mt) = (game_metrics(c), game_metrics(t));
+                let (Some(a), Some(b)) = (mc.get(name), mt.get(name)) else { continue };
+                deltas.push(b - a);
+                let e = arm_means.entry(name).or_default();
+                e.0.push(*a);
+                e.1.push(*b);
+            }
+            if !deltas.is_empty() {
+                strata_by_metric.entry(name).or_default().push(deltas);
+            }
+        }
+    }
+
+    let score_strata = &strata_by_metric["score"];
+    let (combined, ci_lo, ci_hi) = stratified_boot_mean_ci(score_strata, boot, 0x40_2001, alpha);
+    let per_opp: Vec<(String, f64)> = opps
+        .iter()
+        .zip(score_strata.iter())
+        .map(|(o, v)| (o.clone(), mean(v)))
+        .collect();
+    let comb_of = |name: &str| -> f64 {
+        strata_by_metric[name].iter().map(|v| mean(v)).sum::<f64>()
+            / strata_by_metric[name].len() as f64
+    };
+    let gate = BalanceGate {
+        combined,
+        ci_lo,
+        per_opp: per_opp.clone(),
+        fouls_delta: comb_of("fouls_me"),
+        think_delta: comb_of("think_avg_ms_me"),
+        cand_timeouts,
+    };
+    let (pass, reasons) = balance_verdict(&gate);
+
+    let mut out = String::new();
+    out.push_str(&format!("## opponent-balanced 合算（{label}、issue #40）\n\n"));
+    out.push_str(&format!(
+        "候補 `{}`{} / 対照 `{}`{} / commit `{}` / 時計 {} / 予算 候補 {} / 相手 {}\n\n",
+        cand[0].candidate,
+        if cand[0].cand_knobs.is_empty() {
+            String::new()
+        } else {
+            format!("（{}）", fmt_env(&cand[0].cand_knobs))
+        },
+        ctrl[0].candidate,
+        if ctrl[0].cand_knobs.is_empty() {
+            String::new()
+        } else {
+            format!("（{}）", fmt_env(&ctrl[0].cand_knobs))
+        },
+        ctrl[0].commit,
+        ctrl[0].clock,
+        cand[0].budget,
+        cand[0].budget_opp,
+    ));
+    out.push_str("| 相手 | ペア局数 | Δ（候補 − 対照） |\n|---|---:|---:|\n");
+    for (opp, d) in &per_opp {
+        out.push_str(&format!("| {} | {} | {} |\n", opp, paired[opp].len(), pct(*d)));
+    }
+    out.push_str(&format!(
+        "\n**合算 (ΣΔ)/{} = {}**、{:.0}% CI [{}, {}]（層化 bootstrap {boot} 反復。各相手の内側で局を引き直す）\n\n",
+        opps.len(),
+        pct(combined),
+        (1.0 - alpha) * 100.0,
+        pct(ci_lo),
+        pct(ci_hi),
+    ));
+    out.push_str("### 安全性・受動化監査（合算ペア差）\n\n");
+    out.push_str("| 指標 | 対照 | 候補 | 合算ペア差 | CI |\n|---|---:|---:|---:|---|\n");
+    for (name, jp) in METRICS {
+        let Some(strata) = strata_by_metric.get(name) else { continue };
+        let (d, l, h) = stratified_boot_mean_ci(strata, boot.min(4000), 0x40_2002, alpha);
+        let (c, t) = &arm_means[name];
+        out.push_str(&format!(
+            "| {jp} | {:.3} | {:.3} | {:+.3} | [{:+.3}, {:+.3}] |\n",
+            mean(c),
+            mean(t),
+            d,
+            l,
+            h
+        ));
+    }
+    out.push_str(&format!(
+        "\n時間切れ負け: 対照 {ctrl_timeouts} 局 / 候補 {cand_timeouts} 局。\n\
+         持ち駒残数・王手率・詰み勝ち率と**平均評価粒子数**（対照比 −10% 超で中止）は\n\
+         games.jsonl に無いので arena-records（`chose.debug`）から別途出すこと。\n\n"
+    ));
+    out.push_str(&format!(
+        "### 判定（事前登録: 合算 ≥ +{BALANCE_MIN_DELTA} かつ CI 下限 > 0・相手別符号・反則/局 +{BALANCE_MARGIN_FOULS} 以内・時間切れ0・思考平均 +{BALANCE_MARGIN_THINK_MS}ms 以内）\n\n"
+    ));
+    if pass {
+        out.push_str("**通過**（v9〜v14 ガントレットへ進める）\n");
+    } else {
+        out.push_str("**不通過**:\n\n");
+        for r in &reasons {
+            out.push_str(&format!("- {r}\n"));
+        }
+    }
+
+    println!("{out}");
+    if let Some(p) = args.get("markdown") {
+        std::fs::write(p, &out).unwrap_or_else(|e| die(&format!("{p}: {e}")));
+    }
+    if let Some(p) = args.get("json") {
+        let v = serde_json::json!({
+            "schema": SUMMARY_SCHEMA,
+            "kind": "arena-balance",
+            "label": label,
+            "candidate": cand[0].candidate,
+            "control": ctrl[0].candidate,
+            "candidate_knobs": cand[0].cand_knobs,
+            "control_knobs": ctrl[0].cand_knobs,
+            "commit": ctrl[0].commit,
+            "clock": ctrl[0].clock,
+            "think_budget_ms": cand[0].budget,
+            "think_budget_ms_opponent": cand[0].budget_opp,
+            "alpha": alpha,
+            "opponents": per_opp.iter().map(|(o, d)| {
+                (o.clone(), serde_json::json!({
+                    "pairs": paired[o].len(),
+                    "delta": d,
+                }))
+            }).collect::<serde_json::Map<_, _>>(),
+            "combined_delta": combined,
+            "ci_low": ci_lo,
+            "ci_high": ci_hi,
+            "fouls_delta": gate.fouls_delta,
+            "think_avg_ms_delta": gate.think_delta,
+            "candidate_timeouts": cand_timeouts,
+            "pass": pass,
+            "fail_reasons": reasons,
+            "metrics": METRICS.iter().filter(|(n, _)| strata_by_metric.contains_key(n)).map(|(n, _)| {
+                (n.to_string(), serde_json::json!({
+                    "control": mean(&arm_means[n].0),
+                    "candidate": mean(&arm_means[n].1),
+                    "delta": comb_of(n),
+                }))
+            }).collect::<serde_json::Map<_, _>>(),
+        });
+        std::fs::write(p, serde_json::to_string_pretty(&v).unwrap())
+            .unwrap_or_else(|e| die(&format!("{p}: {e}")));
+    }
+    if !pass && !allow_incomplete {
+        // fail-closed: 判定が通らない実験を緑で終わらせない（check_policy combined と同じ）
+        std::process::exit(3);
+    }
+}
+
 /// 標本分散（n−1）
 fn variance(v: &[f64]) -> f64 {
     if v.len() < 2 {
@@ -3180,6 +3668,7 @@ fn main() {
         Some("compare") => cmd_compare(&args),
         Some("report") => cmd_report(&args),
         Some("arena-var") => cmd_arena_var(&args),
+        Some("arena-balance") => cmd_arena_balance(&args),
         other => die(&format!("未知のサブコマンド: {}", other.unwrap_or("(なし)"))),
     }
 }
@@ -3284,6 +3773,94 @@ mod tests {
             baseline_behavior: "beh".into(),
             shared_env: BTreeMap::new(),
         }
+    }
+
+    fn balance_row(baseline: &str, game_no: u64, score_a: f64) -> GameRow {
+        let mut r = game_row("checkmate", score_a);
+        r.baseline = baseline.into();
+        r.game_no = game_no;
+        r.a_is_sente = game_no % 2 == 0;
+        r
+    }
+
+    /// arena-balance のペアリング: 相手ごとに閉じ、集合の不一致・欠落・
+    /// 1相手だけ・先後の食い違いは fail-closed
+    #[test]
+    fn arena_balance_pairs_within_each_opponent() {
+        let ctrl: Vec<GameRow> = vec![
+            balance_row("estimator_v13", 0, 0.0),
+            balance_row("estimator_v13", 1, 1.0),
+            balance_row("estimator_v14", 0, 0.5),
+            balance_row("estimator_v14", 1, 0.5),
+        ];
+        let cand = ctrl.clone(); // A/A
+        let paired = pair_by_opponent(&ctrl, &cand, false).expect("A/A はペアになる");
+        assert_eq!(paired.len(), 2);
+        assert!(paired.values().all(|v| v.len() == 2));
+
+        // 1相手だけでは opponent-balanced にならない（arena-var の領分）
+        let one: Vec<GameRow> = ctrl
+            .iter()
+            .filter(|r| r.baseline == "estimator_v13")
+            .cloned()
+            .collect();
+        assert!(pair_by_opponent(&one, &one, false).is_err());
+
+        // 片 arm に無い局は fail-closed
+        let mut missing = cand.clone();
+        missing.pop();
+        assert!(pair_by_opponent(&ctrl, &missing, false).is_err());
+
+        // 相手集合の不一致も fail-closed
+        let mut wrong = cand.clone();
+        wrong[3].baseline = "estimator_v12".into();
+        assert!(pair_by_opponent(&ctrl, &wrong, false).is_err());
+
+        // 先後の食い違い = 別の条件列
+        let mut flipped = cand.clone();
+        flipped[0].a_is_sente = !flipped[0].a_is_sente;
+        assert!(pair_by_opponent(&ctrl, &flipped, false).is_err());
+    }
+
+    /// 合算の点推定は「各相手の平均の単純平均」= 局数が偏っても 1/2 ずつ
+    #[test]
+    fn arena_balance_point_is_mean_of_stratum_means() {
+        let strata = vec![vec![1.0, 0.0, 1.0, 0.0], vec![0.5, 0.5, 0.5, 0.5]];
+        let (p, lo, hi) = stratified_boot_mean_ci(&strata, 2000, 7, 0.05);
+        assert!((p - 0.5).abs() < 1e-12);
+        assert!(lo <= p && p <= hi);
+        let skewed = vec![vec![1.0; 100], vec![0.0; 4]];
+        let (p, _, _) = stratified_boot_mean_ci(&skewed, 100, 7, 0.05);
+        assert!((p - 0.5).abs() < 1e-12, "局数の多い相手が合算を支配しない");
+        // 空の層は判定不能（NaN）: どの門も通らない側に落ちる
+        let empty = vec![vec![1.0], vec![]];
+        assert!(stratified_boot_mean_ci(&empty, 10, 7, 0.05).0.is_nan());
+    }
+
+    /// 事前登録した門: どの1条件が欠けても不通過。NaN も不通過側
+    #[test]
+    fn arena_balance_verdict_enforces_preregistered_gate() {
+        let ok = BalanceGate {
+            combined: 0.05,
+            ci_lo: 0.01,
+            per_opp: vec![("estimator_v13".into(), 0.04), ("estimator_v14".into(), 0.06)],
+            fouls_delta: 0.1,
+            think_delta: 20.0,
+            cand_timeouts: 0,
+        };
+        assert!(balance_verdict(&ok).0);
+        let fails = |g: BalanceGate| !balance_verdict(&g).0;
+        assert!(fails(BalanceGate { combined: 0.039, ..ok.clone() }), "+0.04 未満");
+        assert!(fails(BalanceGate { ci_lo: 0.0, ..ok.clone() }), "CI 下限 ≤ 0");
+        assert!(fails(BalanceGate {
+            per_opp: vec![("estimator_v13".into(), -0.01), ("estimator_v14".into(), 0.12)],
+            combined: 0.055,
+            ..ok.clone()
+        }), "相手別符号 veto");
+        assert!(fails(BalanceGate { fouls_delta: 0.31, ..ok.clone() }), "反則/局 +0.3 超");
+        assert!(fails(BalanceGate { cand_timeouts: 1, ..ok.clone() }), "時間切れ");
+        assert!(fails(BalanceGate { think_delta: 101.0, ..ok.clone() }), "思考平均 +100ms 超");
+        assert!(fails(BalanceGate { combined: f64::NAN, ..ok.clone() }), "NaN は不通過側");
     }
 
     /// 実際の JSONL を通した parse の検査。**構造体を直接組み立てるテストでは
