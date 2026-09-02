@@ -55,6 +55,10 @@ on:
         description: "既存 Arena 実行の対局記録を候補として使う（対局はやり直さず集計とペア集計だけ回す）"
         required: false
         default: ""
+      balance_manifest:
+        description: "issue #40 held-out 採否用: 計測前に commit した validation manifest のリポジトリ内パス。同一 commit の4 run（対照→候補 × v13/v14）を同じ ref への手動起動で作るのに要る"
+        required: false
+        default: ""
   push:
     paths:
       - ".github/ci/arena.request.json"
@@ -92,6 +96,7 @@ jobs:
           IN_CAND_ENV: ${{ github.event.inputs.cand_env }}
           IN_PAIR_WITH: ${{ github.event.inputs.pair_with }}
           IN_GAMES_FROM: ${{ github.event.inputs.games_from_run_id }}
+          IN_BALANCE_MANIFEST: ${{ github.event.inputs.balance_manifest }}
         run: |
           set -euo pipefail
           default_baselines='estimator_v9 estimator_v10 estimator_v11 estimator_v12 estimator_v13 estimator_v14'
@@ -108,9 +113,11 @@ jobs:
             cand_env="${IN_CAND_ENV:-}"
             pair_with="${IN_PAIR_WITH:-}"
             games_from="${IN_GAMES_FROM:-}"
-            # validation manifest はリクエストファイル経路のみ（issue #40 の
-            # held-out 採否用。手動起動の採否 run は request で回す）
-            balance_manifest=""
+            # held-out 採否の4 run（対照→候補 × v13/v14）は**同一 commit** が
+            # 必須（合算器が要求する）なので、request ファイルの書き換え push では
+            # 作れない（push のたびに commit が変わる）。同じ ref への手動起動
+            # 4回でここから manifest を渡す（PR #41 レビュー5巡目）
+            balance_manifest="${IN_BALANCE_MANIFEST:-}"
           else
             if [ ! -f "$req" ]; then
               # push の paths フィルタはファイルの削除にも一致するので、計測が

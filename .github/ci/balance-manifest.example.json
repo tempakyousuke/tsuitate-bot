@@ -1,7 +1,9 @@
 {
-  "_note": "issue #40 の held-out 採否の validation manifest の例。P1 の処置ノブが決まったら、この形の実ファイル（例 .github/ci/issue40-balance.manifest.json）を**計測より前の commit** で入れ、対照・候補の全4 run の arena.request.json の balance_manifest にそのパスを書く。cand_knobs は候補 run の cand_env と完全一致（対照はノブなし）。games / shards / opponents は事前登録の echo で、合算器が定数と突き合わせる",
+  "_note": "issue #40 の held-out 採否の validation manifest の例。P1 の処置ノブが決まったら、この形の実ファイル（例 .github/ci/issue40-balance.manifest.json）を**計測より前の commit** で入れ、同一 commit の同じ ref へ `gh workflow run arena.yml -f balance_manifest=<path> ...` を4回（対照 v13 → 対照 v14 → 候補 v13（pair_with=対照v13の run ID）→ 候補 v14）起動する。request ファイルの書き換え push では commit が run ごとに変わり合算器の同一 commit 検査を通らない。cand_knobs は候補 run の cand_env と完全一致（対照はノブなし）。candidate / think_budget_ms は必須（bin/arena が起動時に実効値と照合し、合算器も要求する）。games / shards / opponents / clock は echo で、合算器が定数・記録と突き合わせる",
   "experiment": "issue40-heldout",
+  "candidate": "estimator",
   "cand_knobs": { "TSUITATE_EXAMPLE_W": "1.0" },
+  "think_budget_ms": 2000,
   "games": 600,
   "shards": 8,
   "opponents": { "estimator_v13": 20260910, "estimator_v14": 20260909 }

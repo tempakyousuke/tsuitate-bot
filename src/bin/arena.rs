@@ -184,20 +184,31 @@ fn resolve_run_identity(
 /// 指し、その sha256 を games.jsonl の全行へ焼き込む。合算器
 /// （`checkpoint_arena arena-balance --manifest`）は同じファイルの指紋と
 /// 行の指紋の一致を要求するので、「manifest と違う設定で測った run」や
-/// 「計測後に manifest を書き換えた」が判定へ混ざらない。起動時に
-/// candidate 側の実効ノブが manifest の `cand_knobs` と一致することも検査する
-/// （対照 = ノブなしの run は空でよい）。
-fn balance_manifest_fingerprint() -> Option<String> {
+/// 「計測後に manifest を書き換えた」が判定へ混ざらない。起動時に検査する
+/// （対局を回してから落とすと 600 局が無駄になる。PR #41 レビュー5巡目で
+/// 検査を3点足した）:
+/// - candidate 側の実効ノブが manifest の `cand_knobs` と一致（対照 = ノブなしは空でよい）
+/// - manifest が `candidate` / `think_budget_ms` を持つなら実効値と一致
+/// - **診断オラクル（`ARENA_ORACLE_A`）の run には焼き込めない**: 候補の反則を
+///   審判が握りつぶす上限測定を通常の held-out として通してはいけない
+fn balance_manifest_fingerprint(candidate: &str) -> Option<String> {
     let path = std::env::var("ARENA_BALANCE_MANIFEST")
         .ok()
         .filter(|p| !p.trim().is_empty())?;
-    let bytes = std::fs::read(&path).unwrap_or_else(|e| {
-        eprintln!("ARENA_BALANCE_MANIFEST を読めません（{path}）: {e}");
+    let bail = |msg: &str| -> ! {
+        eprintln!("{msg}");
         std::process::exit(1);
-    });
+    };
+    if !oracle_mode().is_empty() {
+        bail(&format!(
+            "ARENA_ORACLE_A が有効な run に ARENA_BALANCE_MANIFEST（{path}）は焼き込めません\n\
+             （オラクルは診断用の上限測定で、held-out 採否の記録にはならない）"
+        ));
+    }
+    let bytes = std::fs::read(&path)
+        .unwrap_or_else(|e| bail(&format!("ARENA_BALANCE_MANIFEST を読めません（{path}）: {e}")));
     let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-        eprintln!("ARENA_BALANCE_MANIFEST（{path}）が JSON として読めません: {e}");
-        std::process::exit(1);
+        bail(&format!("ARENA_BALANCE_MANIFEST（{path}）が JSON として読めません: {e}"))
     });
     let want: BTreeMap<String, String> = match v.get("cand_knobs").and_then(|x| x.as_object()) {
         Some(o) => o
@@ -209,18 +220,31 @@ fn balance_manifest_fingerprint() -> Option<String> {
                 )
             })
             .collect(),
-        None => {
-            eprintln!("ARENA_BALANCE_MANIFEST（{path}）に cand_knobs（object）がありません");
-            std::process::exit(1);
-        }
+        None => bail(&format!(
+            "ARENA_BALANCE_MANIFEST（{path}）に cand_knobs（object）がありません"
+        )),
     };
     let actual = cand_knobs();
     if !actual.is_empty() && actual != want {
-        eprintln!(
+        bail(&format!(
             "ARENA_CAND_KNOBS が manifest（{path}）の cand_knobs と一致しません。\n\
              candidate run は manifest の処置ノブそのもの、対照 run はノブなしで回してください"
-        );
-        std::process::exit(1);
+        ));
+    }
+    if let Some(mc) = v.get("candidate").and_then(|x| x.as_str()) {
+        if mc != candidate {
+            bail(&format!(
+                "candidate {candidate} が manifest（{path}）の candidate {mc} と一致しません"
+            ));
+        }
+    }
+    if let Some(mb) = v.get("think_budget_ms").and_then(|x| x.as_u64()) {
+        let eff = budget_of(candidate, &candidate_config());
+        if eff != Some(mb) {
+            bail(&format!(
+                "候補の実効思考予算 {eff:?} が manifest（{path}）の think_budget_ms {mb} と一致しません"
+            ));
+        }
     }
     use sha2::Digest as _;
     Some(
@@ -229,6 +253,16 @@ fn balance_manifest_fingerprint() -> Option<String> {
             .map(|b| format!("{b:02x}"))
             .collect(),
     )
+}
+
+/// 診断オラクルの実効値（`ARENA_ORACLE_A`。空 = 通常対局）。games.jsonl へ
+/// 必ず記録する: 記録が無いと「対照は通常・候補は nofoul」の run を合算器が
+/// 識別できず、審判が候補の反則を握りつぶした診断 run を held-out として
+/// 通せてしまう（PR #41 レビュー5巡目 [P1]）
+fn oracle_mode() -> String {
+    std::env::var("ARENA_ORACLE_A")
+        .map(|v| v.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// 数値 env を読む。**指定されているのに parse できないときは None で黙らない**
@@ -510,7 +544,6 @@ fn main() {
     // 候補 run が対照に指す run（arena.yml の `-f pair_with=`）。合算器が
     // 「対照の取り違え」を機械検査するために記録へ残す
     let pair_with = std::env::var("ARENA_PAIR_WITH").ok().filter(|s| !s.trim().is_empty());
-    let manifest_fp = balance_manifest_fingerprint();
     let games: u32 = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(100);
     let candidate = args.get(2).cloned().unwrap_or_else(|| "heuristic".into());
     let opponents: Vec<String> = if args.len() > 3 {
@@ -524,6 +557,8 @@ fn main() {
             std::process::exit(1);
         }
     }
+    // manifest の照合は candidate の実効設定（名前・ノブ・予算）が要るのでここで
+    let manifest_fp = balance_manifest_fingerprint(&candidate);
 
     let mut results: Vec<(String, MatchStats)> = vec![];
     for (opp_idx, opp) in opponents.iter().enumerate() {
@@ -598,7 +633,12 @@ fn main() {
                                     // （PR #41 レビュー4巡目。base は実験条件であって
                                     //  実行の識別子ではないので、同じ base で取り直した
                                     //  複数 run の shard 混ぜはこれ無しでは検出できない）
-                                    "schema": 4,
+                                    // schema 5: **診断オラクルを必須記録にした**
+                                    // （同5巡目。無いと「対照は通常・候補は nofoul」を
+                                    //  合算器が識別できず、審判が候補の反則を握りつぶした
+                                    //  診断 run を held-out として通せる）
+                                    "schema": 5,
+                                    "oracle": oracle_mode(),
                                     "run_id": run_identity.as_ref().expect("起動時に解決済み").0,
                                     "run_attempt": run_identity.as_ref().expect("起動時に解決済み").1,
                                     // 候補 run が対照に指した run（無ければ null）。

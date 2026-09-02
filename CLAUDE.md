@@ -227,12 +227,24 @@
     切ることもできない）。`--allow-incomplete` で降格した不完全入力・A/A =
     処置なしも判定不能。
     **処置ノブのような P1 後に決まる可変部分は validation manifest が一次資料**:
-    計測前に commit した manifest（例は `.github/ci/balance-manifest.example.json`）の
-    リポジトリ内パスを arena.request.json の `balance_manifest` に書くと、
-    `bin/arena` が起動時に「実効ノブ == manifest の cand_knobs（対照は空）」を検査した
-    うえで **games.jsonl の全行へ manifest の sha256 を焼き込み**、合算器は
+    計測前に commit した manifest（例は `.github/ci/balance-manifest.example.json`。
+    `cand_knobs` に加えて `candidate` / `think_budget_ms` が必須）を指すと、
+    `bin/arena` が起動時に「実効ノブ == manifest の cand_knobs（対照は空）・
+    candidate 名と実効予算の一致・**オラクル無効**」を検査したうえで
+    **games.jsonl の全行へ manifest の sha256 を焼き込み**、合算器は
     `--manifest <path>` で同じファイルの指紋と全行の一致（違えば die）・期待ノブの
-    完全一致を要求する。manifest 無しの集計は判定不能。
+    完全一致・必須フィールドを要求する。manifest 無しの集計は判定不能。
+    **held-out の4 run（対照→候補 × v13/v14）は同一 commit が必須なので、
+    request ファイルの書き換え push では作れない**（push ごとに commit が変わる。
+    PR #41 レビュー5巡目）: manifest を commit した ref へ
+    `gh workflow run arena.yml -f balance_manifest=<path> -f games=600 -f shards=8
+    -f match_seed=<相手別seed> -f baselines=<相手>`（候補側は
+    `-f cand_env="<ノブ>" -f pair_with=<対照のrun ID>` を追加）を4回起動する。
+    **実験条件も事前登録と照合する**: 実効予算は両 arm・両側とも 2000ms
+    （`BALANCE_BUDGET_MS`。arm 間の一致だけだと「両方 700ms」が通る）・両側 env
+    なし・**診断オラクル（games.jsonl **schema 5** で `oracle` 列を必須記録）は
+    非空なら die**（審判が候補の反則を握りつぶす nofoul 診断 run を held-out として
+    通せてしまうため）。予算・env の逸脱は判定不能。
     入力の同一性検査も fail-closed: arm 内・相手内の一意性（`assert_uniform`）・
     **相手をまたいだ arm 設定の一致**（candidate / clock / commit / 予算 /
     cand_config / cand_knobs / shared_env）・**arm × 相手ごとに base は1つだけ・
@@ -245,9 +257,15 @@
     しまう。CI は `GITHUB_RUN_ID` / `GITHUB_RUN_ATTEMPT`、ローカルは
     `ARENA_EXPERIMENT_ID` が必須 — 無いと `ARENA_GAMES_JSON` 指定の run は起動時に
     落ちる）・**候補行の `pair_with`（`-f pair_with=` で記録）は対照の run_id と
-    一致**（対照の取り違え検査）・**arm 間は同一 candidate 名・対照は W=0
+    一致し、held-out 判定では必須**（紐の無い行は判定不能 = 後から別の同一 seed・
+    同一 commit 対照へ差し替えられる穴を塞ぐ。不一致は die）・**両 arm とも
+    `run_attempt == 1`**（re-run attempt = 取り直しなので判定不能。`pair_with` は
+    run_id しか持たず attempt を区別できないため 1 に固定して組を一意にする。
+    shard が落ちた run は re-run でなく新しい run として取り直す）・
+    **arm 間は同一 candidate 名・対照は W=0
     （cand_knobs 空）・同一 commit**（commit 不一致に override は無い）。
-    run 混入・pair_with 不一致・指紋不一致は `--allow-incomplete` でも降格しない。
+    run 混入・pair_with 不一致・指紋不一致・oracle 非空は `--allow-incomplete` でも
+    降格しない。
     予算不一致の override も無い。平均評価粒子数の門（対照比 −10% 超で中止）は
     games.jsonl に無いので arena-records の `chose.debug` から別途出す
 - `cargo run --release --bin tune -- [反復数] [評価あたり対局数] [基準...]` — 評価パラメータ
