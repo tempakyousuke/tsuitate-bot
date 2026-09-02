@@ -479,7 +479,12 @@ fn main() {
                                     // （PR #23 レビュー指摘2。名前と時計しか見ていないと、
                                     //  同じ `estimator_v14` でも共通 env・共有モデル pin・
                                     //  予算が違う2 run を「ペア」として受理してしまう）
-                                    "schema": 2,
+                                    // schema 3: **base seed と shard を必須にした**
+                                    // （PR #41 レビュー3巡目。記録に残る match_seed は
+                                    //  シャードずらし＋基準ごとの XOR を掛けた実効値なので、
+                                    //  「同じ run か」「shard が揃っているか」を下流が
+                                    //  base / shard で検査できる必要がある）
+                                    "schema": 3,
                                     // **arm を突き合わせる前提の一部**。env アブレーション
                                     // なら両 run で同じでなければならない（違うなら
                                     // 測っているのは別 revision の差でもある）
@@ -487,6 +492,10 @@ fn main() {
                                     "candidate": candidate,
                                     "baseline": opp,
                                     "match_seed": match_seed_eff,
+                                    // ローカルの単発 run（CI の base/shard env なし）は
+                                    // base = seed / shard = 0 とみなす（seed == base + shard）
+                                    "match_seed_base": match_seed_base.unwrap_or(seed),
+                                    "match_seed_shard": shard_index.unwrap_or(0),
                                     "game_no": g.game_no,
                                     "a_is_sente": g.a_is_sente,
                                     "score_a": g.score_a,

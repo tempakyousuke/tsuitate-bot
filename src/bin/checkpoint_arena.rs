@@ -272,6 +272,8 @@ fn usage() -> &'static str {
      \x20         [--markdown OUT] [--json OUT] [--allow-incomplete]\n\
      arena-balance --control <games.jsonl...> --candidate <games.jsonl...>\n\
      \x20             --expect-games N（相手ごとの期待ペア局数。600 以外は判定不能扱い）\n\
+     \x20             --expect-shards N（元 run の shard 数。0..N の完全性を検査）\n\
+     \x20             --expect-seeds \"相手=base,...\"（相手別の事前登録 base seed）\n\
      \x20             --expect-cand-knobs \"K=V K=V\"（事前登録した処置ノブと完全一致を要求）\n\
      \x20             [--expect-opponents \"estimator_v13,estimator_v14\"] [--label NAME]\n\
      \x20             [--alpha 0.05] [--boot N] [--markdown OUT] [--json OUT]\n\
@@ -2590,6 +2592,13 @@ struct GameRow {
     candidate: String,
     baseline: String,
     match_seed: u64,
+    /// **shard ずらしと基準ごとの XOR を掛ける前の base seed**。記録に残る
+    /// `match_seed` は実効値（シャードごと・基準ごとに違う）なので、
+    /// 「同じ run か」「事前登録した seed か」の検査はこちらで行う
+    /// （PR #41 レビュー3巡目）
+    match_seed_base: u64,
+    /// この行を出したシャード番号。shard 集合の完全性検査に使う
+    match_seed_shard: u64,
     game_no: u64,
     a_is_sente: bool,
     score_a: f64,
@@ -2618,10 +2627,12 @@ struct GameRow {
     shared_env: BTreeMap<String, String>,
 }
 
-/// schema 2 で実効条件の指紋を必須にした。schema 1（名前と時計しか残していない）は
-/// **集計から弾く**: 欠損を空値で埋めると「相手 env は両 run とも空で一致」と
-/// 解釈されて検査を素通りする（PR #22 で schema 2 へ上げたのと同じ理由）
-const GAME_ROW_SCHEMA: u64 = 2;
+/// schema 2 で実効条件の指紋を必須にした。schema 3 で `match_seed_base` /
+/// `match_seed_shard` を必須にした（PR #41 レビュー3巡目: 記録の `match_seed` は
+/// シャードずらし＋基準 XOR 済みの実効値なので、run の一意性・shard 完全性は
+/// base / shard 列でしか検査できない）。古い schema は**集計から弾く**:
+/// 欠損を空値で埋めると検査を素通りする（PR #22 と同じ理由）
+const GAME_ROW_SCHEMA: u64 = 3;
 
 /// **ペア差の分散を同定するのに要る最小のペア数**。1ペアでは自由度が 0 で、
 /// n−1 の標本分散が定義できない（`variance` は 0 を返す）
@@ -2694,6 +2705,8 @@ fn parse_game_rows_text(text: &str, where_prefix: &str) -> Result<Vec<GameRow>, 
             candidate: req_s("candidate")?,
             baseline: req_s("baseline")?,
             match_seed: req_u("match_seed")?,
+            match_seed_base: req_u("match_seed_base")?,
+            match_seed_shard: req_u("match_seed_shard")?,
             game_no: req_u("game_no")?,
             a_is_sente: v
                 .get("a_is_sente")
@@ -3235,11 +3248,16 @@ fn stratified_boot_mean_ci(
     (point, idx(alpha / 2.0), idx(1.0 - alpha / 2.0))
 }
 
-/// 相手ごとに (対照, 候補) の局ペアを作る。ペアの鍵は (match_seed, game_no)。
+/// 相手ごとに (対照, 候補) の局ペアを作る。ペアの鍵は (match_seed, game_no)
+/// （実効 seed はシャードごとに違うので、shard をまたいだ衝突は起きない）。
 /// - 相手集合が両 arm で一致しない・2相手未満は Err
-/// - **arm × 相手ごとに実効 `match_seed` は1つだけ**（常に Err、降格なし）。
-///   複数 run の記録を混ぜると、両 arm が同じ2つの seed を持てばペアは成立して
-///   しまうが、それは事前登録した「相手ごとに1つの未使用 seed」ではない
+/// - **arm × 相手ごとに `match_seed_base` は1つだけ**（常に Err、降格なし）。
+///   実効 seed はシャードずらしで1 run でも複数値になる（PR #41 レビュー3巡目で
+///   実効 seed の一意性検査を base へ付け替えた）が、base が2つある = 別々の
+///   run（別の対局条件列）の混入で、「相手ごとに1つの未使用 seed」ではない
+/// - **base seed が事前登録値と一致**（`expect_seeds`: 相手→base。不一致は Err）
+/// - **shard 集合が 0..expect_shards の完全な集合**（欠け・重複・範囲外は Err。
+///   実効 seed ＋ game_no のペア照合は末尾 shard の丸ごと欠落を素通しするため）
 /// - **相手ごとのペア局数 == `expect_games`**（事前登録の各600局を呼び出し側が
 ///   明示する。`allow_incomplete` で警告へ降格するが、降格した事実は
 ///   返り値の**判定不能ノート**に残り、最終判定は「通過」を出せない）
@@ -3253,6 +3271,8 @@ fn pair_by_opponent(
     ctrl: &[GameRow],
     cand: &[GameRow],
     expect_games: usize,
+    expect_shards: usize,
+    expect_seeds: &BTreeMap<String, u64>,
     allow_incomplete: bool,
 ) -> Result<(BTreeMap<String, Vec<(GameRow, GameRow)>>, Vec<String>), String> {
     let opps = |rows: &[GameRow]| -> BTreeSet<String> {
@@ -3273,19 +3293,41 @@ fn pair_by_opponent(
     let mut out: BTreeMap<String, Vec<(GameRow, GameRow)>> = BTreeMap::new();
     let mut notes: Vec<String> = vec![];
     for opp in &co {
-        // 実効 match_seed の一意性（arm × 相手ごと）。ここは降格しない:
-        // seed が2つある = 別々の run（別の対局条件列）を1つの標本として
-        // 数えることになり、「未使用 seed 1本の held-out」という母集団の
-        // 定義そのものが壊れる
+        // run の一意性は **base seed** で検査する（実効 seed は shard ずらしで
+        // 1 run でも複数値になるので、そちらを一意にすると正常な sharded run を
+        // 必ず拒否する）。ここは降格しない: base が2つある = 別々の run の混入で、
+        // 「未使用 seed 1本の held-out」という母集団の定義そのものが壊れる
         for (arm, rows) in [("control", ctrl), ("candidate", cand)] {
-            let seeds: BTreeSet<u64> = rows
-                .iter()
-                .filter(|r| &r.baseline == opp)
-                .map(|r| r.match_seed)
-                .collect();
-            if seeds.len() > 1 {
+            let sub: Vec<&GameRow> = rows.iter().filter(|r| &r.baseline == opp).collect();
+            let bases: BTreeSet<u64> = sub.iter().map(|r| r.match_seed_base).collect();
+            if bases.len() > 1 {
                 return Err(format!(
-                    "{arm}({opp}): 実効 match_seed が複数あります（{seeds:?}）。\n            複数の run の記録を混ぜないでください（相手ごとに1つの seed の1 run）"
+                    "{arm}({opp}): match_seed_base が複数あります（{bases:?}）。\n            複数の run の記録を混ぜないでください（相手ごとに1つの base seed の1 run）"
+                ));
+            }
+            let base = *bases.iter().next().expect("相手集合の検査後なので空ではない");
+            // 事前登録した相手別の base seed（held-out は v14=20260909 / v13=20260910）
+            match expect_seeds.get(opp.as_str()) {
+                None => {
+                    return Err(format!(
+                        "--expect-seeds に相手 {opp} の base seed がありません（\"相手=seed,...\" で全相手ぶん指定）"
+                    ));
+                }
+                Some(&want) if want != base => {
+                    return Err(format!(
+                        "{arm}({opp}): match_seed_base {base} が事前登録 {want} と違います（別の run を渡していませんか）"
+                    ));
+                }
+                Some(_) => {}
+            }
+            // shard 集合の完全性。実効 seed ＋ game_no のペア照合は「両 arm から
+            // 同じ末尾 shard が丸ごと欠けた」を素通しするので、0..N の完全な
+            // 集合であることをここで要求する
+            let shards: BTreeSet<u64> = sub.iter().map(|r| r.match_seed_shard).collect();
+            let want: BTreeSet<u64> = (0..expect_shards as u64).collect();
+            if shards != want {
+                return Err(format!(
+                    "{arm}({opp}): shard 集合 {shards:?} が 0..{expect_shards} と一致しません（欠け・範囲外の shard があります）"
                 ));
             }
         }
@@ -3417,6 +3459,30 @@ fn cmd_arena_balance(args: &Args) {
         .unwrap_or_else(|| {
             die("--expect-games <N>（相手ごとの期待ペア局数。検証セットは 600）を指定してください")
         });
+    // **shard 数と相手別 base seed も事前登録値の照合**（PR #41 レビュー3巡目）。
+    // 記録の match_seed は shard ずらし＋基準 XOR 済みの実効値なので、
+    // run の同一性・完全性は base / shard 列で検査する
+    let expect_shards: usize = args
+        .get("expect-shards")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            die("--expect-shards <N>（元 Arena run の shard 数。held-out は 8）を指定してください")
+        });
+    let expect_seeds: BTreeMap<String, u64> = {
+        let raw = args.get("expect-seeds").unwrap_or_else(|| {
+            die("--expect-seeds \"相手=base,...\"（相手別の事前登録 base seed。held-out は estimator_v14=20260909,estimator_v13=20260910）を指定してください")
+        });
+        raw.split([',', ' '])
+            .filter(|s| !s.is_empty())
+            .map(|kv| match kv.split_once('=') {
+                Some((k, v)) => match v.parse::<u64>() {
+                    Ok(n) => (k.to_string(), n),
+                    Err(_) => die(&format!("--expect-seeds の seed が数値ではありません: {kv}")),
+                },
+                None => die(&format!("--expect-seeds の項が 相手=seed 形式ではありません: {kv}")),
+            })
+            .collect()
+    };
     // **候補側の処置ノブは事前登録値と完全一致**（PR #41 レビュー2巡目）。
     // これが無いと「無関係な既存ノブだけを入れた比較」や A/A でも同一戦略・
     // 同一 commit の条件を満たして門を通せてしまう。起動側（committed な
@@ -3571,9 +3637,15 @@ fn cmd_arena_balance(args: &Args) {
         );
     }
 
-    let (paired, pairing_notes) =
-        pair_by_opponent(&ctrl, &cand, expect_games, allow_incomplete)
-            .unwrap_or_else(|e| die(&e));
+    let (paired, pairing_notes) = pair_by_opponent(
+        &ctrl,
+        &cand,
+        expect_games,
+        expect_shards,
+        &expect_seeds,
+        allow_incomplete,
+    )
+    .unwrap_or_else(|e| die(&e));
     indeterminate.extend(pairing_notes);
     let opps: Vec<String> = paired.keys().cloned().collect();
     if !expect_opps.is_empty() {
@@ -3737,6 +3809,8 @@ fn cmd_arena_balance(args: &Args) {
             "think_budget_ms_opponent": cand[0].budget_opp,
             "alpha": alpha,
             "expect_games": expect_games,
+            "expect_shards": expect_shards,
+            "expect_seeds": expect_seeds,
             "opponents": per_opp.iter().map(|(o, d)| {
                 (o.clone(), serde_json::json!({
                     "pairs": paired[o].len(),
@@ -3833,7 +3907,10 @@ mod tests {
     /// 予算が違う2 run を「ペア」として受理してしまう
     #[test]
     fn game_row_schema_requires_effective_conditions() {
-        assert_eq!(GAME_ROW_SCHEMA, 2, "指紋を必須にした時点で schema を上げる");
+        assert_eq!(
+            GAME_ROW_SCHEMA, 3,
+            "指紋（schema 2）と base/shard（schema 3）を必須にした時点で schema を上げる"
+        );
         let r = game_row("checkmate", 1.0);
         // 突き合わせの前提になる項目が型として存在すること（欠損は parse で die する）
         assert!(!r.baseline_behavior.is_empty());
@@ -3879,6 +3956,8 @@ mod tests {
             candidate: "estimator".into(),
             baseline: "estimator_v14".into(),
             match_seed: 1,
+            match_seed_base: 1,
+            match_seed_shard: 0,
             game_no: 0,
             a_is_sente: true,
             score_a,
@@ -3910,9 +3989,13 @@ mod tests {
     }
 
     /// arena-balance のペアリング: 相手ごとに閉じ、集合の不一致・欠落・
-    /// 1相手だけ・先後の食い違いは fail-closed
+    /// 1相手だけ・先後の食い違い・base seed / shard 集合のずれは fail-closed
     #[test]
     fn arena_balance_pairs_within_each_opponent() {
+        let seeds: BTreeMap<String, u64> =
+            [("estimator_v13".to_string(), 1u64), ("estimator_v14".to_string(), 1u64)]
+                .into_iter()
+                .collect();
         let ctrl: Vec<GameRow> = vec![
             balance_row("estimator_v13", 0, 0.0),
             balance_row("estimator_v13", 1, 1.0),
@@ -3921,18 +4004,51 @@ mod tests {
         ];
         let cand = ctrl.clone(); // A/A
         let (paired, notes) =
-            pair_by_opponent(&ctrl, &cand, 2, false).expect("A/A はペアになる");
+            pair_by_opponent(&ctrl, &cand, 2, 1, &seeds, false).expect("A/A はペアになる");
         assert_eq!(paired.len(), 2);
         assert!(paired.values().all(|v| v.len() == 2));
         assert!(notes.is_empty(), "完全な入力にノートは付かない");
 
+        // **sharded run（同じ base・複数の実効 seed）は受理する**（PR #41
+        // レビュー3巡目: 実効 seed の一意性検査は正常な shards=4 の run を
+        // 必ず拒否していた。run の一意性は base で見る）
+        let mut sh_ctrl = ctrl.clone();
+        let mut sh_cand = cand.clone();
+        for rows in [&mut sh_ctrl, &mut sh_cand] {
+            for opp in ["estimator_v13", "estimator_v14"] {
+                for g in 0..2u64 {
+                    let mut r = balance_row(opp, g, 0.5);
+                    r.match_seed = 1001; // shard ずらし後の別の実効 seed
+                    r.match_seed_shard = 1;
+                    rows.push(r);
+                }
+            }
+        }
+        let (paired, notes) =
+            pair_by_opponent(&sh_ctrl, &sh_cand, 4, 2, &seeds, false).expect("sharded run は正常");
+        assert!(paired.values().all(|v| v.len() == 4));
+        assert!(notes.is_empty());
+        // shard が欠けたら Err（末尾 shard の丸ごと欠落はペア照合を素通しする）
+        assert!(pair_by_opponent(&ctrl, &cand, 2, 2, &seeds, false).is_err());
+
         // **期待局数は明示必須で照合される**（事前登録の各600局の強制。
         // 「2ペア以上あればよい」では smoke や欠損 run でも判定を返せてしまう）
-        assert!(pair_by_opponent(&ctrl, &cand, 600, false).is_err());
+        assert!(pair_by_opponent(&ctrl, &cand, 600, 1, &seeds, false).is_err());
         // --allow-incomplete では通るが**判定不能ノートが残る** = 「通過」を出せない
-        let (_, notes) = pair_by_opponent(&ctrl, &cand, 600, true).expect("警告へ降格");
+        let (_, notes) =
+            pair_by_opponent(&ctrl, &cand, 600, 1, &seeds, true).expect("警告へ降格");
         assert!(!notes.is_empty());
         assert!(!balance_final(true, &notes).1, "ノート付き入力は数値の門が通っても pass しない");
+
+        // **base seed は事前登録値との完全一致**（不一致・未登録の相手は Err）
+        let wrong_seed: BTreeMap<String, u64> =
+            [("estimator_v13".to_string(), 2u64), ("estimator_v14".to_string(), 1u64)]
+                .into_iter()
+                .collect();
+        assert!(pair_by_opponent(&ctrl, &cand, 2, 1, &wrong_seed, false).is_err());
+        let missing_seed: BTreeMap<String, u64> =
+            [("estimator_v14".to_string(), 1u64)].into_iter().collect();
+        assert!(pair_by_opponent(&ctrl, &cand, 2, 1, &missing_seed, false).is_err());
 
         // 1相手だけでは opponent-balanced にならない（arena-var の領分）
         let one: Vec<GameRow> = ctrl
@@ -3940,43 +4056,43 @@ mod tests {
             .filter(|r| r.baseline == "estimator_v13")
             .cloned()
             .collect();
-        assert!(pair_by_opponent(&one, &one, 2, false).is_err());
+        assert!(pair_by_opponent(&one, &one, 2, 1, &seeds, false).is_err());
 
         // 片 arm に無い局は fail-closed
         let mut missing = cand.clone();
         missing.pop();
-        assert!(pair_by_opponent(&ctrl, &missing, 2, false).is_err());
+        assert!(pair_by_opponent(&ctrl, &missing, 2, 1, &seeds, false).is_err());
 
         // 相手集合の不一致も fail-closed
         let mut wrong = cand.clone();
         wrong[3].baseline = "estimator_v12".into();
-        assert!(pair_by_opponent(&ctrl, &wrong, 2, false).is_err());
+        assert!(pair_by_opponent(&ctrl, &wrong, 2, 1, &seeds, false).is_err());
 
         // 先後の食い違い = 別の条件列
         let mut flipped = cand.clone();
         flipped[0].a_is_sente = !flipped[0].a_is_sente;
-        assert!(pair_by_opponent(&ctrl, &flipped, 2, false).is_err());
+        assert!(pair_by_opponent(&ctrl, &flipped, 2, 1, &seeds, false).is_err());
 
-        // **同じ相手に複数の match_seed を混ぜたら常に Err**（降格なし）。
-        // 両 arm が同じ2つの seed を持てばペア自体は成立してしまうので、
+        // **同じ相手に複数の base seed を混ぜたら常に Err**（降格なし）。
+        // 両 arm が同じ2つの base を持てばペア自体は成立してしまうので、
         // ペアリングとは別にここで止める必要がある
         let mut mixed_ctrl = ctrl.clone();
         let mut mixed_cand = cand.clone();
         for rows in [&mut mixed_ctrl, &mut mixed_cand] {
-            let mut extra = balance_row("estimator_v13", 2, 0.5);
-            extra.match_seed = 999;
-            rows.push(extra.clone());
-            let mut extra14 = balance_row("estimator_v14", 2, 0.5);
-            extra14.match_seed = 999;
-            rows.push(extra14);
+            for opp in ["estimator_v13", "estimator_v14"] {
+                let mut extra = balance_row(opp, 2, 0.5);
+                extra.match_seed = 999;
+                extra.match_seed_base = 999;
+                rows.push(extra);
+            }
         }
         assert!(
-            pair_by_opponent(&mixed_ctrl, &mixed_cand, 3, false).is_err(),
-            "seed 混在は期待局数が合っていても弾く"
+            pair_by_opponent(&mixed_ctrl, &mixed_cand, 3, 1, &seeds, false).is_err(),
+            "base 混在は期待局数が合っていても弾く"
         );
         assert!(
-            pair_by_opponent(&mixed_ctrl, &mixed_cand, 3, true).is_err(),
-            "--allow-incomplete でも seed 混在は降格しない"
+            pair_by_opponent(&mixed_ctrl, &mixed_cand, 3, 1, &seeds, true).is_err(),
+            "--allow-incomplete でも base 混在は降格しない"
         );
     }
 
@@ -4041,6 +4157,8 @@ mod tests {
             "candidate": "estimator",
             "baseline": "estimator_v14",
             "match_seed": 20260815,
+            "match_seed_base": 20260815,
+            "match_seed_shard": 0,
             "game_no": 0,
             "a_is_sente": true,
             "score_a": 1.0,
@@ -4076,6 +4194,8 @@ mod tests {
             "candidate",
             "baseline",
             "match_seed",
+            "match_seed_base",
+            "match_seed_shard",
             "game_no",
             "a_is_sente",
             "score_a",

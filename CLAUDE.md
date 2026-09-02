@@ -225,10 +225,15 @@
     定数 `BALANCE_EXPECT_GAMES` に固定** — 600 以外の N や `--allow-incomplete` で
     降格した不完全入力は**判定不能**になり「通過」を出せない）・
     **`--expect-cand-knobs` も必須**（候補側の処置ノブが事前登録値と完全一致。
-    A/A = 処置なしも判定不能）・**arm × 相手ごとに実効 match_seed は1つだけ**
-    （複数 run の混入は `--allow-incomplete` でも降格しない）・**arm 間は同一
-    candidate 名・対照は W=0（cand_knobs 空）・同一 commit**（commit 不一致に
-    override は無い。別 commit の main は対照にできない）を要求する。
+    A/A = 処置なしも判定不能）・**`--expect-shards` / `--expect-seeds` も必須**
+    （games.jsonl schema 3 の `match_seed_base` / `match_seed_shard` 列で検査:
+    arm × 相手ごとに base は1つだけ = 複数 run の混入は `--allow-incomplete` でも
+    降格しない、base は相手別の事前登録値と一致、shard 集合は 0..N の完全な集合。
+    記録の `match_seed` はシャードずらし＋基準 XOR 済みの**実効値**なので
+    一意性検査には使えない — 正常な sharded run でも相手ごとに shard 数ぶんの
+    値になる）・**arm 間は同一 candidate 名・対照は W=0（cand_knobs 空）・
+    同一 commit**（commit 不一致に override は無い。別 commit の main は
+    対照にできない）を要求する。
     予算不一致の override も無い。平均評価粒子数の門（対照比 −10% 超で中止）は
     games.jsonl に無いので arena-records の `chose.debug` から別途出す
 - `cargo run --release --bin tune -- [反復数] [評価あたり対局数] [基準...]` — 評価パラメータ

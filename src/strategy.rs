@@ -7448,9 +7448,12 @@ impl Strategy for EstimatorStrategy {
                         &params,
                         opp_king_w.as_ref(),
                     );
-                let r4 = |x: f64| (x * 10000.0).round() / 10000.0;
-                obj.insert("link".into(), serde_json::json!(r4(c.link)));
-                obj.insert("link_base".into(), serde_json::json!(r4(base)));
+                // **丸めない**（PR #41 レビュー3巡目）: 各値を4桁へ丸めると差に
+                // 最大 ~1e-4 の誤差が入り、小さい正の link 増分が 0 や負へ変わって
+                // 「正の link を得た手」の事前登録定義を保持できない。serde_json の
+                // f64 は round-trip 精度で出るのでそのまま残す
+                obj.insert("link".into(), serde_json::json!(c.link));
+                obj.insert("link_base".into(), serde_json::json!(base));
             }
         }
         self.last_debug = Some(debug);
