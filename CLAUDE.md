@@ -244,12 +244,18 @@
     -f match_seed=<相手別seed> -f baselines=<相手>`（候補側は
     `-f cand_env="<ノブ>" -f pair_with=<対照のrun ID>` を追加）を4回起動する。
     plan が起動時に manifest との一致（games/shards/candidate/相手別 seed・
-    1相手ずつ）を検査し、**取り直しは git タグの台帳で拒否する**（PR #41
-    レビュー6巡目: `run_attempt==1` では「もう一度 dispatch した新しい run」を
-    検出できない）: 全シャード成功した manifest-bound run だけが aggregate で
-    `balance-claim/<manifest指紋16>/<arm>-<相手>` タグを push し、同じ組の
-    再起動は plan で止まる（infra 失敗 = claim 無しの run はやり直せる。
-    塞ぐのは成功した計測の取り直しだけ。タグは永続なので事後監査もできる）。
+    1相手ずつ）と**合算器へ渡せる run であること**（cand arm は pair_with 必須・
+    ctrl arm は禁止、oracle / 両側 env / 時計変更なし、cand_env == manifest の
+    cand_knobs。判定不能になる run に claim を消費させない）を検査し、
+    **取り直しは git タグの台帳で拒否する**（PR #41 レビュー6〜7巡目:
+    `run_attempt==1` では「もう一度 dispatch した新しい run」を検出できない）:
+    `balance-claim/<manifest指紋16>/<arm>-<相手>` タグを **plan が計測前に取得**
+    （annotated tag の message に run_id / attempt を記録 = どの実行が slot を
+    取ったかの不変記録。同時 dispatch の後着は ref 作成の 422 で対局前に落ちる
+    ので、未claim の完走 artifact は生まれない）。**解放は「対局が完走しなかった
+    attempt 1 の run」だけ**（release-claim ジョブ。aggregate の失敗では解放
+    しない = 計測は存在しているため。held-out run の re-run attempt は shard が
+    起動時に拒否）。タグは永続なので事後監査もできる。
     **実験条件も事前登録と照合する**: 実効予算は両 arm・両側とも 2000ms
     （`BALANCE_BUDGET_MS`。arm 間の一致だけだと「両方 700ms」が通る）・両側 env
     なし・**診断オラクル（games.jsonl **schema 5** で `oracle` 列を必須記録）は
@@ -276,8 +282,12 @@
     （cand_knobs 空）・同一 commit**（commit 不一致に override は無い）。
     run 混入・pair_with 不一致・指紋不一致・oracle 非空は `--allow-incomplete` でも
     降格しない。
-    予算不一致の override も無い。平均評価粒子数の門（対照比 −10% 超で中止）は
-    games.jsonl に無いので arena-records の `chose.debug` から別途出す
+    予算不一致の override も無い。**平均評価粒子数の門（対照比 −10% 超で中止）は
+    verdict に入っている**（PR #41 レビュー7巡目）: 粒子数は games.jsonl に
+    無いので、同じ run の `arena-records-*` を `--records-control` /
+    `--records-candidate` で渡す（`chose.debug.unique_particles` の平均。
+    展開先ディレクトリごと渡せる）。**この入力の無い集計は判定不能**、
+    対局数と record 本数の不一致・`unique_particles` の無い chose 行も判定不能
 - `cargo run --release --bin tune -- [反復数] [評価あたり対局数] [基準...]` — 評価パラメータ
   （`strategy::EvalParams`）のSPSA自動チューニング。目的関数はアリーナのスコア率
   （引き分け=0.5勝）。**f+/f− は共通乱数法でペアリングされる**: 同じ対局シード列

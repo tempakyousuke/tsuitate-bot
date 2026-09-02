@@ -277,6 +277,8 @@ fn usage() -> &'static str {
      \x20             [--expect-games N] [--expect-shards N] [--expect-seeds \"相手=base,...\"]\n\
      \x20             [--expect-opponents \"...\"] [--alpha F] [--boot N]（既定はすべて\n\
      \x20               issue #40 の事前登録定数。外した指定は判定不能扱い）\n\
+     \x20             --records-control <dir|jsonl...> --records-candidate <dir|jsonl...>\n\
+     \x20               （arena-records。平均評価粒子数の −10% veto の入力。無い集計は判定不能）\n\
      \x20             [--label NAME] [--markdown OUT] [--json OUT] [--allow-incomplete]"
 }
 
@@ -3432,6 +3434,80 @@ fn manifest_content_notes(v: &serde_json::Value, rows_candidate: &str, rows_cloc
     notes
 }
 
+/// **平均評価粒子数の安全性 veto**（issue #40「候補の平均評価粒子数が
+/// 対照比 −10% 超で中止」、PR #41 レビュー7巡目 [P1] で verdict へ組み込み）。
+/// 粒子数は games.jsonl に無いので、同じ run の artifact `arena-records-*`
+/// （1対局1ファイルの JSONL。`chose.debug.unique_particles` = その決定で
+/// 評価に使ったユニーク粒子数）を `--records-control` / `--records-candidate`
+/// で受け取って平均する。**この入力が無い集計は判定不能**（veto を検証
+/// できないまま pass=true を出さない）
+const BALANCE_PARTICLE_DROP: f64 = 0.10;
+
+/// 1記録テキストぶんの粒子集計: (決定数, unique_particles の総和, 欠測した chose 行数)
+fn particle_stats_from_text(text: &str) -> (usize, u64, usize) {
+    let (mut n, mut sum, mut missing) = (0usize, 0u64, 0usize);
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+        if v.get("type").and_then(|t| t.as_str()) != Some("chose") {
+            continue;
+        }
+        match v.get("debug").and_then(|d| d.get("unique_particles")).and_then(|u| u.as_u64()) {
+            Some(u) => {
+                n += 1;
+                sum += u;
+            }
+            None => missing += 1,
+        }
+    }
+    (n, sum, missing)
+}
+
+struct ParticleSummary {
+    games: usize,
+    decisions: usize,
+    mean: f64,
+    /// debug.unique_particles を持たない chose 行（> 0 なら判定不能ノート行き）
+    missing: usize,
+}
+
+/// `--records-*` のパス（ファイル or ディレクトリ。ディレクトリは再帰で
+/// *.jsonl を拾う = artifact `arena-records-*` の展開先をそのまま渡せる）
+fn particle_summary(paths: &[String], arm: &str) -> ParticleSummary {
+    fn collect(path: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        if path.is_dir() {
+            let entries = std::fs::read_dir(path)
+                .unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+            for e in entries.flatten() {
+                collect(&e.path(), out);
+            }
+        } else if path.extension().is_some_and(|x| x == "jsonl") {
+            out.push(path.to_path_buf());
+        }
+    }
+    let mut files = vec![];
+    for p in paths {
+        collect(std::path::Path::new(p), &mut files);
+    }
+    if files.is_empty() {
+        die(&format!("{arm}: --records に *.jsonl が1つもありません（{paths:?}）"));
+    }
+    let (mut n, mut sum, mut missing) = (0usize, 0u64, 0usize);
+    for f in &files {
+        let text = std::fs::read_to_string(f)
+            .unwrap_or_else(|e| die(&format!("{}: {e}", f.display())));
+        let (a, b, c) = particle_stats_from_text(&text);
+        n += a;
+        sum += b;
+        missing += c;
+    }
+    ParticleSummary {
+        games: files.len(),
+        decisions: n,
+        mean: if n > 0 { sum as f64 / n as f64 } else { f64::NAN },
+        missing,
+    }
+}
+
 /// 最終判定: 入力が事前登録の条件を満たさない（判定不能の理由がある）とき、
 /// 数値の門がどうであれ**「通過」を出さない**。返り値は (表示ラベル, pass)
 fn balance_final(numeric_pass: bool, indeterminate: &[String]) -> (&'static str, bool) {
@@ -3687,6 +3763,9 @@ struct BalanceGate {
     think_delta: f64,
     /// 候補 arm の時間切れ負け局数
     cand_timeouts: u64,
+    /// 平均評価粒子数 (対照, 候補)。None = arena-records 未指定
+    /// （verdict はここでは落とさないが、呼び出し側が判定不能にする）
+    particles: Option<(f64, f64)>,
 }
 
 /// 事前登録した門の判定。返り値は (通過, 落ちた理由の一覧)
@@ -3720,6 +3799,17 @@ fn balance_verdict(g: &BalanceGate) -> (bool, Vec<String>) {
             "思考平均のペア差 {:+.1}ms > +{BALANCE_MARGIN_THINK_MS}ms",
             g.think_delta
         ));
+    }
+    // 平均評価粒子数の veto（issue #40: 対照比 −10% 超で中止）。
+    // NaN（決定数 0 等）も不通過側に落ちる
+    if let Some((c, t)) = g.particles {
+        if !(c > 0.0 && t >= c * (1.0 - BALANCE_PARTICLE_DROP)) {
+            reasons.push(format!(
+                "平均評価粒子数 対照 {c:.1} → 候補 {t:.1}（対照比 {:.1}% 減 > {:.0}% で中止）",
+                (1.0 - t / c) * 100.0,
+                BALANCE_PARTICLE_DROP * 100.0
+            ));
+        }
     }
     (reasons.is_empty(), reasons)
 }
@@ -4015,6 +4105,42 @@ fn cmd_arena_balance(args: &Args) {
         }
     }
 
+    // **平均評価粒子数の veto の入力**（arena-records。PR #41 レビュー7巡目 [P1]:
+    // 「別途出す」の注記だけでは、粒子数が2割減った候補でも pass=true が出ていた）。
+    // 未指定は判定不能 = veto を検証できないまま「通過」を出さない
+    let rec_ctrl = args.all("records-control");
+    let rec_cand = args.all("records-candidate");
+    let particles: Option<((f64, f64), (ParticleSummary, ParticleSummary))> =
+        match (rec_ctrl.is_empty(), rec_cand.is_empty()) {
+            (true, true) => {
+                indeterminate.push(
+                    "--records-control / --records-candidate 未指定 = 平均評価粒子数の veto（対照比 −10% 超で中止）を検証できない".into(),
+                );
+                None
+            }
+            (false, false) => {
+                let sc = particle_summary(&rec_ctrl, "control");
+                let st = particle_summary(&rec_cand, "candidate");
+                for (arm, s) in [("control", &sc), ("candidate", &st)] {
+                    if s.missing > 0 {
+                        indeterminate.push(format!(
+                            "{arm}: unique_particles の無い chose 行が {} 行（記録の版が古い？）",
+                            s.missing
+                        ));
+                    }
+                    let want = expect_games * expect_opps.len();
+                    if s.games != want {
+                        indeterminate.push(format!(
+                            "{arm}: arena-records の対局数 {} ≠ 期待 {want}（record の欠落は粒子平均を選択標本にする）",
+                            s.games
+                        ));
+                    }
+                }
+                Some(((sc.mean, st.mean), (sc, st)))
+            }
+            _ => die("--records-control と --records-candidate は両方指定してください（片 arm だけの粒子平均は比較になりません）"),
+        };
+
     // 相手ごと・指標ごとのペア差
     let mut strata_by_metric: BTreeMap<&'static str, Vec<Vec<f64>>> = BTreeMap::new();
     let mut arm_means: BTreeMap<&'static str, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
@@ -4064,6 +4190,7 @@ fn cmd_arena_balance(args: &Args) {
         fouls_delta: comb_of("fouls_me"),
         think_delta: comb_of("think_avg_ms_me"),
         cand_timeouts,
+        particles: particles.as_ref().map(|(m, _)| *m),
     };
     let (numeric_pass, reasons) = balance_verdict(&gate);
     let (verdict_label, pass) = balance_final(numeric_pass, &indeterminate);
@@ -4117,12 +4244,28 @@ fn cmd_arena_balance(args: &Args) {
         ));
     }
     out.push_str(&format!(
-        "\n時間切れ負け: 対照 {ctrl_timeouts} 局 / 候補 {cand_timeouts} 局。\n\
-         持ち駒残数・王手率・詰み勝ち率と**平均評価粒子数**（対照比 −10% 超で中止）は\n\
-         games.jsonl に無いので arena-records（`chose.debug`）から別途出すこと。\n\n"
+        "\n時間切れ負け: 対照 {ctrl_timeouts} 局 / 候補 {cand_timeouts} 局。\n\n"
     ));
+    match &particles {
+        Some(((c, t), (sc, st))) => out.push_str(&format!(
+            "**平均評価粒子数**（`chose.debug.unique_particles`、veto は対照比 −{:.0}% 超の減少）: \
+             対照 {c:.1}（{} 局 / {} 決定）→ 候補 {t:.1}（{} 局 / {} 決定）= 対照比 {:+.1}%\n\n",
+            BALANCE_PARTICLE_DROP * 100.0,
+            sc.games,
+            sc.decisions,
+            st.games,
+            st.decisions,
+            (t / c - 1.0) * 100.0,
+        )),
+        None => out.push_str(
+            "**平均評価粒子数の veto は未検証**（`--records-control` / `--records-candidate` に\n\
+             arena-records を渡すと verdict に入る。無い集計は判定不能）。\n\
+             持ち駒残数・王手率・詰み勝ち率は games.jsonl に無いので arena-records から別途。\n\n",
+        ),
+    }
     out.push_str(&format!(
-        "### 判定（事前登録: 各{BALANCE_EXPECT_GAMES}局・合算 ≥ +{BALANCE_MIN_DELTA} かつ CI 下限 > 0・相手別符号・反則/局 +{BALANCE_MARGIN_FOULS} 以内・時間切れ0・思考平均 +{BALANCE_MARGIN_THINK_MS}ms 以内）\n\n"
+        "### 判定（事前登録: 各{BALANCE_EXPECT_GAMES}局・合算 ≥ +{BALANCE_MIN_DELTA} かつ CI 下限 > 0・相手別符号・反則/局 +{BALANCE_MARGIN_FOULS} 以内・時間切れ0・思考平均 +{BALANCE_MARGIN_THINK_MS}ms 以内・平均評価粒子数 対照比 −{:.0}% 以内）\n\n",
+        BALANCE_PARTICLE_DROP * 100.0
     ));
     match verdict_label {
         "通過" => out.push_str("**通過**（v9〜v14 ガントレットへ進める）\n"),
@@ -4187,6 +4330,14 @@ fn cmd_arena_balance(args: &Args) {
             "fouls_delta": gate.fouls_delta,
             "think_avg_ms_delta": gate.think_delta,
             "candidate_timeouts": cand_timeouts,
+            "particles": particles.as_ref().map(|((c, t), (sc, st))| serde_json::json!({
+                "control_mean": c,
+                "candidate_mean": t,
+                "control_games": sc.games,
+                "candidate_games": st.games,
+                "control_decisions": sc.decisions,
+                "candidate_decisions": st.decisions,
+            })),
             "verdict": verdict_label,
             "pass": pass,
             "fail_reasons": reasons,
@@ -4811,6 +4962,7 @@ mod tests {
             fouls_delta: 0.1,
             think_delta: 20.0,
             cand_timeouts: 0,
+            particles: Some((300.0, 285.0)), // −5% は許容内
         };
         assert!(balance_verdict(&ok).0);
         let fails = |g: BalanceGate| !balance_verdict(&g).0;
@@ -4825,6 +4977,35 @@ mod tests {
         assert!(fails(BalanceGate { cand_timeouts: 1, ..ok.clone() }), "時間切れ");
         assert!(fails(BalanceGate { think_delta: 101.0, ..ok.clone() }), "思考平均 +100ms 超");
         assert!(fails(BalanceGate { combined: f64::NAN, ..ok.clone() }), "NaN は不通過側");
+        // **平均評価粒子数の veto**（issue #40: 対照比 −10% 超で中止。
+        // PR #41 レビュー7巡目: 「別途出す」注記だけでは 20% 減でも pass=true だった）
+        assert!(fails(BalanceGate { particles: Some((300.0, 269.0)), ..ok.clone() }), "−10% 超");
+        assert!(fails(BalanceGate { particles: Some((300.0, 240.0)), ..ok.clone() }), "−20%");
+        assert!(fails(BalanceGate { particles: Some((300.0, f64::NAN)), ..ok.clone() }), "NaN");
+        assert!(fails(BalanceGate { particles: Some((0.0, 0.0)), ..ok.clone() }), "対照 0 は検証不能");
+        assert!(
+            balance_verdict(&BalanceGate { particles: Some((300.0, 271.0)), ..ok.clone() }).0,
+            "−9.7% は許容内"
+        );
+        // None（records 未指定）は verdict では落とさない = 呼び出し側の
+        // 判定不能ノートが「通過」を塞ぐ（両方が無いと未検証のまま pass が出る）
+        assert!(balance_verdict(&BalanceGate { particles: None, ..ok.clone() }).0);
+    }
+
+    /// arena-records から粒子平均を出す入力の解析（`chose.debug.unique_particles`）
+    #[test]
+    fn arena_balance_particle_stats_parse_records() {
+        let text = concat!(
+            r#"{"type":"obs","event":{}}"#, "\n",
+            r#"{"type":"chose","move_number":1,"usi":"7g7f","think_ms":1200,"debug":{"unique_particles":180,"sample_slots":192}}"#, "\n",
+            r#"{"type":"chose","move_number":3,"usi":"2g2f","think_ms":1100,"debug":{"unique_particles":120}}"#, "\n",
+            r#"{"type":"chose","move_number":5,"usi":"2f2e","think_ms":900,"debug":{}}"#, "\n",
+            r#"{"type":"end","payload":{}}"#, "\n",
+        );
+        let (n, sum, missing) = particle_stats_from_text(text);
+        assert_eq!((n, sum), (2, 300), "chose の unique_particles だけを数える");
+        assert_eq!(missing, 1, "unique_particles の無い chose 行は欠測として数える（黙って捨てない）");
+        assert_eq!(particle_stats_from_text(""), (0, 0, 0));
     }
 
     /// 判定不能の理由が1つでもあれば、数値の門が通っていても最終判定は
