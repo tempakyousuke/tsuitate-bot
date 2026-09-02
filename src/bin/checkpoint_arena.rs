@@ -271,7 +271,8 @@ fn usage() -> &'static str {
      \x20         [--allow-budget-diff]\n\
      \x20         [--markdown OUT] [--json OUT] [--allow-incomplete]\n\
      arena-balance --control <games.jsonl...> --candidate <games.jsonl...>\n\
-     \x20             --expect-games N（相手ごとの期待ペア局数。検証セットは 600）\n\
+     \x20             --expect-games N（相手ごとの期待ペア局数。600 以外は判定不能扱い）\n\
+     \x20             --expect-cand-knobs \"K=V K=V\"（事前登録した処置ノブと完全一致を要求）\n\
      \x20             [--expect-opponents \"estimator_v13,estimator_v14\"] [--label NAME]\n\
      \x20             [--alpha 0.05] [--boot N] [--markdown OUT] [--json OUT]\n\
      \x20             [--allow-incomplete]"
@@ -3179,6 +3180,23 @@ const BALANCE_MIN_DELTA: f64 = 0.04;
 const BALANCE_MARGIN_FOULS: f64 = 0.3;
 /// 安全性: 思考平均（ms/手）のペア差の上限
 const BALANCE_MARGIN_THINK_MS: f64 = 100.0;
+/// **事前登録した相手ごとの局数**（issue #40「held-out validation: 各600局。
+/// N は事前固定し、門付近での増量・取り直しはしない」）。`--expect-games` が
+/// この値でない入力は**判定不能**になり「通過」を出せない（別の N で回した
+/// 標本に #40 の門を当てて通過を主張できてしまうため — PR #41 レビュー2巡目）
+const BALANCE_EXPECT_GAMES: usize = 600;
+
+/// 最終判定: 入力が事前登録の条件を満たさない（判定不能の理由がある）とき、
+/// 数値の門がどうであれ**「通過」を出さない**。返り値は (表示ラベル, pass)
+fn balance_final(numeric_pass: bool, indeterminate: &[String]) -> (&'static str, bool) {
+    if !indeterminate.is_empty() {
+        ("判定不能", false)
+    } else if numeric_pass {
+        ("通過", true)
+    } else {
+        ("不通過", false)
+    }
+}
 
 /// 層化 bootstrap: 各層（相手）の内側で標本を引き直し、層平均の平均を分布にする。
 /// 返り値は (点推定, CI下限, CI上限)。点推定は各層の平均の単純平均 =
@@ -3223,16 +3241,20 @@ fn stratified_boot_mean_ci(
 ///   複数 run の記録を混ぜると、両 arm が同じ2つの seed を持てばペアは成立して
 ///   しまうが、それは事前登録した「相手ごとに1つの未使用 seed」ではない
 /// - **相手ごとのペア局数 == `expect_games`**（事前登録の各600局を呼び出し側が
-///   明示する。`allow_incomplete` で警告へ降格 = そのとき門は執行されない）
-/// - ペアにならない局は Err（`allow_incomplete` で捨てて続行）
+///   明示する。`allow_incomplete` で警告へ降格するが、降格した事実は
+///   返り値の**判定不能ノート**に残り、最終判定は「通過」を出せない）
+/// - ペアにならない局は Err（`allow_incomplete` で捨てて続行 = 同じくノート行き）
 /// - 先後の食い違いは常に Err（別の条件列）
 /// - 相手ごとのペア数が [`MIN_ARENA_PAIRS`] 未満は Err（自由度は作れない）
+///
+/// 返り値は (相手→ペア列, 判定不能ノート)。ノートが空でない入力は
+/// 「情報としての集計はできるが #40 の採否は出せない」
 fn pair_by_opponent(
     ctrl: &[GameRow],
     cand: &[GameRow],
     expect_games: usize,
     allow_incomplete: bool,
-) -> Result<BTreeMap<String, Vec<(GameRow, GameRow)>>, String> {
+) -> Result<(BTreeMap<String, Vec<(GameRow, GameRow)>>, Vec<String>), String> {
     let opps = |rows: &[GameRow]| -> BTreeSet<String> {
         rows.iter().map(|r| r.baseline.clone()).collect()
     };
@@ -3249,6 +3271,7 @@ fn pair_by_opponent(
         ));
     }
     let mut out: BTreeMap<String, Vec<(GameRow, GameRow)>> = BTreeMap::new();
+    let mut notes: Vec<String> = vec![];
     for opp in &co {
         // 実効 match_seed の一意性（arm × 相手ごと）。ここは降格しない:
         // seed が2つある = 別々の run（別の対局条件列）を1つの標本として
@@ -3286,6 +3309,7 @@ fn pair_by_opponent(
             );
             if allow_incomplete {
                 eprintln!("警告: {msg}");
+                notes.push(format!("{opp}: ペアにならない対局 {unpaired} 局を捨てた"));
             } else {
                 return Err(msg);
             }
@@ -3311,13 +3335,17 @@ fn pair_by_opponent(
             );
             if allow_incomplete {
                 eprintln!("警告: {msg}");
+                notes.push(format!(
+                    "{opp}: ペア局数 {} ≠ 期待 {expect_games}",
+                    pairs.len()
+                ));
             } else {
                 return Err(msg);
             }
         }
         out.insert(opp.clone(), pairs);
     }
-    Ok(out)
+    Ok((out, notes))
 }
 
 /// 判定に使う量の入れ物（テスト対象）
@@ -3389,6 +3417,22 @@ fn cmd_arena_balance(args: &Args) {
         .unwrap_or_else(|| {
             die("--expect-games <N>（相手ごとの期待ペア局数。検証セットは 600）を指定してください")
         });
+    // **候補側の処置ノブは事前登録値と完全一致**（PR #41 レビュー2巡目）。
+    // これが無いと「無関係な既存ノブだけを入れた比較」や A/A でも同一戦略・
+    // 同一 commit の条件を満たして門を通せてしまう。起動側（committed な
+    // workflow / request）が事前登録したノブ集合をそのまま書く
+    let expect_knobs: BTreeMap<String, String> = {
+        let raw = args.get("expect-cand-knobs").unwrap_or_else(|| {
+            die("--expect-cand-knobs \"K=V K=V\"（事前登録した処置ノブ。候補 run の cand_knobs と完全一致を要求）を指定してください")
+        });
+        raw.split([',', ' '])
+            .filter(|s| !s.is_empty())
+            .map(|kv| match kv.split_once('=') {
+                Some((k, v)) => (k.to_string(), v.to_string()),
+                None => die(&format!("--expect-cand-knobs の項が K=V 形式ではありません: {kv}")),
+            })
+            .collect()
+    };
     // 期待する相手集合（check_policy combined と同じ規約: 空文字で無効化）。
     // 既定の2相手固定は「片方の相手だけで通過を返せる」穴を塞ぐため
     let expect_opps: BTreeSet<String> = {
@@ -3504,17 +3548,33 @@ fn cmd_arena_balance(args: &Args) {
             }
         }
     }
-    if ctrl[0].candidate == cand[0].candidate
-        && ctrl[0].cand_config == cand[0].cand_config
-        && ctrl[0].commit == cand[0].commit
-    {
-        eprintln!(
-            "注意: control と candidate の実効設定が一致しています。A/A として読みます（差の期待値は 0）"
+    // 候補側の処置ノブは**事前登録値と完全一致**。違えば入力の取り違えなので die
+    if fmt_env(&cand[0].cand_knobs) != fmt_env(&expect_knobs) {
+        die(&format!(
+            "candidate の処置ノブが事前登録と違います:\n            記録 [{}]\n            期待 [{}]",
+            fmt_env(&cand[0].cand_knobs),
+            fmt_env(&expect_knobs)
+        ));
+    }
+
+    // **判定不能の理由**。1つでもあれば数値の門がどうであれ「通過」を出さない
+    // （A/A や不完全入力・事前登録外の N での「通過」表示を塞ぐ）
+    let mut indeterminate: Vec<String> = vec![];
+    if expect_games != BALANCE_EXPECT_GAMES {
+        indeterminate.push(format!(
+            "--expect-games {expect_games} ≠ 事前登録 {BALANCE_EXPECT_GAMES}（informational な集計はできるが #40 の採否は出せない）"
+        ));
+    }
+    if cand[0].cand_knobs.is_empty() || ctrl[0].cand_config == cand[0].cand_config {
+        indeterminate.push(
+            "候補と対照の実効設定が同一（A/A）= 処置が入っていないので採否の対象がない".into(),
         );
     }
 
-    let paired = pair_by_opponent(&ctrl, &cand, expect_games, allow_incomplete)
-        .unwrap_or_else(|e| die(&e));
+    let (paired, pairing_notes) =
+        pair_by_opponent(&ctrl, &cand, expect_games, allow_incomplete)
+            .unwrap_or_else(|e| die(&e));
+    indeterminate.extend(pairing_notes);
     let opps: Vec<String> = paired.keys().cloned().collect();
     if !expect_opps.is_empty() {
         let got: BTreeSet<String> = opps.iter().cloned().collect();
@@ -3575,7 +3635,8 @@ fn cmd_arena_balance(args: &Args) {
         think_delta: comb_of("think_avg_ms_me"),
         cand_timeouts,
     };
-    let (pass, reasons) = balance_verdict(&gate);
+    let (numeric_pass, reasons) = balance_verdict(&gate);
+    let (verdict_label, pass) = balance_final(numeric_pass, &indeterminate);
 
     let mut out = String::new();
     out.push_str(&format!("## opponent-balanced 合算（{label}、issue #40）\n\n"));
@@ -3631,14 +3692,29 @@ fn cmd_arena_balance(args: &Args) {
          games.jsonl に無いので arena-records（`chose.debug`）から別途出すこと。\n\n"
     ));
     out.push_str(&format!(
-        "### 判定（事前登録: 合算 ≥ +{BALANCE_MIN_DELTA} かつ CI 下限 > 0・相手別符号・反則/局 +{BALANCE_MARGIN_FOULS} 以内・時間切れ0・思考平均 +{BALANCE_MARGIN_THINK_MS}ms 以内）\n\n"
+        "### 判定（事前登録: 各{BALANCE_EXPECT_GAMES}局・合算 ≥ +{BALANCE_MIN_DELTA} かつ CI 下限 > 0・相手別符号・反則/局 +{BALANCE_MARGIN_FOULS} 以内・時間切れ0・思考平均 +{BALANCE_MARGIN_THINK_MS}ms 以内）\n\n"
     ));
-    if pass {
-        out.push_str("**通過**（v9〜v14 ガントレットへ進める）\n");
-    } else {
-        out.push_str("**不通過**:\n\n");
-        for r in &reasons {
-            out.push_str(&format!("- {r}\n"));
+    match verdict_label {
+        "通過" => out.push_str("**通過**（v9〜v14 ガントレットへ進める）\n"),
+        "判定不能" => {
+            out.push_str(
+                "**判定不能**（入力が事前登録の条件を満たさない。数値の門がどうであれ通過は出せない）:\n\n",
+            );
+            for r in &indeterminate {
+                out.push_str(&format!("- {r}\n"));
+            }
+            if !numeric_pass {
+                out.push_str("\n参考: 数値の門も次の理由で不通過:\n\n");
+                for r in &reasons {
+                    out.push_str(&format!("- {r}\n"));
+                }
+            }
+        }
+        _ => {
+            out.push_str("**不通過**:\n\n");
+            for r in &reasons {
+                out.push_str(&format!("- {r}\n"));
+            }
         }
     }
 
@@ -3673,8 +3749,11 @@ fn cmd_arena_balance(args: &Args) {
             "fouls_delta": gate.fouls_delta,
             "think_avg_ms_delta": gate.think_delta,
             "candidate_timeouts": cand_timeouts,
+            "verdict": verdict_label,
             "pass": pass,
             "fail_reasons": reasons,
+            "indeterminate_reasons": indeterminate,
+            "expect_cand_knobs": expect_knobs,
             "metrics": METRICS.iter().filter(|(n, _)| strata_by_metric.contains_key(n)).map(|(n, _)| {
                 (n.to_string(), serde_json::json!({
                     "control": mean(&arm_means[n].0),
@@ -3841,14 +3920,19 @@ mod tests {
             balance_row("estimator_v14", 1, 0.5),
         ];
         let cand = ctrl.clone(); // A/A
-        let paired =
+        let (paired, notes) =
             pair_by_opponent(&ctrl, &cand, 2, false).expect("A/A はペアになる");
         assert_eq!(paired.len(), 2);
         assert!(paired.values().all(|v| v.len() == 2));
+        assert!(notes.is_empty(), "完全な入力にノートは付かない");
 
         // **期待局数は明示必須で照合される**（事前登録の各600局の強制。
         // 「2ペア以上あればよい」では smoke や欠損 run でも判定を返せてしまう）
         assert!(pair_by_opponent(&ctrl, &cand, 600, false).is_err());
+        // --allow-incomplete では通るが**判定不能ノートが残る** = 「通過」を出せない
+        let (_, notes) = pair_by_opponent(&ctrl, &cand, 600, true).expect("警告へ降格");
+        assert!(!notes.is_empty());
+        assert!(!balance_final(true, &notes).1, "ノート付き入力は数値の門が通っても pass しない");
 
         // 1相手だけでは opponent-balanced にならない（arena-var の領分）
         let one: Vec<GameRow> = ctrl
@@ -3935,6 +4019,18 @@ mod tests {
         assert!(fails(BalanceGate { cand_timeouts: 1, ..ok.clone() }), "時間切れ");
         assert!(fails(BalanceGate { think_delta: 101.0, ..ok.clone() }), "思考平均 +100ms 超");
         assert!(fails(BalanceGate { combined: f64::NAN, ..ok.clone() }), "NaN は不通過側");
+    }
+
+    /// 判定不能の理由が1つでもあれば、数値の門が通っていても最終判定は
+    /// 「通過」にならない（A/A・不完全入力・事前登録外の N の「通過」表示を塞ぐ）
+    #[test]
+    fn arena_balance_indeterminate_never_passes() {
+        assert_eq!(balance_final(true, &[]), ("通過", true));
+        assert_eq!(balance_final(false, &[]), ("不通過", false));
+        let notes = vec!["--expect-games 104 ≠ 事前登録 600".to_string()];
+        assert_eq!(balance_final(true, &notes), ("判定不能", false));
+        assert_eq!(balance_final(false, &notes), ("判定不能", false));
+        assert_eq!(BALANCE_EXPECT_GAMES, 600, "事前登録した各600局");
     }
 
     /// 実際の JSONL を通した parse の検査。**構造体を直接組み立てるテストでは

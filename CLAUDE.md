@@ -221,13 +221,16 @@
     同じ契約）。入力の同一性検査も fail-closed: arm 内・相手内の一意性
     （`assert_uniform`）に加え、**相手をまたいだ arm 設定の一致**（candidate /
     clock / commit / 予算 / cand_config / cand_knobs / shared_env）・
-    **`--expect-games` は必須**（相手ごとのペア局数を事前登録した値と照合。
-    検証セットは 600）・**arm × 相手ごとに実効 match_seed は1つだけ**（複数 run の
-    混入は `--allow-incomplete` でも降格しない）・**arm 間は同一 candidate 名・
-    対照は W=0（cand_knobs 空）・同一 commit**（commit 不一致に override は無い。
-    別 commit の main は対照にできない）を要求する。予算不一致の override も無い。
-    平均評価粒子数の門（対照比 −10% 超で中止）は games.jsonl に無いので
-    arena-records の `chose.debug` から別途出す
+    **`--expect-games` は必須**（相手ごとのペア局数を照合。**事前登録は各600局で
+    定数 `BALANCE_EXPECT_GAMES` に固定** — 600 以外の N や `--allow-incomplete` で
+    降格した不完全入力は**判定不能**になり「通過」を出せない）・
+    **`--expect-cand-knobs` も必須**（候補側の処置ノブが事前登録値と完全一致。
+    A/A = 処置なしも判定不能）・**arm × 相手ごとに実効 match_seed は1つだけ**
+    （複数 run の混入は `--allow-incomplete` でも降格しない）・**arm 間は同一
+    candidate 名・対照は W=0（cand_knobs 空）・同一 commit**（commit 不一致に
+    override は無い。別 commit の main は対照にできない）を要求する。
+    予算不一致の override も無い。平均評価粒子数の門（対照比 −10% 超で中止）は
+    games.jsonl に無いので arena-records の `chose.debug` から別途出す
 - `cargo run --release --bin tune -- [反復数] [評価あたり対局数] [基準...]` — 評価パラメータ
   （`strategy::EvalParams`）のSPSA自動チューニング。目的関数はアリーナのスコア率
   （引き分け=0.5勝）。**f+/f− は共通乱数法でペアリングされる**: 同じ対局シード列
@@ -1412,8 +1415,12 @@
   active_own_piece > neutral の排他、しきい値横断は first/second/redundant の
   3段で飽和、帯マップは決定開始時に手番ごと1回。利き枚数は**玉を含む全自駒**
   （事前登録の「自駒利き枚数」どおり。runtime の `own_attack_counts` と同じ側）。
-  「正の link」判定は runtime の link 項と同じ `strategy::linked_value_of`
-  （働き重み込み。オフラインは粒子由来の敵玉重みだけ None）の増分で行う）。
+  「正の link」判定は**選択時に実際についた link そのもの**: runtime が
+  `chose.debug` へ `link`（選択手の link 項）と `link_base`（同じ決定・同じ
+  粒子由来の敵玉重み表で測った着手前の link。`strategy::linked_value_of`）を
+  残し、probe はその差を読む（link の働き重みは粒子由来の `opp_king_w` を使う
+  のでオフラインでは再現できない。link 列の無い旧記録は分類から除外して本数を
+  報告する = その記録では頻度判定を出せない）。
   score 側の shadow 順位（粒子が要る）は `CandidateScore` に足した
   `promote_bias` / `drop_bias` 列（score 不変の内訳。rank_probe / rank_dump /
   hits に表示あり）で取る。`--dump` の TSV は両極端の手の抽出・レビュー用

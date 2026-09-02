@@ -17,11 +17,14 @@
 //! - `--dump <path>`: 1行=1受理手の TSV も書く（両極端の手の抽出・レビュー用）
 //!
 //! 分類の定義は `src/marginal_work.rs`（事前登録）を参照。「正の link を得る」は
-//! **runtime の `link` 項と同じ値**（`strategy::linked_value_of` = 働き重み込みの
-//! `linked_value`。オフラインで再現できない粒子由来の敵玉重みだけ None）の
-//! 増分で判定する（PR #41 レビューで本数近似を訂正 — `link_work_w` の重み付けで
-//! 「本数は増えるが link 寄与は減る」手を誤分類できるため）。
-//! 重みは `EvalParams::default()`（= runtime の既定値）。
+//! **選択時に実際についた `CandidateScore.link` そのもの**で判定する: 記録の
+//! `chose.debug` に runtime が残す `link`（選択手の link 項）と `link_base`
+//! （同じ決定・同じ粒子由来の敵玉重み表で測った着手前の link）の差を読む。
+//! link の働き重み（既定 `link_work_w=1`）は粒子由来の `opp_king_w` を使うので
+//! **オフラインでは再現できない**（PR #41 レビュー2巡目 — 本数近似も
+//! `opp_king_w=None` の近似も、着手前後の差の符号ごと変わり得る）。
+//! `link` / `link_base` の無い旧記録の打ちは link-only 分類から除外して
+//! 本数を報告する（その記録では頻度判定を出せない）。
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -30,7 +33,6 @@ use tsuitate_bot::marginal_work::{
     BAND_LABELS, Band, MarginalWorkBreakdown, N_BANDS, N_TRANSITIONS, TRANSITION_TAGS,
     attack_counts, attack_counts_after, band_map, breakdown,
 };
-use tsuitate_bot::strategy::{EvalParams, linked_value_of};
 use tsuitate_bot::board::{Promotion, promotion_choice};
 use tsuitate_bot::protocol::Role;
 use tsuitate_bot::shogi::{ShogiMove, parse_usi, piece_value, unpromote_role};
@@ -58,6 +60,9 @@ struct Tally {
     decisions: [u64; PHASES],
     drops: [u64; PHASES],
     link_only_drops: [u64; PHASES],
+    /// `chose.debug` に `link` / `link_base` が無い打ち（旧記録）。
+    /// link-only 分類の分母から外し、本数だけ報告する
+    link_na_drops: [u64; PHASES],
     promos_optional: [u64; PHASES],
     promos_forced: [u64; PHASES],
     /// 飽和成りは**任意/強制で分けて数える**（P1 の変更対象は任意成りだけなので、
@@ -158,6 +163,24 @@ fn main() {
             broken += 1;
             continue;
         };
+        // 選択時の link / link_base（runtime が chose.debug に残す。issue #40）。
+        // 同一手番の反則指し直しで chose が複数あるときは最後の行が受理手
+        let mut chose_link: std::collections::HashMap<(u64, String), (f64, f64)> =
+            std::collections::HashMap::new();
+        for line in content.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
+            if v["type"] != "chose" {
+                continue;
+            }
+            let (Some(mn), Some(usi)) = (v["move_number"].as_u64(), v["usi"].as_str()) else {
+                continue;
+            };
+            if let (Some(l), Some(b)) =
+                (v["debug"]["link"].as_f64(), v["debug"]["link_base"].as_f64())
+            {
+                chose_link.insert((mn, usi.to_string()), (l, b));
+            }
+        }
         let opp_name = end.opponent.username.clone();
         let tally = by_opp.entry(opp_name.clone()).or_default();
         tally.games += 1;
@@ -174,8 +197,9 @@ fn main() {
             gives_check: bool,
             bd: MarginalWorkBreakdown,
             twin_bd: Option<MarginalWorkBreakdown>,
-            /// runtime と同じ linked_value の増分（働き重み込み・敵玉重みなし）
-            link_delta: f64,
+            /// 選択時に記録された実 link の増分（`chose.debug` の
+            /// `link − link_base`。粒子由来の敵玉重み込み）。旧記録は None
+            link_delta: Option<f64>,
             opp_king_gated: bool,
             opp_king_band: u32,
             opp_king_cands: u32,
@@ -205,14 +229,11 @@ fn main() {
 
             let (kind, role, twin_bd, link_delta) = match mv {
                 ShogiMove::Drop { role, .. } => {
-                    // runtime の link 項と同じ量（働き重み込み）の増分。
-                    // 敵玉重み（粒子）はオフラインでは None
-                    let params = EvalParams::default();
-                    let after_pieces =
-                        tsuitate_bot::check_prep::pieces_after(&pieces, &mv);
-                    let link_delta =
-                        linked_value_of(&after_pieces, bot, you_in_check, &params, None)
-                            - linked_value_of(&pieces, bot, you_in_check, &params, None);
+                    // 選択時の実 link（粒子由来の敵玉重み込み）。オフラインでは
+                    // 再現できないので、記録に無ければ None（分類から除外）
+                    let link_delta = chose_link
+                        .get(&(u64::from(d.pos.move_number()), mv_rec.usi.clone()))
+                        .map(|(l, b)| l - b);
                     ("drop", role, None, link_delta)
                 }
                 ShogiMove::Board { from, to, promote } => {
@@ -235,9 +256,9 @@ fn main() {
                         let twin = ShogiMove::Board { from, to, promote: false };
                         let after_twin = attack_counts_after(&pieces, &twin, bot);
                         let twin_bd = breakdown(&bm, &after_twin, &after);
-                        (kind, pre_role, Some(twin_bd), 0.0)
+                        (kind, pre_role, Some(twin_bd), None)
                     } else {
-                        ("board", pre_role, None, 0.0)
+                        ("board", pre_role, None, None)
                     }
                 }
             };
@@ -275,9 +296,14 @@ fn main() {
                 "drop" => {
                     tally.drops[ph] += 1;
                     tally.drop_bd.add(&r.bd);
-                    link_only = r.link_delta > 1e-9 && r.bd.demand_first_second_gain() == 0;
-                    if link_only {
-                        tally.link_only_drops[ph] += 1;
+                    match r.link_delta {
+                        None => tally.link_na_drops[ph] += 1,
+                        Some(d) => {
+                            link_only = d > 0.0 && r.bd.demand_first_second_gain() == 0;
+                            if link_only {
+                                tally.link_only_drops[ph] += 1;
+                            }
+                        }
                     }
                 }
                 "promo_optional" | "promo_forced" => {
@@ -307,10 +333,12 @@ fn main() {
                     .bd
                     .neutral_redundant_frac()
                     .map_or("".to_string(), |f| format!("{f:.3}"));
+                let link_delta_s =
+                    r.link_delta.map_or("".to_string(), |d| format!("{d:.4}"));
                 let n = Band::Neutral as usize;
                 writeln!(
                     f,
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
                     path.display(),
                     opp_name,
                     r.plies,
@@ -328,7 +356,7 @@ fn main() {
                     r.bd.total_gain(),
                     r.bd.total_loss(),
                     nr_frac,
-                    r.link_delta,
+                    link_delta_s,
                     u8::from(link_only),
                     u8::from(saturated),
                     u8::from(r.opp_king_gated),
@@ -380,10 +408,19 @@ fn main() {
             }
         };
         println!();
+        let link_na: u64 = t.link_na_drops.iter().sum();
         println!(
-            "- link-only打ち: 全打ちの {}・{:.2} 回/局（発火3%未満なら「現象が稀」= P0-3 の中止側）",
-            pct(lod, drops),
+            "- link-only打ち: link 記録のある打ち {} 本中 {}・{:.2} 回/局（発火3%未満なら「現象が稀」= P0-3 の中止側）{}",
+            drops - link_na,
+            pct(lod, drops - link_na),
             lod as f64 / f64::from(t.games.max(1)),
+            if link_na > 0 {
+                format!(
+                    "。**link/link_base の無い打ちが {link_na} 本**（chose.debug に link を残す commit より前の旧記録 = この記録では頻度判定を出せない）"
+                )
+            } else {
+                String::new()
+            },
         );
         println!(
             "- 飽和成り(任意): 任意成りの {}・{:.2} 回/局（**P0-3 の発火3%門の分母は任意成り** = P1 の変更対象。70% 閾値は頻度記述用）",

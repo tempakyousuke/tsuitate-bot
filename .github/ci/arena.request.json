@@ -1,5 +1,5 @@
 {
-  "_comment": "issue #40 P0-1(b) の W=0 記録用 Arena の**取り直し**（PR #41 レビュー1巡目）。run 33558671349 は hits（TSUITATE_DBG_HITS=1）の shadow 順位が事前登録規約と違う式（乱数込み・foul_probe 欠落・USI 辞書順なし）で集計されており、集計済みの値は後から再計算できないため、修正 commit で取り直す。以後の母集団はこの run（旧 run は使わない）。計測後にこのファイルを消す push は全ジョブスキップで緑",
+  "_comment": "issue #40 P0-1(b) の W=0 記録用 Arena の**再取り直し**（PR #41 レビュー2巡目）。link-only 分類に要る選択時の実 link を runtime が chose.debug（link / link_base）へ残すようになったので、その commit で取る。run 33558671349（hits の shadow 順位が旧式）と run 33594298969（link 記録なし）は使わない。計測後にこのファイルを消す push は全ジョブスキップで緑",
   "games": 104,
   "candidate": "estimator",
   "baselines": "estimator_v13 estimator_v14",

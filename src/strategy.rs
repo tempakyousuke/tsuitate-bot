@@ -7429,6 +7429,30 @@ impl Strategy for EstimatorStrategy {
                 serde_json::json!(((p_legal * 1000.0).round()) / 1000.0),
             );
         }
+        // issue #40 P0-2: 選択手の link 項と、同じ決定・同じ敵玉重み表で測った
+        // **現局面（着手前）の link** を記録へ残す。link は粒子由来の
+        // `opp_king_w`（既定 `link_work_w=1` の働き重み）込みなのでオフラインでは
+        // 再現できない（PR #41 レビュー2巡目）。差 `link − link_base` が
+        // 「この手で得た link」で、investment_probe の link-only 分類が読む
+        if let (Some((usi, _, _)), Some(obj)) = (&best, debug.as_object_mut()) {
+            if let Some(c) = self
+                .last_ranking
+                .as_ref()
+                .and_then(|r| r.iter().find(|c| &c.usi == usi))
+            {
+                let base = params.link_w
+                    * linked_value_of(
+                        &view.your_pieces,
+                        view.your_color,
+                        view.you_in_check,
+                        &params,
+                        opp_king_w.as_ref(),
+                    );
+                let r4 = |x: f64| (x * 10000.0).round() / 10000.0;
+                obj.insert("link".into(), serde_json::json!(r4(c.link)));
+                obj.insert("link_base".into(), serde_json::json!(r4(base)));
+            }
+        }
         self.last_debug = Some(debug);
         best.map(|(usi, _, _)| usi)
     }
