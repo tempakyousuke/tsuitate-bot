@@ -255,9 +255,11 @@
     ので、未claim の完走 artifact は生まれない）。**re-run attempt は plan が
     claim 取得前に拒否**（解放済み slot を再claimして1局も指さず埋める穴。
     レビュー8巡目）。**cand arm の claim は「対照 claim の owner run ==
-    pair_with かつその run が success 完了」を確認してから取得**（typo・実行中・
-    失敗した対照を指した candidate が claim を消費しない = 「対照を先に完了」の
-    機械保証）。**解放は「対局が完走しなかった attempt 1 の run」だけ**
+    pair_with かつその run が success 完了かつ head_sha == この run の commit」を
+    確認してから取得**（typo・実行中・失敗した・**別 commit** の対照を指した
+    candidate が claim を消費しない = 「対照を先に完了・同一 commit」の機械保証。
+    commit 不一致は合算器も die するので、claim だけ消費して判定に使えない
+    記録を作らせない。レビュー9巡目）。**解放は「対局が完走しなかった attempt 1 の run」だけ**
     （release-claim ジョブ。claim 名は取得より先に output へ書くので、plan が
     取得後に落ちた経路も解放できる。aggregate の失敗では解放しない = 計測は
     存在しているため）。**合算器も台帳を照合する**: `--manifest` 指定時は
@@ -300,7 +302,9 @@
     (baseline, base, shard, game_no) の重複・鍵集合の不一致・別 run の record・
     manifest 指紋不一致・壊れた JSON 行・end の無い未完 record は **die**）。
     **records 入力の無い集計・meta の無い/不完全な record・`unique_particles` の
-    無い chose 行は判定不能**
+    無い chose 行は判定不能**（**定跡手は例外**: 評価を回さない正当な非評価手
+    なので `chose.debug` に `{"joseki": true}` が入り、集計対象外 = 欠測に
+    数えない。PR #41 レビュー9巡目）
 - `cargo run --release --bin tune -- [反復数] [評価あたり対局数] [基準...]` — 評価パラメータ
   （`strategy::EvalParams`）のSPSA自動チューニング。目的関数はアリーナのスコア率
   （引き分け=0.5勝）。**f+/f− は共通乱数法でペアリングされる**: 同じ対局シード列

@@ -5839,6 +5839,12 @@ impl Strategy for EstimatorStrategy {
             (None, None) => OpeningBook::new(view.your_color),
         });
         if let Some(usi) = book.next(view, log, foul_tried) {
+            // 定跡手は評価を回さない**正当な**非評価手。記録の chose.debug へ
+            // その印を残す（PR #41 レビュー9巡目 [P1]: debug が null のままだと
+            // arena-balance の粒子数 veto が「古い/欠損 record」と区別できず、
+            // 定跡を含む正常な held-out run が必ず判定不能になる）。
+            // 前の決定の debug をそのまま持ち越さない効果もある
+            self.last_debug = Some(serde_json::json!({ "joseki": true }));
             return Some(usi);
         }
 
@@ -11205,6 +11211,29 @@ pub(crate) mod tests {
             opponent_in_check: false,
             status: GameStatus::Playing,
         }
+    }
+
+    /// **定跡手の chose.debug には joseki マーカーが入る**（PR #41 レビュー
+    /// 9巡目 [P1]）。定跡手は評価を回さない正当な非評価手で、debug が null の
+    /// ままだと arena-balance の粒子数 veto が「古い/欠損 record」と区別できず、
+    /// 定跡を含む正常な held-out run が必ず判定不能になる。score には触れない
+    /// （記録だけの変更）
+    #[test]
+    fn 定跡手のdebugにはjosekiマーカーが入る() {
+        let view = minimal_view(
+            crate::shogi::Position::initial().pieces_of(Color::Sente),
+            HashMap::new(),
+        );
+        let log = ObservationLog::default();
+        let mut s = make_seeded("estimator", 7).expect("estimator");
+        let usi = s.choose(&view, &log, &HashSet::new());
+        assert!(usi.is_some(), "初期局面は定跡が指す");
+        let dbg = s.debug_state().expect("定跡手にも debug が入る（null にしない）");
+        assert_eq!(dbg["joseki"], true, "{dbg}");
+        assert!(
+            dbg.get("unique_particles").is_none(),
+            "評価していないので粒子数は持たない（veto の集計対象外の印）"
+        );
     }
 
     #[test]

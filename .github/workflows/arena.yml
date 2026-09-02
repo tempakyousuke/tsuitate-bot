@@ -253,9 +253,19 @@ jobs:
                 echo "pair_with=$pair_with が対照 claim の owner run（${ctrl_owner:-不明}）と一致しません" >&2
                 exit 1
               fi
-              ctrl_status=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ctrl_owner}" --jq '[.status, .conclusion // ""] | join("/")')
-              if [ "$ctrl_status" != "completed/success" ]; then
-                echo "対照 run ${ctrl_owner} が success で完了していません（${ctrl_status}）" >&2
+              ctrl_info=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ctrl_owner}" --jq '[.status, .conclusion // "", .head_sha] | join(" ")')
+              read -r ctrl_status ctrl_conclusion ctrl_sha <<< "$ctrl_info"
+              if [ "$ctrl_status/$ctrl_conclusion" != "completed/success" ]; then
+                echo "対照 run ${ctrl_owner} が success で完了していません（${ctrl_status}/${ctrl_conclusion}）" >&2
+                exit 1
+              fi
+              # **対照 run と同一 commit であること**（PR #41 レビュー9巡目 [P1]:
+              # 合算器は commit 不一致を die するので、別 commit の対照を指した
+              # candidate run は claim だけ消費して判定に使えない記録を残す。
+              # claim を取る前にここで止める）
+              if [ "$ctrl_sha" != "${GITHUB_SHA}" ]; then
+                echo "対照 run ${ctrl_owner} の commit（${ctrl_sha}）がこの run（${GITHUB_SHA}）と違います。" >&2
+                echo "held-out の4 run は同一 commit で回します（合算器も commit 不一致を die する）" >&2
                 exit 1
               fi
             else

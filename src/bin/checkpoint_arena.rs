@@ -3491,8 +3491,20 @@ fn parse_record_strict(
                 });
             }
             Some("chose") => {
-                match v
-                    .get("debug")
+                let dbg = v.get("debug");
+                // **定跡手は評価を回さない正当な非評価手**（`debug.joseki == true`）。
+                // 集計対象外にする = 欠測とは区別する（PR #41 レビュー9巡目 [P1]:
+                // 一緒に missing へ数えると、定跡を含む正常な held-out run が
+                // 必ず判定不能になる）。debug が null / unique_particles 無しで
+                // 印も無い行だけが「古い/欠損 record」= missing
+                if dbg
+                    .and_then(|d| d.get("joseki"))
+                    .and_then(|j| j.as_bool())
+                    == Some(true)
+                {
+                    continue;
+                }
+                match dbg
                     .and_then(|d| d.get("unique_particles"))
                     .and_then(|u| u.as_u64())
                 {
@@ -5219,14 +5231,29 @@ mod tests {
         let text = concat!(
             r#"{"type":"meta","run_id":"r1","run_attempt":1,"baseline":"estimator_v13","game_no":3,"match_seed_base":20260910,"match_seed_shard":2,"balance_manifest":"aa"}"#, "\n",
             r#"{"type":"obs","event":{}}"#, "\n",
-            r#"{"type":"chose","move_number":1,"usi":"7g7f","think_ms":1200,"debug":{"unique_particles":180,"sample_slots":192}}"#, "\n",
-            r#"{"type":"chose","move_number":3,"usi":"2g2f","think_ms":1100,"debug":{"unique_particles":120}}"#, "\n",
-            r#"{"type":"chose","move_number":5,"usi":"2f2e","think_ms":900,"debug":{}}"#, "\n",
+            // **定跡手 = 正当な非評価手**（レビュー9巡目: strategy が
+            // debug.joseki=true を書く。missing に数えると定跡を含む正常な
+            // held-out run が必ず判定不能になる）
+            r#"{"type":"chose","move_number":1,"usi":"7g7f","think_ms":5,"debug":{"joseki":true}}"#, "\n",
+            r#"{"type":"chose","move_number":3,"usi":"7f7e","think_ms":1200,"debug":{"unique_particles":180,"sample_slots":192}}"#, "\n",
+            r#"{"type":"chose","move_number":5,"usi":"2g2f","think_ms":1100,"debug":{"unique_particles":120}}"#, "\n",
+            r#"{"type":"chose","move_number":7,"usi":"2f2e","think_ms":900,"debug":{}}"#, "\n",
             r#"{"type":"end","payload":{}}"#, "\n",
         );
         let (meta, n, sum, missing) = parse_record_strict(text, "t").expect("正常な record");
-        assert_eq!((n, sum), (2, 300), "chose の unique_particles だけを数える");
+        assert_eq!((n, sum), (2, 300), "評価した chose の unique_particles だけを数える");
         assert_eq!(missing, 1, "unique_particles の無い chose 行は欠測として数える（黙って捨てない）");
+
+        // **定跡だけの record（欠測なし）は missing 0** = 定跡入りの正常な run で
+        // 粒子 veto の判定が通り得ることの回帰テスト（レビュー9巡目）
+        let joseki_only = concat!(
+            r#"{"type":"meta","run_id":"r1","run_attempt":1,"baseline":"estimator_v13","game_no":0,"match_seed_base":20260910,"match_seed_shard":0,"balance_manifest":"aa"}"#, "\n",
+            r#"{"type":"chose","move_number":1,"usi":"7g7f","think_ms":5,"debug":{"joseki":true}}"#, "\n",
+            r#"{"type":"chose","move_number":3,"usi":"2g2f","think_ms":1100,"debug":{"unique_particles":120}}"#, "\n",
+            r#"{"type":"end","payload":{}}"#, "\n",
+        );
+        let (_, jn, _, jmissing) = parse_record_strict(joseki_only, "t").expect("正常");
+        assert_eq!((jn, jmissing), (1, 0), "定跡手は欠測に数えない");
         let m = meta.expect("meta が読める");
         assert_eq!((m.run_id.as_deref(), m.run_attempt), (Some("r1"), Some(1)));
         assert_eq!((m.baseline.as_str(), m.game_no, m.base, m.shard), ("estimator_v13", 3, Some(20260910), Some(2)));
