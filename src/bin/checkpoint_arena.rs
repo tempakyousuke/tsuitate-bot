@@ -271,13 +271,13 @@ fn usage() -> &'static str {
      \x20         [--allow-budget-diff]\n\
      \x20         [--markdown OUT] [--json OUT] [--allow-incomplete]\n\
      arena-balance --control <games.jsonl...> --candidate <games.jsonl...>\n\
-     \x20             --expect-games N（相手ごとの期待ペア局数。600 以外は判定不能扱い）\n\
-     \x20             --expect-shards N（元 run の shard 数。0..N の完全性を検査）\n\
-     \x20             --expect-seeds \"相手=base,...\"（相手別の事前登録 base seed）\n\
-     \x20             --expect-cand-knobs \"K=V K=V\"（事前登録した処置ノブと完全一致を要求）\n\
-     \x20             [--expect-opponents \"estimator_v13,estimator_v14\"] [--label NAME]\n\
-     \x20             [--alpha 0.05] [--boot N] [--markdown OUT] [--json OUT]\n\
-     \x20             [--allow-incomplete]"
+     \x20             --manifest <path>（計測前に commit した validation manifest。\n\
+     \x20               cand_knobs の期待値と行指紋の照合。無い集計は判定不能）\n\
+     \x20             [--expect-cand-knobs \"K=V K=V\"（manifest 無しの診断用の期待ノブ）]\n\
+     \x20             [--expect-games N] [--expect-shards N] [--expect-seeds \"相手=base,...\"]\n\
+     \x20             [--expect-opponents \"...\"] [--alpha F] [--boot N]（既定はすべて\n\
+     \x20               issue #40 の事前登録定数。外した指定は判定不能扱い）\n\
+     \x20             [--label NAME] [--markdown OUT] [--json OUT] [--allow-incomplete]"
 }
 
 fn die(msg: &str) -> ! {
@@ -2599,6 +2599,19 @@ struct GameRow {
     match_seed_base: u64,
     /// この行を出したシャード番号。shard 集合の完全性検査に使う
     match_seed_shard: u64,
+    /// **実行の識別子**（CI は GITHUB_RUN_ID、ローカルは ARENA_EXPERIMENT_ID）。
+    /// `match_seed_base` は実験条件であって実行の識別子ではない: 同じ base で
+    /// 取り直した2 run から shard を半分ずつ選んでも、base 1値・shard 集合完全・
+    /// 局数一致で他の検査を全部通る（PR #41 レビュー4巡目）
+    run_id: String,
+    /// 同じ run の re-run attempt も別実行として区別する
+    run_attempt: u64,
+    /// 候補 run が対照に指した run（arena.yml の `-f pair_with=`）。あれば
+    /// 対照の run_id との一致を検査する（対照の取り違えをここで閉じる）
+    pair_with: Option<String>,
+    /// 計測前に commit した validation manifest の指紋（無い run は null =
+    /// #40 の採否では判定不能）
+    balance_manifest: Option<String>,
     game_no: u64,
     a_is_sente: bool,
     score_a: f64,
@@ -2629,10 +2642,12 @@ struct GameRow {
 
 /// schema 2 で実効条件の指紋を必須にした。schema 3 で `match_seed_base` /
 /// `match_seed_shard` を必須にした（PR #41 レビュー3巡目: 記録の `match_seed` は
-/// シャードずらし＋基準 XOR 済みの実効値なので、run の一意性・shard 完全性は
-/// base / shard 列でしか検査できない）。古い schema は**集計から弾く**:
+/// シャードずらし＋基準 XOR 済みの実効値なので、shard 完全性は base / shard 列で
+/// しか検査できない）。schema 4 で `run_id` / `run_attempt`（実行の識別子）を
+/// 必須にした（同4巡目: base は実験条件なので、同じ base で取り直した複数 run の
+/// shard 混ぜを base の一意性では検出できない）。古い schema は**集計から弾く**:
 /// 欠損を空値で埋めると検査を素通りする（PR #22 と同じ理由）
-const GAME_ROW_SCHEMA: u64 = 3;
+const GAME_ROW_SCHEMA: u64 = 4;
 
 /// **ペア差の分散を同定するのに要る最小のペア数**。1ペアでは自由度が 0 で、
 /// n−1 の標本分散が定義できない（`variance` は 0 を返す）
@@ -2701,12 +2716,28 @@ fn parse_game_rows_text(text: &str, where_prefix: &str) -> Result<Vec<GameRow>, 
                 })
                 .collect())
         };
+        // **キー自体は必須・値は null 可**の列（pair_with / balance_manifest）。
+        // キーごと欠けた行を None に落とすと schema 契約の検査が素通りする
+        let opt_s = |k: &str| -> Result<Option<String>, String> {
+            let val = v.get(k).ok_or_else(|| miss(k))?;
+            if val.is_null() {
+                Ok(None)
+            } else {
+                val.as_str()
+                    .map(|s| Some(s.to_string()))
+                    .ok_or_else(|| format!("{where_}: {k} が文字列でも null でもありません"))
+            }
+        };
         rows.push(GameRow {
             candidate: req_s("candidate")?,
             baseline: req_s("baseline")?,
             match_seed: req_u("match_seed")?,
             match_seed_base: req_u("match_seed_base")?,
             match_seed_shard: req_u("match_seed_shard")?,
+            run_id: req_s("run_id")?,
+            run_attempt: req_u("run_attempt")?,
+            pair_with: opt_s("pair_with")?,
+            balance_manifest: opt_s("balance_manifest")?,
             game_no: req_u("game_no")?,
             a_is_sente: v
                 .get("a_is_sente")
@@ -3198,6 +3229,93 @@ const BALANCE_MARGIN_THINK_MS: f64 = 100.0;
 /// この値でない入力は**判定不能**になり「通過」を出せない（別の N で回した
 /// 標本に #40 の門を当てて通過を主張できてしまうため — PR #41 レビュー2巡目）
 const BALANCE_EXPECT_GAMES: usize = 600;
+/// 事前登録した shard 数（issue #40「held-out validation は shards=8」）
+const BALANCE_EXPECT_SHARDS: usize = 8;
+/// 事前登録した相手集合と base seed（issue #40「v14 は match_seed=20260909、
+/// v13 は 20260910」）。相手集合の既定もここから作る
+const BALANCE_EXPECT_SEEDS: [(&str, u64); 2] =
+    [("estimator_v13", 20260910), ("estimator_v14", 20260909)];
+/// 事前登録した信頼水準（95% CI）。`--alpha 0.5` の 50% CI で
+/// 「CI 下限 > 0」を判定した結果は「通過」にしない
+const BALANCE_ALPHA: f64 = 0.05;
+/// 通過判定に使ってよい bootstrap 反復数の下限（既定値でもある）。
+/// `--boot 1` は「1回引いた値」を CI と呼ぶだけで分解能が無い
+const BALANCE_MIN_BOOT: usize = 10_000;
+
+/// **事前登録との照合**（PR #41 レビュー4巡目 [P1]）。門の定数だけでなく、
+/// 判定を変えられる呼び出し時パラメータ（局数・shard 数・base seed・相手集合・
+/// 信頼水準・bootstrap 反復数）も事前登録値と比べ、外れたものは全部
+/// **判定不能ノート**にする: informational な集計はできるが、別の seed・
+/// shard 構成・相手・信頼水準で良く見えた結果を #40 の「通過」とは表示できない
+fn balance_prereg_notes(
+    expect_games: usize,
+    expect_shards: usize,
+    expect_seeds: &BTreeMap<String, u64>,
+    expect_opps: &BTreeSet<String>,
+    alpha: f64,
+    boot: usize,
+) -> Vec<String> {
+    let mut notes = vec![];
+    if expect_games != BALANCE_EXPECT_GAMES {
+        notes.push(format!(
+            "--expect-games {expect_games} ≠ 事前登録 {BALANCE_EXPECT_GAMES}（informational な集計はできるが #40 の採否は出せない）"
+        ));
+    }
+    if expect_shards != BALANCE_EXPECT_SHARDS {
+        notes.push(format!(
+            "--expect-shards {expect_shards} ≠ 事前登録 {BALANCE_EXPECT_SHARDS}"
+        ));
+    }
+    let want_seeds: BTreeMap<String, u64> = BALANCE_EXPECT_SEEDS
+        .iter()
+        .map(|(k, v)| (k.to_string(), *v))
+        .collect();
+    if *expect_seeds != want_seeds {
+        notes.push(format!(
+            "--expect-seeds {expect_seeds:?} ≠ 事前登録 {want_seeds:?}"
+        ));
+    }
+    let want_opps: BTreeSet<String> = BALANCE_EXPECT_SEEDS
+        .iter()
+        .map(|(k, _)| k.to_string())
+        .collect();
+    if *expect_opps != want_opps {
+        notes.push(format!(
+            "--expect-opponents {expect_opps:?} ≠ 事前登録 {want_opps:?}"
+        ));
+    }
+    if alpha != BALANCE_ALPHA {
+        notes.push(format!(
+            "--alpha {alpha} ≠ 事前登録 {BALANCE_ALPHA}（95% CI 以外で取った CI 下限は通過の根拠にしない）"
+        ));
+    }
+    if boot < BALANCE_MIN_BOOT {
+        notes.push(format!(
+            "--boot {boot} < 下限 {BALANCE_MIN_BOOT}（CI の分解能が足りない）"
+        ));
+    }
+    notes
+}
+
+/// validation manifest の指紋と行の指紋の照合。**指紋が違う行は Err**
+/// （別の manifest の下で測った run か、計測後に manifest を書き換えている）。
+/// **指紋の無い行（null）は本数を返す** = 呼び出し側が判定不能ノートへ回す
+/// （「計測前に commit した manifest の下で測った」ことを機械検証できない）
+fn check_manifest_rows(rows: &[GameRow], arm: &str, want_fp: &str) -> Result<usize, String> {
+    let mut missing = 0usize;
+    for r in rows {
+        match &r.balance_manifest {
+            None => missing += 1,
+            Some(fp) if fp != want_fp => {
+                return Err(format!(
+                    "{arm}: 行の balance_manifest {fp} が --manifest の指紋 {want_fp} と一致しません\n            （別の manifest の下で測った run か、計測後に manifest を書き換えています）"
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(missing)
+}
 
 /// 最終判定: 入力が事前登録の条件を満たさない（判定不能の理由がある）とき、
 /// 数値の門がどうであれ**「通過」を出さない**。返り値は (表示ラベル, pass)
@@ -3330,6 +3448,36 @@ fn pair_by_opponent(
                     "{arm}({opp}): shard 集合 {shards:?} が 0..{expect_shards} と一致しません（欠け・範囲外の shard があります）"
                 ));
             }
+            // **実行の識別子は arm × 相手で1つだけ**（PR #41 レビュー4巡目 [P1]、
+            // 降格なし）。base は実験条件であって実行の識別子ではない: 同じ base で
+            // 取り直した run A/B から shard を半分ずつ選んでも、base 1値・
+            // shard 集合完全・局数一致・ペアキー重複なしでここまでの検査を全部
+            // 通る。壁時計予算で同じ seed でも結果が揺れるので、それを許すのは
+            // 「門付近での取り直し」を許すことと同じ
+            let runs: BTreeSet<(&str, u64)> =
+                sub.iter().map(|r| (r.run_id.as_str(), r.run_attempt)).collect();
+            if runs.len() > 1 {
+                return Err(format!(
+                    "{arm}({opp}): 実行の識別子 (run_id, attempt) が複数あります（{runs:?}）。\n            同じ base seed でも別実行の記録は混ぜられません（取り直すなら run ごと差し替え）"
+                ));
+            }
+        }
+        // **対照の取り違え**: 候補行が `pair_with` で対照 run を指しているなら、
+        // 実際に渡された対照の run_id と一致すること（`-f pair_with=` で対照を
+        // 指して回した候補 run の記録がその紐を持っている）
+        let ctrl_run = ctrl
+            .iter()
+            .find(|r| &r.baseline == opp)
+            .map(|r| r.run_id.clone())
+            .expect("相手集合の検査後なので空ではない");
+        for r in cand.iter().filter(|r| &r.baseline == opp) {
+            if let Some(pw) = &r.pair_with {
+                if pw != &ctrl_run {
+                    return Err(format!(
+                        "candidate({opp}): pair_with={pw} が対照の run_id={ctrl_run} と一致しません\n            （候補 run が指した対照と、--control に渡した記録が別物です）"
+                    ));
+                }
+            }
         }
         let key = |r: &GameRow| (r.match_seed, r.game_no);
         let cb: BTreeMap<_, _> = ctrl
@@ -3446,33 +3594,37 @@ fn cmd_arena_balance(args: &Args) {
     if control_paths.is_empty() || candidate_paths.is_empty() {
         die("--control と --candidate に ARENA_GAMES_JSON の JSONL を指定してください");
     }
-    let boot: usize = args.num("boot", 10000);
-    let alpha: f64 = args.num("alpha", 0.05);
+    // **判定を変えられるパラメータの既定はすべて事前登録の定数**（PR #41
+    // レビュー4巡目 [P1]）。CLI から動かすことはできる（他データの診断用）が、
+    // 事前登録値から外れた指定は balance_prereg_notes が**判定不能**にする:
+    // 別の N・shard 構成・seed・相手・信頼水準・反復数で良く見えた結果を
+    // #40 の「通過」とは表示できない
+    let boot: usize = args.num("boot", BALANCE_MIN_BOOT);
+    let alpha: f64 = args.num("alpha", BALANCE_ALPHA);
     let allow_incomplete = args.flag("allow-incomplete");
     let label = args.get("label").unwrap_or("arena-balance").to_string();
-    // **期待局数は必須**（既定値を置かない）。事前登録した局数（検証セットは
-    // 各600局）を起動側が明示的に書くことで、「たまたま揃っていた局数」を
-    // 事後に正当化する読み方を塞ぐ
-    let expect_games: usize = args
-        .get("expect-games")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| {
-            die("--expect-games <N>（相手ごとの期待ペア局数。検証セットは 600）を指定してください")
-        });
-    // **shard 数と相手別 base seed も事前登録値の照合**（PR #41 レビュー3巡目）。
-    // 記録の match_seed は shard ずらし＋基準 XOR 済みの実効値なので、
-    // run の同一性・完全性は base / shard 列で検査する
-    let expect_shards: usize = args
-        .get("expect-shards")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(|| {
-            die("--expect-shards <N>（元 Arena run の shard 数。held-out は 8）を指定してください")
-        });
-    let expect_seeds: BTreeMap<String, u64> = {
-        let raw = args.get("expect-seeds").unwrap_or_else(|| {
-            die("--expect-seeds \"相手=base,...\"（相手別の事前登録 base seed。held-out は estimator_v14=20260909,estimator_v13=20260910）を指定してください")
-        });
-        raw.split([',', ' '])
+    let parse_or_die = |flag: &str, v: &str| -> usize {
+        v.parse()
+            .unwrap_or_else(|_| die(&format!("--{flag} が数値ではありません: {v}")))
+    };
+    let expect_games: usize = match args.get("expect-games") {
+        None => BALANCE_EXPECT_GAMES,
+        Some(v) => parse_or_die("expect-games", v),
+    };
+    // shard 数と相手別 base seed の照合（PR #41 レビュー3巡目）。記録の
+    // match_seed は shard ずらし＋基準 XOR 済みの実効値なので、run の同一性・
+    // 完全性は base / shard 列で検査する
+    let expect_shards: usize = match args.get("expect-shards") {
+        None => BALANCE_EXPECT_SHARDS,
+        Some(v) => parse_or_die("expect-shards", v),
+    };
+    let expect_seeds: BTreeMap<String, u64> = match args.get("expect-seeds") {
+        None => BALANCE_EXPECT_SEEDS
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect(),
+        Some(raw) => raw
+            .split([',', ' '])
             .filter(|s| !s.is_empty())
             .map(|kv| match kv.split_once('=') {
                 Some((k, v)) => match v.parse::<u64>() {
@@ -3481,16 +3633,42 @@ fn cmd_arena_balance(args: &Args) {
                 },
                 None => die(&format!("--expect-seeds の項が 相手=seed 形式ではありません: {kv}")),
             })
-            .collect()
+            .collect(),
     };
+    // **validation manifest**（PR #41 レビュー4巡目 [P1]）。処置ノブのような
+    // 「P1 の後に決まる可変部分」は定数にできないので、**計測前に commit した
+    // manifest ファイル**を一次資料にする: 期待ノブはここから読み、指紋
+    // （ファイル bytes の sha256）を両 arm の全行（`ARENA_BALANCE_MANIFEST` が
+    // 焼き込む）と照合する。--manifest 無しの集計は informational（判定不能）
+    let manifest: Option<(String, serde_json::Value)> = args.get("manifest").map(|p| {
+        let bytes = std::fs::read(p).unwrap_or_else(|e| die(&format!("--manifest {p}: {e}")));
+        use sha2::Digest as _;
+        let fp: String = sha2::Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|e| die(&format!("--manifest {p}: JSON として読めません: {e}")));
+        (fp, v)
+    });
+    let manifest_knobs: Option<BTreeMap<String, String>> = manifest.as_ref().map(|(_, v)| {
+        let o = v
+            .get("cand_knobs")
+            .and_then(|x| x.as_object())
+            .unwrap_or_else(|| die("--manifest に cand_knobs（object）がありません"));
+        o.iter()
+            .map(|(k, val)| {
+                (
+                    k.clone(),
+                    val.as_str().map(str::to_string).unwrap_or_else(|| val.to_string()),
+                )
+            })
+            .collect()
+    });
     // **候補側の処置ノブは事前登録値と完全一致**（PR #41 レビュー2巡目）。
-    // これが無いと「無関係な既存ノブだけを入れた比較」や A/A でも同一戦略・
-    // 同一 commit の条件を満たして門を通せてしまう。起動側（committed な
-    // workflow / request）が事前登録したノブ集合をそのまま書く
-    let expect_knobs: BTreeMap<String, String> = {
-        let raw = args.get("expect-cand-knobs").unwrap_or_else(|| {
-            die("--expect-cand-knobs \"K=V K=V\"（事前登録した処置ノブ。候補 run の cand_knobs と完全一致を要求）を指定してください")
-        });
+    // 期待値は manifest（あれば）が一次資料。--expect-cand-knobs は manifest の
+    // 無い診断用で、両方あれば一致を要求する（期待値の二重管理を許さない）
+    let cli_knobs: Option<BTreeMap<String, String>> = args.get("expect-cand-knobs").map(|raw| {
         raw.split([',', ' '])
             .filter(|s| !s.is_empty())
             .map(|kv| match kv.split_once('=') {
@@ -3498,17 +3676,37 @@ fn cmd_arena_balance(args: &Args) {
                 None => die(&format!("--expect-cand-knobs の項が K=V 形式ではありません: {kv}")),
             })
             .collect()
+    });
+    let expect_knobs: BTreeMap<String, String> = match (&manifest_knobs, &cli_knobs) {
+        (Some(m), Some(c)) if m != c => die(&format!(
+            "--expect-cand-knobs [{}] が --manifest の cand_knobs [{}] と一致しません",
+            fmt_env(c),
+            fmt_env(m)
+        )),
+        (Some(m), _) => m.clone(),
+        (None, Some(c)) => c.clone(),
+        (None, None) => die(
+            "--manifest <path>（計測前に commit した validation manifest）か\n            --expect-cand-knobs \"K=V K=V\"（事前登録した処置ノブ）を指定してください",
+        ),
     };
-    // 期待する相手集合（check_policy combined と同じ規約: 空文字で無効化）。
-    // 既定の2相手固定は「片方の相手だけで通過を返せる」穴を塞ぐため
+    // 期待する相手集合。**空にはできない**（片方の相手だけで通過を返せる穴と、
+    // 「空文字で検査自体を無効化」の穴の両方を塞ぐ — PR #41 レビュー4巡目）
     let expect_opps: BTreeSet<String> = {
-        let raw = args
-            .get("expect-opponents")
-            .unwrap_or("estimator_v13,estimator_v14");
-        raw.split([',', ' '])
-            .filter(|s| !s.is_empty())
-            .map(str::to_string)
-            .collect()
+        let parsed: BTreeSet<String> = match args.get("expect-opponents") {
+            None => BALANCE_EXPECT_SEEDS
+                .iter()
+                .map(|(k, _)| k.to_string())
+                .collect(),
+            Some(raw) => raw
+                .split([',', ' '])
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+        };
+        if parsed.is_empty() {
+            die("--expect-opponents は空にできません（相手集合の検査は無効化できない）");
+        }
+        parsed
     };
 
     let ctrl = parse_game_rows(&control_paths, "control");
@@ -3624,17 +3822,59 @@ fn cmd_arena_balance(args: &Args) {
     }
 
     // **判定不能の理由**。1つでもあれば数値の門がどうであれ「通過」を出さない
-    // （A/A や不完全入力・事前登録外の N での「通過」表示を塞ぐ）
-    let mut indeterminate: Vec<String> = vec![];
-    if expect_games != BALANCE_EXPECT_GAMES {
-        indeterminate.push(format!(
-            "--expect-games {expect_games} ≠ 事前登録 {BALANCE_EXPECT_GAMES}（informational な集計はできるが #40 の採否は出せない）"
-        ));
-    }
+    // （A/A・不完全入力・事前登録外のパラメータでの「通過」表示を塞ぐ）
+    let mut indeterminate: Vec<String> =
+        balance_prereg_notes(expect_games, expect_shards, &expect_seeds, &expect_opps, alpha, boot);
     if cand[0].cand_knobs.is_empty() || ctrl[0].cand_config == cand[0].cand_config {
         indeterminate.push(
             "候補と対照の実効設定が同一（A/A）= 処置が入っていないので採否の対象がない".into(),
         );
+    }
+    // manifest の照合: 指紋が違う行は die（別の manifest の下で測った run）、
+    // 指紋の無い行と --manifest 未指定は判定不能。manifest が echo している
+    // 既知の事前登録値（あれば）も定数と突き合わせる
+    match &manifest {
+        None => indeterminate.push(
+            "--manifest 未指定 = 処置ノブが計測前に commit されたことを機械検証できない".into(),
+        ),
+        Some((fp, v)) => {
+            for (arm, rows) in [("control", &ctrl), ("candidate", &cand)] {
+                match check_manifest_rows(rows, arm, fp) {
+                    Err(e) => die(&e),
+                    Ok(0) => {}
+                    Ok(n) => indeterminate.push(format!(
+                        "{arm}: manifest 指紋の無い行が {n} 行（ARENA_BALANCE_MANIFEST 無しで測った run）"
+                    )),
+                }
+            }
+            if v.get("games").and_then(|x| x.as_u64()).is_some_and(|g| g != BALANCE_EXPECT_GAMES as u64) {
+                indeterminate.push(format!(
+                    "manifest の games {} ≠ 事前登録 {BALANCE_EXPECT_GAMES}",
+                    v["games"]
+                ));
+            }
+            if v.get("shards").and_then(|x| x.as_u64()).is_some_and(|s| s != BALANCE_EXPECT_SHARDS as u64) {
+                indeterminate.push(format!(
+                    "manifest の shards {} ≠ 事前登録 {BALANCE_EXPECT_SHARDS}",
+                    v["shards"]
+                ));
+            }
+            if let Some(o) = v.get("opponents").and_then(|x| x.as_object()) {
+                let got: BTreeMap<String, u64> = o
+                    .iter()
+                    .filter_map(|(k, val)| val.as_u64().map(|n| (k.clone(), n)))
+                    .collect();
+                let want: BTreeMap<String, u64> = BALANCE_EXPECT_SEEDS
+                    .iter()
+                    .map(|(k, s)| (k.to_string(), *s))
+                    .collect();
+                if got != want {
+                    indeterminate.push(format!(
+                        "manifest の opponents {got:?} ≠ 事前登録 {want:?}"
+                    ));
+                }
+            }
+        }
     }
 
     let (paired, pairing_notes) = pair_by_opponent(
@@ -3808,13 +4048,19 @@ fn cmd_arena_balance(args: &Args) {
             "think_budget_ms": cand[0].budget,
             "think_budget_ms_opponent": cand[0].budget_opp,
             "alpha": alpha,
+            "boot": boot,
             "expect_games": expect_games,
             "expect_shards": expect_shards,
             "expect_seeds": expect_seeds,
+            "manifest_fingerprint": manifest.as_ref().map(|(fp, _)| fp.clone()),
             "opponents": per_opp.iter().map(|(o, d)| {
+                let (c0, t0) = &paired[o][0];
                 (o.clone(), serde_json::json!({
                     "pairs": paired[o].len(),
                     "delta": d,
+                    // 監査用: どの実行の記録で判定したか
+                    "control_run": format!("{}#{}", c0.run_id, c0.run_attempt),
+                    "candidate_run": format!("{}#{}", t0.run_id, t0.run_attempt),
                 }))
             }).collect::<serde_json::Map<_, _>>(),
             "combined_delta": combined,
@@ -3908,8 +4154,8 @@ mod tests {
     #[test]
     fn game_row_schema_requires_effective_conditions() {
         assert_eq!(
-            GAME_ROW_SCHEMA, 3,
-            "指紋（schema 2）と base/shard（schema 3）を必須にした時点で schema を上げる"
+            GAME_ROW_SCHEMA, 4,
+            "指紋（schema 2）・base/shard（schema 3）・実行の識別子（schema 4）を必須にした時点で schema を上げる"
         );
         let r = game_row("checkmate", 1.0);
         // 突き合わせの前提になる項目が型として存在すること（欠損は parse で die する）
@@ -3958,6 +4204,10 @@ mod tests {
             match_seed: 1,
             match_seed_base: 1,
             match_seed_shard: 0,
+            run_id: "run-1".into(),
+            run_attempt: 1,
+            pair_with: None,
+            balance_manifest: None,
             game_no: 0,
             a_is_sente: true,
             score_a,
@@ -4096,6 +4346,155 @@ mod tests {
         );
     }
 
+    /// **同じ base seed の複数 run の混入を実行の識別子で止める**（PR #41
+    /// レビュー4巡目 [P1] の再現）: 同一 commit・同一設定・同一 base で取り直した
+    /// run A/B から shard を半分ずつ選ぶと、base 1値・shard 集合 0..N 完全・
+    /// 局数一致・ペアキー重複なしで従来の検査を全部通っていた
+    #[test]
+    fn arena_balance_rejects_shards_mixed_from_two_runs_with_same_base() {
+        let seeds: BTreeMap<String, u64> =
+            [("estimator_v13".to_string(), 1u64), ("estimator_v14".to_string(), 1u64)]
+                .into_iter()
+                .collect();
+        // shard 0 = 実効 seed 1 / shard 1 = 実効 seed 1001（どちらも base 1）
+        let mk = |opp: &str, run: &str, attempt: u64, shard: u64, g: u64| {
+            let mut r = balance_row(opp, g, 0.5);
+            r.run_id = run.into();
+            r.run_attempt = attempt;
+            r.match_seed_shard = shard;
+            r.match_seed = if shard == 0 { 1 } else { 1001 };
+            r
+        };
+        let arm = |run0: &str, a0: u64, run1: &str, a1: u64| -> Vec<GameRow> {
+            ["estimator_v13", "estimator_v14"]
+                .iter()
+                .flat_map(|o| {
+                    vec![mk(o, run0, a0, 0, 0), mk(o, run0, a0, 0, 1), mk(o, run1, a1, 1, 0), mk(o, run1, a1, 1, 1)]
+                })
+                .collect()
+        };
+        let clean = arm("A", 1, "A", 1);
+        let cand = arm("C", 1, "C", 1);
+        assert!(
+            pair_by_opponent(&clean, &cand, 4, 2, &seeds, false).is_ok(),
+            "1実行ずつの正常な入力は通る"
+        );
+        // 対照側が run A（shard 0）＋ run B（shard 1）の混ぜ物
+        let mixed = arm("A", 1, "B", 1);
+        assert!(pair_by_opponent(&mixed, &cand, 4, 2, &seeds, false).is_err());
+        assert!(
+            pair_by_opponent(&mixed, &cand, 4, 2, &seeds, true).is_err(),
+            "--allow-incomplete でも run 混入は降格しない"
+        );
+        // 同じ run の re-run attempt 違いも別実行
+        let reran = arm("A", 1, "A", 2);
+        assert!(pair_by_opponent(&reran, &cand, 4, 2, &seeds, false).is_err());
+        // 候補側の混入も同様
+        assert!(pair_by_opponent(&clean, &arm("C", 1, "D", 1), 4, 2, &seeds, false).is_err());
+    }
+
+    /// **pair_with は対照の run_id と一致する**（対照の取り違えをここで閉じる）
+    #[test]
+    fn arena_balance_checks_pair_with_against_control_run() {
+        let seeds: BTreeMap<String, u64> =
+            [("estimator_v13".to_string(), 1u64), ("estimator_v14".to_string(), 1u64)]
+                .into_iter()
+                .collect();
+        let arm = |run: &str, pw: Option<&str>| -> Vec<GameRow> {
+            ["estimator_v13", "estimator_v14"]
+                .iter()
+                .flat_map(|o| {
+                    (0..2u64)
+                        .map(|g| {
+                            let mut r = balance_row(o, g, 0.5);
+                            r.run_id = run.into();
+                            r.pair_with = pw.map(str::to_string);
+                            r
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let ctrl = arm("ctrl-run", None);
+        assert!(
+            pair_by_opponent(&ctrl, &arm("cand-run", Some("ctrl-run")), 2, 1, &seeds, false).is_ok(),
+            "対照を正しく指した候補は通る"
+        );
+        assert!(
+            pair_by_opponent(&ctrl, &arm("cand-run", Some("other-run")), 2, 1, &seeds, false)
+                .is_err(),
+            "候補が指した対照と --control の記録が別物なら Err"
+        );
+        // pair_with の無い記録（旧 workflow・手動起動）は他の同一性検査に乗る
+        assert!(pair_by_opponent(&ctrl, &arm("cand-run", None), 2, 1, &seeds, false).is_ok());
+    }
+
+    /// **判定を変えられるパラメータは事前登録定数と照合する**（PR #41 レビュー
+    /// 4巡目 [P1]）: 50% CI・1反復 bootstrap・別の shard 数/seed/相手で取った
+    /// 「良い数字」は #40 の通過にならない
+    #[test]
+    fn arena_balance_preregistration_deviations_are_indeterminate() {
+        let seeds: BTreeMap<String, u64> = BALANCE_EXPECT_SEEDS
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect();
+        let opps: BTreeSet<String> =
+            BALANCE_EXPECT_SEEDS.iter().map(|(k, _)| k.to_string()).collect();
+        assert!(
+            balance_prereg_notes(600, 8, &seeds, &opps, 0.05, 10_000).is_empty(),
+            "事前登録どおりの指定にはノートが付かない"
+        );
+        // 定数そのもの（issue #40 本文の事前登録値）
+        assert_eq!(BALANCE_EXPECT_SHARDS, 8);
+        assert_eq!(BALANCE_ALPHA, 0.05);
+        assert_eq!(BALANCE_MIN_BOOT, 10_000);
+        assert_eq!(seeds["estimator_v13"], 20260910);
+        assert_eq!(seeds["estimator_v14"], 20260909);
+
+        let mut wrong_seeds = seeds.clone();
+        wrong_seeds.insert("estimator_v13".into(), 99);
+        let wrong_opps: BTreeSet<String> = ["estimator_v14".to_string()].into_iter().collect();
+        let deviations = [
+            balance_prereg_notes(104, 8, &seeds, &opps, 0.05, 10_000),
+            balance_prereg_notes(600, 4, &seeds, &opps, 0.05, 10_000),
+            balance_prereg_notes(600, 8, &wrong_seeds, &opps, 0.05, 10_000),
+            balance_prereg_notes(600, 8, &seeds, &wrong_opps, 0.05, 10_000),
+            // レビューの再現: --alpha 0.5 = 50% CI で「CI 下限 > 0」を判定
+            balance_prereg_notes(600, 8, &seeds, &opps, 0.5, 10_000),
+            // レビューの再現: --boot 1 = 1回の再標本化を CI と呼ぶ
+            balance_prereg_notes(600, 8, &seeds, &opps, 0.05, 1),
+        ];
+        for notes in deviations {
+            assert!(!notes.is_empty(), "事前登録から外れた指定にはノートが付く");
+            assert!(!balance_final(true, &notes).1, "数値の門が通っても pass しない");
+        }
+    }
+
+    /// **manifest の指紋は行と照合する**: 別 manifest の指紋は Err、指紋の無い
+    /// 行は本数が返る = 判定不能ノート行き（「計測前に commit した manifest の
+    /// 下で測った」ことを機械検証できない）
+    #[test]
+    fn arena_balance_manifest_fingerprint_is_checked_on_rows() {
+        let with_fp = |fp: Option<&str>| {
+            let mut r = game_row("checkmate", 1.0);
+            r.balance_manifest = fp.map(str::to_string);
+            r
+        };
+        assert_eq!(
+            check_manifest_rows(&[with_fp(Some("aa")), with_fp(Some("aa"))], "candidate", "aa"),
+            Ok(0)
+        );
+        assert!(
+            check_manifest_rows(&[with_fp(Some("bb"))], "candidate", "aa").is_err(),
+            "別の manifest の下で測った run は Err"
+        );
+        assert_eq!(
+            check_manifest_rows(&[with_fp(None), with_fp(Some("aa"))], "control", "aa"),
+            Ok(1),
+            "指紋の無い行は本数 = 判定不能ノート行き"
+        );
+    }
+
     /// 合算の点推定は「各相手の平均の単純平均」= 局数が偏っても 1/2 ずつ
     #[test]
     fn arena_balance_point_is_mean_of_stratum_means() {
@@ -4159,6 +4558,10 @@ mod tests {
             "match_seed": 20260815,
             "match_seed_base": 20260815,
             "match_seed_shard": 0,
+            "run_id": "33604671318",
+            "run_attempt": 1,
+            "pair_with": null,
+            "balance_manifest": null,
             "game_no": 0,
             "a_is_sente": true,
             "score_a": 1.0,
@@ -4196,6 +4599,10 @@ mod tests {
             "match_seed",
             "match_seed_base",
             "match_seed_shard",
+            "run_id",
+            "run_attempt",
+            "pair_with",
+            "balance_manifest",
             "game_no",
             "a_is_sente",
             "score_a",
@@ -4231,10 +4638,20 @@ mod tests {
             assert!(e.contains("object"), "{e}");
         }
 
-        // schema 1 は集計から弾く
-        let mut old = valid_row_json();
-        old["schema"] = serde_json::json!(1);
-        assert!(parse_game_rows_text(&old.to_string(), "t").is_err());
+        // 古い schema は集計から弾く（schema 3 = 実行の識別子が無い時期も）
+        for s in [1, 3] {
+            let mut old = valid_row_json();
+            old["schema"] = serde_json::json!(s);
+            assert!(parse_game_rows_text(&old.to_string(), "t").is_err(), "schema {s}");
+        }
+
+        // pair_with / balance_manifest は null 可・文字列以外の値は弾く
+        let mut v = valid_row_json();
+        v["pair_with"] = serde_json::json!("33604671318");
+        let ok = parse_game_rows_text(&v.to_string(), "t").expect("文字列は正常");
+        assert_eq!(ok[0].pair_with.as_deref(), Some("33604671318"));
+        v["pair_with"] = serde_json::json!(123);
+        assert!(parse_game_rows_text(&v.to_string(), "t").is_err(), "数値の pair_with は弾く");
     }
 
     /// **1ペアでは分散が同定できない**ので明示的に失敗させる

@@ -139,6 +139,98 @@ fn check_seed_provenance(
     Ok(())
 }
 
+/// **実行の識別子**（PR #41 レビュー4巡目 [P1]）。
+///
+/// `match_seed_base` は**実験条件**であって実行の識別子ではない: 同じ base で
+/// 取り直した2つの run から shard を半分ずつ選ぶと、base は1値・shard 集合は
+/// 完全・局数も一致して、下流の「複数 run を混ぜない」検査をすべて通ってしまう。
+/// 壁時計予算で同じ seed でも結果が揺れるこのリポジトリでは、それは
+/// 「門付近での取り直し」を機械検査できないことと同じ。そこで
+/// `ARENA_GAMES_JSON` を書く run には実行の識別子を必須にする:
+/// CI は `GITHUB_RUN_ID` / `GITHUB_RUN_ATTEMPT`（Actions が全ジョブに立てる
+/// 既定 env。re-run attempt も別実行として区別する）、ローカルは明示的な
+/// `ARENA_EXPERIMENT_ID`（attempt は 1）。どちらも無ければ起動時に落とす
+/// （書き出し時に落とすと対局が丸ごと無駄になる）。
+fn resolve_run_identity(
+    github_run_id: Option<String>,
+    github_run_attempt: Option<String>,
+    experiment_id: Option<String>,
+) -> Result<(String, u64), String> {
+    if let Some(id) = github_run_id.filter(|s| !s.trim().is_empty()) {
+        // ID があるのに attempt が無い・数値でないときは黙って 1 にしない
+        // （check_seed_provenance と同じ姿勢: 欠測は「一致」ではない）
+        let attempt = github_run_attempt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "GITHUB_RUN_ID があるのに GITHUB_RUN_ATTEMPT がありません".to_string())?
+            .parse::<u64>()
+            .map_err(|_| "GITHUB_RUN_ATTEMPT は非負整数で指定してください".to_string())?;
+        return Ok((id.trim().to_string(), attempt));
+    }
+    if let Some(id) = experiment_id.filter(|s| !s.trim().is_empty()) {
+        return Ok((id.trim().to_string(), 1));
+    }
+    Err("ARENA_GAMES_JSON には実行の識別子が必須です（同じ base seed で取り直した\n\
+         複数 run の混入検査に使う）。CI は GITHUB_RUN_ID / GITHUB_RUN_ATTEMPT（自動）、\n\
+         ローカルは ARENA_EXPERIMENT_ID=<一意な名前> を指定してください"
+        .into())
+}
+
+/// validation manifest の指紋（issue #40 の held-out 採否用、PR #41 レビュー4巡目）。
+///
+/// 処置ノブのような「P1 の後に決まる可変部分」は合算器の定数にできないので、
+/// **計測前に commit した manifest ファイル**を `ARENA_BALANCE_MANIFEST=<path>` で
+/// 指し、その sha256 を games.jsonl の全行へ焼き込む。合算器
+/// （`checkpoint_arena arena-balance --manifest`）は同じファイルの指紋と
+/// 行の指紋の一致を要求するので、「manifest と違う設定で測った run」や
+/// 「計測後に manifest を書き換えた」が判定へ混ざらない。起動時に
+/// candidate 側の実効ノブが manifest の `cand_knobs` と一致することも検査する
+/// （対照 = ノブなしの run は空でよい）。
+fn balance_manifest_fingerprint() -> Option<String> {
+    let path = std::env::var("ARENA_BALANCE_MANIFEST")
+        .ok()
+        .filter(|p| !p.trim().is_empty())?;
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| {
+        eprintln!("ARENA_BALANCE_MANIFEST を読めません（{path}）: {e}");
+        std::process::exit(1);
+    });
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        eprintln!("ARENA_BALANCE_MANIFEST（{path}）が JSON として読めません: {e}");
+        std::process::exit(1);
+    });
+    let want: BTreeMap<String, String> = match v.get("cand_knobs").and_then(|x| x.as_object()) {
+        Some(o) => o
+            .iter()
+            .map(|(k, val)| {
+                (
+                    k.clone(),
+                    val.as_str().map(str::to_string).unwrap_or_else(|| val.to_string()),
+                )
+            })
+            .collect(),
+        None => {
+            eprintln!("ARENA_BALANCE_MANIFEST（{path}）に cand_knobs（object）がありません");
+            std::process::exit(1);
+        }
+    };
+    let actual = cand_knobs();
+    if !actual.is_empty() && actual != want {
+        eprintln!(
+            "ARENA_CAND_KNOBS が manifest（{path}）の cand_knobs と一致しません。\n\
+             candidate run は manifest の処置ノブそのもの、対照 run はノブなしで回してください"
+        );
+        std::process::exit(1);
+    }
+    use sha2::Digest as _;
+    Some(
+        sha2::Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect(),
+    )
+}
+
 /// 数値 env を読む。**指定されているのに parse できないときは None で黙らない**
 /// （黙って None にすると「指定していない」と区別できず、上の整合性検査を
 /// すり抜ける）。
@@ -401,6 +493,24 @@ fn main() {
             std::process::exit(1);
         }
     };
+    // ARENA_GAMES_JSON を書く run は**実行の識別子**（と、あれば manifest 指紋）を
+    // 起動時に解決する。書き出し時に落とすと数時間の対局が丸ごと無駄になる
+    let games_json_path = std::env::var("ARENA_GAMES_JSON").ok().filter(|p| !p.is_empty());
+    let run_identity: Option<(String, u64)> = games_json_path.as_ref().map(|_| {
+        resolve_run_identity(
+            std::env::var("GITHUB_RUN_ID").ok(),
+            std::env::var("GITHUB_RUN_ATTEMPT").ok(),
+            std::env::var("ARENA_EXPERIMENT_ID").ok(),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        })
+    });
+    // 候補 run が対照に指す run（arena.yml の `-f pair_with=`）。合算器が
+    // 「対照の取り違え」を機械検査するために記録へ残す
+    let pair_with = std::env::var("ARENA_PAIR_WITH").ok().filter(|s| !s.trim().is_empty());
+    let manifest_fp = balance_manifest_fingerprint();
     let games: u32 = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(100);
     let candidate = args.get(2).cloned().unwrap_or_else(|| "heuristic".into());
     let opponents: Vec<String> = if args.len() > 3 {
@@ -484,7 +594,20 @@ fn main() {
                                     //  シャードずらし＋基準ごとの XOR を掛けた実効値なので、
                                     //  「同じ run か」「shard が揃っているか」を下流が
                                     //  base / shard で検査できる必要がある）
-                                    "schema": 3,
+                                    // schema 4: **実行の識別子を必須にした**
+                                    // （PR #41 レビュー4巡目。base は実験条件であって
+                                    //  実行の識別子ではないので、同じ base で取り直した
+                                    //  複数 run の shard 混ぜはこれ無しでは検出できない）
+                                    "schema": 4,
+                                    "run_id": run_identity.as_ref().expect("起動時に解決済み").0,
+                                    "run_attempt": run_identity.as_ref().expect("起動時に解決済み").1,
+                                    // 候補 run が対照に指した run（無ければ null）。
+                                    // 合算器が対照 run_id との一致を検査する
+                                    "pair_with": pair_with,
+                                    // 計測前に commit した validation manifest の指紋
+                                    // （ARENA_BALANCE_MANIFEST。無い run は null =
+                                    //  合算器の #40 採否では判定不能）
+                                    "balance_manifest": manifest_fp,
                                     // **arm を突き合わせる前提の一部**。env アブレーション
                                     // なら両 run で同じでなければならない（違うなら
                                     // 測っているのは別 revision の差でもある）
@@ -634,6 +757,38 @@ mod tests {
         // ローカル実行（ラベルを名乗らない）は従来どおり
         assert!(check_seed_provenance(None, None, None).is_ok());
         assert!(check_seed_provenance(Some(20260829), None, None).is_ok());
+    }
+
+    /// **games.jsonl を書く run は実行の識別子が必須**（PR #41 レビュー4巡目 [P1]）。
+    ///
+    /// `match_seed_base` は実験条件であって実行の識別子ではないので、同じ base で
+    /// 取り直した複数 run の shard 混ぜはこれ無しでは検出できない。CI は
+    /// GITHUB_RUN_ID / GITHUB_RUN_ATTEMPT、ローカルは ARENA_EXPERIMENT_ID。
+    #[test]
+    fn 実行の識別子はgithub_run_idかexperiment_idのどちらかで必須() {
+        let s = |v: &str| Some(v.to_string());
+        // CI 経路（re-run attempt も識別子の一部）
+        assert_eq!(
+            resolve_run_identity(s("33604671318"), s("2"), None),
+            Ok(("33604671318".into(), 2))
+        );
+        // ローカル経路（attempt は 1）
+        assert_eq!(
+            resolve_run_identity(None, None, s("issue40-local-a")),
+            Ok(("issue40-local-a".into(), 1))
+        );
+        // GITHUB_RUN_ID があるなら experiment id より優先（CI の実体が勝つ）
+        assert_eq!(
+            resolve_run_identity(s("123"), s("1"), s("x")),
+            Ok(("123".into(), 1))
+        );
+        // **ID があるのに attempt が欠測・非数値なら黙って 1 にしない**
+        assert!(resolve_run_identity(s("123"), None, None).is_err());
+        assert!(resolve_run_identity(s("123"), s(""), None).is_err());
+        assert!(resolve_run_identity(s("123"), s("abc"), None).is_err());
+        // どちらも無ければ落とす（空文字は未指定と同じ）
+        assert!(resolve_run_identity(None, None, None).is_err());
+        assert!(resolve_run_identity(s(""), None, s("  ")).is_err());
     }
 
     /// **summary に base seed と shard が残る**。これが無いと、下流は

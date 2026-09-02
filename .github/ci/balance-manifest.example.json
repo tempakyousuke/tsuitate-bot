@@ -1,0 +1,8 @@
+{
+  "_note": "issue #40 の held-out 採否の validation manifest の例。P1 の処置ノブが決まったら、この形の実ファイル（例 .github/ci/issue40-balance.manifest.json）を**計測より前の commit** で入れ、対照・候補の全4 run の arena.request.json の balance_manifest にそのパスを書く。cand_knobs は候補 run の cand_env と完全一致（対照はノブなし）。games / shards / opponents は事前登録の echo で、合算器が定数と突き合わせる",
+  "experiment": "issue40-heldout",
+  "cand_knobs": { "TSUITATE_EXAMPLE_W": "1.0" },
+  "games": 600,
+  "shards": 8,
+  "opponents": { "estimator_v13": 20260910, "estimator_v14": 20260909 }
+}

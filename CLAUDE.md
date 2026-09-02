@@ -212,28 +212,42 @@
     `-f pair_with=<対照のArena実行ID>` が候補側 run の中でこれを回す。
     ガントレットの記録は `--baseline` で1マッチアップに絞る
   - **`arena-balance` は issue #40 の opponent-balanced 合算器**（2026-09-01 実装。
-    まだ判定実績なし）。2相手ぶん（既定 v13 / v14 を `--expect-opponents` で検査）の
-    対照・候補 games.jsonl を受け取り、相手ごとに局ペア差を作って
-    **`(Δv13 + Δv14) / 2` を層化 bootstrap**（各相手の内側で局を引き直す）で出し、
-    **事前登録した門**（合算 ≥ +0.04・CI 下限 > 0・相手別符号 veto・反則/局 +0.3
-    以内・時間切れ0・思考平均 +100ms 以内）を **fail-closed（不通過なら exit 3、
-    `--allow-incomplete` で警告へ降格）** で判定する（`check_policy combined` と
-    同じ契約）。入力の同一性検査も fail-closed: arm 内・相手内の一意性
-    （`assert_uniform`）に加え、**相手をまたいだ arm 設定の一致**（candidate /
-    clock / commit / 予算 / cand_config / cand_knobs / shared_env）・
-    **`--expect-games` は必須**（相手ごとのペア局数を照合。**事前登録は各600局で
-    定数 `BALANCE_EXPECT_GAMES` に固定** — 600 以外の N や `--allow-incomplete` で
-    降格した不完全入力は**判定不能**になり「通過」を出せない）・
-    **`--expect-cand-knobs` も必須**（候補側の処置ノブが事前登録値と完全一致。
-    A/A = 処置なしも判定不能）・**`--expect-shards` / `--expect-seeds` も必須**
-    （games.jsonl schema 3 の `match_seed_base` / `match_seed_shard` 列で検査:
-    arm × 相手ごとに base は1つだけ = 複数 run の混入は `--allow-incomplete` でも
-    降格しない、base は相手別の事前登録値と一致、shard 集合は 0..N の完全な集合。
-    記録の `match_seed` はシャードずらし＋基準 XOR 済みの**実効値**なので
-    一意性検査には使えない — 正常な sharded run でも相手ごとに shard 数ぶんの
-    値になる）・**arm 間は同一 candidate 名・対照は W=0（cand_knobs 空）・
-    同一 commit**（commit 不一致に override は無い。別 commit の main は
-    対照にできない）を要求する。
+    まだ判定実績なし）。2相手ぶんの対照・候補 games.jsonl を受け取り、相手ごとに
+    局ペア差を作って **`(Δv13 + Δv14) / 2` を層化 bootstrap**（各相手の内側で局を
+    引き直す）で出し、**事前登録した門**（合算 ≥ +0.04・CI 下限 > 0・相手別符号
+    veto・反則/局 +0.3 以内・時間切れ0・思考平均 +100ms 以内）を
+    **fail-closed（不通過なら exit 3、`--allow-incomplete` で警告へ降格）** で
+    判定する（`check_policy combined` と同じ契約）。
+    **判定を変えられるパラメータは全部が事前登録の定数**（PR #41 レビュー4巡目）:
+    局数 600（`BALANCE_EXPECT_GAMES`）・shards 8・base seed（v13=20260910 /
+    v14=20260909）・相手集合 {v13, v14}・alpha 0.05・bootstrap 反復の下限 10000。
+    `--expect-games` / `--expect-shards` / `--expect-seeds` / `--expect-opponents` /
+    `--alpha` / `--boot` の既定はこの定数で、**外した指定は判定不能**（informational
+    な集計はできるが「通過」を出せない。`--expect-opponents` を空にして検査を
+    切ることもできない）。`--allow-incomplete` で降格した不完全入力・A/A =
+    処置なしも判定不能。
+    **処置ノブのような P1 後に決まる可変部分は validation manifest が一次資料**:
+    計測前に commit した manifest（例は `.github/ci/balance-manifest.example.json`）の
+    リポジトリ内パスを arena.request.json の `balance_manifest` に書くと、
+    `bin/arena` が起動時に「実効ノブ == manifest の cand_knobs（対照は空）」を検査した
+    うえで **games.jsonl の全行へ manifest の sha256 を焼き込み**、合算器は
+    `--manifest <path>` で同じファイルの指紋と全行の一致（違えば die）・期待ノブの
+    完全一致を要求する。manifest 無しの集計は判定不能。
+    入力の同一性検査も fail-closed: arm 内・相手内の一意性（`assert_uniform`）・
+    **相手をまたいだ arm 設定の一致**（candidate / clock / commit / 予算 /
+    cand_config / cand_knobs / shared_env）・**arm × 相手ごとに base は1つだけ・
+    shard 集合は 0..N の完全な集合**（games.jsonl の `match_seed_base` /
+    `match_seed_shard` 列。記録の `match_seed` はシャードずらし＋基準 XOR 済みの
+    **実効値**なので一意性検査には使えない）・**arm × 相手ごとに実行の識別子
+    `(run_id, run_attempt)` は1つだけ**（games.jsonl **schema 4** で必須化。
+    **base は実験条件であって実行の識別子ではない**: 同じ base で取り直した
+    2 run から shard を半分ずつ選んでも base 1値・shard 完全・局数一致で通って
+    しまう。CI は `GITHUB_RUN_ID` / `GITHUB_RUN_ATTEMPT`、ローカルは
+    `ARENA_EXPERIMENT_ID` が必須 — 無いと `ARENA_GAMES_JSON` 指定の run は起動時に
+    落ちる）・**候補行の `pair_with`（`-f pair_with=` で記録）は対照の run_id と
+    一致**（対照の取り違え検査）・**arm 間は同一 candidate 名・対照は W=0
+    （cand_knobs 空）・同一 commit**（commit 不一致に override は無い）。
+    run 混入・pair_with 不一致・指紋不一致は `--allow-incomplete` でも降格しない。
     予算不一致の override も無い。平均評価粒子数の門（対照比 −10% 超で中止）は
     games.jsonl に無いので arena-records の `chose.debug` から別途出す
 - `cargo run --release --bin tune -- [反復数] [評価あたり対局数] [基準...]` — 評価パラメータ

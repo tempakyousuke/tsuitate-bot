@@ -75,6 +75,7 @@ jobs:
       cand_env: ${{ steps.split.outputs.cand_env }}
       pair_with: ${{ steps.split.outputs.pair_with }}
       games_from: ${{ steps.split.outputs.games_from }}
+      balance_manifest: ${{ steps.split.outputs.balance_manifest }}
     steps:
       - uses: actions/checkout@v5
       - id: split
@@ -107,6 +108,9 @@ jobs:
             cand_env="${IN_CAND_ENV:-}"
             pair_with="${IN_PAIR_WITH:-}"
             games_from="${IN_GAMES_FROM:-}"
+            # validation manifest はリクエストファイル経路のみ（issue #40 の
+            # held-out 採否用。手動起動の採否 run は request で回す）
+            balance_manifest=""
           else
             if [ ! -f "$req" ]; then
               # push の paths フィルタはファイルの削除にも一致するので、計測が
@@ -129,6 +133,7 @@ jobs:
                 echo "cand_env="
                 echo "pair_with="
                 echo "games_from="
+                echo "balance_manifest="
               } >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -148,6 +153,7 @@ jobs:
             cand_env=$(jq -r '.cand_env // ""' "$req")
             pair_with=$(jq -r '.pair_with // ""' "$req")
             games_from=$(jq -r '.games_from_run_id // ""' "$req")
+            balance_manifest=$(jq -r '.balance_manifest // ""' "$req")
           fi
           # ペア集計は局ごとの突き合わせなので、match_seed が無いと成立しない
           # （`games_from` の再集計では元 run が match_seed 付きで回っていればよい）
@@ -169,6 +175,7 @@ jobs:
           {
             echo "games_from=$games_from"
             echo "pair_with=$pair_with"
+            echo "balance_manifest=${balance_manifest:-}"
             echo "cand_env=$cand_env"
             echo "env<<EOF"
             echo "$extra_env"
@@ -210,6 +217,14 @@ jobs:
           ARENA_EXTRA_ENV: ${{ needs.plan.outputs.env }}
           ARENA_CAND_ENV: ${{ needs.plan.outputs.cand_env }}
           ARENA_CLOCK: ${{ needs.plan.outputs.clock }}
+          # 候補 run が対照に指した run（arena-balance が対照の取り違え検査に使う）。
+          # 実行の識別子そのもの（run_id / run_attempt）は Actions の既定 env
+          # GITHUB_RUN_ID / GITHUB_RUN_ATTEMPT から bin/arena が自分で読む
+          ARENA_PAIR_WITH: ${{ needs.plan.outputs.pair_with }}
+          # 計測前に commit した validation manifest（issue #40 の held-out 採否用）。
+          # 指定すると games.jsonl の全行へ sha256 が焼き込まれ、arena-balance
+          # --manifest がその一致を要求する
+          ARENA_BALANCE_MANIFEST: ${{ needs.plan.outputs.balance_manifest }}
         run: |
           set -euo pipefail
           # 共通seed指定時はシャードごとにずらす（シャード間の対局重複を防ぎつつ、
