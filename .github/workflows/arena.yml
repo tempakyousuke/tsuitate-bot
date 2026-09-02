@@ -70,7 +70,8 @@ jobs:
       skip: ${{ steps.split.outputs.skip }}
       baselines: ${{ steps.split.outputs.baselines }}
       shards: ${{ steps.split.outputs.shards }}
-      games_per_shard: ${{ steps.split.outputs.games_per_shard }}
+      games_by_shard: ${{ steps.split.outputs.games_by_shard }}
+      claim: ${{ steps.split.outputs.claim }}
       candidate: ${{ steps.split.outputs.candidate }}
       match_seed: ${{ steps.split.outputs.match_seed }}
       oracle: ${{ steps.split.outputs.oracle }}
@@ -131,7 +132,8 @@ jobs:
                 # 落ちないよう妥当な形の既定値も置いておく（値は使われない）
                 echo "baselines=[\"dummy\"]"
                 echo "shards=[0]"
-                echo "games_per_shard=0"
+                echo "games_by_shard=[0]"
+                echo "claim="
                 echo "candidate=estimator"
                 echo "match_seed="
                 echo "oracle="
@@ -168,13 +170,56 @@ jobs:
             echo "pair_with は match_seed と併用してください（局ごとの条件が揃いません）" >&2
             exit 1
           fi
+          # **held-out 採否 run（balance_manifest あり）の plan 検査**（PR #41
+          # レビュー6巡目）: ①事前登録の実験条件（games / shards / seed /
+          # candidate）が manifest と一致 ②**取り直しの台帳**（成功 run が
+          # 押した claim タグが既にあれば、同じ (manifest, arm, 相手) の
+          # 再計測 = 事前登録違反として起動を拒否。infra 失敗で claim が
+          # 押されなかった run はやり直せる）。台帳は永続の git タグなので
+          # 事後の監査もできる
+          claim=""
+          if [ -n "${balance_manifest:-}" ]; then
+            if [ ! -f "$balance_manifest" ]; then
+              echo "balance_manifest が見つかりません: $balance_manifest" >&2; exit 1
+            fi
+            for key in games shards candidate; do
+              want=$(jq -r ".${key} // empty" "$balance_manifest")
+              got=$(eval "echo \"\$${key}\"")
+              if [ -z "$want" ] || [ "$want" != "$got" ]; then
+                echo "held-out run の ${key}=${got} が manifest の ${want:-（無し）} と一致しません" >&2
+                exit 1
+              fi
+            done
+            if [ "$(echo "$baselines" | wc -w)" -ne 1 ]; then
+              echo "held-out run は1相手ずつ起動します（baselines=$baselines）" >&2; exit 1
+            fi
+            want_seed=$(jq -r ".opponents[\"$baselines\"] // empty" "$balance_manifest")
+            if [ -z "$want_seed" ] || [ "$want_seed" != "$match_seed" ]; then
+              echo "held-out run の match_seed=$match_seed が manifest の opponents[$baselines]=${want_seed:-（無し）} と一致しません" >&2
+              exit 1
+            fi
+            fp=$(sha256sum "$balance_manifest" | cut -c1-16)
+            if [ -n "$cand_env" ]; then arm=cand; else arm=ctrl; fi
+            claim="balance-claim/${fp}/${arm}-${baselines}"
+            if git ls-remote --exit-code origin "refs/tags/$claim" >/dev/null 2>&1; then
+              echo "この (manifest, ${arm}, ${baselines}) の成功 run は既にあります（tag $claim）。" >&2
+              echo "同じ実験の取り直しは事前登録違反です。別の実験なら新しい manifest を commit してください" >&2
+              exit 1
+            fi
+          fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "起動: event=$EVENT_NAME games=$games candidate=$candidate baselines=$baselines shards=$shards match_seed=$match_seed clock=$clock env=$extra_env cand_env=$cand_env"
           echo "baselines=$(echo "$baselines" | jq -R -c 'split(" ") | map(select(length > 0))')" >> "$GITHUB_OUTPUT"
           echo "shards=$(jq -n -c "[range(0; ${shards})]")" >> "$GITHUB_OUTPUT"
-          per=$(( (games + shards - 1) / shards ))
-          per=$(( per + per % 2 ))   # 先後を揃えるため偶数化
-          echo "games_per_shard=$per" >> "$GITHUB_OUTPUT"
+          # **シャード分割は合計が正確に games になる偶数割り**（PR #41 レビュー
+          # 6巡目 [P1]。従来の ceil の偶数化は 600/8 を 608局 に膨らませ、
+          # 600ペアちょうどを要求する合算器と両立しなかった）。分割規約と
+          # 既知ケースは scripts/ci/split_arena_games.py（--self-test を先に回す）
+          python3 scripts/ci/split_arena_games.py --self-test
+          games_by_shard=$(python3 scripts/ci/split_arena_games.py "$games" "$shards")
+          echo "分割: $games_by_shard（合計 $games）"
+          echo "games_by_shard=$games_by_shard" >> "$GITHUB_OUTPUT"
+          echo "claim=$claim" >> "$GITHUB_OUTPUT"
           echo "candidate=$candidate" >> "$GITHUB_OUTPUT"
           echo "match_seed=$match_seed" >> "$GITHUB_OUTPUT"
           echo "oracle=$oracle" >> "$GITHUB_OUTPUT"
@@ -280,7 +325,7 @@ jobs:
           done
           export ARENA_CAND_KNOBS="$ARENA_CAND_ENV"
           cargo run --release --bin arena -- \
-            "${{ needs.plan.outputs.games_per_shard }}" \
+            "${{ fromJSON(needs.plan.outputs.games_by_shard)[matrix.shard] }}" \
             "${{ needs.plan.outputs.candidate }}" \
             "${{ matrix.baseline }}" \
             | tee arena-result.txt
@@ -343,6 +388,11 @@ jobs:
     # 「一部シャードが失敗しても残りを合算する」ために残す。
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.skip != 'true'
     runs-on: ubuntu-latest
+    # contents: write は held-out の claim タグ（取り直しの台帳）を押すためだけ。
+    # actions: read は pair_with / games_from の cross-run artifact ダウンロード用
+    permissions:
+      contents: write
+      actions: read
     steps:
       # **checkout は必ず download より前**。actions/checkout はワークスペースを
       # 掃除するので、後ろに置くと落とした artifact も集計の中間ファイルも消える
@@ -472,3 +522,22 @@ jobs:
             all-games.jsonl
             arena-var.md
             arena-var.json
+
+      # **held-out の claim タグ = 取り直しの台帳**（PR #41 レビュー6巡目 [P1]）。
+      # `run_attempt == 1` は同一 run の re-run しか検出できず、同じ manifest で
+      # もう一度 dispatch すると新しい run_id の attempt 1 になる。そこで
+      # (manifest 指紋, arm, 相手) ごとに**全シャード成功の run だけが**永続の
+      # git タグを押し、plan が次回起動時にそのタグを見て拒否する。infra 失敗で
+      # ここまで来なかった run は claim を押さないので、失敗のやり直しはできる
+      # （塞ぐのは「成功した計測の取り直し」だけ）。同時起動の競合は後から
+      # 押した側が 422 で赤くなる = その run の記録は使わない
+      - name: Claim held-out slot
+        if: needs.plan.outputs.claim != '' && needs.arena.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${{ github.repository }}/git/refs" \
+            -f ref="refs/tags/${{ needs.plan.outputs.claim }}" \
+            -f sha="${{ github.sha }}"
+          echo "claim: ${{ needs.plan.outputs.claim }} → ${{ github.sha }}（run ${{ github.run_id }}）"

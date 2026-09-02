@@ -231,20 +231,35 @@ fn balance_manifest_fingerprint(candidate: &str) -> Option<String> {
              candidate run は manifest の処置ノブそのもの、対照 run はノブなしで回してください"
         ));
     }
-    if let Some(mc) = v.get("candidate").and_then(|x| x.as_str()) {
-        if mc != candidate {
+    // **candidate / think_budget_ms は必須**（PR #41 レビュー6巡目 [P2]:
+    // 「あれば検査」だと、欠けた manifest でも指紋を焼いて 600 局を完走し、
+    // 4 run 後の合算器で初めて判定不能になる。契約どおり起動時に落とす）
+    let mc = v
+        .get("candidate")
+        .and_then(|x| x.as_str())
+        .unwrap_or_else(|| {
             bail(&format!(
-                "candidate {candidate} が manifest（{path}）の candidate {mc} と一致しません"
-            ));
-        }
+                "ARENA_BALANCE_MANIFEST（{path}）に candidate（文字列）がありません（合算器の必須フィールド）"
+            ))
+        });
+    if mc != candidate {
+        bail(&format!(
+            "candidate {candidate} が manifest（{path}）の candidate {mc} と一致しません"
+        ));
     }
-    if let Some(mb) = v.get("think_budget_ms").and_then(|x| x.as_u64()) {
-        let eff = budget_of(candidate, &candidate_config());
-        if eff != Some(mb) {
+    let mb = v
+        .get("think_budget_ms")
+        .and_then(|x| x.as_u64())
+        .unwrap_or_else(|| {
             bail(&format!(
-                "候補の実効思考予算 {eff:?} が manifest（{path}）の think_budget_ms {mb} と一致しません"
-            ));
-        }
+                "ARENA_BALANCE_MANIFEST（{path}）に think_budget_ms（非負整数）がありません（合算器の必須フィールド）"
+            ))
+        });
+    let eff = budget_of(candidate, &candidate_config());
+    if eff != Some(mb) {
+        bail(&format!(
+            "候補の実効思考予算 {eff:?} が manifest（{path}）の think_budget_ms {mb} と一致しません"
+        ));
     }
     use sha2::Digest as _;
     Some(

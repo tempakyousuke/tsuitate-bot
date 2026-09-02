@@ -49,7 +49,10 @@
   起動するが、**plan が「削除された push」と判定して全ジョブをスキップ**
   するので緑のまま終わる（後片付けで赤い run が残らない。scenario.yml も同様）。
   「基準 × シャード」の matrix に分割され（`-f shards=4` 既定。単一基準の
-  200局も4ランナーに並列化される）、総合結果は **aggregate ジョブのサマリー**
+  200局も4ランナーに並列化される）、**分割は合計が正確に `games` になる偶数割り**
+  （`scripts/ci/split_arena_games.py`、各シャード偶数 = 先後均衡・差≤2。
+  奇数指定だけ全体 +1。〜2026-09-02 は ceil の偶数化で 100→104・600/8→608 に
+  膨らんでいた = 過去記録の「各104局」はこの由来）、総合結果は **aggregate ジョブのサマリー**
   （および artifact `arena-combined`）に合算表で出る。シャード個別は
   `arena-result-<基準>-s<n>` / `arena-records-<基準>-s<n>`。
   `-f match_seed=<数>` で対局条件列を決定論化できる（アブレーション比較用。
@@ -240,6 +243,13 @@
     `gh workflow run arena.yml -f balance_manifest=<path> -f games=600 -f shards=8
     -f match_seed=<相手別seed> -f baselines=<相手>`（候補側は
     `-f cand_env="<ノブ>" -f pair_with=<対照のrun ID>` を追加）を4回起動する。
+    plan が起動時に manifest との一致（games/shards/candidate/相手別 seed・
+    1相手ずつ）を検査し、**取り直しは git タグの台帳で拒否する**（PR #41
+    レビュー6巡目: `run_attempt==1` では「もう一度 dispatch した新しい run」を
+    検出できない）: 全シャード成功した manifest-bound run だけが aggregate で
+    `balance-claim/<manifest指紋16>/<arm>-<相手>` タグを push し、同じ組の
+    再起動は plan で止まる（infra 失敗 = claim 無しの run はやり直せる。
+    塞ぐのは成功した計測の取り直しだけ。タグは永続なので事後監査もできる）。
     **実験条件も事前登録と照合する**: 実効予算は両 arm・両側とも 2000ms
     （`BALANCE_BUDGET_MS`。arm 間の一致だけだと「両方 700ms」が通る）・両側 env
     なし・**診断オラクル（games.jsonl **schema 5** で `oracle` 列を必須記録）は

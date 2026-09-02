@@ -4561,6 +4561,53 @@ mod tests {
         assert!(!balance_final(true, &notes).1, "紐なしは数値の門が通っても pass しない");
     }
 
+    /// **workflow の分割から合算器まで、事前登録の 600/8 が通ること**
+    /// （PR #41 レビュー6巡目 [P1]）。従来の ceil の偶数化は 600/8 を
+    /// 76×8 = 608局 に膨らませ、600ペアちょうどを要求するこの関数と
+    /// 両立しなかった。ここでは `scripts/ci/split_arena_games.py` が出す
+    /// 正確な分割 [76,76,76,76,74,74,74,74]（合計 600・各シャード偶数）を
+    /// そのまま形にして、事前登録の seed / shard 数で受理されることを固定する
+    #[test]
+    fn arena_balance_accepts_the_preregistered_600_over_8_split() {
+        let split: [u64; 8] = [76, 76, 76, 76, 74, 74, 74, 74];
+        assert_eq!(split.iter().sum::<u64>(), 600);
+        assert!(split.iter().all(|g| g % 2 == 0), "各シャード偶数 = 先後均衡");
+        let seeds: BTreeMap<String, u64> = BALANCE_EXPECT_SEEDS
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect();
+        let arm = |run: &str, pw: Option<&str>| -> Vec<GameRow> {
+            let mut rows = vec![];
+            for (opp, base) in BALANCE_EXPECT_SEEDS {
+                for (shard, games) in split.iter().enumerate() {
+                    for g in 0..*games {
+                        let mut r = balance_row(opp, g, 0.5);
+                        r.match_seed_base = base;
+                        r.match_seed_shard = shard as u64;
+                        r.match_seed = base + shard as u64; // 実効 seed（shard ごとに別）
+                        r.run_id = run.into();
+                        r.pair_with = pw.map(str::to_string);
+                        rows.push(r);
+                    }
+                }
+            }
+            rows
+        };
+        let ctrl = arm("run-ctrl", None);
+        let cand = arm("run-cand", Some("run-ctrl"));
+        let (paired, notes) = pair_by_opponent(
+            &ctrl,
+            &cand,
+            BALANCE_EXPECT_GAMES,
+            BALANCE_EXPECT_SHARDS,
+            &seeds,
+            false,
+        )
+        .expect("事前登録どおりの分割は受理される");
+        assert!(paired.values().all(|v| v.len() == 600));
+        assert!(notes.is_empty(), "判定不能ノートが付かない: {notes:?}");
+    }
+
     /// **re-run attempt の記録は判定に使えない**（PR #41 レビュー5巡目 [P1]）。
     /// `pair_with` は run_id しか持たないので、attempt 1 の対照を指した候補に
     /// attempt 2 の記録を渡しても run_id は一致してしまう。事前登録の
