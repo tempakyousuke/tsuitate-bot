@@ -101,15 +101,38 @@ pub fn observe_ranking(ranking: &[CandidateScore]) {
     }
 }
 
-/// 1決定ぶんの集計（純関数。テスト対象）
+/// スコア関数 f の argmax を**決定的に**取る: 乱数（`tiebreak`）は f の側で
+/// 除いてあり、同点は USI の辞書順（小さいほうが首位）。issue #24 の教訓②
+/// （タイブレーク乱数を順位に残さない・完全同点を安定ソートに任せない）を
+/// shadow 順位にもそのまま適用する（issue #40 P0-2 の事前登録規約）
+fn det_argmax<'a>(
+    ranking: &'a [CandidateScore],
+    f: impl Fn(&CandidateScore) -> f64,
+) -> &'a CandidateScore {
+    ranking
+        .iter()
+        .max_by(|a, b| {
+            f(a).partial_cmp(&f(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.usi.cmp(&a.usi))
+        })
+        .expect("空でないことを確認済み")
+}
+
+/// 1決定ぶんの集計（純関数。テスト対象）。
+///
+/// top1入替の判定は**乱数を除いた決定的スコア**で行う:
+/// - 現首位: `score − tiebreak`
+/// - 項除去後: `combine_score(gain − 寄与, p_legal, foul_cost) + foul_probe +
+///   (adjust − tiebreak)`（score の組み立てと同じ形。`foul_probe` は
+///   combine_score の外側の項なので落とさない）
+/// どちらも同点は USI 辞書順。乱数込みで数えると、W=0 の A/A でも
+/// 同点候補の乱数の並びだけで top1_flips が非ゼロになる
 fn tally(ranking: &[CandidateScore]) -> Vec<(&'static str, TermStat)> {
     if ranking.is_empty() {
         return vec![];
     }
-    let best = ranking
-        .iter()
-        .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))
-        .expect("空でないことを確認済み");
+    let best = det_argmax(ranking, |c| c.score - c.tiebreak);
     let mut local: Vec<(&'static str, TermStat)> = vec![];
     for (name, get) in terms() {
         let mut st = TermStat {
@@ -126,18 +149,13 @@ fn tally(ranking: &[CandidateScore]) -> Vec<(&'static str, TermStat)> {
         }
         if st.fired_candidates > 0 {
             st.fired_decisions = 1;
-            // その項を外したときの argmax
-            let without = |c: &CandidateScore| {
-                crate::strategy::combine_score(c.gain - get(c), c.p_legal, c.foul_cost) + c.adjust
-            };
-            let alt = ranking
-                .iter()
-                .max_by(|a, b| {
-                    without(a)
-                        .partial_cmp(&without(b))
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                })
-                .expect("空でないことを確認済み");
+            // その項を外したときの argmax（乱数を除いた決定的スコア）
+            let alt = det_argmax(ranking, |c| {
+                crate::strategy::combine_score(c.gain - get(c), c.p_legal, c.foul_cost)
+                    + c.foul_probe
+                    + c.adjust
+                    - c.tiebreak
+            });
             if alt.usi != best.usi {
                 st.top1_flips = 1;
             }
@@ -268,5 +286,40 @@ mod tests {
         assert_eq!(threat.fired_decisions, 0);
         assert_eq!(threat.candidates, 2);
         assert_eq!(threat.fired_candidates, 0);
+    }
+
+    /// shadow 順位は**乱数を除き、同点は USI 辞書順**（issue #24 教訓②）。
+    /// 決定的スコアが完全同点の2候補で、乱数だけが順位を分けている決定は
+    /// 項を外しても首位が変わらない = top1入替を数えない
+    #[test]
+    fn tiebreak_randomness_never_flips_top1() {
+        let mut a = cand("A", 1.0, 0.5);
+        let mut b = cand("B", 1.0, 0.5);
+        // 乱数込みでは B が首位、乱数を除けば同点 → USI 辞書順で A が首位
+        a.tiebreak = 0.001;
+        a.score += a.tiebreak;
+        a.adjust += a.tiebreak;
+        b.tiebreak = 0.009;
+        b.score += b.tiebreak;
+        b.adjust += b.tiebreak;
+        let t = tally(&[b, a]);
+        let risk = get(&t, "mate_risk");
+        assert_eq!(risk.fired_decisions, 1);
+        assert_eq!(risk.top1_flips, 0, "両候補が対称なので外しても首位（辞書順 A）は不変");
+    }
+
+    /// `foul_probe` は combine_score の外側の項なので、項除去後のスコアからも
+    /// 落とさない（落とすと foul_probe で首位に立っている候補が全項の
+    /// 「除去後」で沈み、無関係な項に top1入替が立つ）
+    #[test]
+    fn foul_probe_is_kept_in_shadow_score() {
+        let mut probe = cand("A", 1.0, 0.0);
+        probe.foul_probe = 2.0;
+        probe.score += probe.foul_probe;
+        // B は mate_risk が発火しているが、外しても A（foul_probe 込み 3.0）が首位のまま
+        let t = tally(&[probe, cand("B", 2.0, 0.5)]);
+        let risk = get(&t, "mate_risk");
+        assert_eq!(risk.fired_decisions, 1);
+        assert_eq!(risk.top1_flips, 0);
     }
 }

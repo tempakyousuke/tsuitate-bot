@@ -17,16 +17,20 @@
 //! - `--dump <path>`: 1行=1受理手の TSV も書く（両極端の手の抽出・レビュー用）
 //!
 //! 分類の定義は `src/marginal_work.rs`（事前登録）を参照。「正の link を得る」は
-//! 働き係数で揺れる連続値でなく**紐の本数**（`defended_piece_count`）の増加で
-//! 判定する（構造判定。runtime の `link` 列との突き合わせは shadow 側で行う）。
+//! **runtime の `link` 項と同じ値**（`strategy::linked_value_of` = 働き重み込みの
+//! `linked_value`。オフラインで再現できない粒子由来の敵玉重みだけ None）の
+//! 増分で判定する（PR #41 レビューで本数近似を訂正 — `link_work_w` の重み付けで
+//! 「本数は増えるが link 寄与は減る」手を誤分類できるため）。
+//! 重みは `EvalParams::default()`（= runtime の既定値）。
 
 use std::collections::BTreeMap;
 use std::io::Write;
 
 use tsuitate_bot::marginal_work::{
     BAND_LABELS, Band, MarginalWorkBreakdown, N_BANDS, N_TRANSITIONS, TRANSITION_TAGS,
-    attack_counts, attack_counts_after, band_map, breakdown, defended_piece_count,
+    attack_counts, attack_counts_after, band_map, breakdown,
 };
+use tsuitate_bot::strategy::{EvalParams, linked_value_of};
 use tsuitate_bot::board::{Promotion, promotion_choice};
 use tsuitate_bot::protocol::Role;
 use tsuitate_bot::shogi::{ShogiMove, parse_usi, piece_value, unpromote_role};
@@ -56,7 +60,10 @@ struct Tally {
     link_only_drops: [u64; PHASES],
     promos_optional: [u64; PHASES],
     promos_forced: [u64; PHASES],
-    saturated_promos: [u64; PHASES],
+    /// 飽和成りは**任意/強制で分けて数える**（P1 の変更対象は任意成りだけなので、
+    /// 発火3%門の分母も任意成り。強制成りは参考の別枠 — PR #41 レビュー）
+    saturated_optional: [u64; PHASES],
+    saturated_forced: [u64; PHASES],
     /// 打ちの帯×遷移の合算
     drop_bd: MarginalWorkBreakdown,
     /// 任意成りの帯×遷移の合算（着手前 → 成りの後）
@@ -167,7 +174,8 @@ fn main() {
             gives_check: bool,
             bd: MarginalWorkBreakdown,
             twin_bd: Option<MarginalWorkBreakdown>,
-            link_delta: i64,
+            /// runtime と同じ linked_value の増分（働き重み込み・敵玉重みなし）
+            link_delta: f64,
             opp_king_gated: bool,
             opp_king_band: u32,
             opp_king_cands: u32,
@@ -197,10 +205,14 @@ fn main() {
 
             let (kind, role, twin_bd, link_delta) = match mv {
                 ShogiMove::Drop { role, .. } => {
-                    let link_delta = i64::from(defended_piece_count(
-                        &tsuitate_bot::check_prep::pieces_after(&pieces, &mv),
-                        bot,
-                    )) - i64::from(defended_piece_count(&pieces, bot));
+                    // runtime の link 項と同じ量（働き重み込み）の増分。
+                    // 敵玉重み（粒子）はオフラインでは None
+                    let params = EvalParams::default();
+                    let after_pieces =
+                        tsuitate_bot::check_prep::pieces_after(&pieces, &mv);
+                    let link_delta =
+                        linked_value_of(&after_pieces, bot, you_in_check, &params, None)
+                            - linked_value_of(&pieces, bot, you_in_check, &params, None);
                     ("drop", role, None, link_delta)
                 }
                 ShogiMove::Board { from, to, promote } => {
@@ -223,9 +235,9 @@ fn main() {
                         let twin = ShogiMove::Board { from, to, promote: false };
                         let after_twin = attack_counts_after(&pieces, &twin, bot);
                         let twin_bd = breakdown(&bm, &after_twin, &after);
-                        (kind, pre_role, Some(twin_bd), 0)
+                        (kind, pre_role, Some(twin_bd), 0.0)
                     } else {
-                        ("board", pre_role, None, 0)
+                        ("board", pre_role, None, 0.0)
                     }
                 }
             };
@@ -263,26 +275,29 @@ fn main() {
                 "drop" => {
                     tally.drops[ph] += 1;
                     tally.drop_bd.add(&r.bd);
-                    link_only = r.link_delta > 0 && r.bd.demand_first_second_gain() == 0;
+                    link_only = r.link_delta > 1e-9 && r.bd.demand_first_second_gain() == 0;
                     if link_only {
                         tally.link_only_drops[ph] += 1;
                     }
                 }
                 "promo_optional" | "promo_forced" => {
+                    saturated = !r.captured
+                        && !r.gives_check
+                        && r.bd.neutral_redundant_frac().is_some_and(|f| f >= 0.7);
                     if r.kind == "promo_optional" {
                         tally.promos_optional[ph] += 1;
                         tally.promo_bd.add(&r.bd);
                         if let Some(t) = &r.twin_bd {
                             tally.promo_twin_bd.add(t);
                         }
+                        if saturated {
+                            tally.saturated_optional[ph] += 1;
+                        }
                     } else {
                         tally.promos_forced[ph] += 1;
-                    }
-                    saturated = !r.captured
-                        && !r.gives_check
-                        && r.bd.neutral_redundant_frac().is_some_and(|f| f >= 0.7);
-                    if saturated {
-                        tally.saturated_promos[ph] += 1;
+                        if saturated {
+                            tally.saturated_forced[ph] += 1;
+                        }
                     }
                 }
                 _ => {}
@@ -295,7 +310,7 @@ fn main() {
                 let n = Band::Neutral as usize;
                 writeln!(
                     f,
-                    "{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{:?}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.4}\t{}\t{}\t{}\t{}",
                     path.display(),
                     opp_name,
                     r.plies,
@@ -335,22 +350,26 @@ fn main() {
         let lod: u64 = t.link_only_drops.iter().sum();
         let po: u64 = t.promos_optional.iter().sum();
         let pf: u64 = t.promos_forced.iter().sum();
-        let sat: u64 = t.saturated_promos.iter().sum();
+        let sat_o: u64 = t.saturated_optional.iter().sum();
+        let sat_f: u64 = t.saturated_forced.iter().sum();
         println!();
         println!("### vs {opp}（{} 局・bot 決定点 {d_total}）", t.games);
         println!();
-        println!("| 手数帯 | 決定点 | 打ち | link-only打ち | 任意成り | 強制成り | 飽和成り |");
-        println!("|---|---|---|---|---|---|---|");
+        println!(
+            "| 手数帯 | 決定点 | 打ち | link-only打ち | 任意成り | 飽和(任意) | 強制成り | 飽和(強制) |"
+        );
+        println!("|---|---|---|---|---|---|---|---|");
         for ph in 0..PHASES {
             println!(
-                "| {} | {} | {} | {} | {} | {} | {} |",
+                "| {} | {} | {} | {} | {} | {} | {} | {} |",
                 PHASE_LABELS[ph],
                 t.decisions[ph],
                 t.drops[ph],
                 t.link_only_drops[ph],
                 t.promos_optional[ph],
+                t.saturated_optional[ph],
                 t.promos_forced[ph],
-                t.saturated_promos[ph],
+                t.saturated_forced[ph],
             );
         }
         let pct = |num: u64, den: u64| -> String {
@@ -367,9 +386,13 @@ fn main() {
             lod as f64 / f64::from(t.games.max(1)),
         );
         println!(
-            "- 飽和成り: 任意成り+強制成りの {}・{:.2} 回/局（70% 閾値は頻度記述用）",
-            pct(sat, po + pf),
-            sat as f64 / f64::from(t.games.max(1)),
+            "- 飽和成り(任意): 任意成りの {}・{:.2} 回/局（**P0-3 の発火3%門の分母は任意成り** = P1 の変更対象。70% 閾値は頻度記述用）",
+            pct(sat_o, po),
+            sat_o as f64 / f64::from(t.games.max(1)),
+        );
+        println!(
+            "- 飽和成り(強制): 強制成りの {}（参考。P1 の変更対象外なので門には数えない）",
+            pct(sat_f, pf),
         );
         println!(
             "- opp_king 帯: 発火 {}・発火時の帯サイズ平均 {:.1} マス・候補数の平均（全決定点）{:.1}（帯サイズの監査）",

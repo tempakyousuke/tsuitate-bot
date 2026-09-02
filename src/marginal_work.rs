@@ -21,20 +21,18 @@
 //!
 //! # 利き枚数 A(s) の規約
 //!
-//! - 数えるのは**玉を除く**自駒の利き（`check_prep::coverage_of` と同じ）。
-//!   玉は投資できる戦力ではなく、玉での取り返しは既存評価が強く割り引く
-//!   （`king_capture_reveal` 既定10、CheckSolver の玉手過信の履歴）ので、
-//!   「取り返しに使える2枚目」の分母に入れない。
-//!   ※ runtime の `own_attack_counts`（`landing_def` 用）は玉を含む別物
+//! - 数えるのは**玉を含む全自駒**の利き（issue #40 の事前登録は
+//!   「自駒利き枚数」で、玉を除く但し書きは無い。runtime の
+//!   `own_attack_counts`（`landing_def` 用）と同じ側。PR #41 レビューで
+//!   玉除外の初版を訂正した — 玉が既に利くマスへの追加が first でなく
+//!   second になるので、表現そのものが変わる）
 //! - 利きは `board::defend_targets` と同じ規約: **自駒の乗ったマスも含み**、
 //!   飛び利きはそこで止まる。自駒マスの枚数 = その駒の紐の本数
 //! - 飛び利きは自駒にしか遮られない**楽観上限**（相手の駒は見えない）
 //!
-//! ただし**紐の増加の判定**（link-only drop の分類）だけは runtime の
-//! `linked_value` と同じ規約（玉の利きも守りに数える）を使う
-//! （[`defended_piece_count`] の doc 参照）。
-
-use std::collections::HashSet;
+//! **「正の link を得る」の判定**（link-only drop の分類）は本数の近似ではなく
+//! runtime の `link` 項と同じ値（`strategy::linked_value_of` = 働き重み込みの
+//! `linked_value`。オフラインでは粒子由来の敵玉重みだけ None）の増分で行う。
 
 use crate::belief_features::sq_index;
 use crate::board::{Coord, defend_targets, parse_usi_square};
@@ -72,13 +70,13 @@ pub const TRANSITION_TAGS: [&str; N_TRANSITIONS] = ["first", "second", "redundan
 /// 「同じ記録から同じ表」が壊れる）
 pub const OPP_KING_GATE: usize = 20;
 
-/// **玉を除く**自駒の利き枚数マップ（`sq_index` 順の 81 要素）。
+/// **玉を含む全自駒**の利き枚数マップ（`sq_index` 順の 81 要素）。
 ///
 /// `defend_targets` と同じ規約（自駒マスを含む・飛び利きはそこで止まる・
 /// 楽観上限）。1枚の駒が同じマスへ複数経路で利いても1と数える。
 pub fn attack_counts(pieces: &[VisiblePiece], color: Color) -> [u8; 81] {
     let mut n = [0u8; 81];
-    for p in pieces.iter().filter(|p| p.role != Role::King) {
+    for p in pieces.iter() {
         let mut seen = [false; 81];
         for s in defend_targets(pieces, p, color) {
             let i = sq_index(s);
@@ -302,25 +300,6 @@ pub fn breakdown(
     out
 }
 
-/// **紐のついた自駒（玉を除く）の本数**。link-only drop 分類の「正の link を
-/// 得る」側の構造判定（本数が増えたか）に使う。
-///
-/// runtime の `linked_value`（`link_w` の項）と同じ規約で、**守る側には玉の
-/// 利きも数える**（「玉で取り返す形も守りとしては成立する」— `strategy.rs`）。
-/// 連続値の `linked_value` は働き係数で揺れるので、分類には本数を使う
-pub fn defended_piece_count(pieces: &[VisiblePiece], color: Color) -> u32 {
-    let mut defended: HashSet<Coord> = HashSet::new();
-    for p in pieces {
-        defended.extend(defend_targets(pieces, p, color));
-    }
-    pieces
-        .iter()
-        .filter(|p| p.role != Role::King)
-        .filter_map(|p| parse_usi_square(&p.square))
-        .filter(|c| defended.contains(c))
-        .count() as u32
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,33 +485,23 @@ mod tests {
     }
 
     #[test]
-    fn 紐の本数は玉の守りも数える() {
-        // 5八の金は 5九の玉に守られている（linked_value と同じ規約）
-        let pieces = vec![pc("5i", Role::King), pc("5h", Role::Gold)];
-        assert_eq!(defended_piece_count(&pieces, Color::Sente), 1);
-        // 玉自身は「守られた駒」の分子に入らない
-        let king_only = vec![pc("5i", Role::King)];
-        assert_eq!(defended_piece_count(&king_only, Color::Sente), 0);
-    }
-
-    #[test]
-    fn 利き枚数マップは玉を除く() {
+    fn 利き枚数マップは玉も数える() {
+        // 事前登録の「自駒利き枚数」どおり、玉の利きも1枚として数える
+        // （runtime の own_attack_counts と同じ側）
         let pieces = vec![pc("5i", Role::King), pc("5g", Role::Pawn)];
         let a = attack_counts(&pieces, Color::Sente);
-        assert_eq!(a[sq_index(sq("5h"))], 0, "玉の利きは数えない");
+        assert_eq!(a[sq_index(sq("5h"))], 1, "玉の利き");
         assert_eq!(a[sq_index(sq("5f"))], 1, "歩の利き");
-    }
-
-    #[test]
-    fn 打ちで紐が増える判定() {
-        let before = vec![pc("5i", Role::King), pc("1c", Role::Gold)];
-        assert_eq!(defended_piece_count(&before, Color::Sente), 0);
-        // 1四に銀を打つと 1三の金へ紐（先手の銀は斜め前 = 1三へ利く…
-        // 1四から見た斜め前は 2三 なので、まっすぐ前 1三 へ利く銀ではなく
-        // 金を 1四 に置く（金は前へ利く）
-        let mv = ShogiMove::Drop { role: Role::Gold, to: sq("1d") };
-        let after = crate::check_prep::pieces_after(&before, &mv);
-        // 1四の金は 1三の金を守り、1三の金（後ろへ利く）も 1四の金を守る = 相互の紐
-        assert_eq!(defended_piece_count(&after, Color::Sente), 2, "相互の紐が2本つく");
+        // 玉が既に利くマスへの利き足しは first でなく second になる
+        let mv = ShogiMove::Drop { role: Role::Gold, to: sq("5g") };
+        let _ = mv; // 5g は歩がいるので打てないが、しきい値の意味の確認は breakdown 側
+        let mut before = [0u8; 81];
+        before[sq_index(sq("5h"))] = 1;
+        let mut after = before;
+        after[sq_index(sq("5h"))] = 2;
+        let bands = neutral_bands();
+        let bd = breakdown(&bands, &before, &after);
+        assert_eq!(bd.gain[Band::Neutral as usize][1], 1, "1→2 は second");
+        assert_eq!(bd.gain[Band::Neutral as usize][0], 0);
     }
 }

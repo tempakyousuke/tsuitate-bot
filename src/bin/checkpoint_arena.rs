@@ -250,7 +250,7 @@ fn assert_opponent_blind_to(opponent: &str, arm_env_keys: &[String], allow: bool
 
 
 fn usage() -> &'static str {
-    "usage: checkpoint_arena <extract|run|unit|pair|compare|report|arena-var> [options]\n\
+    "usage: checkpoint_arena <extract|run|unit|pair|compare|report|arena-var|arena-balance> [options]\n\
      \n\
      extract --records <dir|file...> --out <dir> [--opponent NAME] [--min-remaining N]\n\
      \x20       [--limit N] [--seed N] [--dev-pct N]\n\
@@ -271,6 +271,7 @@ fn usage() -> &'static str {
      \x20         [--allow-budget-diff]\n\
      \x20         [--markdown OUT] [--json OUT] [--allow-incomplete]\n\
      arena-balance --control <games.jsonl...> --candidate <games.jsonl...>\n\
+     \x20             --expect-games N（相手ごとの期待ペア局数。検証セットは 600）\n\
      \x20             [--expect-opponents \"estimator_v13,estimator_v14\"] [--label NAME]\n\
      \x20             [--alpha 0.05] [--boot N] [--markdown OUT] [--json OUT]\n\
      \x20             [--allow-incomplete]"
@@ -3218,12 +3219,18 @@ fn stratified_boot_mean_ci(
 
 /// 相手ごとに (対照, 候補) の局ペアを作る。ペアの鍵は (match_seed, game_no)。
 /// - 相手集合が両 arm で一致しない・2相手未満は Err
+/// - **arm × 相手ごとに実効 `match_seed` は1つだけ**（常に Err、降格なし）。
+///   複数 run の記録を混ぜると、両 arm が同じ2つの seed を持てばペアは成立して
+///   しまうが、それは事前登録した「相手ごとに1つの未使用 seed」ではない
+/// - **相手ごとのペア局数 == `expect_games`**（事前登録の各600局を呼び出し側が
+///   明示する。`allow_incomplete` で警告へ降格 = そのとき門は執行されない）
 /// - ペアにならない局は Err（`allow_incomplete` で捨てて続行）
 /// - 先後の食い違いは常に Err（別の条件列）
 /// - 相手ごとのペア数が [`MIN_ARENA_PAIRS`] 未満は Err（自由度は作れない）
 fn pair_by_opponent(
     ctrl: &[GameRow],
     cand: &[GameRow],
+    expect_games: usize,
     allow_incomplete: bool,
 ) -> Result<BTreeMap<String, Vec<(GameRow, GameRow)>>, String> {
     let opps = |rows: &[GameRow]| -> BTreeSet<String> {
@@ -3243,6 +3250,22 @@ fn pair_by_opponent(
     }
     let mut out: BTreeMap<String, Vec<(GameRow, GameRow)>> = BTreeMap::new();
     for opp in &co {
+        // 実効 match_seed の一意性（arm × 相手ごと）。ここは降格しない:
+        // seed が2つある = 別々の run（別の対局条件列）を1つの標本として
+        // 数えることになり、「未使用 seed 1本の held-out」という母集団の
+        // 定義そのものが壊れる
+        for (arm, rows) in [("control", ctrl), ("candidate", cand)] {
+            let seeds: BTreeSet<u64> = rows
+                .iter()
+                .filter(|r| &r.baseline == opp)
+                .map(|r| r.match_seed)
+                .collect();
+            if seeds.len() > 1 {
+                return Err(format!(
+                    "{arm}({opp}): 実効 match_seed が複数あります（{seeds:?}）。\n            複数の run の記録を混ぜないでください（相手ごとに1つの seed の1 run）"
+                ));
+            }
+        }
         let key = |r: &GameRow| (r.match_seed, r.game_no);
         let cb: BTreeMap<_, _> = ctrl
             .iter()
@@ -3278,22 +3301,21 @@ fn pair_by_opponent(
         if pairs.len() < MIN_ARENA_PAIRS {
             return Err(format!("{opp}: {}", arena_var_pair_error(pairs.len())));
         }
-        out.insert(opp.clone(), pairs);
-    }
-    // **局数の一致**（fail-closed）: 相手ごとの局数が違うと「合算は 1/2 ずつ」の
-    // 意図（opponent-balanced）は保たれるが、run の設定が事前登録
-    // （games / shards / seed をすべて一致）から外れている兆候なので止める
-    let sizes: BTreeSet<usize> = out.values().map(|v| v.len()).collect();
-    if sizes.len() > 1 {
-        let msg = format!(
-            "相手ごとのペア局数が揃っていません: {:?}",
-            out.iter().map(|(k, v)| (k.clone(), v.len())).collect::<Vec<_>>()
-        );
-        if allow_incomplete {
-            eprintln!("警告: {msg}");
-        } else {
-            return Err(msg);
+        // **期待局数の強制**（fail-closed）: 事前登録した局数（検証セットは
+        // 各600局）を呼び出し側が明示し、ここで照合する。「2ペア以上あればよい」
+        // では 104局の smoke でも部分欠損した run でも判定を返せてしまう
+        if pairs.len() != expect_games {
+            let msg = format!(
+                "{opp}: ペア局数 {} が期待 {expect_games} と違います（--expect-games は\n            事前登録した局数。検証セットは各600局）",
+                pairs.len()
+            );
+            if allow_incomplete {
+                eprintln!("警告: {msg}");
+            } else {
+                return Err(msg);
+            }
         }
+        out.insert(opp.clone(), pairs);
     }
     Ok(out)
 }
@@ -3358,6 +3380,15 @@ fn cmd_arena_balance(args: &Args) {
     let alpha: f64 = args.num("alpha", 0.05);
     let allow_incomplete = args.flag("allow-incomplete");
     let label = args.get("label").unwrap_or("arena-balance").to_string();
+    // **期待局数は必須**（既定値を置かない）。事前登録した局数（検証セットは
+    // 各600局）を起動側が明示的に書くことで、「たまたま揃っていた局数」を
+    // 事後に正当化する読み方を塞ぐ
+    let expect_games: usize = args
+        .get("expect-games")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(|| {
+            die("--expect-games <N>（相手ごとの期待ペア局数。検証セットは 600）を指定してください")
+        });
     // 期待する相手集合（check_policy combined と同じ規約: 空文字で無効化）。
     // 既定の2相手固定は「片方の相手だけで通過を返せる」穴を塞ぐため
     let expect_opps: BTreeSet<String> = {
@@ -3410,6 +3441,23 @@ fn cmd_arena_balance(args: &Args) {
     // arm 間（対照 vs 候補）の実験条件。arena-var と同じ趣旨で fail-closed。
     // **予算の不一致に override は無い**（issue #40 の検証は予算 2000ms を
     // 4 run すべてで一致させる契約。予算そのものを比べる用途は arena-var の領分）
+    //
+    // **戦略名は同一**であること: issue #40 の比較は「同じ candidate 戦略の
+    // W=0 vs 処置ノブ」であって、別戦略どうしの比較にこの門を使ってはいけない
+    if ctrl[0].candidate != cand[0].candidate {
+        die(&format!(
+            "candidate 戦略が違います: control={} / candidate={}\n            （issue #40 の対照は同一戦略の W=0。別戦略の比較は arena-var の領分）",
+            ctrl[0].candidate, cand[0].candidate
+        ));
+    }
+    // **対照は W=0**（候補ノブなし = 既定 config）であること。対照側にノブが
+    // 入っていると「処置ノブだけが違う」という比較の前提が崩れる
+    if !ctrl[0].cand_knobs.is_empty() {
+        die(&format!(
+            "control に候補ノブが入っています（{}）。\n            issue #40 の対照は同一 commit・W=0（cand_env なし）の run です",
+            fmt_env(&ctrl[0].cand_knobs)
+        ));
+    }
     if ctrl[0].clock != cand[0].clock {
         die(&format!(
             "時計が違います: control={} / candidate={}",
@@ -3431,16 +3479,13 @@ fn cmd_arena_balance(args: &Args) {
     }
     if ctrl[0].commit != cand[0].commit {
         // issue #40 の対照は「同一 commit・W=0」。別 commit の main を指すと
-        // arena-var は警告するだけなので、こちらは**止める**（本文の指示）
-        let msg = format!(
-            "commit が違います: control={} / candidate={}。\n            issue #40 の対照は同一 commit・W=0 の run（別 commit の main は対照にできません）",
+        // arena-var は警告するだけなので、こちらは**常に止める**
+        // （`--allow-incomplete` でも降格しない。別 commit の比較は
+        // 「ノブの効果 + revision の差」で estimand が別物になる）
+        die(&format!(
+            "commit が違います: control={} / candidate={}。\n            issue #40 の対照は同一 commit・W=0 の run（別 commit の main は対照にできません。\n            この検査に override はありません）",
             ctrl[0].commit, cand[0].commit
-        );
-        if allow_incomplete {
-            eprintln!("警告: {msg}");
-        } else {
-            die(&msg);
-        }
+        ));
     }
     // 相手の実効挙動は**相手ごとに** arm 間で一致していること
     {
@@ -3468,7 +3513,8 @@ fn cmd_arena_balance(args: &Args) {
         );
     }
 
-    let paired = pair_by_opponent(&ctrl, &cand, allow_incomplete).unwrap_or_else(|e| die(&e));
+    let paired = pair_by_opponent(&ctrl, &cand, expect_games, allow_incomplete)
+        .unwrap_or_else(|e| die(&e));
     let opps: Vec<String> = paired.keys().cloned().collect();
     if !expect_opps.is_empty() {
         let got: BTreeSet<String> = opps.iter().cloned().collect();
@@ -3614,6 +3660,7 @@ fn cmd_arena_balance(args: &Args) {
             "think_budget_ms": cand[0].budget,
             "think_budget_ms_opponent": cand[0].budget_opp,
             "alpha": alpha,
+            "expect_games": expect_games,
             "opponents": per_opp.iter().map(|(o, d)| {
                 (o.clone(), serde_json::json!({
                     "pairs": paired[o].len(),
@@ -3794,9 +3841,14 @@ mod tests {
             balance_row("estimator_v14", 1, 0.5),
         ];
         let cand = ctrl.clone(); // A/A
-        let paired = pair_by_opponent(&ctrl, &cand, false).expect("A/A はペアになる");
+        let paired =
+            pair_by_opponent(&ctrl, &cand, 2, false).expect("A/A はペアになる");
         assert_eq!(paired.len(), 2);
         assert!(paired.values().all(|v| v.len() == 2));
+
+        // **期待局数は明示必須で照合される**（事前登録の各600局の強制。
+        // 「2ペア以上あればよい」では smoke や欠損 run でも判定を返せてしまう）
+        assert!(pair_by_opponent(&ctrl, &cand, 600, false).is_err());
 
         // 1相手だけでは opponent-balanced にならない（arena-var の領分）
         let one: Vec<GameRow> = ctrl
@@ -3804,22 +3856,44 @@ mod tests {
             .filter(|r| r.baseline == "estimator_v13")
             .cloned()
             .collect();
-        assert!(pair_by_opponent(&one, &one, false).is_err());
+        assert!(pair_by_opponent(&one, &one, 2, false).is_err());
 
         // 片 arm に無い局は fail-closed
         let mut missing = cand.clone();
         missing.pop();
-        assert!(pair_by_opponent(&ctrl, &missing, false).is_err());
+        assert!(pair_by_opponent(&ctrl, &missing, 2, false).is_err());
 
         // 相手集合の不一致も fail-closed
         let mut wrong = cand.clone();
         wrong[3].baseline = "estimator_v12".into();
-        assert!(pair_by_opponent(&ctrl, &wrong, false).is_err());
+        assert!(pair_by_opponent(&ctrl, &wrong, 2, false).is_err());
 
         // 先後の食い違い = 別の条件列
         let mut flipped = cand.clone();
         flipped[0].a_is_sente = !flipped[0].a_is_sente;
-        assert!(pair_by_opponent(&ctrl, &flipped, false).is_err());
+        assert!(pair_by_opponent(&ctrl, &flipped, 2, false).is_err());
+
+        // **同じ相手に複数の match_seed を混ぜたら常に Err**（降格なし）。
+        // 両 arm が同じ2つの seed を持てばペア自体は成立してしまうので、
+        // ペアリングとは別にここで止める必要がある
+        let mut mixed_ctrl = ctrl.clone();
+        let mut mixed_cand = cand.clone();
+        for rows in [&mut mixed_ctrl, &mut mixed_cand] {
+            let mut extra = balance_row("estimator_v13", 2, 0.5);
+            extra.match_seed = 999;
+            rows.push(extra.clone());
+            let mut extra14 = balance_row("estimator_v14", 2, 0.5);
+            extra14.match_seed = 999;
+            rows.push(extra14);
+        }
+        assert!(
+            pair_by_opponent(&mixed_ctrl, &mixed_cand, 3, false).is_err(),
+            "seed 混在は期待局数が合っていても弾く"
+        );
+        assert!(
+            pair_by_opponent(&mixed_ctrl, &mixed_cand, 3, true).is_err(),
+            "--allow-incomplete でも seed 混在は降格しない"
+        );
     }
 
     /// 合算の点推定は「各相手の平均の単純平均」= 局数が偏っても 1/2 ずつ

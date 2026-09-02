@@ -220,9 +220,12 @@
     `--allow-incomplete` で警告へ降格）** で判定する（`check_policy combined` と
     同じ契約）。入力の同一性検査も fail-closed: arm 内・相手内の一意性
     （`assert_uniform`）に加え、**相手をまたいだ arm 設定の一致**（candidate /
-    clock / commit / 予算 / cand_config / cand_knobs / shared_env）と**相手ごとの
-    ペア局数の一致**・**arm 間の同一 commit**（issue #40 の対照は同一 commit の
-    W=0。別 commit の main は die）を要求する。予算不一致の override は無い。
+    clock / commit / 予算 / cand_config / cand_knobs / shared_env）・
+    **`--expect-games` は必須**（相手ごとのペア局数を事前登録した値と照合。
+    検証セットは 600）・**arm × 相手ごとに実効 match_seed は1つだけ**（複数 run の
+    混入は `--allow-incomplete` でも降格しない）・**arm 間は同一 candidate 名・
+    対照は W=0（cand_knobs 空）・同一 commit**（commit 不一致に override は無い。
+    別 commit の main は対照にできない）を要求する。予算不一致の override も無い。
     平均評価粒子数の門（対照比 −10% 超で中止）は games.jsonl に無いので
     arena-records の `chose.debug` から別途出す
 - `cargo run --release --bin tune -- [反復数] [評価あたり対局数] [基準...]` — 評価パラメータ
@@ -1399,15 +1402,18 @@
   — **戦力投資の限界効用の頻度・分類**（issue #40 P0-2 の粒子不要側、2026-09-01。
   まだ計測実績なし）。記録の真実を再生し、bot の受理手ごとに**自駒だけ**の
   利き枚数マップの差分を「需要帯 × しきい値横断 × gain/loss」で数えて、
-  **link-only drop**（紐は増えるが需要帯への first/second が0の打ち）と
+  **link-only drop**（link は増えるが需要帯への first/second が0の打ち）と
   **saturated promotion**（非捕獲・非王手の成りで正の利き増分の70%以上が
-  neutral × redundant）を相手別・手数帯別に集計する。粒子を回さないので一瞬。
+  neutral × redundant。**任意/強制を分けて数え、発火3%門の分母は任意成り** =
+  P1 の変更対象）を相手別・手数帯別に集計する。粒子を回さないので一瞬。
   定義の一次資料は `src/marginal_work.rs`（**事前登録**: 帯は own_king >
   opp_king（deduce 候補 ≤20 の和集合＋距離1）> backed_target（打ち反則・被捕獲の
   観測裏付け占有 = runtime の `opp_occupancy_evidence` が委譲で同一）>
   active_own_piece > neutral の排他、しきい値横断は first/second/redundant の
-  3段で飽和、帯マップは決定開始時に手番ごと1回。利き枚数は**玉を除く**が、
-  紐の本数判定だけは runtime の `linked_value` と同じく玉の守りも数える）。
+  3段で飽和、帯マップは決定開始時に手番ごと1回。利き枚数は**玉を含む全自駒**
+  （事前登録の「自駒利き枚数」どおり。runtime の `own_attack_counts` と同じ側）。
+  「正の link」判定は runtime の link 項と同じ `strategy::linked_value_of`
+  （働き重み込み。オフラインは粒子由来の敵玉重みだけ None）の増分で行う）。
   score 側の shadow 順位（粒子が要る）は `CandidateScore` に足した
   `promote_bias` / `drop_bias` 列（score 不変の内訳。rank_probe / rank_dump /
   hits に表示あり）で取る。`--dump` の TSV は両極端の手の抽出・レビュー用

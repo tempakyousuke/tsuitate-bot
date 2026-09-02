@@ -2924,6 +2924,64 @@ struct OwnEffects {
 ///
 /// `opp_king_w` は相手玉の信念からの距離重み（`opp_king_effect_weights`）。
 /// None なら V2 の相手玉側（`effect_opp`）は 0 のまま
+/// **紐の項の値**（`own_effects_after` が計算する `linked_value` と同じ定義の
+/// 単独公開版。issue #40 の link-only drop 分類がオフラインで runtime の
+/// `link` 列と同じ量の増分を使うため）。
+///
+/// - 入力は任意の自駒配置（着手前・着手後のどちらでも）
+/// - `opp_king_w` は runtime では粒子由来の敵玉重み。オフライン診断では
+///   再現できないので None を渡す = 働きの敵玉成分を 0 とみなす
+///   （自玉距離成分と `link_work_w` の飽和はそのまま効く）
+/// - **`own_effects_after` と別実装が乖離しないこと**はテスト
+///   `linked_value_ofはown_effects_afterと一致する` が固定する
+///   （ホットパスの `own_effects_after` はループ1回で複数の量を作るので、
+///   委譲でなくテストで同値性を守る）
+pub fn linked_value_of(
+    pieces: &[VisiblePiece],
+    color: Color,
+    you_in_check: bool,
+    params: &EvalParams,
+    opp_king_w: Option<&[f64; 81]>,
+) -> f64 {
+    let king = pieces
+        .iter()
+        .find(|p| p.role == Role::King)
+        .and_then(|p| parse_usi_square(&p.square));
+    let mut defended: HashSet<Coord> = HashSet::new();
+    let mut work_by_sq: HashMap<Coord, f64> = HashMap::new();
+    for p in pieces {
+        let d = defend_targets(pieces, p, color);
+        if let Some(sq) = parse_usi_square(&p.square) {
+            let work: f64 = d
+                .iter()
+                .map(|&s| {
+                    king.map_or(0.0, |k| king_dist_weight(cheb(s, k)))
+                        + opp_king_w.map_or(0.0, |w| w[crate::belief_features::sq_index(s)])
+                })
+                .sum();
+            work_by_sq.insert(sq, work);
+        }
+        defended.extend(d);
+    }
+    let lw = if you_in_check { 0.0 } else { params.link_work_w };
+    let work_ref = params.link_work_ref.max(1e-6);
+    pieces
+        .iter()
+        .filter(|p| p.role != Role::King)
+        .filter_map(|p| parse_usi_square(&p.square).map(|c| (c, p.role)))
+        .filter(|(c, _)| defended.contains(c))
+        .map(|(c, role)| {
+            let factor = if lw == 0.0 {
+                1.0
+            } else {
+                let work = work_by_sq.get(&c).copied().unwrap_or(0.0);
+                (1.0 - lw) + lw * (work / work_ref).min(1.0)
+            };
+            exchange_value(role) * factor
+        })
+        .sum()
+}
+
 fn own_effects_after(
     view: &PlayerView,
     mv: &ShogiMove,
@@ -14310,6 +14368,49 @@ pub(crate) mod tests {
             &EvalParams::default(),
         );
         assert!(two.linked_value > stay.linked_value);
+    }
+
+    /// `linked_value_of`（issue #40 のオフライン分類用の公開版）が
+    /// `own_effects_after` の linked_value と**数値一致**すること。
+    /// 別実装なので、ここがずれたら「link-only drop の『正の link』が
+    /// runtime の link 項と別物」に戻ってしまう
+    #[test]
+    fn linked_value_ofはown_effects_afterと一致する() {
+        let params = EvalParams::default();
+        let cases: Vec<(Vec<VisiblePiece>, &str)> = vec![
+            (
+                vec![
+                    VisiblePiece { square: "5i".into(), role: Role::King },
+                    VisiblePiece { square: "5h".into(), role: Role::Gold },
+                    VisiblePiece { square: "4h".into(), role: Role::Silver },
+                    VisiblePiece { square: "1c".into(), role: Role::Rook },
+                ],
+                "5i4i",
+            ),
+            (
+                vec![
+                    VisiblePiece { square: "5i".into(), role: Role::King },
+                    VisiblePiece { square: "9i".into(), role: Role::Lance },
+                ],
+                "9i9h",
+            ),
+        ];
+        for (pieces, usi) in cases {
+            for in_check in [false, true] {
+                let mut view = minimal_view(pieces.clone(), HashMap::new());
+                view.you_in_check = in_check;
+                let mv = parse_usi(usi).unwrap();
+                let expected =
+                    own_effects_after(&view, &mv, None, None, &params).linked_value;
+                // own_effects_after は着手後の配置で数えるので、同じ着手後配置を作る
+                let after = crate::check_prep::pieces_after(&view.your_pieces, &mv);
+                let got = linked_value_of(&after, view.your_color, in_check, &params, None);
+                assert!(
+                    (expected - got).abs() < 1e-12,
+                    "{usi} in_check={in_check}: own_effects={expected} vs linked_value_of={got}"
+                );
+            }
+        }
     }
 
     #[test]
