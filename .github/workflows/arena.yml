@@ -67,9 +67,11 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     # contents: write は held-out の claim タグ（取り直しの台帳）を**計測前に**
-    # 取得するためだけ（PR #41 レビュー7巡目）
+    # 取得するためだけ（PR #41 レビュー7巡目）。actions: read は
+    # 「対照 run が success で完了しているか」の照合用（同8巡目）
     permissions:
       contents: write
+      actions: read
     outputs:
       skip: ${{ steps.split.outputs.skip }}
       baselines: ${{ steps.split.outputs.baselines }}
@@ -204,10 +206,17 @@ jobs:
               exit 1
             fi
             # **claim を取る前に「合算器へ渡せる run か」を固定する**（PR #41
-            # レビュー7巡目 [P1]: 判定不能になる run が claim を消費すると、
+            # レビュー7〜8巡目 [P1]: 判定不能になる run が claim を消費すると、
             # 正しい再実行が永久に拒否される）。oracle / 両側 env / 時計変更 /
             # re-run は判定不能・die の対象なので起動自体を拒否し、cand arm は
             # pair_with 必須（ctrl arm は禁止）・cand_env は manifest と完全一致
+            if [ "${GITHUB_RUN_ATTEMPT:-1}" != "1" ]; then
+              # re-run の plan が「attempt 1 の失敗で解放された slot」を再取得すると、
+              # shard が attempt≠1 で全滅し release-claim も解放を拒む =
+              # 1局も指されないまま slot が永久に埋まる（レビュー8巡目の再現）
+              echo "held-out run は re-run から起動できません（新しい run を dispatch してください）" >&2
+              exit 1
+            fi
             if [ -n "$oracle" ]; then
               echo "held-out run に oracle は使えません（合算器が die する）" >&2; exit 1
             fi
@@ -217,6 +226,7 @@ jobs:
             if [ -n "$clock" ]; then
               echo "held-out run の時計は既定（1000+3）のまま起動してください" >&2; exit 1
             fi
+            fp=$(sha256sum "$balance_manifest" | cut -c1-16)
             if [ -n "$cand_env" ]; then
               arm=cand
               if [ -z "$pair_with" ]; then
@@ -227,19 +237,42 @@ jobs:
               if [ "$got_knobs" != "$want_knobs" ]; then
                 echo "cand_env [$got_knobs] が manifest の cand_knobs [$want_knobs] と一致しません" >&2; exit 1
               fi
+              # **pair_with は「対照 claim の owner run で、成功完了済み」でなければ
+              # ならない**（レビュー8巡目 [P1]: typo・実行中・失敗した対照を指した
+              # candidate run が claim を消費すると、その record は最終合算に使えない
+              # のに正しい取り直しが拒否される。issue #40 の「対照を先に完了」も
+              # ここで機械保証する）
+              ctrl_claim="balance-claim/${fp}/ctrl-${baselines}"
+              if ! git ls-remote --exit-code origin "refs/tags/$ctrl_claim" >/dev/null 2>&1; then
+                echo "対照の claim（$ctrl_claim）がありません。対照 run を先に完了させてください" >&2
+                exit 1
+              fi
+              git fetch --quiet origin "+refs/tags/${ctrl_claim}:refs/tags/${ctrl_claim}"
+              ctrl_owner=$(git cat-file -p "refs/tags/$ctrl_claim" | sed '1,/^$/d' | jq -r '.run_id')
+              if [ -z "$ctrl_owner" ] || [ "$ctrl_owner" = "null" ] || [ "$ctrl_owner" != "$pair_with" ]; then
+                echo "pair_with=$pair_with が対照 claim の owner run（${ctrl_owner:-不明}）と一致しません" >&2
+                exit 1
+              fi
+              ctrl_status=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ctrl_owner}" --jq '[.status, .conclusion // ""] | join("/")')
+              if [ "$ctrl_status" != "completed/success" ]; then
+                echo "対照 run ${ctrl_owner} が success で完了していません（${ctrl_status}）" >&2
+                exit 1
+              fi
             else
               arm=ctrl
               if [ -n "$pair_with" ]; then
                 echo "対照 run に pair_with は付けません（候補 run が対照を指す向きだけ）" >&2; exit 1
               fi
             fi
-            fp=$(sha256sum "$balance_manifest" | cut -c1-16)
             claim="balance-claim/${fp}/${arm}-${baselines}"
             if git ls-remote --exit-code origin "refs/tags/$claim" >/dev/null 2>&1; then
               echo "この (manifest, ${arm}, ${baselines}) の run は既にあります（tag $claim）。" >&2
               echo "同じ実験の取り直しは事前登録違反です。別の実験なら新しい manifest を commit してください" >&2
               exit 1
             fi
+            # **claim 名は取得より先に output へ書く**（取得後にこのステップが
+            # 落ちても release-claim が claim 名を受け取れるように）
+            echo "claim=$claim" >> "$GITHUB_OUTPUT"
             # **claim は計測前にここで取得する**（PR #41 レビュー7巡目 [P1]:
             # 成功後に押す方式は、同時 dispatch の両方が完走して artifact を
             # 残し、未claim側を後から選べた）。annotated tag の message に
@@ -588,7 +621,11 @@ jobs:
   # 成功済み run の re-run で claim を消す経路を塞ぐ）
   release-claim:
     needs: [plan, arena]
-    if: always() && needs.plan.result == 'success' && needs.plan.outputs.claim != '' && needs.arena.result != 'success'
+    # plan が claim 取得後に落ちた/cancel された経路もここで解放する
+    # （PR #41 レビュー8巡目: plan.result == success を条件にすると、その経路の
+    # claim が lock leak になる。claim 名は取得より先に output へ書かれている）。
+    # 「plan 成功かつ対局完走」だけが claim を保持する
+    if: always() && needs.plan.outputs.claim != '' && !(needs.plan.result == 'success' && needs.arena.result == 'success')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -603,9 +640,12 @@ jobs:
             exit 0
           fi
           claim='${{ needs.plan.outputs.claim }}'
-          # 念のため: この run が取得した claim であることを message の記録で
-          # 確かめてから消す（別 run の claim を巻き添えにしない）
-          tag_obj=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$claim" --jq .object.sha)
+          # plan が claim 名を出した後・取得の前に落ちた run ではタグが無い。
+          # その場合は何もしない（404 で step を赤くしない）
+          if ! tag_obj=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$claim" --jq .object.sha 2>/dev/null); then
+            echo "claim タグ $claim が無い（取得前に落ちた run）。解放不要"
+            exit 0
+          fi
           owner_run=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/$tag_obj" --jq .message | jq -r '.run_id' 2>/dev/null || echo "")
           if [ "$owner_run" != "${GITHUB_RUN_ID}" ]; then
             echo "claim $claim は run ${owner_run:-不明} の取得。解放しない"

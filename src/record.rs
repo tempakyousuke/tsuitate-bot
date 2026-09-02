@@ -73,6 +73,21 @@ impl GameRecorder {
         self.write_line(&json!({ "type": "obs", "ts": now_ms(), "event": obs }));
     }
 
+    /// 記録の由来（アリーナの run 識別・相手・shard・game 番号など）。
+    /// **match ヘッダの直後に1行**書く。arena-balance の粒子数 veto が
+    /// 「この record は判定対象の run のものか」を games.jsonl と突き合わせる
+    /// のに使う（PR #41 レビュー8巡目: 由来の無い record は別 run の粒子数で
+    /// veto を通せてしまう）
+    pub fn meta(&mut self, fields: &serde_json::Map<String, serde_json::Value>) {
+        let mut obj = serde_json::Map::new();
+        obj.insert("type".into(), json!("meta"));
+        obj.insert("ts".into(), json!(now_ms()));
+        for (k, v) in fields {
+            obj.insert(k.clone(), v.clone());
+        }
+        self.write_line(&serde_json::Value::Object(obj));
+    }
+
     /// 自分が選んだ手（受理/反則が確定する前）と思考時間。
     /// debug は戦略の内部状態サマリ（推定の健全性・相手玉分布など。ないなら None）
     pub fn chosen(

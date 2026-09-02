@@ -3443,23 +3443,76 @@ fn manifest_content_notes(v: &serde_json::Value, rows_candidate: &str, rows_cloc
 /// できないまま pass=true を出さない）
 const BALANCE_PARTICLE_DROP: f64 = 0.10;
 
-/// 1記録テキストぶんの粒子集計: (決定数, unique_particles の総和, 欠測した chose 行数)
-fn particle_stats_from_text(text: &str) -> (usize, u64, usize) {
+/// record の由来 meta（`selfplay::write_record` が先頭へ書く。PR #41
+/// レビュー8巡目 [P1]: 由来の無い record 集計は、別 run・重複・欠落の
+/// 粒子数で veto を通せてしまう）
+#[derive(Debug, Clone)]
+struct RecordMeta {
+    run_id: Option<String>,
+    run_attempt: Option<u64>,
+    baseline: String,
+    game_no: u64,
+    base: Option<u64>,
+    shard: Option<u64>,
+    manifest: Option<String>,
+}
+
+/// 1 record ファイルの**厳格**解析: 壊れた JSON 行は Err（黙って捨てると
+/// 平均を選択標本にできる）、`end` の無い未完 record も Err。
+/// 返り値は (meta（無い record は None）, 決定数, unique_particles の総和,
+/// unique_particles の無い chose 行数)
+fn parse_record_strict(
+    text: &str,
+    where_: &str,
+) -> Result<(Option<RecordMeta>, usize, u64, usize), String> {
     let (mut n, mut sum, mut missing) = (0usize, 0u64, 0usize);
-    for line in text.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else { continue };
-        if v.get("type").and_then(|t| t.as_str()) != Some("chose") {
+    let mut meta: Option<RecordMeta> = None;
+    let mut ended = false;
+    for (ln, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
             continue;
         }
-        match v.get("debug").and_then(|d| d.get("unique_particles")).and_then(|u| u.as_u64()) {
-            Some(u) => {
-                n += 1;
-                sum += u;
+        let v: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| format!("{where_}:{}: JSON として読めません: {e}", ln + 1))?;
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("meta") => {
+                let opt_s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+                let opt_u = |k: &str| v.get(k).and_then(|x| x.as_u64());
+                meta = Some(RecordMeta {
+                    run_id: opt_s("run_id"),
+                    run_attempt: opt_u("run_attempt"),
+                    baseline: opt_s("baseline")
+                        .ok_or_else(|| format!("{where_}: meta に baseline がありません"))?,
+                    game_no: opt_u("game_no")
+                        .ok_or_else(|| format!("{where_}: meta に game_no がありません"))?,
+                    base: opt_u("match_seed_base"),
+                    shard: opt_u("match_seed_shard"),
+                    manifest: opt_s("balance_manifest"),
+                });
             }
-            None => missing += 1,
+            Some("chose") => {
+                match v
+                    .get("debug")
+                    .and_then(|d| d.get("unique_particles"))
+                    .and_then(|u| u.as_u64())
+                {
+                    Some(u) => {
+                        n += 1;
+                        sum += u;
+                    }
+                    None => missing += 1,
+                }
+            }
+            Some("end") => ended = true,
+            _ => {}
         }
     }
-    (n, sum, missing)
+    if !ended {
+        return Err(format!(
+            "{where_}: end イベントの無い未完 record です（途中で切れた record を平均に混ぜない）"
+        ));
+    }
+    Ok((meta, n, sum, missing))
 }
 
 struct ParticleSummary {
@@ -3468,6 +3521,8 @@ struct ParticleSummary {
     mean: f64,
     /// debug.unique_particles を持たない chose 行（> 0 なら判定不能ノート行き）
     missing: usize,
+    /// 由来 meta（meta の無い record は入らない = 由来を照合できない）
+    metas: Vec<RecordMeta>,
 }
 
 /// `--records-*` のパス（ファイル or ディレクトリ。ディレクトリは再帰で
@@ -3492,10 +3547,15 @@ fn particle_summary(paths: &[String], arm: &str) -> ParticleSummary {
         die(&format!("{arm}: --records に *.jsonl が1つもありません（{paths:?}）"));
     }
     let (mut n, mut sum, mut missing) = (0usize, 0u64, 0usize);
+    let mut metas = vec![];
     for f in &files {
         let text = std::fs::read_to_string(f)
             .unwrap_or_else(|e| die(&format!("{}: {e}", f.display())));
-        let (a, b, c) = particle_stats_from_text(&text);
+        let (m, a, b, c) = parse_record_strict(&text, &format!("{arm} {}", f.display()))
+            .unwrap_or_else(|e| die(&e));
+        if let Some(m) = m {
+            metas.push(m);
+        }
         n += a;
         sum += b;
         missing += c;
@@ -3505,7 +3565,118 @@ fn particle_summary(paths: &[String], arm: &str) -> ParticleSummary {
         decisions: n,
         mean: if n > 0 { sum as f64 / n as f64 } else { f64::NAN },
         missing,
+        metas,
     }
+}
+
+/// **record の由来を games.jsonl と一対一で照合する**（PR #41 レビュー8巡目 [P1]）。
+/// - 全 record に完全な meta（run 識別・base・shard）が揃っているときだけ
+///   厳格照合: (baseline, base, shard, game_no) の**重複は Err**、games 行の
+///   鍵集合と**完全一致でなければ Err**（同じディレクトリを2回渡す・別 run の
+///   1200 ファイル・欠落 = すべてここで止まる）、run 識別は games 行と一致、
+///   manifest 指紋は `--manifest` と一致（違えば Err）
+/// - meta が不完全な record が1つでもあれば照合できないので**判定不能ノート**
+///   （informational な平均は出るが「通過」は出せない）
+/// 返り値: Ok(判定不能ノート) / Err(die)
+fn verify_record_provenance(
+    s: &ParticleSummary,
+    rows: &[GameRow],
+    arm: &str,
+    manifest_fp: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut notes = vec![];
+    let incomplete = s
+        .metas
+        .iter()
+        .filter(|m| {
+            m.run_id.is_none() || m.run_attempt.is_none() || m.base.is_none() || m.shard.is_none()
+        })
+        .count();
+    if s.games != s.metas.len() || incomplete > 0 {
+        notes.push(format!(
+            "{arm}: 由来 meta の無い/不完全な record が {} 件 = games.jsonl と一対一照合できない",
+            (s.games - s.metas.len()) + incomplete
+        ));
+        return Ok(notes);
+    }
+    // 鍵の重複（同じディレクトリの二重指定・record のコピー）
+    let mut keys: BTreeMap<(String, u64, u64, u64), usize> = BTreeMap::new();
+    for m in &s.metas {
+        *keys
+            .entry((m.baseline.clone(), m.base.unwrap(), m.shard.unwrap(), m.game_no))
+            .or_default() += 1;
+    }
+    if let Some((k, c)) = keys.iter().find(|(_, c)| **c > 1) {
+        return Err(format!(
+            "{arm}: 同じ record 鍵 {k:?} が {c} 件あります（同じディレクトリの二重指定・record の重複）"
+        ));
+    }
+    // games.jsonl の鍵集合との完全一致（別 run の records・欠落・余剰を止める）
+    let row_keys: BTreeSet<(String, u64, u64, u64)> = rows
+        .iter()
+        .map(|r| (r.baseline.clone(), r.match_seed_base, r.match_seed_shard, r.game_no))
+        .collect();
+    let rec_keys: BTreeSet<(String, u64, u64, u64)> = keys.into_keys().collect();
+    if rec_keys != row_keys {
+        let only_rec = rec_keys.difference(&row_keys).count();
+        let only_row = row_keys.difference(&rec_keys).count();
+        return Err(format!(
+            "{arm}: record の鍵集合が games.jsonl と一致しません（record のみ {only_rec} 件 / games のみ {only_row} 件）。\n            判定対象の run の arena-records をそのまま渡してください"
+        ));
+    }
+    // run 識別と manifest 指紋（baseline ごとの games 行と突き合わせる）
+    let run_of: BTreeMap<&str, (&str, u64)> = rows
+        .iter()
+        .map(|r| (r.baseline.as_str(), (r.run_id.as_str(), r.run_attempt)))
+        .collect();
+    for m in &s.metas {
+        let want = run_of.get(m.baseline.as_str()).expect("鍵集合一致を検査済み");
+        let got = (m.run_id.as_deref().unwrap(), m.run_attempt.unwrap());
+        if got != *want {
+            return Err(format!(
+                "{arm}({}): record の run 識別 {got:?} が games.jsonl の {want:?} と違います（別 run の records）",
+                m.baseline
+            ));
+        }
+        if let Some(fp) = manifest_fp {
+            match m.manifest.as_deref() {
+                None => {
+                    notes.push(format!(
+                        "{arm}({}): record に manifest 指紋がありません",
+                        m.baseline
+                    ));
+                }
+                Some(x) if x != fp => {
+                    return Err(format!(
+                        "{arm}({}): record の manifest 指紋が --manifest と一致しません",
+                        m.baseline
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    notes.dedup();
+    Ok(notes)
+}
+
+/// claim 台帳（annotated tag）の記録を読む（PR #41 レビュー8巡目 [P1]:
+/// 台帳を読まない合算器は、台帳外の artifact を最終入力に選ばれても
+/// 気づけない）。タグが無ければ Ok(None)
+fn read_claim_record(repo: &str, tag: &str) -> Result<Option<serde_json::Value>, String> {
+    let out = std::process::Command::new("git")
+        .args(["-C", repo, "cat-file", "-p", &format!("refs/tags/{tag}")])
+        .output()
+        .map_err(|e| format!("git を実行できません: {e}"))?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // annotated tag: ヘッダ行 → 空行 → message（plan が JSON を書く）
+    let msg = text.split_once("\n\n").map(|(_, m)| m).unwrap_or("");
+    serde_json::from_str(msg.trim())
+        .map(Some)
+        .map_err(|e| format!("claim タグ {tag} の message が JSON ではありません: {e}"))
 }
 
 /// 最終判定: 入力が事前登録の条件を満たさない（判定不能の理由がある）とき、
@@ -4105,6 +4276,56 @@ fn cmd_arena_balance(args: &Args) {
         }
     }
 
+    // **claim 台帳との照合**（PR #41 レビュー8巡目 [P1]）。plan が計測前に取得した
+    // annotated tag の message（run_id / run_attempt）と、最終入力の run を
+    // arm × 相手ごとに突き合わせ、**台帳外の artifact（タグ欠落・別 run）で
+    // 判定させない**。タグは `--repo`（既定 `.`）の git から読む: 先に
+    // `git fetch origin '+refs/tags/balance-claim/*'` を試み、失敗は
+    // ローカルタグでの照合に落として判定不能ノートにする
+    if let Some((fp, _)) = &manifest {
+        let repo = args.get("repo").unwrap_or(".").to_string();
+        let fetched = std::process::Command::new("git")
+            .args([
+                "-C",
+                &repo,
+                "fetch",
+                "--quiet",
+                "origin",
+                "+refs/tags/balance-claim/*:refs/tags/balance-claim/*",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !fetched {
+            indeterminate
+                .push("claim 台帳を origin から fetch できない（ローカルのタグで照合）".into());
+        }
+        let fp16 = &fp[..16];
+        for opp in &opps {
+            for (label, rows) in [("ctrl", &ctrl), ("cand", &cand)] {
+                let tag = format!("balance-claim/{fp16}/{label}-{opp}");
+                let Some(row) = rows.iter().find(|r| &r.baseline == opp) else { continue };
+                match read_claim_record(&repo, &tag).unwrap_or_else(|e| die(&e)) {
+                    None => indeterminate.push(format!(
+                        "claim タグ {tag} が見つからない = 台帳外の入力（held-out は plan が計測前に取得する）"
+                    )),
+                    Some(v) => {
+                        let owner = (
+                            v["run_id"].as_str().unwrap_or("").to_string(),
+                            v["run_attempt"].as_u64().unwrap_or(0),
+                        );
+                        if owner != (row.run_id.clone(), row.run_attempt) {
+                            die(&format!(
+                                "{label}({opp}): claim 台帳の owner {owner:?} と入力の run ({}, {}) が違います\n            （台帳外の artifact は判定に使えません）",
+                                row.run_id, row.run_attempt
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // **平均評価粒子数の veto の入力**（arena-records。PR #41 レビュー7巡目 [P1]:
     // 「別途出す」の注記だけでは、粒子数が2割減った候補でも pass=true が出ていた）。
     // 未指定は判定不能 = veto を検証できないまま「通過」を出さない
@@ -4121,20 +4342,19 @@ fn cmd_arena_balance(args: &Args) {
             (false, false) => {
                 let sc = particle_summary(&rec_ctrl, "control");
                 let st = particle_summary(&rec_cand, "candidate");
-                for (arm, s) in [("control", &sc), ("candidate", &st)] {
+                let fp = manifest.as_ref().map(|(fp, _)| fp.as_str());
+                for (arm, s, rows) in [("control", &sc, &ctrl), ("candidate", &st, &cand)] {
                     if s.missing > 0 {
                         indeterminate.push(format!(
                             "{arm}: unique_particles の無い chose 行が {} 行（記録の版が古い？）",
                             s.missing
                         ));
                     }
-                    let want = expect_games * expect_opps.len();
-                    if s.games != want {
-                        indeterminate.push(format!(
-                            "{arm}: arena-records の対局数 {} ≠ 期待 {want}（record の欠落は粒子平均を選択標本にする）",
-                            s.games
-                        ));
-                    }
+                    // **record の由来を games.jsonl と一対一照合**（PR #41
+                    // レビュー8巡目: 重複・別 run・欠落・manifest 不一致は die）
+                    indeterminate.extend(
+                        verify_record_provenance(s, rows, arm, fp).unwrap_or_else(|e| die(&e)),
+                    );
                 }
                 Some(((sc.mean, st.mean), (sc, st)))
             }
@@ -4992,20 +5212,124 @@ mod tests {
         assert!(balance_verdict(&BalanceGate { particles: None, ..ok.clone() }).0);
     }
 
-    /// arena-records から粒子平均を出す入力の解析（`chose.debug.unique_particles`）
+    /// arena-records の**厳格**解析（`chose.debug.unique_particles`）。
+    /// 壊れた行・未完 record は fail-closed（黙って捨てると平均を選択標本にできる）
     #[test]
     fn arena_balance_particle_stats_parse_records() {
         let text = concat!(
+            r#"{"type":"meta","run_id":"r1","run_attempt":1,"baseline":"estimator_v13","game_no":3,"match_seed_base":20260910,"match_seed_shard":2,"balance_manifest":"aa"}"#, "\n",
             r#"{"type":"obs","event":{}}"#, "\n",
             r#"{"type":"chose","move_number":1,"usi":"7g7f","think_ms":1200,"debug":{"unique_particles":180,"sample_slots":192}}"#, "\n",
             r#"{"type":"chose","move_number":3,"usi":"2g2f","think_ms":1100,"debug":{"unique_particles":120}}"#, "\n",
             r#"{"type":"chose","move_number":5,"usi":"2f2e","think_ms":900,"debug":{}}"#, "\n",
             r#"{"type":"end","payload":{}}"#, "\n",
         );
-        let (n, sum, missing) = particle_stats_from_text(text);
+        let (meta, n, sum, missing) = parse_record_strict(text, "t").expect("正常な record");
         assert_eq!((n, sum), (2, 300), "chose の unique_particles だけを数える");
         assert_eq!(missing, 1, "unique_particles の無い chose 行は欠測として数える（黙って捨てない）");
-        assert_eq!(particle_stats_from_text(""), (0, 0, 0));
+        let m = meta.expect("meta が読める");
+        assert_eq!((m.run_id.as_deref(), m.run_attempt), (Some("r1"), Some(1)));
+        assert_eq!((m.baseline.as_str(), m.game_no, m.base, m.shard), ("estimator_v13", 3, Some(20260910), Some(2)));
+
+        // **壊れた JSON 行は Err**（黙って捨てない）
+        let broken = format!("{text}not-json\n");
+        assert!(parse_record_strict(&broken, "t").is_err());
+        // **end の無い未完 record も Err**
+        let unfinished = text.rsplit_once(r#"{"type":"end""#).unwrap().0;
+        assert!(parse_record_strict(unfinished, "t").is_err(), "未完 record は拒否");
+    }
+
+    /// **record の由来を games.jsonl と一対一照合する**（PR #41 レビュー8巡目 [P1]:
+    /// 同じディレクトリの二重指定・別 run の records・欠落・manifest 不一致で
+    /// veto を通せない）
+    #[test]
+    fn arena_balance_record_provenance_is_matched_against_games() {
+        let meta = |baseline: &str, game_no: u64, run: &str| RecordMeta {
+            run_id: Some(run.into()),
+            run_attempt: Some(1),
+            baseline: baseline.into(),
+            game_no,
+            base: Some(1),
+            shard: Some(0),
+            manifest: Some("fp".into()),
+        };
+        let rows: Vec<GameRow> = (0..2u64)
+            .map(|g| {
+                let mut r = balance_row("estimator_v13", g, 0.5);
+                r.run_id = "r1".into();
+                r
+            })
+            .collect();
+        let summary = |metas: Vec<RecordMeta>| ParticleSummary {
+            games: metas.len(),
+            decisions: 10,
+            mean: 100.0,
+            missing: 0,
+            metas,
+        };
+        let ok = summary(vec![meta("estimator_v13", 0, "r1"), meta("estimator_v13", 1, "r1")]);
+        assert!(
+            verify_record_provenance(&ok, &rows, "control", Some("fp"))
+                .expect("一致する入力は通る")
+                .is_empty()
+        );
+        // 重複（同じディレクトリを2回渡した）は Err
+        let dup = summary(vec![meta("estimator_v13", 0, "r1"), meta("estimator_v13", 0, "r1")]);
+        assert!(verify_record_provenance(&dup, &rows, "control", Some("fp")).is_err());
+        // 鍵集合の不一致（欠落・余剰・別 seed の records）は Err
+        let short = summary(vec![meta("estimator_v13", 0, "r1")]);
+        assert!(verify_record_provenance(&short, &rows, "control", Some("fp")).is_err());
+        // 別 run の records は Err
+        let other =
+            summary(vec![meta("estimator_v13", 0, "r2"), meta("estimator_v13", 1, "r2")]);
+        assert!(verify_record_provenance(&other, &rows, "control", Some("fp")).is_err());
+        // manifest 指紋の不一致も Err
+        assert!(verify_record_provenance(&ok, &rows, "control", Some("other-fp")).is_err());
+        // meta の無い/不完全な record は照合できない = 判定不能ノート（通過を出せない）
+        let mut incomplete = summary(vec![meta("estimator_v13", 0, "r1")]);
+        incomplete.games = 2; // 2ファイル中 meta は1つ
+        let notes = verify_record_provenance(&incomplete, &rows, "control", Some("fp"))
+            .expect("ノートへ落ちる");
+        assert!(!notes.is_empty() && !balance_final(true, &notes).1);
+    }
+
+    /// claim 台帳（annotated tag）の読み出し。plan が書く JSON message を
+    /// git cat-file 経由で取り出せること・無いタグは None
+    #[test]
+    fn arena_balance_reads_claim_ledger_from_git() {
+        let dir = std::env::temp_dir().join(format!("claim-ledger-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-q", "-m", "x"]);
+        git(&[
+            "-c", "user.email=t@t", "-c", "user.name=t",
+            "tag", "-a", "balance-claim/abc/ctrl-estimator_v13",
+            "-m", r#"{"run_id":"33701","run_attempt":1,"arm":"ctrl","baseline":"estimator_v13"}"#,
+        ]);
+        let repo = dir.to_string_lossy().to_string();
+        let rec = read_claim_record(&repo, "balance-claim/abc/ctrl-estimator_v13")
+            .expect("読める")
+            .expect("タグがある");
+        assert_eq!(rec["run_id"], "33701");
+        assert_eq!(rec["run_attempt"], 1);
+        assert!(
+            read_claim_record(&repo, "balance-claim/abc/cand-estimator_v13")
+                .expect("エラーではない")
+                .is_none(),
+            "無いタグは None（= 台帳外ノート行き）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 判定不能の理由が1つでもあれば、数値の門が通っていても最終判定は

@@ -252,10 +252,18 @@
     `balance-claim/<manifest指紋16>/<arm>-<相手>` タグを **plan が計測前に取得**
     （annotated tag の message に run_id / attempt を記録 = どの実行が slot を
     取ったかの不変記録。同時 dispatch の後着は ref 作成の 422 で対局前に落ちる
-    ので、未claim の完走 artifact は生まれない）。**解放は「対局が完走しなかった
-    attempt 1 の run」だけ**（release-claim ジョブ。aggregate の失敗では解放
-    しない = 計測は存在しているため。held-out run の re-run attempt は shard が
-    起動時に拒否）。タグは永続なので事後監査もできる。
+    ので、未claim の完走 artifact は生まれない）。**re-run attempt は plan が
+    claim 取得前に拒否**（解放済み slot を再claimして1局も指さず埋める穴。
+    レビュー8巡目）。**cand arm の claim は「対照 claim の owner run ==
+    pair_with かつその run が success 完了」を確認してから取得**（typo・実行中・
+    失敗した対照を指した candidate が claim を消費しない = 「対照を先に完了」の
+    機械保証）。**解放は「対局が完走しなかった attempt 1 の run」だけ**
+    （release-claim ジョブ。claim 名は取得より先に output へ書くので、plan が
+    取得後に落ちた経路も解放できる。aggregate の失敗では解放しない = 計測は
+    存在しているため）。**合算器も台帳を照合する**: `--manifest` 指定時は
+    `--repo`（既定 `.`）の git から claim タグを fetch して読み、arm × 相手の
+    入力 run が台帳の owner と違えば die・タグが無ければ判定不能（台帳外の
+    artifact で判定させない）。タグは永続なので事後監査もできる。
     **実験条件も事前登録と照合する**: 実効予算は両 arm・両側とも 2000ms
     （`BALANCE_BUDGET_MS`。arm 間の一致だけだと「両方 700ms」が通る）・両側 env
     なし・**診断オラクル（games.jsonl **schema 5** で `oracle` 列を必須記録）は
@@ -283,11 +291,16 @@
     run 混入・pair_with 不一致・指紋不一致・oracle 非空は `--allow-incomplete` でも
     降格しない。
     予算不一致の override も無い。**平均評価粒子数の門（対照比 −10% 超で中止）は
-    verdict に入っている**（PR #41 レビュー7巡目）: 粒子数は games.jsonl に
+    verdict に入っている**（PR #41 レビュー7〜8巡目）: 粒子数は games.jsonl に
     無いので、同じ run の `arena-records-*` を `--records-control` /
     `--records-candidate` で渡す（`chose.debug.unique_particles` の平均。
-    展開先ディレクトリごと渡せる）。**この入力の無い集計は判定不能**、
-    対局数と record 本数の不一致・`unique_particles` の無い chose 行も判定不能
+    展開先ディレクトリごと渡せる）。**record は由来 meta を持ち、games.jsonl と
+    一対一で照合される**（`selfplay::write_record` が match ヘッダ直後へ
+    run 識別・baseline・base/shard・game_no・manifest 指紋の meta 行を書く。
+    (baseline, base, shard, game_no) の重複・鍵集合の不一致・別 run の record・
+    manifest 指紋不一致・壊れた JSON 行・end の無い未完 record は **die**）。
+    **records 入力の無い集計・meta の無い/不完全な record・`unique_particles` の
+    無い chose 行は判定不能**
 - `cargo run --release --bin tune -- [反復数] [評価あたり対局数] [基準...]` — 評価パラメータ
   （`strategy::EvalParams`）のSPSA自動チューニング。目的関数はアリーナのスコア率
   （引き分け=0.5勝）。**f+/f− は共通乱数法でペアリングされる**: 同じ対局シード列

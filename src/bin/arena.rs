@@ -139,43 +139,9 @@ fn check_seed_provenance(
     Ok(())
 }
 
-/// **実行の識別子**（PR #41 レビュー4巡目 [P1]）。
-///
-/// `match_seed_base` は**実験条件**であって実行の識別子ではない: 同じ base で
-/// 取り直した2つの run から shard を半分ずつ選ぶと、base は1値・shard 集合は
-/// 完全・局数も一致して、下流の「複数 run を混ぜない」検査をすべて通ってしまう。
-/// 壁時計予算で同じ seed でも結果が揺れるこのリポジトリでは、それは
-/// 「門付近での取り直し」を機械検査できないことと同じ。そこで
-/// `ARENA_GAMES_JSON` を書く run には実行の識別子を必須にする:
-/// CI は `GITHUB_RUN_ID` / `GITHUB_RUN_ATTEMPT`（Actions が全ジョブに立てる
-/// 既定 env。re-run attempt も別実行として区別する）、ローカルは明示的な
-/// `ARENA_EXPERIMENT_ID`（attempt は 1）。どちらも無ければ起動時に落とす
-/// （書き出し時に落とすと対局が丸ごと無駄になる）。
-fn resolve_run_identity(
-    github_run_id: Option<String>,
-    github_run_attempt: Option<String>,
-    experiment_id: Option<String>,
-) -> Result<(String, u64), String> {
-    if let Some(id) = github_run_id.filter(|s| !s.trim().is_empty()) {
-        // ID があるのに attempt が無い・数値でないときは黙って 1 にしない
-        // （check_seed_provenance と同じ姿勢: 欠測は「一致」ではない）
-        let attempt = github_run_attempt
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| "GITHUB_RUN_ID があるのに GITHUB_RUN_ATTEMPT がありません".to_string())?
-            .parse::<u64>()
-            .map_err(|_| "GITHUB_RUN_ATTEMPT は非負整数で指定してください".to_string())?;
-        return Ok((id.trim().to_string(), attempt));
-    }
-    if let Some(id) = experiment_id.filter(|s| !s.trim().is_empty()) {
-        return Ok((id.trim().to_string(), 1));
-    }
-    Err("ARENA_GAMES_JSON には実行の識別子が必須です（同じ base seed で取り直した\n\
-         複数 run の混入検査に使う）。CI は GITHUB_RUN_ID / GITHUB_RUN_ATTEMPT（自動）、\n\
-         ローカルは ARENA_EXPERIMENT_ID=<一意な名前> を指定してください"
-        .into())
-}
+// 実行の識別子（resolve_run_identity）は record の由来 meta と共有するため
+// selfplay.rs へ移した（PR #41 レビュー8巡目）
+use tsuitate_bot::selfplay::resolve_run_identity;
 
 /// validation manifest の指紋（issue #40 の held-out 採否用、PR #41 レビュー4巡目）。
 ///
