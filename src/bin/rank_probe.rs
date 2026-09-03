@@ -48,6 +48,12 @@ fn main() {
                     if c.own_zone != 0.0 {
                         s.push_str(&format!(" 玉圏排除={:+.3}", c.own_zone));
                     }
+                    if c.promote_bias != 0.0 {
+                        s.push_str(&format!(" 成りbias={:+.3}", c.promote_bias));
+                    }
+                    if c.drop_bias != 0.0 {
+                        s.push_str(&format!(" 打ちbias={:+.3}", c.drop_bias));
+                    }
                     // 常時出す内訳（CandidateScore にあるのに表示していなかった）。
                     // gain の差がどこから来ているかは、これが無いと env の
                     // アブレーションで1項ずつ潰すしかない

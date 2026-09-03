@@ -394,6 +394,77 @@ fn play_game_with_oracle(
     }
 }
 
+/// **実行の識別子**（PR #41 レビュー4巡目 [P1]、8巡目で record の meta と
+/// 共有するため lib へ移動）。
+///
+/// `match_seed_base` は**実験条件**であって実行の識別子ではない: 同じ base で
+/// 取り直した2つの run から shard を半分ずつ選ぶと、base は1値・shard 集合は
+/// 完全・局数も一致して、下流の「複数 run を混ぜない」検査をすべて通ってしまう。
+/// CI は `GITHUB_RUN_ID` / `GITHUB_RUN_ATTEMPT`（Actions の既定 env。ID が
+/// あるのに attempt が欠測・非数値なら黙って 1 にしない）、ローカルは明示的な
+/// `ARENA_EXPERIMENT_ID`（attempt は 1）。
+pub fn resolve_run_identity(
+    github_run_id: Option<String>,
+    github_run_attempt: Option<String>,
+    experiment_id: Option<String>,
+) -> Result<(String, u64), String> {
+    if let Some(id) = github_run_id.filter(|s| !s.trim().is_empty()) {
+        let attempt = github_run_attempt
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "GITHUB_RUN_ID があるのに GITHUB_RUN_ATTEMPT がありません".to_string())?
+            .parse::<u64>()
+            .map_err(|_| "GITHUB_RUN_ATTEMPT は非負整数で指定してください".to_string())?;
+        return Ok((id.trim().to_string(), attempt));
+    }
+    if let Some(id) = experiment_id.filter(|s| !s.trim().is_empty()) {
+        return Ok((id.trim().to_string(), 1));
+    }
+    Err("ARENA_GAMES_JSON には実行の識別子が必須です（同じ base seed で取り直した\n\
+         複数 run の混入検査に使う）。CI は GITHUB_RUN_ID / GITHUB_RUN_ATTEMPT（自動）、\n\
+         ローカルは ARENA_EXPERIMENT_ID=<一意な名前> を指定してください"
+        .into())
+}
+
+/// record の先頭へ書く由来 meta（PR #41 レビュー8巡目 [P1]）。games.jsonl と
+/// 同じ (run 識別, baseline, base, shard, game_no, manifest 指紋) を持たせて、
+/// arena-balance の粒子数 veto が「判定対象の run の record か」を一対一で
+/// 照合できるようにする。env が無い項目は null（合算器は null を
+/// 「由来を照合できない」= 判定不能として扱う）
+fn arena_record_meta(game_no: u32, baseline: &str) -> serde_json::Map<String, serde_json::Value> {
+    use serde_json::json;
+    let env_u64 = |k: &str| -> Option<u64> {
+        std::env::var(k).ok().and_then(|v| v.trim().parse().ok())
+    };
+    let run = resolve_run_identity(
+        std::env::var("GITHUB_RUN_ID").ok(),
+        std::env::var("GITHUB_RUN_ATTEMPT").ok(),
+        std::env::var("ARENA_EXPERIMENT_ID").ok(),
+    )
+    .ok();
+    let manifest_fp = std::env::var("ARENA_BALANCE_MANIFEST")
+        .ok()
+        .filter(|p| !p.trim().is_empty())
+        .and_then(|p| std::fs::read(&p).ok())
+        .map(|bytes| {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(&bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        });
+    let mut m = serde_json::Map::new();
+    m.insert("run_id".into(), json!(run.as_ref().map(|(id, _)| id.clone())));
+    m.insert("run_attempt".into(), json!(run.as_ref().map(|(_, a)| *a)));
+    m.insert("baseline".into(), json!(baseline));
+    m.insert("game_no".into(), json!(game_no));
+    m.insert("match_seed_base".into(), json!(env_u64("ARENA_MATCH_SEED_BASE")));
+    m.insert("match_seed_shard".into(), json!(env_u64("ARENA_SHARD")));
+    m.insert("balance_manifest".into(), json!(manifest_fp));
+    m
+}
+
 /// A視点の対局記録を ARENA_RECORD_DIR に書く（bin/analyze が読める形式）。
 /// 実対局と違い審判が真実を持っているので、end ペイロードの全手順は正確
 fn write_record(
@@ -421,6 +492,9 @@ fn write_record(
             return;
         }
     };
+    // 由来 meta を先頭へ（arena-balance の粒子数 veto が games.jsonl と
+    // 一対一照合するための鍵。PR #41 レビュー8巡目）
+    rec.meta(&arena_record_meta(game_no, pb.strategy.name()));
     // chose イベントを対応する MyMove/MyFoul 観測の直前に挟む
     // （実対局の記録と同じ順序 = analyze の p_legal 突き合わせが機能する）
     let mut chosen_iter = pa.chosen.iter();

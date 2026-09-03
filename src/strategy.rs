@@ -330,6 +330,13 @@ pub struct CandidateScore {
     /// gain に加算された成りポテンシャルの差分
     /// （promo_potential_w × (着手後 − 現局面)。符号つき）
     pub promo: f64,
+    /// gain（advance_bias 内）に加算された成りの固定ボーナス分
+    /// （`promote_bias`。成る手にだけ非ゼロ。issue #40 P0-2 の
+    /// 「promote の該当寄与を除いた shadow 順位」用の内訳表示。score 不変）
+    pub promote_bias: f64,
+    /// gain に加算された打ちの固定バイアス分（`drop_bias`。打つ手にだけ
+    /// 非ゼロ。同じく issue #40 の shadow 順位用の内訳表示。score 不変）
+    pub drop_bias: f64,
     /// gain から引かれた持ち駒オプションの不足分
     /// （hand_option_w × (その駒の最良打ちポテンシャル − この打ちマスの実現値)。
     /// 打つ手にだけ非ゼロが入る正の値。gain には控除済み）
@@ -2917,6 +2924,64 @@ struct OwnEffects {
 ///
 /// `opp_king_w` は相手玉の信念からの距離重み（`opp_king_effect_weights`）。
 /// None なら V2 の相手玉側（`effect_opp`）は 0 のまま
+/// **紐の項の値**（`own_effects_after` が計算する `linked_value` と同じ定義の
+/// 単独公開版。issue #40 の link-only drop 分類がオフラインで runtime の
+/// `link` 列と同じ量の増分を使うため）。
+///
+/// - 入力は任意の自駒配置（着手前・着手後のどちらでも）
+/// - `opp_king_w` は runtime では粒子由来の敵玉重み。オフライン診断では
+///   再現できないので None を渡す = 働きの敵玉成分を 0 とみなす
+///   （自玉距離成分と `link_work_w` の飽和はそのまま効く）
+/// - **`own_effects_after` と別実装が乖離しないこと**はテスト
+///   `linked_value_ofはown_effects_afterと一致する` が固定する
+///   （ホットパスの `own_effects_after` はループ1回で複数の量を作るので、
+///   委譲でなくテストで同値性を守る）
+pub fn linked_value_of(
+    pieces: &[VisiblePiece],
+    color: Color,
+    you_in_check: bool,
+    params: &EvalParams,
+    opp_king_w: Option<&[f64; 81]>,
+) -> f64 {
+    let king = pieces
+        .iter()
+        .find(|p| p.role == Role::King)
+        .and_then(|p| parse_usi_square(&p.square));
+    let mut defended: HashSet<Coord> = HashSet::new();
+    let mut work_by_sq: HashMap<Coord, f64> = HashMap::new();
+    for p in pieces {
+        let d = defend_targets(pieces, p, color);
+        if let Some(sq) = parse_usi_square(&p.square) {
+            let work: f64 = d
+                .iter()
+                .map(|&s| {
+                    king.map_or(0.0, |k| king_dist_weight(cheb(s, k)))
+                        + opp_king_w.map_or(0.0, |w| w[crate::belief_features::sq_index(s)])
+                })
+                .sum();
+            work_by_sq.insert(sq, work);
+        }
+        defended.extend(d);
+    }
+    let lw = if you_in_check { 0.0 } else { params.link_work_w };
+    let work_ref = params.link_work_ref.max(1e-6);
+    pieces
+        .iter()
+        .filter(|p| p.role != Role::King)
+        .filter_map(|p| parse_usi_square(&p.square).map(|c| (c, p.role)))
+        .filter(|(c, _)| defended.contains(c))
+        .map(|(c, role)| {
+            let factor = if lw == 0.0 {
+                1.0
+            } else {
+                let work = work_by_sq.get(&c).copied().unwrap_or(0.0);
+                (1.0 - lw) + lw * (work / work_ref).min(1.0)
+            };
+            exchange_value(role) * factor
+        })
+        .sum()
+}
+
 fn own_effects_after(
     view: &PlayerView,
     mv: &ShogiMove,
@@ -3797,6 +3862,11 @@ struct EvalOut {
     link: f64,
     /// gain に加算された成りポテンシャルの差分（符号つき。内訳表示用）
     promo: f64,
+    /// gain（advance_bias 内）に加算された成りの固定ボーナス分
+    /// （`params.promote_bias`。issue #40 P0-2 の shadow 順位用の内訳表示）
+    promote_bias: f64,
+    /// gain に加算された打ちの固定バイアス分（`params.drop_bias`。同上）
+    drop_bias: f64,
     /// gain から引かれた持ち駒オプションの不足分（正の値。内訳表示用）
     hand_option: f64,
     /// gain から引かれた盤上駒の減価（V5。正の値。内訳表示用）
@@ -5769,6 +5839,12 @@ impl Strategy for EstimatorStrategy {
             (None, None) => OpeningBook::new(view.your_color),
         });
         if let Some(usi) = book.next(view, log, foul_tried) {
+            // 定跡手は評価を回さない**正当な**非評価手。記録の chose.debug へ
+            // その印を残す（PR #41 レビュー9巡目 [P1]: debug が null のままだと
+            // arena-balance の粒子数 veto が「古い/欠損 record」と区別できず、
+            // 定跡を含む正常な held-out run が必ず判定不能になる）。
+            // 前の決定の debug をそのまま持ち越さない効果もある
+            self.last_debug = Some(serde_json::json!({ "joseki": true }));
             return Some(usi);
         }
 
@@ -7307,6 +7383,8 @@ impl Strategy for EstimatorStrategy {
                 risk: out.risk_mean,
                 link: out.link,
                 promo: out.promo,
+                promote_bias: out.promote_bias,
+                drop_bias: out.drop_bias,
                 hand_option: out.hand_option,
                 board_discount: out.board_discount,
                 foul_probe: out.foul_probe,
@@ -7356,6 +7434,33 @@ impl Strategy for EstimatorStrategy {
                 "p_legal".into(),
                 serde_json::json!(((p_legal * 1000.0).round()) / 1000.0),
             );
+        }
+        // issue #40 P0-2: 選択手の link 項と、同じ決定・同じ敵玉重み表で測った
+        // **現局面（着手前）の link** を記録へ残す。link は粒子由来の
+        // `opp_king_w`（既定 `link_work_w=1` の働き重み）込みなのでオフラインでは
+        // 再現できない（PR #41 レビュー2巡目）。差 `link − link_base` が
+        // 「この手で得た link」で、investment_probe の link-only 分類が読む
+        if let (Some((usi, _, _)), Some(obj)) = (&best, debug.as_object_mut()) {
+            if let Some(c) = self
+                .last_ranking
+                .as_ref()
+                .and_then(|r| r.iter().find(|c| &c.usi == usi))
+            {
+                let base = params.link_w
+                    * linked_value_of(
+                        &view.your_pieces,
+                        view.your_color,
+                        view.you_in_check,
+                        &params,
+                        opp_king_w.as_ref(),
+                    );
+                // **丸めない**（PR #41 レビュー3巡目）: 各値を4桁へ丸めると差に
+                // 最大 ~1e-4 の誤差が入り、小さい正の link 増分が 0 や負へ変わって
+                // 「正の link を得た手」の事前登録定義を保持できない。serde_json の
+                // f64 は round-trip 精度で出るのでそのまま残す
+                obj.insert("link".into(), serde_json::json!(c.link));
+                obj.insert("link_base".into(), serde_json::json!(base));
+            }
         }
         self.last_debug = Some(debug);
         best.map(|(usi, _, _)| usi)
@@ -7977,31 +8082,9 @@ fn blind_home_position(view: &PlayerView, log: &ObservationLog) -> BlindHome {
 /// 自分が取ったマスは対象外（取った時点で相手駒は消えており、再占有の証拠に
 /// ならない）。歩打ち反則も対象外（二歩の可能性がある）。
 fn opp_occupancy_evidence(view: &PlayerView, log: &ObservationLog) -> [bool; 81] {
-    let mut backed = [false; 81];
-    for e in log.events() {
-        match e {
-            Observation::OpponentMoved {
-                captured_my_piece_at: Some(sq),
-                ..
-            } => {
-                if let Some(c) = parse_usi_square(sq) {
-                    backed[crate::belief_features::sq_index(c)] = true;
-                }
-            }
-            Observation::MyFoul { move_number, usi } if *move_number == view.move_number => {
-                if view.you_in_check {
-                    continue;
-                }
-                if let Some(ShogiMove::Drop { role, to }) = parse_usi(usi) {
-                    if role != Role::Pawn {
-                        backed[crate::belief_features::sq_index(to)] = true;
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    backed
+    // 定義の本体は `marginal_work::backed_targets`（issue #40 の需要帯
+    // backed_target と同一であることを委譲で保証する。挙動は移設前と同じ）
+    crate::marginal_work::backed_targets(log, view.move_number, view.you_in_check)
 }
 
 /// 玉接近減点用の脅威マス（`king_known_approach_w`）。
@@ -9578,7 +9661,7 @@ fn evaluate(
     //   **`gen_nonpromote()` が有効なときだけ**付け替える（従来生成は成り一択
     //   なので、付け替えたままだと桂銀香の成りだけ promote_bias を失う）。
     //   発端は quest31 の 4九銀成（3h4i+、不成=10 / 成=2）
-    let advance_bias = match *mv {
+    let (advance_bias, promote_bias_term, drop_bias_term) = match *mv {
         ShogiMove::Board { from, to, promote } => {
             let adv = match me {
                 Color::Sente => (from.rank - to.rank) as f64,
@@ -9605,9 +9688,9 @@ fn evaluate(
             } else {
                 0.0
             };
-            params.advance_w * adv + promo_bonus
+            (params.advance_w * adv + promo_bonus, promo_bonus, 0.0)
         }
-        ShogiMove::Drop { .. } => params.drop_bias,
+        ShogiMove::Drop { .. } => (params.drop_bias, 0.0, params.drop_bias),
     };
 
     // 大駒を初期位置に置き続けるペナルティ（この手の後に残る枚数分）。
@@ -10109,6 +10192,8 @@ fn evaluate(
         },
         link,
         promo,
+        promote_bias: promote_bias_term,
+        drop_bias: drop_bias_term,
         hand_option: hand_option_pen,
         board_discount,
         foul_probe: foul_probe + gold_join,
@@ -11126,6 +11211,29 @@ pub(crate) mod tests {
             opponent_in_check: false,
             status: GameStatus::Playing,
         }
+    }
+
+    /// **定跡手の chose.debug には joseki マーカーが入る**（PR #41 レビュー
+    /// 9巡目 [P1]）。定跡手は評価を回さない正当な非評価手で、debug が null の
+    /// ままだと arena-balance の粒子数 veto が「古い/欠損 record」と区別できず、
+    /// 定跡を含む正常な held-out run が必ず判定不能になる。score には触れない
+    /// （記録だけの変更）
+    #[test]
+    fn 定跡手のdebugにはjosekiマーカーが入る() {
+        let view = minimal_view(
+            crate::shogi::Position::initial().pieces_of(Color::Sente),
+            HashMap::new(),
+        );
+        let log = ObservationLog::default();
+        let mut s = make_seeded("estimator", 7).expect("estimator");
+        let usi = s.choose(&view, &log, &HashSet::new());
+        assert!(usi.is_some(), "初期局面は定跡が指す");
+        let dbg = s.debug_state().expect("定跡手にも debug が入る（null にしない）");
+        assert_eq!(dbg["joseki"], true, "{dbg}");
+        assert!(
+            dbg.get("unique_particles").is_none(),
+            "評価していないので粒子数は持たない（veto の集計対象外の印）"
+        );
     }
 
     #[test]
@@ -14316,6 +14424,49 @@ pub(crate) mod tests {
             &EvalParams::default(),
         );
         assert!(two.linked_value > stay.linked_value);
+    }
+
+    /// `linked_value_of`（issue #40 のオフライン分類用の公開版）が
+    /// `own_effects_after` の linked_value と**数値一致**すること。
+    /// 別実装なので、ここがずれたら「link-only drop の『正の link』が
+    /// runtime の link 項と別物」に戻ってしまう
+    #[test]
+    fn linked_value_ofはown_effects_afterと一致する() {
+        let params = EvalParams::default();
+        let cases: Vec<(Vec<VisiblePiece>, &str)> = vec![
+            (
+                vec![
+                    VisiblePiece { square: "5i".into(), role: Role::King },
+                    VisiblePiece { square: "5h".into(), role: Role::Gold },
+                    VisiblePiece { square: "4h".into(), role: Role::Silver },
+                    VisiblePiece { square: "1c".into(), role: Role::Rook },
+                ],
+                "5i4i",
+            ),
+            (
+                vec![
+                    VisiblePiece { square: "5i".into(), role: Role::King },
+                    VisiblePiece { square: "9i".into(), role: Role::Lance },
+                ],
+                "9i9h",
+            ),
+        ];
+        for (pieces, usi) in cases {
+            for in_check in [false, true] {
+                let mut view = minimal_view(pieces.clone(), HashMap::new());
+                view.you_in_check = in_check;
+                let mv = parse_usi(usi).unwrap();
+                let expected =
+                    own_effects_after(&view, &mv, None, None, &params).linked_value;
+                // own_effects_after は着手後の配置で数えるので、同じ着手後配置を作る
+                let after = crate::check_prep::pieces_after(&view.your_pieces, &mv);
+                let got = linked_value_of(&after, view.your_color, in_check, &params, None);
+                assert!(
+                    (expected - got).abs() < 1e-12,
+                    "{usi} in_check={in_check}: own_effects={expected} vs linked_value_of={got}"
+                );
+            }
+        }
     }
 
     #[test]

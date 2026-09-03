@@ -55,6 +55,10 @@ on:
         description: "既存 Arena 実行の対局記録を候補として使う（対局はやり直さず集計とペア集計だけ回す）"
         required: false
         default: ""
+      balance_manifest:
+        description: "issue #40 held-out 採否用: 計測前に commit した validation manifest のリポジトリ内パス。同一 commit の4 run（対照→候補 × v13/v14）を同じ ref への手動起動で作るのに要る"
+        required: false
+        default: ""
   push:
     paths:
       - ".github/ci/arena.request.json"
@@ -62,11 +66,18 @@ on:
 jobs:
   plan:
     runs-on: ubuntu-latest
+    # contents: write は held-out の claim タグ（取り直しの台帳）を**計測前に**
+    # 取得するためだけ（PR #41 レビュー7巡目）。actions: read は
+    # 「対照 run が success で完了しているか」の照合用（同8巡目）
+    permissions:
+      contents: write
+      actions: read
     outputs:
       skip: ${{ steps.split.outputs.skip }}
       baselines: ${{ steps.split.outputs.baselines }}
       shards: ${{ steps.split.outputs.shards }}
-      games_per_shard: ${{ steps.split.outputs.games_per_shard }}
+      games_by_shard: ${{ steps.split.outputs.games_by_shard }}
+      claim: ${{ steps.split.outputs.claim }}
       candidate: ${{ steps.split.outputs.candidate }}
       match_seed: ${{ steps.split.outputs.match_seed }}
       oracle: ${{ steps.split.outputs.oracle }}
@@ -75,6 +86,7 @@ jobs:
       cand_env: ${{ steps.split.outputs.cand_env }}
       pair_with: ${{ steps.split.outputs.pair_with }}
       games_from: ${{ steps.split.outputs.games_from }}
+      balance_manifest: ${{ steps.split.outputs.balance_manifest }}
     steps:
       - uses: actions/checkout@v5
       - id: split
@@ -91,6 +103,8 @@ jobs:
           IN_CAND_ENV: ${{ github.event.inputs.cand_env }}
           IN_PAIR_WITH: ${{ github.event.inputs.pair_with }}
           IN_GAMES_FROM: ${{ github.event.inputs.games_from_run_id }}
+          IN_BALANCE_MANIFEST: ${{ github.event.inputs.balance_manifest }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           default_baselines='estimator_v9 estimator_v10 estimator_v11 estimator_v12 estimator_v13 estimator_v14'
@@ -107,6 +121,11 @@ jobs:
             cand_env="${IN_CAND_ENV:-}"
             pair_with="${IN_PAIR_WITH:-}"
             games_from="${IN_GAMES_FROM:-}"
+            # held-out 採否の4 run（対照→候補 × v13/v14）は**同一 commit** が
+            # 必須（合算器が要求する）なので、request ファイルの書き換え push では
+            # 作れない（push のたびに commit が変わる）。同じ ref への手動起動
+            # 4回でここから manifest を渡す（PR #41 レビュー5巡目）
+            balance_manifest="${IN_BALANCE_MANIFEST:-}"
           else
             if [ ! -f "$req" ]; then
               # push の paths フィルタはファイルの削除にも一致するので、計測が
@@ -120,7 +139,8 @@ jobs:
                 # 落ちないよう妥当な形の既定値も置いておく（値は使われない）
                 echo "baselines=[\"dummy\"]"
                 echo "shards=[0]"
-                echo "games_per_shard=0"
+                echo "games_by_shard=[0]"
+                echo "claim="
                 echo "candidate=estimator"
                 echo "match_seed="
                 echo "oracle="
@@ -129,6 +149,7 @@ jobs:
                 echo "cand_env="
                 echo "pair_with="
                 echo "games_from="
+                echo "balance_manifest="
               } >> "$GITHUB_OUTPUT"
               exit 0
             fi
@@ -148,6 +169,7 @@ jobs:
             cand_env=$(jq -r '.cand_env // ""' "$req")
             pair_with=$(jq -r '.pair_with // ""' "$req")
             games_from=$(jq -r '.games_from_run_id // ""' "$req")
+            balance_manifest=$(jq -r '.balance_manifest // ""' "$req")
           fi
           # ペア集計は局ごとの突き合わせなので、match_seed が無いと成立しない
           # （`games_from` の再集計では元 run が match_seed 付きで回っていればよい）
@@ -155,13 +177,139 @@ jobs:
             echo "pair_with は match_seed と併用してください（局ごとの条件が揃いません）" >&2
             exit 1
           fi
+          # **held-out 採否 run（balance_manifest あり）の plan 検査**（PR #41
+          # レビュー6巡目）: ①事前登録の実験条件（games / shards / seed /
+          # candidate）が manifest と一致 ②**取り直しの台帳**（成功 run が
+          # 押した claim タグが既にあれば、同じ (manifest, arm, 相手) の
+          # 再計測 = 事前登録違反として起動を拒否。infra 失敗で claim が
+          # 押されなかった run はやり直せる）。台帳は永続の git タグなので
+          # 事後の監査もできる
+          claim=""
+          if [ -n "${balance_manifest:-}" ]; then
+            if [ ! -f "$balance_manifest" ]; then
+              echo "balance_manifest が見つかりません: $balance_manifest" >&2; exit 1
+            fi
+            for key in games shards candidate; do
+              want=$(jq -r ".${key} // empty" "$balance_manifest")
+              got=$(eval "echo \"\$${key}\"")
+              if [ -z "$want" ] || [ "$want" != "$got" ]; then
+                echo "held-out run の ${key}=${got} が manifest の ${want:-（無し）} と一致しません" >&2
+                exit 1
+              fi
+            done
+            if [ "$(echo "$baselines" | wc -w)" -ne 1 ]; then
+              echo "held-out run は1相手ずつ起動します（baselines=$baselines）" >&2; exit 1
+            fi
+            want_seed=$(jq -r ".opponents[\"$baselines\"] // empty" "$balance_manifest")
+            if [ -z "$want_seed" ] || [ "$want_seed" != "$match_seed" ]; then
+              echo "held-out run の match_seed=$match_seed が manifest の opponents[$baselines]=${want_seed:-（無し）} と一致しません" >&2
+              exit 1
+            fi
+            # **claim を取る前に「合算器へ渡せる run か」を固定する**（PR #41
+            # レビュー7〜8巡目 [P1]: 判定不能になる run が claim を消費すると、
+            # 正しい再実行が永久に拒否される）。oracle / 両側 env / 時計変更 /
+            # re-run は判定不能・die の対象なので起動自体を拒否し、cand arm は
+            # pair_with 必須（ctrl arm は禁止）・cand_env は manifest と完全一致
+            if [ "${GITHUB_RUN_ATTEMPT:-1}" != "1" ]; then
+              # re-run の plan が「attempt 1 の失敗で解放された slot」を再取得すると、
+              # shard が attempt≠1 で全滅し release-claim も解放を拒む =
+              # 1局も指されないまま slot が永久に埋まる（レビュー8巡目の再現）
+              echo "held-out run は re-run から起動できません（新しい run を dispatch してください）" >&2
+              exit 1
+            fi
+            if [ -n "$oracle" ]; then
+              echo "held-out run に oracle は使えません（合算器が die する）" >&2; exit 1
+            fi
+            if [ -n "$extra_env" ]; then
+              echo "held-out run に env（両側ノブ）は使えません（判定不能になる）" >&2; exit 1
+            fi
+            if [ -n "$clock" ]; then
+              echo "held-out run の時計は既定（1000+3）のまま起動してください" >&2; exit 1
+            fi
+            fp=$(sha256sum "$balance_manifest" | cut -c1-16)
+            if [ -n "$cand_env" ]; then
+              arm=cand
+              if [ -z "$pair_with" ]; then
+                echo "候補 run は pair_with（対照 run の ID）が必須です（無い記録は判定不能）" >&2; exit 1
+              fi
+              want_knobs=$(jq -r '.cand_knobs | to_entries | map("\(.key)=\(.value)") | sort | join(" ")' "$balance_manifest")
+              got_knobs=$(printf '%s\n' $cand_env | sort | paste -sd' ' -)
+              if [ "$got_knobs" != "$want_knobs" ]; then
+                echo "cand_env [$got_knobs] が manifest の cand_knobs [$want_knobs] と一致しません" >&2; exit 1
+              fi
+              # **pair_with は「対照 claim の owner run で、成功完了済み」でなければ
+              # ならない**（レビュー8巡目 [P1]: typo・実行中・失敗した対照を指した
+              # candidate run が claim を消費すると、その record は最終合算に使えない
+              # のに正しい取り直しが拒否される。issue #40 の「対照を先に完了」も
+              # ここで機械保証する）
+              ctrl_claim="balance-claim/${fp}/ctrl-${baselines}"
+              if ! git ls-remote --exit-code origin "refs/tags/$ctrl_claim" >/dev/null 2>&1; then
+                echo "対照の claim（$ctrl_claim）がありません。対照 run を先に完了させてください" >&2
+                exit 1
+              fi
+              git fetch --quiet origin "+refs/tags/${ctrl_claim}:refs/tags/${ctrl_claim}"
+              ctrl_owner=$(git cat-file -p "refs/tags/$ctrl_claim" | sed '1,/^$/d' | jq -r '.run_id')
+              if [ -z "$ctrl_owner" ] || [ "$ctrl_owner" = "null" ] || [ "$ctrl_owner" != "$pair_with" ]; then
+                echo "pair_with=$pair_with が対照 claim の owner run（${ctrl_owner:-不明}）と一致しません" >&2
+                exit 1
+              fi
+              ctrl_info=$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${ctrl_owner}" --jq '[.status, .conclusion // "", .head_sha] | join(" ")')
+              read -r ctrl_status ctrl_conclusion ctrl_sha <<< "$ctrl_info"
+              if [ "$ctrl_status/$ctrl_conclusion" != "completed/success" ]; then
+                echo "対照 run ${ctrl_owner} が success で完了していません（${ctrl_status}/${ctrl_conclusion}）" >&2
+                exit 1
+              fi
+              # **対照 run と同一 commit であること**（PR #41 レビュー9巡目 [P1]:
+              # 合算器は commit 不一致を die するので、別 commit の対照を指した
+              # candidate run は claim だけ消費して判定に使えない記録を残す。
+              # claim を取る前にここで止める）
+              if [ "$ctrl_sha" != "${GITHUB_SHA}" ]; then
+                echo "対照 run ${ctrl_owner} の commit（${ctrl_sha}）がこの run（${GITHUB_SHA}）と違います。" >&2
+                echo "held-out の4 run は同一 commit で回します（合算器も commit 不一致を die する）" >&2
+                exit 1
+              fi
+            else
+              arm=ctrl
+              if [ -n "$pair_with" ]; then
+                echo "対照 run に pair_with は付けません（候補 run が対照を指す向きだけ）" >&2; exit 1
+              fi
+            fi
+            claim="balance-claim/${fp}/${arm}-${baselines}"
+            if git ls-remote --exit-code origin "refs/tags/$claim" >/dev/null 2>&1; then
+              echo "この (manifest, ${arm}, ${baselines}) の run は既にあります（tag $claim）。" >&2
+              echo "同じ実験の取り直しは事前登録違反です。別の実験なら新しい manifest を commit してください" >&2
+              exit 1
+            fi
+            # **claim 名は取得より先に output へ書く**（取得後にこのステップが
+            # 落ちても release-claim が claim 名を受け取れるように）
+            echo "claim=$claim" >> "$GITHUB_OUTPUT"
+            # **claim は計測前にここで取得する**（PR #41 レビュー7巡目 [P1]:
+            # 成功後に押す方式は、同時 dispatch の両方が完走して artifact を
+            # 残し、未claim側を後から選べた）。annotated tag の message に
+            # run_id / attempt を残す = どの実行が slot を取ったかの不変記録。
+            # 同時 dispatch は ref 作成の 422 で後着の plan が落ち、対局は始まらない。
+            # 対局が完走しなかった run は release-claim ジョブが解放する
+            tag_sha=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags" \
+              -f tag="$claim" -f type=commit -f object="${GITHUB_SHA}" \
+              -f message="{\"run_id\":\"${GITHUB_RUN_ID}\",\"run_attempt\":${GITHUB_RUN_ATTEMPT},\"arm\":\"${arm}\",\"baseline\":\"${baselines}\"}" \
+              --jq .sha)
+            gh api "repos/${GITHUB_REPOSITORY}/git/refs" \
+              -f ref="refs/tags/$claim" -f sha="$tag_sha"
+            echo "claim 取得: $claim（run ${GITHUB_RUN_ID} attempt ${GITHUB_RUN_ATTEMPT}）"
+          fi
           echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "起動: event=$EVENT_NAME games=$games candidate=$candidate baselines=$baselines shards=$shards match_seed=$match_seed clock=$clock env=$extra_env cand_env=$cand_env"
           echo "baselines=$(echo "$baselines" | jq -R -c 'split(" ") | map(select(length > 0))')" >> "$GITHUB_OUTPUT"
           echo "shards=$(jq -n -c "[range(0; ${shards})]")" >> "$GITHUB_OUTPUT"
-          per=$(( (games + shards - 1) / shards ))
-          per=$(( per + per % 2 ))   # 先後を揃えるため偶数化
-          echo "games_per_shard=$per" >> "$GITHUB_OUTPUT"
+          # **シャード分割は合計が正確に games になる偶数割り**（PR #41 レビュー
+          # 6巡目 [P1]。従来の ceil の偶数化は 600/8 を 608局 に膨らませ、
+          # 600ペアちょうどを要求する合算器と両立しなかった）。分割規約と
+          # 既知ケースは scripts/ci/split_arena_games.py（--self-test を先に回す）
+          python3 scripts/ci/split_arena_games.py --self-test
+          games_by_shard=$(python3 scripts/ci/split_arena_games.py "$games" "$shards")
+          echo "分割: $games_by_shard（合計 $games）"
+          echo "games_by_shard=$games_by_shard" >> "$GITHUB_OUTPUT"
+          echo "claim=$claim" >> "$GITHUB_OUTPUT"
           echo "candidate=$candidate" >> "$GITHUB_OUTPUT"
           echo "match_seed=$match_seed" >> "$GITHUB_OUTPUT"
           echo "oracle=$oracle" >> "$GITHUB_OUTPUT"
@@ -169,6 +317,7 @@ jobs:
           {
             echo "games_from=$games_from"
             echo "pair_with=$pair_with"
+            echo "balance_manifest=${balance_manifest:-}"
             echo "cand_env=$cand_env"
             echo "env<<EOF"
             echo "$extra_env"
@@ -210,8 +359,24 @@ jobs:
           ARENA_EXTRA_ENV: ${{ needs.plan.outputs.env }}
           ARENA_CAND_ENV: ${{ needs.plan.outputs.cand_env }}
           ARENA_CLOCK: ${{ needs.plan.outputs.clock }}
+          # 候補 run が対照に指した run（arena-balance が対照の取り違え検査に使う）。
+          # 実行の識別子そのもの（run_id / run_attempt）は Actions の既定 env
+          # GITHUB_RUN_ID / GITHUB_RUN_ATTEMPT から bin/arena が自分で読む
+          ARENA_PAIR_WITH: ${{ needs.plan.outputs.pair_with }}
+          # 計測前に commit した validation manifest（issue #40 の held-out 採否用）。
+          # 指定すると games.jsonl の全行へ sha256 が焼き込まれ、arena-balance
+          # --manifest がその一致を要求する
+          ARENA_BALANCE_MANIFEST: ${{ needs.plan.outputs.balance_manifest }}
         run: |
           set -euo pipefail
+          # held-out（manifest-bound）run の re-run attempt は使えない: 記録の
+          # run_attempt が 1 でなくなり合算器が判定不能にする。ここで止めれば
+          # attempt 1 の失敗時に release-claim が claim を解放済みなので、
+          # 新しい run として取り直せる（PR #41 レビュー7巡目）
+          if [ -n "${ARENA_BALANCE_MANIFEST:-}" ] && [ "${GITHUB_RUN_ATTEMPT}" != "1" ]; then
+            echo "held-out run は re-run せず、新しい run として起動し直してください" >&2
+            exit 1
+          fi
           # 共通seed指定時はシャードごとにずらす（シャード間の対局重複を防ぎつつ、
           # 同じ入力なら版をまたいで同じ対局条件列になる）
           seed='${{ needs.plan.outputs.match_seed }}'
@@ -258,7 +423,7 @@ jobs:
           done
           export ARENA_CAND_KNOBS="$ARENA_CAND_ENV"
           cargo run --release --bin arena -- \
-            "${{ needs.plan.outputs.games_per_shard }}" \
+            "${{ fromJSON(needs.plan.outputs.games_by_shard)[matrix.shard] }}" \
             "${{ needs.plan.outputs.candidate }}" \
             "${{ matrix.baseline }}" \
             | tee arena-result.txt
@@ -321,6 +486,11 @@ jobs:
     # 「一部シャードが失敗しても残りを合算する」ために残す。
     if: always() && needs.plan.result == 'success' && needs.plan.outputs.skip != 'true'
     runs-on: ubuntu-latest
+    # actions: read は pair_with / games_from の cross-run artifact ダウンロード用
+    # （claim タグは plan が計測前に取得するので、ここに write は要らない）
+    permissions:
+      contents: read
+      actions: read
     steps:
       # **checkout は必ず download より前**。actions/checkout はワークスペースを
       # 掃除するので、後ろに置くと落とした artifact も集計の中間ファイルも消える
@@ -450,3 +620,46 @@ jobs:
             all-games.jsonl
             arena-var.md
             arena-var.json
+
+  # **held-out の claim の解放**（PR #41 レビュー7巡目）。claim は plan が
+  # **計測前に**取得している（同時 dispatch の後着は plan で落ちる = 未claim の
+  # 完走 artifact が生まれない）ので、ここでは「対局が完走しなかった run」の
+  # claim だけを解放して新しい run での取り直しを可能にする。
+  # **aggregate の失敗では解放しない**（対局 = 計測は存在しているので、
+  # そこからのやり直しは「成功した計測の取り直し」になる）。
+  # re-run attempt からも解放しない（attempt 1 の失敗時に解放済みのはずで、
+  # 成功済み run の re-run で claim を消す経路を塞ぐ）
+  release-claim:
+    needs: [plan, arena]
+    # plan が claim 取得後に落ちた/cancel された経路もここで解放する
+    # （PR #41 レビュー8巡目: plan.result == success を条件にすると、その経路の
+    # claim が lock leak になる。claim 名は取得より先に output へ書かれている）。
+    # 「plan 成功かつ対局完走」だけが claim を保持する
+    if: always() && needs.plan.outputs.claim != '' && !(needs.plan.result == 'success' && needs.arena.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Release claim
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_RUN_ATTEMPT}" != "1" ]; then
+            echo "re-run attempt からは解放しない（失敗した run は re-run せず新しい run を起動する）"
+            exit 0
+          fi
+          claim='${{ needs.plan.outputs.claim }}'
+          # plan が claim 名を出した後・取得の前に落ちた run ではタグが無い。
+          # その場合は何もしない（404 で step を赤くしない）
+          if ! tag_obj=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/$claim" --jq .object.sha 2>/dev/null); then
+            echo "claim タグ $claim が無い（取得前に落ちた run）。解放不要"
+            exit 0
+          fi
+          owner_run=$(gh api "repos/${GITHUB_REPOSITORY}/git/tags/$tag_obj" --jq .message | jq -r '.run_id' 2>/dev/null || echo "")
+          if [ "$owner_run" != "${GITHUB_RUN_ID}" ]; then
+            echo "claim $claim は run ${owner_run:-不明} の取得。解放しない"
+            exit 0
+          fi
+          gh api -X DELETE "repos/${GITHUB_REPOSITORY}/git/refs/tags/$claim"
+          echo "released: $claim（対局が完走しなかったため。新しい run として取り直せる）"

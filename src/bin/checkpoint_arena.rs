@@ -250,7 +250,7 @@ fn assert_opponent_blind_to(opponent: &str, arm_env_keys: &[String], allow: bool
 
 
 fn usage() -> &'static str {
-    "usage: checkpoint_arena <extract|run|unit|pair|compare|report|arena-var> [options]\n\
+    "usage: checkpoint_arena <extract|run|unit|pair|compare|report|arena-var|arena-balance> [options]\n\
      \n\
      extract --records <dir|file...> --out <dir> [--opponent NAME] [--min-remaining N]\n\
      \x20       [--limit N] [--seed N] [--dev-pct N]\n\
@@ -269,7 +269,17 @@ fn usage() -> &'static str {
      arena-var --control <games.jsonl...> --candidate <games.jsonl...>\n\
      \x20         [--baseline NAME] [--label NAME] [--alpha 0.05] [--power 0.80] [--boot N]\n\
      \x20         [--allow-budget-diff]\n\
-     \x20         [--markdown OUT] [--json OUT] [--allow-incomplete]"
+     \x20         [--markdown OUT] [--json OUT] [--allow-incomplete]\n\
+     arena-balance --control <games.jsonl...> --candidate <games.jsonl...>\n\
+     \x20             --manifest <path>（計測前に commit した validation manifest。\n\
+     \x20               cand_knobs の期待値と行指紋の照合。無い集計は判定不能）\n\
+     \x20             [--expect-cand-knobs \"K=V K=V\"（manifest 無しの診断用の期待ノブ）]\n\
+     \x20             [--expect-games N] [--expect-shards N] [--expect-seeds \"相手=base,...\"]\n\
+     \x20             [--expect-opponents \"...\"] [--alpha F] [--boot N]（既定はすべて\n\
+     \x20               issue #40 の事前登録定数。外した指定は判定不能扱い）\n\
+     \x20             --records-control <dir|jsonl...> --records-candidate <dir|jsonl...>\n\
+     \x20               （arena-records。平均評価粒子数の −10% veto の入力。無い集計は判定不能）\n\
+     \x20             [--label NAME] [--markdown OUT] [--json OUT] [--allow-incomplete]"
 }
 
 fn die(msg: &str) -> ! {
@@ -2584,6 +2594,30 @@ struct GameRow {
     candidate: String,
     baseline: String,
     match_seed: u64,
+    /// **shard ずらしと基準ごとの XOR を掛ける前の base seed**。記録に残る
+    /// `match_seed` は実効値（シャードごと・基準ごとに違う）なので、
+    /// 「同じ run か」「事前登録した seed か」の検査はこちらで行う
+    /// （PR #41 レビュー3巡目）
+    match_seed_base: u64,
+    /// この行を出したシャード番号。shard 集合の完全性検査に使う
+    match_seed_shard: u64,
+    /// **実行の識別子**（CI は GITHUB_RUN_ID、ローカルは ARENA_EXPERIMENT_ID）。
+    /// `match_seed_base` は実験条件であって実行の識別子ではない: 同じ base で
+    /// 取り直した2 run から shard を半分ずつ選んでも、base 1値・shard 集合完全・
+    /// 局数一致で他の検査を全部通る（PR #41 レビュー4巡目）
+    run_id: String,
+    /// 同じ run の re-run attempt も別実行として区別する
+    run_attempt: u64,
+    /// 候補 run が対照に指した run（arena.yml の `-f pair_with=`）。あれば
+    /// 対照の run_id との一致を検査する（対照の取り違えをここで閉じる）
+    pair_with: Option<String>,
+    /// 計測前に commit した validation manifest の指紋（無い run は null =
+    /// #40 の採否では判定不能）
+    balance_manifest: Option<String>,
+    /// 診断オラクル（`ARENA_ORACLE_A`。空 = 通常対局）。**非空の run は採否に
+    /// 使えない**: 審判が候補の反則を握りつぶす上限測定で、対照と候補の
+    /// どちらか一方だけに掛かっていても記録が無ければ識別できない
+    oracle: String,
     game_no: u64,
     a_is_sente: bool,
     score_a: f64,
@@ -2612,10 +2646,16 @@ struct GameRow {
     shared_env: BTreeMap<String, String>,
 }
 
-/// schema 2 で実効条件の指紋を必須にした。schema 1（名前と時計しか残していない）は
-/// **集計から弾く**: 欠損を空値で埋めると「相手 env は両 run とも空で一致」と
-/// 解釈されて検査を素通りする（PR #22 で schema 2 へ上げたのと同じ理由）
-const GAME_ROW_SCHEMA: u64 = 2;
+/// schema 2 で実効条件の指紋を必須にした。schema 3 で `match_seed_base` /
+/// `match_seed_shard` を必須にした（PR #41 レビュー3巡目: 記録の `match_seed` は
+/// シャードずらし＋基準 XOR 済みの実効値なので、shard 完全性は base / shard 列で
+/// しか検査できない）。schema 4 で `run_id` / `run_attempt`（実行の識別子）を
+/// 必須にした（同4巡目: base は実験条件なので、同じ base で取り直した複数 run の
+/// shard 混ぜを base の一意性では検出できない）。schema 5 で `oracle`
+/// （診断オラクルの実効値）を必須にした（同5巡目: 記録が無いと nofoul の
+/// 診断 run を通常の held-out として識別できない）。古い schema は
+/// **集計から弾く**: 欠損を空値で埋めると検査を素通りする（PR #22 と同じ理由）
+const GAME_ROW_SCHEMA: u64 = 5;
 
 /// **ペア差の分散を同定するのに要る最小のペア数**。1ペアでは自由度が 0 で、
 /// n−1 の標本分散が定義できない（`variance` は 0 を返す）
@@ -2684,10 +2724,29 @@ fn parse_game_rows_text(text: &str, where_prefix: &str) -> Result<Vec<GameRow>, 
                 })
                 .collect())
         };
+        // **キー自体は必須・値は null 可**の列（pair_with / balance_manifest）。
+        // キーごと欠けた行を None に落とすと schema 契約の検査が素通りする
+        let opt_s = |k: &str| -> Result<Option<String>, String> {
+            let val = v.get(k).ok_or_else(|| miss(k))?;
+            if val.is_null() {
+                Ok(None)
+            } else {
+                val.as_str()
+                    .map(|s| Some(s.to_string()))
+                    .ok_or_else(|| format!("{where_}: {k} が文字列でも null でもありません"))
+            }
+        };
         rows.push(GameRow {
             candidate: req_s("candidate")?,
             baseline: req_s("baseline")?,
             match_seed: req_u("match_seed")?,
+            match_seed_base: req_u("match_seed_base")?,
+            match_seed_shard: req_u("match_seed_shard")?,
+            run_id: req_s("run_id")?,
+            run_attempt: req_u("run_attempt")?,
+            pair_with: opt_s("pair_with")?,
+            balance_manifest: opt_s("balance_manifest")?,
+            oracle: req_s("oracle")?,
             game_no: req_u("game_no")?,
             a_is_sente: v
                 .get("a_is_sente")
@@ -3157,6 +3216,1382 @@ fn cmd_arena_var(args: &Args) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// arena-balance: opponent-balanced 合算器（issue #40）
+//
+// 2相手ぶん（既定 v13 / v14）の対照・候補 arena-games.jsonl を読み、
+// 相手ごとに局ペア差を作って `(Δv13 + Δv14) / 2` を**層化 bootstrap**
+// （各相手の内側で局を引き直す）で判定する。`check_policy combined` と
+// 同じ契約: 入力の同一性検査は fail-closed、判定は事前登録した門で、
+// 不通過なら exit 3（`--allow-incomplete` で警告へ降格）。
+// ---------------------------------------------------------------------------
+
+/// issue #40 の held-out 判定の事前登録値（本文「検証 > Arena」の門）。
+/// CLI から動かせない定数にする（門をノブにすると gate-shopping が成立する）
+const BALANCE_MIN_DELTA: f64 = 0.04;
+/// 安全性: 反則/局のペア差の上限
+const BALANCE_MARGIN_FOULS: f64 = 0.3;
+/// 安全性: 思考平均（ms/手）のペア差の上限
+const BALANCE_MARGIN_THINK_MS: f64 = 100.0;
+/// **事前登録した相手ごとの局数**（issue #40「held-out validation: 各600局。
+/// N は事前固定し、門付近での増量・取り直しはしない」）。`--expect-games` が
+/// この値でない入力は**判定不能**になり「通過」を出せない（別の N で回した
+/// 標本に #40 の門を当てて通過を主張できてしまうため — PR #41 レビュー2巡目）
+const BALANCE_EXPECT_GAMES: usize = 600;
+/// 事前登録した shard 数（issue #40「held-out validation は shards=8」）
+const BALANCE_EXPECT_SHARDS: usize = 8;
+/// 事前登録した相手集合と base seed（issue #40「v14 は match_seed=20260909、
+/// v13 は 20260910」）。相手集合の既定もここから作る
+const BALANCE_EXPECT_SEEDS: [(&str, u64); 2] =
+    [("estimator_v13", 20260910), ("estimator_v14", 20260909)];
+/// 事前登録した信頼水準（95% CI）。`--alpha 0.5` の 50% CI で
+/// 「CI 下限 > 0」を判定した結果は「通過」にしない
+const BALANCE_ALPHA: f64 = 0.05;
+/// 事前登録した思考予算（issue #40 の held-out は両 arm・両側 2000ms）。
+/// arm 間の一致検査だけでは「両 arm を 700ms / 8000ms で回した run」でも
+/// 通過を出せてしまう（PR #41 レビュー5巡目 [P1]）
+const BALANCE_BUDGET_MS: u64 = 2000;
+/// 通過判定に使ってよい bootstrap 反復数の下限（既定値でもある）。
+/// `--boot 1` は「1回引いた値」を CI と呼ぶだけで分解能が無い
+const BALANCE_MIN_BOOT: usize = 10_000;
+
+/// **事前登録との照合**（PR #41 レビュー4巡目 [P1]）。門の定数だけでなく、
+/// 判定を変えられる呼び出し時パラメータ（局数・shard 数・base seed・相手集合・
+/// 信頼水準・bootstrap 反復数）も事前登録値と比べ、外れたものは全部
+/// **判定不能ノート**にする: informational な集計はできるが、別の seed・
+/// shard 構成・相手・信頼水準で良く見えた結果を #40 の「通過」とは表示できない
+fn balance_prereg_notes(
+    expect_games: usize,
+    expect_shards: usize,
+    expect_seeds: &BTreeMap<String, u64>,
+    expect_opps: &BTreeSet<String>,
+    alpha: f64,
+    boot: usize,
+) -> Vec<String> {
+    let mut notes = vec![];
+    if expect_games != BALANCE_EXPECT_GAMES {
+        notes.push(format!(
+            "--expect-games {expect_games} ≠ 事前登録 {BALANCE_EXPECT_GAMES}（informational な集計はできるが #40 の採否は出せない）"
+        ));
+    }
+    if expect_shards != BALANCE_EXPECT_SHARDS {
+        notes.push(format!(
+            "--expect-shards {expect_shards} ≠ 事前登録 {BALANCE_EXPECT_SHARDS}"
+        ));
+    }
+    let want_seeds: BTreeMap<String, u64> = BALANCE_EXPECT_SEEDS
+        .iter()
+        .map(|(k, v)| (k.to_string(), *v))
+        .collect();
+    if *expect_seeds != want_seeds {
+        notes.push(format!(
+            "--expect-seeds {expect_seeds:?} ≠ 事前登録 {want_seeds:?}"
+        ));
+    }
+    let want_opps: BTreeSet<String> = BALANCE_EXPECT_SEEDS
+        .iter()
+        .map(|(k, _)| k.to_string())
+        .collect();
+    if *expect_opps != want_opps {
+        notes.push(format!(
+            "--expect-opponents {expect_opps:?} ≠ 事前登録 {want_opps:?}"
+        ));
+    }
+    if alpha != BALANCE_ALPHA {
+        notes.push(format!(
+            "--alpha {alpha} ≠ 事前登録 {BALANCE_ALPHA}（95% CI 以外で取った CI 下限は通過の根拠にしない）"
+        ));
+    }
+    if boot < BALANCE_MIN_BOOT {
+        notes.push(format!(
+            "--boot {boot} < 下限 {BALANCE_MIN_BOOT}（CI の分解能が足りない）"
+        ));
+    }
+    notes
+}
+
+/// validation manifest の指紋と行の指紋の照合。**指紋が違う行は Err**
+/// （別の manifest の下で測った run か、計測後に manifest を書き換えている）。
+/// **指紋の無い行（null）は本数を返す** = 呼び出し側が判定不能ノートへ回す
+/// （「計測前に commit した manifest の下で測った」ことを機械検証できない）
+fn check_manifest_rows(rows: &[GameRow], arm: &str, want_fp: &str) -> Result<usize, String> {
+    let mut missing = 0usize;
+    for r in rows {
+        match &r.balance_manifest {
+            None => missing += 1,
+            Some(fp) if fp != want_fp => {
+                return Err(format!(
+                    "{arm}: 行の balance_manifest {fp} が --manifest の指紋 {want_fp} と一致しません\n            （別の manifest の下で測った run か、計測後に manifest を書き換えています）"
+                ));
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(missing)
+}
+
+/// **診断オラクルの run は採否に使えない**（PR #41 レビュー5巡目 [P1]）。
+/// `nofoul` / `check_nofoul` は審判が候補の反則を握りつぶして指し直させる
+/// 上限測定で、片 arm だけに掛かっていても勝敗の意味が変わる。常に die
+/// （`--allow-incomplete` でも降格しない）
+fn check_no_oracle(rows: &[GameRow], arm: &str) -> Result<(), String> {
+    for r in rows {
+        if !r.oracle.is_empty() {
+            return Err(format!(
+                "{arm}: oracle={} の行があります（診断オラクルの run は #40 の採否に使えません）",
+                r.oracle
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// **実験条件そのものの事前登録照合**（PR #41 レビュー5巡目 [P1]）。
+/// arm 間の一致検査は「両方とも 700ms」を通してしまうので、
+/// 事前登録の実効値（予算 2000ms・両側 env なし）と比べて外れは
+/// **判定不能ノート**にする。予算は両側（候補・固定相手）とも見る
+fn balance_run_condition_notes(ctrl0: &GameRow, cand0: &GameRow) -> Vec<String> {
+    let mut notes = vec![];
+    let want = format!("{BALANCE_BUDGET_MS}");
+    for (label, v) in [
+        ("候補", &cand0.budget),
+        ("相手", &cand0.budget_opp),
+        ("対照側候補", &ctrl0.budget),
+        ("対照側相手", &ctrl0.budget_opp),
+    ] {
+        if *v != want {
+            notes.push(format!(
+                "{label}の実効思考予算 {v} ≠ 事前登録 {BALANCE_BUDGET_MS}ms"
+            ));
+        }
+    }
+    for (arm, r) in [("control", ctrl0), ("candidate", cand0)] {
+        if !r.shared_env.is_empty() {
+            notes.push(format!(
+                "{arm}: 両側に効く env が入っています（[{}]。held-out は env なしが事前登録）",
+                fmt_env(&r.shared_env)
+            ));
+        }
+    }
+    notes
+}
+
+/// **manifest の内容の照合**。判定に足る manifest は `cand_knobs` に加えて
+/// `candidate` / `think_budget_ms` を必須で持ち（PR #41 レビュー5巡目:
+/// 「一致」だけでなく事前登録した実効値そのものを manifest に固定する）、
+/// echo フィールド（games / shards / opponents / clock）はあれば定数・記録と
+/// 突き合わせる。外れはすべて判定不能ノート
+fn manifest_content_notes(v: &serde_json::Value, rows_candidate: &str, rows_clock: &str) -> Vec<String> {
+    let mut notes = vec![];
+    match v.get("candidate").and_then(|x| x.as_str()) {
+        None => notes.push("manifest に candidate がありません（判定に足る manifest は必須）".into()),
+        Some(mc) if mc != rows_candidate => notes.push(format!(
+            "manifest の candidate {mc} ≠ 記録の candidate {rows_candidate}"
+        )),
+        Some(_) => {}
+    }
+    match v.get("think_budget_ms").and_then(|x| x.as_u64()) {
+        None => notes.push(
+            "manifest に think_budget_ms がありません（判定に足る manifest は必須）".into(),
+        ),
+        Some(mb) if mb != BALANCE_BUDGET_MS => notes.push(format!(
+            "manifest の think_budget_ms {mb} ≠ 事前登録 {BALANCE_BUDGET_MS}"
+        )),
+        Some(_) => {}
+    }
+    if v.get("games").and_then(|x| x.as_u64()).is_some_and(|g| g != BALANCE_EXPECT_GAMES as u64) {
+        notes.push(format!(
+            "manifest の games {} ≠ 事前登録 {BALANCE_EXPECT_GAMES}",
+            v["games"]
+        ));
+    }
+    if v.get("shards").and_then(|x| x.as_u64()).is_some_and(|s| s != BALANCE_EXPECT_SHARDS as u64) {
+        notes.push(format!(
+            "manifest の shards {} ≠ 事前登録 {BALANCE_EXPECT_SHARDS}",
+            v["shards"]
+        ));
+    }
+    if let Some(o) = v.get("opponents").and_then(|x| x.as_object()) {
+        let got: BTreeMap<String, u64> = o
+            .iter()
+            .filter_map(|(k, val)| val.as_u64().map(|n| (k.clone(), n)))
+            .collect();
+        let want: BTreeMap<String, u64> = BALANCE_EXPECT_SEEDS
+            .iter()
+            .map(|(k, s)| (k.to_string(), *s))
+            .collect();
+        if got != want {
+            notes.push(format!("manifest の opponents {got:?} ≠ 事前登録 {want:?}"));
+        }
+    }
+    if let Some(mc) = v.get("clock") {
+        if mc.to_string() != rows_clock {
+            notes.push(format!(
+                "manifest の clock {mc} ≠ 記録の clock {rows_clock}"
+            ));
+        }
+    }
+    notes
+}
+
+/// **平均評価粒子数の安全性 veto**（issue #40「候補の平均評価粒子数が
+/// 対照比 −10% 超で中止」、PR #41 レビュー7巡目 [P1] で verdict へ組み込み）。
+/// 粒子数は games.jsonl に無いので、同じ run の artifact `arena-records-*`
+/// （1対局1ファイルの JSONL。`chose.debug.unique_particles` = その決定で
+/// 評価に使ったユニーク粒子数）を `--records-control` / `--records-candidate`
+/// で受け取って平均する。**この入力が無い集計は判定不能**（veto を検証
+/// できないまま pass=true を出さない）
+const BALANCE_PARTICLE_DROP: f64 = 0.10;
+
+/// record の由来 meta（`selfplay::write_record` が先頭へ書く。PR #41
+/// レビュー8巡目 [P1]: 由来の無い record 集計は、別 run・重複・欠落の
+/// 粒子数で veto を通せてしまう）
+#[derive(Debug, Clone)]
+struct RecordMeta {
+    run_id: Option<String>,
+    run_attempt: Option<u64>,
+    baseline: String,
+    game_no: u64,
+    base: Option<u64>,
+    shard: Option<u64>,
+    manifest: Option<String>,
+}
+
+/// 1 record ファイルの**厳格**解析: 壊れた JSON 行は Err（黙って捨てると
+/// 平均を選択標本にできる）、`end` の無い未完 record も Err。
+/// 返り値は (meta（無い record は None）, 決定数, unique_particles の総和,
+/// unique_particles の無い chose 行数)
+fn parse_record_strict(
+    text: &str,
+    where_: &str,
+) -> Result<(Option<RecordMeta>, usize, u64, usize), String> {
+    let (mut n, mut sum, mut missing) = (0usize, 0u64, 0usize);
+    let mut meta: Option<RecordMeta> = None;
+    let mut ended = false;
+    for (ln, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| format!("{where_}:{}: JSON として読めません: {e}", ln + 1))?;
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("meta") => {
+                let opt_s = |k: &str| v.get(k).and_then(|x| x.as_str()).map(str::to_string);
+                let opt_u = |k: &str| v.get(k).and_then(|x| x.as_u64());
+                meta = Some(RecordMeta {
+                    run_id: opt_s("run_id"),
+                    run_attempt: opt_u("run_attempt"),
+                    baseline: opt_s("baseline")
+                        .ok_or_else(|| format!("{where_}: meta に baseline がありません"))?,
+                    game_no: opt_u("game_no")
+                        .ok_or_else(|| format!("{where_}: meta に game_no がありません"))?,
+                    base: opt_u("match_seed_base"),
+                    shard: opt_u("match_seed_shard"),
+                    manifest: opt_s("balance_manifest"),
+                });
+            }
+            Some("chose") => {
+                let dbg = v.get("debug");
+                // **定跡手は評価を回さない正当な非評価手**（`debug.joseki == true`）。
+                // 集計対象外にする = 欠測とは区別する（PR #41 レビュー9巡目 [P1]:
+                // 一緒に missing へ数えると、定跡を含む正常な held-out run が
+                // 必ず判定不能になる）。debug が null / unique_particles 無しで
+                // 印も無い行だけが「古い/欠損 record」= missing
+                if dbg
+                    .and_then(|d| d.get("joseki"))
+                    .and_then(|j| j.as_bool())
+                    == Some(true)
+                {
+                    continue;
+                }
+                match dbg
+                    .and_then(|d| d.get("unique_particles"))
+                    .and_then(|u| u.as_u64())
+                {
+                    Some(u) => {
+                        n += 1;
+                        sum += u;
+                    }
+                    None => missing += 1,
+                }
+            }
+            Some("end") => ended = true,
+            _ => {}
+        }
+    }
+    if !ended {
+        return Err(format!(
+            "{where_}: end イベントの無い未完 record です（途中で切れた record を平均に混ぜない）"
+        ));
+    }
+    Ok((meta, n, sum, missing))
+}
+
+struct ParticleSummary {
+    games: usize,
+    decisions: usize,
+    mean: f64,
+    /// debug.unique_particles を持たない chose 行（> 0 なら判定不能ノート行き）
+    missing: usize,
+    /// 由来 meta（meta の無い record は入らない = 由来を照合できない）
+    metas: Vec<RecordMeta>,
+}
+
+/// `--records-*` のパス（ファイル or ディレクトリ。ディレクトリは再帰で
+/// *.jsonl を拾う = artifact `arena-records-*` の展開先をそのまま渡せる）
+fn particle_summary(paths: &[String], arm: &str) -> ParticleSummary {
+    fn collect(path: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        if path.is_dir() {
+            let entries = std::fs::read_dir(path)
+                .unwrap_or_else(|e| die(&format!("{}: {e}", path.display())));
+            for e in entries.flatten() {
+                collect(&e.path(), out);
+            }
+        } else if path.extension().is_some_and(|x| x == "jsonl") {
+            out.push(path.to_path_buf());
+        }
+    }
+    let mut files = vec![];
+    for p in paths {
+        collect(std::path::Path::new(p), &mut files);
+    }
+    if files.is_empty() {
+        die(&format!("{arm}: --records に *.jsonl が1つもありません（{paths:?}）"));
+    }
+    let (mut n, mut sum, mut missing) = (0usize, 0u64, 0usize);
+    let mut metas = vec![];
+    for f in &files {
+        let text = std::fs::read_to_string(f)
+            .unwrap_or_else(|e| die(&format!("{}: {e}", f.display())));
+        let (m, a, b, c) = parse_record_strict(&text, &format!("{arm} {}", f.display()))
+            .unwrap_or_else(|e| die(&e));
+        if let Some(m) = m {
+            metas.push(m);
+        }
+        n += a;
+        sum += b;
+        missing += c;
+    }
+    ParticleSummary {
+        games: files.len(),
+        decisions: n,
+        mean: if n > 0 { sum as f64 / n as f64 } else { f64::NAN },
+        missing,
+        metas,
+    }
+}
+
+/// **record の由来を games.jsonl と一対一で照合する**（PR #41 レビュー8巡目 [P1]）。
+/// - 全 record に完全な meta（run 識別・base・shard）が揃っているときだけ
+///   厳格照合: (baseline, base, shard, game_no) の**重複は Err**、games 行の
+///   鍵集合と**完全一致でなければ Err**（同じディレクトリを2回渡す・別 run の
+///   1200 ファイル・欠落 = すべてここで止まる）、run 識別は games 行と一致、
+///   manifest 指紋は `--manifest` と一致（違えば Err）
+/// - meta が不完全な record が1つでもあれば照合できないので**判定不能ノート**
+///   （informational な平均は出るが「通過」は出せない）
+/// 返り値: Ok(判定不能ノート) / Err(die)
+fn verify_record_provenance(
+    s: &ParticleSummary,
+    rows: &[GameRow],
+    arm: &str,
+    manifest_fp: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut notes = vec![];
+    let incomplete = s
+        .metas
+        .iter()
+        .filter(|m| {
+            m.run_id.is_none() || m.run_attempt.is_none() || m.base.is_none() || m.shard.is_none()
+        })
+        .count();
+    if s.games != s.metas.len() || incomplete > 0 {
+        notes.push(format!(
+            "{arm}: 由来 meta の無い/不完全な record が {} 件 = games.jsonl と一対一照合できない",
+            (s.games - s.metas.len()) + incomplete
+        ));
+        return Ok(notes);
+    }
+    // 鍵の重複（同じディレクトリの二重指定・record のコピー）
+    let mut keys: BTreeMap<(String, u64, u64, u64), usize> = BTreeMap::new();
+    for m in &s.metas {
+        *keys
+            .entry((m.baseline.clone(), m.base.unwrap(), m.shard.unwrap(), m.game_no))
+            .or_default() += 1;
+    }
+    if let Some((k, c)) = keys.iter().find(|(_, c)| **c > 1) {
+        return Err(format!(
+            "{arm}: 同じ record 鍵 {k:?} が {c} 件あります（同じディレクトリの二重指定・record の重複）"
+        ));
+    }
+    // games.jsonl の鍵集合との完全一致（別 run の records・欠落・余剰を止める）
+    let row_keys: BTreeSet<(String, u64, u64, u64)> = rows
+        .iter()
+        .map(|r| (r.baseline.clone(), r.match_seed_base, r.match_seed_shard, r.game_no))
+        .collect();
+    let rec_keys: BTreeSet<(String, u64, u64, u64)> = keys.into_keys().collect();
+    if rec_keys != row_keys {
+        let only_rec = rec_keys.difference(&row_keys).count();
+        let only_row = row_keys.difference(&rec_keys).count();
+        return Err(format!(
+            "{arm}: record の鍵集合が games.jsonl と一致しません（record のみ {only_rec} 件 / games のみ {only_row} 件）。\n            判定対象の run の arena-records をそのまま渡してください"
+        ));
+    }
+    // run 識別と manifest 指紋（baseline ごとの games 行と突き合わせる）
+    let run_of: BTreeMap<&str, (&str, u64)> = rows
+        .iter()
+        .map(|r| (r.baseline.as_str(), (r.run_id.as_str(), r.run_attempt)))
+        .collect();
+    for m in &s.metas {
+        let want = run_of.get(m.baseline.as_str()).expect("鍵集合一致を検査済み");
+        let got = (m.run_id.as_deref().unwrap(), m.run_attempt.unwrap());
+        if got != *want {
+            return Err(format!(
+                "{arm}({}): record の run 識別 {got:?} が games.jsonl の {want:?} と違います（別 run の records）",
+                m.baseline
+            ));
+        }
+        if let Some(fp) = manifest_fp {
+            match m.manifest.as_deref() {
+                None => {
+                    notes.push(format!(
+                        "{arm}({}): record に manifest 指紋がありません",
+                        m.baseline
+                    ));
+                }
+                Some(x) if x != fp => {
+                    return Err(format!(
+                        "{arm}({}): record の manifest 指紋が --manifest と一致しません",
+                        m.baseline
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    notes.dedup();
+    Ok(notes)
+}
+
+/// claim 台帳（annotated tag）の記録を読む（PR #41 レビュー8巡目 [P1]:
+/// 台帳を読まない合算器は、台帳外の artifact を最終入力に選ばれても
+/// 気づけない）。タグが無ければ Ok(None)
+fn read_claim_record(repo: &str, tag: &str) -> Result<Option<serde_json::Value>, String> {
+    let out = std::process::Command::new("git")
+        .args(["-C", repo, "cat-file", "-p", &format!("refs/tags/{tag}")])
+        .output()
+        .map_err(|e| format!("git を実行できません: {e}"))?;
+    if !out.status.success() {
+        return Ok(None);
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // annotated tag: ヘッダ行 → 空行 → message（plan が JSON を書く）
+    let msg = text.split_once("\n\n").map(|(_, m)| m).unwrap_or("");
+    serde_json::from_str(msg.trim())
+        .map(Some)
+        .map_err(|e| format!("claim タグ {tag} の message が JSON ではありません: {e}"))
+}
+
+/// 最終判定: 入力が事前登録の条件を満たさない（判定不能の理由がある）とき、
+/// 数値の門がどうであれ**「通過」を出さない**。返り値は (表示ラベル, pass)
+fn balance_final(numeric_pass: bool, indeterminate: &[String]) -> (&'static str, bool) {
+    if !indeterminate.is_empty() {
+        ("判定不能", false)
+    } else if numeric_pass {
+        ("通過", true)
+    } else {
+        ("不通過", false)
+    }
+}
+
+/// 層化 bootstrap: 各層（相手）の内側で標本を引き直し、層平均の平均を分布にする。
+/// 返り値は (点推定, CI下限, CI上限)。点推定は各層の平均の単純平均 =
+/// opponent-balanced な合算そのもの
+fn stratified_boot_mean_ci(
+    strata: &[Vec<f64>],
+    boot: usize,
+    seed: u64,
+    alpha: f64,
+) -> (f64, f64, f64) {
+    if strata.iter().any(|v| v.is_empty()) {
+        return (f64::NAN, f64::NAN, f64::NAN);
+    }
+    let point = strata.iter().map(|v| mean(v)).sum::<f64>() / strata.len() as f64;
+    let mut state = seed | 1;
+    let mut draws: Vec<f64> = Vec::with_capacity(boot);
+    for _ in 0..boot {
+        let mut acc = 0.0;
+        for v in strata {
+            let mut s = 0.0;
+            for _ in 0..v.len() {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                s += v[(state >> 33) as usize % v.len()];
+            }
+            acc += s / v.len() as f64;
+        }
+        draws.push(acc / strata.len() as f64);
+    }
+    draws.sort_by(f64::total_cmp);
+    let idx = |q: f64| -> f64 {
+        let i = ((draws.len() - 1) as f64 * q).round() as usize;
+        draws[i.min(draws.len() - 1)]
+    };
+    (point, idx(alpha / 2.0), idx(1.0 - alpha / 2.0))
+}
+
+/// 相手ごとに (対照, 候補) の局ペアを作る。ペアの鍵は (match_seed, game_no)
+/// （実効 seed はシャードごとに違うので、shard をまたいだ衝突は起きない）。
+/// - 相手集合が両 arm で一致しない・2相手未満は Err
+/// - **arm × 相手ごとに `match_seed_base` は1つだけ**（常に Err、降格なし）。
+///   実効 seed はシャードずらしで1 run でも複数値になる（PR #41 レビュー3巡目で
+///   実効 seed の一意性検査を base へ付け替えた）が、base が2つある = 別々の
+///   run（別の対局条件列）の混入で、「相手ごとに1つの未使用 seed」ではない
+/// - **base seed が事前登録値と一致**（`expect_seeds`: 相手→base。不一致は Err）
+/// - **shard 集合が 0..expect_shards の完全な集合**（欠け・重複・範囲外は Err。
+///   実効 seed ＋ game_no のペア照合は末尾 shard の丸ごと欠落を素通しするため）
+/// - **相手ごとのペア局数 == `expect_games`**（事前登録の各600局を呼び出し側が
+///   明示する。`allow_incomplete` で警告へ降格するが、降格した事実は
+///   返り値の**判定不能ノート**に残り、最終判定は「通過」を出せない）
+/// - ペアにならない局は Err（`allow_incomplete` で捨てて続行 = 同じくノート行き）
+/// - 先後の食い違いは常に Err（別の条件列）
+/// - 相手ごとのペア数が [`MIN_ARENA_PAIRS`] 未満は Err（自由度は作れない）
+///
+/// 返り値は (相手→ペア列, 判定不能ノート)。ノートが空でない入力は
+/// 「情報としての集計はできるが #40 の採否は出せない」
+fn pair_by_opponent(
+    ctrl: &[GameRow],
+    cand: &[GameRow],
+    expect_games: usize,
+    expect_shards: usize,
+    expect_seeds: &BTreeMap<String, u64>,
+    allow_incomplete: bool,
+) -> Result<(BTreeMap<String, Vec<(GameRow, GameRow)>>, Vec<String>), String> {
+    let opps = |rows: &[GameRow]| -> BTreeSet<String> {
+        rows.iter().map(|r| r.baseline.clone()).collect()
+    };
+    let (co, to) = (opps(ctrl), opps(cand));
+    if co != to {
+        return Err(format!(
+            "相手集合が対照と候補で違います: control={co:?} / candidate={to:?}"
+        ));
+    }
+    if co.len() < 2 {
+        return Err(format!(
+            "相手が {} 種類しかありません（opponent-balanced 合算には2相手以上が要ります。\n            1相手のペア差は arena-var を使ってください）",
+            co.len()
+        ));
+    }
+    let mut out: BTreeMap<String, Vec<(GameRow, GameRow)>> = BTreeMap::new();
+    let mut notes: Vec<String> = vec![];
+    for opp in &co {
+        // run の一意性は **base seed** で検査する（実効 seed は shard ずらしで
+        // 1 run でも複数値になるので、そちらを一意にすると正常な sharded run を
+        // 必ず拒否する）。ここは降格しない: base が2つある = 別々の run の混入で、
+        // 「未使用 seed 1本の held-out」という母集団の定義そのものが壊れる
+        for (arm, rows) in [("control", ctrl), ("candidate", cand)] {
+            let sub: Vec<&GameRow> = rows.iter().filter(|r| &r.baseline == opp).collect();
+            let bases: BTreeSet<u64> = sub.iter().map(|r| r.match_seed_base).collect();
+            if bases.len() > 1 {
+                return Err(format!(
+                    "{arm}({opp}): match_seed_base が複数あります（{bases:?}）。\n            複数の run の記録を混ぜないでください（相手ごとに1つの base seed の1 run）"
+                ));
+            }
+            let base = *bases.iter().next().expect("相手集合の検査後なので空ではない");
+            // 事前登録した相手別の base seed（held-out は v14=20260909 / v13=20260910）
+            match expect_seeds.get(opp.as_str()) {
+                None => {
+                    return Err(format!(
+                        "--expect-seeds に相手 {opp} の base seed がありません（\"相手=seed,...\" で全相手ぶん指定）"
+                    ));
+                }
+                Some(&want) if want != base => {
+                    return Err(format!(
+                        "{arm}({opp}): match_seed_base {base} が事前登録 {want} と違います（別の run を渡していませんか）"
+                    ));
+                }
+                Some(_) => {}
+            }
+            // shard 集合の完全性。実効 seed ＋ game_no のペア照合は「両 arm から
+            // 同じ末尾 shard が丸ごと欠けた」を素通しするので、0..N の完全な
+            // 集合であることをここで要求する
+            let shards: BTreeSet<u64> = sub.iter().map(|r| r.match_seed_shard).collect();
+            let want: BTreeSet<u64> = (0..expect_shards as u64).collect();
+            if shards != want {
+                return Err(format!(
+                    "{arm}({opp}): shard 集合 {shards:?} が 0..{expect_shards} と一致しません（欠け・範囲外の shard があります）"
+                ));
+            }
+            // **実行の識別子は arm × 相手で1つだけ**（PR #41 レビュー4巡目 [P1]、
+            // 降格なし）。base は実験条件であって実行の識別子ではない: 同じ base で
+            // 取り直した run A/B から shard を半分ずつ選んでも、base 1値・
+            // shard 集合完全・局数一致・ペアキー重複なしでここまでの検査を全部
+            // 通る。壁時計予算で同じ seed でも結果が揺れるので、それを許すのは
+            // 「門付近での取り直し」を許すことと同じ
+            let runs: BTreeSet<(&str, u64)> =
+                sub.iter().map(|r| (r.run_id.as_str(), r.run_attempt)).collect();
+            if runs.len() > 1 {
+                return Err(format!(
+                    "{arm}({opp}): 実行の識別子 (run_id, attempt) が複数あります（{runs:?}）。\n            同じ base seed でも別実行の記録は混ぜられません（取り直すなら run ごと差し替え）"
+                ));
+            }
+            // **re-run attempt は使えない**（PR #41 レビュー5巡目 [P1]）。
+            // `pair_with` は run_id しか持たないので、attempt 1 の対照を指した
+            // 候補に attempt 2 の記録を渡しても run_id は一致する。事前登録の
+            // 「門付近で取り直さない」に従い、判定に使えるのは attempt 1 だけ:
+            // shard が落ちた run は re-run でなく新しい run として取り直す
+            let (_, attempt) = runs.iter().next().expect("非空を検査済み");
+            if *attempt != 1 {
+                notes.push(format!(
+                    "{arm}({opp}): run_attempt {attempt} ≠ 1（re-run attempt の記録 = 取り直し。判定に使えない）"
+                ));
+            }
+        }
+        // **対照の取り違え**: 候補行の `pair_with` は対照の run_id と一致すること
+        // （`-f pair_with=` で対照を指して回した候補 run の記録がその紐を持つ）。
+        // **held-out 判定では必須**: 紐の無い候補 run は「事前に対照を指した」ことを
+        // 機械検証できないので、後から別の同一 seed・同一 commit 対照へ差し替え
+        // られる（PR #41 レビュー5巡目 [P1]。無い行は判定不能ノート行き）
+        let ctrl_run = ctrl
+            .iter()
+            .find(|r| &r.baseline == opp)
+            .map(|r| r.run_id.clone())
+            .expect("相手集合の検査後なので空ではない");
+        let mut missing_pw = 0usize;
+        for r in cand.iter().filter(|r| &r.baseline == opp) {
+            match &r.pair_with {
+                Some(pw) if pw != &ctrl_run => {
+                    return Err(format!(
+                        "candidate({opp}): pair_with={pw} が対照の run_id={ctrl_run} と一致しません\n            （候補 run が指した対照と、--control に渡した記録が別物です）"
+                    ));
+                }
+                Some(_) => {}
+                None => missing_pw += 1,
+            }
+        }
+        if missing_pw > 0 {
+            notes.push(format!(
+                "candidate({opp}): pair_with の無い行が {missing_pw} 行（対照 run への事前の紐付けを機械検証できない）"
+            ));
+        }
+        let key = |r: &GameRow| (r.match_seed, r.game_no);
+        let cb: BTreeMap<_, _> = ctrl
+            .iter()
+            .filter(|r| &r.baseline == opp)
+            .map(|r| (key(r), r))
+            .collect();
+        let tb: BTreeMap<_, _> = cand
+            .iter()
+            .filter(|r| &r.baseline == opp)
+            .map(|r| (key(r), r))
+            .collect();
+        let unpaired =
+            cb.keys().filter(|k| !tb.contains_key(*k)).count()
+                + tb.keys().filter(|k| !cb.contains_key(*k)).count();
+        if unpaired > 0 {
+            let msg = format!(
+                "{opp}: ペアにならない対局が {unpaired} 局あります。\n            同じ match_seed・同じ局数・同じ shard 構成で取り直してください"
+            );
+            if allow_incomplete {
+                eprintln!("警告: {msg}");
+                notes.push(format!("{opp}: ペアにならない対局 {unpaired} 局を捨てた"));
+            } else {
+                return Err(msg);
+            }
+        }
+        let mut pairs: Vec<(GameRow, GameRow)> = vec![];
+        for (k, c) in &cb {
+            let Some(t) = tb.get(k) else { continue };
+            if c.a_is_sente != t.a_is_sente {
+                return Err(format!("{opp} {k:?}: 先後が食い違っています（別の条件列です）"));
+            }
+            pairs.push(((*c).clone(), (*t).clone()));
+        }
+        if pairs.len() < MIN_ARENA_PAIRS {
+            return Err(format!("{opp}: {}", arena_var_pair_error(pairs.len())));
+        }
+        // **期待局数の強制**（fail-closed）: 事前登録した局数（検証セットは
+        // 各600局）を呼び出し側が明示し、ここで照合する。「2ペア以上あればよい」
+        // では 104局の smoke でも部分欠損した run でも判定を返せてしまう
+        if pairs.len() != expect_games {
+            let msg = format!(
+                "{opp}: ペア局数 {} が期待 {expect_games} と違います（--expect-games は\n            事前登録した局数。検証セットは各600局）",
+                pairs.len()
+            );
+            if allow_incomplete {
+                eprintln!("警告: {msg}");
+                notes.push(format!(
+                    "{opp}: ペア局数 {} ≠ 期待 {expect_games}",
+                    pairs.len()
+                ));
+            } else {
+                return Err(msg);
+            }
+        }
+        out.insert(opp.clone(), pairs);
+    }
+    Ok((out, notes))
+}
+
+/// 判定に使う量の入れ物（テスト対象）
+#[derive(Clone)]
+struct BalanceGate {
+    combined: f64,
+    ci_lo: f64,
+    /// 相手ごとの Δ 点推定（符号 veto）
+    per_opp: Vec<(String, f64)>,
+    /// 反則/局（fouls_me）の合算ペア差
+    fouls_delta: f64,
+    /// 思考平均（ms/手）の合算ペア差
+    think_delta: f64,
+    /// 候補 arm の時間切れ負け局数
+    cand_timeouts: u64,
+    /// 平均評価粒子数 (対照, 候補)。None = arena-records 未指定
+    /// （verdict はここでは落とさないが、呼び出し側が判定不能にする）
+    particles: Option<(f64, f64)>,
+}
+
+/// 事前登録した門の判定。返り値は (通過, 落ちた理由の一覧)
+fn balance_verdict(g: &BalanceGate) -> (bool, Vec<String>) {
+    let mut reasons = vec![];
+    if !(g.combined >= BALANCE_MIN_DELTA) {
+        reasons.push(format!(
+            "合算 Δ {:+.4} < +{BALANCE_MIN_DELTA}",
+            g.combined
+        ));
+    }
+    if !(g.ci_lo > 0.0) {
+        reasons.push(format!("合算 CI 下限 {:+.4} ≤ 0", g.ci_lo));
+    }
+    for (opp, d) in &g.per_opp {
+        if !(*d > 0.0) {
+            reasons.push(format!("{opp} の Δ {d:+.4} ≤ 0（相手別符号 veto）"));
+        }
+    }
+    if !(g.fouls_delta <= BALANCE_MARGIN_FOULS) {
+        reasons.push(format!(
+            "反則/局のペア差 {:+.3} > +{BALANCE_MARGIN_FOULS}",
+            g.fouls_delta
+        ));
+    }
+    if g.cand_timeouts > 0 {
+        reasons.push(format!("候補の時間切れ負け {} 局 > 0", g.cand_timeouts));
+    }
+    if !(g.think_delta <= BALANCE_MARGIN_THINK_MS) {
+        reasons.push(format!(
+            "思考平均のペア差 {:+.1}ms > +{BALANCE_MARGIN_THINK_MS}ms",
+            g.think_delta
+        ));
+    }
+    // 平均評価粒子数の veto（issue #40: 対照比 −10% 超で中止）。
+    // NaN（決定数 0 等）も不通過側に落ちる
+    if let Some((c, t)) = g.particles {
+        if !(c > 0.0 && t >= c * (1.0 - BALANCE_PARTICLE_DROP)) {
+            reasons.push(format!(
+                "平均評価粒子数 対照 {c:.1} → 候補 {t:.1}（対照比 {:.1}% 減 > {:.0}% で中止）",
+                (1.0 - t / c) * 100.0,
+                BALANCE_PARTICLE_DROP * 100.0
+            ));
+        }
+    }
+    (reasons.is_empty(), reasons)
+}
+
+fn cmd_arena_balance(args: &Args) {
+    let control_paths = args.all("control");
+    let candidate_paths = args.all("candidate");
+    if control_paths.is_empty() || candidate_paths.is_empty() {
+        die("--control と --candidate に ARENA_GAMES_JSON の JSONL を指定してください");
+    }
+    // **判定を変えられるパラメータの既定はすべて事前登録の定数**（PR #41
+    // レビュー4巡目 [P1]）。CLI から動かすことはできる（他データの診断用）が、
+    // 事前登録値から外れた指定は balance_prereg_notes が**判定不能**にする:
+    // 別の N・shard 構成・seed・相手・信頼水準・反復数で良く見えた結果を
+    // #40 の「通過」とは表示できない
+    let boot: usize = args.num("boot", BALANCE_MIN_BOOT);
+    let alpha: f64 = args.num("alpha", BALANCE_ALPHA);
+    let allow_incomplete = args.flag("allow-incomplete");
+    let label = args.get("label").unwrap_or("arena-balance").to_string();
+    let parse_or_die = |flag: &str, v: &str| -> usize {
+        v.parse()
+            .unwrap_or_else(|_| die(&format!("--{flag} が数値ではありません: {v}")))
+    };
+    let expect_games: usize = match args.get("expect-games") {
+        None => BALANCE_EXPECT_GAMES,
+        Some(v) => parse_or_die("expect-games", v),
+    };
+    // shard 数と相手別 base seed の照合（PR #41 レビュー3巡目）。記録の
+    // match_seed は shard ずらし＋基準 XOR 済みの実効値なので、run の同一性・
+    // 完全性は base / shard 列で検査する
+    let expect_shards: usize = match args.get("expect-shards") {
+        None => BALANCE_EXPECT_SHARDS,
+        Some(v) => parse_or_die("expect-shards", v),
+    };
+    let expect_seeds: BTreeMap<String, u64> = match args.get("expect-seeds") {
+        None => BALANCE_EXPECT_SEEDS
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect(),
+        Some(raw) => raw
+            .split([',', ' '])
+            .filter(|s| !s.is_empty())
+            .map(|kv| match kv.split_once('=') {
+                Some((k, v)) => match v.parse::<u64>() {
+                    Ok(n) => (k.to_string(), n),
+                    Err(_) => die(&format!("--expect-seeds の seed が数値ではありません: {kv}")),
+                },
+                None => die(&format!("--expect-seeds の項が 相手=seed 形式ではありません: {kv}")),
+            })
+            .collect(),
+    };
+    // **validation manifest**（PR #41 レビュー4巡目 [P1]）。処置ノブのような
+    // 「P1 の後に決まる可変部分」は定数にできないので、**計測前に commit した
+    // manifest ファイル**を一次資料にする: 期待ノブはここから読み、指紋
+    // （ファイル bytes の sha256）を両 arm の全行（`ARENA_BALANCE_MANIFEST` が
+    // 焼き込む）と照合する。--manifest 無しの集計は informational（判定不能）
+    let manifest: Option<(String, serde_json::Value)> = args.get("manifest").map(|p| {
+        let bytes = std::fs::read(p).unwrap_or_else(|e| die(&format!("--manifest {p}: {e}")));
+        use sha2::Digest as _;
+        let fp: String = sha2::Sha256::digest(&bytes)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let v: serde_json::Value = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|e| die(&format!("--manifest {p}: JSON として読めません: {e}")));
+        (fp, v)
+    });
+    let manifest_knobs: Option<BTreeMap<String, String>> = manifest.as_ref().map(|(_, v)| {
+        let o = v
+            .get("cand_knobs")
+            .and_then(|x| x.as_object())
+            .unwrap_or_else(|| die("--manifest に cand_knobs（object）がありません"));
+        o.iter()
+            .map(|(k, val)| {
+                (
+                    k.clone(),
+                    val.as_str().map(str::to_string).unwrap_or_else(|| val.to_string()),
+                )
+            })
+            .collect()
+    });
+    // **候補側の処置ノブは事前登録値と完全一致**（PR #41 レビュー2巡目）。
+    // 期待値は manifest（あれば）が一次資料。--expect-cand-knobs は manifest の
+    // 無い診断用で、両方あれば一致を要求する（期待値の二重管理を許さない）
+    let cli_knobs: Option<BTreeMap<String, String>> = args.get("expect-cand-knobs").map(|raw| {
+        raw.split([',', ' '])
+            .filter(|s| !s.is_empty())
+            .map(|kv| match kv.split_once('=') {
+                Some((k, v)) => (k.to_string(), v.to_string()),
+                None => die(&format!("--expect-cand-knobs の項が K=V 形式ではありません: {kv}")),
+            })
+            .collect()
+    });
+    let expect_knobs: BTreeMap<String, String> = match (&manifest_knobs, &cli_knobs) {
+        (Some(m), Some(c)) if m != c => die(&format!(
+            "--expect-cand-knobs [{}] が --manifest の cand_knobs [{}] と一致しません",
+            fmt_env(c),
+            fmt_env(m)
+        )),
+        (Some(m), _) => m.clone(),
+        (None, Some(c)) => c.clone(),
+        (None, None) => die(
+            "--manifest <path>（計測前に commit した validation manifest）か\n            --expect-cand-knobs \"K=V K=V\"（事前登録した処置ノブ）を指定してください",
+        ),
+    };
+    // 期待する相手集合。**空にはできない**（片方の相手だけで通過を返せる穴と、
+    // 「空文字で検査自体を無効化」の穴の両方を塞ぐ — PR #41 レビュー4巡目）
+    let expect_opps: BTreeSet<String> = {
+        let parsed: BTreeSet<String> = match args.get("expect-opponents") {
+            None => BALANCE_EXPECT_SEEDS
+                .iter()
+                .map(|(k, _)| k.to_string())
+                .collect(),
+            Some(raw) => raw
+                .split([',', ' '])
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect(),
+        };
+        if parsed.is_empty() {
+            die("--expect-opponents は空にできません（相手集合の検査は無効化できない）");
+        }
+        parsed
+    };
+
+    let ctrl = parse_game_rows(&control_paths, "control");
+    let cand = parse_game_rows(&candidate_paths, "candidate");
+
+    // 診断オラクルの run は常に die（`--allow-incomplete` でも降格しない）
+    check_no_oracle(&ctrl, "control").unwrap_or_else(|e| die(&e));
+    check_no_oracle(&cand, "candidate").unwrap_or_else(|e| die(&e));
+
+    // arm 内の一意性は**相手ごと**に検査する（assert_uniform は相手混在を
+    // 拒否する設計なので、先に相手で割ってから掛ける）
+    let split = |rows: &[GameRow]| -> BTreeMap<String, Vec<GameRow>> {
+        let mut m: BTreeMap<String, Vec<GameRow>> = BTreeMap::new();
+        for r in rows {
+            m.entry(r.baseline.clone()).or_default().push(r.clone());
+        }
+        m
+    };
+    for (arm, rows) in [("control", &ctrl), ("candidate", &cand)] {
+        for (opp, sub) in split(rows) {
+            assert_uniform(&format!("{arm}({opp})"), &sub);
+        }
+        // **相手をまたいだ arm 設定の一致**（fail-closed）: baseline /
+        // baseline_behavior / match_seed 以外はすべて一致していなければ、
+        // 「2相手で同じ候補を測った」ことにならない
+        let uniq_across = |name: &str, vals: BTreeSet<String>| {
+            if vals.len() > 1 {
+                die(&format!(
+                    "{arm}: 相手をまたいで {name} が違います（{}）。同じ commit・同じ設定の run を渡してください",
+                    vals.into_iter().collect::<Vec<_>>().join(" / ")
+                ));
+            }
+        };
+        uniq_across("candidate", rows.iter().map(|r| r.candidate.clone()).collect());
+        uniq_across("clock", rows.iter().map(|r| r.clock.clone()).collect());
+        uniq_across("commit", rows.iter().map(|r| r.commit.clone()).collect());
+        uniq_across("think_budget_ms_a", rows.iter().map(|r| r.budget.clone()).collect());
+        uniq_across("think_budget_ms_b", rows.iter().map(|r| r.budget_opp.clone()).collect());
+        uniq_across("cand_config", rows.iter().map(|r| r.cand_config.clone()).collect());
+        uniq_across("cand_knobs", rows.iter().map(|r| fmt_env(&r.cand_knobs)).collect());
+        uniq_across("shared_env", rows.iter().map(|r| fmt_env(&r.shared_env)).collect());
+    }
+
+    // arm 間（対照 vs 候補）の実験条件。arena-var と同じ趣旨で fail-closed。
+    // **予算の不一致に override は無い**（issue #40 の検証は予算 2000ms を
+    // 4 run すべてで一致させる契約。予算そのものを比べる用途は arena-var の領分）
+    //
+    // **戦略名は同一**であること: issue #40 の比較は「同じ candidate 戦略の
+    // W=0 vs 処置ノブ」であって、別戦略どうしの比較にこの門を使ってはいけない
+    if ctrl[0].candidate != cand[0].candidate {
+        die(&format!(
+            "candidate 戦略が違います: control={} / candidate={}\n            （issue #40 の対照は同一戦略の W=0。別戦略の比較は arena-var の領分）",
+            ctrl[0].candidate, cand[0].candidate
+        ));
+    }
+    // **対照は W=0**（候補ノブなし = 既定 config）であること。対照側にノブが
+    // 入っていると「処置ノブだけが違う」という比較の前提が崩れる
+    if !ctrl[0].cand_knobs.is_empty() {
+        die(&format!(
+            "control に候補ノブが入っています（{}）。\n            issue #40 の対照は同一 commit・W=0（cand_env なし）の run です",
+            fmt_env(&ctrl[0].cand_knobs)
+        ));
+    }
+    if ctrl[0].clock != cand[0].clock {
+        die(&format!(
+            "時計が違います: control={} / candidate={}",
+            ctrl[0].clock, cand[0].clock
+        ));
+    }
+    if ctrl[0].budget != cand[0].budget || ctrl[0].budget_opp != cand[0].budget_opp {
+        die(&format!(
+            "思考予算が違います: control=(候補 {} / 相手 {}) / candidate=(候補 {} / 相手 {})",
+            ctrl[0].budget, ctrl[0].budget_opp, cand[0].budget, cand[0].budget_opp
+        ));
+    }
+    if fmt_env(&ctrl[0].shared_env) != fmt_env(&cand[0].shared_env) {
+        die(&format!(
+            "両側に効く env が違います: control=[{}] / candidate=[{}]",
+            fmt_env(&ctrl[0].shared_env),
+            fmt_env(&cand[0].shared_env)
+        ));
+    }
+    if ctrl[0].commit != cand[0].commit {
+        // issue #40 の対照は「同一 commit・W=0」。別 commit の main を指すと
+        // arena-var は警告するだけなので、こちらは**常に止める**
+        // （`--allow-incomplete` でも降格しない。別 commit の比較は
+        // 「ノブの効果 + revision の差」で estimand が別物になる）
+        die(&format!(
+            "commit が違います: control={} / candidate={}。\n            issue #40 の対照は同一 commit・W=0 の run（別 commit の main は対照にできません。\n            この検査に override はありません）",
+            ctrl[0].commit, cand[0].commit
+        ));
+    }
+    // 相手の実効挙動は**相手ごとに** arm 間で一致していること
+    {
+        let by = |rows: &[GameRow]| -> BTreeMap<String, String> {
+            rows.iter()
+                .map(|r| (r.baseline.clone(), r.baseline_behavior.clone()))
+                .collect()
+        };
+        let (cb, tb) = (by(&ctrl), by(&cand));
+        for (opp, beh) in &cb {
+            if tb.get(opp).is_some_and(|b| b != beh) {
+                die(&format!(
+                    "相手 {opp} の実効挙動が対照と候補で違います:\n            control={beh}\n            candidate={}",
+                    tb[opp]
+                ));
+            }
+        }
+    }
+    // 候補側の処置ノブは**事前登録値と完全一致**。違えば入力の取り違えなので die
+    if fmt_env(&cand[0].cand_knobs) != fmt_env(&expect_knobs) {
+        die(&format!(
+            "candidate の処置ノブが事前登録と違います:\n            記録 [{}]\n            期待 [{}]",
+            fmt_env(&cand[0].cand_knobs),
+            fmt_env(&expect_knobs)
+        ));
+    }
+
+    // **判定不能の理由**。1つでもあれば数値の門がどうであれ「通過」を出さない
+    // （A/A・不完全入力・事前登録外のパラメータでの「通過」表示を塞ぐ）
+    let mut indeterminate: Vec<String> =
+        balance_prereg_notes(expect_games, expect_shards, &expect_seeds, &expect_opps, alpha, boot);
+    if cand[0].cand_knobs.is_empty() || ctrl[0].cand_config == cand[0].cand_config {
+        indeterminate.push(
+            "候補と対照の実効設定が同一（A/A）= 処置が入っていないので採否の対象がない".into(),
+        );
+    }
+    // 実験条件そのものの事前登録照合（予算 2000ms・両側 env なし）。
+    // arm 間の一致検査は「両方とも 700ms」を通してしまう
+    indeterminate.extend(balance_run_condition_notes(&ctrl[0], &cand[0]));
+    // manifest の照合: 指紋が違う行は die（別の manifest の下で測った run）、
+    // 指紋の無い行と --manifest 未指定は判定不能。内容は candidate /
+    // think_budget_ms を必須で持ち、echo（games / shards / opponents / clock）は
+    // あれば定数・記録と突き合わせる
+    match &manifest {
+        None => indeterminate.push(
+            "--manifest 未指定 = 処置ノブが計測前に commit されたことを機械検証できない".into(),
+        ),
+        Some((fp, v)) => {
+            for (arm, rows) in [("control", &ctrl), ("candidate", &cand)] {
+                match check_manifest_rows(rows, arm, fp) {
+                    Err(e) => die(&e),
+                    Ok(0) => {}
+                    Ok(n) => indeterminate.push(format!(
+                        "{arm}: manifest 指紋の無い行が {n} 行（ARENA_BALANCE_MANIFEST 無しで測った run）"
+                    )),
+                }
+            }
+            indeterminate.extend(manifest_content_notes(v, &cand[0].candidate, &ctrl[0].clock));
+        }
+    }
+
+    let (paired, pairing_notes) = pair_by_opponent(
+        &ctrl,
+        &cand,
+        expect_games,
+        expect_shards,
+        &expect_seeds,
+        allow_incomplete,
+    )
+    .unwrap_or_else(|e| die(&e));
+    indeterminate.extend(pairing_notes);
+    let opps: Vec<String> = paired.keys().cloned().collect();
+    if !expect_opps.is_empty() {
+        let got: BTreeSet<String> = opps.iter().cloned().collect();
+        if got != expect_opps {
+            die(&format!(
+                "相手集合が期待と違います: got={got:?} / expect={expect_opps:?}\n            （--expect-opponents で明示するか、空文字で検査を無効化）"
+            ));
+        }
+    }
+
+    // **claim 台帳との照合**（PR #41 レビュー8巡目 [P1]）。plan が計測前に取得した
+    // annotated tag の message（run_id / run_attempt）と、最終入力の run を
+    // arm × 相手ごとに突き合わせ、**台帳外の artifact（タグ欠落・別 run）で
+    // 判定させない**。タグは `--repo`（既定 `.`）の git から読む: 先に
+    // `git fetch origin '+refs/tags/balance-claim/*'` を試み、失敗は
+    // ローカルタグでの照合に落として判定不能ノートにする
+    if let Some((fp, _)) = &manifest {
+        let repo = args.get("repo").unwrap_or(".").to_string();
+        let fetched = std::process::Command::new("git")
+            .args([
+                "-C",
+                &repo,
+                "fetch",
+                "--quiet",
+                "origin",
+                "+refs/tags/balance-claim/*:refs/tags/balance-claim/*",
+            ])
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !fetched {
+            indeterminate
+                .push("claim 台帳を origin から fetch できない（ローカルのタグで照合）".into());
+        }
+        let fp16 = &fp[..16];
+        for opp in &opps {
+            for (label, rows) in [("ctrl", &ctrl), ("cand", &cand)] {
+                let tag = format!("balance-claim/{fp16}/{label}-{opp}");
+                let Some(row) = rows.iter().find(|r| &r.baseline == opp) else { continue };
+                match read_claim_record(&repo, &tag).unwrap_or_else(|e| die(&e)) {
+                    None => indeterminate.push(format!(
+                        "claim タグ {tag} が見つからない = 台帳外の入力（held-out は plan が計測前に取得する）"
+                    )),
+                    Some(v) => {
+                        let owner = (
+                            v["run_id"].as_str().unwrap_or("").to_string(),
+                            v["run_attempt"].as_u64().unwrap_or(0),
+                        );
+                        if owner != (row.run_id.clone(), row.run_attempt) {
+                            die(&format!(
+                                "{label}({opp}): claim 台帳の owner {owner:?} と入力の run ({}, {}) が違います\n            （台帳外の artifact は判定に使えません）",
+                                row.run_id, row.run_attempt
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // **平均評価粒子数の veto の入力**（arena-records。PR #41 レビュー7巡目 [P1]:
+    // 「別途出す」の注記だけでは、粒子数が2割減った候補でも pass=true が出ていた）。
+    // 未指定は判定不能 = veto を検証できないまま「通過」を出さない
+    let rec_ctrl = args.all("records-control");
+    let rec_cand = args.all("records-candidate");
+    let particles: Option<((f64, f64), (ParticleSummary, ParticleSummary))> =
+        match (rec_ctrl.is_empty(), rec_cand.is_empty()) {
+            (true, true) => {
+                indeterminate.push(
+                    "--records-control / --records-candidate 未指定 = 平均評価粒子数の veto（対照比 −10% 超で中止）を検証できない".into(),
+                );
+                None
+            }
+            (false, false) => {
+                let sc = particle_summary(&rec_ctrl, "control");
+                let st = particle_summary(&rec_cand, "candidate");
+                let fp = manifest.as_ref().map(|(fp, _)| fp.as_str());
+                for (arm, s, rows) in [("control", &sc, &ctrl), ("candidate", &st, &cand)] {
+                    if s.missing > 0 {
+                        indeterminate.push(format!(
+                            "{arm}: unique_particles の無い chose 行が {} 行（記録の版が古い？）",
+                            s.missing
+                        ));
+                    }
+                    // **record の由来を games.jsonl と一対一照合**（PR #41
+                    // レビュー8巡目: 重複・別 run・欠落・manifest 不一致は die）
+                    indeterminate.extend(
+                        verify_record_provenance(s, rows, arm, fp).unwrap_or_else(|e| die(&e)),
+                    );
+                }
+                Some(((sc.mean, st.mean), (sc, st)))
+            }
+            _ => die("--records-control と --records-candidate は両方指定してください（片 arm だけの粒子平均は比較になりません）"),
+        };
+
+    // 相手ごと・指標ごとのペア差
+    let mut strata_by_metric: BTreeMap<&'static str, Vec<Vec<f64>>> = BTreeMap::new();
+    let mut arm_means: BTreeMap<&'static str, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    let mut cand_timeouts = 0u64;
+    let mut ctrl_timeouts = 0u64;
+    for opp in &opps {
+        let pairs = &paired[opp];
+        cand_timeouts += pairs
+            .iter()
+            .filter(|(_, t)| t.reason == "timeout" && t.score_a == 0.0)
+            .count() as u64;
+        ctrl_timeouts += pairs
+            .iter()
+            .filter(|(c, _)| c.reason == "timeout" && c.score_a == 0.0)
+            .count() as u64;
+        for (name, _) in METRICS {
+            let mut deltas = vec![];
+            for (c, t) in pairs {
+                let (mc, mt) = (game_metrics(c), game_metrics(t));
+                let (Some(a), Some(b)) = (mc.get(name), mt.get(name)) else { continue };
+                deltas.push(b - a);
+                let e = arm_means.entry(name).or_default();
+                e.0.push(*a);
+                e.1.push(*b);
+            }
+            if !deltas.is_empty() {
+                strata_by_metric.entry(name).or_default().push(deltas);
+            }
+        }
+    }
+
+    let score_strata = &strata_by_metric["score"];
+    let (combined, ci_lo, ci_hi) = stratified_boot_mean_ci(score_strata, boot, 0x40_2001, alpha);
+    let per_opp: Vec<(String, f64)> = opps
+        .iter()
+        .zip(score_strata.iter())
+        .map(|(o, v)| (o.clone(), mean(v)))
+        .collect();
+    let comb_of = |name: &str| -> f64 {
+        strata_by_metric[name].iter().map(|v| mean(v)).sum::<f64>()
+            / strata_by_metric[name].len() as f64
+    };
+    let gate = BalanceGate {
+        combined,
+        ci_lo,
+        per_opp: per_opp.clone(),
+        fouls_delta: comb_of("fouls_me"),
+        think_delta: comb_of("think_avg_ms_me"),
+        cand_timeouts,
+        particles: particles.as_ref().map(|(m, _)| *m),
+    };
+    let (numeric_pass, reasons) = balance_verdict(&gate);
+    let (verdict_label, pass) = balance_final(numeric_pass, &indeterminate);
+
+    let mut out = String::new();
+    out.push_str(&format!("## opponent-balanced 合算（{label}、issue #40）\n\n"));
+    out.push_str(&format!(
+        "候補 `{}`{} / 対照 `{}`{} / commit `{}` / 時計 {} / 予算 候補 {} / 相手 {}\n\n",
+        cand[0].candidate,
+        if cand[0].cand_knobs.is_empty() {
+            String::new()
+        } else {
+            format!("（{}）", fmt_env(&cand[0].cand_knobs))
+        },
+        ctrl[0].candidate,
+        if ctrl[0].cand_knobs.is_empty() {
+            String::new()
+        } else {
+            format!("（{}）", fmt_env(&ctrl[0].cand_knobs))
+        },
+        ctrl[0].commit,
+        ctrl[0].clock,
+        cand[0].budget,
+        cand[0].budget_opp,
+    ));
+    out.push_str("| 相手 | ペア局数 | Δ（候補 − 対照） |\n|---|---:|---:|\n");
+    for (opp, d) in &per_opp {
+        out.push_str(&format!("| {} | {} | {} |\n", opp, paired[opp].len(), pct(*d)));
+    }
+    out.push_str(&format!(
+        "\n**合算 (ΣΔ)/{} = {}**、{:.0}% CI [{}, {}]（層化 bootstrap {boot} 反復。各相手の内側で局を引き直す）\n\n",
+        opps.len(),
+        pct(combined),
+        (1.0 - alpha) * 100.0,
+        pct(ci_lo),
+        pct(ci_hi),
+    ));
+    out.push_str("### 安全性・受動化監査（合算ペア差）\n\n");
+    out.push_str("| 指標 | 対照 | 候補 | 合算ペア差 | CI |\n|---|---:|---:|---:|---|\n");
+    for (name, jp) in METRICS {
+        let Some(strata) = strata_by_metric.get(name) else { continue };
+        let (d, l, h) = stratified_boot_mean_ci(strata, boot.min(4000), 0x40_2002, alpha);
+        let (c, t) = &arm_means[name];
+        out.push_str(&format!(
+            "| {jp} | {:.3} | {:.3} | {:+.3} | [{:+.3}, {:+.3}] |\n",
+            mean(c),
+            mean(t),
+            d,
+            l,
+            h
+        ));
+    }
+    out.push_str(&format!(
+        "\n時間切れ負け: 対照 {ctrl_timeouts} 局 / 候補 {cand_timeouts} 局。\n\n"
+    ));
+    match &particles {
+        Some(((c, t), (sc, st))) => out.push_str(&format!(
+            "**平均評価粒子数**（`chose.debug.unique_particles`、veto は対照比 −{:.0}% 超の減少）: \
+             対照 {c:.1}（{} 局 / {} 決定）→ 候補 {t:.1}（{} 局 / {} 決定）= 対照比 {:+.1}%\n\n",
+            BALANCE_PARTICLE_DROP * 100.0,
+            sc.games,
+            sc.decisions,
+            st.games,
+            st.decisions,
+            (t / c - 1.0) * 100.0,
+        )),
+        None => out.push_str(
+            "**平均評価粒子数の veto は未検証**（`--records-control` / `--records-candidate` に\n\
+             arena-records を渡すと verdict に入る。無い集計は判定不能）。\n\
+             持ち駒残数・王手率・詰み勝ち率は games.jsonl に無いので arena-records から別途。\n\n",
+        ),
+    }
+    out.push_str(&format!(
+        "### 判定（事前登録: 各{BALANCE_EXPECT_GAMES}局・合算 ≥ +{BALANCE_MIN_DELTA} かつ CI 下限 > 0・相手別符号・反則/局 +{BALANCE_MARGIN_FOULS} 以内・時間切れ0・思考平均 +{BALANCE_MARGIN_THINK_MS}ms 以内・平均評価粒子数 対照比 −{:.0}% 以内）\n\n",
+        BALANCE_PARTICLE_DROP * 100.0
+    ));
+    match verdict_label {
+        "通過" => out.push_str("**通過**（v9〜v14 ガントレットへ進める）\n"),
+        "判定不能" => {
+            out.push_str(
+                "**判定不能**（入力が事前登録の条件を満たさない。数値の門がどうであれ通過は出せない）:\n\n",
+            );
+            for r in &indeterminate {
+                out.push_str(&format!("- {r}\n"));
+            }
+            if !numeric_pass {
+                out.push_str("\n参考: 数値の門も次の理由で不通過:\n\n");
+                for r in &reasons {
+                    out.push_str(&format!("- {r}\n"));
+                }
+            }
+        }
+        _ => {
+            out.push_str("**不通過**:\n\n");
+            for r in &reasons {
+                out.push_str(&format!("- {r}\n"));
+            }
+        }
+    }
+
+    println!("{out}");
+    if let Some(p) = args.get("markdown") {
+        std::fs::write(p, &out).unwrap_or_else(|e| die(&format!("{p}: {e}")));
+    }
+    if let Some(p) = args.get("json") {
+        let v = serde_json::json!({
+            "schema": SUMMARY_SCHEMA,
+            "kind": "arena-balance",
+            "label": label,
+            "candidate": cand[0].candidate,
+            "control": ctrl[0].candidate,
+            "candidate_knobs": cand[0].cand_knobs,
+            "control_knobs": ctrl[0].cand_knobs,
+            "commit": ctrl[0].commit,
+            "clock": ctrl[0].clock,
+            "think_budget_ms": cand[0].budget,
+            "think_budget_ms_opponent": cand[0].budget_opp,
+            "alpha": alpha,
+            "boot": boot,
+            "expect_games": expect_games,
+            "expect_shards": expect_shards,
+            "expect_seeds": expect_seeds,
+            "manifest_fingerprint": manifest.as_ref().map(|(fp, _)| fp.clone()),
+            "opponents": per_opp.iter().map(|(o, d)| {
+                let (c0, t0) = &paired[o][0];
+                (o.clone(), serde_json::json!({
+                    "pairs": paired[o].len(),
+                    "delta": d,
+                    // 監査用: どの実行の記録で判定したか
+                    "control_run": format!("{}#{}", c0.run_id, c0.run_attempt),
+                    "candidate_run": format!("{}#{}", t0.run_id, t0.run_attempt),
+                }))
+            }).collect::<serde_json::Map<_, _>>(),
+            "combined_delta": combined,
+            "ci_low": ci_lo,
+            "ci_high": ci_hi,
+            "fouls_delta": gate.fouls_delta,
+            "think_avg_ms_delta": gate.think_delta,
+            "candidate_timeouts": cand_timeouts,
+            "particles": particles.as_ref().map(|((c, t), (sc, st))| serde_json::json!({
+                "control_mean": c,
+                "candidate_mean": t,
+                "control_games": sc.games,
+                "candidate_games": st.games,
+                "control_decisions": sc.decisions,
+                "candidate_decisions": st.decisions,
+            })),
+            "verdict": verdict_label,
+            "pass": pass,
+            "fail_reasons": reasons,
+            "indeterminate_reasons": indeterminate,
+            "expect_cand_knobs": expect_knobs,
+            "metrics": METRICS.iter().filter(|(n, _)| strata_by_metric.contains_key(n)).map(|(n, _)| {
+                (n.to_string(), serde_json::json!({
+                    "control": mean(&arm_means[n].0),
+                    "candidate": mean(&arm_means[n].1),
+                    "delta": comb_of(n),
+                }))
+            }).collect::<serde_json::Map<_, _>>(),
+        });
+        std::fs::write(p, serde_json::to_string_pretty(&v).unwrap())
+            .unwrap_or_else(|e| die(&format!("{p}: {e}")));
+    }
+    if !pass && !allow_incomplete {
+        // fail-closed: 判定が通らない実験を緑で終わらせない（check_policy combined と同じ）
+        std::process::exit(3);
+    }
+}
+
 /// 標本分散（n−1）
 fn variance(v: &[f64]) -> f64 {
     if v.len() < 2 {
@@ -3180,6 +4615,7 @@ fn main() {
         Some("compare") => cmd_compare(&args),
         Some("report") => cmd_report(&args),
         Some("arena-var") => cmd_arena_var(&args),
+        Some("arena-balance") => cmd_arena_balance(&args),
         other => die(&format!("未知のサブコマンド: {}", other.unwrap_or("(なし)"))),
     }
 }
@@ -3218,7 +4654,10 @@ mod tests {
     /// 予算が違う2 run を「ペア」として受理してしまう
     #[test]
     fn game_row_schema_requires_effective_conditions() {
-        assert_eq!(GAME_ROW_SCHEMA, 2, "指紋を必須にした時点で schema を上げる");
+        assert_eq!(
+            GAME_ROW_SCHEMA, 5,
+            "指紋（2）・base/shard（3）・実行の識別子（4）・oracle（5）を必須にした時点で schema を上げる"
+        );
         let r = game_row("checkmate", 1.0);
         // 突き合わせの前提になる項目が型として存在すること（欠損は parse で die する）
         assert!(!r.baseline_behavior.is_empty());
@@ -3264,6 +4703,13 @@ mod tests {
             candidate: "estimator".into(),
             baseline: "estimator_v14".into(),
             match_seed: 1,
+            match_seed_base: 1,
+            match_seed_shard: 0,
+            run_id: "run-1".into(),
+            run_attempt: 1,
+            pair_with: None,
+            balance_manifest: None,
+            oracle: String::new(),
             game_no: 0,
             a_is_sente: true,
             score_a,
@@ -3286,6 +4732,645 @@ mod tests {
         }
     }
 
+    fn balance_row(baseline: &str, game_no: u64, score_a: f64) -> GameRow {
+        let mut r = game_row("checkmate", score_a);
+        r.baseline = baseline.into();
+        r.game_no = game_no;
+        r.a_is_sente = game_no % 2 == 0;
+        // 既定は「候補が対照 run（テストの既定 run-1）を正しく指している」形。
+        // 紐の無いケースを試すテストは明示的に None へ上書きする
+        r.pair_with = Some("run-1".into());
+        r
+    }
+
+    /// arena-balance のペアリング: 相手ごとに閉じ、集合の不一致・欠落・
+    /// 1相手だけ・先後の食い違い・base seed / shard 集合のずれは fail-closed
+    #[test]
+    fn arena_balance_pairs_within_each_opponent() {
+        let seeds: BTreeMap<String, u64> =
+            [("estimator_v13".to_string(), 1u64), ("estimator_v14".to_string(), 1u64)]
+                .into_iter()
+                .collect();
+        let ctrl: Vec<GameRow> = vec![
+            balance_row("estimator_v13", 0, 0.0),
+            balance_row("estimator_v13", 1, 1.0),
+            balance_row("estimator_v14", 0, 0.5),
+            balance_row("estimator_v14", 1, 0.5),
+        ];
+        let cand = ctrl.clone(); // A/A
+        let (paired, notes) =
+            pair_by_opponent(&ctrl, &cand, 2, 1, &seeds, false).expect("A/A はペアになる");
+        assert_eq!(paired.len(), 2);
+        assert!(paired.values().all(|v| v.len() == 2));
+        assert!(notes.is_empty(), "完全な入力にノートは付かない");
+
+        // **sharded run（同じ base・複数の実効 seed）は受理する**（PR #41
+        // レビュー3巡目: 実効 seed の一意性検査は正常な shards=4 の run を
+        // 必ず拒否していた。run の一意性は base で見る）
+        let mut sh_ctrl = ctrl.clone();
+        let mut sh_cand = cand.clone();
+        for rows in [&mut sh_ctrl, &mut sh_cand] {
+            for opp in ["estimator_v13", "estimator_v14"] {
+                for g in 0..2u64 {
+                    let mut r = balance_row(opp, g, 0.5);
+                    r.match_seed = 1001; // shard ずらし後の別の実効 seed
+                    r.match_seed_shard = 1;
+                    rows.push(r);
+                }
+            }
+        }
+        let (paired, notes) =
+            pair_by_opponent(&sh_ctrl, &sh_cand, 4, 2, &seeds, false).expect("sharded run は正常");
+        assert!(paired.values().all(|v| v.len() == 4));
+        assert!(notes.is_empty());
+        // shard が欠けたら Err（末尾 shard の丸ごと欠落はペア照合を素通しする）
+        assert!(pair_by_opponent(&ctrl, &cand, 2, 2, &seeds, false).is_err());
+
+        // **期待局数は明示必須で照合される**（事前登録の各600局の強制。
+        // 「2ペア以上あればよい」では smoke や欠損 run でも判定を返せてしまう）
+        assert!(pair_by_opponent(&ctrl, &cand, 600, 1, &seeds, false).is_err());
+        // --allow-incomplete では通るが**判定不能ノートが残る** = 「通過」を出せない
+        let (_, notes) =
+            pair_by_opponent(&ctrl, &cand, 600, 1, &seeds, true).expect("警告へ降格");
+        assert!(!notes.is_empty());
+        assert!(!balance_final(true, &notes).1, "ノート付き入力は数値の門が通っても pass しない");
+
+        // **base seed は事前登録値との完全一致**（不一致・未登録の相手は Err）
+        let wrong_seed: BTreeMap<String, u64> =
+            [("estimator_v13".to_string(), 2u64), ("estimator_v14".to_string(), 1u64)]
+                .into_iter()
+                .collect();
+        assert!(pair_by_opponent(&ctrl, &cand, 2, 1, &wrong_seed, false).is_err());
+        let missing_seed: BTreeMap<String, u64> =
+            [("estimator_v14".to_string(), 1u64)].into_iter().collect();
+        assert!(pair_by_opponent(&ctrl, &cand, 2, 1, &missing_seed, false).is_err());
+
+        // 1相手だけでは opponent-balanced にならない（arena-var の領分）
+        let one: Vec<GameRow> = ctrl
+            .iter()
+            .filter(|r| r.baseline == "estimator_v13")
+            .cloned()
+            .collect();
+        assert!(pair_by_opponent(&one, &one, 2, 1, &seeds, false).is_err());
+
+        // 片 arm に無い局は fail-closed
+        let mut missing = cand.clone();
+        missing.pop();
+        assert!(pair_by_opponent(&ctrl, &missing, 2, 1, &seeds, false).is_err());
+
+        // 相手集合の不一致も fail-closed
+        let mut wrong = cand.clone();
+        wrong[3].baseline = "estimator_v12".into();
+        assert!(pair_by_opponent(&ctrl, &wrong, 2, 1, &seeds, false).is_err());
+
+        // 先後の食い違い = 別の条件列
+        let mut flipped = cand.clone();
+        flipped[0].a_is_sente = !flipped[0].a_is_sente;
+        assert!(pair_by_opponent(&ctrl, &flipped, 2, 1, &seeds, false).is_err());
+
+        // **同じ相手に複数の base seed を混ぜたら常に Err**（降格なし）。
+        // 両 arm が同じ2つの base を持てばペア自体は成立してしまうので、
+        // ペアリングとは別にここで止める必要がある
+        let mut mixed_ctrl = ctrl.clone();
+        let mut mixed_cand = cand.clone();
+        for rows in [&mut mixed_ctrl, &mut mixed_cand] {
+            for opp in ["estimator_v13", "estimator_v14"] {
+                let mut extra = balance_row(opp, 2, 0.5);
+                extra.match_seed = 999;
+                extra.match_seed_base = 999;
+                rows.push(extra);
+            }
+        }
+        assert!(
+            pair_by_opponent(&mixed_ctrl, &mixed_cand, 3, 1, &seeds, false).is_err(),
+            "base 混在は期待局数が合っていても弾く"
+        );
+        assert!(
+            pair_by_opponent(&mixed_ctrl, &mixed_cand, 3, 1, &seeds, true).is_err(),
+            "--allow-incomplete でも base 混在は降格しない"
+        );
+    }
+
+    /// **同じ base seed の複数 run の混入を実行の識別子で止める**（PR #41
+    /// レビュー4巡目 [P1] の再現）: 同一 commit・同一設定・同一 base で取り直した
+    /// run A/B から shard を半分ずつ選ぶと、base 1値・shard 集合 0..N 完全・
+    /// 局数一致・ペアキー重複なしで従来の検査を全部通っていた
+    #[test]
+    fn arena_balance_rejects_shards_mixed_from_two_runs_with_same_base() {
+        let seeds: BTreeMap<String, u64> =
+            [("estimator_v13".to_string(), 1u64), ("estimator_v14".to_string(), 1u64)]
+                .into_iter()
+                .collect();
+        // shard 0 = 実効 seed 1 / shard 1 = 実効 seed 1001（どちらも base 1）
+        let mk = |opp: &str, run: &str, attempt: u64, shard: u64, g: u64| {
+            let mut r = balance_row(opp, g, 0.5);
+            r.run_id = run.into();
+            r.run_attempt = attempt;
+            r.match_seed_shard = shard;
+            r.match_seed = if shard == 0 { 1 } else { 1001 };
+            r.pair_with = None; // この試験の焦点は run 混入（紐は別テスト）
+            r
+        };
+        let arm = |run0: &str, a0: u64, run1: &str, a1: u64| -> Vec<GameRow> {
+            ["estimator_v13", "estimator_v14"]
+                .iter()
+                .flat_map(|o| {
+                    vec![mk(o, run0, a0, 0, 0), mk(o, run0, a0, 0, 1), mk(o, run1, a1, 1, 0), mk(o, run1, a1, 1, 1)]
+                })
+                .collect()
+        };
+        let clean = arm("A", 1, "A", 1);
+        let cand = arm("C", 1, "C", 1);
+        assert!(
+            pair_by_opponent(&clean, &cand, 4, 2, &seeds, false).is_ok(),
+            "1実行ずつの正常な入力は通る"
+        );
+        // 対照側が run A（shard 0）＋ run B（shard 1）の混ぜ物
+        let mixed = arm("A", 1, "B", 1);
+        assert!(pair_by_opponent(&mixed, &cand, 4, 2, &seeds, false).is_err());
+        assert!(
+            pair_by_opponent(&mixed, &cand, 4, 2, &seeds, true).is_err(),
+            "--allow-incomplete でも run 混入は降格しない"
+        );
+        // 同じ run の re-run attempt 違いも別実行
+        let reran = arm("A", 1, "A", 2);
+        assert!(pair_by_opponent(&reran, &cand, 4, 2, &seeds, false).is_err());
+        // 候補側の混入も同様
+        assert!(pair_by_opponent(&clean, &arm("C", 1, "D", 1), 4, 2, &seeds, false).is_err());
+    }
+
+    /// **pair_with は対照の run_id と一致する**（対照の取り違えをここで閉じる）
+    #[test]
+    fn arena_balance_checks_pair_with_against_control_run() {
+        let seeds: BTreeMap<String, u64> =
+            [("estimator_v13".to_string(), 1u64), ("estimator_v14".to_string(), 1u64)]
+                .into_iter()
+                .collect();
+        let arm = |run: &str, pw: Option<&str>| -> Vec<GameRow> {
+            ["estimator_v13", "estimator_v14"]
+                .iter()
+                .flat_map(|o| {
+                    (0..2u64)
+                        .map(|g| {
+                            let mut r = balance_row(o, g, 0.5);
+                            r.run_id = run.into();
+                            r.pair_with = pw.map(str::to_string);
+                            r
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let ctrl = arm("ctrl-run", None);
+        let (_, notes) =
+            pair_by_opponent(&ctrl, &arm("cand-run", Some("ctrl-run")), 2, 1, &seeds, false)
+                .expect("対照を正しく指した候補は通る");
+        assert!(notes.is_empty(), "紐が揃っていればノートは付かない: {notes:?}");
+        assert!(
+            pair_by_opponent(&ctrl, &arm("cand-run", Some("other-run")), 2, 1, &seeds, false)
+                .is_err(),
+            "候補が指した対照と --control の記録が別物なら Err"
+        );
+        // **pair_with の無い候補は判定不能**（PR #41 レビュー5巡目 [P1]:
+        // 紐が無いと「事前に対照を指した」ことを機械検証できず、後から別の
+        // 同一 seed・同一 commit 対照へ差し替えられる）。診断集計はできるが
+        // 「通過」は出せない
+        let (_, notes) = pair_by_opponent(&ctrl, &arm("cand-run", None), 2, 1, &seeds, false)
+            .expect("集計自体はできる");
+        assert!(
+            notes.iter().any(|n| n.contains("pair_with")),
+            "紐の無い候補にはノートが付く: {notes:?}"
+        );
+        assert!(!balance_final(true, &notes).1, "紐なしは数値の門が通っても pass しない");
+    }
+
+    /// **workflow の分割から合算器まで、事前登録の 600/8 が通ること**
+    /// （PR #41 レビュー6巡目 [P1]）。従来の ceil の偶数化は 600/8 を
+    /// 76×8 = 608局 に膨らませ、600ペアちょうどを要求するこの関数と
+    /// 両立しなかった。ここでは `scripts/ci/split_arena_games.py` が出す
+    /// 正確な分割 [76,76,76,76,74,74,74,74]（合計 600・各シャード偶数）を
+    /// そのまま形にして、事前登録の seed / shard 数で受理されることを固定する
+    #[test]
+    fn arena_balance_accepts_the_preregistered_600_over_8_split() {
+        let split: [u64; 8] = [76, 76, 76, 76, 74, 74, 74, 74];
+        assert_eq!(split.iter().sum::<u64>(), 600);
+        assert!(split.iter().all(|g| g % 2 == 0), "各シャード偶数 = 先後均衡");
+        let seeds: BTreeMap<String, u64> = BALANCE_EXPECT_SEEDS
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect();
+        let arm = |run: &str, pw: Option<&str>| -> Vec<GameRow> {
+            let mut rows = vec![];
+            for (opp, base) in BALANCE_EXPECT_SEEDS {
+                for (shard, games) in split.iter().enumerate() {
+                    for g in 0..*games {
+                        let mut r = balance_row(opp, g, 0.5);
+                        r.match_seed_base = base;
+                        r.match_seed_shard = shard as u64;
+                        r.match_seed = base + shard as u64; // 実効 seed（shard ごとに別）
+                        r.run_id = run.into();
+                        r.pair_with = pw.map(str::to_string);
+                        rows.push(r);
+                    }
+                }
+            }
+            rows
+        };
+        let ctrl = arm("run-ctrl", None);
+        let cand = arm("run-cand", Some("run-ctrl"));
+        let (paired, notes) = pair_by_opponent(
+            &ctrl,
+            &cand,
+            BALANCE_EXPECT_GAMES,
+            BALANCE_EXPECT_SHARDS,
+            &seeds,
+            false,
+        )
+        .expect("事前登録どおりの分割は受理される");
+        assert!(paired.values().all(|v| v.len() == 600));
+        assert!(notes.is_empty(), "判定不能ノートが付かない: {notes:?}");
+    }
+
+    /// **re-run attempt の記録は判定に使えない**（PR #41 レビュー5巡目 [P1]）。
+    /// `pair_with` は run_id しか持たないので、attempt 1 の対照を指した候補に
+    /// attempt 2 の記録を渡しても run_id は一致してしまう。事前登録の
+    /// 「門付近で取り直さない」に従い attempt 1 だけを受ける
+    #[test]
+    fn arena_balance_rejects_rerun_attempts() {
+        let seeds: BTreeMap<String, u64> =
+            [("estimator_v13".to_string(), 1u64), ("estimator_v14".to_string(), 1u64)]
+                .into_iter()
+                .collect();
+        let arm = |attempt: u64| -> Vec<GameRow> {
+            ["estimator_v13", "estimator_v14"]
+                .iter()
+                .flat_map(|o| {
+                    (0..2u64)
+                        .map(|g| {
+                            let mut r = balance_row(o, g, 0.5);
+                            r.run_attempt = attempt;
+                            r
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let (_, notes) =
+            pair_by_opponent(&arm(1), &arm(1), 2, 1, &seeds, false).expect("attempt 1 は正常");
+        assert!(notes.is_empty());
+        // 対照側・候補側どちらの attempt 2 でも判定不能ノートが付く
+        for (c, t) in [(2u64, 1u64), (1, 2)] {
+            let (_, notes) = pair_by_opponent(&arm(c), &arm(t), 2, 1, &seeds, false)
+                .expect("集計自体はできる");
+            assert!(
+                notes.iter().any(|n| n.contains("run_attempt")),
+                "attempt {c}/{t}: {notes:?}"
+            );
+            assert!(!balance_final(true, &notes).1);
+        }
+    }
+
+    /// **診断オラクルの run は採否に使えない**（審判が候補の反則を握りつぶす
+    /// 上限測定。記録が無いと「対照は通常・候補は nofoul」を識別できない —
+    /// PR #41 レビュー5巡目 [P1] で games.jsonl への必須記録とセット）
+    #[test]
+    fn arena_balance_rejects_oracle_runs() {
+        let normal = game_row("checkmate", 1.0);
+        assert!(check_no_oracle(&[normal.clone()], "control").is_ok());
+        let mut oracle = game_row("checkmate", 1.0);
+        oracle.oracle = "nofoul".into();
+        let e = check_no_oracle(&[normal, oracle], "candidate").expect_err("nofoul は拒否");
+        assert!(e.contains("nofoul"), "{e}");
+    }
+
+    /// **実験条件そのものの事前登録照合**: arm 間の一致だけでは「両方とも
+    /// 700ms」「両側 env 入り」の run でも通過を出せてしまう
+    #[test]
+    fn arena_balance_pins_budget_and_shared_env() {
+        let ok = game_row("checkmate", 1.0);
+        assert_eq!(BALANCE_BUDGET_MS, 2000, "事前登録した思考予算");
+        assert!(balance_run_condition_notes(&ok, &ok).is_empty());
+        // 両 arm を揃えて 700ms にしてもノートが付く（レビューの再現）
+        let mut b700 = ok.clone();
+        b700.budget = "700".into();
+        b700.budget_opp = "700".into();
+        let notes = balance_run_condition_notes(&b700, &b700);
+        assert!(!notes.is_empty() && !balance_final(true, &notes).1);
+        // 8000ms・両側 env も同様
+        let mut b8k = ok.clone();
+        b8k.budget = "8000".into();
+        assert!(!balance_run_condition_notes(&b8k, &b8k).is_empty());
+        let mut env = ok.clone();
+        env.shared_env.insert("TSUITATE_MATE_RISK_W".into(), "3".into());
+        assert!(
+            balance_run_condition_notes(&env, &env)
+                .iter()
+                .any(|n| n.contains("env")),
+        );
+    }
+
+    /// **判定に足る manifest は candidate / think_budget_ms を必須で持つ**。
+    /// echo（games / shards / opponents / clock）はあれば定数・記録と突き合わせる
+    #[test]
+    fn arena_balance_manifest_requires_pinned_fields() {
+        let full = serde_json::json!({
+            "cand_knobs": {"TSUITATE_X_W": "1"},
+            "candidate": "estimator",
+            "think_budget_ms": 2000,
+            "games": 600,
+            "shards": 8,
+            "opponents": {"estimator_v13": 20260910, "estimator_v14": 20260909},
+            "clock": [1000000, 3000],
+        });
+        assert!(manifest_content_notes(&full, "estimator", "[1000000,3000]").is_empty());
+        // 必須フィールドの欠測・不一致はすべて判定不能
+        let mut missing = full.clone();
+        missing.as_object_mut().unwrap().remove("candidate");
+        missing.as_object_mut().unwrap().remove("think_budget_ms");
+        let notes = manifest_content_notes(&missing, "estimator", "[1000000,3000]");
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        let mut wrong = full.clone();
+        wrong["think_budget_ms"] = serde_json::json!(700);
+        wrong["candidate"] = serde_json::json!("heuristic");
+        wrong["clock"] = serde_json::json!([300000, 3000]);
+        let notes = manifest_content_notes(&wrong, "estimator", "[1000000,3000]");
+        assert!(notes.len() >= 3, "{notes:?}");
+        for notes in [
+            manifest_content_notes(&missing, "estimator", "x"),
+            manifest_content_notes(&wrong, "estimator", "x"),
+        ] {
+            assert!(!balance_final(true, &notes).1);
+        }
+    }
+
+    /// **判定を変えられるパラメータは事前登録定数と照合する**（PR #41 レビュー
+    /// 4巡目 [P1]）: 50% CI・1反復 bootstrap・別の shard 数/seed/相手で取った
+    /// 「良い数字」は #40 の通過にならない
+    #[test]
+    fn arena_balance_preregistration_deviations_are_indeterminate() {
+        let seeds: BTreeMap<String, u64> = BALANCE_EXPECT_SEEDS
+            .iter()
+            .map(|(k, v)| (k.to_string(), *v))
+            .collect();
+        let opps: BTreeSet<String> =
+            BALANCE_EXPECT_SEEDS.iter().map(|(k, _)| k.to_string()).collect();
+        assert!(
+            balance_prereg_notes(600, 8, &seeds, &opps, 0.05, 10_000).is_empty(),
+            "事前登録どおりの指定にはノートが付かない"
+        );
+        // 定数そのもの（issue #40 本文の事前登録値）
+        assert_eq!(BALANCE_EXPECT_SHARDS, 8);
+        assert_eq!(BALANCE_ALPHA, 0.05);
+        assert_eq!(BALANCE_MIN_BOOT, 10_000);
+        assert_eq!(seeds["estimator_v13"], 20260910);
+        assert_eq!(seeds["estimator_v14"], 20260909);
+
+        let mut wrong_seeds = seeds.clone();
+        wrong_seeds.insert("estimator_v13".into(), 99);
+        let wrong_opps: BTreeSet<String> = ["estimator_v14".to_string()].into_iter().collect();
+        let deviations = [
+            balance_prereg_notes(104, 8, &seeds, &opps, 0.05, 10_000),
+            balance_prereg_notes(600, 4, &seeds, &opps, 0.05, 10_000),
+            balance_prereg_notes(600, 8, &wrong_seeds, &opps, 0.05, 10_000),
+            balance_prereg_notes(600, 8, &seeds, &wrong_opps, 0.05, 10_000),
+            // レビューの再現: --alpha 0.5 = 50% CI で「CI 下限 > 0」を判定
+            balance_prereg_notes(600, 8, &seeds, &opps, 0.5, 10_000),
+            // レビューの再現: --boot 1 = 1回の再標本化を CI と呼ぶ
+            balance_prereg_notes(600, 8, &seeds, &opps, 0.05, 1),
+        ];
+        for notes in deviations {
+            assert!(!notes.is_empty(), "事前登録から外れた指定にはノートが付く");
+            assert!(!balance_final(true, &notes).1, "数値の門が通っても pass しない");
+        }
+    }
+
+    /// **manifest の指紋は行と照合する**: 別 manifest の指紋は Err、指紋の無い
+    /// 行は本数が返る = 判定不能ノート行き（「計測前に commit した manifest の
+    /// 下で測った」ことを機械検証できない）
+    #[test]
+    fn arena_balance_manifest_fingerprint_is_checked_on_rows() {
+        let with_fp = |fp: Option<&str>| {
+            let mut r = game_row("checkmate", 1.0);
+            r.balance_manifest = fp.map(str::to_string);
+            r
+        };
+        assert_eq!(
+            check_manifest_rows(&[with_fp(Some("aa")), with_fp(Some("aa"))], "candidate", "aa"),
+            Ok(0)
+        );
+        assert!(
+            check_manifest_rows(&[with_fp(Some("bb"))], "candidate", "aa").is_err(),
+            "別の manifest の下で測った run は Err"
+        );
+        assert_eq!(
+            check_manifest_rows(&[with_fp(None), with_fp(Some("aa"))], "control", "aa"),
+            Ok(1),
+            "指紋の無い行は本数 = 判定不能ノート行き"
+        );
+    }
+
+    /// 合算の点推定は「各相手の平均の単純平均」= 局数が偏っても 1/2 ずつ
+    #[test]
+    fn arena_balance_point_is_mean_of_stratum_means() {
+        let strata = vec![vec![1.0, 0.0, 1.0, 0.0], vec![0.5, 0.5, 0.5, 0.5]];
+        let (p, lo, hi) = stratified_boot_mean_ci(&strata, 2000, 7, 0.05);
+        assert!((p - 0.5).abs() < 1e-12);
+        assert!(lo <= p && p <= hi);
+        let skewed = vec![vec![1.0; 100], vec![0.0; 4]];
+        let (p, _, _) = stratified_boot_mean_ci(&skewed, 100, 7, 0.05);
+        assert!((p - 0.5).abs() < 1e-12, "局数の多い相手が合算を支配しない");
+        // 空の層は判定不能（NaN）: どの門も通らない側に落ちる
+        let empty = vec![vec![1.0], vec![]];
+        assert!(stratified_boot_mean_ci(&empty, 10, 7, 0.05).0.is_nan());
+    }
+
+    /// 事前登録した門: どの1条件が欠けても不通過。NaN も不通過側
+    #[test]
+    fn arena_balance_verdict_enforces_preregistered_gate() {
+        let ok = BalanceGate {
+            combined: 0.05,
+            ci_lo: 0.01,
+            per_opp: vec![("estimator_v13".into(), 0.04), ("estimator_v14".into(), 0.06)],
+            fouls_delta: 0.1,
+            think_delta: 20.0,
+            cand_timeouts: 0,
+            particles: Some((300.0, 285.0)), // −5% は許容内
+        };
+        assert!(balance_verdict(&ok).0);
+        let fails = |g: BalanceGate| !balance_verdict(&g).0;
+        assert!(fails(BalanceGate { combined: 0.039, ..ok.clone() }), "+0.04 未満");
+        assert!(fails(BalanceGate { ci_lo: 0.0, ..ok.clone() }), "CI 下限 ≤ 0");
+        assert!(fails(BalanceGate {
+            per_opp: vec![("estimator_v13".into(), -0.01), ("estimator_v14".into(), 0.12)],
+            combined: 0.055,
+            ..ok.clone()
+        }), "相手別符号 veto");
+        assert!(fails(BalanceGate { fouls_delta: 0.31, ..ok.clone() }), "反則/局 +0.3 超");
+        assert!(fails(BalanceGate { cand_timeouts: 1, ..ok.clone() }), "時間切れ");
+        assert!(fails(BalanceGate { think_delta: 101.0, ..ok.clone() }), "思考平均 +100ms 超");
+        assert!(fails(BalanceGate { combined: f64::NAN, ..ok.clone() }), "NaN は不通過側");
+        // **平均評価粒子数の veto**（issue #40: 対照比 −10% 超で中止。
+        // PR #41 レビュー7巡目: 「別途出す」注記だけでは 20% 減でも pass=true だった）
+        assert!(fails(BalanceGate { particles: Some((300.0, 269.0)), ..ok.clone() }), "−10% 超");
+        assert!(fails(BalanceGate { particles: Some((300.0, 240.0)), ..ok.clone() }), "−20%");
+        assert!(fails(BalanceGate { particles: Some((300.0, f64::NAN)), ..ok.clone() }), "NaN");
+        assert!(fails(BalanceGate { particles: Some((0.0, 0.0)), ..ok.clone() }), "対照 0 は検証不能");
+        assert!(
+            balance_verdict(&BalanceGate { particles: Some((300.0, 271.0)), ..ok.clone() }).0,
+            "−9.7% は許容内"
+        );
+        // None（records 未指定）は verdict では落とさない = 呼び出し側の
+        // 判定不能ノートが「通過」を塞ぐ（両方が無いと未検証のまま pass が出る）
+        assert!(balance_verdict(&BalanceGate { particles: None, ..ok.clone() }).0);
+    }
+
+    /// arena-records の**厳格**解析（`chose.debug.unique_particles`）。
+    /// 壊れた行・未完 record は fail-closed（黙って捨てると平均を選択標本にできる）
+    #[test]
+    fn arena_balance_particle_stats_parse_records() {
+        let text = concat!(
+            r#"{"type":"meta","run_id":"r1","run_attempt":1,"baseline":"estimator_v13","game_no":3,"match_seed_base":20260910,"match_seed_shard":2,"balance_manifest":"aa"}"#, "\n",
+            r#"{"type":"obs","event":{}}"#, "\n",
+            // **定跡手 = 正当な非評価手**（レビュー9巡目: strategy が
+            // debug.joseki=true を書く。missing に数えると定跡を含む正常な
+            // held-out run が必ず判定不能になる）
+            r#"{"type":"chose","move_number":1,"usi":"7g7f","think_ms":5,"debug":{"joseki":true}}"#, "\n",
+            r#"{"type":"chose","move_number":3,"usi":"7f7e","think_ms":1200,"debug":{"unique_particles":180,"sample_slots":192}}"#, "\n",
+            r#"{"type":"chose","move_number":5,"usi":"2g2f","think_ms":1100,"debug":{"unique_particles":120}}"#, "\n",
+            r#"{"type":"chose","move_number":7,"usi":"2f2e","think_ms":900,"debug":{}}"#, "\n",
+            r#"{"type":"end","payload":{}}"#, "\n",
+        );
+        let (meta, n, sum, missing) = parse_record_strict(text, "t").expect("正常な record");
+        assert_eq!((n, sum), (2, 300), "評価した chose の unique_particles だけを数える");
+        assert_eq!(missing, 1, "unique_particles の無い chose 行は欠測として数える（黙って捨てない）");
+
+        // **定跡だけの record（欠測なし）は missing 0** = 定跡入りの正常な run で
+        // 粒子 veto の判定が通り得ることの回帰テスト（レビュー9巡目）
+        let joseki_only = concat!(
+            r#"{"type":"meta","run_id":"r1","run_attempt":1,"baseline":"estimator_v13","game_no":0,"match_seed_base":20260910,"match_seed_shard":0,"balance_manifest":"aa"}"#, "\n",
+            r#"{"type":"chose","move_number":1,"usi":"7g7f","think_ms":5,"debug":{"joseki":true}}"#, "\n",
+            r#"{"type":"chose","move_number":3,"usi":"2g2f","think_ms":1100,"debug":{"unique_particles":120}}"#, "\n",
+            r#"{"type":"end","payload":{}}"#, "\n",
+        );
+        let (_, jn, _, jmissing) = parse_record_strict(joseki_only, "t").expect("正常");
+        assert_eq!((jn, jmissing), (1, 0), "定跡手は欠測に数えない");
+        let m = meta.expect("meta が読める");
+        assert_eq!((m.run_id.as_deref(), m.run_attempt), (Some("r1"), Some(1)));
+        assert_eq!((m.baseline.as_str(), m.game_no, m.base, m.shard), ("estimator_v13", 3, Some(20260910), Some(2)));
+
+        // **壊れた JSON 行は Err**（黙って捨てない）
+        let broken = format!("{text}not-json\n");
+        assert!(parse_record_strict(&broken, "t").is_err());
+        // **end の無い未完 record も Err**
+        let unfinished = text.rsplit_once(r#"{"type":"end""#).unwrap().0;
+        assert!(parse_record_strict(unfinished, "t").is_err(), "未完 record は拒否");
+    }
+
+    /// **record の由来を games.jsonl と一対一照合する**（PR #41 レビュー8巡目 [P1]:
+    /// 同じディレクトリの二重指定・別 run の records・欠落・manifest 不一致で
+    /// veto を通せない）
+    #[test]
+    fn arena_balance_record_provenance_is_matched_against_games() {
+        let meta = |baseline: &str, game_no: u64, run: &str| RecordMeta {
+            run_id: Some(run.into()),
+            run_attempt: Some(1),
+            baseline: baseline.into(),
+            game_no,
+            base: Some(1),
+            shard: Some(0),
+            manifest: Some("fp".into()),
+        };
+        let rows: Vec<GameRow> = (0..2u64)
+            .map(|g| {
+                let mut r = balance_row("estimator_v13", g, 0.5);
+                r.run_id = "r1".into();
+                r
+            })
+            .collect();
+        let summary = |metas: Vec<RecordMeta>| ParticleSummary {
+            games: metas.len(),
+            decisions: 10,
+            mean: 100.0,
+            missing: 0,
+            metas,
+        };
+        let ok = summary(vec![meta("estimator_v13", 0, "r1"), meta("estimator_v13", 1, "r1")]);
+        assert!(
+            verify_record_provenance(&ok, &rows, "control", Some("fp"))
+                .expect("一致する入力は通る")
+                .is_empty()
+        );
+        // 重複（同じディレクトリを2回渡した）は Err
+        let dup = summary(vec![meta("estimator_v13", 0, "r1"), meta("estimator_v13", 0, "r1")]);
+        assert!(verify_record_provenance(&dup, &rows, "control", Some("fp")).is_err());
+        // 鍵集合の不一致（欠落・余剰・別 seed の records）は Err
+        let short = summary(vec![meta("estimator_v13", 0, "r1")]);
+        assert!(verify_record_provenance(&short, &rows, "control", Some("fp")).is_err());
+        // 別 run の records は Err
+        let other =
+            summary(vec![meta("estimator_v13", 0, "r2"), meta("estimator_v13", 1, "r2")]);
+        assert!(verify_record_provenance(&other, &rows, "control", Some("fp")).is_err());
+        // manifest 指紋の不一致も Err
+        assert!(verify_record_provenance(&ok, &rows, "control", Some("other-fp")).is_err());
+        // meta の無い/不完全な record は照合できない = 判定不能ノート（通過を出せない）
+        let mut incomplete = summary(vec![meta("estimator_v13", 0, "r1")]);
+        incomplete.games = 2; // 2ファイル中 meta は1つ
+        let notes = verify_record_provenance(&incomplete, &rows, "control", Some("fp"))
+            .expect("ノートへ落ちる");
+        assert!(!notes.is_empty() && !balance_final(true, &notes).1);
+    }
+
+    /// claim 台帳（annotated tag）の読み出し。plan が書く JSON message を
+    /// git cat-file 経由で取り出せること・無いタグは None
+    #[test]
+    fn arena_balance_reads_claim_ledger_from_git() {
+        let dir = std::env::temp_dir().join(format!("claim-ledger-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false);
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["-c", "user.email=t@t", "-c", "user.name=t", "commit", "--allow-empty", "-q", "-m", "x"]);
+        git(&[
+            "-c", "user.email=t@t", "-c", "user.name=t",
+            "tag", "-a", "balance-claim/abc/ctrl-estimator_v13",
+            "-m", r#"{"run_id":"33701","run_attempt":1,"arm":"ctrl","baseline":"estimator_v13"}"#,
+        ]);
+        let repo = dir.to_string_lossy().to_string();
+        let rec = read_claim_record(&repo, "balance-claim/abc/ctrl-estimator_v13")
+            .expect("読める")
+            .expect("タグがある");
+        assert_eq!(rec["run_id"], "33701");
+        assert_eq!(rec["run_attempt"], 1);
+        assert!(
+            read_claim_record(&repo, "balance-claim/abc/cand-estimator_v13")
+                .expect("エラーではない")
+                .is_none(),
+            "無いタグは None（= 台帳外ノート行き）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 判定不能の理由が1つでもあれば、数値の門が通っていても最終判定は
+    /// 「通過」にならない（A/A・不完全入力・事前登録外の N の「通過」表示を塞ぐ）
+    #[test]
+    fn arena_balance_indeterminate_never_passes() {
+        assert_eq!(balance_final(true, &[]), ("通過", true));
+        assert_eq!(balance_final(false, &[]), ("不通過", false));
+        let notes = vec!["--expect-games 104 ≠ 事前登録 600".to_string()];
+        assert_eq!(balance_final(true, &notes), ("判定不能", false));
+        assert_eq!(balance_final(false, &notes), ("判定不能", false));
+        assert_eq!(BALANCE_EXPECT_GAMES, 600, "事前登録した各600局");
+    }
+
     /// 実際の JSONL を通した parse の検査。**構造体を直接組み立てるテストでは
     /// パーサの抜けを検出できない**（PR #23 2回目レビュー指摘3）
     fn valid_row_json() -> serde_json::Value {
@@ -3294,6 +5379,13 @@ mod tests {
             "candidate": "estimator",
             "baseline": "estimator_v14",
             "match_seed": 20260815,
+            "match_seed_base": 20260815,
+            "match_seed_shard": 0,
+            "run_id": "33604671318",
+            "run_attempt": 1,
+            "pair_with": null,
+            "balance_manifest": null,
+            "oracle": "",
             "game_no": 0,
             "a_is_sente": true,
             "score_a": 1.0,
@@ -3329,6 +5421,13 @@ mod tests {
             "candidate",
             "baseline",
             "match_seed",
+            "match_seed_base",
+            "match_seed_shard",
+            "run_id",
+            "run_attempt",
+            "pair_with",
+            "balance_manifest",
+            "oracle",
             "game_no",
             "a_is_sente",
             "score_a",
@@ -3364,10 +5463,20 @@ mod tests {
             assert!(e.contains("object"), "{e}");
         }
 
-        // schema 1 は集計から弾く
-        let mut old = valid_row_json();
-        old["schema"] = serde_json::json!(1);
-        assert!(parse_game_rows_text(&old.to_string(), "t").is_err());
+        // 古い schema は集計から弾く（3 = 実行の識別子・4 = oracle が無い時期も）
+        for s in [1, 3, 4] {
+            let mut old = valid_row_json();
+            old["schema"] = serde_json::json!(s);
+            assert!(parse_game_rows_text(&old.to_string(), "t").is_err(), "schema {s}");
+        }
+
+        // pair_with / balance_manifest は null 可・文字列以外の値は弾く
+        let mut v = valid_row_json();
+        v["pair_with"] = serde_json::json!("33604671318");
+        let ok = parse_game_rows_text(&v.to_string(), "t").expect("文字列は正常");
+        assert_eq!(ok[0].pair_with.as_deref(), Some("33604671318"));
+        v["pair_with"] = serde_json::json!(123);
+        assert!(parse_game_rows_text(&v.to_string(), "t").is_err(), "数値の pair_with は弾く");
     }
 
     /// **1ペアでは分散が同定できない**ので明示的に失敗させる

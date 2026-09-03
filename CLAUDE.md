@@ -49,7 +49,10 @@
   起動するが、**plan が「削除された push」と判定して全ジョブをスキップ**
   するので緑のまま終わる（後片付けで赤い run が残らない。scenario.yml も同様）。
   「基準 × シャード」の matrix に分割され（`-f shards=4` 既定。単一基準の
-  200局も4ランナーに並列化される）、総合結果は **aggregate ジョブのサマリー**
+  200局も4ランナーに並列化される）、**分割は合計が正確に `games` になる偶数割り**
+  （`scripts/ci/split_arena_games.py`、各シャード偶数 = 先後均衡・差≤2。
+  奇数指定だけ全体 +1。〜2026-09-02 は ceil の偶数化で 100→104・600/8→608 に
+  膨らんでいた = 過去記録の「各104局」はこの由来）、総合結果は **aggregate ジョブのサマリー**
   （および artifact `arena-combined`）に合算表で出る。シャード個別は
   `arena-result-<基準>-s<n>` / `arena-records-<基準>-s<n>`。
   `-f match_seed=<数>` で対局条件列を決定論化できる（アブレーション比較用。
@@ -211,6 +214,97 @@
     `--known-arena-delta` に渡す既知値にもなる**。CI では `arena.yml` の
     `-f pair_with=<対照のArena実行ID>` が候補側 run の中でこれを回す。
     ガントレットの記録は `--baseline` で1マッチアップに絞る
+  - **`arena-balance` は issue #40 の opponent-balanced 合算器**（2026-09-01 実装。
+    まだ判定実績なし）。2相手ぶんの対照・候補 games.jsonl を受け取り、相手ごとに
+    局ペア差を作って **`(Δv13 + Δv14) / 2` を層化 bootstrap**（各相手の内側で局を
+    引き直す）で出し、**事前登録した門**（合算 ≥ +0.04・CI 下限 > 0・相手別符号
+    veto・反則/局 +0.3 以内・時間切れ0・思考平均 +100ms 以内）を
+    **fail-closed（不通過なら exit 3、`--allow-incomplete` で警告へ降格）** で
+    判定する（`check_policy combined` と同じ契約）。
+    **判定を変えられるパラメータは全部が事前登録の定数**（PR #41 レビュー4巡目）:
+    局数 600（`BALANCE_EXPECT_GAMES`）・shards 8・base seed（v13=20260910 /
+    v14=20260909）・相手集合 {v13, v14}・alpha 0.05・bootstrap 反復の下限 10000。
+    `--expect-games` / `--expect-shards` / `--expect-seeds` / `--expect-opponents` /
+    `--alpha` / `--boot` の既定はこの定数で、**外した指定は判定不能**（informational
+    な集計はできるが「通過」を出せない。`--expect-opponents` を空にして検査を
+    切ることもできない）。`--allow-incomplete` で降格した不完全入力・A/A =
+    処置なしも判定不能。
+    **処置ノブのような P1 後に決まる可変部分は validation manifest が一次資料**:
+    計測前に commit した manifest（例は `.github/ci/balance-manifest.example.json`。
+    `cand_knobs` に加えて `candidate` / `think_budget_ms` が必須）を指すと、
+    `bin/arena` が起動時に「実効ノブ == manifest の cand_knobs（対照は空）・
+    candidate 名と実効予算の一致・**オラクル無効**」を検査したうえで
+    **games.jsonl の全行へ manifest の sha256 を焼き込み**、合算器は
+    `--manifest <path>` で同じファイルの指紋と全行の一致（違えば die）・期待ノブの
+    完全一致・必須フィールドを要求する。manifest 無しの集計は判定不能。
+    **held-out の4 run（対照→候補 × v13/v14）は同一 commit が必須なので、
+    request ファイルの書き換え push では作れない**（push ごとに commit が変わる。
+    PR #41 レビュー5巡目）: manifest を commit した ref へ
+    `gh workflow run arena.yml -f balance_manifest=<path> -f games=600 -f shards=8
+    -f match_seed=<相手別seed> -f baselines=<相手>`（候補側は
+    `-f cand_env="<ノブ>" -f pair_with=<対照のrun ID>` を追加）を4回起動する。
+    plan が起動時に manifest との一致（games/shards/candidate/相手別 seed・
+    1相手ずつ）と**合算器へ渡せる run であること**（cand arm は pair_with 必須・
+    ctrl arm は禁止、oracle / 両側 env / 時計変更なし、cand_env == manifest の
+    cand_knobs。判定不能になる run に claim を消費させない）を検査し、
+    **取り直しは git タグの台帳で拒否する**（PR #41 レビュー6〜7巡目:
+    `run_attempt==1` では「もう一度 dispatch した新しい run」を検出できない）:
+    `balance-claim/<manifest指紋16>/<arm>-<相手>` タグを **plan が計測前に取得**
+    （annotated tag の message に run_id / attempt を記録 = どの実行が slot を
+    取ったかの不変記録。同時 dispatch の後着は ref 作成の 422 で対局前に落ちる
+    ので、未claim の完走 artifact は生まれない）。**re-run attempt は plan が
+    claim 取得前に拒否**（解放済み slot を再claimして1局も指さず埋める穴。
+    レビュー8巡目）。**cand arm の claim は「対照 claim の owner run ==
+    pair_with かつその run が success 完了かつ head_sha == この run の commit」を
+    確認してから取得**（typo・実行中・失敗した・**別 commit** の対照を指した
+    candidate が claim を消費しない = 「対照を先に完了・同一 commit」の機械保証。
+    commit 不一致は合算器も die するので、claim だけ消費して判定に使えない
+    記録を作らせない。レビュー9巡目）。**解放は「対局が完走しなかった attempt 1 の run」だけ**
+    （release-claim ジョブ。claim 名は取得より先に output へ書くので、plan が
+    取得後に落ちた経路も解放できる。aggregate の失敗では解放しない = 計測は
+    存在しているため）。**合算器も台帳を照合する**: `--manifest` 指定時は
+    `--repo`（既定 `.`）の git から claim タグを fetch して読み、arm × 相手の
+    入力 run が台帳の owner と違えば die・タグが無ければ判定不能（台帳外の
+    artifact で判定させない）。タグは永続なので事後監査もできる。
+    **実験条件も事前登録と照合する**: 実効予算は両 arm・両側とも 2000ms
+    （`BALANCE_BUDGET_MS`。arm 間の一致だけだと「両方 700ms」が通る）・両側 env
+    なし・**診断オラクル（games.jsonl **schema 5** で `oracle` 列を必須記録）は
+    非空なら die**（審判が候補の反則を握りつぶす nofoul 診断 run を held-out として
+    通せてしまうため）。予算・env の逸脱は判定不能。
+    入力の同一性検査も fail-closed: arm 内・相手内の一意性（`assert_uniform`）・
+    **相手をまたいだ arm 設定の一致**（candidate / clock / commit / 予算 /
+    cand_config / cand_knobs / shared_env）・**arm × 相手ごとに base は1つだけ・
+    shard 集合は 0..N の完全な集合**（games.jsonl の `match_seed_base` /
+    `match_seed_shard` 列。記録の `match_seed` はシャードずらし＋基準 XOR 済みの
+    **実効値**なので一意性検査には使えない）・**arm × 相手ごとに実行の識別子
+    `(run_id, run_attempt)` は1つだけ**（games.jsonl **schema 4** で必須化。
+    **base は実験条件であって実行の識別子ではない**: 同じ base で取り直した
+    2 run から shard を半分ずつ選んでも base 1値・shard 完全・局数一致で通って
+    しまう。CI は `GITHUB_RUN_ID` / `GITHUB_RUN_ATTEMPT`、ローカルは
+    `ARENA_EXPERIMENT_ID` が必須 — 無いと `ARENA_GAMES_JSON` 指定の run は起動時に
+    落ちる）・**候補行の `pair_with`（`-f pair_with=` で記録）は対照の run_id と
+    一致し、held-out 判定では必須**（紐の無い行は判定不能 = 後から別の同一 seed・
+    同一 commit 対照へ差し替えられる穴を塞ぐ。不一致は die）・**両 arm とも
+    `run_attempt == 1`**（re-run attempt = 取り直しなので判定不能。`pair_with` は
+    run_id しか持たず attempt を区別できないため 1 に固定して組を一意にする。
+    shard が落ちた run は re-run でなく新しい run として取り直す）・
+    **arm 間は同一 candidate 名・対照は W=0
+    （cand_knobs 空）・同一 commit**（commit 不一致に override は無い）。
+    run 混入・pair_with 不一致・指紋不一致・oracle 非空は `--allow-incomplete` でも
+    降格しない。
+    予算不一致の override も無い。**平均評価粒子数の門（対照比 −10% 超で中止）は
+    verdict に入っている**（PR #41 レビュー7〜8巡目）: 粒子数は games.jsonl に
+    無いので、同じ run の `arena-records-*` を `--records-control` /
+    `--records-candidate` で渡す（`chose.debug.unique_particles` の平均。
+    展開先ディレクトリごと渡せる）。**record は由来 meta を持ち、games.jsonl と
+    一対一で照合される**（`selfplay::write_record` が match ヘッダ直後へ
+    run 識別・baseline・base/shard・game_no・manifest 指紋の meta 行を書く。
+    (baseline, base, shard, game_no) の重複・鍵集合の不一致・別 run の record・
+    manifest 指紋不一致・壊れた JSON 行・end の無い未完 record は **die**）。
+    **records 入力の無い集計・meta の無い/不完全な record・`unique_particles` の
+    無い chose 行は判定不能**（**定跡手は例外**: 評価を回さない正当な非評価手
+    なので `chose.debug` に `{"joseki": true}` が入り、集計対象外 = 欠測に
+    数えない。PR #41 レビュー9巡目）
 - `cargo run --release --bin tune -- [反復数] [評価あたり対局数] [基準...]` — 評価パラメータ
   （`strategy::EvalParams`）のSPSA自動チューニング。目的関数はアリーナのスコア率
   （引き分け=0.5勝）。**f+/f− は共通乱数法でペアリングされる**: 同じ対局シード列
@@ -1381,6 +1475,29 @@
   `price_shards`（既定8。**継続対局なので最も重い**）。
   どれも元対局単位で割り、`*-aggregate` が `report` で合算する
   （**シャードが欠けたら失敗**）
+- `cargo run --release --bin investment_probe -- [--dump out.tsv] <records/*.jsonl | dir>...`
+  — **戦力投資の限界効用の頻度・分類**（issue #40 P0-2 の粒子不要側、2026-09-01。
+  まだ計測実績なし）。記録の真実を再生し、bot の受理手ごとに**自駒だけ**の
+  利き枚数マップの差分を「需要帯 × しきい値横断 × gain/loss」で数えて、
+  **link-only drop**（link は増えるが需要帯への first/second が0の打ち）と
+  **saturated promotion**（非捕獲・非王手の成りで正の利き増分の70%以上が
+  neutral × redundant。**任意/強制を分けて数え、発火3%門の分母は任意成り** =
+  P1 の変更対象）を相手別・手数帯別に集計する。粒子を回さないので一瞬。
+  定義の一次資料は `src/marginal_work.rs`（**事前登録**: 帯は own_king >
+  opp_king（deduce 候補 ≤20 の和集合＋距離1）> backed_target（打ち反則・被捕獲の
+  観測裏付け占有 = runtime の `opp_occupancy_evidence` が委譲で同一）>
+  active_own_piece > neutral の排他、しきい値横断は first/second/redundant の
+  3段で飽和、帯マップは決定開始時に手番ごと1回。利き枚数は**玉を含む全自駒**
+  （事前登録の「自駒利き枚数」どおり。runtime の `own_attack_counts` と同じ側）。
+  「正の link」判定は**選択時に実際についた link そのもの**: runtime が
+  `chose.debug` へ `link`（選択手の link 項）と `link_base`（同じ決定・同じ
+  粒子由来の敵玉重み表で測った着手前の link。`strategy::linked_value_of`）を
+  残し、probe はその差を読む（link の働き重みは粒子由来の `opp_king_w` を使う
+  のでオフラインでは再現できない。link 列の無い旧記録は分類から除外して本数を
+  報告する = その記録では頻度判定を出せない）。
+  score 側の shadow 順位（粒子が要る）は `CandidateScore` に足した
+  `promote_bias` / `drop_bias` 列（score 不変の内訳。rank_probe / rank_dump /
+  hits に表示あり）で取る。`--dump` の TSV は両極端の手の抽出・レビュー用
 - `cargo run --release --bin mine_check -- [--min-fouls N] [--emit <dir> <接頭辞>] <records/*.jsonl...>`
   — **被王手の決定点の採掘**（2026-08-19）。記録の真実を再生し bot 側の被王手
   決定点から「反則を N 回以上した」（foul）と「王手駒を玉以外で取れたのに
