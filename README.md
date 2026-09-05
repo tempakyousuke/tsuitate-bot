@@ -40,7 +40,7 @@ cargo run --release
 | `TSUITATE_QUEUE_RETRY_MS` | `60000` | キュー参加拒否（受付時間外など）後の再試行間隔 ms |
 | `TSUITATE_RECORD_DIR` | `records` | 対局記録（JSONL）の出力先。空文字で無効 |
 
-評価ノブ（`TSUITATE_*`）の一覧と採否の経緯は `CLAUDE.md`。
+評価ノブ（`TSUITATE_*`）の一覧と採否の経緯は `docs/knobs.md`。
 
 ## 構成
 
