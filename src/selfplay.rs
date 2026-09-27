@@ -8,7 +8,6 @@
 //! - 王手宣言は両者に、取った駒種は指した側に、取られたマスは相手側に通知
 //! - 詰み・ステイルメイト・投了（choose が None）・手数上限で終局
 
-use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -16,11 +15,11 @@ use rand::Rng;
 
 use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{
-    ClockState, Color, FoulCounts, FoulRecord, GameEndPayload, GameStatus, MoveRecord,
-    OpponentInfo, PlayerView, RatingChange, RatingChangePair,
+    Color, FoulRecord, GameEndPayload, MoveRecord, OpponentInfo, RatingChange, RatingChangePair,
 };
+use crate::referee::{Referee, StepResult};
 use crate::record::GameRecorder;
-use crate::shogi::{Outcome, Position, parse_usi, unpromote_role};
+use crate::shogi::Position;
 use crate::strategy::Strategy;
 
 pub const MAX_FOULS: u32 = 10;
@@ -186,12 +185,10 @@ fn min_opt(a: Option<i64>, b: Option<i64>) -> Option<i64> {
     }
 }
 
+/// 対局者側の状態（戦略・時計・思考時間）。裁定の状態（観測ログ・反則数・
+/// その手番の反則試行）は `Referee` が持つ
 struct PlayerState {
     strategy: Box<dyn Strategy>,
-    log: ObservationLog,
-    fouls: u32,
-    fouls_in_check: u32,
-    foul_tried: HashSet<String>,
     /// None = 時計なし（checkpoint arena の継続対局）。時間切れ終局が存在せず、
     /// フィッシャー加算もしない。**思考時間の記録（think_us）は時計の有無に
     /// 依らず必ず取る**（「遅くなったが勝率が上がった」偽の改善を弾くため）
@@ -206,34 +203,16 @@ struct PlayerState {
     chosen: Vec<(u32, String, Option<serde_json::Value>)>,
 }
 
-fn make_view(
-    pos: &Position,
-    color: Color,
-    fouls: &[u32; 2],
-    clocks_ms: &[i64; 2],
-    game_no: u32,
-) -> PlayerView {
-    let idx = |c: Color| if c == Color::Sente { 0 } else { 1 };
-    PlayerView {
-        game_id: format!("arena-{game_no}"),
-        your_color: color,
-        your_pieces: pos.pieces_of(color),
-        your_hand: pos.hand_map(color),
-        turn: pos.turn(),
-        move_number: pos.move_number(),
-        clocks: ClockState {
-            sente_ms: clocks_ms[0],
-            gote_ms: clocks_ms[1],
-            running: Some(pos.turn()),
-            server_time: 0,
-        },
-        fouls: FoulCounts {
-            you: fouls[idx(color)],
-            opponent: fouls[idx(color.other())],
-        },
-        you_in_check: pos.in_check(color),
-        opponent_in_check: pos.in_check(color.other()),
-        status: GameStatus::Playing,
+impl PlayerState {
+    fn new(strategy: Box<dyn Strategy>, clock_ms: Option<i64>) -> Self {
+        Self {
+            strategy,
+            clock_ms,
+            clock_granted_ms: clock_ms.map_or(0, |ms| ms.max(0) as u64),
+            clock_min_ms: None,
+            think_us: Vec::new(),
+            chosen: Vec::new(),
+        }
     }
 }
 
@@ -247,40 +226,37 @@ pub struct GameTruth {
 /// oracle[先手, 後手]: 診断用。Some の側は該当する反則手が「候補から外して
 /// 指し直し」になり、反則カウント・観測は発生しない（OracleMode 参照）。
 ///
-/// `start` は開始局面と**絶対手数**（通常の対局は `Position::initial()` と 0、
-/// checkpoint arena は途中局面とそこまでの手数）。両者の観測ログ・反則数・
-/// `foul_tried` は `players` 側が持っているので、ここでは受け取らない。
-/// MAX_PLIES・反則上限・王手/捕獲通知・終局判定は開始点に依らず共通
+/// 裁定（反則・王手/捕獲通知・終局判定・手数上限）は `Referee` が持つ。
+/// ここが持つのは対局者側の都合（時計・投了・思考時間・オラクル）だけ。
+/// 開始局面と絶対手数は `referee` 側（通常の対局は `Referee::new()`、
+/// checkpoint arena は `Referee::from_start`）
 fn play_game_with_oracle(
     players: &mut [PlayerState; 2],
+    referee: &mut Referee,
     game_no: u32,
     oracle: [Option<OracleMode>; 2],
-    start: (Position, u32),
-) -> (GameResult, &'static str, u32, GameTruth) {
-    let (mut pos, mut plies) = start;
+) -> (GameResult, &'static str, u32) {
     let idx = |c: Color| if c == Color::Sente { 0usize } else { 1usize };
-    let mut truth = GameTruth {
-        moves: vec![],
-        foul_attempts: vec![],
-    };
 
     loop {
-        if plies >= MAX_PLIES {
-            return (GameResult::Draw, "max_plies", plies, truth);
+        // 開始時点で終局済み（途中局面の手数上限など）。通常は受理手の後の `step` が返す
+        if let Some((result, reason)) = referee.ended() {
+            return (result, reason, referee.plies());
         }
-        let side = pos.turn();
-        let fouls = [players[0].fouls, players[1].fouls];
+        let side = referee.to_move();
         // 時計なし（clock_ms = None）でも view の残り時間は必要なので初期値を見せる。
         // 戦略側は clocks を読まない（読むのは bridge.rs の表示だけ）
         let clocks_ms = [
             players[0].clock_ms.unwrap_or_else(fischer_initial_ms),
             players[1].clock_ms.unwrap_or_else(fischer_initial_ms),
         ];
-        let view = make_view(&pos, side, &fouls, &clocks_ms, game_no);
+        let view = referee.view(side, clocks_ms, game_no);
 
         let mover = &mut players[idx(side)];
         let started = Instant::now();
-        let choice = mover.strategy.choose(&view, &mover.log, &mover.foul_tried);
+        let choice = mover
+            .strategy
+            .choose(&view, referee.log(side), referee.foul_tried(side));
         let elapsed = started.elapsed();
         mover.think_us.push(elapsed.as_micros() as u64);
         if let Some(clock_ms) = mover.clock_ms.as_mut() {
@@ -291,105 +267,51 @@ fn play_game_with_oracle(
                 None => now,
             });
             if now <= 0 {
-                return (GameResult::Win(side.other()), "timeout", plies, truth);
+                return (GameResult::Win(side.other()), "timeout", referee.plies());
             }
         }
         let Some(usi) = choice else {
-            return (GameResult::Win(side.other()), "resign", plies, truth);
+            return (GameResult::Win(side.other()), "resign", referee.plies());
         };
 
-        let legal = parse_usi(&usi).is_some_and(|mv| pos.is_legal(&mv));
-        if !legal {
-            // 反則: 手番は変わらない（judge.ts と同じ）。フィッシャー加算もしない
-            let in_check = pos.in_check(side);
+        if !referee.is_legal(&usi) {
             // 診断用オラクル: 該当する反則手は握りつぶして指し直させる
             // （反則カウントも観測も発生しない = 完全な合法性知識の上限測定）
             let skip = match oracle[idx(side)] {
                 Some(OracleMode::NoFoul) => true,
-                Some(OracleMode::CheckNoFoul) => in_check,
+                Some(OracleMode::CheckNoFoul) => referee.position().in_check(side),
                 None => false,
             };
             if skip {
-                players[idx(side)].foul_tried.insert(usi);
+                referee.suppress_foul(usi);
                 continue;
             }
+        }
+
+        let move_number = referee.position().move_number();
+        let debug = mover.strategy.debug_state();
+        mover.chosen.push((move_number, usi.clone(), debug));
+        let step = referee.step(&usi, elapsed.as_millis() as u64);
+        // フィッシャー加算は受理された手の後だけ（反則には付かない）。
+        // **終局手（詰み・ステイルメイト・手数上限）も受理手なので加算する**
+        let accepted = matches!(
+            step,
+            StepResult::Accepted
+                | StepResult::Ended {
+                    move_accepted: true,
+                    ..
+                }
+        );
+        if accepted {
             let mover = &mut players[idx(side)];
-            mover.fouls += 1;
-            if in_check {
-                mover.fouls_in_check += 1;
-            }
-            mover.foul_tried.insert(usi.clone());
-            let debug = mover.strategy.debug_state();
-            mover.chosen.push((pos.move_number(), usi.clone(), debug));
-            let foul_count = mover.fouls;
-            truth.foul_attempts.push(FoulRecord {
-                move_number: pos.move_number(),
-                by_color: side,
-                usi: usi.clone(),
-            });
-            mover.log.record(Observation::MyFoul {
-                move_number: pos.move_number(),
-                usi,
-            });
-            players[idx(side.other())]
-                .log
-                .record(Observation::OpponentFoul { count: foul_count });
-            if foul_count >= MAX_FOULS {
-                return (GameResult::Win(side.other()), "foul_limit", plies, truth);
-            }
-            continue;
-        }
-
-        let mv = parse_usi(&usi).unwrap();
-        {
-            let mover = &mut players[idx(side)];
-            let debug = mover.strategy.debug_state();
-            mover.chosen.push((pos.move_number(), usi.clone(), debug));
-        }
-        truth.moves.push(MoveRecord {
-            usi: usi.clone(),
-            by_color: side,
-            ms: elapsed.as_millis() as u64,
-            fouls_before: players[idx(side)].fouls,
-        });
-        let captured = pos.play_unchecked(&mv);
-        plies += 1;
-        players[idx(side)].foul_tried.clear();
-        if let Some(clock_ms) = players[idx(side)].clock_ms.as_mut() {
-            *clock_ms += fischer_increment_ms();
-            players[idx(side)].clock_granted_ms += fischer_increment_ms() as u64;
-        }
-
-        // 通知（game-room.ts と同じ内容・同じ moveNumber 規約 = 適用後の値）
-        let move_number = pos.move_number();
-        let captured_square = captured.map(|_| match mv {
-            crate::shogi::ShogiMove::Board { to, .. } => crate::board::make_usi_square(to),
-            crate::shogi::ShogiMove::Drop { .. } => unreachable!("打ちでは駒を取れない"),
-        });
-        players[idx(side)].log.record(Observation::MyMove {
-            move_number,
-            usi,
-            captured: captured.map(unpromote_role),
-        });
-        players[idx(side.other())].log.record(Observation::OpponentMoved {
-            move_number,
-            captured_my_piece_at: captured_square,
-        });
-        if pos.in_check(pos.turn()) {
-            let in_check = pos.turn();
-            for p in players.iter_mut() {
-                p.log.record(Observation::Check { in_check });
+            if let Some(clock_ms) = mover.clock_ms.as_mut() {
+                *clock_ms += fischer_increment_ms();
+                mover.clock_granted_ms += fischer_increment_ms() as u64;
             }
         }
-
-        match pos.outcome() {
-            Some(Outcome::Checkmate { winner }) => {
-                return (GameResult::Win(winner), "checkmate", plies, truth);
-            }
-            Some(Outcome::Stalemate { winner }) => {
-                return (GameResult::Win(winner), "stalemate", plies, truth);
-            }
-            None => {}
+        // 反則: 手番は変わらない（judge.ts と同じ）
+        if let StepResult::Ended { result, reason, .. } = step {
+            return (result, reason, referee.plies());
         }
     }
 }
@@ -472,6 +394,7 @@ fn write_record(
     game_no: u32,
     a_is_sente: bool,
     players: &[PlayerState; 2],
+    referee: &Referee,
     result: GameResult,
     reason: &str,
     truth: GameTruth,
@@ -480,6 +403,7 @@ fn write_record(
     let idx = |c: Color| if c == Color::Sente { 0usize } else { 1usize };
     let pa = &players[idx(a_color)];
     let pb = &players[idx(a_color.other())];
+    let log_a = referee.log(a_color);
     let mut rec = match GameRecorder::create(
         dir,
         &format!("arena-{game_no}"),
@@ -498,7 +422,7 @@ fn write_record(
     // chose イベントを対応する MyMove/MyFoul 観測の直前に挟む
     // （実対局の記録と同じ順序 = analyze の p_legal 突き合わせが機能する）
     let mut chosen_iter = pa.chosen.iter();
-    for obs in pa.log.events() {
+    for obs in log_a.events() {
         if matches!(
             obs,
             Observation::MyMove { .. } | Observation::MyFoul { .. }
@@ -542,6 +466,7 @@ fn record_game(
     game_no: u32,
     a_is_sente: bool,
     players: [PlayerState; 2],
+    referee: &Referee,
     result: GameResult,
     reason: &str,
     plies: u32,
@@ -552,6 +477,16 @@ fn record_game(
     } else {
         (gote, sente)
     };
+    let (color_a, color_b) = if a_is_sente {
+        (Color::Sente, Color::Gote)
+    } else {
+        (Color::Gote, Color::Sente)
+    };
+    let (fouls_a, fouls_b) = (referee.fouls(color_a), referee.fouls(color_b));
+    let (fic_a, fic_b) = (
+        referee.fouls_in_check(color_a),
+        referee.fouls_in_check(color_b),
+    );
     // 局ごとの結果（ペア差の分散の実測用）。think_us は下で move されるので先に畳む
     let sum_ms = |us: &[u64]| us.iter().sum::<u64>() as f64 / 1000.0;
     stats.per_game.push(GameOutcome {
@@ -569,19 +504,19 @@ fn record_game(
         },
         reason: reason.to_string(),
         plies,
-        fouls_a: pa.fouls,
-        fouls_b: pb.fouls,
-        fouls_in_check_a: pa.fouls_in_check,
-        fouls_in_check_b: pb.fouls_in_check,
+        fouls_a,
+        fouls_b,
+        fouls_in_check_a: fic_a,
+        fouls_in_check_b: fic_b,
         think_ms_a: sum_ms(&pa.think_us),
         think_ms_b: sum_ms(&pb.think_us),
         moves_a: pa.think_us.len() as u32,
         moves_b: pb.think_us.len() as u32,
     });
-    stats.fouls_a += pa.fouls as u64;
-    stats.fouls_b += pb.fouls as u64;
-    stats.fouls_in_check_a += pa.fouls_in_check as u64;
-    stats.fouls_in_check_b += pb.fouls_in_check as u64;
+    stats.fouls_a += fouls_a as u64;
+    stats.fouls_b += fouls_b as u64;
+    stats.fouls_in_check_a += fic_a as u64;
+    stats.fouls_in_check_b += fic_b as u64;
     stats.think_us_a.extend(pa.think_us);
     stats.think_us_b.extend(pb.think_us);
     stats.clock_granted_ms_a += pa.clock_granted_ms;
@@ -718,17 +653,8 @@ where
                     while game_no < games {
                         // 偶数局は A が先手
                         let a_is_sente = game_no % 2 == 0;
-                        let new_player = |strategy: Box<dyn Strategy>| PlayerState {
-                            strategy,
-                            log: ObservationLog::default(),
-                            fouls: 0,
-                            fouls_in_check: 0,
-                            foul_tried: HashSet::new(),
-                            clock_ms: Some(fischer_initial_ms()),
-                            clock_granted_ms: fischer_initial_ms() as u64,
-                            clock_min_ms: None,
-                            think_us: Vec::new(),
-                            chosen: Vec::new(),
+                        let new_player = |strategy: Box<dyn Strategy>| {
+                            PlayerState::new(strategy, Some(fischer_initial_ms()))
                         };
                         let seeds_a = GameSeeds {
                             game_no,
@@ -749,16 +675,20 @@ where
                         } else {
                             [None, oracle_a]
                         };
-                        let (result, reason, plies, truth) = play_game_with_oracle(
-                            &mut players,
-                            game_no,
-                            oracle,
-                            (Position::initial(), 0),
-                        );
+                        let mut referee = Referee::new();
+                        let (result, reason, plies) =
+                            play_game_with_oracle(&mut players, &mut referee, game_no, oracle);
                         if let Some(dir) = record_dir {
-                            write_record(dir, game_no, a_is_sente, &players, result, reason, truth);
+                            let truth = referee.take_truth();
+                            write_record(
+                                dir, game_no, a_is_sente, &players, &referee, result, reason,
+                                truth,
+                            );
                         }
-                        record_game(&mut local, game_no, a_is_sente, players, result, reason, plies);
+                        record_game(
+                            &mut local, game_no, a_is_sente, players, &referee, result, reason,
+                            plies,
+                        );
                         game_no += threads as u32;
                     }
                     local
@@ -827,52 +757,42 @@ pub fn play_continuation(
     start: StartState,
     game_no: u32,
 ) -> ContinuationOutcome {
-    let StartState {
-        pos,
-        logs,
-        fouls,
-        plies: start_plies,
-    } = start;
-    let [log_s, log_g] = logs;
-    let new_player = |strategy: Box<dyn Strategy>, log: ObservationLog, fouls: u32| PlayerState {
-        strategy,
-        log,
-        fouls,
-        fouls_in_check: 0,
-        foul_tried: HashSet::new(),
-        clock_ms: None,
-        clock_granted_ms: 0,
-        clock_min_ms: None,
-        think_us: Vec::new(),
-        chosen: Vec::new(),
-    };
+    let start_plies = start.plies;
+    let start_fouls = start.fouls;
     let [strat_s, strat_g] = strategies;
     let mut players = [
-        new_player(strat_s, log_s, fouls[0]),
-        new_player(strat_g, log_g, fouls[1]),
+        PlayerState::new(strat_s, None),
+        PlayerState::new(strat_g, None),
     ];
-    let (result, reason, plies, truth) =
-        play_game_with_oracle(&mut players, game_no, [None, None], (pos, start_plies));
+    let mut referee = Referee::from_start(start);
+    let (result, reason, plies) =
+        play_game_with_oracle(&mut players, &mut referee, game_no, [None, None]);
+    let fouls = [referee.fouls(Color::Sente), referee.fouls(Color::Gote)];
     let [p0, p1] = players;
     ContinuationOutcome {
         result,
         reason,
         plies,
         added_plies: plies - start_plies,
-        fouls: [p0.fouls, p1.fouls],
-        added_fouls: [p0.fouls - fouls[0], p1.fouls - fouls[1]],
-        added_fouls_in_check: [p0.fouls_in_check, p1.fouls_in_check],
+        fouls,
+        added_fouls: [fouls[0] - start_fouls[0], fouls[1] - start_fouls[1]],
+        added_fouls_in_check: [
+            referee.fouls_in_check(Color::Sente),
+            referee.fouls_in_check(Color::Gote),
+        ],
         think_us: [p0.think_us, p1.think_us],
-        truth,
+        truth: referee.take_truth(),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
 
     use super::*;
+    use crate::protocol::PlayerView;
+    use crate::shogi::parse_usi;
 
     /// 即投了する戦略（シード配線のテスト用）
     struct Resigner;
@@ -999,6 +919,43 @@ mod tests {
         );
     }
 
+    /// **終局手（詰み）にもフィッシャー加算が付く**（旧実装は着手の適用直後・終局判定の前に
+    /// 加算していた。審判の切り出しで一度落とした退行の回帰テスト。等価性ダイジェストは
+    /// 時計なしで回すので、ここで別に固定する）
+    #[test]
+    fn 終局手にもフィッシャー加算が付く() {
+        use crate::board::parse_usi_square;
+        use crate::protocol::Role;
+        use crate::shogi::Piece;
+        let sq = |s: &str| parse_usi_square(s).unwrap();
+        let piece = |color, role| Some(Piece { color, role });
+        // 後手玉 5一・先手金 5三・持ち駒の金。G*5b で詰み
+        let mut pos = Position::empty(Color::Sente);
+        pos.set(sq("5i"), piece(Color::Sente, Role::King));
+        pos.set(sq("5a"), piece(Color::Gote, Role::King));
+        pos.set(sq("5c"), piece(Color::Sente, Role::Gold));
+        pos.set_hand(Color::Sente, Role::Gold, 1);
+        let seen = std::sync::Arc::new(Mutex::new(vec![]));
+        let mut players = [
+            PlayerState::new(Box::new(Fixed { usi: "G*5b", seen_fouls: seen }), Some(10_000)),
+            PlayerState::new(Box::new(Resigner), Some(10_000)),
+        ];
+        let mut referee = Referee::from_start(StartState {
+            pos,
+            logs: [ObservationLog::default(), ObservationLog::default()],
+            fouls: [0, 0],
+            plies: 10,
+        });
+        let (result, reason, plies) =
+            play_game_with_oracle(&mut players, &mut referee, 0, [None, None]);
+        assert_eq!((result, reason, plies), (GameResult::Win(Color::Sente), "checkmate", 11));
+        assert_eq!(
+            players[0].clock_granted_ms,
+            10_000 + fischer_increment_ms() as u64,
+            "詰ませた手にも加算が付く"
+        );
+    }
+
     /// 同じ match_seed なら、スレッド数や実行順に関係なく
     /// 各対局・各プレイヤーに同じシードが割り当てられる（共通乱数法の土台）
     #[test]
@@ -1034,5 +991,143 @@ mod tests {
         }
         let different = collect(43);
         assert_ne!(first, different, "違うシードなら違う条件列");
+    }
+
+
+    /// 自駒だけを見た候補から seed つき乱数で選ぶ戦略（審判の等価性テスト用）。
+    /// 呼ばれるたびに、渡された観測ログ・反則試行・視界を `trace` へ書く
+    struct SeededRandom {
+        rng: rand::rngs::StdRng,
+        trace: std::sync::Arc<Mutex<String>>,
+    }
+    impl Strategy for SeededRandom {
+        fn choose(
+            &mut self,
+            view: &PlayerView,
+            log: &ObservationLog,
+            foul_tried: &HashSet<String>,
+        ) -> Option<String> {
+            use crate::board::{
+                Promotion, drop_targets, make_usi_drop, make_usi_move, move_targets,
+                parse_usi_square, promotion_choice,
+            };
+            use rand::Rng;
+            let color = view.your_color;
+            let mut cands = vec![];
+            for piece in &view.your_pieces {
+                let from = parse_usi_square(&piece.square).unwrap();
+                for to in move_targets(&view.your_pieces, piece, color) {
+                    match promotion_choice(piece.role, from, to, color) {
+                        Promotion::None => cands.push(make_usi_move(from, to, false)),
+                        Promotion::Optional => {
+                            cands.push(make_usi_move(from, to, false));
+                            cands.push(make_usi_move(from, to, true));
+                        }
+                        Promotion::Forced => cands.push(make_usi_move(from, to, true)),
+                    }
+                }
+            }
+            for role in crate::shogi::HAND_ROLES {
+                if view.your_hand.get(&role).copied().unwrap_or(0) > 0 {
+                    for to in drop_targets(&view.your_pieces, role, color) {
+                        cands.extend(make_usi_drop(role, to));
+                    }
+                }
+            }
+            cands.retain(|u| !foul_tried.contains(u));
+            cands.sort();
+            let mut tried: Vec<&String> = foul_tried.iter().collect();
+            tried.sort();
+            let mut t = self.trace.lock().unwrap();
+            t.push_str(&format!(
+                "{:?}|{}|{}|{}|{:?}|{}\n",
+                color,
+                view.move_number,
+                view.fouls.you,
+                view.fouls.opponent,
+                (view.you_in_check, view.opponent_in_check),
+                serde_json::to_string(log.events()).unwrap(),
+            ));
+            t.push_str(&format!("{tried:?}\n"));
+            if cands.is_empty() {
+                return None;
+            }
+            Some(cands[self.rng.random_range(0..cands.len())].clone())
+        }
+        fn name(&self) -> &'static str {
+            "seeded_random"
+        }
+    }
+
+    /// 審判の切り出し（`Referee`）の前後で裁定・観測が1ビットも変わらないことの回帰テスト。
+    /// 期待値のダイジェストは切り出し前のコードで取った（2026-09-27）。
+    /// 乱数方策は反則が多く素のままでは全局が反則負けで終わるので、診断用オラクルの
+    /// 組み合わせを変えて詰み・手数上限・オラクルの握りつぶしの経路も通す
+    fn referee_digest() -> String {
+        use rand::SeedableRng;
+        use sha2::{Digest, Sha256};
+        let configs = [
+            [None, None],
+            [Some(OracleMode::NoFoul), Some(OracleMode::NoFoul)],
+            [Some(OracleMode::NoFoul), None],
+            [Some(OracleMode::CheckNoFoul), Some(OracleMode::CheckNoFoul)],
+        ];
+        let mut h = Sha256::new();
+        for (ci, oracle) in configs.into_iter().enumerate() {
+            for game in 0..12u64 {
+                let trace = std::sync::Arc::new(Mutex::new(String::new()));
+                let mk = |seed: u64| -> Box<dyn Strategy> {
+                    Box::new(SeededRandom {
+                        rng: rand::rngs::StdRng::seed_from_u64(seed),
+                        trace: std::sync::Arc::clone(&trace),
+                    })
+                };
+                let seed = (ci as u64) * 1000 + game * 2;
+                let (result, reason, plies, truth, fouls, fic) =
+                    run_game_for_digest([mk(seed), mk(seed + 1)], oracle, game as u32);
+                if std::env::var("DIGEST_VERBOSE").is_ok() {
+                    println!("END {ci} {reason} {plies} {fouls:?}");
+                }
+                h.update(trace.lock().unwrap().as_bytes());
+                h.update(format!("{result:?}|{reason}|{plies}|{fouls:?}|{fic:?}\n"));
+                for m in &truth.moves {
+                    h.update(format!("m{}{:?}{}\n", m.usi, m.by_color, m.fouls_before));
+                }
+                for f in &truth.foul_attempts {
+                    h.update(format!("f{}{:?}{}\n", f.usi, f.by_color, f.move_number));
+                }
+            }
+        }
+        h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn run_game_for_digest(
+        s: [Box<dyn Strategy>; 2],
+        oracle: [Option<OracleMode>; 2],
+        game_no: u32,
+    ) -> (GameResult, &'static str, u32, GameTruth, [u32; 2], [u32; 2]) {
+        let [a, b] = s;
+        let mut players = [PlayerState::new(a, None), PlayerState::new(b, None)];
+        let mut referee = Referee::new();
+        let (r, reason, plies) = play_game_with_oracle(&mut players, &mut referee, game_no, oracle);
+        (
+            r,
+            reason,
+            plies,
+            referee.take_truth(),
+            [referee.fouls(Color::Sente), referee.fouls(Color::Gote)],
+            [
+                referee.fouls_in_check(Color::Sente),
+                referee.fouls_in_check(Color::Gote),
+            ],
+        )
+    }
+
+    #[test]
+    fn 審判の切り出し前後で裁定と観測が一致する() {
+        assert_eq!(
+            referee_digest(),
+            "f296402c5801f7f20ebcdef2c43527bc1ed624dd14fc8885de45fcf4d521fadf"
+        );
     }
 }
