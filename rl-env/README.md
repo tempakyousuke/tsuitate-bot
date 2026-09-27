@@ -56,6 +56,21 @@ env.pop_finished()                 # 終局した局: game_no / winner / reason 
   同じ観測列）。estimator 系は壁時計で思考を打ち切るので、seed が同じでも完全には再現しない
 - 自駒視点の候補が1つも残らない手番は `no_moves` で負け
 
+### 模倣学習のデータセット（M2a）
+
+```python
+ds = tsuitate_rl.RecordDataset(paths)   # 対局記録（JSONL）のパスのリスト
+ds.num_games, ds.num_attempts, ds.skipped   # 読めなかった局は (パス, 理由)
+ds.signatures                            # 棋譜の署名（学習/検証の分割キー）
+ds.game_attempts                         # 各局の試行数
+(obs, mask, action, side, value, foul, game), outside = ds.encode_games([0, 1, 2])
+```
+
+- 読み込み時に真実を審判で再生し、**記録した側の観測が記録と一致し、勝敗が再生の裁定と
+  一致する局だけ**を残す
+- `encode_games` は指定した局の全試行（反則した試行を含む）を返す。`value` は手番側から見た
+  終局の結果（勝ち +1 / 負け −1 / 引き分け 0）。1試行あたり約39KB なので、局は数十ずつ渡す
+
 ## 実測（2026-09-27、Apple Silicon、ランダム方策）
 
 | n | 決定点/秒 | observe | step |
