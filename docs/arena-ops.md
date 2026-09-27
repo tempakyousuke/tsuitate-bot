@@ -357,3 +357,25 @@
   `systemctl disable --now <サービス名>` → `gcloud compute scp` で `tune-*.jsonl` を
   `tuning/` へ回収 → VM停止。**採用判定は必ずCIの200局ガントレット**（100局は偽陽性事例あり）
 
+### RL（R-NaD）の GPU VM
+
+DeepNash 路線の自己対局学習（`docs/rl-deepnash-design.md`）は別の GPU VM で回す。
+
+- **VM**: `tsuitate-rl`（`tsuitate-solver` / `asia-northeast1-b` / `g2-standard-8` ＋ NVIDIA L4 1枚 /
+  **Spot**・停止時は STOP / イメージ `common-cu129-ubuntu-2404-nvidia-580`）。
+  2026-09-28 の単価で **Spot 約 $0.66/時**（L4 $0.430 ＋ 8vCPU・32GB $0.226）、通常なら約 $1.10/時。
+  プロジェクトの `GPUS_ALL_REGIONS` は 2026-09-28 に 0 → 1 へ申請・承認済み（2枚目を使うなら再申請）
+- **コード転送**: `tsuitate-bot` の tar（上と同じ作り方。`rl-env/target` も除く）と、
+  `tar czf /tmp/tsuitate-nn-rnad.tar.gz -C ~/Develop/tsuitate-nn --exclude __pycache__ rnad out_rnad/bc/checkpoint.pt`
+  を `scripts/gce/setup-rnad.sh` と一緒に `/tmp/` へ送り、
+  `bash /tmp/setup-rnad.sh rnad '<train_rnad.py の引数>'` を実行（Rust・PyTorch の CUDA 版・
+  `tsuitate_rl` のビルド → 参照実装との一致テスト → systemd 常駐まで自動）
+- **完走したら VM が自分で停止する**（`AUTO_POWEROFF=1` が既定。GPU の課金を放置で積まない）。
+  Spot で止められたら `instances start` するだけで、`--checkpoint-every` ごとの checkpoint から再開する
+- **進捗確認**: `gcloud compute ssh tsuitate-rl ... --command "journalctl -u rnad --no-pager -o cat | tail"`
+- **回収**: `gcloud compute scp` で `~/tsuitate-nn/out_rnad/<out>/`（`log.jsonl`・`checkpoint.pt`・
+  `policy_<step>.bin`）を手元へ。重みを arena で測るときは Release に置く（`rl_policy:release:...`）
+- **実測**（2026-09-28、256局/更新）: 自己対局 約3秒＋学習 約4.5秒 = 1更新 約7.5秒・約4,000標本/秒
+  （手元の Mac の約4倍）。行動のサンプリングを CPU でやると自己対局が 15秒になり律速になる
+  （`rnad.sample_actions` はデバイス上の Gumbel-max でサンプリングする）
+
