@@ -84,6 +84,38 @@ def check_atomic_step() -> None:
         )
 
 
+def check_no_auto_reset() -> None:
+    """auto_reset=False: 終局した局は止まり（マスク空・行動 -1）、reset() で全局が新しくなる"""
+    n = 6
+    env = tsuitate_rl.VecEnv(n, seed=5, auto_reset=False)
+    rng = np.random.default_rng(5)
+    ended = 0
+    for _ in range(400):
+        alive = env.alive()
+        if not alive.any():
+            break
+        obs, mask, player = env.observe()
+        assert (mask.any(axis=1) == alive).all(), "止まった局のマスクは空"
+        actions = random_actions(mask, rng)
+        actions[~alive] = -1
+        _, done = env.step(actions)
+        assert not (done & ~alive).any()
+        ended += int(done.sum())
+        # 止まった局に -1 以外を渡すと拒否（どの局も進まない）
+        alive_now = env.alive()
+        if (~alive_now).any() and alive_now.any():
+            try:
+                env.step(np.where(alive_now, random_actions(env.observe()[1], rng), 0))
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("止まった局への行動が通った")
+    assert ended == n and not env.alive().any(), "全局が1局ずつ終わって止まる"
+    assert len(env.pop_finished()) == n
+    env.reset()
+    assert env.alive().all()
+
+
 def check_seeded_opponent() -> None:
     """同じ seed・同じ行動列なら、heuristic 相手の対局は同じ観測列になる"""
 
@@ -128,6 +160,7 @@ if __name__ == "__main__":
     check_selfplay(64, 400)
     check_versus()
     check_atomic_step()
+    check_no_auto_reset()
     check_seeded_opponent()
     print("不正行動の一括拒否・seed つき相手の再現性: OK")
     for n in (64, 256, 1024):

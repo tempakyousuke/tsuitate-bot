@@ -5,6 +5,8 @@
 //! 使い方と罠（報酬の色は step の前に控える等）は rl-env/README.md。
 //!
 //! 終局した局は `step` の中で自動的に新しい局へ差し替わる（次の `observe` は新しい局の初手）。
+//! `auto_reset=False` なら終局した局はそのまま止まり（行動は -1 を渡す）、`reset()` で
+//! まとめて新しい局にする（R-NaD のように1局を丸ごと集める学習用）。
 
 use numpy::{PyArray1, PyArray2, PyArray4, PyArrayMethods, PyReadonlyArray1};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
@@ -64,6 +66,8 @@ struct VecEnv {
     spec: GameSpec,
     next_game_no: u32,
     finished: Vec<Finished>,
+    /// 終局した局を step の中で新しい局へ差し替えるか
+    auto_reset: bool,
 }
 
 fn color_code(c: Color) -> i8 {
@@ -121,8 +125,14 @@ fn build_fresh(
 #[pymethods]
 impl VecEnv {
     #[new]
-    #[pyo3(signature = (n, opponent=None, seed=0))]
-    fn new(py: Python<'_>, n: usize, opponent: Option<String>, seed: u64) -> PyResult<Self> {
+    #[pyo3(signature = (n, opponent=None, seed=0, auto_reset=true))]
+    fn new(
+        py: Python<'_>,
+        n: usize,
+        opponent: Option<String>,
+        seed: u64,
+        auto_reset: bool,
+    ) -> PyResult<Self> {
         if n == 0 {
             return Err(PyValueError::new_err("n は 1 以上"));
         }
@@ -140,7 +150,27 @@ impl VecEnv {
             spec,
             next_game_no,
             finished,
+            auto_reset,
         })
+    }
+
+    /// 全局を新しい局にする（途中の局は記録せずに捨てる）
+    fn reset(&mut self, py: Python<'_>) {
+        let n = self.games.len();
+        let VecEnv {
+            games,
+            spec,
+            next_game_no,
+            finished,
+            ..
+        } = self;
+        *games = py.detach(|| build_fresh(spec, next_game_no, finished, n));
+    }
+
+    /// 各局がまだ終局していないか（`auto_reset=False` で止まった局は False）
+    fn alive<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<bool>> {
+        let v: Vec<bool> = self.games.iter().map(|g| g.outcome().is_none()).collect();
+        PyArray1::from_vec(py, v)
     }
 
     #[getter]
@@ -148,7 +178,7 @@ impl VecEnv {
         self.games.len()
     }
 
-    /// 各局の今の手番の (観測, マスク, 手番の色)
+    /// 各局の今の手番の (観測, マスク, 手番の色)。終局して止まっている局のマスクは空
     // &mut なのは rayon で局を分けるため（相手戦略は Send だが Sync ではない）
     fn observe<'py>(&mut self, py: Python<'py>) -> PyResult<ObserveOut<'py>> {
         let n = self.games.len();
@@ -161,7 +191,10 @@ impl VecEnv {
                 .zip(games.par_iter_mut())
                 .for_each(|((o, m), g): ((&mut [f32], &mut [bool]), &mut EnvGame)| {
                     g.observe_into(o);
-                    m.copy_from_slice(g.mask());
+                    // 終局して止まっている局（auto_reset=False）はマスクが空 = 全部 false のまま
+                    if !g.mask().is_empty() {
+                        m.copy_from_slice(g.mask());
+                    }
                 });
             (obs, mask)
         });
@@ -177,7 +210,8 @@ impl VecEnv {
     /// 新しい局へ差し替える。
     ///
     /// **行動はバッチ全体を先に検査する**: 1つでも範囲外・マスク外があれば、どの局も
-    /// 進めずに `ValueError` を返す（一部の局だけ進むと、終局した局の報酬が失われる）
+    /// 進めずに `ValueError` を返す（一部の局だけ進むと、終局した局の報酬が失われる）。
+    /// `auto_reset=False` で終局して止まっている局には -1 を渡す（それ以外の値は拒否）
     fn step<'py>(
         &mut self,
         py: Python<'py>,
@@ -191,12 +225,21 @@ impl VecEnv {
                 raw.len()
             )));
         }
-        let mut actions = Vec::with_capacity(n);
+        let mut actions: Vec<Option<usize>> = Vec::with_capacity(n);
         let mut errors = vec![];
         for (i, (&a, g)) in raw.iter().zip(&self.games).enumerate() {
+            if g.outcome().is_some() {
+                // auto_reset=False で止まっている局（auto_reset=True では起きない）
+                if a == -1 {
+                    actions.push(None);
+                } else {
+                    errors.push(format!("env {i}: 終局済みの局には -1 を渡す（{a}）"));
+                }
+                continue;
+            }
             match usize::try_from(a) {
                 Ok(a) => match g.check_action(a) {
-                    Ok(()) => actions.push(a),
+                    Ok(()) => actions.push(Some(a)),
                     Err(e) => errors.push(format!("env {i}: {e:?}")),
                 },
                 Err(_) => errors.push(format!("env {i}: 負の行動 {a}")),
@@ -211,12 +254,17 @@ impl VecEnv {
             spec,
             next_game_no,
             finished,
+            auto_reset,
         } = self;
+        let auto_reset = *auto_reset;
         let (rewards, done, internal) = py.detach(|| {
             let results: Vec<_> = games
                 .par_iter_mut()
                 .zip(actions.par_iter())
-                .map(|(g, &a)| g.step(a))
+                .map(|(g, &a)| match a {
+                    Some(a) => g.step(a),
+                    None => Ok(None),
+                })
                 .collect();
             let mut rewards = vec![0.0f32; n * 2];
             let mut done = vec![false; n];
@@ -232,7 +280,7 @@ impl VecEnv {
                     Err(e) => internal.push(format!("env {i}: {e:?}")),
                 }
             }
-            // 終局した局を記録し、新しい局へ差し替える（新しい局の構築も並列）
+            // 終局した局を記録し、auto_reset なら新しい局へ差し替える（新しい局の構築も並列）
             let ended: Vec<usize> = (0..n).filter(|&i| done[i]).collect();
             for &i in &ended {
                 let old = &games[i];
@@ -242,9 +290,11 @@ impl VecEnv {
                     outcome: old.outcome().expect("done の局は終局している"),
                 });
             }
-            let fresh = build_fresh(spec, next_game_no, finished, ended.len());
-            for (i, game) in ended.into_iter().zip(fresh) {
-                games[i] = game;
+            if auto_reset {
+                let fresh = build_fresh(spec, next_game_no, finished, ended.len());
+                for (i, game) in ended.into_iter().zip(fresh) {
+                    games[i] = game;
+                }
             }
             (rewards, done, internal)
         });
