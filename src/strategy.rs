@@ -193,6 +193,11 @@ pub fn make_seeded(name: &str, seed: u64) -> Option<Box<dyn Strategy + Send>> {
         "estimator_v14" => Some(Box::new(
             crate::frozen::estimator_v14::EstimatorV14::with_seed(seed),
         )),
+        // 着手の分布は `Heuristic` と同じ。乱数源だけ seed つきにする
+        // （RL 環境の評価モードで相手の着手列を再現するため。2026-09-27）
+        "heuristic" => Some(Box::new(SeededHeuristic {
+            rng: rand::rngs::StdRng::seed_from_u64(seed),
+        })),
         _ => make(name),
     }
 }
@@ -383,10 +388,38 @@ impl Strategy for Heuristic {
     }
 }
 
+/// `Heuristic` の seed つき版（`make_seeded("heuristic", seed)`）。着手の分布は同じ
+pub struct SeededHeuristic {
+    rng: rand::rngs::StdRng,
+}
+
+impl Strategy for SeededHeuristic {
+    fn choose(
+        &mut self,
+        view: &PlayerView,
+        _log: &ObservationLog,
+        foul_tried: &HashSet<String>,
+    ) -> Option<String> {
+        choose_move_with(view, foul_tried, &mut self.rng)
+    }
+
+    fn name(&self) -> &'static str {
+        "heuristic"
+    }
+}
+
 /// 候補手を生成してスコア最大の手を返す。foul_tried の手は除外。
 /// 候補が尽きたら None（呼び出し側で投了する）。
 pub fn choose_move(view: &PlayerView, foul_tried: &HashSet<String>) -> Option<String> {
-    let mut rng = rand::rng();
+    choose_move_with(view, foul_tried, &mut rand::rng())
+}
+
+/// `choose_move` の乱数源を渡せる版
+pub fn choose_move_with(
+    view: &PlayerView,
+    foul_tried: &HashSet<String>,
+    rng: &mut impl Rng,
+) -> Option<String> {
     let mut best: Option<(String, f64)> = None;
     let consider = |usi: String, score: f64, best: &mut Option<(String, f64)>| {
         if foul_tried.contains(&usi) {

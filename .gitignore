@@ -7,5 +7,7 @@
 /scenario-gui/src-tauri/target/
 /scenario-gui/src-tauri/gen/
 /scenario-gui/public/fixtures/
+/rl-env/target/
+/rl-env/.venv/
 __pycache__/
 /data/
