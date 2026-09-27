@@ -334,12 +334,38 @@ jobs:
         baseline: ${{ fromJSON(needs.plan.outputs.baselines) }}
         shard: ${{ fromJSON(needs.plan.outputs.shards) }}
     runs-on: ubuntu-latest
+    # contents: read は checkout と、方策ネットの重みを Release から取るため
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+
+      # 方策ネット（DeepNash 路線）の重みは Release に置く: 戦略名に
+      # `rl_policy:release:<タグ>/<ファイル名>` と書くと、ここで取ってきて手元のパスへ
+      # 置き換える（それ以外の戦略名はそのまま）。基準名は artifact 名にも入るが、
+      # artifact 名に `:` `/` は使えないので、英数字と `._-` 以外を `_` にした slug を使う
+      # （既存の estimator_vN はそのまま = 後段のワークフローの artifact 名は変わらない）
+      - name: Resolve RL weights
+        id: names
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE: ${{ needs.plan.outputs.candidate }}
+          BASELINE: ${{ matrix.baseline }}
+        run: |
+          set -euo pipefail
+          bash scripts/ci/resolve_rl_weights.sh --self-test
+          cand=$(bash scripts/ci/resolve_rl_weights.sh "$CANDIDATE")
+          base=$(bash scripts/ci/resolve_rl_weights.sh "$BASELINE")
+          slug=$(printf '%s' "$BASELINE" | tr -c 'A-Za-z0-9._-' '_')
+          {
+            echo "candidate=$cand"
+            echo "baseline=$base"
+            echo "slug=$slug"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Run arena shard
         env:
@@ -367,6 +393,9 @@ jobs:
           # 指定すると games.jsonl の全行へ sha256 が焼き込まれ、arena-balance
           # --manifest がその一致を要求する
           ARENA_BALANCE_MANIFEST: ${{ needs.plan.outputs.balance_manifest }}
+          # 方策ネットの重みを手元のパスへ置き換えた戦略名（上の Resolve RL weights）
+          RESOLVED_CANDIDATE: ${{ steps.names.outputs.candidate }}
+          RESOLVED_BASELINE: ${{ steps.names.outputs.baseline }}
         run: |
           set -euo pipefail
           # held-out（manifest-bound）run の re-run attempt は使えない: 記録の
@@ -424,8 +453,8 @@ jobs:
           export ARENA_CAND_KNOBS="$ARENA_CAND_ENV"
           cargo run --release --bin arena -- \
             "${{ fromJSON(needs.plan.outputs.games_by_shard)[matrix.shard] }}" \
-            "${{ needs.plan.outputs.candidate }}" \
-            "${{ matrix.baseline }}" \
+            "$RESOLVED_CANDIDATE" \
+            "$RESOLVED_BASELINE" \
             | tee arena-result.txt
 
       # 被詰めろオラクル: 相手が詰みを実行してこない環境でも自玉の受けを測れる
@@ -462,7 +491,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: arena-result-${{ matrix.baseline }}-s${{ matrix.shard }}
+          name: arena-result-${{ steps.names.outputs.slug }}-s${{ matrix.shard }}
           path: |
             arena-result.txt
             arena-summary.json
@@ -473,7 +502,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v6
         with:
-          name: arena-records-${{ matrix.baseline }}-s${{ matrix.shard }}
+          name: arena-records-${{ steps.names.outputs.slug }}-s${{ matrix.shard }}
           path: arena-records/
           if-no-files-found: ignore
 
