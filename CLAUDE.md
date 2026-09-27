@@ -395,7 +395,10 @@
   （学習は `~/Develop/tsuitate-nn/rnad/`、PyTorch との一致はフィクスチャ
   `tests/fixtures/rl/tiny_policy.*` で常時検査）。`policy.rs` = 方策ネットで指す戦略で、
   **戦略名に重みのパスを埋め込む**（`rl_policy:<パス>` はサンプリング、
-  `rl_policy_greedy:<パス>` は最大の手。記録上の名前は重みの sha256 入りの `rl_policy@<12桁>`）
+  `rl_policy_greedy:<パス>` は最大の手。記録上の名前は重みの sha256 入りの `rl_policy@<12桁>`）。
+  **実験中の重みはリポジトリにコミットせず GitHub Release に置く**（重みは差分圧縮が効かず
+  履歴が膨らむため。採用した版だけ `models/` にコミットする）。CI の arena では
+  `rl_policy:release:<タグ>/<ファイル名>` と書けば arena.yml が取ってくる
 - `truth_replay.rs` — 対局記録の真実（game:end の全手順＋反則試行）から
   **両者の観測列**を再構成して決定点を1つずつ渡す共通部品。観測の作り方
   （順序・move_number 規約・王手宣言の両者通知）は selfplay.rs の審判と一致させること
