@@ -1,0 +1,69 @@
+# rl-env（`tsuitate_rl`）
+
+DeepNash（R-NaD）路線の RL 環境を Python から呼ぶための PyO3 の薄いラッパー。
+設計は `docs/rl-deepnash-design.md`。
+
+- 1局の進行（裁定・観測エンコード・行動マスク・相手戦略の自動着手）は本体
+  （`src/referee.rs` / `src/rl/`）にあり、ここは **n 局の並列化（rayon、GIL を外す）と
+  numpy 変換だけ**を持つ
+- 本体の依存（pyo3 / numpy / rayon）を増やさないため別 crate。本体の `cargo build` / CI には
+  含まれない
+
+## ビルド
+
+学習側の venv（`~/Develop/tsuitate-nn/.venv`、Python 3.12）へ入れる:
+
+```sh
+~/Develop/tsuitate-nn/.venv/bin/python -m pip install maturin   # 初回だけ
+VIRTUAL_ENV=~/Develop/tsuitate-nn/.venv ~/Develop/tsuitate-nn/.venv/bin/maturin develop --release -m rl-env/Cargo.toml
+~/Develop/tsuitate-nn/.venv/bin/python rl-env/smoke.py          # 通しと速度計測
+```
+
+本体（`src/rl/` 等）を変えたら `maturin develop` をやり直す。
+
+## API
+
+```python
+import tsuitate_rl
+env = tsuitate_rl.VecEnv(256, seed=0)                       # 自己対局
+env = tsuitate_rl.VecEnv(64, opponent="heuristic", seed=0)  # 評価モード（strategy::make の名前）
+obs, mask, player = env.observe()  # [n,86,9,9] f32 / [n,11259] bool / [n] i8（0=先手 1=後手）
+rewards, done = env.step(actions)  # [n] i64 → [n,2] f32（先手,後手）/ [n] bool
+env.learner_colors()               # 評価モードの学習側の色（自己対局は -1）
+env.pop_finished()                 # 終局した局: game_no / winner / reason / plies / fouls / learner
+```
+
+- 終局した局は `step` の中で新しい局へ差し替わる（`done` の局の次の `observe` は新しい局）。
+  学習側では **`done` の局で価値のブートストラップと履歴の引き継ぎを切る**こと
+- 報酬は終局時だけ ±1（引き分け 0）。反則などの途中報酬はない。自己対局では、終局の手を
+  指さなかった側にも同じ `step` で報酬が返る（[先手, 後手] の両方が入る）ので、両者の
+  直前の遷移へ割り当てる
+- **自己対局では反則で同じプレイヤーが続けて指す**（反則は手番を変えない）。`player` は
+  毎回 `observe` の値を使い、交互だと仮定しない
+- 行動は**バッチ全体を先に検査**し、1つでも範囲外・マスク外があれば、どの局も進めずに
+  `ValueError`
+- 評価モードは偶数局で学習側が先手。相手の手番は内部で指し進め、`observe` は常に学習側の手番。
+  相手の手で終局した場合も、その直前の学習側の `step` が報酬を返す
+- **評価モードで報酬の列を選ぶ色は `step` の前に取る**（`step` の後の `learner_colors()` は
+  差し替わった新しい局の色で、終局した局とは先後が逆のことがある）:
+
+  ```python
+  learner = env.learner_colors()
+  rewards, done = env.step(actions)
+  learner_rewards = rewards[np.arange(env.num_envs), learner]
+  ```
+- 相手の乱数は `seed` と局番号から決まる。heuristic は完全に再現する（同じ seed・同じ行動列 →
+  同じ観測列）。estimator 系は壁時計で思考を打ち切るので、seed が同じでも完全には再現しない
+- 自駒視点の候補が1つも残らない手番は `no_moves` で負け
+
+## 実測（2026-09-27、Apple Silicon、ランダム方策）
+
+| n | 決定点/秒 | observe | step |
+| --- | --- | --- | --- |
+| 64 | 約10.3万 | 0.2ms | 0.4ms |
+| 256 | 約11.5万 | 0.8ms | 1.5ms |
+| 1024 | 約12.2万 | 3.1ms | 5.3ms |
+
+ネットの推論を含まない環境側の上限。**マシンが空いているときの値**で、他の重い処理が
+動いていると数分の1に落ちる（同じコードで 34µs → 96µs/決定点になった実測あり）。
+速度を比べるときは同じ条件で対照も取り直すこと。

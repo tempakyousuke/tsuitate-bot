@@ -386,7 +386,10 @@
 - `rl/` — **DeepNash（R-NaD）路線の部品**（NN 段階④、設計は `docs/rl-deepnash-design.md`）。
   `action.rs` = 139×81 の行動符号化と自駒視点の行動マスク（真の合法手 ⊆ マスクを常時検査）、
   `encode.rs` = 観測 → 86×9×9 のテンソル。**入力は `Strategy::choose` と同じ
-  `(PlayerView, ObservationLog, foul_tried)` だけ**にしてあり、学習環境と推論が同じ関数を通る
+  `(PlayerView, ObservationLog, foul_tried)` だけ**にしてあり、学習環境と推論が同じ関数を通る。
+  `env.rs` = RL 環境の1局（自己対局・Rust 戦略を相手にする評価モード）。
+  Python からは別 crate の `rl-env/`（PyO3、`tsuitate_rl.VecEnv`）で n 局を並列に回す。
+  本体の依存と CI を増やさないため別 crate で、ビルドは maturin（`rl-env/README.md`）
 - `truth_replay.rs` — 対局記録の真実（game:end の全手順＋反則試行）から
   **両者の観測列**を再構成して決定点を1つずつ渡す共通部品。観測の作り方
   （順序・move_number 規約・王手宣言の両者通知）は selfplay.rs の審判と一致させること

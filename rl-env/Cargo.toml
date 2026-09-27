@@ -1,0 +1,18 @@
+[package]
+name = "tsuitate-rl-env"
+version = "0.1.0"
+edition = "2024"
+description = "tsuitate-bot の RL 環境（PyO3 の薄いラッパー。docs/rl-deepnash-design.md）"
+
+# 本体の依存を増やさないため別 crate にしている（本体の cargo build / CI には含まれない）。
+# ビルドは maturin: `maturin develop --release -m rl-env/Cargo.toml`（rl-env/README.md）
+[lib]
+name = "tsuitate_rl"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+tsuitate-bot = { path = ".." }
+pyo3 = { version = "0.29", features = ["extension-module", "abi3-py311"] }
+numpy = "0.29"
+rayon = "1"
+rand = "0.9"
