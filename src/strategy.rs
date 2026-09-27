@@ -198,6 +198,10 @@ pub fn make_seeded(name: &str, seed: u64) -> Option<Box<dyn Strategy + Send>> {
         "heuristic" => Some(Box::new(SeededHeuristic {
             rng: rand::rngs::StdRng::seed_from_u64(seed),
         })),
+        _ if name.starts_with("rl_policy") => {
+            crate::rl::policy::RlPolicy::from_name(name, Some(seed))
+                .map(|p| Box::new(p) as Box<dyn Strategy + Send>)
+        }
         _ => make(name),
     }
 }
@@ -286,7 +290,9 @@ pub fn make(name: &str) -> Option<Box<dyn Strategy + Send>> {
         "estimator_v12" => Some(Box::new(crate::frozen::estimator_v12::EstimatorV12::new())),
         "estimator_v13" => Some(Box::new(crate::frozen::estimator_v13::EstimatorV13::new())),
         "estimator_v14" => Some(Box::new(crate::frozen::estimator_v14::EstimatorV14::new())),
-        _ => None,
+        // 方策ネット（DeepNash 路線）: `rl_policy:<重みのパス>` / `rl_policy_greedy:<パス>`
+        _ => crate::rl::policy::RlPolicy::from_name(name, None)
+            .map(|p| Box::new(p) as Box<dyn Strategy + Send>),
     }
 }
 

@@ -289,9 +289,225 @@ impl VecEnv {
     }
 }
 
+/// 対局記録（JSONL）を教師にする模倣学習のデータセット（M2a）。
+///
+/// 読み込み時に真実を `Referee` で再生し、**記録した側の観測が記録と一致し、記録の勝敗が
+/// 再生の裁定と一致する局だけ**を残す（食い違う局は `skipped` に数える。勝敗は価値の教師になるので、
+/// 勝者の取り違え・読めない結果・途中で切れた記録を通さない）。エンコードは局単位で `encode_games` を呼ぶ
+/// （試行ごとに観測を保持すると重いので、呼ぶたびに再生し直す。局単位で並列）。
+#[pyclass(unsendable)]
+struct RecordDataset {
+    games: Vec<LoadedGame>,
+    skipped: Vec<(String, String)>,
+}
+
+struct LoadedGame {
+    path: String,
+    end: tsuitate_bot::protocol::GameEndPayload,
+    /// 検査済みの勝敗（価値の教師の元）
+    result: GameResult,
+    /// 試行数
+    attempts: usize,
+    /// 着手列と反則試行列の署名（同じ棋譜を学習/検証の両方へ入れないための分割キー）
+    signature: String,
+}
+
+fn game_signature(end: &tsuitate_bot::protocol::GameEndPayload) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for m in &end.moves {
+        m.usi.hash(&mut h);
+    }
+    for f in &end.foul_attempts {
+        (f.move_number, &f.usi).hash(&mut h);
+    }
+    format!("{:016x}", h.finish())
+}
+
+/// 1局の全試行をエンコードした結果
+#[derive(Default)]
+struct Encoded {
+    obs: Vec<f32>,
+    mask: Vec<bool>,
+    action: Vec<i64>,
+    side: Vec<i8>,
+    value: Vec<f32>,
+    foul: Vec<bool>,
+    game: Vec<i32>,
+    /// マスクの外にあった教師の手（通常は 0。0 でなければエンコードかマスクの不具合）
+    outside_mask: usize,
+}
+
+fn encode_game(g: &LoadedGame, game_idx: usize) -> Encoded {
+    use tsuitate_bot::rl::action::{encode_usi, legal_mask};
+    use tsuitate_bot::rl::encode::encode_into;
+    use tsuitate_bot::rl::records::replay;
+    let (end, result) = (&g.end, g.result);
+    let mut e = Encoded::default();
+    e.obs.reserve(g.attempts * OBS_LEN);
+    e.mask.reserve(g.attempts * NUM_ACTIONS);
+    let _ = replay(end, |r, a| {
+        let view = r.view(a.side, [0, 0], game_idx as u32);
+        let mask = legal_mask(&view, r.foul_tried(a.side));
+        let Some(action) = encode_usi(&a.usi, a.side).filter(|&x| mask[x]) else {
+            e.outside_mask += 1;
+            return;
+        };
+        let start = e.obs.len();
+        e.obs.resize(start + OBS_LEN, 0.0);
+        encode_into(&view, r.log(a.side), r.foul_tried(a.side), &mut e.obs[start..]);
+        e.mask.extend_from_slice(&mask);
+        e.action.push(action as i64);
+        e.side.push(color_code(a.side));
+        e.value.push(match result {
+            GameResult::Win(c) if c == a.side => 1.0,
+            GameResult::Win(_) => -1.0,
+            GameResult::Draw => 0.0,
+        });
+        e.foul.push(a.foul);
+        e.game.push(game_idx as i32);
+    });
+    e
+}
+
+type BatchOut<'py> = (
+    Bound<'py, PyArray4<f32>>,
+    Bound<'py, PyArray2<bool>>,
+    Bound<'py, PyArray1<i64>>,
+    Bound<'py, PyArray1<i8>>,
+    Bound<'py, PyArray1<f32>>,
+    Bound<'py, PyArray1<bool>>,
+    Bound<'py, PyArray1<i32>>,
+);
+
+#[pymethods]
+impl RecordDataset {
+    #[new]
+    fn new(py: Python<'_>, paths: Vec<String>) -> Self {
+        use tsuitate_bot::rl::records::{
+            recorded_observations, replay, same_observations, verify_outcome,
+        };
+        let loaded: Vec<_> = py.detach(|| {
+            paths
+                .par_iter()
+                .map(|p| {
+                    let content = std::fs::read_to_string(p).map_err(|e| e.to_string())?;
+                    let (color, end) = tsuitate_bot::truth_replay::parse_bot_and_end(&content)
+                        .ok_or("match/end 行が無い")?;
+                    let mut n = 0usize;
+                    let r = replay(&end, |_, _| n += 1).map_err(|e| format!("{e:?}"))?;
+                    if !same_observations(r.log(color).events(), &recorded_observations(&content)) {
+                        return Err("再生した観測が記録と食い違う".to_string());
+                    }
+                    let result = verify_outcome(&end, &r).map_err(|e| format!("{e:?}"))?;
+                    Ok(LoadedGame {
+                        path: p.clone(),
+                        signature: game_signature(&end),
+                        end,
+                        result,
+                        attempts: n,
+                    })
+                })
+                .collect()
+        });
+        let mut ds = RecordDataset {
+            games: vec![],
+            skipped: vec![],
+        };
+        for (p, r) in paths.into_iter().zip(loaded) {
+            match r {
+                Ok(g) => ds.games.push(g),
+                Err(e) => ds.skipped.push((p, e)),
+            }
+        }
+        ds
+    }
+
+    #[getter]
+    fn num_games(&self) -> usize {
+        self.games.len()
+    }
+
+    /// 全局の試行数の合計（= 標本数の上限。マスク外の手があればその分少なくなる）
+    #[getter]
+    fn num_attempts(&self) -> usize {
+        self.games.iter().map(|g| g.attempts).sum()
+    }
+
+    /// 各局の試行数（学習率スケジュールの総更新数の計算用）
+    #[getter]
+    fn game_attempts(&self) -> Vec<usize> {
+        self.games.iter().map(|g| g.attempts).collect()
+    }
+
+    /// 各局の棋譜の署名（着手列＋反則試行列）。同じ署名の局は学習/検証の同じ側へ入れる
+    #[getter]
+    fn signatures(&self) -> Vec<String> {
+        self.games.iter().map(|g| g.signature.clone()).collect()
+    }
+
+    /// 読み込めなかった局の (パス, 理由)
+    #[getter]
+    fn skipped(&self) -> Vec<(String, String)> {
+        self.skipped.clone()
+    }
+
+    fn path(&self, game: usize) -> Option<String> {
+        self.games.get(game).map(|g| g.path.clone())
+    }
+
+    /// 指定した局の全試行を (観測, マスク, 教師の行動, 手番の色, 価値の教師, 反則だったか, 局番号)
+    /// で返す。価値の教師は手番側から見た終局の結果（勝ち +1 / 負け −1 / 引き分け 0）。
+    /// 教師の手がマスクの外にあった試行は落とす（数は `outside_mask` の戻り値で分かる）
+    fn encode_games<'py>(
+        &self,
+        py: Python<'py>,
+        games: Vec<usize>,
+    ) -> PyResult<(BatchOut<'py>, usize)> {
+        if let Some(&g) = games.iter().find(|&&g| g >= self.games.len()) {
+            return Err(PyValueError::new_err(format!("局番号 {g} は範囲外")));
+        }
+        let all = &self.games;
+        let parts: Vec<Encoded> = py.detach(|| {
+            games
+                .par_iter()
+                .map(|&g| encode_game(&all[g], g))
+                .collect()
+        });
+        let total: usize = parts.iter().map(|p| p.action.len()).sum();
+        let mut e = Encoded::default();
+        e.obs.reserve_exact(total * OBS_LEN);
+        e.mask.reserve_exact(total * NUM_ACTIONS);
+        for p in parts {
+            e.obs.extend(p.obs);
+            e.mask.extend(p.mask);
+            e.action.extend(p.action);
+            e.side.extend(p.side);
+            e.value.extend(p.value);
+            e.foul.extend(p.foul);
+            e.game.extend(p.game);
+            e.outside_mask += p.outside_mask;
+        }
+        let n = e.action.len();
+        Ok((
+            (
+                PyArray1::from_vec(py, e.obs).reshape([n, NUM_PLANES, 9, 9])?,
+                PyArray1::from_vec(py, e.mask).reshape([n, NUM_ACTIONS])?,
+                PyArray1::from_vec(py, e.action),
+                PyArray1::from_vec(py, e.side),
+                PyArray1::from_vec(py, e.value),
+                PyArray1::from_vec(py, e.foul),
+                PyArray1::from_vec(py, e.game),
+            ),
+            e.outside_mask,
+        ))
+    }
+}
+
 #[pymodule]
 fn tsuitate_rl(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<VecEnv>()?;
+    m.add_class::<RecordDataset>()?;
     m.add("NUM_ACTIONS", NUM_ACTIONS)?;
     m.add("NUM_PLANES", NUM_PLANES)?;
     Ok(())

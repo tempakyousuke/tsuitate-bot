@@ -389,7 +389,13 @@
   `(PlayerView, ObservationLog, foul_tried)` だけ**にしてあり、学習環境と推論が同じ関数を通る。
   `env.rs` = RL 環境の1局（自己対局・Rust 戦略を相手にする評価モード）。
   Python からは別 crate の `rl-env/`（PyO3、`tsuitate_rl.VecEnv`）で n 局を並列に回す。
-  本体の依存と CI を増やさないため別 crate で、ビルドは maturin（`rl-env/README.md`）
+  本体の依存と CI を増やさないため別 crate で、ビルドは maturin（`rl-env/README.md`）。
+  `records.rs` = 対局記録の真実を試行ごとに `Referee` へ流し直す（模倣学習の教師。
+  記録の勝敗も再生の裁定と照合する）。`policy_net.rs` = 方策・価値ネットの手書き推論
+  （学習は `~/Develop/tsuitate-nn/rnad/`、PyTorch との一致はフィクスチャ
+  `tests/fixtures/rl/tiny_policy.*` で常時検査）。`policy.rs` = 方策ネットで指す戦略で、
+  **戦略名に重みのパスを埋め込む**（`rl_policy:<パス>` はサンプリング、
+  `rl_policy_greedy:<パス>` は最大の手。記録上の名前は重みの sha256 入りの `rl_policy@<12桁>`）
 - `truth_replay.rs` — 対局記録の真実（game:end の全手順＋反則試行）から
   **両者の観測列**を再構成して決定点を1つずつ渡す共通部品。観測の作り方
   （順序・move_number 規約・王手宣言の両者通知）は selfplay.rs の審判と一致させること
