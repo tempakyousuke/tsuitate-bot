@@ -35,7 +35,8 @@ pub struct StyleStats {
     pub samples: u32,
     /// 自玉から距離2以内への打ち（受理）
     pub near_drops: [u32; 2],
-    /// 自玉から距離2以内への打ちの反則（打ったマスに相手の駒がいた＝相手の駒の検知）
+    /// 自玉から距離2以内への打ちの反則のうち、**打ったマスに相手の駒がいたもの**（＝相手の駒の検知）。
+    /// 王手を防がない打ち・打ち歩詰めなど、マスが空いていた反則は含めない
     pub near_drop_fouls: [u32; 2],
     /// 自玉から距離2以内での駒取り
     pub near_captures: [u32; 2],
@@ -207,8 +208,9 @@ impl EnvGame {
             None => None,
         };
         let is_drop = matches!(mv, Some(ShogiMove::Drop { .. }));
-        let captures = matches!(mv, Some(ShogiMove::Board { to, .. })
-            if pos.piece_at(to).is_some_and(|p| p.color != side));
+        // 行き先に相手の駒がいるか（真実の盤面で判定する。打ちなら必ず反則になり、それが検知）
+        let hits_opponent = target
+            .is_some_and(|t| pos.piece_at(t).is_some_and(|p| p.color != side));
         let near_king = matches!((king, target), (Some(k), Some(t)) if near(k, t, 2));
 
         let result = self.referee.step(usi, 0);
@@ -218,9 +220,10 @@ impl EnvGame {
             StepResult::Ended { move_accepted, .. } => move_accepted,
         };
         if near_king {
-            match (accepted, is_drop, captures) {
+            match (accepted, is_drop, hits_opponent) {
                 (true, true, _) => self.style.near_drops[i] += 1,
-                (false, true, _) => self.style.near_drop_fouls[i] += 1,
+                // 王手を防がない打ち・打ち歩詰めの反則は検知ではないので数えない
+                (false, true, true) => self.style.near_drop_fouls[i] += 1,
                 (true, false, true) => self.style.near_captures[i] += 1,
                 _ => {}
             }
@@ -422,6 +425,34 @@ mod tests {
             drops += s.near_drops.iter().sum::<u32>() + s.near_drop_fouls.iter().sum::<u32>();
         }
         assert!(drops > 0, "ランダム対局でも玉の近くへの打ちは起きる");
+    }
+
+    #[test]
+    fn 検知として数えるのは相手の駒がいたマスへの打ちの反則だけ() {
+        use crate::protocol::Role;
+        use crate::rl::action::encode_usi;
+        use crate::shogi::{Piece, Position};
+        let sq = |file, rank| Coord { file, rank };
+        let put = |pos: &mut Position, c, color, role| pos.set(c, Some(Piece { color, role }));
+        // 先手 5九玉が 1九の飛車で王手されている。6八に後手の銀
+        let mut pos = Position::empty(Color::Sente);
+        put(&mut pos, sq(5, 9), Color::Sente, Role::King);
+        put(&mut pos, sq(5, 1), Color::Gote, Role::King);
+        put(&mut pos, sq(1, 9), Color::Gote, Role::Rook);
+        put(&mut pos, sq(6, 8), Color::Gote, Role::Silver);
+        pos.set_hand(Color::Sente, Role::Pawn, 1);
+        let start = StartState { pos, logs: Default::default(), fouls: [0, 0], plies: 0 };
+        let mut game = EnvGame::selfplay(Some(start), 0);
+
+        // 王手を防がない空きマスへの打ち（反則だが検知ではない）
+        game.step(encode_usi("P*5h", Color::Sente).unwrap()).unwrap();
+        assert_eq!(game.referee().fouls(Color::Sente), 1);
+        assert_eq!(game.style().near_drop_fouls, [0, 0]);
+
+        // 後手の銀がいるマスへの打ち（検知）
+        game.step(encode_usi("P*6h", Color::Sente).unwrap()).unwrap();
+        assert_eq!(game.referee().fouls(Color::Sente), 2);
+        assert_eq!(game.style().near_drop_fouls, [1, 0]);
     }
 
     #[test]
