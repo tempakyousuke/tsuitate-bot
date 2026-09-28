@@ -31,6 +31,9 @@ obs, mask, player = env.observe()  # [n,86,9,9] f32 / [n,11259] bool / [n] i8（
 rewards, done = env.step(actions)  # [n] i64 → [n,2] f32（先手,後手）/ [n] bool
 env.learner_colors()               # 評価モードの学習側の色（自己対局は -1）
 env.pop_finished()                 # 終局した局: game_no / winner / reason / plies / fouls / learner
+                                   #   ＋玉の周りの集計: guard_r1 / guard_r2 / near_drops / near_drop_fouls / near_captures
+env = tsuitate_rl.VecEnv(64, opponent="rl_policy:<重み>", guard_bonus=0.5, guard_radius=1)
+                                   # 玉の周りの固めのボーナス（下記）
 ```
 
 - 終局した局は `step` の中で新しい局へ差し替わる（`done` の局の次の `observe` は新しい局）。
@@ -55,6 +58,12 @@ env.pop_finished()                 # 終局した局: game_no / winner / reason 
 - 相手の乱数は `seed` と局番号から決まる。heuristic は完全に再現する（同じ seed・同じ行動列 →
   同じ観測列）。estimator 系は壁時計で思考を打ち切るので、seed が同じでも完全には再現しない
 - 自駒視点の候補が1つも残らない手番は `no_moves` で負け
+- **`guard_bonus=λ`**（既定 0）: 終局の報酬に λ × 対局を通した玉の周りの占有率の平均を両者それぞれ
+  足す（防御特化モデル用。`docs/rl-deepnash-design.md` の「防御特化（玉の周りの固め）」）。
+  占有率 = 自玉から距離 `guard_radius`（1 = 8近傍 / 2）以内の盤上のマスのうち自駒がいる割合で、
+  開始局面と受理手の直後ごとに標本を取る。**λ > 0 では報酬が零和でなくなる**ので、評価モードで
+  学習側の列だけを使う形を想定している。`pop_finished()` の `guard_r1` / `guard_r2` は λ に
+  関係なく常に出る（監視用）
 
 ### 模倣学習のデータセット（M2a）
 

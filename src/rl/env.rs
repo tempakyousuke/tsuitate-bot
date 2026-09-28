@@ -9,12 +9,87 @@
 //! 並列化と numpy 変換は PyO3 側（`rl-env/`）が持つ。ここは Python に依存しないので
 //! `cargo test` で検査できる。
 
+use crate::board::Coord;
 use crate::protocol::Color;
 use crate::referee::{Referee, StepResult};
 use crate::rl::action::{NUM_ACTIONS, decode_usi, legal_mask};
 use crate::rl::encode::{OBS_LEN, encode_into};
 use crate::selfplay::{GameResult, StartState, fischer_initial_ms};
+use crate::shogi::{ShogiMove, parse_usi};
 use crate::strategy::Strategy;
+
+/// 玉の周りの集計の半径（チェビシェフ距離。1 = 8近傍、2 = 距離2以内の24マス）
+pub const GUARD_RADII: [i8; 2] = [1, 2];
+
+/// **玉の周りを固める戦法**の集計（docs/rl-deepnash-design.md の「防御特化（玉の周りの固め）」）。
+///
+/// スタイル特化モデルの報酬と監視に使う。自分の配置は完全既知の情報なので、どれも各側が
+/// 自分で数えられる量（報酬に使っても相手の情報は漏れない）。添字は `[先手, 後手]`、
+/// 半径の添字は `GUARD_RADII` の並び。
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct StyleStats {
+    /// 占有率（自玉の周りの盤上のマスのうち、玉以外の自駒がいる割合）の合計。
+    /// 開始局面と受理手の直後ごとに両者ぶん足す
+    pub guard_sum: [[f64; 2]; 2],
+    /// `guard_sum` の標本数
+    pub samples: u32,
+    /// 自玉から距離2以内への打ち（受理）
+    pub near_drops: [u32; 2],
+    /// 自玉から距離2以内への打ちの反則（打ったマスに相手の駒がいた＝相手の駒の検知）
+    pub near_drop_fouls: [u32; 2],
+    /// 自玉から距離2以内での駒取り
+    pub near_captures: [u32; 2],
+}
+
+impl StyleStats {
+    /// 対局を通した占有率の平均（`radius_idx` は `GUARD_RADII` の添字）。[先手, 後手]、∈ [0, 1]
+    pub fn guard_mean(&self, radius_idx: usize) -> [f64; 2] {
+        if self.samples == 0 {
+            return [0.0, 0.0];
+        }
+        let n = f64::from(self.samples);
+        [self.guard_sum[0][radius_idx] / n, self.guard_sum[1][radius_idx] / n]
+    }
+
+    fn sample(&mut self, referee: &Referee) {
+        for (i, color) in [Color::Sente, Color::Gote].into_iter().enumerate() {
+            for (r, &radius) in GUARD_RADII.iter().enumerate() {
+                self.guard_sum[i][r] += guard_fraction(referee, color, radius);
+            }
+        }
+        self.samples += 1;
+    }
+}
+
+/// `color` の玉から距離 `radius` 以内の盤上のマス（玉のマスを除く）のうち、玉以外の自駒が
+/// いる割合。盤端の玉はマス数が減るので割合で数える（端にいるだけで損をしないように）
+pub fn guard_fraction(referee: &Referee, color: Color, radius: i8) -> f64 {
+    let pos = referee.position();
+    let Some(k) = pos.king_square(color) else {
+        return 0.0;
+    };
+    let (mut squares, mut own) = (0u32, 0u32);
+    for df in -radius..=radius {
+        for dr in -radius..=radius {
+            if df == 0 && dr == 0 {
+                continue;
+            }
+            let c = Coord { file: k.file + df, rank: k.rank + dr };
+            if !crate::board::on_board(c) {
+                continue;
+            }
+            squares += 1;
+            if pos.piece_at(c).is_some_and(|p| p.color == color) {
+                own += 1;
+            }
+        }
+    }
+    if squares == 0 { 0.0 } else { f64::from(own) / f64::from(squares) }
+}
+
+fn near(a: Coord, b: Coord, radius: i8) -> bool {
+    (a.file - b.file).abs() <= radius && (a.rank - b.rank).abs() <= radius
+}
 
 /// 終局の記録
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +128,7 @@ pub struct EnvGame {
     /// 今の手番（学習側）のマスク。終局後は空
     mask: Vec<bool>,
     outcome: Option<Outcome>,
+    style: StyleStats,
 }
 
 impl EnvGame {
@@ -85,7 +161,9 @@ impl EnvGame {
             game_no,
             mask: vec![],
             outcome: None,
+            style: StyleStats::default(),
         };
+        game.style.sample(&game.referee);
         game.settle();
         game
     }
@@ -110,6 +188,47 @@ impl EnvGame {
 
     pub fn mask(&self) -> &[bool] {
         &self.mask
+    }
+
+    /// 玉の周りを固める戦法の集計（終局後も読める）
+    pub fn style(&self) -> &StyleStats {
+        &self.style
+    }
+
+    /// 審判へ1手渡し、玉の周りの集計を更新する（学習側・相手側の両方の手がここを通る）
+    fn play(&mut self, usi: &str) -> StepResult {
+        let side = self.referee.to_move();
+        let i = usize::from(side == Color::Gote);
+        let pos = self.referee.position();
+        let king = pos.king_square(side);
+        let mv = parse_usi(usi);
+        let target = match mv {
+            Some(ShogiMove::Board { to, .. }) | Some(ShogiMove::Drop { to, .. }) => Some(to),
+            None => None,
+        };
+        let is_drop = matches!(mv, Some(ShogiMove::Drop { .. }));
+        let captures = matches!(mv, Some(ShogiMove::Board { to, .. })
+            if pos.piece_at(to).is_some_and(|p| p.color != side));
+        let near_king = matches!((king, target), (Some(k), Some(t)) if near(k, t, 2));
+
+        let result = self.referee.step(usi, 0);
+        let accepted = match result {
+            StepResult::Accepted => true,
+            StepResult::Foul => false,
+            StepResult::Ended { move_accepted, .. } => move_accepted,
+        };
+        if near_king {
+            match (accepted, is_drop, captures) {
+                (true, true, _) => self.style.near_drops[i] += 1,
+                (false, true, _) => self.style.near_drop_fouls[i] += 1,
+                (true, false, true) => self.style.near_captures[i] += 1,
+                _ => {}
+            }
+        }
+        if accepted {
+            self.style.sample(&self.referee);
+        }
+        result
     }
 
     /// 今の手番の観測を書く（`obs` は長さ `OBS_LEN`）
@@ -137,7 +256,7 @@ impl EnvGame {
         self.check_action(action)?;
         let side = self.referee.to_move();
         let usi = decode_usi(action, side).ok_or(EnvError::MaskedAction(action))?;
-        if let StepResult::Ended { result, reason, .. } = self.referee.step(&usi, 0) {
+        if let StepResult::Ended { result, reason, .. } = self.play(&usi) {
             self.finish(result, reason);
         } else {
             self.settle();
@@ -170,7 +289,7 @@ impl EnvGame {
                 self.finish(GameResult::Win(side.other()), "resign");
                 return;
             };
-            if let StepResult::Ended { result, reason, .. } = self.referee.step(&usi, 0) {
+            if let StepResult::Ended { result, reason, .. } = self.play(&usi) {
                 self.finish(result, reason);
                 return;
             }
@@ -262,6 +381,55 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(5);
         play_random(&mut game, &mut rng);
         assert_eq!(game.step(0), Err(EnvError::GameOver));
+    }
+
+    #[test]
+    fn 初期局面の玉の周りの占有率() {
+        let game = EnvGame::selfplay(None, 0);
+        // 5九玉の8近傍で盤上は5マス、うち自駒は金2枚
+        assert_eq!(guard_fraction(game.referee(), Color::Sente, 1), 0.4);
+        assert_eq!(guard_fraction(game.referee(), Color::Gote, 1), 0.4);
+        let s = game.style();
+        assert_eq!(s.samples, 1);
+        assert_eq!(s.guard_mean(0), [0.4, 0.4]);
+    }
+
+    #[test]
+    fn 玉の周りの集計は受理手ごとに標本を取り値域に収まる() {
+        let mut rng = StdRng::seed_from_u64(6);
+        let mut drops = 0;
+        for g in 0..10 {
+            let mut game = EnvGame::selfplay(None, g);
+            let mut accepted = 0;
+            loop {
+                if game.outcome().is_some() {
+                    break;
+                }
+                let a = random_action(game.mask(), rng.random()).unwrap();
+                let before = game.referee().plies();
+                game.step(a).unwrap();
+                if game.referee().plies() > before {
+                    accepted += 1;
+                }
+            }
+            let s = game.style();
+            assert_eq!(s.samples, 1 + accepted, "開始局面＋受理手ごと");
+            for r in 0..GUARD_RADII.len() {
+                for v in s.guard_mean(r) {
+                    assert!((0.0..=1.0).contains(&v));
+                }
+            }
+            drops += s.near_drops.iter().sum::<u32>() + s.near_drop_fouls.iter().sum::<u32>();
+        }
+        assert!(drops > 0, "ランダム対局でも玉の近くへの打ちは起きる");
+    }
+
+    #[test]
+    fn 評価モードでは相手の手も集計に入る() {
+        let opp = crate::strategy::make("heuristic").unwrap();
+        // 学習側が後手なら、構築時に相手（先手）の初手が指されて標本が2つになる
+        let game = EnvGame::versus(None, Color::Gote, opp, 0);
+        assert_eq!(game.style().samples, 2);
     }
 
     #[test]
