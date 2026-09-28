@@ -22,11 +22,16 @@ set -euo pipefail
 SERVICE="$1"
 TRAIN_ARGS="$2"
 AUTO_POWEROFF="${AUTO_POWEROFF:-1}"
+# 完走したら印を残し、以後の起動では走らせない（ConditionPathExists）。印が無いと、結果を
+# 回収しようと VM を起こしたとき「完走済み → 即終了 → 自動停止」で落ちて SSH できない
+# （2026-09-28 に実際に起きた。L4 の在庫切れと重なり、ディスクのスナップショット経由で回収した）
+DONE_MARK="$HOME/.rnad-${SERVICE}.done"
+rm -f "$DONE_MARK"
 if [ "$AUTO_POWEROFF" = "1" ]; then
   # 完走（終了コード 0）のときだけ停止する。失敗は Restart=on-failure で起こし直す
-  EXEC_START="/bin/bash -c '$HOME/tsuitate-nn/.venv/bin/python rnad/train_rnad.py ${TRAIN_ARGS} && sudo /sbin/poweroff'"
+  EXEC_START="/bin/bash -c '$HOME/tsuitate-nn/.venv/bin/python rnad/train_rnad.py ${TRAIN_ARGS} && touch ${DONE_MARK} && sudo /sbin/poweroff'"
 else
-  EXEC_START="$HOME/tsuitate-nn/.venv/bin/python rnad/train_rnad.py ${TRAIN_ARGS}"
+  EXEC_START="/bin/bash -c '$HOME/tsuitate-nn/.venv/bin/python rnad/train_rnad.py ${TRAIN_ARGS} && touch ${DONE_MARK}'"
 fi
 
 nvidia-smi > /dev/null || { echo "nvidia-smi が通らない（GPU ドライバ未導入）" >&2; exit 1; }
@@ -63,6 +68,7 @@ sudo tee "/etc/systemd/system/${SERVICE}.service" > /dev/null <<EOF
 [Unit]
 Description=tsuitate R-NaD ${SERVICE}
 After=network.target
+ConditionPathExists=!${DONE_MARK}
 
 [Service]
 Type=simple
