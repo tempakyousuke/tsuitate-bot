@@ -24,9 +24,15 @@ TRAIN_ARGS="$2"
 AUTO_POWEROFF="${AUTO_POWEROFF:-1}"
 # 完走したら印を残し、以後の起動では走らせない（ConditionPathExists）。印が無いと、結果を
 # 回収しようと VM を起こしたとき「完走済み → 即終了 → 自動停止」で落ちて SSH できない
-# （2026-09-28 に実際に起きた。L4 の在庫切れと重なり、ディスクのスナップショット経由で回収した）
-DONE_MARK="$HOME/.rnad-${SERVICE}.done"
-rm -f "$DONE_MARK"
+# （2026-09-28 に実際に起きた。L4 の在庫切れと重なり、ディスクのスナップショット経由で回収した）。
+# **印は学習の引数ごと**に持つ: 同じ引数で setup をやり直しても完走済みなら走らせず、
+# 引数を変えれば（--steps を増やして続ける等）新しい印なので走る
+ARGS_ID=$(printf '%s' "$TRAIN_ARGS" | sha256sum | cut -c1-12)
+DONE_MARK="$HOME/.rnad-${SERVICE}-${ARGS_ID}.done"
+
+# 動いている旧サービスはファイルを置き換える前に止める（置き換え中に旧版が完走すると、
+# 旧版が印を作ったり AUTO_POWEROFF で VM ごと落としたりする）
+sudo systemctl stop "${SERVICE}.service" 2>/dev/null || true
 if [ "$AUTO_POWEROFF" = "1" ]; then
   # 完走（終了コード 0）のときだけ停止する。失敗は Restart=on-failure で起こし直す
   EXEC_START="/bin/bash -c '$HOME/tsuitate-nn/.venv/bin/python rnad/train_rnad.py ${TRAIN_ARGS} && touch ${DONE_MARK} && sudo /sbin/poweroff'"
@@ -84,5 +90,9 @@ WantedBy=multi-user.target
 EOF
 sudo systemctl daemon-reload
 sudo systemctl enable "${SERVICE}.service"
-sudo systemctl restart "${SERVICE}.service"
+if [ -f "$DONE_MARK" ]; then
+  echo "この引数の学習は完走済み（${DONE_MARK}）なので走らせない。続けるなら --steps などを変える"
+else
+  sudo systemctl restart "${SERVICE}.service"
+fi
 echo "SETUP_DONE ${SERVICE}"
