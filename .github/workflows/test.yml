@@ -73,7 +73,8 @@ jobs:
       - name: NN forward pass speed (release)
         run: cargo test --release --locked --lib forward_pass_is_fast_enough_for_hot_loop
 
-      # 凍結版 rl_v15 が元の重みと一手ずつ同じ手を指すこと（debug では推論が重いので
-      # `#[cfg_attr(debug_assertions, ignore)]`。上のステップのビルドを使い回す。実測 約7秒）
-      - name: Frozen rl_v15 identity (release)
-        run: cargo test --release --locked --lib rl_v15は元の重みと同じ手を指す
+      # 方策ネットの凍結版 rl_vN が元の重みと一手ずつ同じ手を指すこと（debug では推論が
+      # 重いので `#[cfg_attr(debug_assertions, ignore)]`。上のステップのビルドを使い回す。
+      # 実測 1版あたり約7秒）
+      - name: Frozen rl_vN identity (release)
+        run: cargo test --release --locked --lib rl凍結版は元の重みと同じ手を指す
