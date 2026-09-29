@@ -496,4 +496,44 @@ mod tests {
         assert!(!v14.contains(&"TSUITATE_JOSEKI".to_string()));
         assert!(env_keys_in_source("estimator_v6").len() < v14.len());
     }
+
+    /// rl_v15 は元の重み（`rl_policy:models/rl_v15.bin`）と**同じ seed なら同じ手を指す**。
+    /// 審判で数局を進め、手番ごとに両者へ同じ入力を渡して一手ずつ突き合わせる
+    /// （arena 100局の 50%±10 より強い同一性の担保）。debug の推論は1回 約0.1秒と重い
+    /// （3局で約4分）ので release 専用で、CI は test.yml の release ステップで回す
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release 専用（debug では推論が重い）")]
+    fn rl_v15は元の重みと同じ手を指す() {
+        use crate::protocol::Color;
+        use crate::referee::{Referee, StepResult};
+        use crate::strategy::Strategy;
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/models/rl_v15.bin");
+        let name = format!("rl_policy:{path}");
+        for game in 0..3u64 {
+            let mut frozen = [
+                rl_v15::RlV15::with_seed(game),
+                rl_v15::RlV15::with_seed(game + 100),
+            ];
+            let mut orig = [
+                crate::rl::policy::RlPolicy::from_name(&name, Some(game)).unwrap(),
+                crate::rl::policy::RlPolicy::from_name(&name, Some(game + 100)).unwrap(),
+            ];
+            let mut referee = Referee::new();
+            let mut steps = 0;
+            while referee.ended().is_none() && steps < 400 {
+                let c = referee.to_move();
+                let i = if c == Color::Sente { 0 } else { 1 };
+                let view = referee.view(c, [300_000, 300_000], 0);
+                let a = frozen[i].choose(&view, referee.log(c), referee.foul_tried(c));
+                let b = orig[i].choose(&view, referee.log(c), referee.foul_tried(c));
+                assert_eq!(a, b, "局 {game} の {steps} 試行目で食い違った");
+                let Some(usi) = a else { break };
+                if let StepResult::Ended { .. } = referee.step(&usi, 10) {
+                    break;
+                }
+                steps += 1;
+            }
+            assert!(steps > 20, "局 {game} が短すぎる（{steps} 試行）");
+        }
+    }
 }
