@@ -31,6 +31,12 @@ mod play;
 /// ランキング（内訳表示）は last_ranking を実装した現行 estimator だけ
 const ENGINES: &[&str] = &[
     "estimator",
+    "rl_v16",
+    "rl_v15",
+    "estimator_v14",
+    "estimator_v13",
+    "estimator_v12",
+    "estimator_v11",
     "estimator_v10",
     "estimator_v9",
     "estimator_v8",
