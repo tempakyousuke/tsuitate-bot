@@ -42,7 +42,7 @@
 - `cargo test --release -- --ignored` — 遅い検証（shogi.rs の perft depth 4/5）
 - `cargo run --release --bin arena -- [対局数] [候補] [基準1] [基準2] ...` — 戦略同士の対戦。
   基準を複数並べるとガントレット。**戦略の変更は必ずこれで凍結版ガントレットに
-  有意に勝ち越すことを確認する**（既定の対象は v9 以降）。
+  有意に勝ち越すことを確認する**（既定の対象は v9〜v14 と rl_v15）。
   **実行はローカルでなく GitHub Actions**（`.github/workflows/arena.yml`。
   **通常のコード push では走らない**）:
   `gh workflow run arena.yml --ref <ブランチ> -f games=100 -f candidate=estimator -f baselines="estimator_v13 estimator_v14"`、
@@ -658,13 +658,24 @@
   足した変更で、**凍結版の挙動は変わらない**（読み取り規則とフォールバックは
   文字どおり同じ・`preload` を呼ぶのは `bin/export_eval_rank_data` だけ）ため
   基準の再計測はしていない。
+  **2026-09-29（rl_v15 凍結）に `src/model.rs` の pin を新設**した。rl_v15 が観測の
+  テンソル化で使うためだが、estimator の v6〜v14 も `crate::model::` を呼んでいたので、
+  **v6〜v14 の `behavior_fingerprint` もこの時点で変わる**（model.rs 自体は無変更 =
+  挙動は不変。指紋は pin の一覧から作るため）。checkpoint arena は同じ実行内でしか
+  指紋を比べないので実害はない。なお rl_v15 もルールエンジン（`board.rs` / `shogi.rs`）と
+  観測（`observation.rs`）は estimator の凍結版と同じく**共有のまま pin していない**。
   `versions_using(module)` / `env_keys_read_by(name)`（共有モジュール経由の env 込み）/
   `behavior_fingerprint(name, env)`（版・env・共有 pin から作る実効挙動の指紋）で
   機械可読に取れる。
   v9〜v11 は NN の重みを凍結ファイルへコピーしているので影響しない。
   **v15 以降は実行時 env を読まない**（`HERMETIC_FROM`）。
   **各版の内容と凍結時の成績は `docs/frozen-versions.md`**（現行の最新は
-  `estimator_v14`、2026-08-19 凍結）。
+  **方策ネットの `rl_v15`**（R-NaD 10,000更新、2026-09-29 凍結）、estimator 系の最新は
+  `estimator_v14`（2026-08-19 凍結））。方策ネットの凍結は
+  `python3 scripts/freeze_rl.py <N> <日付> "<要約>" models/rl_vN.bin > src/frozen/rl_vN.rs`
+  （推論の一式を固定コピー・重みを埋め込み。共有のまま使う `src/model.rs` は
+  `SHARED_MODEL_PINS` で pin。同一性確認は元の重みの `rl_policy:release:...` vs `rl_vN`）。
+  estimator 系の手順は以下。
   凍結後は編集しない。改善が確定したら
   `python3 scripts/freeze_estimator.py <N> <日付> "<差分の要約>" > src/frozen/estimator_vN.rs`
   で生成し（estimator.rs/check.rs/strategy.rs を1ファイルへまとめ、テストと
@@ -732,7 +743,7 @@ opp_move / value の教師データを再生成する（教師データの鮮度
   （observation.rs にない情報を使わない、という公平性の担保はこの構造で守る）
 - **比較の基準は heuristic ではなく凍結版**。heuristic への勝率は飽和していて
   改善の検出力がない。また非推移性（v2 に勝つが v1 に負ける）を検出するため、
-  **ガントレットで凍結版に勝ち越すことを合格条件とする**（既定の対象は v9 以降）
+  **ガントレットで凍結版に勝ち越すことを合格条件とする**（既定の対象は v9〜v14 と rl_v15）
 - 同一戦略同士は約50%になる（1000局で確認済み）。**同一コードでも 100 局では
   44% まで振れる**ので、版の比較は必ず `match_seed` でペアにする
 - 時間切れは負けとして数え、思考時間の統計（平均/p99/最大）も出す。

@@ -361,18 +361,27 @@
 
 DeepNash 路線の自己対局学習（`docs/rl-deepnash-design.md`）は別の GPU VM で回す。
 
-- **VM**: `tsuitate-rl`（`tsuitate-solver` / `asia-northeast1-b` / `g2-standard-8` ＋ NVIDIA L4 1枚 /
-  **Spot**・停止時は STOP / イメージ `common-cu129-ubuntu-2404-nvidia-580`）。
-  2026-09-28 の単価で **Spot 約 $0.66/時**（L4 $0.430 ＋ 8vCPU・32GB $0.226）、通常なら約 $1.10/時。
+- **VM**: `tsuitate-rl2`（`tsuitate-solver` / `asia-northeast1-c` / `g2-standard-8` ＋ NVIDIA L4 1枚 /
+  **通常料金（オンデマンド）** / イメージ `common-cu129-ubuntu-2404-nvidia-580`）。
+  2026-09-28 の単価で **通常 約 $1.10/時**、Spot なら約 $0.66/時（L4 $0.430 ＋ 8vCPU・32GB $0.226）。
+  最初は Spot の `tsuitate-rl`（asia-northeast1-b）で回したが、**Tokyo の3ゾーンすべてで L4 の Spot が
+  在庫切れになり起動できなくなった**（通常料金でも b と a は在庫切れ、c だけ空いていた）ので、
+  ディスクのスナップショットから c に通常料金で作り直した（旧 VM は 2026-09-29 に削除）。
   プロジェクトの `GPUS_ALL_REGIONS` は 2026-09-28 に 0 → 1 へ申請・承認済み（2枚目を使うなら再申請）
 - **コード転送**: `tsuitate-bot` の tar（上と同じ作り方。`rl-env/target` も除く）と、
   `tar czf /tmp/tsuitate-nn-rnad.tar.gz -C ~/Develop/tsuitate-nn --exclude __pycache__ rnad out_rnad/bc/checkpoint.pt`
   を `scripts/gce/setup-rnad.sh` と一緒に `/tmp/` へ送り、
   `bash /tmp/setup-rnad.sh rnad '<train_rnad.py の引数>'` を実行（Rust・PyTorch の CUDA 版・
   `tsuitate_rl` のビルド → 参照実装との一致テスト → systemd 常駐まで自動）
+- **VM を再起動すると `/tmp` は消える**ので、setup をやり直すときは2つの tar と setup-rnad.sh を送り直す
 - **完走したら VM が自分で停止する**（`AUTO_POWEROFF=1` が既定。GPU の課金を放置で積まない）。
-  Spot で止められたら `instances start` するだけで、`--checkpoint-every` ごとの checkpoint から再開する
-- **進捗確認**: `gcloud compute ssh tsuitate-rl ... --command "journalctl -u rnad --no-pager -o cat | tail"`
+  完了の印は学習の引数ごとに残るので、回収のために起動しても学習は再実行されない。
+  続きを回すときは `--steps` を増やした引数で setup をやり直す（新しい印になるので走り、
+  同じ `--out` の checkpoint から再開する）。Spot で止められたら `instances start` するだけ
+- **L4 の在庫切れ**: G2 は L4 を外せず機種も変えられないので、起動できないときは VM のディスクに
+  触れない。回収だけならスナップショット → ディスク → 一時 VM に読み取り専用でつなぐ。
+  別ゾーンで回すならスナップショットから `--create-disk boot=yes,source-snapshot=...` で作り直す
+- **進捗確認**: `gcloud compute ssh tsuitate-rl2 --zone asia-northeast1-c --command "journalctl -u rnad --no-pager -o cat | tail"`
 - **回収**: `gcloud compute scp` で `~/tsuitate-nn/out_rnad/<out>/`（`log.jsonl`・`checkpoint.pt`・
   `policy_<step>.bin`）を手元へ。重みを arena で測るときは Release に置く（`rl_policy:release:...`）
 - **実測**（2026-09-28、256局/更新）: 自己対局 約3秒＋学習 約4.5秒 = 1更新 約7.5秒・約4,000標本/秒
