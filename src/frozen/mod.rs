@@ -24,6 +24,7 @@ pub mod estimator_v13;
 pub mod estimator_v14;
 /// v15 以降は方策ネット（DeepNash 路線）。推論の一式を固定コピーで持つ（`scripts/freeze_rl.py`）
 pub mod rl_v15;
+pub mod rl_v16;
 
 /// **hermetic 規約を適用する最初の版**（issue #21）。
 ///
@@ -47,6 +48,7 @@ pub const SOURCES: &[(u32, &str, &str)] = &[
     (13, "estimator_v13", include_str!("estimator_v13.rs")),
     (14, "estimator_v14", include_str!("estimator_v14.rs")),
     (15, "rl_v15", include_str!("rl_v15.rs")),
+    (16, "rl_v16", include_str!("rl_v16.rs")),
 ];
 
 /// 凍結版 `name` が**自分のファイルの中で**読む `TSUITATE_*` の一覧。
@@ -346,7 +348,9 @@ mod tests {
         assert_eq!(versions_using("king_belief_nn"), vec!["estimator_v14"]);
         // 自駒の再構成は estimator の凍結版も rl_v15 も使う（v15 の凍結で pin に加えた）
         let model_users = versions_using("model");
-        assert!(model_users.contains(&"rl_v15") && model_users.contains(&"estimator_v14"));
+        for name in ["rl_v15", "rl_v16", "estimator_v14"] {
+            assert!(model_users.contains(&name), "{name}");
+        }
         // v9〜v11 は NN の重みを自分のファイルへコピーしているので影響しない
         assert!(versions_using("opp_move_nn").is_empty());
         for pinned in ["opp_move_nn_v25", "value_nn_v22"] {
@@ -497,43 +501,52 @@ mod tests {
         assert!(env_keys_in_source("estimator_v6").len() < v14.len());
     }
 
-    /// rl_v15 は元の重み（`rl_policy:models/rl_v15.bin`）と**同じ seed なら同じ手を指す**。
+    /// 方策ネットの凍結版 `rl_vN` は元の重み（`rl_policy:models/rl_vN.bin`）と
+    /// **同じ seed なら同じ手を指す**（`SOURCES` の rl_ 版を全部検査する）。
     /// 審判で数局を進め、手番ごとに両者へ同じ入力を渡して一手ずつ突き合わせる
     /// （arena 100局の 50%±10 より強い同一性の担保）。debug の推論は1回 約0.1秒と重い
-    /// （3局で約4分）ので release 専用で、CI は test.yml の release ステップで回す
+    /// （1版3局で約4分）ので release 専用で、CI は test.yml の release ステップで回す
     #[test]
     #[cfg_attr(debug_assertions, ignore = "release 専用（debug では推論が重い）")]
-    fn rl_v15は元の重みと同じ手を指す() {
+    fn rl凍結版は元の重みと同じ手を指す() {
         use crate::protocol::Color;
         use crate::referee::{Referee, StepResult};
         use crate::strategy::Strategy;
-        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/models/rl_v15.bin");
-        let name = format!("rl_policy:{path}");
-        for game in 0..3u64 {
-            let mut frozen = [
-                rl_v15::RlV15::with_seed(game),
-                rl_v15::RlV15::with_seed(game + 100),
-            ];
-            let mut orig = [
-                crate::rl::policy::RlPolicy::from_name(&name, Some(game)).unwrap(),
-                crate::rl::policy::RlPolicy::from_name(&name, Some(game + 100)).unwrap(),
-            ];
-            let mut referee = Referee::new();
-            let mut steps = 0;
-            while referee.ended().is_none() && steps < 400 {
-                let c = referee.to_move();
-                let i = if c == Color::Sente { 0 } else { 1 };
-                let view = referee.view(c, [300_000, 300_000], 0);
-                let a = frozen[i].choose(&view, referee.log(c), referee.foul_tried(c));
-                let b = orig[i].choose(&view, referee.log(c), referee.foul_tried(c));
-                assert_eq!(a, b, "局 {game} の {steps} 試行目で食い違った");
-                let Some(usi) = a else { break };
-                if let StepResult::Ended { .. } = referee.step(&usi, 10) {
-                    break;
+        let rl_versions: Vec<&str> = SOURCES
+            .iter()
+            .map(|(_, name, _)| *name)
+            .filter(|name| name.starts_with("rl_v"))
+            .collect();
+        assert!(rl_versions.contains(&"rl_v16"), "{rl_versions:?}");
+        for version in rl_versions {
+            let path = format!("{}/models/{version}.bin", env!("CARGO_MANIFEST_DIR"));
+            let name = format!("rl_policy:{path}");
+            for game in 0..3u64 {
+                let mut frozen = [
+                    crate::strategy::make_seeded(version, game).unwrap(),
+                    crate::strategy::make_seeded(version, game + 100).unwrap(),
+                ];
+                let mut orig = [
+                    crate::rl::policy::RlPolicy::from_name(&name, Some(game)).unwrap(),
+                    crate::rl::policy::RlPolicy::from_name(&name, Some(game + 100)).unwrap(),
+                ];
+                let mut referee = Referee::new();
+                let mut steps = 0;
+                while referee.ended().is_none() && steps < 400 {
+                    let c = referee.to_move();
+                    let i = if c == Color::Sente { 0 } else { 1 };
+                    let view = referee.view(c, [300_000, 300_000], 0);
+                    let a = frozen[i].choose(&view, referee.log(c), referee.foul_tried(c));
+                    let b = orig[i].choose(&view, referee.log(c), referee.foul_tried(c));
+                    assert_eq!(a, b, "{version} 局 {game} の {steps} 試行目で食い違った");
+                    let Some(usi) = a else { break };
+                    if let StepResult::Ended { .. } = referee.step(&usi, 10) {
+                        break;
+                    }
+                    steps += 1;
                 }
-                steps += 1;
+                assert!(steps > 20, "{version} 局 {game} が短すぎる（{steps} 試行）");
             }
-            assert!(steps > 20, "局 {game} が短すぎる（{steps} 試行）");
         }
     }
 }

@@ -42,7 +42,7 @@
 - `cargo test --release -- --ignored` — 遅い検証（shogi.rs の perft depth 4/5）
 - `cargo run --release --bin arena -- [対局数] [候補] [基準1] [基準2] ...` — 戦略同士の対戦。
   基準を複数並べるとガントレット。**戦略の変更は必ずこれで凍結版ガントレットに
-  有意に勝ち越すことを確認する**（既定の対象は v9〜v14 と rl_v15）。
+  有意に勝ち越すことを確認する**（既定の対象は rl_v15 以降の方策ネット＋歩哨の estimator_v14。v9〜v13 は 2026-09-30 に既定から外した＝方策ネットが全版に大差で勝ち越し、判別力がないため）。
   **実行はローカルでなく GitHub Actions**（`.github/workflows/arena.yml`。
   **通常のコード push では走らない**）:
   `gh workflow run arena.yml --ref <ブランチ> -f games=100 -f candidate=estimator -f baselines="estimator_v13 estimator_v14"`、
@@ -670,11 +670,18 @@
   v9〜v11 は NN の重みを凍結ファイルへコピーしているので影響しない。
   **v15 以降は実行時 env を読まない**（`HERMETIC_FROM`）。
   **各版の内容と凍結時の成績は `docs/frozen-versions.md`**（現行の最新は
-  **方策ネットの `rl_v15`**（R-NaD 10,000更新、2026-09-29 凍結）、estimator 系の最新は
+  **方策ネットの `rl_v16`**（R-NaD 15,000更新、2026-09-30 凍結）、estimator 系の最新は
   `estimator_v14`（2026-08-19 凍結））。方策ネットの凍結は
   `python3 scripts/freeze_rl.py <N> <日付> "<要約>" models/rl_vN.bin > src/frozen/rl_vN.rs`
   （推論の一式を固定コピー・重みを埋め込み。共有のまま使う `src/model.rs` は
-  `SHARED_MODEL_PINS` で pin。同一性確認は元の重みの `rl_policy:release:...` vs `rl_vN`）。
+  `SHARED_MODEL_PINS` で pin。同一性確認は `frozen::tests::rl凍結版は元の重みと同じ手を指す`
+  が `SOURCES` の rl_ 版を全部一手ずつ突き合わせる＝登録するだけで検査される）。
+  登録は `frozen/mod.rs`（`pub mod` と `SOURCES`）・`strategy::make`/`make_seeded`・
+  arena.yml の baselines 既定値（2か所）。
+  **ガントレットの既定は rl_v15 以降＋歩哨の `estimator_v14`**（2026-09-30 ユーザー判断）。
+  v14 を残すのは非推移性の検出のため: 15,000更新は rl_v15 に 71% と大きく伸びたのに
+  v9〜v14 へのペア差は −1.0pt±4.7 で横ばいだった（自己対局の系列は自分の過去版に
+  特化しうる）。v14 は詰みで終わる局が多く、反則負けが主の v9〜v12 と違う相手になる。
   estimator 系の手順は以下。
   凍結後は編集しない。改善が確定したら
   `python3 scripts/freeze_estimator.py <N> <日付> "<差分の要約>" > src/frozen/estimator_vN.rs`
@@ -743,7 +750,7 @@ opp_move / value の教師データを再生成する（教師データの鮮度
   （observation.rs にない情報を使わない、という公平性の担保はこの構造で守る）
 - **比較の基準は heuristic ではなく凍結版**。heuristic への勝率は飽和していて
   改善の検出力がない。また非推移性（v2 に勝つが v1 に負ける）を検出するため、
-  **ガントレットで凍結版に勝ち越すことを合格条件とする**（既定の対象は v9〜v14 と rl_v15）
+  **ガントレットで凍結版に勝ち越すことを合格条件とする**（既定の対象は rl_v15 以降の方策ネット＋歩哨の estimator_v14。v9〜v13 は 2026-09-30 に既定から外した＝方策ネットが全版に大差で勝ち越し、判別力がないため）
 - 同一戦略同士は約50%になる（1000局で確認済み）。**同一コードでも 100 局では
   44% まで振れる**ので、版の比較は必ず `match_seed` でペアにする
 - 時間切れは負けとして数え、思考時間の統計（平均/p99/最大）も出す。
