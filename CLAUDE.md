@@ -658,6 +658,12 @@
   足した変更で、**凍結版の挙動は変わらない**（読み取り規則とフォールバックは
   文字どおり同じ・`preload` を呼ぶのは `bin/export_eval_rank_data` だけ）ため
   基準の再計測はしていない。
+  **2026-09-29（rl_v15 凍結）に `src/model.rs` の pin を新設**した。rl_v15 が観測の
+  テンソル化で使うためだが、estimator の v6〜v14 も `crate::model::` を呼んでいたので、
+  **v6〜v14 の `behavior_fingerprint` もこの時点で変わる**（model.rs 自体は無変更 =
+  挙動は不変。指紋は pin の一覧から作るため）。checkpoint arena は同じ実行内でしか
+  指紋を比べないので実害はない。なお rl_v15 もルールエンジン（`board.rs` / `shogi.rs`）と
+  観測（`observation.rs`）は estimator の凍結版と同じく**共有のまま pin していない**。
   `versions_using(module)` / `env_keys_read_by(name)`（共有モジュール経由の env 込み）/
   `behavior_fingerprint(name, env)`（版・env・共有 pin から作る実効挙動の指紋）で
   機械可読に取れる。
