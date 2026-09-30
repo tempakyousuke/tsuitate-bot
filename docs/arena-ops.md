@@ -374,6 +374,13 @@ DeepNash 路線の自己対局学習（`docs/rl-deepnash-design.md`）は別の 
   `bash /tmp/setup-rnad.sh rnad '<train_rnad.py の引数>'` を実行（Rust・PyTorch の CUDA 版・
   `tsuitate_rl` のビルド → 参照実装との一致テスト → systemd 常駐まで自動）
 - **VM を再起動すると `/tmp` は消える**ので、setup をやり直すときは2つの tar と setup-rnad.sh を送り直す
+- **カーネルの自動更新で GPU を失う**: unattended-upgrades がカーネルを上げると、再起動後に
+  NVIDIA のビルド済みモジュール（`linux-modules-nvidia-580-server-open-<カーネル>`）が無く
+  `nvidia-smi` が通らない（2026-09-30 に 7.0.0-1011 → 1013 で実際に起きた）。
+  `sudo apt-get install linux-modules-nvidia-580-server-open-$(uname -r) linux-modules-nvidia-580-server-open-gcp`
+  → `sudo modprobe nvidia` で直る。以後は `apt-mark hold linux-image-gcp linux-headers-gcp linux-gcp
+  linux-modules-nvidia-580-server-open-gcp` でカーネルを固定してある（上げるときは hold を外して
+  モジュールと一緒に上げる）
 - **完走したら VM が自分で停止する**（`AUTO_POWEROFF=1` が既定。GPU の課金を放置で積まない）。
   完了の印は学習の引数ごとに残るので、回収のために起動しても学習は再実行されない。
   続きを回すときは `--steps` を増やした引数で setup をやり直す（新しい印になるので走り、

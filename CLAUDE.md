@@ -670,7 +670,7 @@
   v9〜v11 は NN の重みを凍結ファイルへコピーしているので影響しない。
   **v15 以降は実行時 env を読まない**（`HERMETIC_FROM`）。
   **各版の内容と凍結時の成績は `docs/frozen-versions.md`**（現行の最新は
-  **方策ネットの `rl_v16`**（R-NaD 15,000更新、2026-09-30 凍結）、estimator 系の最新は
+  **方策ネットの `rl_v17`**（R-NaD 20,000更新、2026-09-30 凍結）、estimator 系の最新は
   `estimator_v14`（2026-08-19 凍結））。方策ネットの凍結は
   `python3 scripts/freeze_rl.py <N> <日付> "<要約>" models/rl_vN.bin > src/frozen/rl_vN.rs`
   （推論の一式を固定コピー・重みを埋め込み。共有のまま使う `src/model.rs` は
