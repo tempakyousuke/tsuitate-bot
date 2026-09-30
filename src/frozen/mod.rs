@@ -25,6 +25,7 @@ pub mod estimator_v14;
 /// v15 以降は方策ネット（DeepNash 路線）。推論の一式を固定コピーで持つ（`scripts/freeze_rl.py`）
 pub mod rl_v15;
 pub mod rl_v16;
+pub mod rl_v17;
 
 /// **hermetic 規約を適用する最初の版**（issue #21）。
 ///
@@ -49,6 +50,7 @@ pub const SOURCES: &[(u32, &str, &str)] = &[
     (14, "estimator_v14", include_str!("estimator_v14.rs")),
     (15, "rl_v15", include_str!("rl_v15.rs")),
     (16, "rl_v16", include_str!("rl_v16.rs")),
+    (17, "rl_v17", include_str!("rl_v17.rs")),
 ];
 
 /// 凍結版 `name` が**自分のファイルの中で**読む `TSUITATE_*` の一覧。
@@ -348,7 +350,7 @@ mod tests {
         assert_eq!(versions_using("king_belief_nn"), vec!["estimator_v14"]);
         // 自駒の再構成は estimator の凍結版も rl_v15 も使う（v15 の凍結で pin に加えた）
         let model_users = versions_using("model");
-        for name in ["rl_v15", "rl_v16", "estimator_v14"] {
+        for name in ["rl_v15", "rl_v16", "rl_v17", "estimator_v14"] {
             assert!(model_users.contains(&name), "{name}");
         }
         // v9〜v11 は NN の重みを自分のファイルへコピーしているので影響しない
@@ -517,7 +519,7 @@ mod tests {
             .map(|(_, name, _)| *name)
             .filter(|name| name.starts_with("rl_v"))
             .collect();
-        assert!(rl_versions.contains(&"rl_v16"), "{rl_versions:?}");
+        assert!(rl_versions.contains(&"rl_v17"), "{rl_versions:?}");
         for version in rl_versions {
             let path = format!("{}/models/{version}.bin", env!("CARGO_MANIFEST_DIR"));
             let name = format!("rl_policy:{path}");
