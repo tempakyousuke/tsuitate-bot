@@ -392,6 +392,8 @@ DeepNash 路線の自己対局学習（`docs/rl-deepnash-design.md`）は別の 
 - **回収**: `gcloud compute scp` で `~/tsuitate-nn/out_rnad/<out>/`（`log.jsonl`・`checkpoint.pt`・
   `policy_<step>.bin`）を手元へ。重みを arena で測るときは Release に置く（`rl_policy:release:...`）
 - **実測**（2026-09-28、256局/更新）: 自己対局 約3秒＋学習 約4.5秒 = 1更新 約7.5秒・約4,000標本/秒
-  （手元の Mac の約4倍）。行動のサンプリングを CPU でやると自己対局が 15秒になり律速になる
+  （手元の Mac の約4倍）。行動のサンプリングを CPU でやると自己対局が 15秒になり律速になる。
+  2026-10-01（30,000更新付近）は自己対局 約3.0秒＋学習 約3.7秒。`--precision tf32` は既定と同じ速さ
+  （畳み込みは既定で TF32）。bf16 なら学習が約2.4秒になるが数値のずれがある（`docs/rl-deepnash-design.md` の7回目）
   （`rnad.sample_actions` はデバイス上の Gumbel-max でサンプリングする）
 
