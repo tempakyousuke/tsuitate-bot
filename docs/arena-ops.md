@@ -211,7 +211,17 @@
     無いと `Var(delta)=0.5` の仮定に乗ったままで、**同じ実行が
     `--known-arena-delta` に渡す既知値にもなる**。CI では `arena.yml` の
     `-f pair_with=<対照のArena実行ID>` が候補側 run の中でこれを回す。
-    ガントレットの記録は `--baseline` で1マッチアップに絞る
+    ガントレットの記録は `--baseline` で1マッチアップに絞る。
+    **`pair_with` が CI で落ちる2つの場合**（どちらも対局は全シャード成功していて、落ちるのは
+    aggregate の「Pair with control run」だけ。記録は artifact `arena-result-*` に残る）:
+    ①**ガントレット**（相手が複数）は arena.yml が `--baseline` を付けないので「相手が混在しています」で落ちる
+    → ガントレットに `pair_with` は付けない ②対照と候補で**コミットが違う**と
+    `TSUITATE_SOURCE_FINGERPRINT` が食い違い「両側に効く env が違います」で落ちる（凍結版の追加や
+    docs の変更でも指紋は変わる）。RL の重み（Release の `rl_policy:release:...`）を節目ごとに比べるときは
+    ほぼ必ずコミットが変わるので、相手の `baseline_behavior` が両 run で一致することを確かめてから
+    局を **(相手, `match_seed_base`, `match_seed_shard`, `game_no`)** で対にして手元で差を取る
+    （**`match_seed` はシャード単位の値なので、それだけで対にすると別の局どうしを比べてしまう**。
+    2026-10-01 に実際に間違えた）
   - **`arena-balance` は issue #40 の opponent-balanced 合算器**（2026-09-01 実装。
     まだ判定実績なし）。2相手ぶんの対照・候補 games.jsonl を受け取り、相手ごとに
     局ペア差を作って **`(Δv13 + Δv14) / 2` を層化 bootstrap**（各相手の内側で局を
