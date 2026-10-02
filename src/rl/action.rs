@@ -203,11 +203,12 @@ pub fn basic_legal_mask(view: &PlayerView, foul_tried: &HashSet<String>) -> Vec<
 /// 除外で候補が尽きたときは旧マスクへ戻す（推論が健全なら、真の局面に合法手がある限り
 /// 尽きることはない。尽きる＝推論の前提が崩れているので、指せなくなるより安全側に倒す）
 pub fn legal_mask(view: &PlayerView, log: &ObservationLog, foul_tried: &HashSet<String>) -> Vec<bool> {
-    let deduction = Deduction::new(view, log, foul_tried);
+    let candidates = candidate_usis(view);
+    let deduction = Deduction::new(view, log, foul_tried, &candidates.iter().cloned().collect());
     let mut mask = vec![false; NUM_ACTIONS];
     let mut basic = vec![false; NUM_ACTIONS];
     let mut any = false;
-    for usi in candidate_usis(view) {
+    for usi in candidates {
         if foul_tried.contains(&usi) {
             continue;
         }
@@ -232,14 +233,23 @@ struct CheckerHyp {
     dist: i8,
 }
 
-/// 観測から論理的に確定する反則。3種類あり、どれも**真の合法手を落とさない**ことだけを条件にしている
+/// 観測から論理的に確定する反則。どれも**真の合法手を落とさない**ことだけを条件にしている
 /// （「たぶん反則」は落とさない。それはネットの領分）。
 ///
 /// 1. **反則した手の成り／不成の片割れ**: 両者の違いは移動後の駒種だけで、自玉が取られるか
 ///    （= 合法か）は盤上の占有にしか依らない。行き所の有無は候補生成が自駒視点で落とし済み
-/// 2. **直前に相手が駒を取ったマス**（相手の着手駒がいまそこにいる）: そこへの打ちと、
-///    そこを飛び越える移動
-/// 3. **王手中に王手を解消し得ない手**: 王手駒がいうるマスの集合 H を作り、H のどの仮説に
+/// 2. **相手の駒がいると確定したマス**（`occupied`）への打ちと、そこを飛び越える移動。確定の根拠は
+///    - 直前に相手が駒を取ったマス（相手の着手駒がいまそこにいる）
+///    - 王手中でないときの**歩以外の打ちの反則**: 打ちで自玉が危なくなることは無く、二歩・
+///      行き所は候補生成が落とし済みなので、原因は「打ち先に相手の駒がいる」しかない
+///      （歩は打ち歩詰めがありうるので使わない）
+///    - 王手中でないときの**間が1マスの飛び越え反則**（下の 3 で原因が遮りと確定したもの）:
+///      遮っている駒は間の1マスにしかいられない
+/// 3. **飛び越え反則の先**（`blocked_beyond`）: 王手中でないときに2マス以上の直線移動 F→T が
+///    反則で、F の駒がピンされえない（玉の筋で最初の自駒でない、または移動方向がその筋と平行）
+///    なら、原因は「F と T の間に相手の駒がいる」しかない（T に相手の駒がいれば駒取りで合法）。
+///    同じ F から同じ方向へ T より先へ進む手も必ず遮られる
+/// 4. **王手中に王手を解消し得ない手**: 王手駒がいうるマスの集合 H を作り、H のどの仮説に
 ///    対しても解消しない手を落とす。H は
 ///    - 相手の直前の手が駒を取っていなければ: 玉から8方向に最初の自駒の手前までのマスと、
 ///      桂の王手マス（自駒がいないもの）。王手駒はこのどこかにいる
@@ -256,7 +266,10 @@ struct CheckerHyp {
 ///      h が隣接・桂のときは駒種が分からないので玉の手は落とさない
 struct Deduction {
     twins: HashSet<String>,
-    known_opponent: Option<Coord>,
+    /// 相手の駒がいると確定したマス（直前に取られたマスを含む）
+    occupied: HashSet<Coord>,
+    /// 飛び越え反則した (元のマス, 方向, 距離)。同じ元・方向でこれより遠い手は遮られる
+    blocked_beyond: Vec<(Coord, (i8, i8), i8)>,
     check: Option<(Coord, Vec<CheckerHyp>)>,
 }
 
@@ -303,7 +316,14 @@ fn reachable(o: Coord, x: Coord) -> bool {
 }
 
 impl Deduction {
-    fn new(view: &PlayerView, log: &ObservationLog, foul_tried: &HashSet<String>) -> Self {
+    /// `candidates` は自駒視点の候補手（`candidate_usis`）。反則から推論するのは候補手の反則だけ
+    /// （候補外の反則は原因が成りの選択や行き所でありうるので、占有・遮りの根拠にしない）
+    fn new(
+        view: &PlayerView,
+        log: &ObservationLog,
+        foul_tried: &HashSet<String>,
+        candidates: &HashSet<String>,
+    ) -> Self {
         let twins = foul_tried
             .iter()
             .filter_map(|usi| match parse_usi(usi)? {
@@ -328,6 +348,60 @@ impl Deduction {
             }
         }
 
+        // 動けないと確定している相手の歩（deduce::immobile_opponent_pawns）は使わない:
+        // ログを毎回先頭から辿るのでマスクのコストが倍になる割に、記録483局で反則2件にしか効かない
+        let mut occupied: HashSet<Coord> = known_opponent.into_iter().collect();
+
+        let mut blocked_beyond = vec![];
+        if !view.you_in_check {
+            let king = view
+                .your_pieces
+                .iter()
+                .find(|p| p.role == Role::King)
+                .and_then(|p| parse_usi_square(&p.square));
+            let own: HashSet<Coord> = view
+                .your_pieces
+                .iter()
+                .filter_map(|p| parse_usi_square(&p.square))
+                .collect();
+            // f が玉の筋で最初の自駒なら、その筋の方向（＝ピンされうる向き）
+            let pin_dir = |f: Coord| -> Option<(i8, i8)> {
+                let k = king?;
+                ALL_DIRS.iter().copied().find(|&d| {
+                    let mut c = step(k, d, 1);
+                    while on_board(c) && !own.contains(&c) {
+                        c = step(c, d, 1);
+                    }
+                    c == f
+                })
+            };
+            for usi in foul_tried.iter().filter(|u| candidates.contains(*u)) {
+                match parse_usi(usi) {
+                    Some(ShogiMove::Drop { role, to }) if role != Role::Pawn => {
+                        occupied.insert(to);
+                    }
+                    Some(ShogiMove::Board { from, to, .. }) if king.is_some() => {
+                        let (df, dr) = (to.file - from.file, to.rank - from.rank);
+                        let dist = df.abs().max(dr.abs());
+                        if dist < 2 || (df != 0 && dr != 0 && df.abs() != dr.abs()) {
+                            continue;
+                        }
+                        let unit = (df.signum(), dr.signum());
+                        let pinnable = pin_dir(from)
+                            .is_some_and(|d| d != unit && d != (-unit.0, -unit.1));
+                        if pinnable {
+                            continue;
+                        }
+                        blocked_beyond.push((from, unit, dist));
+                        if dist == 2 {
+                            occupied.insert(step(from, unit, 1));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         let check = if view.you_in_check {
             Self::checker_hyps(view, known_opponent)
         } else {
@@ -335,7 +409,8 @@ impl Deduction {
         };
         Deduction {
             twins,
-            known_opponent,
+            occupied,
+            blocked_beyond,
             check,
         }
     }
@@ -432,12 +507,18 @@ impl Deduction {
         if self.twins.contains(usi) {
             return true;
         }
-        if let Some(x) = self.known_opponent {
-            let blocked = match *mv {
-                ShogiMove::Drop { to, .. } => to == x,
-                ShogiMove::Board { from, to, .. } => passes_through(from, to, x),
-            };
-            if blocked {
+        let on_occupied = self.occupied.iter().any(|&x| match *mv {
+            ShogiMove::Drop { to, .. } => to == x,
+            ShogiMove::Board { from, to, .. } => passes_through(from, to, x),
+        });
+        if on_occupied {
+            return true;
+        }
+        if let ShogiMove::Board { from, to, .. } = *mv {
+            let beyond = self.blocked_beyond.iter().any(|&(f, unit, dist)| {
+                f == from && (2..=8).any(|k| k > dist && step(f, unit, k) == to)
+            });
+            if beyond {
                 return true;
             }
         }
@@ -473,6 +554,10 @@ mod tests {
     use super::*;
     use crate::referee::{Referee, StepResult};
     use rand::{Rng, SeedableRng, rngs::StdRng};
+
+    fn deduce(view: &PlayerView, log: &ObservationLog, tried: &HashSet<String>) -> Deduction {
+        Deduction::new(view, log, tried, &candidate_usis(view).into_iter().collect())
+    }
 
     #[test]
     fn 行動数は139かける81() {
@@ -566,15 +651,15 @@ mod tests {
                 let view = referee.view(side, [0, 0], game);
                 let log = referee.log(side);
                 let tried = referee.foul_tried(side);
-                let deduction = Deduction::new(&view, log, tried);
+                let deduction = deduce(&view, log, tried);
                 let legal = referee.position().legal_moves();
                 for mv in &legal {
                     let usi = mv.to_usi();
                     assert!(
                         !deduction.rules_out(&usi, mv),
-                        "局 {game}: 合法手 {usi} を除外した（王手中 {}・直前の捕獲 {:?}）",
+                        "局 {game}: 合法手 {usi} を除外した（王手中 {}・確定占有 {:?}・反則済み {tried:?}）",
                         view.you_in_check,
-                        deduction.known_opponent
+                        deduction.occupied
                     );
                     legal_checked += 1;
                 }
@@ -583,7 +668,14 @@ mod tests {
                 ruled_out += (0..NUM_ACTIONS).filter(|&a| basic[a] && !mask[a]).count();
                 if view.you_in_check {
                     check_states += 1;
-                    capture_checks += deduction.known_opponent.is_some() as usize;
+                    let captured = log.events().iter().rev().find_map(|e| match e {
+                        Observation::OpponentMoved {
+                            captured_my_piece_at,
+                            ..
+                        } => Some(captured_my_piece_at.is_some()),
+                        _ => None,
+                    });
+                    capture_checks += captured.unwrap_or(false) as usize;
                 }
 
                 // 半分は真実を見て王手（なければ駒取り）を選ぶ。残りはマスク内から一様に（反則も起きる）
@@ -654,7 +746,7 @@ mod tests {
             };
             let replayed = crate::rl::records::replay(&end, |r, a| {
                 let view = r.view(a.side, [0, 0], 0);
-                let deduction = Deduction::new(&view, r.log(a.side), r.foul_tried(a.side));
+                let deduction = deduce(&view, r.log(a.side), r.foul_tried(a.side));
                 for mv in r.position().legal_moves() {
                     let usi = mv.to_usi();
                     assert!(
@@ -803,6 +895,64 @@ mod tests {
         for usi in ["4d3c", "7h7a", "4d2b"] {
             assert!(allowed(&view, &log, &tried, usi), "{usi} は残す");
         }
+    }
+
+    /// 王手中でないときの歩以外の打ちの反則 → 打ち先に相手の駒がいると確定する
+    #[test]
+    fn 打ちの反則から打ち先の占有を確定させる() {
+        let mut view = view_from_sfen(
+            "lnsgkgsnl/1r5b1/ppppppppp/9/9/9/PPPPPPPPP/1B5R1/LNSGKGSNL",
+            Color::Sente,
+            &[(Role::Gold, 1), (Role::Silver, 1), (Role::Pawn, 1)],
+        );
+        view.you_in_check = false;
+        let log = ObservationLog::default();
+        let tried: HashSet<String> = ["G*5e".to_string()].into();
+        // 同じマスへの別の駒の打ちと、そこを飛び越える移動は確定反則
+        assert!(!allowed(&view, &log, &tried, "S*5e"));
+        // 歩の打ちの反則は打ち歩詰めがありうるので根拠にしない
+        let tried_pawn: HashSet<String> = ["P*5e".to_string()].into();
+        assert!(allowed(&view, &log, &tried_pawn, "S*5e"));
+    }
+
+    /// 飛び越え反則（ピンされえない駒）→ 同じ方向でそれより先は遮られる。間が1マスなら
+    /// そのマスの占有が確定し、そこへの打ちも落ちる（ユーザー指摘）
+    #[test]
+    fn 飛び越え反則の先と間の1マスを落とす() {
+        let mut view = view_from_sfen(
+            "4k4/9/9/9/9/9/9/7R1/4K4",
+            Color::Sente,
+            &[(Role::Gold, 1)],
+        );
+        view.you_in_check = false;
+        let log = ObservationLog::default();
+        let tried: HashSet<String> = ["2h2d".to_string()].into();
+        for usi in ["2h2c", "2h2b", "2h2a", "2h2c+", "2h2a+"] {
+            assert!(!allowed(&view, &log, &tried, usi), "{usi} は遮られる");
+        }
+        for usi in ["2h2e", "2h2g", "2h5h"] {
+            assert!(allowed(&view, &log, &tried, usi), "{usi} は残す");
+        }
+        // 間が1マス（2h→2f の間は 2g だけ）なら 2g の占有が確定する
+        let tried2: HashSet<String> = ["2h2f".to_string()].into();
+        assert!(!allowed(&view, &log, &tried2, "G*2g"));
+        assert!(!allowed(&view, &log, &tried2, "2h2e"));
+        assert!(allowed(&view, &log, &tried2, "G*2f"));
+    }
+
+    /// ピンされうる駒（玉の筋で最初の自駒）が筋から外れる飛び越え反則は、原因がピンかも
+    /// しれないので推論しない
+    #[test]
+    fn ピンされうる駒の反則からは推論しない() {
+        // 5九玉の真上 5八に飛車。横へ動く反則はピン（5筋の上に相手の飛び駒）でもありうる
+        let mut view = view_from_sfen("4k4/9/9/9/9/9/9/4R4/4K4", Color::Sente, &[]);
+        view.you_in_check = false;
+        let log = ObservationLog::default();
+        let tried: HashSet<String> = ["5h3h".to_string()].into();
+        assert!(allowed(&view, &log, &tried, "5h2h"));
+        // 筋に沿う動き（縦）の反則なら原因は遮りしかない
+        let tried_up: HashSet<String> = ["5h5d".to_string()].into();
+        assert!(!allowed(&view, &log, &tried_up, "5h5c"));
     }
 
     /// 直前に相手が駒を取ったマスへは打てず、そこを飛び越えられない（王手でなくても）
