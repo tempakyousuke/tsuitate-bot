@@ -200,6 +200,7 @@ pub fn make_seeded(name: &str, seed: u64) -> Option<Box<dyn Strategy + Send>> {
         "rl_v19" => Some(Box::new(crate::frozen::rl_v19::RlV19::with_seed(seed))),
         "rl_v20" => Some(Box::new(crate::frozen::rl_v20::RlV20::with_seed(seed))),
         "rl_v21" => Some(Box::new(crate::frozen::rl_v21::RlV21::with_seed(seed))),
+        "rl_v22" => Some(Box::new(crate::frozen::rl_v22::RlV22::with_seed(seed))),
         // 着手の分布は `Heuristic` と同じ。乱数源だけ seed つきにする
         // （RL 環境の評価モードで相手の着手列を再現するため。2026-09-27）
         "heuristic" => Some(Box::new(SeededHeuristic {
@@ -304,6 +305,7 @@ pub fn make(name: &str) -> Option<Box<dyn Strategy + Send>> {
         "rl_v19" => Some(Box::new(crate::frozen::rl_v19::RlV19::new())),
         "rl_v20" => Some(Box::new(crate::frozen::rl_v20::RlV20::new())),
         "rl_v21" => Some(Box::new(crate::frozen::rl_v21::RlV21::new())),
+        "rl_v22" => Some(Box::new(crate::frozen::rl_v22::RlV22::new())),
         // 方策ネット（DeepNash 路線）: `rl_policy:<重みのパス>` / `rl_policy_greedy:<パス>` /
         // `rl_policy_basic:<パス>`（旧マスク）
         _ => crate::rl::policy::RlPolicy::from_name(name, None)

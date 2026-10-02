@@ -30,6 +30,7 @@ pub mod rl_v18;
 pub mod rl_v19;
 pub mod rl_v20;
 pub mod rl_v21;
+pub mod rl_v22;
 
 /// **hermetic 規約を適用する最初の版**（issue #21）。
 ///
@@ -59,6 +60,7 @@ pub const SOURCES: &[(u32, &str, &str)] = &[
     (19, "rl_v19", include_str!("rl_v19.rs")),
     (20, "rl_v20", include_str!("rl_v20.rs")),
     (21, "rl_v21", include_str!("rl_v21.rs")),
+    (22, "rl_v22", include_str!("rl_v22.rs")),
 ];
 
 /// 凍結版 `name` が**自分のファイルの中で**読む `TSUITATE_*` の一覧。
@@ -358,7 +360,7 @@ mod tests {
         assert_eq!(versions_using("king_belief_nn"), vec!["estimator_v14"]);
         // 自駒の再構成は estimator の凍結版も rl_v15 も使う（v15 の凍結で pin に加えた）
         let model_users = versions_using("model");
-        for name in ["rl_v15", "rl_v16", "rl_v17", "rl_v18", "rl_v19", "rl_v20", "rl_v21", "estimator_v14"] {
+        for name in ["rl_v15", "rl_v16", "rl_v17", "rl_v18", "rl_v19", "rl_v20", "rl_v21", "rl_v22", "estimator_v14"] {
             assert!(model_users.contains(&name), "{name}");
         }
         // v9〜v11 は NN の重みを自分のファイルへコピーしているので影響しない
@@ -527,7 +529,7 @@ mod tests {
             .map(|(_, name, src)| (*name, *src))
             .filter(|(name, _)| name.starts_with("rl_v"))
             .collect();
-        assert!(rl_versions.iter().any(|(n, _)| *n == "rl_v21"), "rl_v21 が無い");
+        assert!(rl_versions.iter().any(|(n, _)| *n == "rl_v22"), "rl_v22 が無い");
         for (version, src) in rl_versions {
             let path = format!("{}/models/{version}.bin", env!("CARGO_MANIFEST_DIR"));
             // 観測からの確定反則を落とすマスク（`action::MASK_VERSION` 2）より前に凍結した版は

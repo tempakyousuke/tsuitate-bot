@@ -387,7 +387,7 @@
   `action.rs` = 139×81 の行動符号化と行動マスク（真の合法手 ⊆ マスクを常時検査）。
   マスクは自駒視点の候補に加えて**観測から反則が確定する手**（王手を解消し得ない手・反則手の
   成/不成の片割れ・直前に取られたマスへの打ち）を落とす（`MASK_VERSION` 2、2026-10-02〜。
-  rl_v21 以前の凍結版は旧マスク = `rl_policy_basic:`。詳細は設計 doc の「行動マスク」）、
+  rl_v22 以前の凍結版は旧マスク = `rl_policy_basic:`。詳細は設計 doc の「行動マスク」）、
   `encode.rs` = 観測 → 86×9×9 のテンソル。**入力は `Strategy::choose` と同じ
   `(PlayerView, ObservationLog, foul_tried)` だけ**にしてあり、学習環境と推論が同じ関数を通る。
   `env.rs` = RL 環境の1局（自己対局・Rust 戦略を相手にする評価モード）。
@@ -674,7 +674,7 @@
   v9〜v11 は NN の重みを凍結ファイルへコピーしているので影響しない。
   **v15 以降は実行時 env を読まない**（`HERMETIC_FROM`）。
   **各版の内容と凍結時の成績は `docs/frozen-versions.md`**（現行の最新は
-  **方策ネットの `rl_v21`**（R-NaD 40,000更新、2026-10-02 凍結）、estimator 系の最新は
+  **方策ネットの `rl_v22`**（R-NaD 45,000更新、2026-10-02 凍結）、estimator 系の最新は
   `estimator_v14`（2026-08-19 凍結））。方策ネットの凍結は
   `python3 scripts/freeze_rl.py <N> <日付> "<要約>" models/rl_vN.bin > src/frozen/rl_vN.rs`
   （推論の一式を固定コピー・重みを埋め込み。共有のまま使う `src/model.rs` は

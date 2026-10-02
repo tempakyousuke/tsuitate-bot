@@ -11,7 +11,7 @@
   （上限を変えると入力の正規化が変わるため）
 - 重みは `include_bytes!` でバイナリに埋め込み、sha256 をテストで検査する
 - サンプリング（softmax から seed つきで引く）は `src/rl/policy.rs` の `rl_policy:` と同じ手順
-  （マスクは凍結時点の `action::legal_mask`。rl_v21 以前は旧マスク＝`rl_policy_basic:` と同じ）
+  （マスクは凍結時点の `action::legal_mask`。rl_v22 以前は旧マスク＝`rl_policy_basic:` と同じ）
 - 共有のまま使うのはルールエンジン（board / shogi）・観測（observation）・自駒の再構成（model）。
   model は `frozen::SHARED_MODEL_PINS` で pin する（変えるとテンソルが変わるため）
 - 実行時 env は読まない（`frozen::HERMETIC_FROM` 以降の規約）

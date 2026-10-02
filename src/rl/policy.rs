@@ -4,7 +4,7 @@
 //! - `rl_policy:<path>` — マスク内の softmax から**サンプリング**（混合戦略として学んだ分布どおり）
 //! - `rl_policy_greedy:<path>` — 最大の手（決定的）
 //! - `rl_policy_basic:<path>` — サンプリングだが**旧マスク**（`action::basic_legal_mask`。観測からの
-//!   確定反則を落とさない）。凍結版 rl_v15〜rl_v21 と同じ手順で、同一性テストとマスクの効果測定に使う
+//!   確定反則を落とさない）。凍結版 rl_v15〜rl_v22 と同じ手順で、同一性テストとマスクの効果測定に使う
 //!
 //! 入力は `Strategy::choose` の引数だけで、学習環境と同じ `rl::encode` / `rl::action` を通る。
 //!
