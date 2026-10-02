@@ -304,7 +304,8 @@ pub fn make(name: &str) -> Option<Box<dyn Strategy + Send>> {
         "rl_v19" => Some(Box::new(crate::frozen::rl_v19::RlV19::new())),
         "rl_v20" => Some(Box::new(crate::frozen::rl_v20::RlV20::new())),
         "rl_v21" => Some(Box::new(crate::frozen::rl_v21::RlV21::new())),
-        // 方策ネット（DeepNash 路線）: `rl_policy:<重みのパス>` / `rl_policy_greedy:<パス>`
+        // 方策ネット（DeepNash 路線）: `rl_policy:<重みのパス>` / `rl_policy_greedy:<パス>` /
+        // `rl_policy_basic:<パス>`（旧マスク）
         _ => crate::rl::policy::RlPolicy::from_name(name, None)
             .map(|p| Box::new(p) as Box<dyn Strategy + Send>),
     }

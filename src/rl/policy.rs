@@ -3,6 +3,8 @@
 //! 戦略名に重みファイルのパスを埋め込む（`strategy::make`）:
 //! - `rl_policy:<path>` — マスク内の softmax から**サンプリング**（混合戦略として学んだ分布どおり）
 //! - `rl_policy_greedy:<path>` — 最大の手（決定的）
+//! - `rl_policy_basic:<path>` — サンプリングだが**旧マスク**（`action::basic_legal_mask`。観測からの
+//!   確定反則を落とさない）。凍結版 rl_v15〜rl_v21 と同じ手順で、同一性テストとマスクの効果測定に使う
 //!
 //! 入力は `Strategy::choose` の引数だけで、学習環境と同じ `rl::encode` / `rl::action` を通る。
 //!
@@ -19,20 +21,21 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 
 use crate::observation::ObservationLog;
 use crate::protocol::PlayerView;
-use crate::rl::action::{decode_usi, legal_mask};
+use crate::rl::action::{basic_legal_mask, decode_usi, legal_mask};
 use crate::rl::encode::encode;
 use crate::rl::policy_net::PolicyNet;
 use crate::strategy::Strategy;
 
 pub const PREFIX_SAMPLE: &str = "rl_policy:";
 pub const PREFIX_GREEDY: &str = "rl_policy_greedy:";
+pub const PREFIX_BASIC: &str = "rl_policy_basic:";
 
 /// 読み込んだ重み（内容のハッシュで共有する）
 #[derive(Clone)]
 struct Loaded {
     net: Arc<PolicyNet>,
-    /// `name()` が返す名前（サンプリング / greedy）。ハッシュごとに1度だけ確保して使い回す
-    names: (&'static str, &'static str),
+    /// `name()` が返す名前（サンプリング / greedy / 旧マスク）。ハッシュごとに1度だけ確保して使い回す
+    names: (&'static str, &'static str, &'static str),
     sha256: String,
 }
 
@@ -52,6 +55,7 @@ fn load_cached(path: &str) -> Result<Loaded, String> {
         names: (
             Box::leak(format!("rl_policy@{short}").into_boxed_str()),
             Box::leak(format!("rl_policy_greedy@{short}").into_boxed_str()),
+            Box::leak(format!("rl_policy_basic@{short}").into_boxed_str()),
         ),
         sha256: sha256.clone(),
     };
@@ -61,21 +65,24 @@ fn load_cached(path: &str) -> Result<Loaded, String> {
 
 pub struct RlPolicy {
     net: Arc<PolicyNet>,
-    names: (&'static str, &'static str),
+    names: (&'static str, &'static str, &'static str),
     sha256: String,
     greedy: bool,
+    basic_mask: bool,
     rng: StdRng,
     last: Option<serde_json::Value>,
 }
 
 impl RlPolicy {
-    /// 戦略名（`rl_policy:<path>` / `rl_policy_greedy:<path>`）から作る。名前が違えば None、
-    /// 重みが読めなければ panic（arena の設定ミスを黙って別の戦略にしないため）
+    /// 戦略名（`rl_policy:<path>` / `rl_policy_greedy:<path>` / `rl_policy_basic:<path>`）から作る。
+    /// 名前が違えば None、重みが読めなければ panic（arena の設定ミスを黙って別の戦略にしないため）
     pub fn from_name(name: &str, seed: Option<u64>) -> Option<Self> {
-        let (greedy, path) = if let Some(p) = name.strip_prefix(PREFIX_GREEDY) {
-            (true, p)
+        let (greedy, basic_mask, path) = if let Some(p) = name.strip_prefix(PREFIX_GREEDY) {
+            (true, false, p)
+        } else if let Some(p) = name.strip_prefix(PREFIX_BASIC) {
+            (false, true, p)
         } else if let Some(p) = name.strip_prefix(PREFIX_SAMPLE) {
-            (false, p)
+            (false, false, p)
         } else {
             return None;
         };
@@ -89,6 +96,7 @@ impl RlPolicy {
             names: loaded.names,
             sha256: loaded.sha256,
             greedy,
+            basic_mask,
             rng,
             last: None,
         })
@@ -102,7 +110,11 @@ impl Strategy for RlPolicy {
         log: &ObservationLog,
         foul_tried: &HashSet<String>,
     ) -> Option<String> {
-        let mask = legal_mask(view, foul_tried);
+        let mask = if self.basic_mask {
+            basic_legal_mask(view, foul_tried)
+        } else {
+            legal_mask(view, log, foul_tried)
+        };
         let legal: Vec<usize> = (0..mask.len()).filter(|&a| mask[a]).collect();
         if legal.is_empty() {
             return None;
@@ -135,12 +147,19 @@ impl Strategy for RlPolicy {
             "value": value,
             "weights_sha256": self.sha256,
             "greedy": self.greedy,
+            "mask_version": if self.basic_mask { 1 } else { crate::rl::action::MASK_VERSION },
         }));
         decode_usi(pick, view.your_color)
     }
 
     fn name(&self) -> &'static str {
-        if self.greedy { self.names.1 } else { self.names.0 }
+        if self.greedy {
+            self.names.1
+        } else if self.basic_mask {
+            self.names.2
+        } else {
+            self.names.0
+        }
     }
 
     fn debug_state(&self) -> Option<serde_json::Value> {
@@ -171,7 +190,7 @@ mod tests {
                 let Some(usi) = p.choose(&view, referee.log(side), referee.foul_tried(side)) else {
                     break;
                 };
-                let mask = legal_mask(&view, referee.foul_tried(side));
+                let mask = legal_mask(&view, referee.log(side), referee.foul_tried(side));
                 assert!(mask[crate::rl::action::encode_usi(&usi, side).unwrap()]);
                 if let StepResult::Ended { .. } = referee.step(&usi, 0) {
                     break;
