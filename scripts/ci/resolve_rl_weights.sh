@@ -4,7 +4,7 @@
 #
 #   scripts/ci/resolve_rl_weights.sh 'rl_policy:release:<タグ>/<ファイル名>'
 #     → Release <タグ> の <ファイル名> を rl-weights/<タグ>/ へ落として
-#       'rl_policy:<絶対パス>' を標準出力へ出す（rl_policy_greedy も同じ）
+#       'rl_policy:<絶対パス>' を標準出力へ出す（rl_policy_greedy / rl_policy_basic も同じ）
 #   それ以外の戦略名（estimator_v14 など）はそのまま出す
 #
 # 実験中の重みはリポジトリにコミットせず Release に置く（履歴が重みで膨らまないように）。
@@ -18,7 +18,7 @@ parse() {
   # 出力: prefix tag asset（分解できなければ何も出さない）
   local name="$1"
   case "$name" in
-    rl_policy:release:* | rl_policy_greedy:release:*) ;;
+    rl_policy:release:* | rl_policy_greedy:release:* | rl_policy_basic:release:*) ;;
     *) return 0 ;;
   esac
   local prefix="${name%%:release:*}"
@@ -45,6 +45,7 @@ if [ "${1:-}" = "--self-test" ]; then
   check 'rl_policy:/abs/policy.bin' ''
   check 'rl_policy:release:rlw-bc-m2a/policy.bin' 'rl_policy rlw-bc-m2a policy.bin'
   check 'rl_policy_greedy:release:rlw/2026/a.bin' 'rl_policy_greedy rlw/2026 a.bin'
+  check 'rl_policy_basic:release:rlw-x/policy.bin' 'rl_policy_basic rlw-x policy.bin'
   if (parse 'rl_policy:release:policy.bin' 2>/dev/null); then
     echo "self-test 失敗: タグの無い指定を通した" >&2
     exit 1
