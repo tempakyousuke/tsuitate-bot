@@ -211,7 +211,17 @@
     無いと `Var(delta)=0.5` の仮定に乗ったままで、**同じ実行が
     `--known-arena-delta` に渡す既知値にもなる**。CI では `arena.yml` の
     `-f pair_with=<対照のArena実行ID>` が候補側 run の中でこれを回す。
-    ガントレットの記録は `--baseline` で1マッチアップに絞る
+    ガントレットの記録は `--baseline` で1マッチアップに絞る。
+    **`pair_with` が CI で落ちる2つの場合**（どちらも対局は全シャード成功していて、落ちるのは
+    aggregate の「Pair with control run」だけ。記録は artifact `arena-result-*` に残る）:
+    ①**ガントレット**（相手が複数）は arena.yml が `--baseline` を付けないので「相手が混在しています」で落ちる
+    → ガントレットに `pair_with` は付けない ②対照と候補で**コミットが違う**と
+    `TSUITATE_SOURCE_FINGERPRINT` が食い違い「両側に効く env が違います」で落ちる（凍結版の追加や
+    docs の変更でも指紋は変わる）。RL の重み（Release の `rl_policy:release:...`）を節目ごとに比べるときは
+    ほぼ必ずコミットが変わるので、相手の `baseline_behavior` が両 run で一致することを確かめてから
+    局を **(相手, `match_seed_base`, `match_seed_shard`, `game_no`)** で対にして手元で差を取る
+    （**`match_seed` はシャード単位の値なので、それだけで対にすると別の局どうしを比べてしまう**。
+    2026-10-01 に実際に間違えた）
   - **`arena-balance` は issue #40 の opponent-balanced 合算器**（2026-09-01 実装。
     まだ判定実績なし）。2相手ぶんの対照・候補 games.jsonl を受け取り、相手ごとに
     局ペア差を作って **`(Δv13 + Δv14) / 2` を層化 bootstrap**（各相手の内側で局を
@@ -361,21 +371,39 @@
 
 DeepNash 路線の自己対局学習（`docs/rl-deepnash-design.md`）は別の GPU VM で回す。
 
-- **VM**: `tsuitate-rl`（`tsuitate-solver` / `asia-northeast1-b` / `g2-standard-8` ＋ NVIDIA L4 1枚 /
-  **Spot**・停止時は STOP / イメージ `common-cu129-ubuntu-2404-nvidia-580`）。
-  2026-09-28 の単価で **Spot 約 $0.66/時**（L4 $0.430 ＋ 8vCPU・32GB $0.226）、通常なら約 $1.10/時。
+- **VM**: `tsuitate-rl2`（`tsuitate-solver` / `asia-northeast1-c` / `g2-standard-8` ＋ NVIDIA L4 1枚 /
+  **通常料金（オンデマンド）** / イメージ `common-cu129-ubuntu-2404-nvidia-580`）。
+  2026-09-28 の単価で **通常 約 $1.10/時**、Spot なら約 $0.66/時（L4 $0.430 ＋ 8vCPU・32GB $0.226）。
+  最初は Spot の `tsuitate-rl`（asia-northeast1-b）で回したが、**Tokyo の3ゾーンすべてで L4 の Spot が
+  在庫切れになり起動できなくなった**（通常料金でも b と a は在庫切れ、c だけ空いていた）ので、
+  ディスクのスナップショットから c に通常料金で作り直した（旧 VM は 2026-09-29 に削除）。
   プロジェクトの `GPUS_ALL_REGIONS` は 2026-09-28 に 0 → 1 へ申請・承認済み（2枚目を使うなら再申請）
 - **コード転送**: `tsuitate-bot` の tar（上と同じ作り方。`rl-env/target` も除く）と、
   `tar czf /tmp/tsuitate-nn-rnad.tar.gz -C ~/Develop/tsuitate-nn --exclude __pycache__ rnad out_rnad/bc/checkpoint.pt`
   を `scripts/gce/setup-rnad.sh` と一緒に `/tmp/` へ送り、
   `bash /tmp/setup-rnad.sh rnad '<train_rnad.py の引数>'` を実行（Rust・PyTorch の CUDA 版・
   `tsuitate_rl` のビルド → 参照実装との一致テスト → systemd 常駐まで自動）
+- **VM を再起動すると `/tmp` は消える**ので、setup をやり直すときは2つの tar と setup-rnad.sh を送り直す
+- **カーネルの自動更新で GPU を失う**: unattended-upgrades がカーネルを上げると、再起動後に
+  NVIDIA のビルド済みモジュール（`linux-modules-nvidia-580-server-open-<カーネル>`）が無く
+  `nvidia-smi` が通らない（2026-09-30 に 7.0.0-1011 → 1013 で実際に起きた）。
+  `sudo apt-get install linux-modules-nvidia-580-server-open-$(uname -r) linux-modules-nvidia-580-server-open-gcp`
+  → `sudo modprobe nvidia` で直る。以後は `apt-mark hold linux-image-gcp linux-headers-gcp linux-gcp
+  linux-modules-nvidia-580-server-open-gcp` でカーネルを固定してある（上げるときは hold を外して
+  モジュールと一緒に上げる）
 - **完走したら VM が自分で停止する**（`AUTO_POWEROFF=1` が既定。GPU の課金を放置で積まない）。
-  Spot で止められたら `instances start` するだけで、`--checkpoint-every` ごとの checkpoint から再開する
-- **進捗確認**: `gcloud compute ssh tsuitate-rl ... --command "journalctl -u rnad --no-pager -o cat | tail"`
+  完了の印は学習の引数ごとに残るので、回収のために起動しても学習は再実行されない。
+  続きを回すときは `--steps` を増やした引数で setup をやり直す（新しい印になるので走り、
+  同じ `--out` の checkpoint から再開する）。Spot で止められたら `instances start` するだけ
+- **L4 の在庫切れ**: G2 は L4 を外せず機種も変えられないので、起動できないときは VM のディスクに
+  触れない。回収だけならスナップショット → ディスク → 一時 VM に読み取り専用でつなぐ。
+  別ゾーンで回すならスナップショットから `--create-disk boot=yes,source-snapshot=...` で作り直す
+- **進捗確認**: `gcloud compute ssh tsuitate-rl2 --zone asia-northeast1-c --command "journalctl -u rnad --no-pager -o cat | tail"`
 - **回収**: `gcloud compute scp` で `~/tsuitate-nn/out_rnad/<out>/`（`log.jsonl`・`checkpoint.pt`・
   `policy_<step>.bin`）を手元へ。重みを arena で測るときは Release に置く（`rl_policy:release:...`）
 - **実測**（2026-09-28、256局/更新）: 自己対局 約3秒＋学習 約4.5秒 = 1更新 約7.5秒・約4,000標本/秒
-  （手元の Mac の約4倍）。行動のサンプリングを CPU でやると自己対局が 15秒になり律速になる
+  （手元の Mac の約4倍）。行動のサンプリングを CPU でやると自己対局が 15秒になり律速になる。
+  2026-10-01（30,000更新付近）は自己対局 約3.0秒＋学習 約3.7秒。`--precision tf32` は既定と同じ速さ
+  （畳み込みは既定で TF32）。bf16 なら学習が約2.4秒になるが数値のずれがある（`docs/rl-deepnash-design.md` の7回目）
   （`rnad.sample_actions` はデバイス上の Gumbel-max でサンプリングする）
 

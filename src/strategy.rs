@@ -193,6 +193,15 @@ pub fn make_seeded(name: &str, seed: u64) -> Option<Box<dyn Strategy + Send>> {
         "estimator_v14" => Some(Box::new(
             crate::frozen::estimator_v14::EstimatorV14::with_seed(seed),
         )),
+        "rl_v15" => Some(Box::new(crate::frozen::rl_v15::RlV15::with_seed(seed))),
+        "rl_v16" => Some(Box::new(crate::frozen::rl_v16::RlV16::with_seed(seed))),
+        "rl_v17" => Some(Box::new(crate::frozen::rl_v17::RlV17::with_seed(seed))),
+        "rl_v18" => Some(Box::new(crate::frozen::rl_v18::RlV18::with_seed(seed))),
+        "rl_v19" => Some(Box::new(crate::frozen::rl_v19::RlV19::with_seed(seed))),
+        "rl_v20" => Some(Box::new(crate::frozen::rl_v20::RlV20::with_seed(seed))),
+        "rl_v21" => Some(Box::new(crate::frozen::rl_v21::RlV21::with_seed(seed))),
+        "rl_v22" => Some(Box::new(crate::frozen::rl_v22::RlV22::with_seed(seed))),
+        "rl_v23" => Some(Box::new(crate::frozen::rl_v23::RlV23::with_seed(seed))),
         // 着手の分布は `Heuristic` と同じ。乱数源だけ seed つきにする
         // （RL 環境の評価モードで相手の着手列を再現するため。2026-09-27）
         "heuristic" => Some(Box::new(SeededHeuristic {
@@ -290,7 +299,17 @@ pub fn make(name: &str) -> Option<Box<dyn Strategy + Send>> {
         "estimator_v12" => Some(Box::new(crate::frozen::estimator_v12::EstimatorV12::new())),
         "estimator_v13" => Some(Box::new(crate::frozen::estimator_v13::EstimatorV13::new())),
         "estimator_v14" => Some(Box::new(crate::frozen::estimator_v14::EstimatorV14::new())),
-        // 方策ネット（DeepNash 路線）: `rl_policy:<重みのパス>` / `rl_policy_greedy:<パス>`
+        "rl_v15" => Some(Box::new(crate::frozen::rl_v15::RlV15::new())),
+        "rl_v16" => Some(Box::new(crate::frozen::rl_v16::RlV16::new())),
+        "rl_v17" => Some(Box::new(crate::frozen::rl_v17::RlV17::new())),
+        "rl_v18" => Some(Box::new(crate::frozen::rl_v18::RlV18::new())),
+        "rl_v19" => Some(Box::new(crate::frozen::rl_v19::RlV19::new())),
+        "rl_v20" => Some(Box::new(crate::frozen::rl_v20::RlV20::new())),
+        "rl_v21" => Some(Box::new(crate::frozen::rl_v21::RlV21::new())),
+        "rl_v22" => Some(Box::new(crate::frozen::rl_v22::RlV22::new())),
+        "rl_v23" => Some(Box::new(crate::frozen::rl_v23::RlV23::new())),
+        // 方策ネット（DeepNash 路線）: `rl_policy:<重みのパス>` / `rl_policy_greedy:<パス>` /
+        // `rl_policy_basic:<パス>`（旧マスク）
         _ => crate::rl::policy::RlPolicy::from_name(name, None)
             .map(|p| Box::new(p) as Box<dyn Strategy + Send>),
     }

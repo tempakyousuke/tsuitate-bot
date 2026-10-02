@@ -22,6 +22,16 @@ pub mod estimator_v11;
 pub mod estimator_v12;
 pub mod estimator_v13;
 pub mod estimator_v14;
+/// v15 以降は方策ネット（DeepNash 路線）。推論の一式を固定コピーで持つ（`scripts/freeze_rl.py`）
+pub mod rl_v15;
+pub mod rl_v16;
+pub mod rl_v17;
+pub mod rl_v18;
+pub mod rl_v19;
+pub mod rl_v20;
+pub mod rl_v21;
+pub mod rl_v22;
+pub mod rl_v23;
 
 /// **hermetic 規約を適用する最初の版**（issue #21）。
 ///
@@ -44,6 +54,15 @@ pub const SOURCES: &[(u32, &str, &str)] = &[
     (12, "estimator_v12", include_str!("estimator_v12.rs")),
     (13, "estimator_v13", include_str!("estimator_v13.rs")),
     (14, "estimator_v14", include_str!("estimator_v14.rs")),
+    (15, "rl_v15", include_str!("rl_v15.rs")),
+    (16, "rl_v16", include_str!("rl_v16.rs")),
+    (17, "rl_v17", include_str!("rl_v17.rs")),
+    (18, "rl_v18", include_str!("rl_v18.rs")),
+    (19, "rl_v19", include_str!("rl_v19.rs")),
+    (20, "rl_v20", include_str!("rl_v20.rs")),
+    (21, "rl_v21", include_str!("rl_v21.rs")),
+    (22, "rl_v22", include_str!("rl_v22.rs")),
+    (23, "rl_v23", include_str!("rl_v23.rs")),
 ];
 
 /// 凍結版 `name` が**自分のファイルの中で**読む `TSUITATE_*` の一覧。
@@ -110,6 +129,7 @@ pub fn env_keys_read_by(name: &str) -> Vec<String> {
 /// 「現行 estimator の解決式で代用する」ことによる嘘を混ぜない。
 ///
 /// 凍結版でない名前は `None`（呼び出し側が instance config か「該当なし」を選ぶ）。
+/// 方策ネットの凍結版（`rl_v15` 以降）は思考予算を持たないので 0。
 pub fn effective_think_budget_ms(
     name: &str,
     env: &std::collections::BTreeMap<String, String>,
@@ -269,6 +289,15 @@ pub const SHARED_MODEL_PINS: &[(&str, &str, &str, &str)] = &[
         "king_belief_nn",
         include_str!("../king_belief_nn.rs"),
     ),
+    (
+        // **自駒の再構成**。方策ネットの凍結版（rl_v15〜）が観測のテンソル化で使う
+        // （取られた駒・王手されたときの自玉の位置）。estimator の凍結版 v6〜v14 も使っていた
+        // （v15 の凍結時に pin へ加えて判明）。変えると全凍結版の挙動が変わりうる
+        "src/model.rs",
+        "7fcbf2018bbec4f221603b0b4f090e0a44c1e763ddb0a4ac8934bdf41e0524ff",
+        "model",
+        include_str!("../model.rs"),
+    ),
 ];
 
 /// 共有モジュール `module`（`likelihood` 等のモジュール名）を呼ぶ凍結版の一覧。
@@ -331,6 +360,11 @@ mod tests {
     #[test]
     fn 共有モジュールから影響する凍結版を引ける() {
         assert_eq!(versions_using("king_belief_nn"), vec!["estimator_v14"]);
+        // 自駒の再構成は estimator の凍結版も rl_v15 も使う（v15 の凍結で pin に加えた）
+        let model_users = versions_using("model");
+        for name in ["rl_v15", "rl_v16", "rl_v17", "rl_v18", "rl_v19", "rl_v20", "rl_v21", "rl_v22", "rl_v23", "estimator_v14"] {
+            assert!(model_users.contains(&name), "{name}");
+        }
         // v9〜v11 は NN の重みを自分のファイルへコピーしているので影響しない
         assert!(versions_using("opp_move_nn").is_empty());
         for pinned in ["opp_move_nn_v25", "value_nn_v22"] {
@@ -437,9 +471,10 @@ mod tests {
         common.insert("TSUITATE_THINK_BUDGET_MS".to_string(), "555".to_string());
         let empty = BTreeMap::new();
 
-        // どの版も未設定なら凍結時点の既定
+        // どの版も未設定なら凍結時点の既定（方策ネットの版は思考予算を持たないので 0）
         for (_, name, _) in SOURCES {
-            assert_eq!(effective_think_budget_ms(name, &empty), Some(2000), "{name}");
+            let want = if name.starts_with("estimator_") { 2000 } else { 0 };
+            assert_eq!(effective_think_budget_ms(name, &empty), Some(want), "{name}");
         }
         // **v12 / v13 だけが候補専用の名前を読む**（凍結時に持ち込んだ）
         assert_eq!(effective_think_budget_ms("estimator_v12", &cand), Some(777));
@@ -451,9 +486,10 @@ mod tests {
                 "{name} は候補専用の名前を読まない"
             );
         }
-        // 共通の名前はどの版も読む
+        // 共通の名前は estimator のどの版も読む（v15 以降は env を読まないので既定のまま）
         for (_, name, _) in SOURCES {
-            assert_eq!(effective_think_budget_ms(name, &common), Some(555), "{name}");
+            let want = if name.starts_with("estimator_") { 555 } else { 0 };
+            assert_eq!(effective_think_budget_ms(name, &common), Some(want), "{name}");
         }
         // 凍結版でない名前は None
         assert!(effective_think_budget_ms("estimator", &common).is_none());
@@ -464,12 +500,74 @@ mod tests {
     /// （checkpoint arena / arena の実行前検査がこれを使う）。
     #[test]
     fn 既存凍結版が読むenvを機械的に列挙できる() {
-        assert!(SOURCES.iter().all(|(v, _, _)| *v < HERMETIC_FROM));
+        // env を読む「既知の負債」は estimator の v6〜v14 だけ（v15 以降は hermetic）
+        assert!(
+            SOURCES
+                .iter()
+                .filter(|(v, _, _)| *v >= HERMETIC_FROM)
+                .all(|(_, name, _)| env_keys_in_source(name).is_empty())
+        );
         let v14 = env_keys_in_source("estimator_v14");
         assert!(v14.contains(&"TSUITATE_HAND_ASSET_W".to_string()), "{v14:?}");
         assert!(v14.contains(&"TSUITATE_THINK_BUDGET_MS".to_string()), "{v14:?}");
         // 共有モジュール経由（定跡）はファイル内には出ない
         assert!(!v14.contains(&"TSUITATE_JOSEKI".to_string()));
         assert!(env_keys_in_source("estimator_v6").len() < v14.len());
+    }
+
+    /// 方策ネットの凍結版 `rl_vN` は元の重み（`rl_policy:models/rl_vN.bin`）と
+    /// **同じ seed なら同じ手を指す**（`SOURCES` の rl_ 版を全部検査する）。
+    /// 審判で数局を進め、手番ごとに両者へ同じ入力を渡して一手ずつ突き合わせる
+    /// （arena 100局の 50%±10 より強い同一性の担保）。debug の推論は1回 約0.1秒と重い
+    /// （1版3局で約4分）ので release 専用で、CI は test.yml の release ステップで回す
+    #[test]
+    #[cfg_attr(debug_assertions, ignore = "release 専用（debug では推論が重い）")]
+    fn rl凍結版は元の重みと同じ手を指す() {
+        use crate::protocol::Color;
+        use crate::referee::{Referee, StepResult};
+        use crate::strategy::Strategy;
+        let rl_versions: Vec<(&str, &str)> = SOURCES
+            .iter()
+            .map(|(_, name, src)| (*name, *src))
+            .filter(|(name, _)| name.starts_with("rl_v"))
+            .collect();
+        assert!(rl_versions.iter().any(|(n, _)| *n == "rl_v23"), "rl_v23 が無い");
+        for (version, src) in rl_versions {
+            let path = format!("{}/models/{version}.bin", env!("CARGO_MANIFEST_DIR"));
+            // 観測からの確定反則を落とすマスク（`action::MASK_VERSION` 2）より前に凍結した版は
+            // 旧マスクと比べる
+            let prefix = if src.contains("pub const MASK_VERSION") {
+                crate::rl::policy::PREFIX_SAMPLE
+            } else {
+                crate::rl::policy::PREFIX_BASIC
+            };
+            let name = format!("{prefix}{path}");
+            for game in 0..3u64 {
+                let mut frozen = [
+                    crate::strategy::make_seeded(version, game).unwrap(),
+                    crate::strategy::make_seeded(version, game + 100).unwrap(),
+                ];
+                let mut orig = [
+                    crate::rl::policy::RlPolicy::from_name(&name, Some(game)).unwrap(),
+                    crate::rl::policy::RlPolicy::from_name(&name, Some(game + 100)).unwrap(),
+                ];
+                let mut referee = Referee::new();
+                let mut steps = 0;
+                while referee.ended().is_none() && steps < 400 {
+                    let c = referee.to_move();
+                    let i = if c == Color::Sente { 0 } else { 1 };
+                    let view = referee.view(c, [300_000, 300_000], 0);
+                    let a = frozen[i].choose(&view, referee.log(c), referee.foul_tried(c));
+                    let b = orig[i].choose(&view, referee.log(c), referee.foul_tried(c));
+                    assert_eq!(a, b, "{version} 局 {game} の {steps} 試行目で食い違った");
+                    let Some(usi) = a else { break };
+                    if let StepResult::Ended { .. } = referee.step(&usi, 10) {
+                        break;
+                    }
+                    steps += 1;
+                }
+                assert!(steps > 20, "{version} 局 {game} が短すぎる（{steps} 試行）");
+            }
+        }
     }
 }

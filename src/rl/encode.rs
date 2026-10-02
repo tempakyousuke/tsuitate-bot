@@ -497,7 +497,7 @@ mod tests {
                 let view = referee.view(side, [0, 0], game);
                 let t = std::time::Instant::now();
                 encode_into(&view, referee.log(side), referee.foul_tried(side), &mut buf);
-                let mask = legal_mask(&view, referee.foul_tried(side));
+                let mask = legal_mask(&view, referee.log(side), referee.foul_tried(side));
                 elapsed += t.elapsed();
                 n += 1;
                 let actions: Vec<usize> = (0..NUM_ACTIONS).filter(|&a| mask[a]).collect();
@@ -527,7 +527,7 @@ mod tests {
                 let view = referee.view(side, [0, 0], game);
                 let obs = encode(&view, referee.log(side), referee.foul_tried(side));
                 assert!(obs.iter().all(|v| v.is_finite() && *v >= 0.0 && *v <= 3.0));
-                let mask = legal_mask(&view, referee.foul_tried(side));
+                let mask = legal_mask(&view, referee.log(side), referee.foul_tried(side));
                 let actions: Vec<usize> = (0..NUM_ACTIONS).filter(|&a| mask[a]).collect();
                 if actions.is_empty() {
                     break;

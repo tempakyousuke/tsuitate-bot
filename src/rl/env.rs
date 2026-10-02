@@ -278,7 +278,7 @@ impl EnvGame {
             let learner_turn = self.learner.is_none_or(|l| l == side);
             if learner_turn {
                 let view = self.referee.view(side, clocks(), self.game_no);
-                self.mask = legal_mask(&view, self.referee.foul_tried(side));
+                self.mask = legal_mask(&view, self.referee.log(side), self.referee.foul_tried(side));
                 if !self.mask.iter().any(|&m| m) {
                     // 自駒視点の候補が尽きた（全部反則済み）= 指せる手がない
                     self.finish(GameResult::Win(side.other()), "no_moves");

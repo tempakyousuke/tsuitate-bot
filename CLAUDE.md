@@ -42,7 +42,7 @@
 - `cargo test --release -- --ignored` — 遅い検証（shogi.rs の perft depth 4/5）
 - `cargo run --release --bin arena -- [対局数] [候補] [基準1] [基準2] ...` — 戦略同士の対戦。
   基準を複数並べるとガントレット。**戦略の変更は必ずこれで凍結版ガントレットに
-  有意に勝ち越すことを確認する**（既定の対象は v9 以降）。
+  有意に勝ち越すことを確認する**（既定の対象は rl_v15 以降の方策ネット＋歩哨の estimator_v14。v9〜v13 は 2026-09-30 に既定から外した＝方策ネットが全版に大差で勝ち越し、判別力がないため）。
   **実行はローカルでなく GitHub Actions**（`.github/workflows/arena.yml`。
   **通常のコード push では走らない**）:
   `gh workflow run arena.yml --ref <ブランチ> -f games=100 -f candidate=estimator -f baselines="estimator_v13 estimator_v14"`、
@@ -276,10 +276,11 @@
     落として1つの取り込みJSONにまとめる。ソルバーは `tempakyousuke/tsuitate-solver`
     を checkout して `--no-default-features`（GUI 依存なし）でビルドする。
     成果物は artifact `tsume-puzzles` の `tsume-puzzles.json`。
-    **毎日 09:00 UTC（18:00 JST）に自動実行される**（既定は自己対局160局。
-    1対局1問になる前の実測は 0.62問/局 で概ね100問/日だったが、本番プールでは
-    313問中145問が同じ対局の重複だったので、以降は概ね半分の 0.3問/局 前後になる
-    見込み）。取り込みは**サイト側の日次 cron が artifact を
+    **毎日 09:00 UTC（18:00 JST）に自動実行される**（既定は**方策ネット同士**
+    rl_v22 vs rl_v20 の自己対局800局・採掘16シャード。2026-10-02 に estimator 同士の
+    160局から切り替えた。方策ネットは50局が約30秒なので対局はほぼ無料で、律速は
+    採掘側。手元実測 0.5問/局 = 概ね400問/日の見込み。estimator 同士は1対局1問の
+    制限後で約0.3問/局だった）。取り込みは**サイト側の日次 cron が artifact を
     取りにくる**（tsuitate の `docs/operations.md`「詰めチャレ問題の日次取り込み」）
     ので、このワークフローは artifact を置くところまで。手で確認したいときは
     artifact を落として `/admin/tsume-challenge` に貼り付ければ同じ経路を通る。
@@ -384,7 +385,10 @@
   時計・投了・診断用オラクルは対局者側の都合なので `selfplay.rs` 側に残す。
   切り出し前後の等価性はダイジェストのテストで固定してある
 - `rl/` — **DeepNash（R-NaD）路線の部品**（NN 段階④、設計は `docs/rl-deepnash-design.md`）。
-  `action.rs` = 139×81 の行動符号化と自駒視点の行動マスク（真の合法手 ⊆ マスクを常時検査）、
+  `action.rs` = 139×81 の行動符号化と行動マスク（真の合法手 ⊆ マスクを常時検査）。
+  マスクは自駒視点の候補に加えて**観測から反則が確定する手**（王手を解消し得ない手・反則手の
+  成/不成の片割れ・直前に取られたマスへの打ち）を落とす（`MASK_VERSION` 2、2026-10-02〜。
+  rl_v22 以前の凍結版は旧マスク = `rl_policy_basic:`。詳細は設計 doc の「行動マスク」）、
   `encode.rs` = 観測 → 86×9×9 のテンソル。**入力は `Strategy::choose` と同じ
   `(PlayerView, ObservationLog, foul_tried)` だけ**にしてあり、学習環境と推論が同じ関数を通る。
   `env.rs` = RL 環境の1局（自己対局・Rust 戦略を相手にする評価モード）。
@@ -395,7 +399,8 @@
   （学習は `~/Develop/tsuitate-nn/rnad/`、PyTorch との一致はフィクスチャ
   `tests/fixtures/rl/tiny_policy.*` で常時検査）。`policy.rs` = 方策ネットで指す戦略で、
   **戦略名に重みのパスを埋め込む**（`rl_policy:<パス>` はサンプリング、
-  `rl_policy_greedy:<パス>` は最大の手。記録上の名前は重みの sha256 入りの `rl_policy@<12桁>`）。
+  `rl_policy_greedy:<パス>` は最大の手、`rl_policy_basic:<パス>` は旧マスクでのサンプリング。
+  記録上の名前は重みの sha256 入りの `rl_policy@<12桁>`）。
   **実験中の重みはリポジトリにコミットせず GitHub Release に置く**（重みは差分圧縮が効かず
   履歴が膨らむため。採用した版だけ `models/` にコミットする）。CI の arena では
   `rl_policy:release:<タグ>/<ファイル名>` と書けば arena.yml が取ってくる
@@ -658,13 +663,31 @@
   足した変更で、**凍結版の挙動は変わらない**（読み取り規則とフォールバックは
   文字どおり同じ・`preload` を呼ぶのは `bin/export_eval_rank_data` だけ）ため
   基準の再計測はしていない。
+  **2026-09-29（rl_v15 凍結）に `src/model.rs` の pin を新設**した。rl_v15 が観測の
+  テンソル化で使うためだが、estimator の v6〜v14 も `crate::model::` を呼んでいたので、
+  **v6〜v14 の `behavior_fingerprint` もこの時点で変わる**（model.rs 自体は無変更 =
+  挙動は不変。指紋は pin の一覧から作るため）。checkpoint arena は同じ実行内でしか
+  指紋を比べないので実害はない。なお rl_v15 もルールエンジン（`board.rs` / `shogi.rs`）と
+  観測（`observation.rs`）は estimator の凍結版と同じく**共有のまま pin していない**。
   `versions_using(module)` / `env_keys_read_by(name)`（共有モジュール経由の env 込み）/
   `behavior_fingerprint(name, env)`（版・env・共有 pin から作る実効挙動の指紋）で
   機械可読に取れる。
   v9〜v11 は NN の重みを凍結ファイルへコピーしているので影響しない。
   **v15 以降は実行時 env を読まない**（`HERMETIC_FROM`）。
   **各版の内容と凍結時の成績は `docs/frozen-versions.md`**（現行の最新は
-  `estimator_v14`、2026-08-19 凍結）。
+  **方策ネットの `rl_v23`**（R-NaD 50,000更新、2026-10-02 凍結。新マスクの最初の版）、estimator 系の最新は
+  `estimator_v14`（2026-08-19 凍結））。方策ネットの凍結は
+  `python3 scripts/freeze_rl.py <N> <日付> "<要約>" models/rl_vN.bin > src/frozen/rl_vN.rs`
+  （推論の一式を固定コピー・重みを埋め込み。共有のまま使う `src/model.rs` は
+  `SHARED_MODEL_PINS` で pin。同一性確認は `frozen::tests::rl凍結版は元の重みと同じ手を指す`
+  が `SOURCES` の rl_ 版を全部一手ずつ突き合わせる＝登録するだけで検査される）。
+  登録は `frozen/mod.rs`（`pub mod` と `SOURCES`）・`strategy::make`/`make_seeded`・
+  arena.yml の baselines 既定値（2か所）。
+  **ガントレットの既定は rl_v15 以降＋歩哨の `estimator_v14`**（2026-09-30 ユーザー判断）。
+  v14 を残すのは非推移性の検出のため: 15,000更新は rl_v15 に 71% と大きく伸びたのに
+  v9〜v14 へのペア差は −1.0pt±4.7 で横ばいだった（自己対局の系列は自分の過去版に
+  特化しうる）。v14 は詰みで終わる局が多く、反則負けが主の v9〜v12 と違う相手になる。
+  estimator 系の手順は以下。
   凍結後は編集しない。改善が確定したら
   `python3 scripts/freeze_estimator.py <N> <日付> "<差分の要約>" > src/frozen/estimator_vN.rs`
   で生成し（estimator.rs/check.rs/strategy.rs を1ファイルへまとめ、テストと
@@ -732,7 +755,7 @@ opp_move / value の教師データを再生成する（教師データの鮮度
   （observation.rs にない情報を使わない、という公平性の担保はこの構造で守る）
 - **比較の基準は heuristic ではなく凍結版**。heuristic への勝率は飽和していて
   改善の検出力がない。また非推移性（v2 に勝つが v1 に負ける）を検出するため、
-  **ガントレットで凍結版に勝ち越すことを合格条件とする**（既定の対象は v9 以降）
+  **ガントレットで凍結版に勝ち越すことを合格条件とする**（既定の対象は rl_v15 以降の方策ネット＋歩哨の estimator_v14。v9〜v13 は 2026-09-30 に既定から外した＝方策ネットが全版に大差で勝ち越し、判別力がないため）
 - 同一戦略同士は約50%になる（1000局で確認済み）。**同一コードでも 100 局では
   44% まで振れる**ので、版の比較は必ず `match_seed` でペアにする
 - 時間切れは負けとして数え、思考時間の統計（平均/p99/最大）も出す。
