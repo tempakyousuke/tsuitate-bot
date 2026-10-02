@@ -17,7 +17,7 @@ use rayon::prelude::*;
 use tsuitate_bot::protocol::Color;
 use tsuitate_bot::rl::action::NUM_ACTIONS;
 use tsuitate_bot::rl::encode::{NUM_PLANES, OBS_LEN};
-use tsuitate_bot::rl::env::{EnvGame, Outcome};
+use tsuitate_bot::rl::env::{EnvGame, GUARD_RADII, Outcome, StyleStats};
 use tsuitate_bot::selfplay::{GameResult, mix};
 use tsuitate_bot::strategy::{self, Strategy};
 
@@ -33,6 +33,7 @@ struct Finished {
     game_no: u32,
     learner: Option<Color>,
     outcome: Outcome,
+    style: StyleStats,
 }
 
 /// 新しい局を作るのに要る設定（`VecEnv` 本体は Sync でないので、並列に作るときはこれだけ渡す）
@@ -41,9 +42,26 @@ struct GameSpec {
     /// 評価モードの相手（`strategy::make` の名前）。None なら自己対局
     opponent: Option<String>,
     seed: u64,
+    /// 玉の周りの固めのボーナスの係数 λ（0 = 報酬は勝敗だけ）
+    guard_bonus: f32,
+    /// ボーナスに使う半径の `GUARD_RADII` の添字
+    guard_radius_idx: usize,
 }
 
 impl GameSpec {
+    /// 終局の報酬 = 勝敗(±1) + λ × 対局を通した玉の周りの占有率の平均（両者それぞれ）。
+    /// λ > 0 では零和でなくなる
+    fn rewards(&self, outcome: &Outcome, style: &StyleStats) -> [f32; 2] {
+        let mut r = outcome.rewards();
+        if self.guard_bonus != 0.0 {
+            let g = style.guard_mean(self.guard_radius_idx);
+            for (r, g) in r.iter_mut().zip(g) {
+                *r += self.guard_bonus * g as f32;
+            }
+        }
+        r
+    }
+
     fn learner(&self, game_no: u32) -> Option<Color> {
         self.opponent.as_ref().map(|_| learner_of(game_no))
     }
@@ -115,6 +133,7 @@ fn build_fresh(
                     game_no: game.game_no(),
                     learner: spec.learner(game.game_no()),
                     outcome,
+                    style: *game.style(),
                 }),
             }
         }
@@ -125,23 +144,38 @@ fn build_fresh(
 #[pymethods]
 impl VecEnv {
     #[new]
-    #[pyo3(signature = (n, opponent=None, seed=0, auto_reset=true))]
+    #[pyo3(signature = (n, opponent=None, seed=0, auto_reset=true, guard_bonus=0.0, guard_radius=1))]
     fn new(
         py: Python<'_>,
         n: usize,
         opponent: Option<String>,
         seed: u64,
         auto_reset: bool,
+        guard_bonus: f32,
+        guard_radius: i8,
     ) -> PyResult<Self> {
         if n == 0 {
             return Err(PyValueError::new_err("n は 1 以上"));
         }
+        if !guard_bonus.is_finite() {
+            return Err(PyValueError::new_err("guard_bonus は有限の値"));
+        }
+        let Some(guard_radius_idx) = GUARD_RADII.iter().position(|&r| r == guard_radius) else {
+            return Err(PyValueError::new_err(format!(
+                "guard_radius は {GUARD_RADII:?} のどれか"
+            )));
+        };
         if let Some(name) = &opponent
             && make_opponent(name, 0).is_none()
         {
             return Err(PyValueError::new_err(format!("未知の戦略: {name}")));
         }
-        let spec = GameSpec { opponent, seed };
+        let spec = GameSpec {
+            opponent,
+            seed,
+            guard_bonus,
+            guard_radius_idx,
+        };
         let mut next_game_no = 0;
         let mut finished = vec![];
         let games = py.detach(|| build_fresh(&spec, &mut next_game_no, &mut finished, n));
@@ -273,7 +307,8 @@ impl VecEnv {
                 match r {
                     Ok(None) => {}
                     Ok(Some(outcome)) => {
-                        rewards[2 * i..2 * i + 2].copy_from_slice(&outcome.rewards());
+                        let reward = spec.rewards(&outcome, games[i].style());
+                        rewards[2 * i..2 * i + 2].copy_from_slice(&reward);
                         done[i] = true;
                     }
                     // 検査済みなので起きない（起きたら環境の不具合）
@@ -288,6 +323,7 @@ impl VecEnv {
                     game_no: old.game_no(),
                     learner: spec.learner(old.game_no()),
                     outcome: old.outcome().expect("done の局は終局している"),
+                    style: *old.style(),
                 });
             }
             if auto_reset {
@@ -333,6 +369,14 @@ impl VecEnv {
             d.set_item("plies", f.outcome.plies)?;
             d.set_item("fouls", f.outcome.fouls.to_vec())?;
             d.set_item("learner", f.learner.map(color_code))?;
+            // 玉の周りを固める戦法の集計（[先手, 後手]）。guard_r1 / guard_r2 は半径1（8近傍）/
+            // 半径2 の占有率の対局平均、near_* は自玉から距離2以内の打ち・打ちの反則・駒取りの回数
+            for (r, &radius) in GUARD_RADII.iter().enumerate() {
+                d.set_item(format!("guard_r{radius}"), f.style.guard_mean(r).to_vec())?;
+            }
+            d.set_item("near_drops", f.style.near_drops.to_vec())?;
+            d.set_item("near_drop_fouls", f.style.near_drop_fouls.to_vec())?;
+            d.set_item("near_captures", f.style.near_captures.to_vec())?;
             out.push(d);
         }
         Ok(out)

@@ -134,6 +134,42 @@ def check_seeded_opponent() -> None:
     assert any((x != y).any() for x, y in zip(a, c)), "seed を変えても同じ観測列"
 
 
+def check_guard_bonus() -> None:
+    """guard_bonus=λ の報酬は、勝敗の報酬 + λ × 玉の周りの占有率の対局平均（両者それぞれ）"""
+    n, lam = 16, 0.5
+    plain = tsuitate_rl.VecEnv(n, seed=6, auto_reset=False)
+    bonus = tsuitate_rl.VecEnv(n, seed=6, auto_reset=False, guard_bonus=lam)
+    rng = np.random.default_rng(6)
+    got = np.zeros((n, 2), dtype=np.float32)
+    base = np.zeros((n, 2), dtype=np.float32)
+    while plain.alive().any():
+        _, mask, _ = plain.observe()
+        _, mask_b, _ = bonus.observe()
+        assert (mask == mask_b).all(), "ボーナスは対局の進行を変えない"
+        actions = random_actions(mask, rng)
+        actions[~plain.alive()] = -1
+        r0, _ = plain.step(actions)
+        r1, _ = bonus.step(actions)
+        base += r0
+        got += r1
+    finished = {f["game_no"]: f for f in bonus.pop_finished()}
+    assert len(finished) == n
+    for i in range(n):
+        f = finished[i]  # 初期の n 局は局番号 = 並びの位置
+        for key in ("guard_r1", "guard_r2"):
+            assert all(0.0 <= v <= 1.0 for v in f[key])
+        expected = base[i] + lam * np.array(f["guard_r1"], dtype=np.float32)
+        assert np.allclose(got[i], expected, atol=1e-5), (got[i], expected)
+    try:
+        tsuitate_rl.VecEnv(1, guard_radius=3)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("未対応の半径が通った")
+    mean = np.mean([f["guard_r1"] for f in finished.values()])
+    print(f"玉の周りのボーナス: 報酬の加算が集計と一致（ランダム方策の8近傍占有率 平均 {mean:.3f}）")
+
+
 def bench(n: int, steps: int) -> None:
     env = tsuitate_rl.VecEnv(n, seed=3)
     rng = np.random.default_rng(3)
@@ -162,6 +198,7 @@ if __name__ == "__main__":
     check_atomic_step()
     check_no_auto_reset()
     check_seeded_opponent()
+    check_guard_bonus()
     print("不正行動の一括拒否・seed つき相手の再現性: OK")
     for n in (64, 256, 1024):
         bench(n, 100)
