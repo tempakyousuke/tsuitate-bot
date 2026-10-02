@@ -384,7 +384,8 @@ struct Encoded {
     value: Vec<f32>,
     foul: Vec<bool>,
     game: Vec<i32>,
-    /// マスクの外にあった教師の手（通常は 0。0 でなければエンコードかマスクの不具合）
+    /// マスクの外にあった教師の手。観測から反則が確定する手（`action::legal_mask` の除外）を
+    /// 教師が試みたぶんだけ出る（それ以外で出ればエンコードかマスクの不具合）
     outside_mask: usize,
 }
 
@@ -398,7 +399,7 @@ fn encode_game(g: &LoadedGame, game_idx: usize) -> Encoded {
     e.mask.reserve(g.attempts * NUM_ACTIONS);
     let _ = replay(end, |r, a| {
         let view = r.view(a.side, [0, 0], game_idx as u32);
-        let mask = legal_mask(&view, r.foul_tried(a.side));
+        let mask = legal_mask(&view, r.log(a.side), r.foul_tried(a.side));
         let Some(action) = encode_usi(&a.usi, a.side).filter(|&x| mask[x]) else {
             e.outside_mask += 1;
             return;

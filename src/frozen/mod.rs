@@ -524,15 +524,22 @@ mod tests {
         use crate::protocol::Color;
         use crate::referee::{Referee, StepResult};
         use crate::strategy::Strategy;
-        let rl_versions: Vec<&str> = SOURCES
+        let rl_versions: Vec<(&str, &str)> = SOURCES
             .iter()
-            .map(|(_, name, _)| *name)
-            .filter(|name| name.starts_with("rl_v"))
+            .map(|(_, name, src)| (*name, *src))
+            .filter(|(name, _)| name.starts_with("rl_v"))
             .collect();
-        assert!(rl_versions.contains(&"rl_v22"), "{rl_versions:?}");
-        for version in rl_versions {
+        assert!(rl_versions.iter().any(|(n, _)| *n == "rl_v22"), "rl_v22 が無い");
+        for (version, src) in rl_versions {
             let path = format!("{}/models/{version}.bin", env!("CARGO_MANIFEST_DIR"));
-            let name = format!("rl_policy:{path}");
+            // 観測からの確定反則を落とすマスク（`action::MASK_VERSION` 2）より前に凍結した版は
+            // 旧マスクと比べる
+            let prefix = if src.contains("pub const MASK_VERSION") {
+                crate::rl::policy::PREFIX_SAMPLE
+            } else {
+                crate::rl::policy::PREFIX_BASIC
+            };
+            let name = format!("{prefix}{path}");
             for game in 0..3u64 {
                 let mut frozen = [
                     crate::strategy::make_seeded(version, game).unwrap(),

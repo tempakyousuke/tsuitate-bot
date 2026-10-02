@@ -197,7 +197,7 @@ mod tests {
             let (result, reason) = loop {
                 let side = referee.to_move();
                 let view = referee.view(side, [0, 0], game);
-                let mask = legal_mask(&view, referee.foul_tried(side));
+                let mask = legal_mask(&view, referee.log(side), referee.foul_tried(side));
                 let a = random_action(&mask, rng.random()).unwrap();
                 let mut tried: Vec<String> = referee.foul_tried(side).iter().cloned().collect();
                 tried.sort();
@@ -265,7 +265,7 @@ mod tests {
         let (result, reason) = loop {
             let side = referee.to_move();
             let view = referee.view(side, [0, 0], 0);
-            let mask = legal_mask(&view, referee.foul_tried(side));
+            let mask = legal_mask(&view, referee.log(side), referee.foul_tried(side));
             let usi = decode_usi(random_action(&mask, rng.random()).unwrap(), side).unwrap();
             if let StepResult::Ended { result, reason, .. } = referee.step(&usi, 0) {
                 break (result, reason);
