@@ -3,9 +3,17 @@ name: Mine tsume
 # 自己対局の棋譜から「詰めチャレ」（サイト tsuitate の /tsume-challenge）の
 # 問題を掘り、取り込みJSONを artifact として出す。
 #
-# 毎日 09:00 UTC（18:00 JST）に自動実行される。既定は自己対局160局からの採掘で、
-# 実測 0.62問/局 なので概ね100問/日。**取り込みはサイト側の日次 cron が artifact を
+# 毎日 09:00 UTC（18:00 JST）に自動実行される。既定は方策ネット（R-NaD）同士の
+# 自己対局800局からの採掘。**取り込みはサイト側の日次 cron が artifact を
 # 取りにくる**（tsuitate の docs/operations.md）ので、ここは artifact を置くだけ。
+#
+# 自己対局の既定は rl_v22（最新の凍結版）vs rl_v20（本番 bot）。2026-10-02 に
+# estimator vs estimator_v14（160局）から切り替えた。方策ネットは1手 約20ms で
+# 50局が約30秒（estimator は1シャード20局に約25分）なので対局はほぼ無料になり、
+# 律速は採掘（ソルバー）側へ移った。採掘の1シャードあたりの局数を従来並み
+# （約50局）に保つよう mine_shards を増やしてある。
+# 手元実測（40局・--skip-plies 40・timeout 60秒）: 0.5問/局（estimator は約0.3問/局）。
+# 3手詰14 / 5手詰3 / 9手詰1 / 15手詰2、推定レート 932〜2077。
 #
 # 入力は2通り:
 #   1. arena_run_id を指定 … 既存の Arena 実行の `arena-records-*` を使う
@@ -41,15 +49,15 @@ on:
       games:
         description: "自己対局する場合の対局数（全シャード合計）"
         required: false
-        default: "200"
+        default: "800"
       candidate:
         description: "自己対局の候補戦略"
         required: false
-        default: "estimator"
+        default: "rl_v22"
       baseline:
         description: "自己対局の基準戦略"
         required: false
-        default: "estimator_v14"
+        default: "rl_v20"
       clock:
         description: "自己対局の時計（初期秒+加算秒）。既定は本番相当"
         required: false
@@ -57,11 +65,11 @@ on:
       selfplay_shards:
         description: "自己対局の分割数"
         required: false
-        default: "4"
+        default: "2"
       mine_shards:
         description: "採掘の分割数（棋譜ファイルをこの数に分けて並列に解く）"
         required: false
-        default: "4"
+        default: "16"
       skip_plies:
         description: "この手数までの局面は無視する（序盤は詰まない）"
         required: false
@@ -104,12 +112,12 @@ on:
 # （job レベルの if: だけは env を参照できないので inputs.arena_run_id のまま。
 #  schedule では空＝自己対局、という意図どおりの分岐になる）。
 env:
-  GAMES: ${{ inputs.games || '160' }}
-  CANDIDATE: ${{ inputs.candidate || 'estimator' }}
-  BASELINE: ${{ inputs.baseline || 'estimator_v14' }}
+  GAMES: ${{ inputs.games || '800' }}
+  CANDIDATE: ${{ inputs.candidate || 'rl_v22' }}
+  BASELINE: ${{ inputs.baseline || 'rl_v20' }}
   CLOCK: ${{ inputs.clock || '300+3' }}
-  SELFPLAY_SHARDS: ${{ inputs.selfplay_shards || '8' }}
-  MINE_SHARDS: ${{ inputs.mine_shards || '4' }}
+  SELFPLAY_SHARDS: ${{ inputs.selfplay_shards || '2' }}
+  MINE_SHARDS: ${{ inputs.mine_shards || '16' }}
   SKIP_PLIES: ${{ inputs.skip_plies || '40' }}
   MIN_DEPTH: ${{ inputs.min_depth || '3' }}
   MAX_DEPTH: ${{ inputs.max_depth || '15' }}
