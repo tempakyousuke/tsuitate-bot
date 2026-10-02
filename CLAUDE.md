@@ -384,7 +384,10 @@
   時計・投了・診断用オラクルは対局者側の都合なので `selfplay.rs` 側に残す。
   切り出し前後の等価性はダイジェストのテストで固定してある
 - `rl/` — **DeepNash（R-NaD）路線の部品**（NN 段階④、設計は `docs/rl-deepnash-design.md`）。
-  `action.rs` = 139×81 の行動符号化と自駒視点の行動マスク（真の合法手 ⊆ マスクを常時検査）、
+  `action.rs` = 139×81 の行動符号化と行動マスク（真の合法手 ⊆ マスクを常時検査）。
+  マスクは自駒視点の候補に加えて**観測から反則が確定する手**（王手を解消し得ない手・反則手の
+  成/不成の片割れ・直前に取られたマスへの打ち）を落とす（`MASK_VERSION` 2、2026-10-02〜。
+  rl_v21 以前の凍結版は旧マスク = `rl_policy_basic:`。詳細は設計 doc の「行動マスク」）、
   `encode.rs` = 観測 → 86×9×9 のテンソル。**入力は `Strategy::choose` と同じ
   `(PlayerView, ObservationLog, foul_tried)` だけ**にしてあり、学習環境と推論が同じ関数を通る。
   `env.rs` = RL 環境の1局（自己対局・Rust 戦略を相手にする評価モード）。
@@ -395,7 +398,8 @@
   （学習は `~/Develop/tsuitate-nn/rnad/`、PyTorch との一致はフィクスチャ
   `tests/fixtures/rl/tiny_policy.*` で常時検査）。`policy.rs` = 方策ネットで指す戦略で、
   **戦略名に重みのパスを埋め込む**（`rl_policy:<パス>` はサンプリング、
-  `rl_policy_greedy:<パス>` は最大の手。記録上の名前は重みの sha256 入りの `rl_policy@<12桁>`）。
+  `rl_policy_greedy:<パス>` は最大の手、`rl_policy_basic:<パス>` は旧マスクでのサンプリング。
+  記録上の名前は重みの sha256 入りの `rl_policy@<12桁>`）。
   **実験中の重みはリポジトリにコミットせず GitHub Release に置く**（重みは差分圧縮が効かず
   履歴が膨らむため。採用した版だけ `models/` にコミットする）。CI の arena では
   `rl_policy:release:<タグ>/<ファイル名>` と書けば arena.yml が取ってくる
