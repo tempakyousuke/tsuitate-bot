@@ -240,7 +240,6 @@ struct CheckerHyp {
 ///    （= 合法か）は盤上の占有にしか依らない。行き所の有無は候補生成が自駒視点で落とし済み
 /// 2. **相手の駒がいると確定したマス**（`occupied`）への打ちと、そこを飛び越える移動。確定の根拠は
 ///    - 直前に相手が駒を取ったマス（相手の着手駒がいまそこにいる）
-///    - 動けないと確定している相手の歩（`deduce::immobile_opponent_pawns`）
 ///    - 王手中でないときの**歩以外の打ちの反則**: 打ちで自玉が危なくなることは無く、二歩・
 ///      行き所は候補生成が落とし済みなので、原因は「打ち先に相手の駒がいる」しかない
 ///      （歩は打ち歩詰めがありうるので使わない）
@@ -349,8 +348,9 @@ impl Deduction {
             }
         }
 
+        // 動けないと確定している相手の歩（deduce::immobile_opponent_pawns）は使わない:
+        // ログを毎回先頭から辿るのでマスクのコストが倍になる割に、記録483局で反則2件にしか効かない
         let mut occupied: HashSet<Coord> = known_opponent.into_iter().collect();
-        occupied.extend(crate::deduce::immobile_opponent_pawns(view.your_color, log));
 
         let mut blocked_beyond = vec![];
         if !view.you_in_check {
