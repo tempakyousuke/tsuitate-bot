@@ -677,7 +677,7 @@
   **各版の内容と凍結時の成績は `docs/frozen-versions.md`**（現行の最新は
   **方策ネットの `rl_v24`**（R-NaD 55,000更新、2026-10-03 凍結）、estimator 系の最新は
   `estimator_v14`（2026-08-19 凍結）。スタイル特化の系列は `rl_<系列>_vN` で、最新は入玉特化の
-  `rl_nyugyoku_v1`（2026-10-03 凍結。既定のガントレットに入れる））。方策ネットの凍結は
+  `rl_nyugyoku_v1`（2026-10-03 凍結）と速攻特化の `rl_speed_v1`（2026-10-04 凍結）。どちらも既定のガントレットに入れる）。方策ネットの凍結は
   `python3 scripts/freeze_rl.py <N> <日付> "<要約>" models/rl_vN.bin > src/frozen/rl_vN.rs`
   （特化の系列は `--series <系列>` を付けて `models/rl_<系列>_vN.bin` → `src/frozen/rl_<系列>_vN.rs`。
   `SOURCES` の番号は系列をまたいだ凍結の通し番号）
