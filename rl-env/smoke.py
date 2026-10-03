@@ -208,6 +208,54 @@ def check_guard_bonus() -> None:
     print(f"玉の周りのボーナス: 報酬の加算が集計と一致（ランダム方策の8近傍占有率 平均 {mean:.3f}）")
 
 
+def check_speed_bonus() -> None:
+    """speed_bonus=λ の報酬は、勝敗の報酬 + 勝った側に λ × max(0, (H − 手数) / H)（zero なら負けた側から引く）"""
+    n, lam, horizon = 16, 2.0, 150
+    plain = tsuitate_rl.VecEnv(n, seed=7, auto_reset=False)
+    own = tsuitate_rl.VecEnv(n, seed=7, auto_reset=False, speed_bonus=lam, speed_horizon=horizon)
+    zero = tsuitate_rl.VecEnv(
+        n, seed=7, auto_reset=False, speed_bonus=lam, speed_horizon=horizon, speed_sum="zero"
+    )
+    rng = np.random.default_rng(7)
+    base = np.zeros((n, 2), dtype=np.float32)
+    got_own = np.zeros((n, 2), dtype=np.float32)
+    got_zero = np.zeros((n, 2), dtype=np.float32)
+    while plain.alive().any():
+        _, mask, _ = plain.observe()
+        for env in (own, zero):
+            _, mask_b, _ = env.observe()
+            assert (mask == mask_b).all(), "ボーナスは対局の進行を変えない"
+        actions = random_actions(mask, rng)
+        actions[~plain.alive()] = -1
+        base += plain.step(actions)[0]
+        got_own += own.step(actions)[0]
+        got_zero += zero.step(actions)[0]
+    finished = {f["game_no"]: f for f in own.pop_finished()}
+    assert len(finished) == n
+    wins = 0
+    for i in range(n):
+        f = finished[i]  # 初期の n 局は局番号 = 並びの位置
+        bonus = np.zeros(2, dtype=np.float32)
+        if f["winner"] is not None:
+            wins += 1
+            b = lam * max(0.0, (horizon - f["plies"]) / horizon)
+            bonus[f["winner"]] = b
+            assert np.allclose(got_zero[i], base[i] + np.where(bonus > 0, bonus, -b), atol=1e-5)
+        else:
+            assert np.allclose(got_zero[i], base[i], atol=1e-5)
+        assert np.allclose(got_own[i], base[i] + bonus, atol=1e-5), (got_own[i], base[i], bonus)
+        assert abs(got_zero[i].sum()) < 1e-5, "zero は零和"
+    for kwargs in ({"speed_horizon": 0}, {"speed_sum": "both"}, {"speed_bonus": float("nan")}):
+        try:
+            tsuitate_rl.VecEnv(1, **kwargs)
+        except (ValueError, OverflowError):
+            pass
+        else:
+            raise AssertionError(f"不正な指定が通った: {kwargs}")
+    plies = np.mean([f["plies"] for f in finished.values()])
+    print(f"速攻ボーナス: 報酬の加算が手数と一致（ランダム方策 {wins}/{n} 局が決着、平均 {plies:.1f} 手）")
+
+
 def bench(n: int, steps: int) -> None:
     env = tsuitate_rl.VecEnv(n, seed=3)
     rng = np.random.default_rng(3)
@@ -238,6 +286,7 @@ if __name__ == "__main__":
     check_seeded_opponent()
     check_opponents_list()
     check_guard_bonus()
+    check_speed_bonus()
     print("不正行動の一括拒否・seed つき相手の再現性・相手の混在: OK")
     for n in (64, 256, 1024):
         bench(n, 100)

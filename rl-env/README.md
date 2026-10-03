@@ -36,6 +36,8 @@ env = tsuitate_rl.VecEnv(8, opponents=["rl_v15"] * 4 + ["rl_v16"] * 4, auto_rese
                                    # リーグ学習: 局番号 g の局は opponents[g % len] と指す（下記）
 env = tsuitate_rl.VecEnv(64, opponent="rl_policy:<重み>", guard_bonus=0.5, guard_radius=1)
                                    # 玉の周りの固めのボーナス（下記）
+env = tsuitate_rl.VecEnv(256, speed_bonus=2.0, speed_horizon=200, speed_sum="own")
+                                   # 速攻ボーナス（下記）
 ```
 
 - 終局した局は `step` の中で新しい局へ差し替わる（`done` の局の次の `observe` は新しい局）。
@@ -66,6 +68,11 @@ env = tsuitate_rl.VecEnv(64, opponent="rl_policy:<重み>", guard_bonus=0.5, gua
   開始局面と受理手の直後ごとに標本を取る。**λ > 0 では報酬が零和でなくなる**ので、評価モードで
   学習側の列だけを使う形を想定している。`pop_finished()` の `guard_r1` / `guard_r2` は λ に
   関係なく常に出る（監視用）
+- **`speed_bonus=λ`**（既定 0）: 終局の報酬に、**勝った側にだけ** λ × max(0, (`speed_horizon` − 手数) / `speed_horizon`)
+  を足す（速攻特化モデル用。`docs/rl-deepnash-design.md` の「速攻特化（決着の速さのボーナス）」）。手数は受理手の数
+  （`pop_finished()` の `plies`）で、`speed_horizon` の既定は 200（`MAX_PLIES`）。引き分けには付かない。
+  `speed_sum="own"`（既定）は非零和、`speed_sum="zero"` は負けた側から同じ額を引く（零和だが、負けそうな側に
+  手数を延ばす動機ができる）。`guard_bonus` と併用すると両方が足される
 - **`opponents=[名前, ...]`**（`opponent` と排他）: 1つの env に複数の相手を混ぜる。局番号 g の局は
   `opponents[g % len]` と指す。リーグ学習（tsuitate-nn の `--league`）で、苦手な相手ほど多く当てる配分を
   1つの env で回すためのもの。相手ごとに env を分けると、相手の推論（凍結版の方策ネットで1手約10ms）が
