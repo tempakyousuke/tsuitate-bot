@@ -30,8 +30,10 @@ env = tsuitate_rl.VecEnv(64, opponent="heuristic", seed=0)  # 評価モード（
 obs, mask, player = env.observe()  # [n,86,9,9] f32 / [n,11259] bool / [n] i8（0=先手 1=後手）
 rewards, done = env.step(actions)  # [n] i64 → [n,2] f32（先手,後手）/ [n] bool
 env.learner_colors()               # 評価モードの学習側の色（自己対局は -1）
-env.pop_finished()                 # 終局した局: game_no / winner / reason / plies / fouls / learner
+env.pop_finished()                 # 終局した局: game_no / winner / reason / plies / fouls / learner / opponent
                                    #   ＋玉の周りの集計: guard_r1 / guard_r2 / near_drops / near_drop_fouls / near_captures
+env = tsuitate_rl.VecEnv(8, opponents=["rl_v15"] * 4 + ["rl_v16"] * 4, auto_reset=False)
+                                   # リーグ学習: 局番号 g の局は opponents[g % len] と指す（下記）
 env = tsuitate_rl.VecEnv(64, opponent="rl_policy:<重み>", guard_bonus=0.5, guard_radius=1)
                                    # 玉の周りの固めのボーナス（下記）
 ```
@@ -64,6 +66,13 @@ env = tsuitate_rl.VecEnv(64, opponent="rl_policy:<重み>", guard_bonus=0.5, gua
   開始局面と受理手の直後ごとに標本を取る。**λ > 0 では報酬が零和でなくなる**ので、評価モードで
   学習側の列だけを使う形を想定している。`pop_finished()` の `guard_r1` / `guard_r2` は λ に
   関係なく常に出る（監視用）
+- **`opponents=[名前, ...]`**（`opponent` と排他）: 1つの env に複数の相手を混ぜる。局番号 g の局は
+  `opponents[g % len]` と指す。リーグ学習（tsuitate-nn の `--league`）で、苦手な相手ほど多く当てる配分を
+  1つの env で回すためのもの。相手ごとに env を分けると、相手の推論（凍結版の方策ネットで1手約10ms）が
+  env の数だけ直列になる（`VecEnv` は unsendable なので Python のスレッドでは並べられない）。
+  学習側の色は局番号の偶奇で決まるので、相手ごとに**偶数個ずつ**並べると先後がそろう。
+  作った直後に終局した局（相手の即投了など）は局番号を進めて作り直すので、その後ろの局の相手はずれうる。
+  どの相手と指した局かは `pop_finished()` の `opponent` で分かる
 
 ### 模倣学習のデータセット（M2a）
 

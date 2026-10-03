@@ -32,6 +32,8 @@ type StepOut<'py> = (Bound<'py, PyArray2<f32>>, Bound<'py, PyArray1<bool>>);
 struct Finished {
     game_no: u32,
     learner: Option<Color>,
+    /// 評価モードの相手の名前（自己対局は None）
+    opponent: Option<String>,
     outcome: Outcome,
     style: StyleStats,
 }
@@ -39,8 +41,10 @@ struct Finished {
 /// 新しい局を作るのに要る設定（`VecEnv` 本体は Sync でないので、並列に作るときはこれだけ渡す）
 #[derive(Clone)]
 struct GameSpec {
-    /// 評価モードの相手（`strategy::make` の名前）。None なら自己対局
-    opponent: Option<String>,
+    /// 評価モードの相手（`strategy::make` の名前）。空なら自己対局。
+    /// 局番号 g の局は `opponents[g % len]` と指す（相手1人なら全局がその相手。
+    /// 複数ならリーグ学習で1つの env に相手を混ぜる。`VecEnv::new` の `opponents`）
+    opponents: Vec<String>,
     seed: u64,
     /// 玉の周りの固めのボーナスの係数 λ（0 = 報酬は勝敗だけ）
     guard_bonus: f32,
@@ -62,12 +66,26 @@ impl GameSpec {
         r
     }
 
+    fn opponent(&self, game_no: u32) -> Option<&String> {
+        (!self.opponents.is_empty()).then(|| &self.opponents[game_no as usize % self.opponents.len()])
+    }
+
     fn learner(&self, game_no: u32) -> Option<Color> {
-        self.opponent.as_ref().map(|_| learner_of(game_no))
+        self.opponent(game_no).map(|_| learner_of(game_no))
+    }
+
+    fn finished(&self, game: &EnvGame) -> Finished {
+        Finished {
+            game_no: game.game_no(),
+            learner: self.learner(game.game_no()),
+            opponent: self.opponent(game.game_no()).cloned(),
+            outcome: game.outcome().expect("終局した局だけを記録する"),
+            style: *game.style(),
+        }
     }
 
     fn build(&self, game_no: u32) -> EnvGame {
-        match &self.opponent {
+        match self.opponent(game_no) {
             None => EnvGame::selfplay(None, game_no),
             Some(name) => {
                 let opp = make_opponent(name, mix(self.seed ^ mix(u64::from(game_no))))
@@ -127,14 +145,10 @@ fn build_fresh(
             .map(|g| spec.build(g))
             .collect();
         for game in built {
-            match game.outcome() {
-                None => out.push(game),
-                Some(outcome) => finished.push(Finished {
-                    game_no: game.game_no(),
-                    learner: spec.learner(game.game_no()),
-                    outcome,
-                    style: *game.style(),
-                }),
+            if game.outcome().is_none() {
+                out.push(game);
+            } else {
+                finished.push(spec.finished(&game));
             }
         }
     }
@@ -144,7 +158,8 @@ fn build_fresh(
 #[pymethods]
 impl VecEnv {
     #[new]
-    #[pyo3(signature = (n, opponent=None, seed=0, auto_reset=true, guard_bonus=0.0, guard_radius=1))]
+    #[pyo3(signature = (n, opponent=None, seed=0, auto_reset=true, guard_bonus=0.0, guard_radius=1, opponents=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         n: usize,
@@ -153,6 +168,7 @@ impl VecEnv {
         auto_reset: bool,
         guard_bonus: f32,
         guard_radius: i8,
+        opponents: Option<Vec<String>>,
     ) -> PyResult<Self> {
         if n == 0 {
             return Err(PyValueError::new_err("n は 1 以上"));
@@ -165,13 +181,28 @@ impl VecEnv {
                 "guard_radius は {GUARD_RADII:?} のどれか"
             )));
         };
-        if let Some(name) = &opponent
-            && make_opponent(name, 0).is_none()
-        {
-            return Err(PyValueError::new_err(format!("未知の戦略: {name}")));
+        // `opponents` は局番号 g の局の相手を `opponents[g % len]` で決める（リーグ学習で1つの env に
+        // 相手を混ぜる。相手ごとに env を分けると、相手の推論が env の数だけ直列になる）。
+        // 局番号の偶奇で学習側の色が決まるので、相手ごとの局は偶数個ずつ並べると先後がそろう
+        let opponents = match (opponent, opponents) {
+            (Some(_), Some(_)) => {
+                return Err(PyValueError::new_err("opponent と opponents は片方だけ指定する"));
+            }
+            (Some(name), None) => vec![name],
+            (None, Some(list)) if list.is_empty() => {
+                return Err(PyValueError::new_err("opponents が空"));
+            }
+            (None, Some(list)) => list,
+            (None, None) => vec![],
+        };
+        let mut checked = std::collections::HashSet::new();
+        for name in &opponents {
+            if checked.insert(name.as_str()) && make_opponent(name, 0).is_none() {
+                return Err(PyValueError::new_err(format!("未知の戦略: {name}")));
+            }
         }
         let spec = GameSpec {
-            opponent,
+            opponents,
             seed,
             guard_bonus,
             guard_radius_idx,
@@ -318,13 +349,7 @@ impl VecEnv {
             // 終局した局を記録し、auto_reset なら新しい局へ差し替える（新しい局の構築も並列）
             let ended: Vec<usize> = (0..n).filter(|&i| done[i]).collect();
             for &i in &ended {
-                let old = &games[i];
-                finished.push(Finished {
-                    game_no: old.game_no(),
-                    learner: spec.learner(old.game_no()),
-                    outcome: old.outcome().expect("done の局は終局している"),
-                    style: *old.style(),
-                });
+                finished.push(spec.finished(&games[i]));
             }
             if auto_reset {
                 let fresh = build_fresh(spec, next_game_no, finished, ended.len());
@@ -369,6 +394,7 @@ impl VecEnv {
             d.set_item("plies", f.outcome.plies)?;
             d.set_item("fouls", f.outcome.fouls.to_vec())?;
             d.set_item("learner", f.learner.map(color_code))?;
+            d.set_item("opponent", f.opponent)?;
             // 玉の周りを固める戦法の集計（[先手, 後手]）。guard_r1 / guard_r2 は半径1（8近傍）/
             // 半径2 の占有率の対局平均、near_* は自玉から距離2以内の打ち・打ちの反則・駒取りの回数
             for (r, &radius) in GUARD_RADII.iter().enumerate() {

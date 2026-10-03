@@ -134,6 +134,44 @@ def check_seeded_opponent() -> None:
     assert any((x != y).any() for x, y in zip(a, c)), "seed を変えても同じ観測列"
 
 
+def check_opponents_list() -> None:
+    """opponents=[...] は局番号 g の局を opponents[g % len] と指させ、pop_finished に相手名が出る。
+    1人だけの opponents=[x] は opponent=x と同じ観測列になる"""
+    names = ["heuristic"] * 4 + ["rl_v15"] * 4
+    env = tsuitate_rl.VecEnv(8, opponents=names, seed=9, auto_reset=False)
+    colors = env.learner_colors()
+    assert colors.tolist() == [0, 1] * 4, colors
+    rng = np.random.default_rng(1)
+    while env.alive().any():
+        _, mask, _ = env.observe()
+        actions = random_actions(mask, rng)
+        actions[~env.alive()] = -1
+        env.step(actions)
+    fin = sorted(env.pop_finished(), key=lambda f: f["game_no"])
+    assert [f["opponent"] for f in fin] == names, [f["opponent"] for f in fin]
+    assert [f["learner"] for f in fin] == [0, 1] * 4
+
+    def run(**kw) -> list[np.ndarray]:
+        e = tsuitate_rl.VecEnv(4, seed=21, **kw)
+        r = np.random.default_rng(2)
+        out = []
+        for _ in range(40):
+            obs, mask, _ = e.observe()
+            out.append(obs.copy())
+            e.step(random_actions(mask, r))
+        return out
+
+    a, b = run(opponent="heuristic"), run(opponents=["heuristic"])
+    assert all((x == y).all() for x, y in zip(a, b)), "opponents=[x] が opponent=x と違う"
+    for bad in ({"opponent": "heuristic", "opponents": ["heuristic"]}, {"opponents": []},
+                {"opponents": ["heuristic", "存在しない戦略"]}):
+        try:
+            tsuitate_rl.VecEnv(2, **bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"{bad} が通った")
+
+
 def check_guard_bonus() -> None:
     """guard_bonus=λ の報酬は、勝敗の報酬 + λ × 玉の周りの占有率の対局平均（両者それぞれ）"""
     n, lam = 16, 0.5
@@ -198,7 +236,8 @@ if __name__ == "__main__":
     check_atomic_step()
     check_no_auto_reset()
     check_seeded_opponent()
+    check_opponents_list()
     check_guard_bonus()
-    print("不正行動の一括拒否・seed つき相手の再現性: OK")
+    print("不正行動の一括拒否・seed つき相手の再現性・相手の混在: OK")
     for n in (64, 256, 1024):
         bench(n, 100)
