@@ -354,6 +354,13 @@ fn accept(args: &Args, result: &Value) -> bool {
     if (depth as u32) < args.min_depth || (depth as u32) > args.max_depth {
         return false;
     }
+    // 詰将棋は攻め方で始まり攻め方で終わる（サイトの取り込みは偶数手を弾き、
+    // 1問でも混じると artifact 全体が拒否される）。ソルバーは「玉方の手の後に
+    // 候補局面が全て詰んでいる」ときに偶数手の Checkmate を返すことがある
+    // （2026-10-03 run 37112508460 で 4手詰めが1問混入）
+    if depth % 2 == 0 {
+        return false;
+    }
     if !args.allow_second && result["hasSecondSolution"] == json!(true) {
         return false;
     }
@@ -630,6 +637,7 @@ mod tests {
         assert!(!accept(&args, &json!({ "found": false, "depth": 5, "rating": { "value": 1500 } })));
         assert!(!accept(&args, &json!({ "found": true, "depth": 1, "rating": { "value": 1500 } })));
         assert!(!accept(&args, &json!({ "found": true, "depth": 99, "rating": { "value": 1500 } })));
+        assert!(!accept(&args, &json!({ "found": true, "depth": 4, "rating": { "value": 1500 } })));
         assert!(!accept(&args, &json!({ "found": true, "depth": 5, "rating": null })));
         assert!(!accept(
             &args,
