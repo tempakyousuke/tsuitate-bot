@@ -2,6 +2,10 @@
 """方策ネット（DeepNash 路線の R-NaD）の凍結版を生成する。
 
     python3 scripts/freeze_rl.py <N> <日付> "<要約>" models/rl_vN.bin > src/frozen/rl_vN.rs
+    python3 scripts/freeze_rl.py <N> <日付> "<要約>" models/rl_<系列>_vN.bin --series <系列> > src/frozen/rl_<系列>_vN.rs
+
+`--series` は本線以外の系列（スタイル特化モデル。例 `nyugyoku` → `rl_nyugyoku_vN` / `RlNyugyokuVN`）。
+省略すると本線の `rl_vN`。
 
 凍結版は **推論の一式を固定コピーとして持つ**（estimator の凍結と同じ考え方）:
 - `src/rl/action.rs`（行動の符号化・マスク）・`src/rl/encode.rs`（観測のテンソル化）・
@@ -47,9 +51,21 @@ def indent(src: str) -> str:
 
 
 def main() -> None:
-    if len(sys.argv) != 5:
+    args = sys.argv[1:]
+    series = ""
+    if "--series" in args:
+        i = args.index("--series")
+        series = args[i + 1]
+        del args[i:i + 2]
+        if not re.fullmatch(r"[a-z][a-z0-9]*", series):
+            sys.exit(f"--series は英小文字と数字だけ（{series}）")
+    if len(args) != 4:
         sys.exit(__doc__)
-    n, date, summary, weights = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+    n, date, summary, weights = args
+    # 戦略名と型名: 本線は rl_vN / RlVN、系列つきは rl_<系列>_vN / Rl<系列>VN
+    strat = f"rl_{series}_v{n}" if series else f"rl_v{n}"
+    ty = f"Rl{series.capitalize()}V{n}" if series else f"RlV{n}"
+    label = f"{series} 系列の凍結版 v{n}" if series else f"凍結版 v{n}"
     data = (ROOT / weights).read_bytes()
     sha = hashlib.sha256(data).hexdigest()
 
@@ -71,7 +87,7 @@ def main() -> None:
             sys.exit(f"{name} に凍結されない依存が残っている")
 
     rel_weights = "../../" + weights
-    print(f"""//! **凍結版 v{n}**（{date}）: 方策ネット（DeepNash 路線の R-NaD）。{summary}
+    print(f"""//! **{label}**（{date}）: 方策ネット（DeepNash 路線の R-NaD）。{summary}
 //!
 //! `scripts/freeze_rl.py` が生成した。**編集しない**（改善は `src/rl/` で行う）。
 //! 推論の一式（行動の符号化・観測のテンソル化・手書きの推論）は凍結時点の固定コピーで、
@@ -99,13 +115,13 @@ fn net() -> &'static policy_net::PolicyNet {{
     NET.get_or_init(|| policy_net::PolicyNet::from_bytes(WEIGHTS).expect("凍結版の重みが読めない"))
 }}
 
-/// 凍結版 v{n} の戦略（`strategy::make("rl_v{n}")`）。softmax からサンプリングする
-pub struct RlV{n} {{
+/// {label} の戦略（`strategy::make("{strat}")`）。softmax からサンプリングする
+pub struct {ty} {{
     rng: StdRng,
     last: Option<serde_json::Value>,
 }}
 
-impl RlV{n} {{
+impl {ty} {{
     pub fn new() -> Self {{
         Self {{ rng: StdRng::from_rng(&mut rand::rng()), last: None }}
     }}
@@ -115,13 +131,13 @@ impl RlV{n} {{
     }}
 }}
 
-impl Default for RlV{n} {{
+impl Default for {ty} {{
     fn default() -> Self {{
         Self::new()
     }}
 }}
 
-impl Strategy for RlV{n} {{
+impl Strategy for {ty} {{
     fn choose(
         &mut self,
         view: &PlayerView,
@@ -153,7 +169,7 @@ impl Strategy for RlV{n} {{
     }}
 
     fn name(&self) -> &'static str {{
-        "rl_v{n}"
+        "{strat}"
     }}
 
     fn debug_state(&self) -> Option<serde_json::Value> {{

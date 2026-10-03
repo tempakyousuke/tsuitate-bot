@@ -33,6 +33,7 @@ pub mod rl_v21;
 pub mod rl_v22;
 pub mod rl_v23;
 pub mod rl_v24;
+pub mod rl_nyugyoku_v1;
 
 /// **hermetic 規約を適用する最初の版**（issue #21）。
 ///
@@ -65,6 +66,8 @@ pub const SOURCES: &[(u32, &str, &str)] = &[
     (22, "rl_v22", include_str!("rl_v22.rs")),
     (23, "rl_v23", include_str!("rl_v23.rs")),
     (24, "rl_v24", include_str!("rl_v24.rs")),
+    // スタイル特化の系列（rl_<系列>_vN）。番号は凍結の通し番号（HERMETIC_FROM の判定に使う）
+    (25, "rl_nyugyoku_v1", include_str!("rl_nyugyoku_v1.rs")),
 ];
 
 /// 凍結版 `name` が**自分のファイルの中で**読む `TSUITATE_*` の一覧。
@@ -364,7 +367,7 @@ mod tests {
         assert_eq!(versions_using("king_belief_nn"), vec!["estimator_v14"]);
         // 自駒の再構成は estimator の凍結版も rl_v15 も使う（v15 の凍結で pin に加えた）
         let model_users = versions_using("model");
-        for name in ["rl_v15", "rl_v16", "rl_v17", "rl_v18", "rl_v19", "rl_v20", "rl_v21", "rl_v22", "rl_v23", "rl_v24", "estimator_v14"] {
+        for name in ["rl_v15", "rl_v16", "rl_v17", "rl_v18", "rl_v19", "rl_v20", "rl_v21", "rl_v22", "rl_v23", "rl_v24", "rl_nyugyoku_v1", "estimator_v14"] {
             assert!(model_users.contains(&name), "{name}");
         }
         // v9〜v11 は NN の重みを自分のファイルへコピーしているので影響しない
@@ -517,7 +520,7 @@ mod tests {
         assert!(env_keys_in_source("estimator_v6").len() < v14.len());
     }
 
-    /// 方策ネットの凍結版 `rl_vN` は元の重み（`rl_policy:models/rl_vN.bin`）と
+    /// 方策ネットの凍結版 `rl_vN`・`rl_<系列>_vN` は元の重み（`rl_policy:models/<名前>.bin`）と
     /// **同じ seed なら同じ手を指す**（`SOURCES` の rl_ 版を全部検査する）。
     /// 審判で数局を進め、手番ごとに両者へ同じ入力を渡して一手ずつ突き合わせる
     /// （arena 100局の 50%±10 より強い同一性の担保）。debug の推論は1回 約0.1秒と重い
@@ -531,7 +534,7 @@ mod tests {
         let rl_versions: Vec<(&str, &str)> = SOURCES
             .iter()
             .map(|(_, name, src)| (*name, *src))
-            .filter(|(name, _)| name.starts_with("rl_v"))
+            .filter(|(name, _)| name.starts_with("rl_"))
             .collect();
         assert!(rl_versions.iter().any(|(n, _)| *n == "rl_v24"), "rl_v24 が無い");
         for (version, src) in rl_versions {
