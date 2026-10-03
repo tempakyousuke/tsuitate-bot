@@ -676,8 +676,11 @@
   **v15 以降は実行時 env を読まない**（`HERMETIC_FROM`）。
   **各版の内容と凍結時の成績は `docs/frozen-versions.md`**（現行の最新は
   **方策ネットの `rl_v24`**（R-NaD 55,000更新、2026-10-03 凍結）、estimator 系の最新は
-  `estimator_v14`（2026-08-19 凍結））。方策ネットの凍結は
+  `estimator_v14`（2026-08-19 凍結）。スタイル特化の系列は `rl_<系列>_vN` で、最新は入玉特化の
+  `rl_nyugyoku_v1`（2026-10-03 凍結。既定のガントレットに入れる））。方策ネットの凍結は
   `python3 scripts/freeze_rl.py <N> <日付> "<要約>" models/rl_vN.bin > src/frozen/rl_vN.rs`
+  （特化の系列は `--series <系列>` を付けて `models/rl_<系列>_vN.bin` → `src/frozen/rl_<系列>_vN.rs`。
+  `SOURCES` の番号は系列をまたいだ凍結の通し番号）
   （推論の一式を固定コピー・重みを埋め込み。共有のまま使う `src/model.rs` は
   `SHARED_MODEL_PINS` で pin。同一性確認は `frozen::tests::rl凍結版は元の重みと同じ手を指す`
   が `SOURCES` の rl_ 版を全部一手ずつ突き合わせる＝登録するだけで検査される）。
