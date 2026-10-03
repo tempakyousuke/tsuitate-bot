@@ -110,6 +110,53 @@ impl Outcome {
             GameResult::Draw => [0.0, 0.0],
         }
     }
+
+    /// 決着の速さ ∈ [0, 1] = max(0, (horizon − 手数) / horizon)。手数は受理手の数（反則は数えない）。
+    /// 引き分けは 0（`max_plies` は決着していない）。`horizon` = 0 も 0
+    pub fn speed(&self, horizon: u32) -> f32 {
+        if matches!(self.result, GameResult::Draw) || horizon == 0 {
+            return 0.0;
+        }
+        (horizon.saturating_sub(self.plies) as f32) / horizon as f32
+    }
+
+    /// 速攻ボーナス（docs/rl-deepnash-design.md の「速攻特化」）。[先手, 後手] の加算分で、
+    /// **勝った側に λ × 速さ**を足す。`SpeedSum::Zero` なら負けた側から同じ額を引く（零和）。
+    /// 引き分けは両者 0
+    pub fn speed_bonus(&self, lambda: f32, horizon: u32, sum: SpeedSum) -> [f32; 2] {
+        let GameResult::Win(winner) = self.result else {
+            return [0.0, 0.0];
+        };
+        let b = lambda * self.speed(horizon);
+        let loser = match sum {
+            SpeedSum::Own => 0.0,
+            SpeedSum::Zero => -b,
+        };
+        match winner {
+            Color::Sente => [b, loser],
+            Color::Gote => [loser, b],
+        }
+    }
+}
+
+/// 速攻ボーナスの配り方
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeedSum {
+    /// 勝った側だけに足す（非零和。負けた側の報酬は勝敗のまま = 「遅く負ける」動機を作らない）
+    Own,
+    /// 勝った側に足し、負けた側から同じ額を引く（零和。自己対局の R-NaD の前提を保つ代わりに、
+    /// 負けそうな側は手数を延ばす動機を持つ）
+    Zero,
+}
+
+impl SpeedSum {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "own" => Some(Self::Own),
+            "zero" => Some(Self::Zero),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -461,6 +508,35 @@ mod tests {
         // 学習側が後手なら、構築時に相手（先手）の初手が指されて標本が2つになる
         let game = EnvGame::versus(None, Color::Gote, opp, 0);
         assert_eq!(game.style().samples, 2);
+    }
+
+    #[test]
+    fn 速攻ボーナスは勝った側に速さに比例して付く() {
+        let o = |result, plies| Outcome { result, reason: "checkmate", plies, fouls: [0, 0] };
+        let sente = o(GameResult::Win(Color::Sente), 50);
+        assert_eq!(sente.speed(200), 0.75);
+        assert_eq!(sente.speed_bonus(2.0, 200, SpeedSum::Own), [1.5, 0.0]);
+        assert_eq!(sente.speed_bonus(2.0, 200, SpeedSum::Zero), [1.5, -1.5]);
+
+        let gote = o(GameResult::Win(Color::Gote), 100);
+        assert_eq!(gote.speed_bonus(1.0, 200, SpeedSum::Own), [0.0, 0.5]);
+        assert_eq!(gote.speed_bonus(1.0, 200, SpeedSum::Zero), [-0.5, 0.5]);
+
+        // 速いほど大きく、horizon 以上の手数では 0（負にはならない）
+        let fast = o(GameResult::Win(Color::Sente), 30).speed(100);
+        let slow = o(GameResult::Win(Color::Sente), 70).speed(100);
+        assert!(fast > slow);
+        assert_eq!(o(GameResult::Win(Color::Sente), 120).speed(100), 0.0);
+        assert_eq!(o(GameResult::Win(Color::Sente), 120).speed(0), 0.0);
+
+        // 引き分けには付かない
+        let draw = o(GameResult::Draw, 10);
+        assert_eq!(draw.speed(200), 0.0);
+        assert_eq!(draw.speed_bonus(5.0, 200, SpeedSum::Zero), [0.0, 0.0]);
+
+        assert_eq!(SpeedSum::parse("own"), Some(SpeedSum::Own));
+        assert_eq!(SpeedSum::parse("zero"), Some(SpeedSum::Zero));
+        assert_eq!(SpeedSum::parse("both"), None);
     }
 
     #[test]

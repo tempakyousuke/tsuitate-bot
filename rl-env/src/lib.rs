@@ -17,8 +17,8 @@ use rayon::prelude::*;
 use tsuitate_bot::protocol::Color;
 use tsuitate_bot::rl::action::NUM_ACTIONS;
 use tsuitate_bot::rl::encode::{NUM_PLANES, OBS_LEN};
-use tsuitate_bot::rl::env::{EnvGame, GUARD_RADII, Outcome, StyleStats};
-use tsuitate_bot::selfplay::{GameResult, mix};
+use tsuitate_bot::rl::env::{EnvGame, GUARD_RADII, Outcome, SpeedSum, StyleStats};
+use tsuitate_bot::selfplay::{GameResult, MAX_PLIES, mix};
 use tsuitate_bot::strategy::{self, Strategy};
 
 type ObserveOut<'py> = (
@@ -50,17 +50,30 @@ struct GameSpec {
     guard_bonus: f32,
     /// ボーナスに使う半径の `GUARD_RADII` の添字
     guard_radius_idx: usize,
+    /// 速攻ボーナスの係数 λ（0 = 付けない）
+    speed_bonus: f32,
+    /// 速攻ボーナスの手数の尺度（この手数で速さ 0）
+    speed_horizon: u32,
+    /// 速攻ボーナスの配り方（勝った側だけ / 零和）
+    speed_sum: SpeedSum,
 }
 
 impl GameSpec {
-    /// 終局の報酬 = 勝敗(±1) + λ × 対局を通した玉の周りの占有率の平均（両者それぞれ）。
-    /// λ > 0 では零和でなくなる
+    /// 終局の報酬 = 勝敗(±1) + λ_guard × 対局を通した玉の周りの占有率の平均（両者それぞれ）
+    /// ＋速攻ボーナス（勝った側に λ_speed × 速さ。`Outcome::speed_bonus`）。
+    /// λ_guard > 0、または λ_speed > 0 で `speed_sum="own"` のときは零和でなくなる
     fn rewards(&self, outcome: &Outcome, style: &StyleStats) -> [f32; 2] {
         let mut r = outcome.rewards();
         if self.guard_bonus != 0.0 {
             let g = style.guard_mean(self.guard_radius_idx);
             for (r, g) in r.iter_mut().zip(g) {
                 *r += self.guard_bonus * g as f32;
+            }
+        }
+        if self.speed_bonus != 0.0 {
+            let b = outcome.speed_bonus(self.speed_bonus, self.speed_horizon, self.speed_sum);
+            for (r, b) in r.iter_mut().zip(b) {
+                *r += b;
             }
         }
         r
@@ -158,7 +171,7 @@ fn build_fresh(
 #[pymethods]
 impl VecEnv {
     #[new]
-    #[pyo3(signature = (n, opponent=None, seed=0, auto_reset=true, guard_bonus=0.0, guard_radius=1, opponents=None))]
+    #[pyo3(signature = (n, opponent=None, seed=0, auto_reset=true, guard_bonus=0.0, guard_radius=1, opponents=None, speed_bonus=0.0, speed_horizon=MAX_PLIES, speed_sum="own"))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -169,6 +182,9 @@ impl VecEnv {
         guard_bonus: f32,
         guard_radius: i8,
         opponents: Option<Vec<String>>,
+        speed_bonus: f32,
+        speed_horizon: u32,
+        speed_sum: &str,
     ) -> PyResult<Self> {
         if n == 0 {
             return Err(PyValueError::new_err("n は 1 以上"));
@@ -176,6 +192,17 @@ impl VecEnv {
         if !guard_bonus.is_finite() {
             return Err(PyValueError::new_err("guard_bonus は有限の値"));
         }
+        if !speed_bonus.is_finite() {
+            return Err(PyValueError::new_err("speed_bonus は有限の値"));
+        }
+        if speed_horizon == 0 {
+            return Err(PyValueError::new_err("speed_horizon は 1 以上"));
+        }
+        let Some(speed_sum) = SpeedSum::parse(speed_sum) else {
+            return Err(PyValueError::new_err(format!(
+                "speed_sum は \"own\" か \"zero\"（{speed_sum}）"
+            )));
+        };
         let Some(guard_radius_idx) = GUARD_RADII.iter().position(|&r| r == guard_radius) else {
             return Err(PyValueError::new_err(format!(
                 "guard_radius は {GUARD_RADII:?} のどれか"
@@ -206,6 +233,9 @@ impl VecEnv {
             seed,
             guard_bonus,
             guard_radius_idx,
+            speed_bonus,
+            speed_horizon,
+            speed_sum,
         };
         let mut next_game_no = 0;
         let mut finished = vec![];
