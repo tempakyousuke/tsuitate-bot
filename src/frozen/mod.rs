@@ -35,6 +35,7 @@ pub mod rl_v23;
 pub mod rl_v24;
 pub mod rl_nyugyoku_v1;
 pub mod rl_speed_v1;
+pub mod rl_guard_v1;
 
 /// **hermetic 規約を適用する最初の版**（issue #21）。
 ///
@@ -70,6 +71,7 @@ pub const SOURCES: &[(u32, &str, &str)] = &[
     // スタイル特化の系列（rl_<系列>_vN）。番号は凍結の通し番号（HERMETIC_FROM の判定に使う）
     (25, "rl_nyugyoku_v1", include_str!("rl_nyugyoku_v1.rs")),
     (26, "rl_speed_v1", include_str!("rl_speed_v1.rs")),
+    (27, "rl_guard_v1", include_str!("rl_guard_v1.rs")),
 ];
 
 /// 凍結版 `name` が**自分のファイルの中で**読む `TSUITATE_*` の一覧。
@@ -369,7 +371,7 @@ mod tests {
         assert_eq!(versions_using("king_belief_nn"), vec!["estimator_v14"]);
         // 自駒の再構成は estimator の凍結版も rl_v15 も使う（v15 の凍結で pin に加えた）
         let model_users = versions_using("model");
-        for name in ["rl_v15", "rl_v16", "rl_v17", "rl_v18", "rl_v19", "rl_v20", "rl_v21", "rl_v22", "rl_v23", "rl_v24", "rl_nyugyoku_v1", "rl_speed_v1", "estimator_v14"] {
+        for name in ["rl_v15", "rl_v16", "rl_v17", "rl_v18", "rl_v19", "rl_v20", "rl_v21", "rl_v22", "rl_v23", "rl_v24", "rl_nyugyoku_v1", "rl_speed_v1", "rl_guard_v1", "estimator_v14"] {
             assert!(model_users.contains(&name), "{name}");
         }
         // v9〜v11 は NN の重みを自分のファイルへコピーしているので影響しない
