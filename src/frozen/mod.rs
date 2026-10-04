@@ -33,6 +33,7 @@ pub mod rl_v21;
 pub mod rl_v22;
 pub mod rl_v23;
 pub mod rl_v24;
+pub mod rl_v25;
 pub mod rl_nyugyoku_v1;
 pub mod rl_speed_v1;
 pub mod rl_guard_v1;
@@ -72,6 +73,7 @@ pub const SOURCES: &[(u32, &str, &str)] = &[
     (25, "rl_nyugyoku_v1", include_str!("rl_nyugyoku_v1.rs")),
     (26, "rl_speed_v1", include_str!("rl_speed_v1.rs")),
     (27, "rl_guard_v1", include_str!("rl_guard_v1.rs")),
+    (28, "rl_v25", include_str!("rl_v25.rs")),
 ];
 
 /// 凍結版 `name` が**自分のファイルの中で**読む `TSUITATE_*` の一覧。
@@ -371,7 +373,7 @@ mod tests {
         assert_eq!(versions_using("king_belief_nn"), vec!["estimator_v14"]);
         // 自駒の再構成は estimator の凍結版も rl_v15 も使う（v15 の凍結で pin に加えた）
         let model_users = versions_using("model");
-        for name in ["rl_v15", "rl_v16", "rl_v17", "rl_v18", "rl_v19", "rl_v20", "rl_v21", "rl_v22", "rl_v23", "rl_v24", "rl_nyugyoku_v1", "rl_speed_v1", "rl_guard_v1", "estimator_v14"] {
+        for name in ["rl_v15", "rl_v16", "rl_v17", "rl_v18", "rl_v19", "rl_v20", "rl_v21", "rl_v22", "rl_v23", "rl_v24", "rl_v25", "rl_nyugyoku_v1", "rl_speed_v1", "rl_guard_v1", "estimator_v14"] {
             assert!(model_users.contains(&name), "{name}");
         }
         // v9〜v11 は NN の重みを自分のファイルへコピーしているので影響しない
@@ -540,7 +542,7 @@ mod tests {
             .map(|(_, name, src)| (*name, *src))
             .filter(|(name, _)| name.starts_with("rl_"))
             .collect();
-        assert!(rl_versions.iter().any(|(n, _)| *n == "rl_v24"), "rl_v24 が無い");
+        assert!(rl_versions.iter().any(|(n, _)| *n == "rl_v25"), "rl_v25 が無い");
         for (version, src) in rl_versions {
             let path = format!("{}/models/{version}.bin", env!("CARGO_MANIFEST_DIR"));
             // 観測からの確定反則を落とすマスク（`action::MASK_VERSION` 2）より前に凍結した版は
