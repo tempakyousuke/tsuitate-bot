@@ -15,7 +15,8 @@
 //!
 //! 相手の観測履歴は粒子に無いので、相手の応手は方策ネットでなく推定器の相手モデル（opp_move NN）で
 //! 代用する（露見マス・触ったマスは `EstimatorStrategy` の2手読みと同じ定義で渡す）。
-//! 相手の反則は模擬しない。粒子は**物理的に整合するものだけ**使い、無ければ探索をやめて元の方策で指す。
+//! 相手の反則は模擬しない。粒子は**物理的に整合するもの**を優先し、全滅していれば物理不整合の粒子で
+//! 探索する（`taint=0` なら探索をやめて元の方策で指す。実測では落とすほうが大幅に強い）。
 //!
 //! 既知の近似: rl_v25 の価値ヘッドは R-NaD の正則化報酬（−η·log(π/π_reg)）込みの目標で学習している
 //! ので、純粋な勝敗の期待値ではない（1〜2手先の候補間では差がほぼ打ち消し合う前提で使っている）。
@@ -50,6 +51,9 @@ pub struct SearchParams {
     pub greedy: bool,
     /// 推定器の思考予算スケール（estimator 戦略の既定 2000ms ÷ 900ms に合わせる）
     pub scale: f64,
+    /// 物理的に整合する粒子が無い決定点で、物理不整合（phys_taint）の粒子で探索するか。
+    /// false なら探索をやめて元の方策で指す
+    pub taint: bool,
 }
 
 impl Default for SearchParams {
@@ -60,6 +64,7 @@ impl Default for SearchParams {
             eta: 2.0,
             greedy: false,
             scale: 2000.0 / 900.0,
+            taint: true,
         }
     }
 }
@@ -78,6 +83,7 @@ fn parse_spec(spec: &str) -> Result<(String, SearchParams), String> {
             "eta" => p.eta = v.parse().map_err(|e: std::num::ParseFloatError| bad(e.to_string()))?,
             "scale" => p.scale = v.parse().map_err(|e: std::num::ParseFloatError| bad(e.to_string()))?,
             "greedy" => p.greedy = v == "1" || v == "true",
+            "taint" => p.taint = v == "1" || v == "true",
             _ => return Err(format!("{k}: 未知のパラメータ")),
         }
     }
@@ -112,7 +118,7 @@ impl RlSearch {
             params.k,
             params.n,
             params.eta,
-            if params.greedy { "g" } else { "" }
+            format!("{}{}", if params.greedy { "g" } else { "" }, if params.taint { "" } else { "t0" })
         );
         let seed = seed.unwrap_or_else(|| rand::rng().random());
         Some(RlSearch {
@@ -293,22 +299,23 @@ fn push_move_squares(mv: &ShogiMove, captured: bool, captures: &mut Vec<Coord>, 
     touched.push(to);
 }
 
-/// 探索に使う粒子と重み。**物理不整合（phys_taint）の粒子は使わない**（推定器の約束どおり、
-/// 幽霊取りなどで救済した盤面は合法性・詰みの根拠にならない）。情報制約だけを緩めた
-/// ソフト救済の粒子は、推定器が logw へ課金済みなのでそのまま使う。
+/// 探索に使う粒子と重み。`allow_taint` が false なら**物理不整合（phys_taint）の粒子は使わない**
+/// （推定器の約束どおり、幽霊取りなどで救済した盤面は合法性・詰みの根拠にならない）。
+/// 情報制約だけを緩めたソフト救済の粒子は、推定器が logw へ課金済みなのでそのまま使う。
 /// 重みは `weighted_unique_particles` と同じ規約（logw を max で正規化し、同一指紋を畳み込む）
-fn search_pool(est: &Estimator, me: Color) -> Vec<(Position, f64)> {
+fn search_pool(est: &Estimator, me: Color, allow_taint: bool) -> Vec<(Position, f64)> {
+    let usable = |t: u8| allow_taint || t == 0;
     let max_logw = est
         .log_weights()
         .iter()
         .zip(est.phys_taint())
-        .filter(|(_, t)| **t == 0)
+        .filter(|(_, t)| usable(**t))
         .map(|(w, _)| *w)
         .fold(f64::MIN, f64::max);
     let mut idx: HashMap<u64, usize> = HashMap::new();
     let mut out: Vec<(Position, f64)> = vec![];
     for ((p, &taint), &w) in est.particles().iter().zip(est.phys_taint()).zip(est.log_weights()) {
-        if taint > 0 || p.turn() != me {
+        if !usable(taint) || p.turn() != me {
             continue;
         }
         let m = (w - max_logw).exp();
@@ -355,9 +362,16 @@ impl Strategy for RlSearch {
         // 上位 k 手に残った π の質量（切り詰めが η と無関係に分布を変える量の記録）
         let kept_mass: f64 = cands.iter().take(self.params.k).map(|c| c.1).sum();
 
-        // 物理的に整合する粒子だけを重みどおりに引く（search_pool）
+        // 物理的に整合する粒子を重みどおりに引く（search_pool）。全滅していて `taint=1` なら
+        // 物理不整合の粒子へ落とす（実測: 落とさずに元の方策へ戻すと η=30 で 80.5% → 66.5%。
+        // 未探索の決定点を含む39局の勝率が 90% → 36% と、差のほぼ全部がそこに集中した）
         let est = self.est.as_ref().unwrap();
-        let pool = search_pool(est, me);
+        let mut pool = search_pool(est, me, false);
+        let mut tainted = false;
+        if pool.is_empty() && self.params.taint {
+            pool = search_pool(est, me, true);
+            tainted = !pool.is_empty();
+        }
         let pool_total: f64 = pool.iter().map(|x| x.1).sum();
         let can_search = !pool.is_empty() && pool_total > 0.0;
         let searched = self.params.eta != 0.0 && can_search && cands.len().min(self.params.k) > 1;
@@ -441,6 +455,7 @@ impl Strategy for RlSearch {
             "value": value,
             "searched": searched,
             "pool": pool.len(),
+            "tainted": tainted,
             "kept_mass": kept_mass,
             "cands": cands.iter().zip(&q).zip(&w).zip(&se).map(|(((&(a, p), &qa), &wa), &sa)| serde_json::json!({
                 "usi": decode_usi(a, me), "p": p, "q": qa, "se": sa, "p_new": wa / wsum,
