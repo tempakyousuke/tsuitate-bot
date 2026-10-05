@@ -202,6 +202,15 @@ tsuitate-bot本体の運営bot（`tsuitate-bot.service`）とは別サービス�
    sudo systemctl status tsuitate-webhook-bot
    ```
 
+## プロフィール画像
+
+サイトのbot設定でアップロードしている Kakurenbot のアイコンは
+`assets/kakurenbot-icon/kakurenbot-a-512.webp`（2026-10-05、衝立から片目でのぞく
+ロボット）。元は同じディレクトリの `kakurenbot-a.svg` で、差し替えるときは
+SVG を直して `rsvg-convert -w 512 -h 512 kakurenbot-a.svg -o tmp.png` →
+`cwebp tmp.png -o kakurenbot-a-512.webp` で書き出す。サイトの制約は
+JPEG/PNG/WebP・100kB以下で、表示は円形に切り抜かれる（中心から直径80%の内側に収める）。
+
 ## 別バージョンのbotを並行稼働させる（例: v10を動かしたままv20を追加）
 
 「1プロセス = 1戦略 = 1エンドポイント」という設計なので、既存の稼働中プロセスに

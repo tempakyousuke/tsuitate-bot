@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">Kakurenbot A — Peekaboo screen</title>
+  <desc id="desc">A friendly teal robot peeks with one bright eye around a warm wooden folding screen, holding its edge. Solid cream background.</desc>
+  <rect width="512" height="512" fill="#FFF3DE"/>
+  <g stroke="#343C39" stroke-width="12" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Antenna, ear, and little body sit behind the head and screen. -->
+    <path d="M334 175V140" fill="none"/>
+    <circle cx="334" cy="125" r="17" fill="#32998D"/>
+    <rect x="380" y="213" width="30" height="52" rx="13" fill="#32998D"/>
+    <path d="M279 292H327Q363 292 363 328V363H277Z" fill="#32998D"/>
+    <rect x="232" y="169" width="160" height="151" rx="43" fill="#32998D"/>
+    <rect x="251" y="202" width="119" height="83" rx="29" fill="#343C39" stroke="none"/>
+    <ellipse cx="332" cy="239" rx="19" ry="23" fill="#FFF3DE" stroke="none"/>
+    <path d="M309 297Q324 307 339 297" fill="none" stroke-width="9"/>
+    <!-- Two broad paper panels make the folding-screen silhouette. -->
+    <path d="M111 177L195 148 279 177V375L195 346 111 375Z" fill="#E8B96E"/>
+    <path d="M195 148V346L279 375V177Z" fill="#F8D99A"/>
+    <path d="M132 194L174 180M132 338L174 324" fill="none" stroke="#BE894B" stroke-width="9"/>
+    <!-- A simple shogi-piece inset; no small lettering. -->
+    <path d="M234 223L254 233 261 279H207L214 233Z" fill="#E8B96E" stroke="none"/>
+    <!-- One mitten wraps around the edge, reinforcing the hiding pose. -->
+    <rect x="258" y="293" width="49" height="40" rx="19" fill="#32998D"/>
+  </g>
+</svg>
