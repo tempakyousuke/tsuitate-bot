@@ -14,3 +14,4 @@ pub mod env;
 pub mod policy;
 pub mod policy_net;
 pub mod records;
+pub mod search;

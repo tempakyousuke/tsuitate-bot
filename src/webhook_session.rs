@@ -1721,4 +1721,32 @@ mod tests {
             "cold start exceeded webhook budget"
         );
     }
+
+    /// rl_search（方策ネット＋粒子の探索）での実測（手動実行用）。推定器の逐次 prewarm と
+    /// 探索が両方乗る最悪ケース: `cargo test --release -- --ignored rl_search_within_deadline --nocapture`
+    #[test]
+    #[ignore]
+    fn long_synthetic_history_replays_cold_start_with_rl_search_within_deadline() {
+        let name = format!(
+            "rl_search:{}/models/rl_v25.bin,eta=30",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let store = SessionStore::new(name);
+        let positions = synth_positions(80, Color::Sente);
+        let last_ply = positions
+            .keys()
+            .filter_map(|k| k.parse::<u32>().ok())
+            .max()
+            .unwrap();
+        let req = request("g-long-rl-search", "b", last_ply, positions);
+        let start = std::time::Instant::now();
+        let mv = choose_move(&store, &req).unwrap();
+        let elapsed = start.elapsed();
+        println!("rl_search cold-start replay ({last_ply} plies) took {elapsed:?} -> {mv}");
+        assert_eq!(mv.len(), 7);
+        assert!(
+            elapsed < Duration::from_secs(10),
+            "cold start exceeded webhook budget"
+        );
+    }
 }
