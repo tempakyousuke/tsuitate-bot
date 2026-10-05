@@ -10,29 +10,34 @@
 //!    どちらの末端も自分の決定点なので、価値ヘッドの学習分布の中で評価できる:
 //!    - a が s で非合法 → 反則として観測に積み、**同じ手番の決定点**の価値（反則上限なら −1）
 //!    - 合法 → 適用し、相手の応手を `estimator::predict_opp_reply` で1手サンプルして、
-//!      **次の自分の決定点**の価値（詰み・詰まされは ±1）
+//!      **次の自分の決定点**の価値（詰み・詰まされは ±1、200手の上限は 0）
 //! 3. Q(a) = 粒子平均の価値。π'(a) ∝ π(a)·exp(η·Q(a))（磁石 = π の MMD 1ステップ）から引く
 //!
 //! 相手の観測履歴は粒子に無いので、相手の応手は方策ネットでなく推定器の相手モデル（opp_move NN）で
-//! 代用する。相手の反則は模擬しない。
+//! 代用する（露見マス・触ったマスは `EstimatorStrategy` の2手読みと同じ定義で渡す）。
+//! 相手の反則は模擬しない。粒子は**物理的に整合するものだけ**使い、無ければ探索をやめて元の方策で指す。
+//!
+//! 既知の近似: rl_v25 の価値ヘッドは R-NaD の正則化報酬（−η·log(π/π_reg)）込みの目標で学習している
+//! ので、純粋な勝敗の期待値ではない（1〜2手先の候補間では差がほぼ打ち消し合う前提で使っている）。
 //!
 //! 戦略名: `rl_search:<重みのパス>[,k=8][,n=16][,eta=2][,greedy=1][,scale=2.2]`。
 //! `eta=0` は「上位 k 手に切り詰めただけの方策」で、探索の効果を切り分ける対照に使う。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use sha2::{Digest, Sha256};
 
+use crate::board::Coord;
 use crate::estimator::{Estimator, predict_opp_reply};
 use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{ClockState, Color, FoulCounts, GameStatus, PlayerView};
 use crate::rl::action::{decode_action, decode_usi, legal_mask};
 use crate::rl::encode::encode;
 use crate::rl::policy_net::PolicyNet;
-use crate::selfplay::MAX_FOULS;
-use crate::shogi::{Outcome, Position, ShogiMove, unpromote_role};
+use crate::selfplay::{MAX_FOULS, MAX_PLIES};
+use crate::shogi::{Outcome, Position, ShogiMove, parse_usi, unpromote_role};
 use crate::strategy::Strategy;
 
 pub const PREFIX: &str = "rl_search:";
@@ -158,80 +163,165 @@ fn copy_log(log: &ObservationLog) -> ObservationLog {
     out
 }
 
-fn mated_winner(pos: &Position) -> Option<Color> {
+/// 受理手の直後の終局判定（`Referee::accept` と同じ順: 詰み・ステイルメイト > 手数上限）。
+/// 自分から見た価値を返す（勝ち 1・負け −1・引き分け 0）
+fn terminal_value(pos: &Position, me: Color) -> Option<f32> {
     match pos.outcome() {
-        Some(Outcome::Checkmate { winner }) | Some(Outcome::Stalemate { winner }) => Some(winner),
+        Some(Outcome::Checkmate { winner }) | Some(Outcome::Stalemate { winner }) => {
+            Some(if winner == me { 1.0 } else { -1.0 })
+        }
+        // 初期局面からの対局では 受理手数 = move_number − 1
+        None if pos.move_number().saturating_sub(1) >= MAX_PLIES => Some(0.0),
         None => None,
     }
 }
 
-/// 粒子 `pos`（自分の手番）で候補 `mv` を指した結果を、次の自分の決定点の価値で評価する
-#[allow(clippy::too_many_arguments)]
-fn leaf_value(
-    net: &PolicyNet,
+/// 1候補 × 1粒子の遷移の行き先
+#[derive(Debug)]
+pub(crate) enum Leaf {
+    /// 終局（自分から見た価値）
+    Terminal(f32),
+    /// 次の自分の決定点（反則なら同じ手番、受理なら相手の応手の後）
+    Decision {
+        view: PlayerView,
+        log: ObservationLog,
+        foul_tried: HashSet<String>,
+    },
+}
+
+/// 粒子 `pos`（自分の手番）で候補 `mv` を指し、受理なら `reply` が返す相手の応手を1手進めて、
+/// 次の自分の決定点（または終局）まで観測を積む。観測の作り方は `Referee` と同じ
+/// （反則は手番維持、王手宣言は受理手の後、終局判定は詰み > 手数上限）
+pub(crate) fn step_leaf(
     view: &PlayerView,
     log: &ObservationLog,
     foul_tried: &HashSet<String>,
     pos: &Position,
     mv: &ShogiMove,
-    usi: &str,
-    rng: &mut StdRng,
-) -> f32 {
+    reply: impl FnOnce(&Position) -> Option<ShogiMove>,
+) -> Leaf {
     let me = view.your_color;
+    let usi = mv.to_usi();
     if !pos.is_legal(mv) {
         // 反則: 手番はそのまま。反則上限なら負け
         let fouls = view.fouls.you + 1;
         if fouls >= MAX_FOULS {
-            return -1.0;
+            return Leaf::Terminal(-1.0);
         }
         let mut log2 = copy_log(log);
         log2.record(Observation::MyFoul {
             move_number: pos.move_number(),
-            usi: usi.to_string(),
+            usi: usi.clone(),
         });
         let mut tried = foul_tried.clone();
-        tried.insert(usi.to_string());
+        tried.insert(usi);
         let mut v = view.clone();
         v.fouls.you = fouls;
-        return net.forward(&encode(&v, &log2, &tried)).1;
+        return Leaf::Decision {
+            view: v,
+            log: log2,
+            foul_tried: tried,
+        };
     }
     let mut p = pos.clone();
     let captured = p.play_unchecked(mv);
     let mut log2 = copy_log(log);
     log2.record(Observation::MyMove {
         move_number: p.move_number(),
-        usi: usi.to_string(),
+        usi,
         captured: captured.map(unpromote_role),
     });
-    if let Some(w) = mated_winner(&p) {
-        return if w == me { 1.0 } else { -1.0 };
-    }
     if p.in_check(me.other()) {
         log2.record(Observation::Check { in_check: me.other() });
     }
-    // 相手の応手（推定器の相手モデル。相手の反則は模擬しない）
-    let Some(reply) = predict_opp_reply(&p, me, &[], &[], foul_tried.len() as u32, rng) else {
-        return 0.0;
+    if let Some(v) = terminal_value(&p, me) {
+        return Leaf::Terminal(v);
+    }
+    // 相手の応手（相手の反則は模擬しない）
+    let Some(r) = reply(&p) else {
+        return Leaf::Terminal(0.0);
     };
-    let lost_at = match reply {
+    let lost_at = match r {
         ShogiMove::Board { to, .. } if p.piece_at(to).is_some_and(|q| q.color == me) => {
             Some(crate::board::make_usi_square(to))
         }
         _ => None,
     };
-    p.play_unchecked(&reply);
+    p.play_unchecked(&r);
     log2.record(Observation::OpponentMoved {
         move_number: p.move_number(),
         captured_my_piece_at: lost_at,
     });
-    if let Some(w) = mated_winner(&p) {
-        return if w == me { 1.0 } else { -1.0 };
-    }
     if p.in_check(me) {
         log2.record(Observation::Check { in_check: me });
     }
-    let v = view_of(&p, me, view.fouls.clone(), &view.game_id);
-    net.forward(&encode(&v, &log2, &HashSet::new())).1
+    if let Some(v) = terminal_value(&p, me) {
+        return Leaf::Terminal(v);
+    }
+    Leaf::Decision {
+        view: view_of(&p, me, view.fouls.clone(), &view.game_id),
+        log: log2,
+        foul_tried: HashSet::new(),
+    }
+}
+
+/// 観測ログから「自分が駒を取ったマス（相手に露見）」と「自分の手が触れたマス」を作る。
+/// `EstimatorStrategy::choose` の2手読みと同じ定義（estimator の my_capture_sq / my_touched_sq）
+fn my_squares(log: &ObservationLog) -> (Vec<Coord>, Vec<Coord>) {
+    let mut captures = vec![];
+    let mut touched = vec![];
+    for e in log.events() {
+        if let Observation::MyMove { usi, captured, .. } = e {
+            if let Some(mv) = parse_usi(usi) {
+                push_move_squares(&mv, captured.is_some(), &mut captures, &mut touched);
+            }
+        }
+    }
+    (captures, touched)
+}
+
+fn push_move_squares(mv: &ShogiMove, captured: bool, captures: &mut Vec<Coord>, touched: &mut Vec<Coord>) {
+    let to = match *mv {
+        ShogiMove::Board { to, .. } | ShogiMove::Drop { to, .. } => to,
+    };
+    if captured {
+        captures.push(to);
+    }
+    if let ShogiMove::Board { from, .. } = *mv {
+        touched.push(from);
+    }
+    touched.push(to);
+}
+
+/// 探索に使う粒子と重み。**物理不整合（phys_taint）の粒子は使わない**（推定器の約束どおり、
+/// 幽霊取りなどで救済した盤面は合法性・詰みの根拠にならない）。情報制約だけを緩めた
+/// ソフト救済の粒子は、推定器が logw へ課金済みなのでそのまま使う。
+/// 重みは `weighted_unique_particles` と同じ規約（logw を max で正規化し、同一指紋を畳み込む）
+fn search_pool(est: &Estimator, me: Color) -> Vec<(Position, f64)> {
+    let max_logw = est
+        .log_weights()
+        .iter()
+        .zip(est.phys_taint())
+        .filter(|(_, t)| **t == 0)
+        .map(|(w, _)| *w)
+        .fold(f64::MIN, f64::max);
+    let mut idx: HashMap<u64, usize> = HashMap::new();
+    let mut out: Vec<(Position, f64)> = vec![];
+    for ((p, &taint), &w) in est.particles().iter().zip(est.phys_taint()).zip(est.log_weights()) {
+        if taint > 0 || p.turn() != me {
+            continue;
+        }
+        let m = (w - max_logw).exp();
+        let fp = p.fingerprint();
+        match idx.get(&fp) {
+            Some(&i) => out[i].1 += m,
+            None => {
+                idx.insert(fp, out.len());
+                out.push((p.clone(), m));
+            }
+        }
+    }
+    out
 }
 
 impl Strategy for RlSearch {
@@ -262,30 +352,27 @@ impl Strategy for RlSearch {
             .map(|&a| (a, f64::from(logits[a] - max).exp() / total))
             .collect();
         cands.sort_by(|a, b| b.1.total_cmp(&a.1));
-        cands.truncate(self.params.k);
+        // 上位 k 手に残った π の質量（切り詰めが η と無関係に分布を変える量の記録）
+        let kept_mass: f64 = cands.iter().take(self.params.k).map(|c| c.1).sum();
 
-        // 粒子を重みどおりに引く（厳密粒子が無ければ taint 込み）
+        // 物理的に整合する粒子だけを重みどおりに引く（search_pool）
         let est = self.est.as_ref().unwrap();
-        let weighted = crate::scenario_core::weighted_unique_particles(est);
-        let strict: Vec<(&Position, f64)> = weighted.iter().filter(|w| w.2).map(|w| (w.0, w.1)).collect();
-        let pool: Vec<(&Position, f64)> = if strict.is_empty() {
-            weighted.iter().map(|w| (w.0, w.1)).collect()
-        } else {
-            strict
-        };
-        // 粒子の手番が自分でないもの（推定器が壊れたとき）は使わない
-        let pool: Vec<(Position, f64)> = pool
-            .into_iter()
-            .filter(|(p, _)| p.turn() == me)
-            .map(|(p, w)| (p.clone(), w))
-            .collect();
+        let pool = search_pool(est, me);
         let pool_total: f64 = pool.iter().map(|x| x.1).sum();
+        let can_search = !pool.is_empty() && pool_total > 0.0;
+        let searched = self.params.eta != 0.0 && can_search && cands.len().min(self.params.k) > 1;
+        // 探索できない決定点は元の方策（切り詰めなし）で指す。eta=0 の対照は常に上位 k 手
+        if searched || self.params.eta == 0.0 {
+            cands.truncate(self.params.k);
+        }
 
         let mut q = vec![0.0f64; cands.len()];
         // Q の標準誤差（診断用。粒子と応手のサンプル数が足りているかを見る）
         let mut se = vec![0.0f64; cands.len()];
-        let searched = self.params.eta != 0.0 && !pool.is_empty() && pool_total > 0.0 && cands.len() > 1;
         if searched {
+            // 相手の応手モデルの入力（露見マス・触ったマス）。候補自身の分は候補ごとに足す
+            let (captures0, touched0) = my_squares(log);
+            let my_fouls = foul_tried.len() as u32;
             let samples: Vec<&Position> = (0..self.params.n)
                 .map(|_| {
                     let mut r = self.rng.random::<f64>() * pool_total;
@@ -300,11 +387,27 @@ impl Strategy for RlSearch {
                 .collect();
             for (ci, &(a, _)) in cands.iter().enumerate() {
                 let mv = decode_action(a, me).expect("マスク内の行動は復号できる");
-                let usi = mv.to_usi();
-                let vals: Vec<f64> = samples
-                    .iter()
-                    .map(|s| f64::from(leaf_value(&self.net, view, log, foul_tried, s, &mv, &usi, &mut self.rng)))
-                    .collect();
+                let mut vals: Vec<f64> = Vec::with_capacity(samples.len());
+                for s in &samples {
+                    let rng = &mut self.rng;
+                    let leaf = step_leaf(view, log, foul_tried, s, &mv, |next| {
+                        // この候補で駒を取れば、捕獲通知でそのマスは相手に露見する
+                        // （既知マスに入れないと即時の取り返しのブーストが掛からない）
+                        let (mut captures, mut touched) = (captures0.clone(), touched0.clone());
+                        let captured = match mv {
+                            ShogiMove::Board { to, .. } => s.piece_at(to).is_some(),
+                            ShogiMove::Drop { .. } => false,
+                        };
+                        push_move_squares(&mv, captured, &mut captures, &mut touched);
+                        predict_opp_reply(next, me, &captures, &touched, my_fouls, rng)
+                    });
+                    vals.push(match leaf {
+                        Leaf::Terminal(v) => f64::from(v),
+                        Leaf::Decision { view, log, foul_tried } => {
+                            f64::from(self.net.forward(&encode(&view, &log, &foul_tried)).1)
+                        }
+                    });
+                }
                 let m = vals.iter().sum::<f64>() / vals.len() as f64;
                 q[ci] = m;
                 let var = vals.iter().map(|v| (v - m).powi(2)).sum::<f64>() / vals.len() as f64;
@@ -338,6 +441,7 @@ impl Strategy for RlSearch {
             "value": value,
             "searched": searched,
             "pool": pool.len(),
+            "kept_mass": kept_mass,
             "cands": cands.iter().zip(&q).zip(&w).zip(&se).map(|(((&(a, p), &qa), &wa), &sa)| serde_json::json!({
                 "usi": decode_usi(a, me), "p": p, "q": qa, "se": sa, "p_new": wa / wsum,
             })).collect::<Vec<_>>(),
@@ -395,5 +499,107 @@ mod tests {
             }
         }
         assert!(players[0].debug_state().unwrap()["searched"].as_bool().unwrap());
+    }
+
+    fn replay(hist: &[String]) -> Referee {
+        let mut r = Referee::new();
+        for usi in hist {
+            r.step(usi, 0);
+        }
+        r
+    }
+
+    fn events_json(log: &ObservationLog) -> String {
+        serde_json::to_string(log.events()).unwrap()
+    }
+
+    /// `step_leaf` の遷移（観測・視界・反則済みの手・終局）が審判と一致する。
+    /// 真の局面を粒子とみなし、候補手（反則もありうる）と相手の応手を同じだけ審判に進めて突き合わせる。
+    /// 200手の上限（自分の手で到達・相手の応手で到達）と反則負けの境界も通す
+    #[test]
+    fn 探索の遷移は審判と一致する() {
+        use crate::selfplay::GameResult;
+        let (mut hit_draw_mine, mut hit_draw_reply, mut hit_foul_limit, mut hit_foul) = (false, false, false, false);
+        for seed in 0..8u64 {
+            let mut rng = StdRng::seed_from_u64(seed);
+            // 実際の対局の反則率（高いと反則負けの境界、低いと200手の境界を通る）
+            let foul_rate = if seed < 5 { 0.01 } else { 0.4 };
+            let mut referee = Referee::new();
+            let mut hist: Vec<String> = vec![];
+            loop {
+                let me = referee.to_move();
+                let view = referee.view(me, [0, 0], 0);
+                let (log, tried) = (referee.log(me), referee.foul_tried(me));
+                let mask = legal_mask(&view, log, tried);
+                let masked: Vec<usize> = (0..mask.len()).filter(|&a| mask[a]).collect();
+                if masked.is_empty() {
+                    break;
+                }
+                let pos = referee.position().clone();
+
+                // 候補（マスク内から一様 = 反則もありうる）と相手の応手を突き合わせる
+                let cand = decode_action(masked[rng.random_range(0..masked.len())], me).unwrap();
+                let pick: u64 = rng.random();
+                let mut used_reply: Option<String> = None;
+                let leaf = step_leaf(&view, log, tried, &pos, &cand, |next| {
+                    let moves = next.legal_moves();
+                    let r = moves.get(pick as usize % moves.len().max(1)).copied();
+                    used_reply = r.map(|m| m.to_usi());
+                    r
+                });
+                let mut b = replay(&hist);
+                let first = b.step(&cand.to_usi(), 0);
+                if first == StepResult::Foul {
+                    hit_foul = true;
+                }
+                if first == StepResult::Accepted {
+                    b.step(used_reply.as_deref().expect("受理なら応手を引いている"), 0);
+                }
+                match (leaf, b.ended()) {
+                    (Leaf::Terminal(v), Some((result, reason))) => {
+                        let want = match result {
+                            GameResult::Win(c) if c == me => 1.0,
+                            GameResult::Win(_) => -1.0,
+                            GameResult::Draw => 0.0,
+                        };
+                        assert_eq!(v, want, "seed {seed}: 終局 {reason} の価値");
+                        match reason {
+                            "max_plies" if used_reply.is_none() => hit_draw_mine = true,
+                            "max_plies" => hit_draw_reply = true,
+                            "foul_limit" => hit_foul_limit = true,
+                            _ => {}
+                        }
+                    }
+                    (Leaf::Decision { view: v2, log: l2, foul_tried: t2 }, None) => {
+                        assert_eq!(b.to_move(), me, "seed {seed}: 次は自分の決定点");
+                        let bv = b.view(me, [0, 0], 0);
+                        assert_eq!(events_json(&l2), events_json(b.log(me)), "seed {seed}: 観測");
+                        assert_eq!(&t2, b.foul_tried(me), "seed {seed}: 反則済みの手");
+                        assert_eq!((v2.fouls.you, v2.fouls.opponent), (bv.fouls.you, bv.fouls.opponent));
+                        assert_eq!(
+                            encode(&v2, &l2, &t2),
+                            encode(&bv, b.log(me), b.foul_tried(me)),
+                            "seed {seed}: ネットの入力"
+                        );
+                    }
+                    (leaf, ended) => panic!("seed {seed}: 食い違い {leaf:?} vs {ended:?}"),
+                }
+
+                // 実際の対局を1手進める（大半は合法手）
+                let usi = if rng.random::<f64>() < foul_rate {
+                    decode_usi(masked[rng.random_range(0..masked.len())], me).unwrap()
+                } else {
+                    let moves = pos.legal_moves();
+                    moves[rng.random_range(0..moves.len())].to_usi()
+                };
+                hist.push(usi.clone());
+                if let StepResult::Ended { .. } = referee.step(&usi, 0) {
+                    break;
+                }
+            }
+        }
+        assert!(hit_foul, "反則の遷移を通っていない");
+        assert!(hit_foul_limit, "反則負けの境界を通っていない");
+        assert!(hit_draw_mine && hit_draw_reply, "200手の境界（自分の手 {hit_draw_mine} / 応手 {hit_draw_reply}）を通っていない");
     }
 }
