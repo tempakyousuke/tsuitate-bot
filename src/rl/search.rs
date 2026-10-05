@@ -54,6 +54,10 @@ pub struct SearchParams {
     /// 物理的に整合する粒子が無い決定点で、物理不整合（phys_taint）の粒子で探索するか。
     /// false なら探索をやめて元の方策で指す
     pub taint: bool,
+    /// 一次プールにソフト救済（info_miss > 0）の粒子も入れるか
+    pub soft: bool,
+    /// 相手の応手モデルへ露見マス・触ったマスを渡すか（false は切り分け用の修正前の挙動）
+    pub known: bool,
 }
 
 impl Default for SearchParams {
@@ -65,6 +69,8 @@ impl Default for SearchParams {
             greedy: false,
             scale: 2000.0 / 900.0,
             taint: true,
+            soft: true,
+            known: true,
         }
     }
 }
@@ -84,6 +90,8 @@ fn parse_spec(spec: &str) -> Result<(String, SearchParams), String> {
             "scale" => p.scale = v.parse().map_err(|e: std::num::ParseFloatError| bad(e.to_string()))?,
             "greedy" => p.greedy = v == "1" || v == "true",
             "taint" => p.taint = v == "1" || v == "true",
+            "soft" => p.soft = v == "1" || v == "true",
+            "known" => p.known = v == "1" || v == "true",
             _ => return Err(format!("{k}: 未知のパラメータ")),
         }
     }
@@ -118,7 +126,13 @@ impl RlSearch {
             params.k,
             params.n,
             params.eta,
-            format!("{}{}", if params.greedy { "g" } else { "" }, if params.taint { "" } else { "t0" })
+            format!(
+                "{}{}{}{}",
+                if params.greedy { "g" } else { "" },
+                if params.taint { "" } else { "t0" },
+                if params.soft { "" } else { "s0" },
+                if params.known { "" } else { "k0" }
+            )
         );
         let seed = seed.unwrap_or_else(|| rand::rng().random());
         Some(RlSearch {
@@ -299,23 +313,27 @@ fn push_move_squares(mv: &ShogiMove, captured: bool, captures: &mut Vec<Coord>, 
     touched.push(to);
 }
 
-/// 探索に使う粒子と重み。`allow_taint` が false なら**物理不整合（phys_taint）の粒子は使わない**
-/// （推定器の約束どおり、幽霊取りなどで救済した盤面は合法性・詰みの根拠にならない）。
-/// 情報制約だけを緩めたソフト救済の粒子は、推定器が logw へ課金済みなのでそのまま使う。
+/// 探索に使う粒子と重み。`usable(info_miss, phys_taint)` を満たす粒子だけを使う
+/// （phys_taint > 0 = 幽霊取りなどで救済した物理不整合の盤面、info_miss > 0 = 情報制約だけを
+/// 緩めたソフト救済の盤面。どちらの減衰も推定器が logw へ課金済み）。
 /// 重みは `weighted_unique_particles` と同じ規約（logw を max で正規化し、同一指紋を畳み込む）
-fn search_pool(est: &Estimator, me: Color, allow_taint: bool) -> Vec<(Position, f64)> {
-    let usable = |t: u8| allow_taint || t == 0;
+fn search_pool(est: &Estimator, me: Color, usable: impl Fn(u8, u8) -> bool) -> Vec<(Position, f64)> {
     let max_logw = est
         .log_weights()
         .iter()
-        .zip(est.phys_taint())
-        .filter(|(_, t)| usable(**t))
+        .zip(est.info_miss().iter().zip(est.phys_taint()))
+        .filter(|(_, (m, t))| usable(**m, **t))
         .map(|(w, _)| *w)
         .fold(f64::MIN, f64::max);
     let mut idx: HashMap<u64, usize> = HashMap::new();
     let mut out: Vec<(Position, f64)> = vec![];
-    for ((p, &taint), &w) in est.particles().iter().zip(est.phys_taint()).zip(est.log_weights()) {
-        if !usable(taint) || p.turn() != me {
+    for ((p, (&miss, &taint)), &w) in est
+        .particles()
+        .iter()
+        .zip(est.info_miss().iter().zip(est.phys_taint()))
+        .zip(est.log_weights())
+    {
+        if !usable(miss, taint) || p.turn() != me {
             continue;
         }
         let m = (w - max_logw).exp();
@@ -365,11 +383,14 @@ impl Strategy for RlSearch {
         // 物理的に整合する粒子を重みどおりに引く（search_pool）。全滅していて `taint=1` なら
         // 物理不整合の粒子へ落とす（実測: 落とさずに元の方策へ戻すと η=30 で 80.5% → 66.5%。
         // 未探索の決定点を含む39局の勝率が 90% → 36% と、差のほぼ全部がそこに集中した）
+        // `soft=0` なら一次プールは厳密粒子（info_miss=0 かつ phys_taint=0）だけにし、全滅時は
+        // ソフト救済も物理不整合も全部使う（修正前の `weighted_unique_particles` の strict と同じ）
         let est = self.est.as_ref().unwrap();
-        let mut pool = search_pool(est, me, false);
+        let soft = self.params.soft;
+        let mut pool = search_pool(est, me, |m, t| t == 0 && (soft || m == 0));
         let mut tainted = false;
         if pool.is_empty() && self.params.taint {
-            pool = search_pool(est, me, true);
+            pool = search_pool(est, me, |_, _| true);
             tainted = !pool.is_empty();
         }
         let pool_total: f64 = pool.iter().map(|x| x.1).sum();
@@ -386,6 +407,7 @@ impl Strategy for RlSearch {
         if searched {
             // 相手の応手モデルの入力（露見マス・触ったマス）。候補自身の分は候補ごとに足す
             let (captures0, touched0) = my_squares(log);
+            let known = self.params.known;
             let my_fouls = foul_tried.len() as u32;
             let samples: Vec<&Position> = (0..self.params.n)
                 .map(|_| {
@@ -413,6 +435,11 @@ impl Strategy for RlSearch {
                             ShogiMove::Drop { .. } => false,
                         };
                         push_move_squares(&mv, captured, &mut captures, &mut touched);
+                        if !known {
+                            // 切り分け用（known=0）: 露見マス・触ったマスを渡さない修正前の挙動
+                            captures.clear();
+                            touched.clear();
+                        }
                         predict_opp_reply(next, me, &captures, &touched, my_fouls, rng)
                     });
                     vals.push(match leaf {
