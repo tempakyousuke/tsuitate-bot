@@ -58,6 +58,9 @@ pub struct SearchParams {
     pub soft: bool,
     /// 相手の応手モデルへ露見マス・触ったマスを渡すか（false は切り分け用の修正前の挙動）
     pub known: bool,
+    /// 推定器の更新だけでこの時間（ms）を超えた手番は探索を省いて元の方策で指す。
+    /// webhook のコールドスタート（履歴の読み直し）で応答時間の上限を守るため。0 = 無効
+    pub slow_ms: u64,
 }
 
 impl Default for SearchParams {
@@ -71,6 +74,7 @@ impl Default for SearchParams {
             taint: true,
             soft: true,
             known: true,
+            slow_ms: 4000,
         }
     }
 }
@@ -92,6 +96,7 @@ fn parse_spec(spec: &str) -> Result<(String, SearchParams), String> {
             "taint" => p.taint = v == "1" || v == "true",
             "soft" => p.soft = v == "1" || v == "true",
             "known" => p.known = v == "1" || v == "true",
+            "slow_ms" => p.slow_ms = v.parse().map_err(|e: std::num::ParseIntError| bad(e.to_string()))?,
             _ => return Err(format!("{k}: 未知のパラメータ")),
         }
     }
@@ -109,6 +114,8 @@ pub struct RlSearch {
     seed: u64,
     rng: StdRng,
     last: Option<serde_json::Value>,
+    /// 前回の choose 以降に prewarm へ使った時間（ms）。次の choose の `slow` 判定に足す
+    prewarm_ms: u64,
 }
 
 impl RlSearch {
@@ -143,6 +150,7 @@ impl RlSearch {
             seed,
             rng: StdRng::seed_from_u64(seed ^ 0x5eed_5eed),
             last: None,
+            prewarm_ms: 0,
         })
     }
 
@@ -351,7 +359,9 @@ fn search_pool(est: &Estimator, me: Color, usable: impl Fn(u8, u8) -> bool) -> V
 
 impl Strategy for RlSearch {
     fn prewarm(&mut self, view: &PlayerView, log: &ObservationLog) {
+        let t = std::time::Instant::now();
         self.estimator(view.your_color).update(log);
+        self.prewarm_ms += t.elapsed().as_millis() as u64;
     }
 
     fn choose(
@@ -363,6 +373,9 @@ impl Strategy for RlSearch {
         let t0 = std::time::Instant::now();
         let me = view.your_color;
         self.estimator(me).update(log);
+        // 直前の prewarm（webhook のコールドスタートの逐次読み直し）に使った時間も同じ応答の中なので足す
+        let update_ms = std::mem::take(&mut self.prewarm_ms) + t0.elapsed().as_millis() as u64;
+        let slow = self.params.slow_ms > 0 && update_ms > self.params.slow_ms;
 
         let mask = legal_mask(view, log, foul_tried);
         let legal: Vec<usize> = (0..mask.len()).filter(|&a| mask[a]).collect();
@@ -395,7 +408,7 @@ impl Strategy for RlSearch {
         }
         let pool_total: f64 = pool.iter().map(|x| x.1).sum();
         let can_search = !pool.is_empty() && pool_total > 0.0;
-        let searched = self.params.eta != 0.0 && can_search && cands.len().min(self.params.k) > 1;
+        let searched = self.params.eta != 0.0 && can_search && !slow && cands.len().min(self.params.k) > 1;
         // 探索できない決定点は元の方策（切り詰めなし）で指す。eta=0 の対照は常に上位 k 手
         if searched || self.params.eta == 0.0 {
             cands.truncate(self.params.k);
@@ -483,6 +496,8 @@ impl Strategy for RlSearch {
             "searched": searched,
             "pool": pool.len(),
             "tainted": tainted,
+            "update_ms": update_ms,
+            "slow": slow,
             "kept_mass": kept_mass,
             "cands": cands.iter().zip(&q).zip(&w).zip(&se).map(|(((&(a, p), &qa), &wa), &sa)| serde_json::json!({
                 "usi": decode_usi(a, me), "p": p, "q": qa, "se": sa, "p_new": wa / wsum,
