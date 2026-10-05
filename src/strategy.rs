@@ -206,6 +206,7 @@ pub fn make_seeded(name: &str, seed: u64) -> Option<Box<dyn Strategy + Send>> {
         "rl_v25" => Some(Box::new(crate::frozen::rl_v25::RlV25::with_seed(seed))),
         "rl_nyugyoku_v1" => Some(Box::new(crate::frozen::rl_nyugyoku_v1::RlNyugyokuV1::with_seed(seed))),
         "rl_speed_v1" => Some(Box::new(crate::frozen::rl_speed_v1::RlSpeedV1::with_seed(seed))),
+        "rl_speed_v2" => Some(Box::new(crate::frozen::rl_speed_v2::RlSpeedV2::with_seed(seed))),
         "rl_guard_v1" => Some(Box::new(crate::frozen::rl_guard_v1::RlGuardV1::with_seed(seed))),
         // 着手の分布は `Heuristic` と同じ。乱数源だけ seed つきにする
         // （RL 環境の評価モードで相手の着手列を再現するため。2026-09-27）
@@ -317,6 +318,7 @@ pub fn make(name: &str) -> Option<Box<dyn Strategy + Send>> {
         "rl_v25" => Some(Box::new(crate::frozen::rl_v25::RlV25::new())),
         "rl_nyugyoku_v1" => Some(Box::new(crate::frozen::rl_nyugyoku_v1::RlNyugyokuV1::new())),
         "rl_speed_v1" => Some(Box::new(crate::frozen::rl_speed_v1::RlSpeedV1::new())),
+        "rl_speed_v2" => Some(Box::new(crate::frozen::rl_speed_v2::RlSpeedV2::new())),
         "rl_guard_v1" => Some(Box::new(crate::frozen::rl_guard_v1::RlGuardV1::new())),
         // 方策ネット（DeepNash 路線）: `rl_policy:<重みのパス>` / `rl_policy_greedy:<パス>` /
         // `rl_policy_basic:<パス>`（旧マスク）
