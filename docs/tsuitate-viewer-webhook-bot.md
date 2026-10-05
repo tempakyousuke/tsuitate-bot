@@ -104,7 +104,7 @@ strategy.rs/NN特徴量にモジュール横断でハードコードされてお
 | `TSUITATE_WEBHOOK_PATH` | `/webhook` | 受け付けるパス。サイト登録時のエンドポイントURLと一致させる |
 | `TSUITATE_WEBHOOK_STRATEGY` | `estimator_v10` | 戦略名（`strategy::make` が認識する名前） |
 | `WEBHOOK_TIMESTAMP_TOLERANCE_SECONDS` | `300` | HMAC timestampの許容秒数 |
-| `TSUITATE_THINK_BUDGET_MS` | `2000`（strategy.rs既定） | 登録する「レスポンス時間」より十分小さい値に絞ること |
+| `TSUITATE_THINK_BUDGET_MS` | `2000`（strategy.rs既定） | 応答時間の上限より十分小さい値に絞ること（2026-10-06 時点で登録画面に上限の項目は無い） |
 | `TSUITATE_COLD_START_PREWARM_MS` | `2500` | 再起動後の履歴prewarmに使う上限。残りの履歴は通常updateで処理する |
 | `TSUITATE_WEBHOOK_SESSION_DIR` | 未設定（無効） | 対局ごとの観測イベント列を `<dir>/<gameId>.jsonl` へ追記し、プロセス再起動・セッションTTL掃除の後もそこから復元する。**差分プロトコルではリクエストから全履歴を再構成できないため、本番運用では設定を強く推奨**（未設定だと再起動後、進行中の対局は 409 で継続不能になる） |
 | `TSUITATE_WEBHOOK_LOG_DIR` | 未設定（無効） | 設定すると検証済みリクエストの生payload・応答・所要時間を `<dir>/<gameId>.jsonl` に1行1リクエストで追記する（本体の `TSUITATE_RECORD_DIR` と同じ思想。実戦での「弱く感じる」挙動を後から再現・分析するための診断用） |
@@ -244,9 +244,12 @@ v10・v20は別プロセス・別ポート・別Secretで完全に独立する�
   実測したもの（`webhook_session::tests::
   long_synthetic_history_replays_cold_start_with_estimator_v10_within_deadline`、
   `cargo test --release -- --ignored` で再実行できる）で、対局が長くなるほど
-  この時間は伸びる。登録する「レスポンス時間」はデフォルトの5000msではなく
-  10000ms程度に余裕を持たせることを推奨（`TSUITATE_THINK_BUDGET_MS`を下げれば
-  さらに縮められる）。`deadlineMs`（リクエストで渡ってくる値）は現状コード側で
+  この時間は伸びる。以前はサイトの登録に「レスポンス時間」（既定5000ms）があり
+  10000ms程度を推奨していたが、**2026-10-06 時点で登録画面からこの項目が無くなっている**
+  （ユーザー確認。上限が撤廃されたと推測しているが未検証で、サイト側の固定値が
+  残っている可能性はある）。rl_search（`rl_search:...`）は同じ80plyで約6.5秒
+  （`long_synthetic_history_replays_cold_start_with_rl_search_within_deadline`。推定器の更新が
+  `slow_ms` を超えた手番は探索を省くガード込み）。`deadlineMs`（リクエストで渡ってくる値）は現状コード側で
   参照していない（差分化後の型定義からは消えており、欠落も許容する）ため、
   内部で早期打ち切りはしない
 - `sfen` フィールドを使った `GameModel::diff_view` 相当の整合性チェックは
