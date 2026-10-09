@@ -22,7 +22,7 @@ on:
       baselines:
         description: "基準戦略（スペース区切り。複数でガントレット）"
         required: false
-        default: "estimator_v14 rl_v15 rl_v16 rl_v17 rl_v18 rl_v19 rl_v20 rl_v21 rl_v22 rl_v23 rl_v24 rl_v25 rl_nyugyoku_v1 rl_nyugyoku_v2 rl_speed_v1 rl_speed_v2 rl_guard_v1"
+        default: "estimator_v14 rl_v15 rl_v16 rl_v17 rl_v18 rl_v19 rl_v20 rl_v21 rl_v22 rl_v23 rl_v24 rl_v25 rl_v26 rl_nyugyoku_v1 rl_nyugyoku_v2 rl_speed_v1 rl_speed_v2 rl_guard_v1"
       match_seed:
         description: "共通seed（アブレーション比較用。空なら毎局ランダム）"
         required: false
@@ -107,7 +107,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          default_baselines='estimator_v14 rl_v15 rl_v16 rl_v17 rl_v18 rl_v19 rl_v20 rl_v21 rl_v22 rl_v23 rl_v24 rl_v25 rl_nyugyoku_v1 rl_nyugyoku_v2 rl_speed_v1 rl_speed_v2 rl_guard_v1'
+          default_baselines='estimator_v14 rl_v15 rl_v16 rl_v17 rl_v18 rl_v19 rl_v20 rl_v21 rl_v22 rl_v23 rl_v24 rl_v25 rl_v26 rl_nyugyoku_v1 rl_nyugyoku_v2 rl_speed_v1 rl_speed_v2 rl_guard_v1'
           req='.github/ci/arena.request.json'
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             games="${IN_GAMES:-100}"
