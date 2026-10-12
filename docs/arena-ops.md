@@ -382,7 +382,9 @@ DeepNash 路線の自己対局学習（`docs/rl-deepnash-design.md`）は別の 
   `tar czf /tmp/tsuitate-nn-rnad.tar.gz -C ~/Develop/tsuitate-nn --exclude __pycache__ rnad out_rnad/bc/checkpoint.pt`
   を `scripts/gce/setup-rnad.sh` と一緒に `/tmp/` へ送り、
   `bash /tmp/setup-rnad.sh rnad '<train_rnad.py の引数>'` を実行（Rust・PyTorch の CUDA 版・
-  `tsuitate_rl` のビルド → 参照実装との一致テスト → systemd 常駐まで自動）
+  `tsuitate_rl` のビルド → 参照実装との一致テスト → systemd 常駐まで自動）。
+  引数を `'<1本目>' '<2本目>' ...` と複数渡すと1本ずつ直列に回し、全部完走してから停止する
+  （GPU は1枚なので比較の arm を並べて回すときに使う）
 - **VM を再起動すると `/tmp` は消える**ので、setup をやり直すときは2つの tar と setup-rnad.sh を送り直す
 - **カーネルの自動更新で GPU を失う**: unattended-upgrades がカーネルを上げると、再起動後に
   NVIDIA のビルド済みモジュール（`linux-modules-nvidia-580-server-open-<カーネル>`）が無く

@@ -8,9 +8,11 @@
 #   VM は NVIDIA ドライバ入りのイメージ（Deep Learning VM など）で、nvidia-smi が通ること
 #
 # 使い方:
-#   bash setup-rnad.sh <サービス名> "<train_rnad.py の引数>"
+#   bash setup-rnad.sh <サービス名> "<train_rnad.py の引数>" ["<2本目の引数>" ...]
 # 例:
 #   bash setup-rnad.sh rnad "--init out_rnad/bc/checkpoint.pt --out out_rnad/rnad_gpu --steps 3000 --batch 256"
+# 引数を複数渡すと、その順に1本ずつ回す（GPU は1枚なので並べずに直列。全部完走したら停止する）。
+# 途中で止められても、完走済みの run は --out の checkpoint が --steps に達しているので即座に抜ける
 #
 # Spot で止められたら instances start するだけ: systemd が train_rnad.py を起こし直し、
 # <out>/checkpoint.pt から続きを再開する（--checkpoint-every ごとに書かれる）。
@@ -20,7 +22,16 @@
 set -euo pipefail
 
 SERVICE="$1"
-TRAIN_ARGS="$2"
+shift
+RUNS=("$@")
+[ "${#RUNS[@]}" -ge 1 ] || { echo "train_rnad.py の引数を1つ以上渡す" >&2; exit 1; }
+# 1本だけなら従来どおりの文字列（印のハッシュも従来と同じになる）
+TRAIN_ARGS=$(IFS=$'\n'; printf '%s' "${RUNS[*]}")
+PY="$HOME/tsuitate-nn/.venv/bin/python"
+TRAIN_CMD=""
+for run_args in "${RUNS[@]}"; do
+  TRAIN_CMD="${TRAIN_CMD:+$TRAIN_CMD && }$PY rnad/train_rnad.py ${run_args}"
+done
 AUTO_POWEROFF="${AUTO_POWEROFF:-1}"
 # 完走したら印を残し、以後の起動では走らせない（ConditionPathExists）。印が無いと、結果を
 # 回収しようと VM を起こしたとき「完走済み → 即終了 → 自動停止」で落ちて SSH できない
@@ -35,9 +46,9 @@ DONE_MARK="$HOME/.rnad-${SERVICE}-${ARGS_ID}.done"
 sudo systemctl stop "${SERVICE}.service" 2>/dev/null || true
 if [ "$AUTO_POWEROFF" = "1" ]; then
   # 完走（終了コード 0）のときだけ停止する。失敗は Restart=on-failure で起こし直す
-  EXEC_START="/bin/bash -c '$HOME/tsuitate-nn/.venv/bin/python rnad/train_rnad.py ${TRAIN_ARGS} && touch ${DONE_MARK} && sudo /sbin/poweroff'"
+  EXEC_START="/bin/bash -c '${TRAIN_CMD} && touch ${DONE_MARK} && sudo /sbin/poweroff'"
 else
-  EXEC_START="/bin/bash -c '$HOME/tsuitate-nn/.venv/bin/python rnad/train_rnad.py ${TRAIN_ARGS} && touch ${DONE_MARK}'"
+  EXEC_START="/bin/bash -c '${TRAIN_CMD} && touch ${DONE_MARK}'"
 fi
 
 nvidia-smi > /dev/null || { echo "nvidia-smi が通らない（GPU ドライバ未導入）" >&2; exit 1; }
