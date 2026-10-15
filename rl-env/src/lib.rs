@@ -398,6 +398,18 @@ impl VecEnv {
         ))
     }
 
+    /// 各局の今の手番から見た真実の盤面のラベル `[n, 81]`（int8。−1 = 自駒、0 = 空き、
+    /// 1〜14 = 相手の駒種。マスと向きは `observe` と同じ。`EnvGame::truth_into`）。
+    /// **補助損失・診断専用**で、方策の入力には使わない。終局して止まっている局は終局時の盤面
+    fn truth<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<i8>>> {
+        let n = self.games.len();
+        let mut out = vec![0i8; n * 81];
+        for (o, g) in out.chunks_mut(81).zip(&self.games) {
+            g.truth_into(o);
+        }
+        PyArray1::from_vec(py, out).reshape([n, 81])
+    }
+
     /// 評価モードで各局の学習側の色（0=先手 1=後手）。自己対局では -1。
     /// **今の局の色**なので、`step` が返す報酬の列を選ぶには step の前に取っておくこと
     fn learner_colors<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i8>> {
