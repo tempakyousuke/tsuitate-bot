@@ -10,13 +10,31 @@
 //! `cargo test` で検査できる。
 
 use crate::board::Coord;
-use crate::protocol::Color;
+use crate::protocol::{Color, Role};
 use crate::referee::{Referee, StepResult};
-use crate::rl::action::{NUM_ACTIONS, decode_usi, legal_mask};
+use crate::rl::action::{NUM_ACTIONS, decode_usi, index_square, legal_mask, normalize};
 use crate::rl::encode::{OBS_LEN, encode_into};
 use crate::selfplay::{GameResult, StartState, fischer_initial_ms};
 use crate::shogi::{ShogiMove, parse_usi};
 use crate::strategy::Strategy;
+
+/// `EnvGame::truth_into` の相手駒のラベルの駒種の並び（観測の自駒プレーンと同じ `Role` の宣言順）
+pub const TRUTH_ROLES: [Role; 14] = [
+    Role::Pawn,
+    Role::Lance,
+    Role::Knight,
+    Role::Silver,
+    Role::Gold,
+    Role::Bishop,
+    Role::Rook,
+    Role::King,
+    Role::Tokin,
+    Role::Promotedlance,
+    Role::Promotedknight,
+    Role::Promotedsilver,
+    Role::Horse,
+    Role::Dragon,
+];
 
 /// 玉の周りの集計の半径（チェビシェフ距離。1 = 8近傍、2 = 距離2以内の24マス）
 pub const GUARD_RADII: [i8; 2] = [1, 2];
@@ -289,6 +307,25 @@ impl EnvGame {
         encode_into(&view, self.referee.log(side), self.referee.foul_tried(side), obs);
     }
 
+    /// 今の手番から見た**真実の盤面のラベル**を書く（`out` は長さ 81、マス番号は観測と同じ
+    /// `action::square_index` で手番側を先手向きに正規化）。値は −1 = 自駒（観測で既知）、
+    /// 0 = 空き、1〜14 = 相手の駒（`TRUTH_ROLES` の添字 + 1）。
+    ///
+    /// **学習の補助損失・診断専用**（相手駒の位置は観測に無い情報なので、方策の入力には使わない）
+    pub fn truth_into(&self, out: &mut [i8]) {
+        debug_assert_eq!(out.len(), 81);
+        let side = self.referee.to_move();
+        let pos = self.referee.position();
+        for (i, o) in out.iter_mut().enumerate() {
+            let c = normalize(index_square(i), side);
+            *o = match pos.piece_at(c) {
+                None => 0,
+                Some(p) if p.color == side => -1,
+                Some(p) => TRUTH_ROLES.iter().position(|&r| r == p.role).map_or(0, |k| k as i8 + 1),
+            };
+        }
+    }
+
     /// 行動が今の手番で受け付けられるか（状態は変えない）。並列環境はバッチ全体を
     /// これで検査してから `step` する（1局の不正で他の局だけ進むのを防ぐため）
     pub fn check_action(&self, action: usize) -> Result<(), EnvError> {
@@ -382,6 +419,29 @@ pub fn random_action(mask: &[bool], r: f64) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn 真実のラベルは手番側から見た相手駒を正規化して返す() {
+        use crate::rl::action::square_index;
+        let mut g = EnvGame::selfplay(None, 0);
+        for side in [Color::Sente, Color::Gote] {
+            assert_eq!(g.to_move(), side);
+            let mut t = [0i8; 81];
+            g.truth_into(&mut t);
+            // 初手（先手）と2手目（後手）: どちらも相手の玉は正規化後の 5一
+            let king = TRUTH_ROLES.iter().position(|&r| r == Role::King).unwrap() as i8 + 1;
+            assert_eq!(t[square_index(Coord { file: 5, rank: 1 })], king);
+            assert_eq!(t[square_index(Coord { file: 5, rank: 9 })], -1);
+            assert_eq!(t.iter().filter(|&&v| v > 0).count(), 20);
+            assert_eq!(t.iter().filter(|&&v| v < 0).count(), 20);
+            if side == Color::Sente {
+                // 先手の 7六歩（初手は相手の陣に触れない）
+                let a = (0..NUM_ACTIONS).find(|&a| g.mask()[a] && g.check_action(a).is_ok()
+                    && decode_usi(a, Color::Sente).as_deref() == Some("7g7f")).unwrap();
+                g.step(a).unwrap();
+            }
+        }
+    }
+
     use super::*;
     use rand::{Rng, SeedableRng, rngs::StdRng};
 
