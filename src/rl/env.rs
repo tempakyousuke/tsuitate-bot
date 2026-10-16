@@ -13,7 +13,7 @@ use crate::board::Coord;
 use crate::protocol::{Color, Role};
 use crate::referee::{Referee, StepResult};
 use crate::rl::action::{NUM_ACTIONS, decode_usi, index_square, legal_mask, normalize};
-use crate::rl::encode::{OBS_LEN, encode_into};
+use crate::rl::encode::encode_into;
 use crate::selfplay::{GameResult, StartState, fischer_initial_ms};
 use crate::shogi::{ShogiMove, parse_usi};
 use crate::strategy::Strategy;
@@ -299,9 +299,8 @@ impl EnvGame {
         result
     }
 
-    /// 今の手番の観測を書く（`obs` は長さ `OBS_LEN`）
+    /// 今の手番の観測を書く（`obs` の長さでエンコーダの版を選ぶ。`rl::encode::encode_into`）
     pub fn observe_into(&self, obs: &mut [f32]) {
-        debug_assert_eq!(obs.len(), OBS_LEN);
         let side = self.referee.to_move();
         let view = self.referee.view(side, clocks(), self.game_no);
         encode_into(&view, self.referee.log(side), self.referee.foul_tried(side), obs);

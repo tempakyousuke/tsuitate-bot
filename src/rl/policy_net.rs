@@ -14,13 +14,14 @@ use std::collections::HashMap;
 use std::io::Read;
 
 use crate::rl::action::{NUM_ACTION_KINDS, NUM_ACTIONS};
-use crate::rl::encode::{NUM_PLANES, OBS_LEN};
+use crate::rl::encode::{NUM_PLANES, obs_len};
 
 const MAGIC: &[u8; 8] = b"TSRLPV01";
 const SQ: usize = 81;
 
 #[derive(Debug)]
 pub struct PolicyNet {
+    planes: usize,
     channels: usize,
     blocks: usize,
     tensors: HashMap<String, Vec<f32>>,
@@ -58,10 +59,11 @@ impl PolicyNet {
             bytes.get(12..12 + hlen).ok_or("ヘッダが切れている")?,
         )
         .map_err(|e| e.to_string())?;
-        if header.planes != NUM_PLANES {
+        if obs_len(header.planes).is_none() {
             return Err(format!(
-                "入力プレーン数 {} が現行のエンコーダ {NUM_PLANES} と違う",
-                header.planes
+                "入力プレーン数 {} に対応するエンコーダが無い（v1 = {NUM_PLANES}、v2 = {}）",
+                header.planes,
+                crate::rl::encode::NUM_PLANES_DEDUCED
             ));
         }
         let mut off = 12 + hlen;
@@ -82,6 +84,7 @@ impl PolicyNet {
             return Err("末尾に余分なデータがある".into());
         }
         let net = PolicyNet {
+            planes: header.planes,
             channels: header.channels,
             blocks: header.blocks,
             tensors,
@@ -93,7 +96,7 @@ impl PolicyNet {
     fn check_shapes(&self) -> Result<(), String> {
         let c = self.channels;
         let mut want: Vec<(String, usize)> = vec![
-            ("stem.w".into(), c * NUM_PLANES * 9),
+            ("stem.w".into(), c * self.planes * 9),
             ("stem.b".into(), c),
             ("p1.w".into(), 32 * c),
             ("p1.b".into(), 32),
@@ -126,11 +129,16 @@ impl PolicyNet {
         &self.tensors[name]
     }
 
-    /// 観測（長さ `OBS_LEN`）→ (ロジット（長さ `NUM_ACTIONS`、マスク前）, 価値 ∈ [−1, 1])
+    /// 入力プレーン数（エンコーダの版。`rl::encode::encode_planes` に渡す）
+    pub fn planes(&self) -> usize {
+        self.planes
+    }
+
+    /// 観測（長さ `planes() * 81`）→ (ロジット（長さ `NUM_ACTIONS`、マスク前）, 価値 ∈ [−1, 1])
     pub fn forward(&self, obs: &[f32]) -> (Vec<f32>, f32) {
-        assert_eq!(obs.len(), OBS_LEN);
+        assert_eq!(obs.len(), self.planes * SQ);
         let c = self.channels;
-        let mut x = conv3x3(obs, NUM_PLANES, c, self.t("stem.w"), self.t("stem.b"));
+        let mut x = conv3x3(obs, self.planes, c, self.t("stem.w"), self.t("stem.b"));
         relu(&mut x);
         for i in 0..self.blocks {
             let mut y = conv3x3(&x, c, c, self.t(&format!("block{i}.c1.w")), self.t(&format!("block{i}.c1.b")));
@@ -245,13 +253,72 @@ mod tests {
         }
     }
 
+    /// v1 の重みの stem に確定事実のプレーンぶん 0 の列を足した v2 の重みは、v2 の観測に対して
+    /// v1 と同じ出力になる（学習で v1 の checkpoint から v2 を始めるときの前提）
+    #[test]
+    fn v2の重みは足したプレーンが0なら_v1と同じ出力になる() {
+        use crate::rl::encode::NUM_PLANES_DEDUCED;
+        let bytes = std::fs::read(format!("{FIXTURE}.bin")).unwrap();
+        let v1 = PolicyNet::from_bytes(&bytes).unwrap();
+        assert_eq!(v1.planes(), NUM_PLANES);
+        let v2 = PolicyNet::from_bytes(&widen_stem(&bytes, NUM_PLANES_DEDUCED)).unwrap();
+        assert_eq!(v2.planes(), NUM_PLANES_DEDUCED);
+        let tv: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(format!("{FIXTURE}.test.json")).unwrap())
+                .unwrap();
+        for input in tv["input"].as_array().unwrap() {
+            let x: Vec<f32> = serde_json::from_value(input.clone()).unwrap();
+            let mut x2 = x.clone();
+            // 足したプレーンには値を入れる（重みが 0 なので出力に効かないはず）
+            x2.extend((0..(NUM_PLANES_DEDUCED - NUM_PLANES) * SQ).map(|i| (i % 7) as f32 / 7.0));
+            let (a, va) = v1.forward(&x);
+            let (b, vb) = v2.forward(&x2);
+            assert_eq!(a, b);
+            assert_eq!(va, vb);
+        }
+        // 対応するエンコーダの無いプレーン数は読まない
+        assert!(PolicyNet::from_bytes(&widen_stem(&bytes, NUM_PLANES + 1)).is_err());
+    }
+
+    /// 重みファイルの stem.w（[c, planes, 3, 3]）の入力チャネルを `planes` まで 0 で広げる
+    fn widen_stem(bytes: &[u8], planes: usize) -> Vec<u8> {
+        let hlen = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+        let mut header: serde_json::Value = serde_json::from_slice(&bytes[12..12 + hlen]).unwrap();
+        let old = header["planes"].as_u64().unwrap() as usize;
+        header["planes"] = planes.into();
+        let mut data = vec![];
+        let mut off = 12 + hlen;
+        for t in header["tensors"].as_array_mut().unwrap() {
+            let shape: Vec<usize> = serde_json::from_value(t["shape"].clone()).unwrap();
+            let n: usize = shape.iter().product();
+            let raw = &bytes[off..off + 4 * n];
+            off += 4 * n;
+            if t["name"] == "stem.w" {
+                let (c, k) = (shape[0], shape[2] * shape[3]);
+                for o in 0..c {
+                    data.extend_from_slice(&raw[4 * o * old * k..4 * (o + 1) * old * k]);
+                    data.extend(std::iter::repeat_n(0u8, 4 * (planes - old) * k));
+                }
+                t["shape"] = serde_json::json!([c, planes, shape[2], shape[3]]);
+            } else {
+                data.extend_from_slice(raw);
+            }
+        }
+        let h = serde_json::to_vec(&header).unwrap();
+        let mut out = bytes[..8].to_vec();
+        out.extend((h.len() as u32).to_le_bytes());
+        out.extend(h);
+        out.extend(data);
+        out
+    }
+
     /// 1回の forward の所要時間。
     /// `RL_POLICY_BENCH=<重み> cargo test --release --lib 方策ネットの速度 -- --ignored --nocapture`
     #[test]
     #[ignore]
     fn 方策ネットの速度() {
         let net = PolicyNet::load(&std::env::var("RL_POLICY_BENCH").unwrap()).unwrap();
-        let x = vec![0.5f32; OBS_LEN];
+        let x = vec![0.5f32; net.planes() * SQ];
         let t = std::time::Instant::now();
         let n = 50;
         for _ in 0..n {

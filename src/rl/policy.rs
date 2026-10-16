@@ -22,7 +22,7 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 use crate::observation::ObservationLog;
 use crate::protocol::PlayerView;
 use crate::rl::action::{basic_legal_mask, decode_usi, legal_mask};
-use crate::rl::encode::encode;
+use crate::rl::encode::encode_planes;
 use crate::rl::policy_net::PolicyNet;
 use crate::strategy::Strategy;
 
@@ -119,7 +119,7 @@ impl Strategy for RlPolicy {
         if legal.is_empty() {
             return None;
         }
-        let (logits, value) = self.net.forward(&encode(view, log, foul_tried));
+        let (logits, value) = self.net.forward(&encode_planes(self.net.planes(), view, log, foul_tried));
         let max = legal.iter().map(|&a| logits[a]).fold(f32::MIN, f32::max);
         let weights: Vec<f64> = legal.iter().map(|&a| f64::from(logits[a] - max).exp()).collect();
         let total: f64 = weights.iter().sum();
