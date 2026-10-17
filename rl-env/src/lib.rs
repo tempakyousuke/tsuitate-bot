@@ -360,6 +360,7 @@ impl VecEnv {
             next_game_no,
             finished,
             auto_reset,
+            ..
         } = self;
         let auto_reset = *auto_reset;
         let (rewards, done, internal) = py.detach(|| {
