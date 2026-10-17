@@ -225,6 +225,41 @@ pub fn legal_mask(view: &PlayerView, log: &ObservationLog, foul_tried: &HashSet<
     if any { mask } else { basic }
 }
 
+/// マスクの推論（`Deduction`）が確定させた事実のうち、盤のマスで表せるもの（エンコーダ v2 の入力）。
+/// どれも真の盤面と矛盾しない（マスクが真の合法手を落とさないのと同じ根拠）
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct DeducedFacts {
+    /// 相手の駒がいると確定したマス
+    pub occupied: Vec<Coord>,
+    /// 飛び越え反則ごとの間のマス（それぞれ少なくとも1マスに相手の駒がいる）
+    pub blocked: Vec<Vec<Coord>>,
+    /// 王手中: 王手駒がいうるマス（重複なし。王手中でない・前提が崩れているときは空）
+    pub checkers: Vec<Coord>,
+}
+
+pub fn deduced_facts(view: &PlayerView, log: &ObservationLog, foul_tried: &HashSet<String>) -> DeducedFacts {
+    let candidates: HashSet<String> = candidate_usis(view).into_iter().collect();
+    let d = Deduction::new(view, log, foul_tried, &candidates);
+    let mut occupied: Vec<Coord> = d.occupied.into_iter().collect();
+    occupied.sort_by_key(|c| (c.file, c.rank));
+    let blocked = d
+        .blocked_beyond
+        .iter()
+        .map(|&(f, unit, dist)| (1..dist).map(|k| step(f, unit, k)).collect())
+        .collect();
+    let mut checkers: Vec<Coord> = d
+        .check
+        .map(|(_, hyps)| hyps.into_iter().map(|h| h.square).collect())
+        .unwrap_or_default();
+    checkers.sort_by_key(|c| (c.file, c.rank));
+    checkers.dedup();
+    DeducedFacts {
+        occupied,
+        blocked,
+        checkers,
+    }
+}
+
 /// 王手駒がいうるマスの1仮説。`dir` は玉から見た方向（桂は None）、`dist` は玉からの距離
 #[derive(Debug, Clone, Copy)]
 struct CheckerHyp {

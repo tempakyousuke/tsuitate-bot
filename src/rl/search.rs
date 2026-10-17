@@ -35,7 +35,7 @@ use crate::estimator::{Estimator, predict_opp_reply};
 use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{ClockState, Color, FoulCounts, GameStatus, PlayerView};
 use crate::rl::action::{decode_action, decode_usi, legal_mask};
-use crate::rl::encode::encode;
+use crate::rl::encode::encode_planes;
 use crate::rl::policy_net::PolicyNet;
 use crate::selfplay::{MAX_FOULS, MAX_PLIES};
 use crate::shogi::{Outcome, Position, ShogiMove, parse_usi, unpromote_role};
@@ -382,7 +382,7 @@ impl Strategy for RlSearch {
         if legal.is_empty() {
             return None;
         }
-        let (logits, value) = self.net.forward(&encode(view, log, foul_tried));
+        let (logits, value) = self.net.forward(&encode_planes(self.net.planes(), view, log, foul_tried));
         let max = legal.iter().map(|&a| logits[a]).fold(f32::MIN, f32::max);
         let total: f64 = legal.iter().map(|&a| f64::from(logits[a] - max).exp()).sum();
         let mut cands: Vec<(usize, f64)> = legal
@@ -458,7 +458,7 @@ impl Strategy for RlSearch {
                     vals.push(match leaf {
                         Leaf::Terminal(v) => f64::from(v),
                         Leaf::Decision { view, log, foul_tried } => {
-                            f64::from(self.net.forward(&encode(&view, &log, &foul_tried)).1)
+                            f64::from(self.net.forward(&encode_planes(self.net.planes(), &view, &log, &foul_tried)).1)
                         }
                     });
                 }
@@ -520,6 +520,7 @@ impl Strategy for RlSearch {
 mod tests {
     use super::*;
     use crate::referee::{Referee, StepResult};
+    use crate::rl::encode::NUM_PLANES_DEDUCED;
 
     const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/rl/tiny_policy.bin");
 
@@ -634,8 +635,8 @@ mod tests {
                         assert_eq!(&t2, b.foul_tried(me), "seed {seed}: 反則済みの手");
                         assert_eq!((v2.fouls.you, v2.fouls.opponent), (bv.fouls.you, bv.fouls.opponent));
                         assert_eq!(
-                            encode(&v2, &l2, &t2),
-                            encode(&bv, b.log(me), b.foul_tried(me)),
+                            encode_planes(NUM_PLANES_DEDUCED, &v2, &l2, &t2),
+                            encode_planes(NUM_PLANES_DEDUCED, &bv, b.log(me), b.foul_tried(me)),
                             "seed {seed}: ネットの入力"
                         );
                     }

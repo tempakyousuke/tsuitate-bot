@@ -16,7 +16,7 @@ use rayon::prelude::*;
 
 use tsuitate_bot::protocol::Color;
 use tsuitate_bot::rl::action::NUM_ACTIONS;
-use tsuitate_bot::rl::encode::{NUM_PLANES, OBS_LEN};
+use tsuitate_bot::rl::encode::{NUM_PLANES, NUM_PLANES_DEDUCED, OBS_LEN, obs_len};
 use tsuitate_bot::rl::env::{EnvGame, GUARD_RADII, Outcome, SpeedSum, StyleStats};
 use tsuitate_bot::selfplay::{GameResult, MAX_PLIES, mix};
 use tsuitate_bot::strategy::{self, Strategy};
@@ -116,7 +116,8 @@ struct VecEnv {
     next_game_no: u32,
     finished: Vec<Finished>,
     /// 終局した局を step の中で新しい局へ差し替えるか
-    auto_reset: bool,
+    auto_reset: bool,    /// 観測のプレーン数（エンコーダの版。`rl::encode::obs_len`）
+    planes: usize,
 }
 
 fn color_code(c: Color) -> i8 {
@@ -171,7 +172,7 @@ fn build_fresh(
 #[pymethods]
 impl VecEnv {
     #[new]
-    #[pyo3(signature = (n, opponent=None, seed=0, auto_reset=true, guard_bonus=0.0, guard_radius=1, opponents=None, speed_bonus=0.0, speed_horizon=MAX_PLIES, speed_sum="own"))]
+    #[pyo3(signature = (n, opponent=None, seed=0, auto_reset=true, guard_bonus=0.0, guard_radius=1, opponents=None, speed_bonus=0.0, speed_horizon=MAX_PLIES, speed_sum="own", planes=NUM_PLANES))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -185,9 +186,15 @@ impl VecEnv {
         speed_bonus: f32,
         speed_horizon: u32,
         speed_sum: &str,
+        planes: usize,
     ) -> PyResult<Self> {
         if n == 0 {
             return Err(PyValueError::new_err("n は 1 以上"));
+        }
+        if obs_len(planes).is_none() {
+            return Err(PyValueError::new_err(format!(
+                "planes は {NUM_PLANES}（v1）か {NUM_PLANES_DEDUCED}（v2 = 確定事実のプレーンつき）（{planes}）"
+            )));
         }
         if !guard_bonus.is_finite() {
             return Err(PyValueError::new_err("guard_bonus は有限の値"));
@@ -246,6 +253,7 @@ impl VecEnv {
             next_game_no,
             finished,
             auto_reset,
+            planes,
         })
     }
 
@@ -277,11 +285,13 @@ impl VecEnv {
     // &mut なのは rayon で局を分けるため（相手戦略は Send だが Sync ではない）
     fn observe<'py>(&mut self, py: Python<'py>) -> PyResult<ObserveOut<'py>> {
         let n = self.games.len();
+        let planes = self.planes;
+        let len = planes * 81;
         let games = &mut self.games;
         let (obs, mask) = py.detach(|| {
-            let mut obs = vec![0.0f32; n * OBS_LEN];
+            let mut obs = vec![0.0f32; n * len];
             let mut mask = vec![false; n * NUM_ACTIONS];
-            obs.par_chunks_mut(OBS_LEN)
+            obs.par_chunks_mut(len)
                 .zip(mask.par_chunks_mut(NUM_ACTIONS))
                 .zip(games.par_iter_mut())
                 .for_each(|((o, m), g): ((&mut [f32], &mut [bool]), &mut EnvGame)| {
@@ -295,7 +305,7 @@ impl VecEnv {
         });
         let player: Vec<i8> = self.games.iter().map(|g| color_code(g.to_move())).collect();
         Ok((
-            PyArray1::from_vec(py, obs).reshape([n, NUM_PLANES, 9, 9])?,
+            PyArray1::from_vec(py, obs).reshape([n, planes, 9, 9])?,
             PyArray1::from_vec(py, mask).reshape([n, NUM_ACTIONS])?,
             PyArray1::from_vec(py, player),
         ))
@@ -350,6 +360,7 @@ impl VecEnv {
             next_game_no,
             finished,
             auto_reset,
+            ..
         } = self;
         let auto_reset = *auto_reset;
         let (rewards, done, internal) = py.detach(|| {
@@ -673,5 +684,6 @@ fn tsuitate_rl(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<RecordDataset>()?;
     m.add("NUM_ACTIONS", NUM_ACTIONS)?;
     m.add("NUM_PLANES", NUM_PLANES)?;
+    m.add("NUM_PLANES_DEDUCED", NUM_PLANES_DEDUCED)?;
     Ok(())
 }
