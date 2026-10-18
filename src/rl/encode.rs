@@ -10,7 +10,7 @@
 use std::collections::HashSet;
 
 use crate::board::{Coord, parse_usi_square};
-use crate::deduce::{immobile_opponent_pawns, opp_king_candidates};
+use crate::deduce::{ImmobilePawns, KingCandidates};
 use crate::model::GameModel;
 use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{Color, PlayerView, Role};
@@ -176,6 +176,31 @@ fn move_squares(usi: &str) -> Option<(Option<Coord>, Coord)> {
     }
 }
 
+/// 確定事実のプレーンのうち、観測ログを先頭からたどって求めるもの（相手玉の候補・動けない歩）の
+/// 途中状態。同じ局・同じ側の観測を、ログを伸ばしながら何度も書くとき（RL の環境）に使い回すと、
+/// 伸びたぶんだけ処理すれば済む（毎回たどり直すと長い対局ほど重い）。結果は使い回さないときと同じ
+#[derive(Clone, Default)]
+pub struct DeducedCache {
+    state: Option<(Color, KingCandidates, ImmobilePawns)>,
+}
+
+impl DeducedCache {
+    /// `log` まで進めた途中状態。色が違う・ログが前回より短い（別の局）ときは作り直す
+    fn advance(&mut self, color: Color, log: &ObservationLog) -> (&KingCandidates, &ImmobilePawns) {
+        let stale = self
+            .state
+            .as_ref()
+            .is_none_or(|(c, _, pawns)| *c != color || pawns.done() > log.events().len());
+        if stale {
+            self.state = Some((color, KingCandidates::new(color), ImmobilePawns::new(color)));
+        }
+        let (_, king, pawns) = self.state.as_mut().expect("作った");
+        king.advance(log);
+        pawns.advance(log);
+        (king, pawns)
+    }
+}
+
 /// 観測をテンソルへ書く。`out` の長さでエンコーダの版を選ぶ: `OBS_LEN` は v1、
 /// `NUM_PLANES_DEDUCED * 81` は v2（v1 の後ろに確定事実のプレーン）
 pub fn encode_into(
@@ -184,6 +209,18 @@ pub fn encode_into(
     foul_tried: &HashSet<String>,
     out: &mut [f32],
 ) {
+    encode_into_cached(view, log, foul_tried, out, &mut DeducedCache::default());
+}
+
+/// `encode_into` と同じ観測を、確定事実の途中状態 `cache` を使い回して書く。`cache` は同じ局・同じ側の
+/// 観測を書くときだけ使い回すこと（局が変わったら作り直す。色が違う・ログが短くなったときは中で作り直す）
+pub fn encode_into_cached(
+    view: &PlayerView,
+    log: &ObservationLog,
+    foul_tried: &HashSet<String>,
+    out: &mut [f32],
+    cache: &mut DeducedCache,
+) {
     assert!(
         out.len() == OBS_LEN || out.len() == NUM_PLANES_DEDUCED * 81,
         "観測の長さ {} に対応するエンコーダが無い",
@@ -191,7 +228,7 @@ pub fn encode_into(
     );
     out.fill(0.0);
     if out.len() > OBS_LEN {
-        encode_deduced(view, log, foul_tried, out);
+        encode_deduced(view, log, foul_tried, out, cache);
     }
     let color = view.your_color;
     let now = view.move_number;
@@ -345,7 +382,13 @@ pub fn encode_into(
 }
 
 /// 確定事実のプレーン（v2 の後ろ5枚）を書く。`out` は 0 で埋めてあること
-fn encode_deduced(view: &PlayerView, log: &ObservationLog, foul_tried: &HashSet<String>, out: &mut [f32]) {
+fn encode_deduced(
+    view: &PlayerView,
+    log: &ObservationLog,
+    foul_tried: &HashSet<String>,
+    out: &mut [f32],
+    cache: &mut DeducedCache,
+) {
     let color = view.your_color;
     let facts = deduced_facts(view, log, foul_tried);
     let mut p = Planes { buf: out, color };
@@ -364,10 +407,13 @@ fn encode_deduced(view: &PlayerView, log: &ObservationLog, foul_tried: &HashSet<
             p.set(D_CHECKER, c, v);
         }
     }
-    for c in opp_king_candidates(color, log) {
+    // deduce::opp_king_candidates / immobile_opponent_pawns と同じ（途中状態を使い回すだけ）
+    let (king, pawns) = cache.advance(color, log);
+    let locked = pawns.result();
+    for c in king.candidates(log, &locked) {
         p.set(D_KING, c, 1.0);
     }
-    for c in immobile_opponent_pawns(color, log) {
+    for c in locked {
         p.set(D_PAWN, c, 1.0);
     }
 }
@@ -393,6 +439,7 @@ pub fn encode_planes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::deduce::immobile_opponent_pawns;
     use crate::referee::{Referee, StepResult};
     use crate::rl::action::{NUM_ACTIONS, decode_usi, index_square, legal_mask};
     use rand::{Rng, SeedableRng, rngs::StdRng};
@@ -546,6 +593,43 @@ mod tests {
         assert_eq!(plane(&obs, P_OPP_HOLD)[0], 1.0);
     }
 
+    /// 確定事実の途中状態を使い回しても（`encode_into_cached`）、毎回たどり直すのと同じ観測になる。
+    /// 両方の側を毎手番書く（手番でない側のログは自分の手で終わる = 王手宣言を待って保留する末尾の
+    /// 自分の手も通る）。1つの途中状態を次の局へ持ち越すと、ログが短くなるので作り直される
+    #[test]
+    fn 確定事実の途中状態を使い回しても同じ観測になる() {
+        let mut rng = StdRng::seed_from_u64(12);
+        let mut caches = [DeducedCache::default(), DeducedCache::default()];
+        let mut fresh = vec![0.0; NUM_PLANES_DEDUCED * 81];
+        let mut cached = vec![0.0; NUM_PLANES_DEDUCED * 81];
+        let mut n = 0;
+        for game in 0..12 {
+            let mut referee = Referee::new();
+            loop {
+                let side = referee.to_move();
+                for (i, s) in [Color::Sente, Color::Gote].into_iter().enumerate() {
+                    let view = referee.view(s, [0, 0], game);
+                    let (log, tried) = (referee.log(s), referee.foul_tried(s));
+                    encode_into(&view, log, tried, &mut fresh);
+                    encode_into_cached(&view, log, tried, &mut cached, &mut caches[i]);
+                    assert_eq!(fresh, cached, "game {game} {s:?} ログ長 {}", log.events().len());
+                    n += 1;
+                }
+                let view = referee.view(side, [0, 0], game);
+                let mask = legal_mask(&view, referee.log(side), referee.foul_tried(side));
+                let actions: Vec<usize> = (0..NUM_ACTIONS).filter(|&a| mask[a]).collect();
+                if actions.is_empty() {
+                    break;
+                }
+                let usi = decode_usi(actions[rng.random_range(0..actions.len())], side).unwrap();
+                if let StepResult::Ended { .. } = referee.step(&usi, 0) {
+                    break;
+                }
+            }
+        }
+        assert!(n > 1000, "局面が少なすぎる: {n}");
+    }
+
     /// 1決定点あたりのエンコード＋マスクの所要時間（自己対局の速度の上限を決める）。
     /// `cargo test --release --lib エンコードの速度 -- --ignored --nocapture`
     #[test]
@@ -555,10 +639,12 @@ mod tests {
         let mut n = 0u32;
         let mut elapsed = std::time::Duration::ZERO;
         let mut elapsed_v2 = std::time::Duration::ZERO;
+        let mut elapsed_v2_cached = std::time::Duration::ZERO;
         let mut buf = vec![0.0; OBS_LEN];
         let mut buf_v2 = vec![0.0; NUM_PLANES_DEDUCED * 81];
         for game in 0..20 {
             let mut referee = Referee::new();
+            let mut caches = [DeducedCache::default(), DeducedCache::default()];
             loop {
                 let side = referee.to_move();
                 let view = referee.view(side, [0, 0], game);
@@ -569,6 +655,10 @@ mod tests {
                 let t = std::time::Instant::now();
                 encode_into(&view, referee.log(side), referee.foul_tried(side), &mut buf_v2);
                 elapsed_v2 += t.elapsed();
+                let cache = &mut caches[(side == Color::Gote) as usize];
+                let t = std::time::Instant::now();
+                encode_into_cached(&view, referee.log(side), referee.foul_tried(side), &mut buf_v2, cache);
+                elapsed_v2_cached += t.elapsed();
                 n += 1;
                 let actions: Vec<usize> = (0..NUM_ACTIONS).filter(|&a| mask[a]).collect();
                 if actions.is_empty() {
@@ -581,9 +671,11 @@ mod tests {
             }
         }
         println!(
-            "{n} 決定点、v1 のエンコード＋マスク 平均 {:.1}µs/決定点、v2 のエンコード 平均 {:.1}µs/決定点",
+            "{n} 決定点、v1 のエンコード＋マスク 平均 {:.1}µs/決定点、v2 のエンコード 平均 {:.1}µs/決定点\
+             （途中状態を使い回すと {:.1}µs/決定点）",
             elapsed.as_secs_f64() * 1e6 / n as f64,
-            elapsed_v2.as_secs_f64() * 1e6 / n as f64
+            elapsed_v2.as_secs_f64() * 1e6 / n as f64,
+            elapsed_v2_cached.as_secs_f64() * 1e6 / n as f64
         );
     }
 
