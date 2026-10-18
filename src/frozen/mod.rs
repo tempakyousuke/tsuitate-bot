@@ -50,7 +50,7 @@ pub mod rl_selfplay_v1;
 pub mod rl_selfplay_v2;
 pub mod rl_selfplay_v3;
 pub mod rl_selfplay_v4;
-pub mod rl_selfplay_v5;
+pub mod rl_deduce_v1;
 pub mod rl_guard_v1;
 
 /// **hermetic 規約を適用する最初の版**（issue #21）。
@@ -103,7 +103,7 @@ pub const SOURCES: &[(u32, &str, &str)] = &[
     (40, "rl_selfplay_v2", include_str!("rl_selfplay_v2.rs")),
     (41, "rl_selfplay_v3", include_str!("rl_selfplay_v3.rs")),
     (42, "rl_selfplay_v4", include_str!("rl_selfplay_v4.rs")),
-    (43, "rl_selfplay_v5", include_str!("rl_selfplay_v5.rs")),
+    (43, "rl_deduce_v1", include_str!("rl_deduce_v1.rs")),
 ];
 
 /// 凍結版 `name` が**自分のファイルの中で**読む `TSUITATE_*` の一覧。
@@ -340,8 +340,8 @@ pub const SHARED_MODEL_PINS: &[(&str, &str, &str, &str)] = &[
         include_str!("../model.rs"),
     ),
     (
-        // **観測からの演繹**。方策ネットの凍結版のうちエンコーダ v2（確定事実のプレーンつき、rl_selfplay_v5〜）が
-        // 相手玉の候補と動けない歩のプレーンに使う。estimator の凍結版 v8〜v14 も呼んでいた（rl_selfplay_v5 の凍結で
+        // **観測からの演繹**。方策ネットの凍結版のうちエンコーダ v2（確定事実のプレーンつき、rl_deduce_v1〜）が
+        // 相手玉の候補と動けない歩のプレーンに使う。estimator の凍結版 v8〜v14 も呼んでいた（rl_deduce_v1 の凍結で
         // pin に加えた。それまでは pin なしの共有だった）。変えるとプレーンの中身＝挙動が変わりうるので、
         // 速くするだけの書き換え（差分更新など）でも出力が同じことを確かめてから更新する
         "src/deduce.rs",
@@ -413,12 +413,12 @@ mod tests {
         assert_eq!(versions_using("king_belief_nn"), vec!["estimator_v14"]);
         // 自駒の再構成は estimator の凍結版も rl_v15 も使う（v15 の凍結で pin に加えた）
         let model_users = versions_using("model");
-        for name in ["rl_v15", "rl_v16", "rl_v17", "rl_v18", "rl_v19", "rl_v20", "rl_v21", "rl_v22", "rl_v23", "rl_v24", "rl_v25", "rl_v26", "rl_v27", "rl_v28", "rl_v29", "rl_v29branch_v1", "rl_v30", "rl_selfplay_v1", "rl_selfplay_v2", "rl_selfplay_v3", "rl_selfplay_v4", "rl_selfplay_v5", "rl_nyugyoku_v1", "rl_nyugyoku_v2", "rl_speed_v1", "rl_speed_v2", "rl_speed_v3", "rl_speed_v4", "rl_guard_v1", "estimator_v14"] {
+        for name in ["rl_v15", "rl_v16", "rl_v17", "rl_v18", "rl_v19", "rl_v20", "rl_v21", "rl_v22", "rl_v23", "rl_v24", "rl_v25", "rl_v26", "rl_v27", "rl_v28", "rl_v29", "rl_v29branch_v1", "rl_v30", "rl_selfplay_v1", "rl_selfplay_v2", "rl_selfplay_v3", "rl_selfplay_v4", "rl_deduce_v1", "rl_nyugyoku_v1", "rl_nyugyoku_v2", "rl_speed_v1", "rl_speed_v2", "rl_speed_v3", "rl_speed_v4", "rl_guard_v1", "estimator_v14"] {
             assert!(model_users.contains(&name), "{name}");
         }
-        // 観測からの演繹は estimator の v8〜v14 と、エンコーダ v2 の方策ネット（rl_selfplay_v5〜）が使う
+        // 観測からの演繹は estimator の v8〜v14 と、エンコーダ v2 の方策ネット（rl_deduce_v1〜）が使う
         let deduce_users = versions_using("deduce");
-        for name in ["estimator_v8", "estimator_v9", "estimator_v10", "estimator_v11", "estimator_v12", "estimator_v13", "estimator_v14", "rl_selfplay_v5"] {
+        for name in ["estimator_v8", "estimator_v9", "estimator_v10", "estimator_v11", "estimator_v12", "estimator_v13", "estimator_v14", "rl_deduce_v1"] {
             assert!(deduce_users.contains(&name), "{name}");
         }
         assert!(!deduce_users.contains(&"rl_selfplay_v4"));

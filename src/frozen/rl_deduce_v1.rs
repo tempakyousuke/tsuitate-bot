@@ -1,8 +1,8 @@
-//! **selfplay 系列の凍結版 v5**（2026-10-18）: 方策ネット（DeepNash 路線の R-NaD）。自己対局だけ（リーグなし）・Δm=2,000 の selfplay 系統の 52,000更新で、確定事実の入力プレーン（エンコーダ v2、91枚）の最初の版。rl_selfplay_v4（50,000）の入口を0の重みで広げ、学習率 1e-4・1更新768局のまま1段階回した。rl_selfplay_v4 に 66.5%、50,000 とのペア差 +2.7pt
+//! **deduce 系列の凍結版 v1**（2026-10-18）: 方策ネット（DeepNash 路線の R-NaD）。確定事実の入力プレーン（エンコーダ v2、91枚）の deduce 系統の最初の版。selfplay 系統の rl_selfplay_v4（50,000更新）の入口を0の重みで広げ、同じ条件（自己対局だけ・Δm=2,000・学習率 1e-4・1更新768局）で 52,000更新まで1段階回した。rl_selfplay_v4 に 66.5%、50,000 とのペア差 +2.7pt
 //!
 //! `scripts/freeze_rl.py` が生成した。**編集しない**（改善は `src/rl/` で行う）。
 //! 推論の一式（行動の符号化・観測のテンソル化・手書きの推論）は凍結時点の固定コピーで、
-//! 重みは `models/rl_selfplay_v5.bin` をバイナリに埋め込む（sha256 `5eee3a0471a1ce9a3f3f4a56b9e1ea42d2ccbff11952d2236f76397696da3492`）。
+//! 重みは `models/rl_deduce_v1.bin` をバイナリに埋め込む（sha256 `5eee3a0471a1ce9a3f3f4a56b9e1ea42d2ccbff11952d2236f76397696da3492`）。
 //! 探索なしで1手 約10ms。思考予算・実行時 env は持たない。
 
 #![allow(clippy::all)]
@@ -17,7 +17,7 @@ use crate::protocol::PlayerView;
 use crate::strategy::Strategy;
 
 /// 埋め込んだ重み
-const WEIGHTS: &[u8] = include_bytes!("../../models/rl_selfplay_v5.bin");
+const WEIGHTS: &[u8] = include_bytes!("../../models/rl_deduce_v1.bin");
 /// 埋め込んだ重みの sha256（凍結時点の値。テストで検査する）
 pub const WEIGHTS_SHA256: &str = "5eee3a0471a1ce9a3f3f4a56b9e1ea42d2ccbff11952d2236f76397696da3492";
 
@@ -26,13 +26,13 @@ fn net() -> &'static policy_net::PolicyNet {
     NET.get_or_init(|| policy_net::PolicyNet::from_bytes(WEIGHTS).expect("凍結版の重みが読めない"))
 }
 
-/// selfplay 系列の凍結版 v5 の戦略（`strategy::make("rl_selfplay_v5")`）。softmax からサンプリングする
-pub struct RlSelfplayV5 {
+/// deduce 系列の凍結版 v1 の戦略（`strategy::make("rl_deduce_v1")`）。softmax からサンプリングする
+pub struct RlDeduceV1 {
     rng: StdRng,
     last: Option<serde_json::Value>,
 }
 
-impl RlSelfplayV5 {
+impl RlDeduceV1 {
     pub fn new() -> Self {
         Self { rng: StdRng::from_rng(&mut rand::rng()), last: None }
     }
@@ -42,13 +42,13 @@ impl RlSelfplayV5 {
     }
 }
 
-impl Default for RlSelfplayV5 {
+impl Default for RlDeduceV1 {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl Strategy for RlSelfplayV5 {
+impl Strategy for RlDeduceV1 {
     fn choose(
         &mut self,
         view: &PlayerView,
@@ -80,7 +80,7 @@ impl Strategy for RlSelfplayV5 {
     }
 
     fn name(&self) -> &'static str {
-        "rl_selfplay_v5"
+        "rl_deduce_v1"
     }
 
     fn debug_state(&self) -> Option<serde_json::Value> {
