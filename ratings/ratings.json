@@ -1,202 +1,226 @@
 {
+  "rl_selfplay_v3": {
+    "bt": 1665.3,
+    "site_mean": 1678.2,
+    "site_p5": 1576,
+    "site_p95": 1773,
+    "score": 0.717,
+    "games": 2700
+  },
+  "rl_selfplay_v4": {
+    "bt": 1661.8,
+    "site_mean": 1664.4,
+    "site_p5": 1577,
+    "site_p95": 1743,
+    "score": 0.713,
+    "games": 2700
+  },
+  "rl_selfplay_v2": {
+    "bt": 1648.9,
+    "site_mean": 1655.7,
+    "site_p5": 1559,
+    "site_p95": 1742,
+    "score": 0.6976,
+    "games": 2700
+  },
   "rl_selfplay_v1": {
-    "bt": 1662.5,
-    "site_mean": 1670.3,
-    "site_p5": 1569,
-    "site_p95": 1762,
-    "score": 0.7144,
-    "games": 2400
+    "bt": 1629.7,
+    "site_mean": 1636.4,
+    "site_p5": 1555,
+    "site_p95": 1740,
+    "score": 0.6741,
+    "games": 2700
   },
   "rl_v29": {
-    "bt": 1649.9,
-    "site_mean": 1663.0,
-    "site_p5": 1575,
-    "site_p95": 1753,
-    "score": 0.6994,
-    "games": 2400
+    "bt": 1606.6,
+    "site_mean": 1607.2,
+    "site_p5": 1532,
+    "site_p95": 1688,
+    "score": 0.6446,
+    "games": 2700
   },
   "rl_v29branch_v1": {
-    "bt": 1646.0,
-    "site_mean": 1653.9,
-    "site_p5": 1551,
-    "site_p95": 1738,
-    "score": 0.6946,
-    "games": 2400
+    "bt": 1605.0,
+    "site_mean": 1606.7,
+    "site_p5": 1509,
+    "site_p95": 1698,
+    "score": 0.6426,
+    "games": 2700
   },
   "rl_v30": {
-    "bt": 1644.8,
-    "site_mean": 1655.2,
-    "site_p5": 1537,
-    "site_p95": 1754,
-    "score": 0.6931,
-    "games": 2400
+    "bt": 1600.0,
+    "site_mean": 1599.3,
+    "site_p5": 1517,
+    "site_p95": 1675,
+    "score": 0.6361,
+    "games": 2700
   },
   "rl_v28": {
-    "bt": 1621.8,
-    "site_mean": 1620.4,
-    "site_p5": 1533,
-    "site_p95": 1710,
-    "score": 0.6646,
-    "games": 2400
+    "bt": 1583.4,
+    "site_mean": 1594.3,
+    "site_p5": 1516,
+    "site_p95": 1689,
+    "score": 0.6143,
+    "games": 2700
   },
   "rl_v27": {
-    "bt": 1605.8,
-    "site_mean": 1612.9,
-    "site_p5": 1533,
-    "site_p95": 1691,
-    "score": 0.6442,
-    "games": 2400
-  },
-  "rl_speed_v4": {
-    "bt": 1584.9,
-    "site_mean": 1591.8,
-    "site_p5": 1520,
-    "site_p95": 1673,
-    "score": 0.6167,
-    "games": 2400
+    "bt": 1569.3,
+    "site_mean": 1571.0,
+    "site_p5": 1480,
+    "site_p95": 1650,
+    "score": 0.5954,
+    "games": 2700
   },
   "rl_v26": {
-    "bt": 1570.7,
-    "site_mean": 1574.5,
-    "site_p5": 1487,
-    "site_p95": 1651,
-    "score": 0.5977,
-    "games": 2400
+    "bt": 1554.5,
+    "site_mean": 1552.1,
+    "site_p5": 1462,
+    "site_p95": 1640,
+    "score": 0.5754,
+    "games": 2700
+  },
+  "rl_speed_v4": {
+    "bt": 1548.6,
+    "site_mean": 1554.9,
+    "site_p5": 1471,
+    "site_p95": 1631,
+    "score": 0.5672,
+    "games": 2700
   },
   "rl_speed_v3": {
-    "bt": 1569.6,
-    "site_mean": 1575.5,
-    "site_p5": 1488,
-    "site_p95": 1661,
-    "score": 0.5962,
-    "games": 2400
+    "bt": 1540.1,
+    "site_mean": 1537.2,
+    "site_p5": 1454,
+    "site_p95": 1624,
+    "score": 0.5556,
+    "games": 2700
   },
   "rl_speed_v2": {
-    "bt": 1554.1,
-    "site_mean": 1561.3,
-    "site_p5": 1481,
-    "site_p95": 1644,
-    "score": 0.5752,
-    "games": 2400
+    "bt": 1524.7,
+    "site_mean": 1518.2,
+    "site_p5": 1434,
+    "site_p95": 1594,
+    "score": 0.5343,
+    "games": 2700
   },
   "rl_v25": {
-    "bt": 1518.5,
-    "site_mean": 1516.2,
-    "site_p5": 1435,
-    "site_p95": 1602,
-    "score": 0.526,
-    "games": 2400
+    "bt": 1506.0,
+    "site_mean": 1511.5,
+    "site_p5": 1437,
+    "site_p95": 1594,
+    "score": 0.5083,
+    "games": 2700
   },
   "rl_nyugyoku_v2": {
-    "bt": 1502.4,
-    "site_mean": 1501.2,
-    "site_p5": 1421,
-    "site_p95": 1594,
-    "score": 0.5038,
-    "games": 2400
-  },
-  "rl_speed_v1": {
-    "bt": 1488.1,
-    "site_mean": 1482.7,
-    "site_p5": 1400,
-    "site_p95": 1568,
-    "score": 0.4838,
-    "games": 2400
+    "bt": 1482.9,
+    "site_mean": 1484.4,
+    "site_p5": 1404,
+    "site_p95": 1565,
+    "score": 0.4763,
+    "games": 2700
   },
   "rl_v24": {
-    "bt": 1483.6,
-    "site_mean": 1485.8,
-    "site_p5": 1410,
-    "site_p95": 1580,
-    "score": 0.4775,
-    "games": 2400
+    "bt": 1475.3,
+    "site_mean": 1479.2,
+    "site_p5": 1383,
+    "site_p95": 1566,
+    "score": 0.4657,
+    "games": 2700
+  },
+  "rl_speed_v1": {
+    "bt": 1473.8,
+    "site_mean": 1471.6,
+    "site_p5": 1387,
+    "site_p95": 1556,
+    "score": 0.4637,
+    "games": 2700
   },
   "rl_guard_v1": {
-    "bt": 1477.9,
-    "site_mean": 1471.1,
-    "site_p5": 1382,
-    "site_p95": 1562,
-    "score": 0.4696,
-    "games": 2400
+    "bt": 1467.4,
+    "site_mean": 1471.6,
+    "site_p5": 1384,
+    "site_p95": 1560,
+    "score": 0.4548,
+    "games": 2700
   },
   "rl_nyugyoku_v1": {
-    "bt": 1456.5,
-    "site_mean": 1453.5,
-    "site_p5": 1366,
-    "site_p95": 1550,
-    "score": 0.44,
-    "games": 2400
+    "bt": 1450.2,
+    "site_mean": 1456.9,
+    "site_p5": 1360,
+    "site_p95": 1554,
+    "score": 0.4311,
+    "games": 2700
   },
   "rl_v23": {
-    "bt": 1447.7,
-    "site_mean": 1445.3,
-    "site_p5": 1361,
-    "site_p95": 1542,
-    "score": 0.4279,
-    "games": 2400
+    "bt": 1441.9,
+    "site_mean": 1436.9,
+    "site_p5": 1350,
+    "site_p95": 1524,
+    "score": 0.4198,
+    "games": 2700
   },
   "rl_v22": {
-    "bt": 1405.9,
-    "site_mean": 1399.3,
-    "site_p5": 1311,
-    "site_p95": 1487,
-    "score": 0.3717,
-    "games": 2400
+    "bt": 1399.0,
+    "site_mean": 1394.0,
+    "site_p5": 1316,
+    "site_p95": 1480,
+    "score": 0.3626,
+    "games": 2700
   },
   "rl_v16": {
-    "bt": 1396.3,
-    "site_mean": 1391.5,
-    "site_p5": 1307,
-    "site_p95": 1488,
-    "score": 0.3592,
-    "games": 2400
+    "bt": 1389.9,
+    "site_mean": 1392.6,
+    "site_p5": 1311,
+    "site_p95": 1490,
+    "score": 0.3509,
+    "games": 2700
   },
   "rl_v19": {
-    "bt": 1377.0,
-    "site_mean": 1367.1,
-    "site_p5": 1274,
-    "site_p95": 1461,
-    "score": 0.3344,
-    "games": 2400
+    "bt": 1372.3,
+    "site_mean": 1368.0,
+    "site_p5": 1282,
+    "site_p95": 1453,
+    "score": 0.3285,
+    "games": 2700
   },
   "rl_v18": {
-    "bt": 1373.6,
-    "site_mean": 1375.4,
-    "site_p5": 1292,
-    "site_p95": 1474,
-    "score": 0.33,
-    "games": 2400
+    "bt": 1370.4,
+    "site_mean": 1361.5,
+    "site_p5": 1274,
+    "site_p95": 1454,
+    "score": 0.3261,
+    "games": 2700
   },
   "rl_v17": {
-    "bt": 1372.4,
-    "site_mean": 1361.9,
-    "site_p5": 1265,
-    "site_p95": 1454,
-    "score": 0.3285,
-    "games": 2400
+    "bt": 1366.6,
+    "site_mean": 1357.1,
+    "site_p5": 1262,
+    "site_p95": 1449,
+    "score": 0.3215,
+    "games": 2700
   },
   "rl_v21": {
-    "bt": 1371.8,
-    "site_mean": 1375.3,
-    "site_p5": 1299,
-    "site_p95": 1457,
-    "score": 0.3277,
-    "games": 2400
+    "bt": 1363.8,
+    "site_mean": 1350.6,
+    "site_p5": 1277,
+    "site_p95": 1443,
+    "score": 0.318,
+    "games": 2700
   },
   "rl_v20": {
-    "bt": 1361.9,
-    "site_mean": 1350.0,
-    "site_p5": 1267,
-    "site_p95": 1430,
-    "score": 0.3154,
-    "games": 2400
+    "bt": 1353.4,
+    "site_mean": 1344.8,
+    "site_p5": 1269,
+    "site_p95": 1428,
+    "score": 0.3052,
+    "games": 2700
   },
   "rl_v15": {
-    "bt": 1356.3,
-    "site_mean": 1344.8,
-    "site_p5": 1246,
-    "site_p95": 1454,
-    "score": 0.3085,
-    "games": 2400
+    "bt": 1349.4,
+    "site_mean": 1343.7,
+    "site_p5": 1253,
+    "site_p95": 1432,
+    "score": 0.3004,
+    "games": 2700
   }
 }
