@@ -10,10 +10,11 @@
 use std::collections::HashSet;
 
 use crate::board::{Coord, parse_usi_square};
+use crate::deduce::{immobile_opponent_pawns, opp_king_candidates};
 use crate::model::GameModel;
 use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{Color, PlayerView, Role};
-use crate::rl::action::{normalize, square_index};
+use crate::rl::action::{deduced_facts, normalize, square_index};
 use crate::selfplay::{MAX_FOULS, MAX_PLIES};
 use crate::shogi::{HAND_ROLES, Position, ShogiMove, hand_index, parse_usi, unpromote_role};
 
@@ -79,6 +80,22 @@ const NUM_SCALARS: usize = 9;
 
 pub const NUM_PLANES: usize = P_SCALAR + NUM_SCALARS;
 pub const OBS_LEN: usize = NUM_PLANES * 81;
+
+// 確定事実のプレーン（エンコーダ v2、2026-10-16。docs/rl-deepnash-design.md の改善案2）。
+// v1（`NUM_PLANES`）の後ろに足すだけなので、v1 の重みの stem に 0 の列を足せば同じ関数から始められる。
+// どれも観測から論理的に確定する事実（真の盤面と矛盾しない）で、`action::deduced_facts` と `deduce` が作る
+const D_OCC: usize = NUM_PLANES; // 相手の駒がいると確定したマス
+const D_BLOCK: usize = D_OCC + 1; // 飛び越え反則の間のマス（どれかに相手の駒がいる。値は 1/マス数）
+const D_CHECKER: usize = D_BLOCK + 1; // 王手中: 王手駒がいうるマス（値は 1/仮説数）
+const D_KING: usize = D_CHECKER + 1; // 相手玉がいうるマス（deduce::opp_king_candidates）
+const D_PAWN: usize = D_KING + 1; // 動けないと確定した相手の歩（deduce::immobile_opponent_pawns）
+/// エンコーダ v2 のプレーン数（v1 + 確定事実 5枚）
+pub const NUM_PLANES_DEDUCED: usize = D_PAWN + 1;
+
+/// プレーン数 → 観測の長さ。対応するエンコーダが無いプレーン数は None
+pub fn obs_len(planes: usize) -> Option<usize> {
+    (planes == NUM_PLANES || planes == NUM_PLANES_DEDUCED).then_some(planes * 81)
+}
 
 /// 反則1件を1組のプレーンへ書く（`base` は `P_FOUL` か `P_PAST_FOUL`）
 fn put_foul(p: &mut Planes, base: usize, usi: &str, v: f32) {
@@ -159,15 +176,23 @@ fn move_squares(usi: &str) -> Option<(Option<Coord>, Coord)> {
     }
 }
 
-/// 観測をテンソルへ書く。`out` は長さ `OBS_LEN`
+/// 観測をテンソルへ書く。`out` の長さでエンコーダの版を選ぶ: `OBS_LEN` は v1、
+/// `NUM_PLANES_DEDUCED * 81` は v2（v1 の後ろに確定事実のプレーン）
 pub fn encode_into(
     view: &PlayerView,
     log: &ObservationLog,
     foul_tried: &HashSet<String>,
     out: &mut [f32],
 ) {
-    assert_eq!(out.len(), OBS_LEN);
+    assert!(
+        out.len() == OBS_LEN || out.len() == NUM_PLANES_DEDUCED * 81,
+        "観測の長さ {} に対応するエンコーダが無い",
+        out.len()
+    );
     out.fill(0.0);
+    if out.len() > OBS_LEN {
+        encode_deduced(view, log, foul_tried, out);
+    }
     let color = view.your_color;
     let now = view.move_number;
     let fresh = |mn: u32| DECAY.powi(now.saturating_sub(mn) as i32);
@@ -319,8 +344,48 @@ pub fn encode_into(
     }
 }
 
+/// 確定事実のプレーン（v2 の後ろ5枚）を書く。`out` は 0 で埋めてあること
+fn encode_deduced(view: &PlayerView, log: &ObservationLog, foul_tried: &HashSet<String>, out: &mut [f32]) {
+    let color = view.your_color;
+    let facts = deduced_facts(view, log, foul_tried);
+    let mut p = Planes { buf: out, color };
+    for &c in &facts.occupied {
+        p.set(D_OCC, c, 1.0);
+    }
+    for seg in &facts.blocked {
+        let v = 1.0 / seg.len() as f32;
+        for &c in seg {
+            p.max(D_BLOCK, c, v);
+        }
+    }
+    if !facts.checkers.is_empty() {
+        let v = 1.0 / facts.checkers.len() as f32;
+        for &c in &facts.checkers {
+            p.set(D_CHECKER, c, v);
+        }
+    }
+    for c in opp_king_candidates(color, log) {
+        p.set(D_KING, c, 1.0);
+    }
+    for c in immobile_opponent_pawns(color, log) {
+        p.set(D_PAWN, c, 1.0);
+    }
+}
+
+/// v1 の観測（長さ `OBS_LEN`）
 pub fn encode(view: &PlayerView, log: &ObservationLog, foul_tried: &HashSet<String>) -> Vec<f32> {
-    let mut out = vec![0.0; OBS_LEN];
+    encode_planes(NUM_PLANES, view, log, foul_tried)
+}
+
+/// プレーン数 `planes`（`NUM_PLANES` か `NUM_PLANES_DEDUCED`）の観測。重みのヘッダのプレーン数を渡す
+pub fn encode_planes(
+    planes: usize,
+    view: &PlayerView,
+    log: &ObservationLog,
+    foul_tried: &HashSet<String>,
+) -> Vec<f32> {
+    let len = obs_len(planes).unwrap_or_else(|| panic!("プレーン数 {planes} に対応するエンコーダが無い"));
+    let mut out = vec![0.0; len];
     encode_into(view, log, foul_tried, &mut out);
     out
 }
@@ -489,7 +554,9 @@ mod tests {
         let mut rng = StdRng::seed_from_u64(1);
         let mut n = 0u32;
         let mut elapsed = std::time::Duration::ZERO;
+        let mut elapsed_v2 = std::time::Duration::ZERO;
         let mut buf = vec![0.0; OBS_LEN];
+        let mut buf_v2 = vec![0.0; NUM_PLANES_DEDUCED * 81];
         for game in 0..20 {
             let mut referee = Referee::new();
             loop {
@@ -499,6 +566,9 @@ mod tests {
                 encode_into(&view, referee.log(side), referee.foul_tried(side), &mut buf);
                 let mask = legal_mask(&view, referee.log(side), referee.foul_tried(side));
                 elapsed += t.elapsed();
+                let t = std::time::Instant::now();
+                encode_into(&view, referee.log(side), referee.foul_tried(side), &mut buf_v2);
+                elapsed_v2 += t.elapsed();
                 n += 1;
                 let actions: Vec<usize> = (0..NUM_ACTIONS).filter(|&a| mask[a]).collect();
                 if actions.is_empty() {
@@ -511,9 +581,78 @@ mod tests {
             }
         }
         println!(
-            "{n} 決定点、平均 {:.1}µs/決定点",
-            elapsed.as_secs_f64() * 1e6 / n as f64
+            "{n} 決定点、v1 のエンコード＋マスク 平均 {:.1}µs/決定点、v2 のエンコード 平均 {:.1}µs/決定点",
+            elapsed.as_secs_f64() * 1e6 / n as f64,
+            elapsed_v2.as_secs_f64() * 1e6 / n as f64
         );
+    }
+
+    /// エンコーダ v2 の前半は v1 と同じで、確定事実のプレーンは真の盤面と矛盾しない
+    /// （相手の駒がいると確定したマスには相手の駒がいる・飛び越え反則の間のどれかに相手の駒がいる・
+    /// 王手駒の候補に本当の王手駒が入る・相手玉の候補に本当の相手玉が入る・動けない歩は本当に相手の歩）
+    #[test]
+    fn 確定事実のプレーンは真の盤面と矛盾しない() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let (mut n, mut n_occ, mut n_block, mut n_check, mut n_pawn) = (0, 0, 0, 0, 0);
+        for game in 0..30 {
+            let mut referee = Referee::new();
+            loop {
+                let side = referee.to_move();
+                let view = referee.view(side, [0, 0], game);
+                let (log, tried) = (referee.log(side), referee.foul_tried(side));
+                let v1 = encode(&view, log, tried);
+                let v2 = encode_planes(NUM_PLANES_DEDUCED, &view, log, tried);
+                assert_eq!(&v2[..OBS_LEN], &v1[..], "v2 の前半は v1 と同じ");
+                assert!(v2.iter().all(|v| v.is_finite() && (0.0..=3.0).contains(v)));
+                let pos = referee.position();
+                let opp = |c: Coord| pos.piece_at(c).filter(|p| p.color != side);
+                let at = |k: usize, c: Coord| v2[k * 81 + square_index(normalize(c, side))];
+                let facts = deduced_facts(&view, log, tried);
+                for &c in &facts.occupied {
+                    assert!(opp(c).is_some(), "game {game}: 確定した占有 {c:?} に相手の駒がいない");
+                    assert_eq!(at(D_OCC, c), 1.0);
+                    n_occ += 1;
+                }
+                for seg in &facts.blocked {
+                    assert!(seg.iter().any(|&c| opp(c).is_some()), "game {game}: 遮りの間 {seg:?} が空");
+                    n_block += 1;
+                }
+                if view.you_in_check && !facts.checkers.is_empty() {
+                    let king = pos.king_square(side).unwrap();
+                    let real: Vec<Coord> = pos
+                        .pieces()
+                        .filter(|(c, p)| p.color != side && pos.attacks(*c, king))
+                        .map(|(c, _)| c)
+                        .collect();
+                    assert!(
+                        real.iter().any(|c| facts.checkers.contains(c)),
+                        "game {game}: 王手駒 {real:?} が候補 {:?} に無い",
+                        facts.checkers
+                    );
+                    assert!(real.iter().any(|&c| at(D_CHECKER, c) > 0.0));
+                    n_check += 1;
+                }
+                let opp_king = pos.king_square(side.other()).unwrap();
+                assert_eq!(at(D_KING, opp_king), 1.0, "game {game}: 相手玉のマスが候補に無い");
+                for c in immobile_opponent_pawns(side, log) {
+                    assert_eq!(opp(c).map(|p| p.role), Some(Role::Pawn), "game {game}: 動けない歩 {c:?}");
+                    assert_eq!(at(D_PAWN, c), 1.0);
+                    n_pawn += 1;
+                }
+                n += 1;
+                let mask = legal_mask(&view, log, tried);
+                let actions: Vec<usize> = (0..NUM_ACTIONS).filter(|&a| mask[a]).collect();
+                if actions.is_empty() {
+                    break;
+                }
+                let usi = decode_usi(actions[rng.random_range(0..actions.len())], side).unwrap();
+                if let StepResult::Ended { .. } = referee.step(&usi, 0) {
+                    break;
+                }
+            }
+        }
+        println!("{n} 決定点: 占有 {n_occ} / 遮り {n_block} / 王手 {n_check} / 動けない歩 {n_pawn}");
+        assert!(n_occ > 0 && n_block > 0 && n_check > 0, "検査が空振りしている");
     }
 
     /// ランダム対局の全局面で値域が壊れない（NaN・無限大・負値が出ない）

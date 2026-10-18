@@ -16,7 +16,8 @@
 - 重みは `include_bytes!` でバイナリに埋め込み、sha256 をテストで検査する
 - サンプリング（softmax から seed つきで引く）は `src/rl/policy.rs` の `rl_policy:` と同じ手順
   （マスクは凍結時点の `action::legal_mask`。rl_v22 以前は旧マスク＝`rl_policy_basic:` と同じ）
-- 共有のまま使うのはルールエンジン（board / shogi）・観測（observation）・自駒の再構成（model）。
+- 共有のまま使うのはルールエンジン（board / shogi）・観測（observation）・自駒の再構成（model）・
+  観測からの演繹（deduce。エンコーダ v2 = 確定事実のプレーンつきの重みだけが呼ぶ）。
   model は `frozen::SHARED_MODEL_PINS` で pin する（変えるとテンソルが変わるため）
 - 実行時 env は読まない（`frozen::HERMETIC_FROM` 以降の規約）
 
@@ -150,7 +151,7 @@ impl Strategy for {ty} {{
         if legal.is_empty() {{
             return None;
         }}
-        let (logits, value) = net().forward(&encode::encode(view, log, foul_tried));
+        let (logits, value) = net().forward(&encode::encode_planes(net().planes(), view, log, foul_tried));
         let max = legal.iter().map(|&a| logits[a]).fold(f32::MIN, f32::max);
         let weights: Vec<f64> = legal.iter().map(|&a| f64::from(logits[a] - max).exp()).collect();
         let total: f64 = weights.iter().sum();
@@ -198,7 +199,7 @@ mod tests {{
         use sha2::{{Digest, Sha256}};
         let got: String = Sha256::digest(WEIGHTS).iter().map(|b| format!("{{b:02x}}")).collect();
         assert_eq!(got, WEIGHTS_SHA256);
-        assert!(net().forward(&vec![0.0; encode::OBS_LEN]).0.len() == action::NUM_ACTIONS);
+        assert!(net().forward(&vec![0.0; net().planes() * 81]).0.len() == action::NUM_ACTIONS);
     }}
 }}""")
 
