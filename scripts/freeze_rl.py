@@ -18,7 +18,7 @@
   （マスクは凍結時点の `action::legal_mask`。rl_v22 以前は旧マスク＝`rl_policy_basic:` と同じ）
 - 共有のまま使うのはルールエンジン（board / shogi）・観測（observation）・自駒の再構成（model）・
   観測からの演繹（deduce。エンコーダ v2 = 確定事実のプレーンつきの重みだけが呼ぶ）。
-  model は `frozen::SHARED_MODEL_PINS` で pin する（変えるとテンソルが変わるため）
+  model と deduce は `frozen::SHARED_MODEL_PINS` で pin する（変えるとテンソルが変わるため）
 - 実行時 env は読まない（`frozen::HERMETIC_FROM` 以降の規約）
 
 同一性の確認: この スクリプトを再実行して凍結ファイルとの diff が無いこと、CI で
