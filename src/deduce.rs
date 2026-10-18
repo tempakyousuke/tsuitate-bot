@@ -37,30 +37,111 @@ use crate::shogi::{Position, ShogiMove, promote_role};
 /// 万一 候補が空になったら演繹のどこかが不健全なので、**制約を捨てて広い集合へ
 /// 戻す**（玉位置の質量を潰す事故を避ける。ansatsu 回帰の教訓）。
 pub fn opp_king_candidates(my_color: Color, log: &ObservationLog) -> std::collections::BTreeSet<Coord> {
-    use std::collections::BTreeSet;
-    let opp = my_color.other();
-    let all_squares = || -> BTreeSet<Coord> {
-        (1..=9)
-            .flat_map(|file| (1..=9).map(move |rank| Coord { file, rank }))
-            .collect()
-    };
-    let mut model = crate::model::GameModel::new(my_color);
-    let mut cands: BTreeSet<Coord> = BTreeSet::new();
-    if let Some(k) = Position::initial().king_square(opp) {
-        cands.insert(k);
-    } else {
-        return all_squares();
+    let mut king = KingCandidates::new(my_color);
+    king.advance(log);
+    king.candidates(log, &immobile_opponent_pawns(my_color, log))
+}
+
+/// `opp_king_candidates` の途中状態。観測ログを**先頭から順に**食わせ（`advance`）、伸びたぶんだけ続きを
+/// 処理する（同じ局・同じ側のログを伸ばしながら何度も引く RL のエンコーダ用。毎回先頭から
+/// たどり直すと長い対局ほど重い）。結果は `opp_king_candidates` と同じ（あちらもこれを通る）
+#[derive(Clone)]
+pub struct KingCandidates {
+    my_color: Color,
+    model: crate::model::GameModel,
+    cands: std::collections::BTreeSet<Coord>,
+    /// 直前の自分の手で王手を宣言していたら、そのときの自駒盤を持ち越す
+    /// （相手の応手が「玉を動かすしかなかった」かの判定に使う）
+    checking_board: Option<Position>,
+    /// 処理し終えたイベントの数
+    done: usize,
+    /// 演繹が不健全と分かって全マスへ戻した（以後のイベントは見ない）
+    gave_up: bool,
+}
+
+impl KingCandidates {
+    pub fn new(my_color: Color) -> Self {
+        let king = Position::initial().king_square(my_color.other());
+        Self {
+            my_color,
+            model: crate::model::GameModel::new(my_color),
+            cands: king.into_iter().collect(),
+            checking_board: None,
+            done: 0,
+            gave_up: king.is_none(),
+        }
     }
 
-    let events = log.events();
-    // 直前の自分の手で王手を宣言していたら、そのときの自駒盤を持ち越す
-    // （相手の応手が「玉を動かすしかなかった」かの判定に使う）
-    let mut checking_board: Option<Position> = None;
-    for (i, e) in events.iter().enumerate() {
+    /// 処理し終えたイベントの数（`log` がこれより短ければ別のログ）
+    pub fn done(&self) -> usize {
+        self.done
+    }
+
+    /// `log` の未処理のイベントを処理する。`log` は前回渡したログの続き（同じ局・同じ側）であること。
+    /// 自分の手は直後の王手宣言を見て処理するので、末尾の自分の手は宣言が届くまで処理を保留する
+    pub fn advance(&mut self, log: &ObservationLog) {
+        let events = log.events();
+        while self.done < events.len() && !self.gave_up {
+            if matches!(events[self.done], Observation::MyMove { .. }) && self.done + 1 == events.len() {
+                break;
+            }
+            self.step(events, self.done);
+            self.done += 1;
+        }
+    }
+
+    /// 相手玉の候補。`log` は直前に `advance` に渡したログ、`locked` は同じログの
+    /// `immobile_opponent_pawns`（相手の歩が居ると確定しているマス）
+    pub fn candidates(
+        &self,
+        log: &ObservationLog,
+        locked: &std::collections::BTreeSet<Coord>,
+    ) -> std::collections::BTreeSet<Coord> {
+        let events = log.events();
+        let tail;
+        let me = if self.done < events.len() && !self.gave_up {
+            // 保留した末尾の自分の手（王手宣言はまだ無い）を写しの上で処理する
+            let mut t = self.clone();
+            while t.done < events.len() && !t.gave_up {
+                t.step(events, t.done);
+                t.done += 1;
+            }
+            tail = t;
+            &tail
+        } else {
+            self
+        };
+        if me.gave_up {
+            return all_squares();
+        }
+        let mut cands = me.cands.clone();
+        // **相手の歩が居ると確定しているマスに玉は居ない**（2026-08-03）。
+        // 玉候補は `strategy::project_taint_kings` が taint 粒子の玉を移設する先に
+        // なるが、その移設は移設先の駒と**入れ替え**るので、確定した歩のマスを
+        // 候補に残すと歩が弾き出されて「自分の観測だけで否定できる粒子」が生まれる
+        // （ユーザー指摘の 4七歩）。ここで落としておけば全ての利用箇所が守られる
+        if !locked.is_empty() {
+            let pruned: std::collections::BTreeSet<Coord> = cands.difference(locked).copied().collect();
+            // 空になったら演繹のどこかが不健全なので制約を捨てる（既存の安全弁と同じ）
+            if !pruned.is_empty() {
+                cands = pruned;
+            }
+        }
+        cands
+    }
+
+    /// イベント `events[i]` を1つ処理する（自分の手は `events[i + 1]` の王手宣言も見る）
+    fn step(&mut self, events: &[Observation], i: usize) {
+        use std::collections::BTreeSet;
+        let my_color = self.my_color;
+        let opp = my_color.other();
+        let e = &events[i];
+        let model = &mut self.model;
+        let cands = &mut self.cands;
         model.apply(e);
         match e {
             Observation::MyMove { usi, captured, .. } => {
-                let board = my_only_board(&model);
+                let board = my_only_board(model);
                 let declared = matches!(
                     events.get(i + 1),
                     Some(Observation::Check { in_check }) if *in_check == opp
@@ -92,13 +173,14 @@ pub fn opp_king_candidates(my_color: Color, log: &ObservationLog) -> std::collec
                 cands.retain(|&k| board.piece_at(k).is_none());
                 if cands.is_empty() {
                     // 演繹が不健全（か観測が欠けている）。制約を捨てて安全側へ
-                    cands = before;
+                    *cands = before;
                     cands.retain(|&k| board.piece_at(k).is_none());
                     if cands.is_empty() {
-                        return all_squares();
+                        self.gave_up = true;
+                        return;
                     }
                 }
-                checking_board = declared.then_some(board);
+                self.checking_board = declared.then_some(board);
             }
             Observation::OpponentMoved {
                 captured_my_piece_at,
@@ -111,8 +193,8 @@ pub fn opp_king_candidates(my_color: Color, log: &ObservationLog) -> std::collec
                 // 掛けていて、その王手駒が**隣接**していて（＝合駒で防げない）
                 // **取られてもいない**なら、玉は動くしかなかった＝居残りは除外できる
                 let mut next: BTreeSet<Coord> = BTreeSet::new();
-                for &k in &cands {
-                    let forced_to_move = checking_board.as_ref().is_some_and(|b| {
+                for &k in cands.iter() {
+                    let forced_to_move = self.checking_board.as_ref().is_some_and(|b| {
                         b.pieces().any(|(from, pc)| {
                             pc.color == my_color
                                 && unblockable(from, k)
@@ -135,31 +217,22 @@ pub fn opp_king_candidates(my_color: Color, log: &ObservationLog) -> std::collec
                         }
                     }
                 }
-                let board = my_only_board(&model);
+                let board = my_only_board(model);
                 // 相手は自玉を王手に晒す手を指せない
                 next.retain(|&k| !surely_attacked(&board, k, my_color));
                 next.retain(|&k| board.piece_at(k).is_none());
-                cands = if next.is_empty() { all_squares() } else { next };
-                checking_board = None;
+                *cands = if next.is_empty() { all_squares() } else { next };
+                self.checking_board = None;
             }
             _ => {}
         }
     }
-    // **相手の歩が居ると確定しているマスに玉は居ない**（2026-08-03）。
-    // 玉候補は `strategy::project_taint_kings` が taint 粒子の玉を移設する先に
-    // なるが、その移設は移設先の駒と**入れ替え**るので、確定した歩のマスを
-    // 候補に残すと歩が弾き出されて「自分の観測だけで否定できる粒子」が生まれる
-    // （ユーザー指摘の 4七歩）。ここで落としておけば全ての利用箇所が守られる
-    let locked = immobile_opponent_pawns(my_color, log);
-    if !locked.is_empty() {
-        let pruned: std::collections::BTreeSet<Coord> =
-            cands.difference(&locked).copied().collect();
-        // 空になったら演繹のどこかが不健全なので制約を捨てる（既存の安全弁と同じ）
-        if !pruned.is_empty() {
-            cands = pruned;
-        }
-    }
-    cands
+}
+
+fn all_squares() -> std::collections::BTreeSet<Coord> {
+    (1..=9)
+        .flat_map(|file| (1..=9).map(move |rank| Coord { file, rank }))
+        .collect()
 }
 
 /// 自駒だけを置いた盤（未知のマスは空。走り駒のレイはここで最大まで伸びる）
@@ -375,47 +448,95 @@ pub fn immobile_opponent_pawns(
     my_color: Color,
     log: &ObservationLog,
 ) -> std::collections::BTreeSet<Coord> {
-    use std::collections::BTreeSet;
-    let opp = my_color.other();
-    // 相手の歩の初期段と、その前進先の段（相手から見た前方 = 自分に近づく向き）
-    let (pawn_rank, front_rank) = match opp {
-        Color::Sente => (7, 6),
-        Color::Gote => (3, 4),
-    };
-    // 前進の向き（相手の歩が進む段の増分）と成り込み段
-    let step: i8 = if opp == Color::Sente { -1 } else { 1 };
-    let promo_zone = |r: i8| if opp == Color::Sente { r <= 3 } else { r >= 7 };
-    // 自分の盤面を再構成する（自駒だけ。GameModel と同じ材料）
-    let init = Position::initial();
-    let mut mine: HashMap<Coord, Role> = init
-        .pieces()
-        .filter(|(_, p)| p.color == my_color)
-        .map(|(sq, p)| (sq, p.role))
-        .collect();
-    // 筋ごとの「その筋の相手の歩がいられる段」の**上界集合**（1件に絞れたら確定）。
-    // 歩は前進しかしないので段だけで表せる。give_up[f] は追跡を諦めた筋
-    let mut possible: HashMap<i8, BTreeSet<i8>> =
-        (1..=9).map(|f| (f, BTreeSet::from([pawn_rank]))).collect();
-    let mut give_up: HashSet<i8> = HashSet::new();
-    let _ = front_rank;
+    let mut pawns = ImmobilePawns::new(my_color);
+    pawns.advance(log);
+    pawns.result()
+}
 
-    // 自駒が居るマスに相手の歩は居ない（自駒の配置は常に厳密に分かる）
-    let prune_by_mine = |possible: &mut HashMap<i8, BTreeSet<i8>>, mine: &HashMap<Coord, Role>| {
-        for (&f, ranks) in possible.iter_mut() {
-            ranks.retain(|&r| !mine.contains_key(&Coord { file: f, rank: r }));
+/// `immobile_opponent_pawns` の途中状態。観測ログを**先頭から順に**食わせ（`advance`）、伸びたぶんだけ
+/// 続きを処理する（`KingCandidates` と同じ用途）。結果は `immobile_opponent_pawns` と同じ（あちらもこれを通る）
+#[derive(Clone)]
+pub struct ImmobilePawns {
+    my_color: Color,
+    /// 自分の盤面（自駒だけ。GameModel と同じ材料）
+    mine: HashMap<Coord, Role>,
+    /// 筋ごとの「その筋の相手の歩がいられる段」の**上界集合**（1件に絞れたら確定）。
+    /// 歩は前進しかしないので段だけで表せる
+    possible: HashMap<i8, std::collections::BTreeSet<i8>>,
+    /// 追跡を諦めた筋
+    give_up: HashSet<i8>,
+    /// 処理し終えたイベントの数
+    done: usize,
+}
+
+impl ImmobilePawns {
+    pub fn new(my_color: Color) -> Self {
+        use std::collections::BTreeSet;
+        // 相手の歩の初期段（相手から見た前方 = 自分に近づく向きへ進む）
+        let pawn_rank = match my_color.other() {
+            Color::Sente => 7,
+            Color::Gote => 3,
+        };
+        let mine: HashMap<Coord, Role> = Position::initial()
+            .pieces()
+            .filter(|(_, p)| p.color == my_color)
+            .map(|(sq, p)| (sq, p.role))
+            .collect();
+        let possible: HashMap<i8, BTreeSet<i8>> = (1..=9).map(|f| (f, BTreeSet::from([pawn_rank]))).collect();
+        Self {
+            my_color,
+            mine,
+            possible,
+            give_up: HashSet::new(),
+            done: 0,
         }
-    };
+    }
 
-    for e in log.events() {
+    /// 処理し終えたイベントの数（`log` がこれより短ければ別のログ）
+    pub fn done(&self) -> usize {
+        self.done
+    }
+
+    /// `log` の未処理のイベントを処理する。`log` は前回渡したログの続き（同じ局・同じ側）であること
+    pub fn advance(&mut self, log: &ObservationLog) {
+        let events = log.events();
+        while self.done < events.len() {
+            self.step(&events[self.done]);
+            self.done += 1;
+        }
+    }
+
+    /// 動けないと確定した相手の歩のマス
+    pub fn result(&self) -> std::collections::BTreeSet<Coord> {
+        self.possible
+            .iter()
+            .filter(|(f, ranks)| !self.give_up.contains(f) && ranks.len() == 1)
+            .map(|(&f, ranks)| Coord {
+                file: f,
+                rank: *ranks.iter().next().expect("1件"),
+            })
+            .collect()
+    }
+
+    fn step(&mut self, e: &Observation) {
+        let opp = self.my_color.other();
+        // 前進の向き（相手の歩が進む段の増分）と成り込み段
+        let step: i8 = if opp == Color::Sente { -1 } else { 1 };
+        let promo_zone = |r: i8| if opp == Color::Sente { r <= 3 } else { r >= 7 };
+        let (mine, possible, give_up) = (&mut self.mine, &mut self.possible, &mut self.give_up);
+        // 自駒が居るマスに相手の歩は居ない（自駒の配置は常に厳密に分かる）
+        let prune_by_mine = |possible: &mut HashMap<i8, std::collections::BTreeSet<i8>>, mine: &HashMap<Coord, Role>| {
+            for (&f, ranks) in possible.iter_mut() {
+                ranks.retain(|&r| !mine.contains_key(&Coord { file: f, rank: r }));
+            }
+        };
         match e {
             Observation::MyMove { usi, captured, .. } => match crate::shogi::parse_usi(usi) {
                 Some(ShogiMove::Board { from, to, promote }) => {
                     // その筋の歩がいられる段で駒を取ったなら、取ったのがその歩
                     // だった可能性がある（`captured` は成る前の駒種に潰されて
                     // 届くので と金 と歩を区別できない）→ その筋は諦める
-                    if captured.is_some()
-                        && possible.get(&to.file).is_some_and(|s| s.contains(&to.rank))
-                    {
+                    if captured.is_some() && possible.get(&to.file).is_some_and(|s| s.contains(&to.rank)) {
                         give_up.insert(to.file);
                     }
                     if let Some(role) = mine.remove(&from) {
@@ -426,12 +547,12 @@ pub fn immobile_opponent_pawns(
                         };
                         mine.insert(to, r);
                     }
-                    prune_by_mine(&mut possible, &mine);
+                    prune_by_mine(possible, mine);
                 }
                 Some(ShogiMove::Drop { role, to }) => {
                     // 打てた = そのマスは空だった
                     mine.insert(to, role);
-                    prune_by_mine(&mut possible, &mine);
+                    prune_by_mine(possible, mine);
                 }
                 None => {}
             },
@@ -469,22 +590,12 @@ pub fn immobile_opponent_pawns(
                 if let Some(c) = captured_sq {
                     mine.remove(&c);
                 }
-                prune_by_mine(&mut possible, &mine);
+                prune_by_mine(possible, mine);
             }
             // 反則は盤面を動かさない。王手宣言も自駒の配置には影響しない
-            Observation::MyFoul { .. }
-            | Observation::OpponentFoul { .. }
-            | Observation::Check { .. } => {}
+            Observation::MyFoul { .. } | Observation::OpponentFoul { .. } | Observation::Check { .. } => {}
         }
     }
-    possible
-        .into_iter()
-        .filter(|(f, ranks)| !give_up.contains(f) && ranks.len() == 1)
-        .map(|(f, ranks)| Coord {
-            file: f,
-            rank: *ranks.iter().next().expect("1件"),
-        })
-        .collect::<BTreeSet<_>>()
 }
 
 /// 相手の各着手（OpponentMoved）の直前時点での「自玉の位置」と、

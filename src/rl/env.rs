@@ -13,7 +13,7 @@ use crate::board::Coord;
 use crate::protocol::{Color, Role};
 use crate::referee::{Referee, StepResult};
 use crate::rl::action::{NUM_ACTIONS, decode_usi, index_square, legal_mask, normalize};
-use crate::rl::encode::encode_into;
+use crate::rl::encode::{DeducedCache, encode_into_cached};
 use crate::selfplay::{GameResult, StartState, fischer_initial_ms};
 use crate::shogi::{ShogiMove, parse_usi};
 use crate::strategy::Strategy;
@@ -195,6 +195,8 @@ pub struct EnvGame {
     mask: Vec<bool>,
     outcome: Option<Outcome>,
     style: StyleStats,
+    /// 確定事実のプレーンの途中状態（先手・後手の観測ごと。この局の中でだけ使い回す）
+    deduced: [DeducedCache; 2],
 }
 
 impl EnvGame {
@@ -228,6 +230,7 @@ impl EnvGame {
             mask: vec![],
             outcome: None,
             style: StyleStats::default(),
+            deduced: Default::default(),
         };
         game.style.sample(&game.referee);
         game.settle();
@@ -300,10 +303,12 @@ impl EnvGame {
     }
 
     /// 今の手番の観測を書く（`obs` の長さでエンコーダの版を選ぶ。`rl::encode::encode_into`）
-    pub fn observe_into(&self, obs: &mut [f32]) {
+    /// v2 の確定事実は手番側ごとの途中状態を使い回す（結果は `encode_into` と同じ）
+    pub fn observe_into(&mut self, obs: &mut [f32]) {
         let side = self.referee.to_move();
         let view = self.referee.view(side, clocks(), self.game_no);
-        encode_into(&view, self.referee.log(side), self.referee.foul_tried(side), obs);
+        let cache = &mut self.deduced[(side == Color::Gote) as usize];
+        encode_into_cached(&view, self.referee.log(side), self.referee.foul_tried(side), obs, cache);
     }
 
     /// 今の手番から見た**真実の盤面のラベル**を書く（`out` は長さ 81、マス番号は観測と同じ
