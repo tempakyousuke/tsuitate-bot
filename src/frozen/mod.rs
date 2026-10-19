@@ -53,6 +53,7 @@ pub mod rl_selfplay_v4;
 pub mod rl_deduce_v1;
 pub mod rl_deduce_v2;
 pub mod rl_deduce_v3;
+pub mod rl_deduce_v4;
 pub mod rl_guard_v1;
 
 /// **hermetic 規約を適用する最初の版**（issue #21）。
@@ -108,6 +109,7 @@ pub const SOURCES: &[(u32, &str, &str)] = &[
     (43, "rl_deduce_v1", include_str!("rl_deduce_v1.rs")),
     (44, "rl_deduce_v2", include_str!("rl_deduce_v2.rs")),
     (45, "rl_deduce_v3", include_str!("rl_deduce_v3.rs")),
+    (46, "rl_deduce_v4", include_str!("rl_deduce_v4.rs")),
 ];
 
 /// 凍結版 `name` が**自分のファイルの中で**読む `TSUITATE_*` の一覧。
@@ -421,12 +423,12 @@ mod tests {
         assert_eq!(versions_using("king_belief_nn"), vec!["estimator_v14"]);
         // 自駒の再構成は estimator の凍結版も rl_v15 も使う（v15 の凍結で pin に加えた）
         let model_users = versions_using("model");
-        for name in ["rl_v15", "rl_v16", "rl_v17", "rl_v18", "rl_v19", "rl_v20", "rl_v21", "rl_v22", "rl_v23", "rl_v24", "rl_v25", "rl_v26", "rl_v27", "rl_v28", "rl_v29", "rl_v29branch_v1", "rl_v30", "rl_selfplay_v1", "rl_selfplay_v2", "rl_selfplay_v3", "rl_selfplay_v4", "rl_deduce_v1", "rl_deduce_v2", "rl_deduce_v3", "rl_nyugyoku_v1", "rl_nyugyoku_v2", "rl_speed_v1", "rl_speed_v2", "rl_speed_v3", "rl_speed_v4", "rl_guard_v1", "estimator_v14"] {
+        for name in ["rl_v15", "rl_v16", "rl_v17", "rl_v18", "rl_v19", "rl_v20", "rl_v21", "rl_v22", "rl_v23", "rl_v24", "rl_v25", "rl_v26", "rl_v27", "rl_v28", "rl_v29", "rl_v29branch_v1", "rl_v30", "rl_selfplay_v1", "rl_selfplay_v2", "rl_selfplay_v3", "rl_selfplay_v4", "rl_deduce_v1", "rl_deduce_v2", "rl_deduce_v3", "rl_deduce_v4", "rl_nyugyoku_v1", "rl_nyugyoku_v2", "rl_speed_v1", "rl_speed_v2", "rl_speed_v3", "rl_speed_v4", "rl_guard_v1", "estimator_v14"] {
             assert!(model_users.contains(&name), "{name}");
         }
         // 観測からの演繹は estimator の v8〜v14 と、エンコーダ v2 の方策ネット（rl_deduce_v1〜）が使う
         let deduce_users = versions_using("deduce");
-        for name in ["estimator_v8", "estimator_v9", "estimator_v10", "estimator_v11", "estimator_v12", "estimator_v13", "estimator_v14", "rl_deduce_v1", "rl_deduce_v2", "rl_deduce_v3"] {
+        for name in ["estimator_v8", "estimator_v9", "estimator_v10", "estimator_v11", "estimator_v12", "estimator_v13", "estimator_v14", "rl_deduce_v1", "rl_deduce_v2", "rl_deduce_v3", "rl_deduce_v4"] {
             assert!(deduce_users.contains(&name), "{name}");
         }
         assert!(!deduce_users.contains(&"rl_selfplay_v4"));
