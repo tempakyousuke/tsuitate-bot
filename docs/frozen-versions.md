@@ -432,3 +432,15 @@ R-NaD は段階ごとに前の版との差が縮み（selfplay 系統で 62.5% �
   **rl_deduce_v2（54,000）とのペア差は全体 +1.1pt±1.3**（rl_deduce_v2 戦を除く 5,700組）。rl_deduce_v2 への 59.5%±6.8 は
   有意な勝ち越しで、旧基準も満たす。
   同一性確認: `frozen::tests::rl凍結版は元の重みと同じ手を指す`）。
+- `rl_deduce_v4` = **deduce 系統の 58,000更新**。rl_deduce_v3（56,000）から同じ条件（学習率 1e-4・768局/更新・自己対局だけ・
+  Δm=2,000・錨 rl_deduce_v1）で1段階（56,000 → 58,000）回した。
+  `rl_deduce_v3.rs` との差は重みと名前だけ。重みの原本は Release `rlw-deduce-s58000-20261019/policy.bin`。通し番号 46）
+  （2026-10-19 凍結。全版各200局（run 39248006472 / 39248014647 / 39248022986）: **rl_deduce_v3 55.8%** / rl_deduce_v2 63.5% /
+  rl_deduce_v1 69.0% / rl_selfplay_v4 72.8% / rl_selfplay_v3 72.5% / rl_selfplay_v2 82.2% / rl_selfplay_v1 83.5% / rl_v30 90.0% /
+  rl_v29branch_v1 82.8% / rl_v29 82.5% / rl_v28 79.8% / rl_v27 85.0% / rl_speed_v4 82.0% / rl_speed_v3 78.2% / rl_speed_v2 80.5% /
+  rl_speed_v1 75.2% / rl_v26 65.8% / rl_v25 74.5% / rl_v24 57.8% / rl_nyugyoku_v2 79.0% / rl_nyugyoku_v1 72.5% / rl_guard_v1 67.2% /
+  rl_v23 75.8% / rl_v22 70.0% / rl_v21 73.8% / rl_v20 75.5% / rl_v19 72.0% / rl_v18 77.2% / rl_v17 78.0% / rl_v16 74.0% / rl_v15 78.5%。
+  estimator_v14 70.0%（100局、run 39248031379）。
+  **rl_deduce_v3（56,000）とのペア差は全体 +0.1pt±1.3**（rl_deduce_v3 戦を除く 5,900組）。rl_deduce_v3 への 55.8%±6.9 は
+  有意な勝ち越しではないので、緩めた基準で凍結した（rl_selfplay_v4 と同じ形）。
+  同一性確認: `frozen::tests::rl凍結版は元の重みと同じ手を指す`）。
