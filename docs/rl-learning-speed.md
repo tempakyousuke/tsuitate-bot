@@ -203,7 +203,10 @@ b2 = 0.999 で何千更新も覚えている。分散を減らす腕へ切り替
    ```sh
    .venv/bin/python rnad/bench_update.py --ckpt out_rnad/selfplay_v2planes/checkpoint.pt --batch 768 --reps 3 --loop 6
    ```
-   - `packed` の更新量のコサイン ≥ 0.99999（`delta_cos_min`）・相対誤差 ≤ 1e-5 なら数式は同じ
+   - `packed` の**勾配**の相対誤差 ≤ 1e-5（`grad_rel_err_max`）なら数式は同じ。CPU・rl_deduce_v4 の重みで 5e-7 だった
+     （更新量のコサインは、Adam の状態が新しいと1歩目が勾配の符号に近いので 0.9994 程度まで下がる。本物の checkpoint なら 1 に近い）
+   - 参考: CPU（このコンテナ、rl_deduce_v4 と同じ 64ch×6・16局）では更新 9.0秒 → packed 6.6秒（1.36倍）、
+     「自己対局 + 更新」11.3秒 → 重ねて 7.2秒（1.57倍）。GPU では比が変わるので必ず基準機で測る
    - `従来 collect + update` と `重ねる` の比が 1.4倍以上なら採用。ピークのメモリ（タスクマネージャ / `free -h`）が 7GB 未満か
 3. 採用なら、次の段階から `--packed --pipeline --compact-legal` を足して再開する（設定の上書きは要らない。
    どれも checkpoint の設定に入らない）。合わせて**学習に影響しない**次の3つも付ける:
