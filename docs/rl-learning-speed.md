@@ -159,4 +159,57 @@ b2 = 0.999 で何千更新も覚えている。分散を減らす腕へ切り替
 半分に戻るまで約4,200更新、PG では約8,000更新ほぼ止まる見込み。そのまま比べると「更新の式の違い + 学習率が 5〜14分の1」の
 比較になる。**両腕に `--reset-adam --lr-warmup 100` を付ける**（対照も同じ条件にそろえる）。
 
-（以下、6節以降は計測の進行に合わせて埋める）
+（6節 代理実験の結果は計測の進行に合わせて埋める）
+
+## 7. GPU（ゲーム用 PC）で回す手順
+
+### 7.1 次の Δm の区切りで: 数式を変えない高速化（学習曲線の A/B は要らない）
+
+1. tsuitate-bot の main の rl-env を入れ直す（`maturin develop --release -m ../tsuitate-bot/rl-env/Cargo.toml`）。
+   tsuitate-nn はブランチ `claude/admiring-carson-1hwun6`
+2. 学習済みの checkpoint で30分ほど測る（学習を止めている間に。乱数初期化のネットは局が長く遅く出る）:
+   ```sh
+   .venv/bin/python rnad/bench_update.py --ckpt out_rnad/selfplay_v2planes/checkpoint.pt --batch 768 --reps 3 --loop 6
+   ```
+   - `packed` の更新量のコサイン ≥ 0.99999（`delta_cos_min`）・相対誤差 ≤ 1e-5 なら数式は同じ
+   - `従来 collect + update` と `重ねる` の比が 1.4倍以上なら採用。ピークのメモリ（タスクマネージャ / `free -h`）が 7GB 未満か
+3. 採用なら、次の段階から `--packed --pipeline --compact-legal` を足して再開する（設定の上書きは要らない。
+   どれも checkpoint の設定に入らない）。合わせて**学習に影響しない**次の3つも付ける:
+   `--extra-ema 0.0003,0.003 --export-current --tail-avg`（書き出しの平均化を比べるため。7.3）
+4. 学習ログの `ratio_dev_max`（`--pipeline` で 1更新遅れの方策を使った分の π/μ のずれ）が 1e-2 未満であること
+
+### 7.2 1回だけ: 同じ設定の複製の対照（seed 間のばらつきを測る）
+
+どの A/B の検出力の計算にも効く一番大きい未知数。本線と同じ checkpoint をコピーし、**`--reseed --seed <別の値>`** で1段階回す
+（`--reseed` を付けないと checkpoint の乱数状態が戻り、同じ自己対局が再生されて、ばらつきが 0 に見える）。
+本線の同じ段階の書き出しとのペア差（CI のガントレット、`match_seed`）が、同じ設定の run どうしのばらつきになる。
+
+### 7.3 分散を減らす腕の A/B（代理 P2 で効いたら）
+
+```sh
+# 対照も腕も、同じ checkpoint のコピーから。両腕に --reset-adam --lr-warmup 100（5節の注意）
+cp out_rnad/main/checkpoint_58000.pt out_rnad/ab_ctrl/checkpoint.pt
+cp out_rnad/main/checkpoint_58000.pt out_rnad/ab_cap100/checkpoint.pt
+python -u rnad/train_rnad.py --out out_rnad/ab_ctrl   --steps 62000 <本線と同じ引数> --reset-adam --lr-warmup 100 \
+    --packed --pipeline --compact-legal --export-current --extra-ema 0.005 --panel panel_v1.json --panel-every 500 --panel-games 2048
+python -u rnad/train_rnad.py --out out_rnad/ab_cap100 --steps 62000 <本線と同じ引数> --reset-adam --lr-warmup 100 \
+    --packed --pipeline --compact-legal --export-current --extra-ema 0.005 --panel panel_v1.json --panel-every 500 --panel-games 2048 \
+    --inv-mu-cap 100 --override-config
+```
+
+- **2段階（4,000更新）を見る**: 1段階目の差は「水準」、2段階目の差が「速さ」。直近の変更（学習率 1e-4、768局、確定事実のプレーン）は
+  どれも「1回だけ上がって、次の段階から横ばい」だったので、水準の上乗せと速さを分けて読む
+- 判定はパネル（学習ループ内、区切りで 16,000局まで増やせる）と CI のガントレットのペア差。直接対戦（B 対 A）は感度が高いが
+  自分の系列への特化を含むので、ペア差と並べて読む
+- 見張り: 学習ログの `pi_top_gt_0999`（0.999 を超える決定点の割合）が対照より 5pt 以上増える・`entropy_mean` が 2割以上減るなら、
+  方策が決定的に固まり始めている（1/μ の上限・PG で NeuRD の性質が弱まった兆候）。rl_search の価値ヘッドへの影響は、
+  固定パネルの局で価値の較正（最終結果に対する Brier）を見る
+- パネル `panel_v1.json`（例）: 同じ系列 rl_selfplay_v2 / rl_selfplay_v4 / rl_deduce_v2 / rl_deduce_v4、近い祖先 rl_v29 / rl_v30、
+  特化系 rl_speed_v4 / rl_nyugyoku_v2 / rl_guard_v1、古い本線 rl_v25 / rl_v26（`speedlab.py panel --member <名前>=<models/…bin> ... --fix rl_v30=1553.3`
+  で一度だけ総当たりして固定する。`--panel` はレートを当て直さない）
+
+### 7.4 浮いた時間の使い方（高速化を入れた後で）
+
+同じ基準機の秒数で次の2つを比べる（両腕 `--reset-adam`）: (i) 1更新 1,536局・学習率 1e-4、(ii) 768局・2倍の更新回数・学習率 5e-5。
+Adam（β1 = 0）は1歩が局数によらずほぼ学習率で決まるので、局数と学習率は一緒に動かす。これは「雑音で律速されているか」の
+確かめにもなる（局数を倍にしても1更新あたりの伸びが変わらないなら、分散を減らす手も効かない）。
