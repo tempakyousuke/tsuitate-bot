@@ -1045,7 +1045,7 @@ DeepNash の論文（Perolat ら、Science 2022、arXiv 2206.15378）の学習�
 | --- | --- | --- |
 | 1 | 今の本線（自己対局半分＋凍結版23体のリーグ（rl_v29branch_v1 を追加）、Δm=200、錨 rl_v29branch_v1） | 30,000 → 35,000 を完了（`run_main_v30.sh`）。35,000 を `rl_v30` として凍結 |
 | 2 | 自己対局だけ（`--league-frac 0`）、Δm=200 | 保留 |
-| **3** | **自己対局だけ、Δm=2,000** | 30,000 → 40,000 を完了（`selfplay_s2000`）。40,000 → 42,000 は1更新あたり768局（`selfplay_s2000_b768`）。42,000 を `rl_selfplay_v1` として凍結。44,000 → 46,000 は学習率 1e-4（`selfplay_b768_lr1e4`）で、46,000 を `rl_selfplay_v2`、学習率 1e-4 のまま回した 48,000 を `rl_selfplay_v3`、50,000 を `rl_selfplay_v4` として凍結。50,000 → 52,000 は確定事実の入力プレーン（エンコーダ v2、`selfplay_v2planes`）で、52,000 を `rl_deduce_v1`、同じ条件で続けた 54,000 を `rl_deduce_v2`、56,000 を `rl_deduce_v3`、58,000 を `rl_deduce_v4`、Δm=10,000 で1段階回した 68,000 を `rl_deduce_v5`、続けて同じ条件で回した 78,000 を `rl_deduce_v6` として凍結 |
+| **3** | **自己対局だけ、Δm=2,000** | 30,000 → 40,000 を完了（`selfplay_s2000`）。40,000 → 42,000 は1更新あたり768局（`selfplay_s2000_b768`）。42,000 を `rl_selfplay_v1` として凍結。44,000 → 46,000 は学習率 1e-4（`selfplay_b768_lr1e4`）で、46,000 を `rl_selfplay_v2`、学習率 1e-4 のまま回した 48,000 を `rl_selfplay_v3`、50,000 を `rl_selfplay_v4` として凍結。50,000 → 52,000 は確定事実の入力プレーン（エンコーダ v2、`selfplay_v2planes`）で、52,000 を `rl_deduce_v1`、同じ条件で続けた 54,000 を `rl_deduce_v2`、56,000 を `rl_deduce_v3`、58,000 を `rl_deduce_v4`、Δm=10,000 で1段階回した 68,000 を `rl_deduce_v5`、続けて同じ条件で回した 78,000 を `rl_deduce_v6`、`--pipeline` 入りで回した 88,000 を `rl_deduce_v7` として凍結 |
 
 - arm 3 は本家の条件に一番近い。それ以外は `run_main_v30.sh`（tsuitate-nn ブランチ `rnad-ckpt-main-from-speed3-30000`）と
   同じ（錨 rl_v29branch_v1・学習率 2e-4・η 0.2・β 16・256局/更新・tf32）。出発点は**学習状態一式**（ネット・optimizer・正則化ネット）を
@@ -1158,6 +1158,13 @@ DeepNash の論文（Perolat ら、Science 2022、arXiv 2206.15378）の学習�
   - 段階の頭で `--pipeline` の A/B を手軽にした（同じ 68,000 から 70,000 まで、腕は `out_rnad/pipeline_ab`）。70,000 どうしの直接対戦
     1,000局で pipeline の腕 50.8%±3.1 = 差なし（docs/rl-learning-speed.md 7.1）。78,000 からは `--pipeline` も入れる
 - run（arena、`--ref main`）: 78,000 = 39931747050 / 39931751461 / 39931758250（estimator_v14） / vs rl_v30・rl_selfplay_v1〜v4・rl_deduce_v1〜v5 39931754878
+- **78,000 → 88,000 は `--packed --pipeline --compact-legal`**（2026-10-23〜24。ほかは同じ条件、錨は rl_deduce_v4 のまま）。
+  1更新 約7.9秒（前の段階 13.3秒）で、1段階 約23時間。錨への勝率は段階末 69.1%±5.7（前の段階末 64.5%）
+  - 78,000 とのペア差 **+2.9±1.3**（6,500組。直前の2段階は +1.0）、rl_deduce_v4 に 77.5%、rl_v30 に 87.5%、estimator_v14 に 67.0%（100局）
+  - rl_deduce_v6 には 200局で 47.5%±6.9、同じ seed で 1,000局に増やして **59.4%±3.1** → **`rl_deduce_v7`** として凍結
+    （200局の下振れの検討は docs/frozen-versions.md）。`--pipeline` を入れても伸びは落ちていない
+- run（arena、`--ref main`）: 88,000 = 40083519249 / 40083521657 / 40083526793（estimator_v14） / vs rl_v30・rl_selfplay_v1〜v4・rl_deduce_v1〜v6 40083524276 /
+  vs rl_deduce_v6 1,000局 40085416344
 
 **計測と凍結の間隔（2026-10-13 方針）**: **Δm の区切りに合わせる**。R-NaD の学習は「正則化方策を固定したゲームを解く」
 段階の繰り返しで、区切りの直前がその段階の答えに一番近い状態、途中は α の補間（段階の前半は前の正則化方策が混ざる）の
