@@ -637,15 +637,10 @@ A/B と bench 約13時間（6%）。1区切りの停止は 0.9〜6.7時間、平
    `until .venv/bin/python rnad/train_rnad.py …; do sleep 60; done` で落ちても自動で再開させ、train_rnad.py で `info['reg_update']` の後に
    `checkpoint_<step>.pt` を保存して `extra_ema.pt` も複写する（5〜10行）。書き出しは原子的でないので、見張りは大きさと mtime で書き終わりを待つ。
    pipeline では再開すると収集の乱数列が変わる
-2. **S1(a)（Python だけ）**: `rnad/proto/speed2/fast_collect.py`（F1）の形を `rnad.collect` に「自己対局・λ=0・truth なし」の分岐として足す（旧経路は残す）。
-   3070 で `rnad/proto/speed2/verify_collect.py --batch 768 --device cuda --modes orig,fast_np --out v.json` を回して CUDA でのビット一致を確かめ（10分）、
-   同じ checkpoint・同じ `--seed` で旧版と交互に約100更新回して計時する（完全なペア。秒は 1,000決定点あたりに直し、同じ α の区間どうしで比べる）
-3. **S1(b)**: VecEnv に `observe_alive_f16_csr` を足す（`rnad/proto/speed2/observe_alive.diff`、tsuitate-bot の rl-env への差分。既存の observe は残す）。
-   H2D の帯域と型変換の場所は `rnad/proto/speed2/box_bench.py` で測る
-4. **S2-lite**: update の頭で fp16 の観測・行動・CSR を1回だけ GPU へ送り、統計は GPU に貯めて最後に1回だけ返す。CPU での一致検査は
-   `rnad/proto/speed2/s2lite_equiv.py`（F4）。torch.profiler で memcpy HtoD と同期の数（予想 約1,500回 → 数十回）を見る
-5. **S3（融合）**: `rnad/proto/speed2/fused_update.py`（F5）を `--fused` として入れる（v-trace は CPU のまま）。bench_update に `packed / fused` の腕を足し、
-   3070 で α=1 と補間中の両方を測ってから採用する
+2. **S1〜S3 は実装した（2026-10-25、9.9）**: `--fast-collect py|rust`（収集）・`--device-batch`（batch を GPU に置く）・`--fused`（順伝播の融合）。どれも既定オフで、CPU では従来とビット単位で同じ（S3 も試作の相対誤差 1e-8 ではなくビット一致にした）。入れ方は 9.9 の手順。下の 3〜5 は検討時の記録
+3. （記録）S1(a): F1 の形を `rnad.collect` の分岐として足す。S1(b): VecEnv に `observe_alive_f16_csr` を足す（H2D の帯域と型変換の場所は `rnad/proto/speed2/box_bench.py` で測れる）
+4. （記録）S2-lite: update の頭で fp16 の観測・行動・CSR を1回だけ GPU へ送り、統計は GPU に貯めて最後に1回だけ返す（torch.profiler で memcpy HtoD と同期の数を見る。予想 約1,500回 → 数十回）
+5. （記録）S3: pass 1 の online 順伝播を pass 2 へ融合する（v-trace は CPU のまま）
 6. **ついでに**: T2 の見張りのログだけ（`rnad/proto/speed2/stage_monitor_and_ramp.diff` を `schedule_ramp=0` で。CPU でビット一致）。T_r は `kl_online_reg` で読み、
    `kl_target_reg`（ターゲットの遅れで Δm=2,000 では平らにならない）は判定に使わない。T3 の `--tail-avg --export-current`。既存の書き出しから遡るなら
    W_t = (target_t − 0.779·target_{t−250})/0.221 で `--tail-avg` をほぼ厳密に再構成できる（式は書き出しの間隔 e=250 のとき。一般には 0.779 を
@@ -701,3 +696,43 @@ O2（4090）は S1 を入れて律速を確定してから1時間の試走。N3�
   `--league-device rust` と今の本線（自己対局だけ）には影響しない
 - **直し方の案【推測・未検証】**: `v_trace_scalars` で、無効なステップでは carry を 0 にせず、そのまま通す。自己対局と Rust リーグには局の途中の隙間がないので、
   結果は変わらないはず。リーグを再開する前にテストで確かめる
+
+### 9.9 実装した: 収集・batch の GPU 常駐・順伝播の融合（2026-10-25）
+
+9.1 の 2（S1 → S2 → S3）を、**既定オフのフラグ**として本体に入れた（tsuitate-nn の `rnad/rnad.py`・`rnad/train_rnad.py`、
+tsuitate-bot の `rl-env/src/lib.rs`）。どれも計算の持ち方だけを変え、**CPU では学習が従来とビット単位で同じ**になることを確かめた。
+
+| フラグ | 中身 | 一致の確かめ方（CPU） | 使える条件 |
+| --- | --- | --- | --- |
+| `--fast-collect py` | 収集の Python 側: 生きている局の行を1回だけ抜く・観測を CPU で1回だけ fp16 にして batch とデバイスの両方に使う（送る量が半分）・合法手の添字を `flatnonzero` で1回だけ作り、デバイス上の密なマスクは添字から scatter で作る（密なマスクを送らない）・入玉の記帳をベクトル化 | `rnad/tests/test_fast_collect.py`: 自己対局（91枚・86枚）・複数の env・相手が Rust の戦略の env で、batch の全キーがビット単位で一致 | `--compact-legal`。`--league-device gpu`・入玉ボーナス・補助ヘッドとは使えない（起動時に止まる）。`--pipeline` と併用できる |
+| `--fast-collect rust` | 加えて **Rust 側で生きている局だけを観測**し、fp16 のビットと合法手の添字で返す（`VecEnv.observe_alive_f16_csr`。終局した局の観測を作らない） | 同上。fp16 への丸め（Rust で書いた最近接偶数）は numpy の float16 と 125万個の値（f16 の全値・丸めの境目と前後・特殊値・乱数のビット列）で一致 | 同上。**rl-env を作り直す**（`VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop --release -m ../tsuitate-bot/rl-env/Cargo.toml`） |
+| `--device-batch` | batch を更新の頭で1回だけ GPU へ送る（観測は fp16 のまま）。合法手の詰めは行数を CPU の個数から決めて同期せずに作り、1回目と2回目で使い回す。π_a・Σπ·lpr・ターゲットの v・見張りの和・損失は GPU に貯め、1回目と2回目の終わりに1回ずつだけ CPU へ戻す（従来はチャンクごとに同期） | `rnad/tests/test_fast_update.py`: 2回続けた更新の後の4つのネット・勾配・Adam の状態・ログの値がビット単位で一致（α=0・補間中・α=1と差し替え・補助ヘッド・c_ply・1/μ の上限・報酬の縮め・PG・チャンク1つ） | `--packed --compact-legal`。GPU のメモリを batch あたり約1GB（768局の観測の fp16）と、詰めの使い回しで約0.2GB |
+| `--fused` | 1回目（勾配なし）の現在のネットの順伝播を2回目へまとめる。チャンクを後ろから回し、v-trace をチャンクごとに局ごとの持ち越しで進める（`v_trace_scalars` の1ステップと同じ式・同じ順）。チャンクの勾配は取っておいて**従来と同じ順（チャンクの昇順）に足す**ので、試作（相対誤差 8.4e-8）と違って勾配もビット単位で同じ | 同上（device_batch との組み合わせも、密なマスク・packed なしも） | `--league-device gpu` とは使えない（相手の手番が batch の隙間になり、手番が時刻 0 から続かない。起動時と update で止まる）。勾配の取り置きに GPU のメモリを約130MB |
+
+- `train_rnad.py` を同じ seed で、フラグなしと3つ全部付き（`--fast-collect rust --device-batch --fused`）で6更新ずつ回し、
+  `--pipeline` あり・なしの両方で、更新ごとのログの値（時間を除く全部）と最後の checkpoint の4つのネットが一致した（CPU、8局・16ch×1）
+- `bench_update.py` に腕を足した。`--collect-arms orig,py,rust` は同じ env の seed・同じ乱数列で集めて batch がビット単位で同じかを、
+  `--update-arms packed,device,fused,fused+device` は同じ batch・同じ学習状態から1回ずつ更新して、更新後の全パラメータが基準と同じかを出す
+  （同じ名前を2回並べると基準どうしの揺れの床が見える）。`--fast-collect` / `--device-batch` / `--fused` は sequential / pipelined のループにも効く
+- CPU での参考値（この VM、24局、rl_deduce_v7。NN が CPU で重いので GPU の比は表さない）: 収集 orig 1.93秒 / py 1.88 / rust 1.82、
+  更新 packed 3.15秒 / device 3.01 / fused 2.71 / fused+device 2.52（全部ビット単位で同じ）
+- 試作（`rnad/proto/speed2/` の F1〜F5）は経緯の記録として残す
+
+**3070 での入れ方**（本線を止めている間に。9.6 の 2）:
+
+```sh
+# 1. rl-env を作り直し、テストを回す（CPU でも動く。数分）
+VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop --release -m ../tsuitate-bot/rl-env/Cargo.toml
+.venv/bin/python rnad/tests/test_fast_collect.py && .venv/bin/python rnad/tests/test_fast_update.py
+# 2. 本線の checkpoint で腕を並べる（30分程度）
+.venv/bin/python rnad/bench_update.py --ckpt out_rnad/deduce_s10000/checkpoint.pt --batch 768 --compact-legal \
+    --collect-arms orig,py,rust --update-arms packed,packed,device,fused,fused+device \
+    --fast-collect rust --device-batch --fused --precision tf32
+```
+
+- **判定**: ① `collect_mismatch` が空（CUDA でも batch がビット単位で同じ）、② `update_arms_bitwise` が真か、偽なら更新量の相対誤差が
+  `packed` どうし（2回目の packed）と同じ水準（cuDNN の逆伝播が非決定的なら基準どうしでも揺れる）、③ pipelined の1更新の秒が今（7.9秒前後）より短い。
+  ①②を満たせば学習の中身は同じなので、学習曲線の A/B は要らない。次の Δm の区切りから本線の引数に `--fast-collect rust --device-batch --fused` を足す
+- `--precision tf32` は本線と同じ精度で測るため（`bench_update.py` に足した）
+- 効き方の見込み（9.3）: 今は補間中に収集が律速なので、まず `--fast-collect` が効き、収集が更新より速くなってから `--device-batch` / `--fused` が
+  壁時計に出る。どれがどれだけ効いたかは、`stage_log.py` で α<1 と α=1 の区間ごとに `collect_busy_sec` と `update_sec` を見る

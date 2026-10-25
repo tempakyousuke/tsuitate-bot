@@ -28,6 +28,11 @@ import tsuitate_rl
 env = tsuitate_rl.VecEnv(256, seed=0)                       # 自己対局
 env = tsuitate_rl.VecEnv(64, opponent="heuristic", seed=0)  # 評価モード（strategy::make の名前）
 obs, mask, player = env.observe()  # [n,86,9,9] f32 / [n,11259] bool / [n] i8（0=先手 1=後手）
+bits, cols, counts, player = env.observe_alive_f16_csr()
+                                   # 終局していない局だけ（局の昇順）: 観測の fp16 のビット [m,planes·81] u16 /
+                                   #   合法手の添字（行ごとに昇順でつなげる）i16 / 行ごとの個数 i32 / 手番の色 i8。
+                                   #   observe() の生きている行を fp16 に丸め、マスクを添字に詰めたものとビット単位で同じ
+                                   #   （tsuitate-nn の collect(fast="rust")。終局した局の観測を作らないぶん軽い）
 rewards, done = env.step(actions)  # [n] i64 → [n,2] f32（先手,後手）/ [n] bool
 env.learner_colors()               # 評価モードの学習側の色（自己対局は -1）
 env.pop_finished()                 # 終局した局: game_no / winner / reason / plies / fouls / learner / opponent

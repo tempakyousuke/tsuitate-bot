@@ -127,6 +127,48 @@ fn color_code(c: Color) -> i8 {
     }
 }
 
+/// f32 → f16 のビット（最近接偶数丸め = torch の `.half()`・numpy の `astype(float16)` と同じ）。
+/// half クレートのソフトウェア版と同じ手順（依存を増やさないため写した）。一致は tsuitate-nn の
+/// rnad/tests/test_fast_collect.py が `f32_to_f16_bits` で numpy と突き合わせる
+fn f32_to_f16(value: f32) -> u16 {
+    let x = value.to_bits();
+    let sign = x & 0x8000_0000;
+    let exp = x & 0x7F80_0000;
+    let man = x & 0x007F_FFFF;
+    if exp == 0x7F80_0000 {
+        // 無限大と NaN（NaN は仮数の上位ビットを残し、静かな NaN にする）
+        let nan_bit = if man == 0 { 0 } else { 0x0200 };
+        return ((sign >> 16) | 0x7C00 | nan_bit | (man >> 13)) as u16;
+    }
+    let half_sign = sign >> 16;
+    let half_exp = ((exp >> 23) as i32) - 127 + 15;
+    if half_exp >= 0x1F {
+        return (half_sign | 0x7C00) as u16; // 桁あふれ → 無限大
+    }
+    if half_exp <= 0 {
+        // f16 の非正規化数（小さすぎれば ±0）
+        if 14 - half_exp > 24 {
+            return half_sign as u16;
+        }
+        let man = man | 0x0080_0000;
+        let mut half_man = man >> (14 - half_exp);
+        let round_bit = 1 << (13 - half_exp);
+        if (man & round_bit) != 0 && (man & (3 * round_bit - 1)) != 0 {
+            half_man += 1;
+        }
+        return (half_sign | half_man) as u16;
+    }
+    let half_man = man >> 13;
+    let round_bit = 0x0000_1000;
+    let bits = half_sign | ((half_exp as u32) << 10) | half_man;
+    // 繰り上がりが指数へ伝わるのも IEEE の丸めと同じ（最大の有限値を超えれば無限大になる）
+    if (man & round_bit) != 0 && (man & (3 * round_bit - 1)) != 0 {
+        (bits + 1) as u16
+    } else {
+        bits as u16
+    }
+}
+
 /// 評価モードの学習側の色（偶数局で先手）
 fn learner_of(game_no: u32) -> Color {
     if game_no % 2 == 0 {
@@ -307,6 +349,51 @@ impl VecEnv {
         Ok((
             PyArray1::from_vec(py, obs).reshape([n, planes, 9, 9])?,
             PyArray1::from_vec(py, mask).reshape([n, NUM_ACTIONS])?,
+            PyArray1::from_vec(py, player),
+        ))
+    }
+
+    /// **終局していない局だけ**の (観測の fp16 のビット [m, planes·81] u16, 合法手の添字 i16, 行ごとの個数 i32,
+    /// 手番の色 i8)。並びは局の添字の昇順で、`observe()` の結果を生きている局の行に絞り、観測を fp16 に丸め
+    /// （torch の `.half()` と同じ最近接偶数）、マスクを行ごとに昇順の添字へ詰めたものとビット単位で同じ。
+    /// tsuitate-nn の `rnad.collect(fast="rust")` が使う（docs/rl-learning-speed.md「さらに速くする」の S1）。
+    /// 終局して止まっている局（auto_reset=False）の観測を作らないぶん、`observe` より軽い
+    fn observe_alive_f16_csr<'py>(
+        &mut self,
+        py: Python<'py>,
+    ) -> PyResult<(
+        Bound<'py, PyArray2<u16>>,
+        Bound<'py, PyArray1<i16>>,
+        Bound<'py, PyArray1<i32>>,
+        Bound<'py, PyArray1<i8>>,
+    )> {
+        let len = self.planes * 81;
+        let mut live: Vec<&mut EnvGame> = self.games.iter_mut().filter(|g| g.outcome().is_none()).collect();
+        let n = live.len();
+        let player: Vec<i8> = live.iter().map(|g| color_code(g.to_move())).collect();
+        let (obs16, cols, counts) = py.detach(|| {
+            let mut obs16 = vec![0u16; n * len];
+            let per_game: Vec<Vec<i16>> = obs16
+                .par_chunks_mut(len)
+                .zip(live.par_iter_mut())
+                .map_init(
+                    || vec![0.0f32; len],
+                    |buf, (o, g)| {
+                        g.observe_into(buf);
+                        for (d, &s) in o.iter_mut().zip(buf.iter()) {
+                            *d = f32_to_f16(s);
+                        }
+                        g.mask().iter().enumerate().filter(|&(_, &m)| m).map(|(i, _)| i as i16).collect()
+                    },
+                )
+                .collect();
+            let counts: Vec<i32> = per_game.iter().map(|c| c.len() as i32).collect();
+            (obs16, per_game.concat(), counts)
+        });
+        Ok((
+            PyArray1::from_vec(py, obs16).reshape([n, len])?,
+            PyArray1::from_vec(py, cols),
+            PyArray1::from_vec(py, counts),
             PyArray1::from_vec(py, player),
         ))
     }
@@ -678,10 +765,18 @@ impl RecordDataset {
     }
 }
 
+/// `VecEnv.observe_alive_f16_csr` の fp16 への丸めを、任意の f32 の列に当てたビット（検査用）
+#[pyfunction]
+fn f32_to_f16_bits<'py>(py: Python<'py>, x: PyReadonlyArray1<'py, f32>) -> PyResult<Bound<'py, PyArray1<u16>>> {
+    let bits: Vec<u16> = x.as_slice()?.iter().map(|&v| f32_to_f16(v)).collect();
+    Ok(PyArray1::from_vec(py, bits))
+}
+
 #[pymodule]
 fn tsuitate_rl(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<VecEnv>()?;
     m.add_class::<RecordDataset>()?;
+    m.add_function(wrap_pyfunction!(f32_to_f16_bits, m)?)?;
     m.add("NUM_ACTIONS", NUM_ACTIONS)?;
     m.add("NUM_PLANES", NUM_PLANES)?;
     m.add("NUM_PLANES_DEDUCED", NUM_PLANES_DEDUCED)?;
