@@ -484,3 +484,15 @@ R-NaD は段階ごとに前の版との差が縮み（selfplay 系統で 62.5% �
   **59.4%±3.1**（590-404-6）。先頭の200局は 200局の run と結果まで一致し、残り800局が 62.3%。A/B の 1,000局（run 39724961182）では
   各シャードの先頭50局と残りに差が無い（52.5% / 50.4%）ので、200局の 47.5% は偶然の下振れと見る。1,000局で凍結の基準を満たす。
   同一性確認: `frozen::tests::rl凍結版は元の重みと同じ手を指す`）。
+- `rl_deduce_v8` = **deduce 系統の 98,000更新**。rl_deduce_v7（88,000）から同じ条件（Δm=10,000・学習率 1e-4・768局/更新・
+  自己対局だけ・`--packed --pipeline --compact-legal`）で1段階（88,000 → 98,000）回した。錨はこの段階から rl_deduce_v7。
+  `rl_deduce_v7.rs` との差は重みと名前だけ。重みの原本は Release `rlw-deduce-s10000-s98000-20261025/policy.bin`。通し番号 50）
+  （2026-10-25 凍結。全版各200局（run 40187004318 / 40187006474 / 40187008288）: **rl_deduce_v7 60.0%** / rl_deduce_v6 71.5% /
+  rl_deduce_v5 75.8% / rl_deduce_v4 79.0% / rl_deduce_v3 80.5% / rl_deduce_v2 83.5% / rl_deduce_v1 82.5% / rl_selfplay_v4 85.5% /
+  rl_selfplay_v3 86.5% / rl_selfplay_v2 89.5% / rl_selfplay_v1 90.2% / rl_v30 88.5% / rl_v29branch_v1 89.0% / rl_v29 86.0% / rl_v28 83.0% /
+  rl_v27 90.5% / rl_speed_v4 84.5% / rl_speed_v3 82.5% / rl_speed_v2 81.2% / rl_speed_v1 78.0% / rl_v26 71.8% / rl_v25 73.0% / rl_v24 70.2% /
+  rl_nyugyoku_v2 79.8% / rl_nyugyoku_v1 71.5% / rl_guard_v1 70.5% / rl_v23 76.0% / rl_v22 73.8% / rl_v21 76.5% / rl_v20 80.0% / rl_v19 81.5% /
+  rl_v18 78.0% / rl_v17 79.0% / rl_v16 81.0% / rl_v15 87.0%。estimator_v14 74.0%（100局、run 40187010284）。
+  **rl_deduce_v7（88,000）とのペア差は全体 +2.7pt±1.2**（rl_deduce_v7 戦を除く 6,700組）。うち rl_deduce_v6 戦の +24.0 は 88,000 の
+  200局の下振れ（47.5%）の戻りを含むので、これを除くと約 +2.0。rl_deduce_v7 への 60.0%±6.8 は有意な勝ち越しで、旧基準も満たす。
+  同一性確認: `frozen::tests::rl凍結版は元の重みと同じ手を指す`）。
