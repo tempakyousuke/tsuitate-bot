@@ -19,9 +19,13 @@
   相手・match_seed・シャード・局番号で決まる）d_o は局ごとに対にした差の平均なので、局の揺れ（対にした分だけ小さい）と
   相手による効き方の違いの両方が入る。z はこれで割った値（G − 1 の t で読む）。相手が8体未満の組は自由度が足りず
   誤差が小さく出すぎるので、相手でまとめた誤差と z は出さない
-- 参考に、局を独立とみなした二項の誤差（対にしない上限）も出す
-- 局数が腕どうしで違う相手は比べられないので止める。1つの腕の run は同じ candidate でなければ止め、違う腕が同じ candidate
-  なら止める（run ID の貼り間違いを防ぐ）。腕ごとの candidate を出力の頭に書く
+- 参考に、局を独立とみなした二項の誤差も出す（腕を1つずつ比べるなら対にしないときの上限。`B+C` の右側は B と C を独立とみなすので、
+  ほぼ同じネットを平均すると小さく出る）
+- 局数が腕どうしで違う相手は比べられないので止める。腕は (candidate, cand_knobs, cand_config) で見分け、1つの腕の run がそろって
+  いなければ止め、違う腕が同じなら止める（run ID の貼り間違いを防ぐ。同じ腕を2回比べるときは --allow-same-arm）。腕ごとの candidate を
+  出力の頭に書く
+- combined.json と同じ場所に all.jsonl（同じ artifact に入っている、シャードごとの記録）があれば、差に出てくる腕どうしで相手ごとに
+  match_seed_base・シャードの組・時計がそろっているかを確かめ、違えば止める（無ければ確かめられないと書く）
 - 差ごとに、その差に出てくる腕のすべてにいる相手だけを数える
 
     python3 scripts/ci/arena_groups.py --self-test
@@ -30,6 +34,7 @@
 import argparse
 import json
 import math
+import pathlib
 import sys
 
 MIN_CLUSTERS = 8  # これ未満の組は相手でまとめた誤差を出さない
@@ -38,9 +43,13 @@ BAD_NAME_CHARS = "-+,="
 
 
 def load_arm(paths):
-    """({相手: (局, 得点)}, candidate)。同じ相手が2つの run に出たら、candidate が run で違えば止める"""
+    """({相手: (局, 得点)}, 腕の見分け (candidate, cand_knobs, cand_config), {相手: 対局の条件} か None)。
+    同じ相手が2つの run に出たら、腕の見分けが run で違えば止める。条件は combined.json の隣の all.jsonl から読む（無い run が
+    あれば None）"""
     out = {}
-    cands = set()
+    ids = set()
+    cond = {}
+    have_all = True
     for path in paths:
         with open(path) as f:
             rows = json.load(f)
@@ -51,10 +60,51 @@ def load_arm(paths):
             n = r["wins"] + r["losses"] + r["draws"]
             out[name] = (n, (r["wins"] + 0.5 * r["draws"]) / n)
             if "candidate" in r:
-                cands.add(r["candidate"])
-    if len(cands) > 1:
-        raise SystemExit(f"{', '.join(paths)}: 1つの腕に違う candidate の run が混ざっている: {sorted(cands)}")
-    return out, (cands.pop() if cands else "")
+                ids.add((r["candidate"], "", ""))
+        shards = pathlib.Path(path).with_name("all.jsonl")
+        if not shards.exists():
+            have_all = False
+            continue
+        ids = {i for i in ids if i[1:] != ("", "")}  # all.jsonl のほうが詳しい
+        for line in shards.read_text().splitlines():
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            ids.add((r.get("candidate", ""), json.dumps(r.get("cand_knobs") or {}, sort_keys=True),
+                     json.dumps(r.get("cand_config"), sort_keys=True)))
+            c = cond.setdefault(r["baseline"], {"seed": set(), "shards": set(), "clock": set()})
+            c["seed"].add(r.get("match_seed_base"))
+            c["shards"].add(r.get("match_seed_shard"))
+            c["clock"].add((r.get("fischer_initial_ms"), r.get("fischer_increment_ms")))
+    if len(ids) > 1:
+        raise SystemExit(f"{', '.join(paths)}: 1つの腕に違う候補（candidate・cand_knobs・cand_config）の run が混ざっている: {sorted(ids)}")
+    return out, (ids.pop() if ids else ("", "", "")), (cond if have_all else None)
+
+
+def check_same_arm(idents, allow=False):
+    """違う腕が同じ候補なら止める（run ID の貼り間違い）"""
+    seen = {}
+    for name, ident in idents.items():
+        if ident[0] and ident in seen and not allow:
+            raise SystemExit(f"腕 {seen[ident]} と {name} が同じ候補（{ident[0]}）。同じ腕を2回比べるなら --allow-same-arm")
+        seen.setdefault(ident, name)
+
+
+def check_conditions(conds, names, opps):
+    """差に出てくる腕どうしで、相手ごとに match_seed_base・シャードの組・時計がそろっているか。そろっていなければ止める。
+    確かめられない（all.jsonl の無い腕がある）ときは False"""
+    if any(conds.get(a) is None for a in names):
+        return False
+    for o in opps:
+        got = [(a, conds[a].get(o)) for a in names]
+        if any(c is None for _, c in got):
+            raise SystemExit(f"相手 {o} の all.jsonl の記録が " + ", ".join(a for a, c in got if c is None) + " に無い")
+        first = got[0][1]
+        for a, c in got[1:]:
+            if c != first:
+                raise SystemExit(f"相手 {o} の対局の条件（match_seed_base・シャード・時計）が {got[0][0]} と {a} で違う: "
+                                 f"{sorted(map(str, first.items()))} / {sorted(map(str, c.items()))}")
+    return True
 
 
 def side_score(arms, names, opp):
@@ -104,7 +154,7 @@ def diff_opps(arms, names, group):
 def fmt_cell(D, se_c, se_b, G):
     if abs(D) < 5e-10:
         D = 0.0  # 平均の丸めで −0.00 と出さない
-    if G < MIN_CLUSTERS or not se_c > 0:
+    if G < MIN_CLUSTERS or not se_c > TIE_PT:
         why = f"{G}体" if G < MIN_CLUSTERS else "相手ごとの差がすべて同じ"
         return f"{D:+.2f}（{why}。二項 ± {se_b:.2f}）"
     return f"{D:+.2f} ± {se_c:.2f}（z {D / se_c:+.2f}。二項 ± {se_b:.2f}）"
@@ -116,8 +166,14 @@ def count_signs(ds):
     return pos, neg, len(ds) - pos - neg
 
 
-def report(arms, cands, groups, diffs, detail=None):
+def report(arms, cands, groups, diffs, detail=None, conds=None):
     lines = ["腕: " + "、".join(f"{a} = {cands.get(a) or '（candidate なし）'}" for a in arms)]
+    if conds is not None:
+        for spec in diffs:
+            names = sum(parse_diff(spec), [])
+            opps = sorted(set.intersection(*[set(arms[a]) for a in names]))
+            if not check_conditions(conds, names, opps):
+                lines.append(f"注意: {spec} は all.jsonl の無い腕があり、match_seed・シャード・時計がそろっているかを確かめていない")
     every = set().union(*[set(v) for v in arms.values()])
     listed = {o for v in groups.values() for o in v}
     rest = sorted(every - listed)
@@ -222,26 +278,76 @@ def self_test():
     assert "正 9・負 0・同じ 1" in out, out
     # 平均の丸めは符号に数えない
     assert count_signs({"a": 1e-14, "b": -1e-14, "c": 0.5}) == (1, 0, 2)
-    # load_arm: 分は半分、candidate の混ざりは止める
-    import os
-    import tempfile
-    paths = []
+    # z を出すのは 8体から（7体は出さない）。相手ごとの差がそろった 8体の組（丸めで SE が 1e-16 程度）も z を出さない
+    for G, want_z in ((8, True), (7, False)):
+        a = {f"r{i}": (100, 0.5 + 0.01 * i) for i in range(G)}
+        b = {f"r{i}": (100, 0.5) for i in range(G)}
+        out = report({"P": a, "Q": b}, {}, {"g": list(a)}, ["P-Q"])
+        assert ("z +" in out) == want_z, (G, out)
+    a = {f"r{i}": (100, 0.3 + 0.05 * i) for i in range(8)}
+    b = {f"r{i}": (100, 0.3 + 0.05 * i - 0.07) for i in range(8)}
+    out = report({"P": a, "Q": b}, {}, {"g": list(a)}, ["P-Q"])
+    row = next(x for x in out.split("\n") if x.startswith("| P-Q |"))
+    assert "相手ごとの差がすべて同じ" in row and "z " not in row, out
     try:
-        for rows in ([{"baseline": "x", "wins": 1, "losses": 1, "draws": 2, "candidate": "c1"}],
-                     [{"baseline": "y", "wins": 1, "losses": 0, "draws": 0, "candidate": "c2"}]):
-            with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
-                json.dump(rows, f)
-            paths.append(f.name)
-        assert load_arm(paths[:1]) == ({"x": (4, 0.5)}, "c1")
-        try:
-            load_arm(paths)
-        except SystemExit:
-            pass
-        else:
-            raise AssertionError("candidate の混ざりを見逃した")
-    finally:
-        for p in paths:
-            os.unlink(p)
+        report({"P": a, "Q": b}, {}, {"g": list(a)}, ["P-Q"], detail="無い組")
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("--detail の無い組を通した")
+    # 左側の平均の二項: (A+B)/2 − C
+    arms3 = {"A": arm([0.6]), "B": arm([0.8]), "C": arm([0.5])}
+    _, _, se_b3, _ = diff_stats(arms3, ["A", "B"], ["C"], ["o0"])
+    assert abs(se_b3 - math.sqrt((0.24 + 0.16) / 4 / 100 + 0.25 / 100) * 100) < 1e-9, se_b3
+    # 1体抜きの幅
+    out = report(arms2, {}, {"大": [f"p{i}" for i in range(10)]}, ["X-Y"], detail="大")
+    loo = [diff_stats(arms2, ["X"], ["Y"], [f"p{j}" for j in range(10) if j != i])[0] for i in range(10)]
+    assert f"1体抜きで {min(loo):+.2f}〜{max(loo):+.2f}" in out, out
+    # 違う腕が同じ候補なら止める（--allow-same-arm で通す）。同じ candidate でも cand_knobs が違えば別の腕
+    try:
+        check_same_arm({"x": ("c", "{}", "1"), "y": ("c", "{}", "1")})
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("同じ候補の2つの腕を見逃した")
+    check_same_arm({"x": ("c", "{}", "1"), "y": ("c", "{}", "1")}, allow=True)
+    check_same_arm({"x": ("c", '{"K": "1"}', "1"), "y": ("c", "{}", "2")})
+    # 対局の条件: そろっていれば通す、match_seed_base が違えば止める、all.jsonl の無い腕があれば確かめない
+    c1 = {"o0": {"seed": {1}, "shards": {0, 1}, "clock": {(1000, 3)}}}
+    c2 = {"o0": {"seed": {2}, "shards": {0, 1}, "clock": {(1000, 3)}}}
+    assert check_conditions({"x": c1, "y": c1}, ["x", "y"], ["o0"])
+    assert not check_conditions({"x": c1, "y": None}, ["x", "y"], ["o0"])
+    try:
+        check_conditions({"x": c1, "y": c2}, ["x", "y"], ["o0"])
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("match_seed の違いを見逃した")
+    # load_arm: 分は半分、candidate の混ざり・1つの腕の中での相手の重なりは止める、all.jsonl から条件を読む
+    import tempfile
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = pathlib.Path(tmp)
+        paths = []
+        for i, rows in enumerate(([{"baseline": "x", "wins": 1, "losses": 1, "draws": 2, "candidate": "c1"}],
+                                  [{"baseline": "y", "wins": 1, "losses": 0, "draws": 0, "candidate": "c2"}],
+                                  [{"baseline": "x", "wins": 1, "losses": 0, "draws": 0, "candidate": "c1"}])):
+            (tmp / f"r{i}").mkdir()
+            path = tmp / f"r{i}" / "combined.json"
+            path.write_text(json.dumps(rows))
+            paths.append(str(path))
+        got = load_arm(paths[:1])
+        assert got[0] == {"x": (4, 0.5)} and got[1][0] == "c1" and got[2] is None, got
+        for bad in ([paths[0], paths[1]], [paths[0], paths[2]]):
+            try:
+                load_arm(bad)
+            except SystemExit:
+                continue
+            raise AssertionError(f"{bad} を通した")
+        (tmp / "r0" / "all.jsonl").write_text("\n".join(json.dumps(
+            {"baseline": "x", "candidate": "c1", "cand_knobs": {}, "cand_config": "h", "match_seed_base": 7,
+             "match_seed_shard": sh, "fischer_initial_ms": 1000000, "fischer_increment_ms": 3000}) for sh in (0, 1)) + "\n")
+        got = load_arm(paths[:1])
+        assert got[1] == ("c1", "{}", '"h"') and got[2] == {"x": {"seed": {7}, "shards": {0, 1}, "clock": {(1000000, 3000)}}}, got
     print("self-test ok")
 
 
@@ -251,6 +357,7 @@ def main():
     ap.add_argument("--arm", action="append", default=[], help="名前=combined.json[,combined.json ...]（名前に - + , = は使えない）")
     ap.add_argument("--diff", action="append", default=[], help="A-B（右側は B+C で平均）")
     ap.add_argument("--detail", default="", help="この組の相手ごとの差も出す")
+    ap.add_argument("--allow-same-arm", action="store_true", help="違う腕が同じ候補でも止めない（同じ腕どうしの揺れを見るとき）")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
     if args.self_test:
@@ -260,7 +367,7 @@ def main():
         ap.error("--groups・--arm・--diff が要る")
     with open(args.groups) as f:
         groups = json.load(f)
-    arms, cands = {}, {}
+    arms, cands, idents, conds = {}, {}, {}, {}
     for spec in args.arm:
         name, sep, paths = spec.partition("=")
         if not sep or not name or not paths:
@@ -269,17 +376,14 @@ def main():
             raise SystemExit(f"腕の名前 {name} に {BAD_NAME_CHARS} のどれかが入っている")
         if name in arms:
             raise SystemExit(f"--arm {name} が2回ある（run は , でつなぐ）")
-        arms[name], cands[name] = load_arm(paths.split(","))
-    seen = {}
-    for name, c in cands.items():
-        if c and c in seen:
-            raise SystemExit(f"腕 {seen[c]} と {name} が同じ candidate: {c}")
-        seen[c] = name
+        arms[name], idents[name], conds[name] = load_arm(paths.split(","))
+        cands[name] = idents[name][0]
+    check_same_arm(idents, args.allow_same_arm)
     for spec in args.diff:
         for a in sum(parse_diff(spec), []):
             if a not in arms:
                 raise SystemExit(f"--diff の腕 {a} が --arm に無い")
-    print(report(arms, cands, groups, args.diff, args.detail or None))
+    print(report(arms, cands, groups, args.diff, args.detail or None, conds))
 
 
 if __name__ == "__main__":
