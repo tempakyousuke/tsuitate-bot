@@ -1189,10 +1189,12 @@ cp -p out_rnad/deduce_s10000/checkpoint.pt out_rnad/ab_base_108000.pt
        --control ab_rnad --which target --pair-by wallclock --sec-per-update ab_rnad=<6.0a>,ab_mmd=<6.0c 単独> \
        --from-step 108000 --exclude-step 108000 --control-any-seed --groups lineage.json
    ```
-   - 最後の比較点（対照は 118,000、MMD は 108,000 + n_eq。どちらも step の番号）は、両腕とも相手1体 4,096局で測り直す（計 約4.5万組）。
-   - コマンドは `speedlab.py eval <3つの run> --panel panel_v2.json --device cuda --games 4096 --which target --out-file panel_eval_final.jsonl --steps <比較点>` → `report --eval-file panel_eval_final.jsonl`。
-     `--which` を省くと MMD の run の書き出し（policy・current・EMA 2つ）を全部測り、約4倍かかる
-   - GPU で約30分〜1時間かかる。
+   - 最後の比較点（対照は 118,000、MMD は 108,000 + n_eq。どちらも step の番号）は、両腕とも相手1体 4,096局で測り直す
+     （panel_v2 の15体 × 4,096 = 1ネットあたり約6.1万組）。
+   - コマンドは腕ごとに分ける: `speedlab.py eval out_rnad/ab_rnad_s1 --panel panel_v2.json --device cuda --games 4096 --which target --out-file panel_eval_final.jsonl --steps 118000` と、
+     MMD の run に `--steps <108000 + n_eq>` で同じもの → `report --eval-file panel_eval_final.jsonl`。1つのコマンドに両方の step を渡すと MMD を 118,000 でも測り、
+     report の「全体」にその点が混ざる（MMD に不利）。`--which` を省くと MMD の run の書き出し（policy・current・EMA 2つ）を全部測り、約4倍かかる
+   - GPU で約0.7〜1.4時間かかる（11体で見積もった 0.5〜1時間の 15/11 倍）。
    - ループ内の 1,024局とは別ファイルにする（局数が違うと対にならない）。
 3. **CI のガントレット**（`arena.yml`、`-f match_seed=<数>`、相手1体 200局以上）。
    - MMD の比較点の書き出しと本線の 118,000 を、同じ match_seed で測る。
@@ -1215,7 +1217,7 @@ cp -p out_rnad/deduce_s10000/checkpoint.pt out_rnad/ab_base_108000.pt
   - 【二次】τ（同じ設定の run どうしの揺れ）は未計測で、0.5〜0.8pt と見込まれている（`tsuitate-bot/docs/rl-learning-speed.md:84-86, 661`）。
   - **τ = 0.8 と仮定し、その仮定を報告に書く**。
   - MMD を2本回したら、2本の差から τ の手がかりを出し、max(0.8, 推定値) を使う（自由度1なので不確か）。
-  - se_eval は約0.28pt（σ_d 0.55〜0.60、4.5万組。同 :77, :659）。
+  - se_eval は約0.23pt（σ_d 0.55〜0.60、15体 × 4,096 = 約6.1万組。同 :77, :659。初版の 0.28pt は 11体の panel_v1 で数えていた）。
 - 【一次・批判側】speedlab の「±」は、seed が1本だと局ごとのペア差だけから出る（`rnad/speedlab.py:420`「局ごと、1 seed」）。
   τ が入らないので、上の SE で読み直す。
 
@@ -1252,8 +1254,8 @@ cp -p out_rnad/deduce_s10000/checkpoint.pt out_rnad/ab_base_108000.pt
 | 6.0d パネルの確認 | 約0.25時間 | 0.25時間 |
 | 6.1 A0（pipeline なし） | 約0.5時間 | 0.5時間 |
 | 6.1 A ＋ 6.2 B（MMD を n_eq まで） | 単独なら約15時間。2本同時でそれぞれ 0.8倍の速さなら約19時間（上限 22時間。上限に当たったらその時点の更新回数で換算して比べる） | 同じ |
-| 評価（最後の 4,096局） | 約0.5〜1時間 | 0.5〜1時間 |
-| 合計 | **約17〜22時間** | 約17〜22時間（本線の約1.1〜1.5段階） |
+| 評価（最後の 4,096局） | 約0.7〜1.4時間 | 0.7〜1.4時間 |
+| 合計 | **約18〜23時間** | 約18〜23時間（本線の約1.2〜1.5段階） |
 
 - 対照（本線の 108,000→118,000）は本線の学習そのものなので、遅れに入れない。
 - 任意: 保留のときの延長（＋15時間）、R-NaD の複製の対照（`--reseed`、＋15時間）。
