@@ -60,6 +60,11 @@
   var·CPU秒・安全性の共同指標）をサマリーへ出す（issue #19 の P0。
   対照と候補で match_seed / 局数 / shards / 相手 / 時計 をすべて揃え、
   違うのは `cand_env` や `candidate` だけにすること）。
+  **相手の組ごとの差**（系列内・系列外など）は `scripts/ci/arena_groups.py` で、各 run の
+  `arena-combined/combined.json` から出す（相手ごとの差を単位にした cluster-robust な誤差つき。
+  ガントレットを相手で分けた複数の run を1つの腕にまとめられる。組は
+  `scripts/ci/groups_deduce_lineage.json` のような JSON。`--self-test` あり。
+  docs/rl-learning-speed.md 10.7 の MMD の追試の判定に使う）。
   baselines の既定値は凍結版を追加したら手動で更新すること。
   **アリーナの時計は既定 1000秒+3秒**（本番サイトの300秒+3秒より厚い）。
   `-f clock="300+3"` で本番相当に切り替えられる（審判側の設定。
