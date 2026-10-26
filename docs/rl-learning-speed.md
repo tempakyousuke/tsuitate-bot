@@ -786,7 +786,7 @@ VIRTUAL_ENV=$PWD/.venv .venv/bin/maturin develop --release -m ../tsuitate-bot/rl
 | --- | --- |
 | `rnad/mmd.py`（新規） | `MMDConfig` と preset（`tsuitate` = 今の既定 / `mixinit` = 設計の初版 / `ataraxos`）、`power_schedule`（Ataraxos の式そのまま）、手番側ごとの λ-return（`player_lambda_returns`。`v_trace_scalars` を η=0・π=μ=1・c=λ で呼ぶ。反則で同じ側が続く手番もそのまま扱える）、行の選び方（`pps` / `quantile` / `topk` / `none`）、磁石（`target` / `mix:target,ε` / `mix:init,ε` / `uniform`。動く磁石の速さは `--mmd-magnet-avg` で書き出しの EMA と切り離せる）、`MMDLearner`（k 歩固定・チャンクの逆伝播・decoupled PPO・勾配ノルムのクリップ・EMA のターゲット） |
 | `rnad/rnad.py` | `collect(..., actor_extras=True)`（行動したネットの価値 `v_actor` と合法手全体の対数確率 `mu_logp`。乱数は消費しない。従来・py・rust の3経路とも） |
-| `rnad/train_rnad.py` | `--algo mmd` と `--mmd-*`・`--init-which`・`--init-step`。R-NaD だけの設定（`--lr` `--eta` `--schedule` など）を既定以外にしたとき・使えない組み合わせ（`--fused` `--reuse` `--league` ボーナス など）・algo の違う checkpoint での再開は起動時に止める。学習率の warmup は MMD を始めた step から数える（同じコマンドで再開しても走り直さない） |
+| `rnad/train_rnad.py` | `--algo mmd` と `--mmd-*`・`--init-which`・`--init-step`。R-NaD だけの設定（`--lr` `--eta` `--schedule` など）を既定以外にしたとき・使えない組み合わせ（`--fused` `--reuse` `--league` ボーナス など）・algo の違う checkpoint での再開は起動時に止める。学習率の warmup は MMD を始めた step から数える（同じコマンドで再開しても走り直さない）。価値の温めがあれば、温めが終わった step から数え直す（2026-10-26。10.7 の 4） |
 | `rnad/bench_update.py` | `--mmd-arms 0.25,0.5,1`（割合ごとの1更新の秒・クリップ前の勾配ノルムの分位・GPU のメモリ）、`--collect-arms rust,rust+extras`、`--calib net,target`（checkpoint の価値の帯ごとの較正）、`--loop-mmd <割合>`（集める → 更新の壁時計を MMD で） |
 | `rnad/speedlab.py` | report に `--pair-by wallclock`・`--sec-per-update`・`--from-step`・`--exclude-step`・`--control-any-seed`・`--vs-step`・`--groups`・`--eval-file`、eval に `--device`・`--out-file`・`--steps`（9.x の物差しを途中から分けた A/B に使うため）。中止の後（10.7）に、締まりを除いて比べる `eval --decode greedy\|temp:<T>`・`export-ck`・`temp-match`・`report --vs-which`、`--vs-step` の組ごとの表、ログの窓の平均（`rnad/log_windows.py`） |
 | 診断 | `gradsnr.py` の MMD の変種と U 統計量のコサイン（標準誤差は1組抜きのジャックナイフ）、`toy_kuhn.py --expected` と MMD の腕、`toy_value_rows.py`（新規） |
@@ -1034,11 +1034,12 @@ DtgtS 系だけ 0.002。動く磁石はこの EMA をそのまま磁石にする
 ```
 
 - `n_eq` = 対照の壁時計（10,000更新 × 本線の秒/更新）÷ MMD の単独の秒/更新（3 の bench）
-- `--lr-warmup` は MMD を始めた step（108,000）から数えるので、止めて同じコマンドで再開しても走り直さない。pipeline で再開すると収集の乱数が
+- `--lr-warmup` は MMD を始めた step（108,000）から数えるので、止めて同じコマンドで再開しても走り直さない（`--mmd-value-warmup` があれば温めが終わった step から数え直す。
+  2026-10-26 から。10.7 の 4）。pipeline で再開すると収集の乱数が
   `seed*1_000_003 + 17 + step` から始まるので、続けた run とは別の局になる（R-NaD と同じ）
 - Release に上げるときはタグに `mmd` を入れる（書き出しの名前 `policy_<step>.bin` が本線と同じ番号になる）
 
-**中止の門**（どれか1つで止めて CPU に戻る。最初の 200更新は方策の形とパネルを判定しない）:
+**中止の門**（どれか1つで止めて CPU に戻る。方策が動き始めてから〔価値の温めの後〕の最初の 200更新は方策の形とパネルを判定しない）:
 
 - NaN
 - **自己対局の手数（`plies`）が出発点から 3割以上減る**、または `entropy_mean` が ±30% 以上動く、または `pi_top_gt_0999` が +5pt 以上増える
@@ -1166,7 +1167,9 @@ se_eval 約0.23pt）。Δ̂ ≥ max(+2.0, 1.645·SE) かつガントレットで
    - 自己対局だけの学習が自分の系列に寄るのは R-NaD も同じ（deduce 系統は1段階ごとに直前の版に約57〜60%、rl_v30 には 87.5〜88.5% で横ばい）。
      MMD は同じことを速くしている可能性がある。MMD はリーグを使えない（`--league` は止めてある。`player_lambda_returns` は自己対局の batch が前提）
 4. **手順の不具合**: 学習率の warmup（100更新）を MMD を始めた step から数えていたので、価値の温め（200更新。価値の頭だけを学ぶ）の間に使い切り、
-   幹と方策の頭は 108,200 で Adam の状態が空のまま学習率いっぱいで動き始めた。最初の100更新の大きい動きの一部はこれかもしれない（影響は小さい見込み）
+   幹と方策の頭は 108,200 で Adam の状態が空のまま学習率いっぱいで動き始めた。最初の100更新の大きい動きの一部はこれかもしれない（影響は小さい見込み）。
+   **tsuitate-nn で直した**: 温めがあれば、warmup は温めが終わった step から数え直す（価値の頭の学習率もそこで一度下がって上がり直す）。温めが 0 なら従来と同じ。
+   門の「最初の 200更新は判定しない」も、方策が動き始めてから数える
 5. **中止の門について**: 門は P2 の崩れ（手数 80 → 21、エントロピー → 0.001）を捉えるために作ったもので、今回はその形ではない（手数は動かず、越えたのは
    pi_top の +5.1pt だけ）。ただし門は出発点に対する相対値で、本線の出発点は P2 よりエントロピーが低い（0.495 対 約0.7）ので、絶対値では小さい動きで触れる。
    門を作り直すのは結果を見た後の変更になるので、次に回すなら回す前に決める

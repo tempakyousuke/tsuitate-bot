@@ -1157,6 +1157,7 @@ cp -p out_rnad/deduce_s10000/checkpoint.pt out_rnad/ab_base_108000.pt
   - 報告では、系列内（selfplay・deduce）と系列外（特化系・古い本線）の小計を並べる（`--groups`）。
 
 **中止の門**（どれか1つで止めて CPU に戻る）。最初の 200更新は、方策の形とパネルを判定しない（新しい Adam の最初の山を門の外に置くため）。
+価値の温め（`--mmd-value-warmup`）があるときは、方策が動き始めてから数える（2026-10-26 の訂正。`rl-learning-speed.md` 10.7 の 4）。
 
 - NaN。
 - `kl_mu`（最後の歩）か `kl_mu_unkept` が、50更新の移動平均で 0.05 を超える。
