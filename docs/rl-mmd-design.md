@@ -1066,7 +1066,7 @@ T1b・T4b・T4c がその穴を埋める。
 
 ```sh
 .venv/bin/python rnad/stage_log.py out_rnad/deduce_s10000/log.jsonl --from-step <fast フラグを入れた step> --dm 10000 \
-    --out-dir /tmp/stage_check --json stage_now.json
+    --schedule-start 58000 --out-dir /tmp/stage_check --json stage_now.json
 ```
 
 - α<1 と α=1 の区間それぞれで、次の中央値を出す。
@@ -1189,8 +1189,9 @@ cp -p out_rnad/deduce_s10000/checkpoint.pt out_rnad/ab_base_108000.pt
        --control ab_rnad --which target --pair-by wallclock --sec-per-update ab_rnad=<6.0a>,ab_mmd=<6.0c 単独> \
        --from-step 108000 --exclude-step 108000 --control-any-seed --groups lineage.json
    ```
-   - 最後の比較点（対照は 118,000、MMD は n_eq）は、両腕とも相手1体 4,096局で測り直す（計 約4.5万組）。
-   - コマンドは `speedlab.py eval <3つの run> --panel panel_v2.json --device cuda --games 4096 --out-file panel_eval_final.jsonl --steps <比較点>` → `report --eval-file panel_eval_final.jsonl`。
+   - 最後の比較点（対照は 118,000、MMD は 108,000 + n_eq。どちらも step の番号）は、両腕とも相手1体 4,096局で測り直す（計 約4.5万組）。
+   - コマンドは `speedlab.py eval <3つの run> --panel panel_v2.json --device cuda --games 4096 --which target --out-file panel_eval_final.jsonl --steps <比較点>` → `report --eval-file panel_eval_final.jsonl`。
+     `--which` を省くと MMD の run の書き出し（policy・current・EMA 2つ）を全部測り、約4倍かかる
    - GPU で約30分〜1時間かかる。
    - ループ内の 1,024局とは別ファイルにする（局数が違うと対にならない）。
 3. **CI のガントレット**（`arena.yml`、`-f match_seed=<数>`、相手1体 200局以上）。
