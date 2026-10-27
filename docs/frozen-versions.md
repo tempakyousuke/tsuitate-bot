@@ -510,3 +510,16 @@ R-NaD は段階ごとに前の版との差が縮み（selfplay 系統で 62.5% �
   **rl_deduce_v8（98,000）とのペア差は全体 +0.3pt±1.2**（rl_deduce_v8 戦を除く 6,900組。直前の2段階は +2.9 / +2.7）。
   rl_deduce_v8 への 60.2%±6.8 は有意な勝ち越しで、旧基準も満たす。
   同一性確認: `frozen::tests::rl凍結版は元の重みと同じ手を指す`）。
+- `rl_deduce_v10` = **deduce 系統の 118,000更新**。rl_deduce_v9（108,000）から同じ条件（Δm=10,000・学習率 1e-4・768局/更新・
+  自己対局だけ・錨 rl_deduce_v7・`--fast-collect rust --device-batch --fused`）で1段階（108,000 → 118,000）回した。MMD の A/B
+  （tsuitate-nn #17）の対照を兼ねて `--panel panel_v2.json` を付けた（学習には影響しない）。`rl_deduce_v9.rs` との差は重みと名前だけ。
+  重みの原本は Release `rlw-deduce-s10000-s118000-20261027/policy.bin`。通し番号 52）
+  （2026-10-27 凍結。全版各200局（run 40440395634 / 40440407384 / 40440419545）: **rl_deduce_v9 64.2%** / rl_deduce_v8 72.5% /
+  rl_deduce_v7 81.2% / rl_deduce_v6 82.8% / rl_deduce_v5 86.5% / rl_deduce_v4 86.8% / rl_deduce_v3 86.5% / rl_deduce_v2 88.0% / rl_deduce_v1 84.0% /
+  rl_selfplay_v4 86.0% / rl_selfplay_v3 88.5% / rl_selfplay_v2 87.8% / rl_selfplay_v1 90.0% / rl_v30 90.0% / rl_v29branch_v1 87.2% / rl_v29 91.5% /
+  rl_v28 85.0% / rl_v27 93.0% / rl_speed_v4 84.2% / rl_speed_v3 84.5% / rl_speed_v2 83.5% / rl_speed_v1 83.2% / rl_v26 67.8% / rl_v25 74.0% /
+  rl_v24 71.5% / rl_nyugyoku_v2 84.0% / rl_nyugyoku_v1 72.5% / rl_guard_v1 73.8% / rl_v23 75.5% / rl_v22 73.5% / rl_v21 79.5% / rl_v20 78.0% /
+  rl_v19 72.0% / rl_v18 76.8% / rl_v17 83.0% / rl_v16 81.0% / rl_v15 80.2%。estimator_v14 76.0%（100局、run 40440432561）。
+  **rl_deduce_v9（108,000）とのペア差は全体 +2.2pt±1.2**（rl_deduce_v9 戦を除く 7,100組。直前の段階は +0.3）。
+  rl_deduce_v9 への 64.2%±6.6 は有意な勝ち越しで、旧基準も満たす。
+  同一性確認: `frozen::tests::rl凍結版は元の重みと同じ手を指す`）。
