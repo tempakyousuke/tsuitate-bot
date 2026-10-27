@@ -41,3 +41,4 @@
 | `tsuitate-viewer-webhook-bot.md` | 運用 | `webhook_bot` の現行手順。既定戦略は凍結版 `estimator_v10` |
 | `rl-deepnash-design.md` | 設計 | 2026-09-27。NN 段階④（フルRL、DeepNash の R-NaD）の着手。審判の切り出し・観測/行動エンコード・マスクの健全性・マイルストーン M0〜M4。**提案段階（未実装）** |
 | `rl-learning-speed.md` | 設計/記録 | 2026-10-20。R-NaD の学習方法どうしの**速さの比べ方**（固定パネルの Elo・代理・GPU の A/B の検出力）と、学習なしの診断（勾配の雑音の 99% がまれな手の 1/μ）・CPU の代理実験（1/μ の上限で大きい学習率でも壊れにくい。速さそのものは CPU では測れなかった）・数式を変えない高速化（約1.8倍の見込み）。コードは tsuitate-nn のブランチ `claude/admiring-carson-1hwun6` |
+| `rl-mmd-design.md` | 設計 | 2026-10-25。Ataraxos（Stratego）の学習（PPO の比クリップ ＋ 磁石への KL、1/μ が無い）の一次資料の読み込みと、本線への当てはめの設計（対応表・行の選び方・磁石・λ・予定・A/B の手順・批判 24件への回答）。tsuitate-nn に `--algo mmd` として実装済み。**CPU の診断の後で既定の磁石を変えた**（`rl-learning-speed.md` 10節）。**3070 の A/B は Phase A で中止の門に触れて今の既定は棄却**、CI の greedy どうしの比較で事前の基準は読み方で分かれ、CI での追試を勧める（`rl-learning-speed.md` 10.7） |
