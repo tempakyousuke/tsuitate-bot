@@ -13,6 +13,14 @@
 //!      **次の自分の決定点**の価値（詰み・詰まされは ±1、200手の上限は 0）
 //! 3. Q(a) = 粒子平均の価値。π'(a) ∝ π(a)·exp(η·Q(a))（磁石 = π の MMD 1ステップ）から引く
 //!
+//! **反則の末端の付け替え**（`foul=redirect`、既定。2026-10-28）: 2 の「反則なら同じ手番の決定点の価値」は
+//! 相手の応手を挟まないので、合法手（応手1手の後）より水平線が1手短い。劣勢では応手の後の価値が今の価値より
+//! 系統的に低く、価値ヘッドは反則1回をほぼ減点しないので、**粒子の全部が反則と見ている手が Q の最大になる**
+//! （webhook 実戦の 2四金: 方策 7% → 探索後 98%）。そこで a が粒子 s で非合法なら、その値を
+//! 「s で合法な他の候補 b の値の π 加重平均」（＝反則した後に π で指し直す）に置き換える。
+//! s で合法な候補が他に無いときだけ従来の末端を使う。反則上限での負け（−1）はそのまま。
+//! `foul=leaf` は従来の挙動（対照用）
+//!
 //! 相手の観測履歴は粒子に無いので、相手の応手は方策ネットでなく推定器の相手モデル（opp_move NN）で
 //! 代用する（露見マス・触ったマスは `EstimatorStrategy` の2手読みと同じ定義で渡す）。
 //! 相手の反則は模擬しない。粒子は**物理的に整合するもの**を優先し、全滅していれば物理不整合の粒子で
@@ -21,7 +29,7 @@
 //! 既知の近似: rl_v25 の価値ヘッドは R-NaD の正則化報酬（−η·log(π/π_reg)）込みの目標で学習している
 //! ので、純粋な勝敗の期待値ではない（1〜2手先の候補間では差がほぼ打ち消し合う前提で使っている）。
 //!
-//! 戦略名: `rl_search:<重みのパス>[,k=8][,n=16][,eta=2][,greedy=1][,scale=2.2]`。
+//! 戦略名: `rl_search:<重みのパス>[,k=8][,n=16][,eta=2][,greedy=1][,scale=2.2][,foul=redirect|leaf]`。
 //! `eta=0` は「上位 k 手に切り詰めただけの方策」で、探索の効果を切り分ける対照に使う。
 
 use std::collections::{HashMap, HashSet};
@@ -61,6 +69,9 @@ pub struct SearchParams {
     /// 推定器の更新だけでこの時間（ms）を超えた手番は探索を省いて元の方策で指す。
     /// webhook のコールドスタート（履歴の読み直し）で応答時間の上限を守るため。0 = 無効
     pub slow_ms: u64,
+    /// 反則になる (候補, 粒子) の値を、その粒子で合法な他候補の値の π 加重平均へ付け替えるか
+    /// （モジュール doc の「反則の末端の付け替え」）。false は従来の「同じ手番の決定点の価値」
+    pub redirect_fouls: bool,
 }
 
 impl Default for SearchParams {
@@ -75,6 +86,7 @@ impl Default for SearchParams {
             soft: true,
             known: true,
             slow_ms: 4000,
+            redirect_fouls: true,
         }
     }
 }
@@ -97,6 +109,13 @@ fn parse_spec(spec: &str) -> Result<(String, SearchParams), String> {
             "soft" => p.soft = v == "1" || v == "true",
             "known" => p.known = v == "1" || v == "true",
             "slow_ms" => p.slow_ms = v.parse().map_err(|e: std::num::ParseIntError| bad(e.to_string()))?,
+            "foul" => {
+                p.redirect_fouls = match v {
+                    "redirect" => true,
+                    "leaf" => false,
+                    _ => return Err(format!("{kv}: redirect か leaf")),
+                }
+            }
             _ => return Err(format!("{k}: 未知のパラメータ")),
         }
     }
@@ -134,11 +153,12 @@ impl RlSearch {
             params.n,
             params.eta,
             format!(
-                "{}{}{}{}",
+                "{}{}{}{}{}",
                 if params.greedy { "g" } else { "" },
                 if params.taint { "" } else { "t0" },
                 if params.soft { "" } else { "s0" },
-                if params.known { "" } else { "k0" }
+                if params.known { "" } else { "k0" },
+                if params.redirect_fouls { "" } else { "fl" }
             )
         );
         let seed = seed.unwrap_or_else(|| rand::rng().random());
@@ -159,6 +179,46 @@ impl RlSearch {
         self.est
             .get_or_insert_with(|| Estimator::with_seed_and_scale(color, seed, scale))
     }
+
+    /// 末端の価値（終局はそのまま、決定点は価値ヘッド）
+    fn leaf_value(&self, leaf: Leaf) -> f64 {
+        match leaf {
+            Leaf::Terminal(v) => f64::from(v),
+            Leaf::Decision { view, log, foul_tried } => {
+                f64::from(self.net.forward(&encode_planes(self.net.planes(), &view, &log, &foul_tried)).1)
+            }
+        }
+    }
+}
+
+/// 反則になる (候補, 粒子)（`fouled`）の値を、同じ粒子で合法な他の候補の値の π 加重平均で埋める
+/// （＝反則した後に π で指し直す。モジュール doc の「反則の末端の付け替え」）。
+/// 同じ粒子で合法な候補が他に無くて埋められなかった (候補, 粒子) を返す
+fn redirect_foul_values(probs: &[f64], vals: &mut [Vec<f64>], fouled: &[Vec<bool>]) -> Vec<(usize, usize)> {
+    let mut rest = vec![];
+    let samples = vals.first().map_or(0, |r| r.len());
+    for si in 0..samples {
+        let legal: Vec<usize> = (0..vals.len()).filter(|&cj| !fouled[cj][si]).collect();
+        let den: f64 = legal.iter().map(|&cj| probs[cj]).sum();
+        let filled = if legal.is_empty() {
+            None
+        } else if den > 0.0 {
+            Some(legal.iter().map(|&cj| probs[cj] * vals[cj][si]).sum::<f64>() / den)
+        } else {
+            // π が下位で全部 0 に潰れたとき
+            Some(legal.iter().map(|&cj| vals[cj][si]).sum::<f64>() / legal.len() as f64)
+        };
+        for ci in 0..vals.len() {
+            if !fouled[ci][si] {
+                continue;
+            }
+            match filled {
+                Some(v) => vals[ci][si] = v,
+                None => rest.push((ci, si)),
+            }
+        }
+    }
+    rest
 }
 
 /// 局面と自分側の帳簿から、自分の決定点の視界を作る（`Referee::view` と同じ中身）
@@ -417,6 +477,8 @@ impl Strategy for RlSearch {
         let mut q = vec![0.0f64; cands.len()];
         // Q の標準誤差（診断用。粒子と応手のサンプル数が足りているかを見る）
         let mut se = vec![0.0f64; cands.len()];
+        // 付け替えた反則の割合（診断用。foul=leaf では常に 0）
+        let mut foul_rate = vec![0.0f64; cands.len()];
         if searched {
             // 相手の応手モデルの入力（露見マス・触ったマス）。候補自身の分は候補ごとに足す
             let (captures0, touched0) = my_squares(log);
@@ -434,10 +496,17 @@ impl Strategy for RlSearch {
                     &pool.last().unwrap().0
                 })
                 .collect();
+            // vals[候補][粒子]。付け替える反則は fouled に印を付けて後で埋める
+            let mut vals = vec![vec![0.0f64; samples.len()]; cands.len()];
+            let mut fouled = vec![vec![false; samples.len()]; cands.len()];
+            let redirect = self.params.redirect_fouls && view.fouls.you + 1 < MAX_FOULS;
             for (ci, &(a, _)) in cands.iter().enumerate() {
                 let mv = decode_action(a, me).expect("マスク内の行動は復号できる");
-                let mut vals: Vec<f64> = Vec::with_capacity(samples.len());
-                for s in &samples {
+                for (si, s) in samples.iter().enumerate() {
+                    if redirect && !s.is_legal(&mv) {
+                        fouled[ci][si] = true;
+                        continue;
+                    }
                     let rng = &mut self.rng;
                     let leaf = step_leaf(view, log, foul_tried, s, &mv, |next| {
                         // この候補で駒を取れば、捕獲通知でそのマスは相手に露見する
@@ -455,17 +524,22 @@ impl Strategy for RlSearch {
                         }
                         predict_opp_reply(next, me, &captures, &touched, my_fouls, rng)
                     });
-                    vals.push(match leaf {
-                        Leaf::Terminal(v) => f64::from(v),
-                        Leaf::Decision { view, log, foul_tried } => {
-                            f64::from(self.net.forward(&encode_planes(self.net.planes(), &view, &log, &foul_tried)).1)
-                        }
-                    });
+                    vals[ci][si] = self.leaf_value(leaf);
                 }
-                let m = vals.iter().sum::<f64>() / vals.len() as f64;
+            }
+            let probs: Vec<f64> = cands.iter().map(|c| c.1).collect();
+            // 他に合法な候補が無い粒子は従来の末端（同じ手番の決定点）で評価する
+            for (ci, si) in redirect_foul_values(&probs, &mut vals, &fouled) {
+                let mv = decode_action(cands[ci].0, me).expect("マスク内の行動は復号できる");
+                let leaf = step_leaf(view, log, foul_tried, samples[si], &mv, |_| None);
+                vals[ci][si] = self.leaf_value(leaf);
+            }
+            for (ci, row) in vals.iter().enumerate() {
+                let m = row.iter().sum::<f64>() / row.len() as f64;
                 q[ci] = m;
-                let var = vals.iter().map(|v| (v - m).powi(2)).sum::<f64>() / vals.len() as f64;
-                se[ci] = (var / vals.len() as f64).sqrt();
+                let var = row.iter().map(|v| (v - m).powi(2)).sum::<f64>() / row.len() as f64;
+                se[ci] = (var / row.len() as f64).sqrt();
+                foul_rate[ci] = fouled[ci].iter().filter(|&&f| f).count() as f64 / row.len() as f64;
             }
         }
 
@@ -499,8 +573,8 @@ impl Strategy for RlSearch {
             "update_ms": update_ms,
             "slow": slow,
             "kept_mass": kept_mass,
-            "cands": cands.iter().zip(&q).zip(&w).zip(&se).map(|(((&(a, p), &qa), &wa), &sa)| serde_json::json!({
-                "usi": decode_usi(a, me), "p": p, "q": qa, "se": sa, "p_new": wa / wsum,
+            "cands": cands.iter().zip(&q).zip(&w).zip(&se).zip(&foul_rate).map(|((((&(a, p), &qa), &wa), &sa), &fr)| serde_json::json!({
+                "usi": decode_usi(a, me), "p": p, "q": qa, "se": sa, "p_new": wa / wsum, "foul": fr,
             })).collect::<Vec<_>>(),
             "ms": t0.elapsed().as_millis() as u64,
         }));
@@ -532,6 +606,25 @@ mod tests {
         assert_eq!(parse_spec("x.bin").unwrap().1, SearchParams::default());
         assert!(parse_spec("x.bin,zz=1").is_err());
         assert!(parse_spec("x.bin,k=0").is_err());
+        assert!(parse_spec("x.bin").unwrap().1.redirect_fouls);
+        assert!(!parse_spec("x.bin,foul=leaf").unwrap().1.redirect_fouls);
+        assert!(parse_spec("x.bin,foul=zz").is_err());
+    }
+
+    #[test]
+    fn 反則の値は同じ粒子で合法な他候補の方策加重平均になる() {
+        let probs = [0.5, 0.3, 0.2];
+        // 粒子0: 候補0 が反則 / 粒子1: 候補0・1 が反則 / 粒子2: 全部反則
+        let mut vals = vec![vec![9.0, 9.0, 9.0], vec![0.4, 9.0, 9.0], vec![-0.2, 0.1, 9.0]];
+        let fouled = vec![vec![true, true, true], vec![false, true, true], vec![false, false, true]];
+        let rest = redirect_foul_values(&probs, &mut vals, &fouled);
+        let want0 = (0.3 * 0.4 + 0.2 * -0.2) / 0.5;
+        assert!((vals[0][0] - want0).abs() < 1e-12);
+        assert!((vals[0][1] - 0.1).abs() < 1e-12 && (vals[1][1] - 0.1).abs() < 1e-12);
+        assert_eq!((vals[1][0], vals[2][0], vals[2][1]), (0.4, -0.2, 0.1), "合法な値は動かさない");
+        assert_eq!(rest, vec![(0, 2), (1, 2), (2, 2)], "合法な候補が無い粒子は従来の末端へ回す");
+        // 確実に反則の手は、合法な候補の最大値を超えない
+        assert!(vals[0][0] <= 0.4);
     }
 
     /// 小さいネットでも、マスク内の手だけを指して1局を終えられる
