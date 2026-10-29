@@ -87,6 +87,26 @@ env = tsuitate_rl.VecEnv(256, speed_bonus=2.0, speed_horizon=200, speed_sum="own
   学習側の色は局番号の偶奇で決まるので、相手ごとに**偶数個ずつ**並べると先後がそろう。
   作った直後に終局した局（相手の即投了など）は局番号を進めて作り直すので、その後ろの局の相手はずれうる。
   どの相手と指した局かは `pop_finished()` の `opponent` で分かる
+- **`openings=[[USI, ...], ...]`・`opening_prob=p`**（既定 None・0 = 強制しない）: **序盤の強制**
+  （docs/rl-opening-diversity.md）。局ごと・**先後それぞれ独立に**確率 p で、その側の最初の数手を
+  ライン（先手視点の USI の並び。`joseki.json` の `moves`。後手は点対称にミラー）から指させる。
+  強制した手は env の中で指す（評価モードの相手の手番と同じ経路）ので `observe` には現れず、
+  学習側から見ると環境の手になる。両者の観測・反則済みの手・集計は、その側が自分でその手を選んだときと同じ
+  - ラインは作るときに自駒だけの盤で検査し、**初期配置の相手の駒に触れる手**（最後の駒取りなど）の
+    手前で切る。打ちは使えない。不正なラインは `ValueError`
+  - 強制は、どちらかの駒取りか王手（両者に見える接触）・その側の反則・予定の手数で止め、以後その局では戻らない。
+    定跡の手が実際には反則（見えない相手の駒に遮られた等）なら、**反則として指して**から止める
+  - `opening_weights`（ラインごとの重み、既定は一様）・`opening_len=(lo, hi)`（手数を局ごとに一様に引く。
+    既定はラインを切った後の最後まで）・`opening_sides`（`both` / `sente` / `gote`、評価モードでは
+    `learner` / `opponent` も）・`opening_seed`（乱数列。既定は `seed`）
+  - `set_opening_seed(s)`: 乱数列を替える（**次に作る局から**効く）。予定は乱数列と「直前の `reset` からの
+    通し番号」で決まるので、学習は更新ごとに `set_opening_seed` してから `reset` すれば、再開しても同じ局に
+    同じ予定が付く。`forced_moves()` は今の局の強制した手数 `[n, 2]`
+  - `opening_prob=0` は `openings` を渡さないのと同じ経路（ビット単位で同じ局）。`guard_bonus` / `speed_bonus`
+    とは一緒に使えない（強制した手の形や手数がボーナスに入るため）
+  - `pop_finished()` に `forced_moves` / `forced_line`（ラインの添字。名前は一意でないので添字）/
+    `forced_stop`（`contact` / `length` / `foul` / `game_end`）を [先手, 後手] で足す。強制しない局でも
+    `contact_ply`（最初の接触の受理手の数）と `fouls_precontact`（それより前の反則 [先手, 後手]）を出す
 
 ### 模倣学習のデータセット（M2a）
 
