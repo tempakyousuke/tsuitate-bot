@@ -14,6 +14,7 @@ use crate::protocol::{Color, Role};
 use crate::referee::{Referee, StepResult};
 use crate::rl::action::{NUM_ACTIONS, decode_usi, index_square, legal_mask, normalize};
 use crate::rl::encode::{DeducedCache, encode_into_cached};
+use crate::rl::forced::ForcedPlan;
 use crate::selfplay::{GameResult, StartState, fischer_initial_ms};
 use crate::shogi::{ShogiMove, parse_usi};
 use crate::strategy::Strategy;
@@ -185,6 +186,35 @@ pub enum EnvError {
     GameOver,
 }
 
+/// 序盤の反則を数える手数（各側の受理手。`EnvGame::fouls_early`）。速攻どうしでは駒が7〜8手目でぶつかるので、
+/// 接触の前の反則（`fouls_precontact`）はほぼ 0 になる。相手の序盤が変わったときの「いつもの形を前提にした手」の
+/// 反則はこちらで見る
+pub const EARLY_MOVES: u32 = 12;
+
+/// 1つの側の序盤の強制の状態（`rl::forced`）
+#[derive(Debug, Clone, Default)]
+struct ForcedState {
+    plan: Option<ForcedPlan>,
+    /// 強制して受理された手の数（= ラインの進み）
+    played: u32,
+    /// 強制をやめた理由（一度やめたら戻らない）
+    stop: Option<&'static str>,
+}
+
+/// 1つの側の序盤の強制の記録（終局後も読める。`EnvGame::forced_stats`）
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ForcedStats {
+    /// 割り当てたライン（強制しない側は None）
+    pub line: Option<u32>,
+    /// 強制して受理された手の数
+    pub moves: u32,
+    /// やめた理由: "contact"（どちらかの駒取り・王手）/ "length"（予定の手数を指し終えた。指し終えた時点で決まる）/
+    /// "foul"（強制した手が反則）/ "not_in_mask"（マスクに無い。検査済みのラインでは起きない）/
+    /// "game_end"（予定の途中で、その側の次の手番が来る前に終局した）/ "active"（対局中でまだ強制している）。
+    /// 強制しない側は None
+    pub stop: Option<&'static str>,
+}
+
 pub struct EnvGame {
     referee: Referee,
     /// 評価モードで学習側が持つ色（None = 自己対局。両者とも学習側）
@@ -197,12 +227,33 @@ pub struct EnvGame {
     style: StyleStats,
     /// 確定事実のプレーンの途中状態（先手・後手の観測ごと。この局の中でだけ使い回す）
     deduced: [DeducedCache; 2],
+    /// 序盤の強制（[先手, 後手]。強制しない局は両方とも予定なし）
+    forced: [ForcedState; 2],
+    /// 最初の接触（どちらかの駒取り・王手。両者に見える）が起きた時点の受理手の数
+    contact_ply: Option<u32>,
+    /// 最初の接触より前の反則の数 [先手, 後手]
+    fouls_precontact: [u32; 2],
+    /// 各側の受理手の数と、受理手が `EARLY_MOVES` に届くまでの反則の数 [先手, 後手]
+    own_moves: [u32; 2],
+    fouls_early: [u32; 2],
 }
 
 impl EnvGame {
     /// 自己対局の1局。`start` が None なら初期局面から
     pub fn selfplay(start: Option<StartState>, game_no: u32) -> Self {
-        Self::build(start, None, None, game_no)
+        Self::build(start, None, None, game_no, [None, None])
+    }
+
+    /// 序盤を強制する1局（初期局面から。`plans` は [先手, 後手]、`rl::forced`）。
+    /// `learner` / `opponent` が None なら自己対局、Some なら評価モード
+    pub fn with_forced(
+        learner: Option<Color>,
+        opponent: Option<Box<dyn Strategy + Send>>,
+        game_no: u32,
+        plans: [Option<ForcedPlan>; 2],
+    ) -> Self {
+        assert_eq!(learner.is_some(), opponent.is_some(), "評価モードは学習側の色と相手の両方を持つ");
+        Self::build(None, learner, opponent, game_no, plans)
     }
 
     /// 評価モードの1局。`opponent` が `learner` の相手側を指す
@@ -212,7 +263,7 @@ impl EnvGame {
         opponent: Box<dyn Strategy + Send>,
         game_no: u32,
     ) -> Self {
-        Self::build(start, Some(learner), Some(opponent), game_no)
+        Self::build(start, Some(learner), Some(opponent), game_no, [None, None])
     }
 
     fn build(
@@ -220,8 +271,10 @@ impl EnvGame {
         learner: Option<Color>,
         opponent: Option<Box<dyn Strategy + Send>>,
         game_no: u32,
+        plans: [Option<ForcedPlan>; 2],
     ) -> Self {
         let referee = start.map_or_else(Referee::new, Referee::from_start);
+        let [s, g] = plans;
         let mut game = Self {
             referee,
             learner,
@@ -231,6 +284,11 @@ impl EnvGame {
             outcome: None,
             style: StyleStats::default(),
             deduced: Default::default(),
+            forced: [ForcedState { plan: s, ..Default::default() }, ForcedState { plan: g, ..Default::default() }],
+            contact_ply: None,
+            fouls_precontact: [0, 0],
+            own_moves: [0, 0],
+            fouls_early: [0, 0],
         };
         game.style.sample(&game.referee);
         game.settle();
@@ -262,6 +320,31 @@ impl EnvGame {
     /// 玉の周りを固める戦法の集計（終局後も読める）
     pub fn style(&self) -> &StyleStats {
         &self.style
+    }
+
+    /// 序盤の強制の記録 [先手, 後手]（終局後も読める）
+    pub fn forced_stats(&self) -> [ForcedStats; 2] {
+        let running = if self.outcome.is_none() { "active" } else { "game_end" };
+        self.forced.each_ref().map(|f| ForcedStats {
+            line: f.plan.as_ref().map(|p| p.line_id),
+            moves: f.played,
+            stop: f.plan.as_ref().map(|_| f.stop.unwrap_or(running)),
+        })
+    }
+
+    /// 最初の接触（どちらかの駒取り・王手）が起きた時点の受理手の数（起きていなければ None）
+    pub fn contact_ply(&self) -> Option<u32> {
+        self.contact_ply
+    }
+
+    /// 最初の接触より前の反則の数 [先手, 後手]
+    pub fn fouls_precontact(&self) -> [u32; 2] {
+        self.fouls_precontact
+    }
+
+    /// 各側の受理手が `EARLY_MOVES` に届くまでの反則の数 [先手, 後手]
+    pub fn fouls_early(&self) -> [u32; 2] {
+        self.fouls_early
     }
 
     /// 審判へ1手渡し、玉の周りの集計を更新する（学習側・相手側の両方の手がここを通る）
@@ -298,6 +381,21 @@ impl EnvGame {
         }
         if accepted {
             self.style.sample(&self.referee);
+        }
+        let fouled = matches!(result, StepResult::Foul | StepResult::Ended { move_accepted: false, .. });
+        if fouled && self.own_moves[i] < EARLY_MOVES {
+            self.fouls_early[i] += 1;
+        }
+        if accepted {
+            self.own_moves[i] += 1;
+        }
+        if self.contact_ply.is_none() {
+            // 接触 = 駒取りか王手（どちらも両者の観測に入る）。打ちが受理されたなら行き先は空いていた
+            if accepted && (hits_opponent || self.referee.position().in_check(self.referee.to_move())) {
+                self.contact_ply = Some(self.referee.plies());
+            } else if fouled {
+                self.fouls_precontact[i] += 1;
+            }
         }
         result
     }
@@ -355,7 +453,35 @@ impl EnvGame {
         Ok(self.outcome)
     }
 
-    /// 相手（Rust 戦略）の手番を指し進め、学習側の手番で止めてマスクを作る
+    /// 序盤の強制の次の手（強制しない・やめた・やめるなら None。やめる理由はここで記録し、
+    /// 以後その局では戻らない）
+    fn forced_move(&mut self, side: Color) -> Option<String> {
+        let i = usize::from(side == Color::Gote);
+        let state = &self.forced[i];
+        let plan = state.plan.as_ref()?;
+        if state.stop.is_some() {
+            return None;
+        }
+        // 予定の手数を指し終えたら、その時点で "length" にしている（settle）。ここでの "length" は
+        // 手で作った予定がラインより長いとき
+        let stop = if self.contact_ply.is_some() {
+            Some("contact")
+        } else if let Some(&a) = plan.line.get(state.played as usize).filter(|_| state.played < plan.limit) {
+            let view = self.referee.view(side, clocks(), self.game_no);
+            let mask = legal_mask(&view, self.referee.log(side), self.referee.foul_tried(side));
+            if mask.get(a).copied().unwrap_or(false) {
+                return decode_usi(a, side);
+            }
+            // 自駒だけの盤で検査したラインで、接触も反則もまだ無いなら起きない
+            Some("not_in_mask")
+        } else {
+            Some("length")
+        };
+        self.forced[i].stop = stop;
+        None
+    }
+
+    /// 相手（Rust 戦略）の手番と序盤の強制の手を指し進め、学習側の手番で止めてマスクを作る
     fn settle(&mut self) {
         loop {
             if let Some((result, reason)) = self.referee.ended() {
@@ -363,6 +489,28 @@ impl EnvGame {
                 return;
             }
             let side = self.referee.to_move();
+            // 強制の手は学習側・相手側どちらの手番でも、その側が選んだ手と同じ経路（play）で指す
+            // （両者の観測・反則済みの手・集計が、その側が自分でその手を選んだときと同じになる）
+            if let Some(usi) = self.forced_move(side) {
+                let i = usize::from(side == Color::Gote);
+                let result = self.play(&usi);
+                let f = &mut self.forced[i];
+                match result {
+                    StepResult::Accepted | StepResult::Ended { move_accepted: true, .. } => {
+                        f.played += 1;
+                        if f.plan.as_ref().is_some_and(|p| f.played >= p.limit.min(p.line.len() as u32)) {
+                            f.stop = Some("length");
+                        }
+                    }
+                    // 見えない相手の駒に遮られた等。反則は数え、同じ手番を方策（相手）に渡す
+                    StepResult::Foul | StepResult::Ended { move_accepted: false, .. } => f.stop = Some("foul"),
+                }
+                if let StepResult::Ended { result, reason, .. } = result {
+                    self.finish(result, reason);
+                    return;
+                }
+                continue;
+            }
             let learner_turn = self.learner.is_none_or(|l| l == side);
             if learner_turn {
                 let view = self.referee.view(side, clocks(), self.game_no);
@@ -601,6 +749,204 @@ mod tests {
         assert_eq!(SpeedSum::parse("own"), Some(SpeedSum::Own));
         assert_eq!(SpeedSum::parse("zero"), Some(SpeedSum::Zero));
         assert_eq!(SpeedSum::parse("both"), None);
+    }
+
+    fn plan(moves: &[&str], limit: u32) -> crate::rl::forced::ForcedPlan {
+        use crate::rl::action::encode_usi;
+        let line: Vec<usize> = moves.iter().map(|u| encode_usi(u, Color::Sente).unwrap()).collect();
+        crate::rl::forced::ForcedPlan { line: line.into(), line_id: 7, limit }
+    }
+
+    fn act(game: &EnvGame, usi: &str) -> usize {
+        crate::rl::action::encode_usi(usi, game.to_move()).unwrap()
+    }
+
+    /// その側の試行（受理手と反則）を順に並べる
+    fn attempts(game: &EnvGame, side: Color) -> Vec<String> {
+        game.referee()
+            .log(side)
+            .events()
+            .iter()
+            .filter_map(|e| match e {
+                crate::observation::Observation::MyMove { usi, .. }
+                | crate::observation::Observation::MyFoul { usi, .. } => Some(usi.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn 強制した手はその側が自分で選んだときと同じ観測を残す() {
+        use crate::rl::records::same_observations;
+        let mut rng = StdRng::seed_from_u64(11);
+        let lines = [
+            (["7g7f", "6g6f", "2h6h", "5i4h", "4h3h"].as_slice(), ["2g2f", "2f2e", "2e2d"].as_slice()),
+            (["5g5f", "2h5h", "5f5e", "5i4h"].as_slice(), ["7i7h", "8h7i", "5i4h", "5g5f", "3g3f"].as_slice()),
+            (["9g9f", "8h9g", "2h8h", "7i7h", "5i6h"].as_slice(), ["7g7f", "2h3h", "3g3f", "3f3e"].as_slice()),
+        ];
+        for (g, (ls, lg)) in lines.into_iter().enumerate() {
+            for limits in [(9, 9), (2, 1), (1, 9)] {
+                let plans = [Some(plan(ls, limits.0.min(ls.len() as u32))), Some(plan(lg, limits.1.min(lg.len() as u32)))];
+                let mut a = EnvGame::with_forced(None, None, g as u32, plans);
+                play_random(&mut a, &mut rng);
+                let stats = a.forced_stats();
+                assert!(stats.iter().all(|s| s.moves >= 1 && s.line == Some(7)), "{stats:?}");
+                // 強制しない局で、同じ試行を両者が自分で選ぶ
+                let mut b = EnvGame::selfplay(None, g as u32);
+                let mut next = [0usize, 0];
+                let want = [attempts(&a, Color::Sente), attempts(&a, Color::Gote)];
+                while b.outcome().is_none() {
+                    let side = b.to_move();
+                    let i = usize::from(side == Color::Gote);
+                    let a_ = act(&b, &want[i][next[i]]);
+                    next[i] += 1;
+                    b.step(a_).unwrap();
+                }
+                for side in [Color::Sente, Color::Gote] {
+                    assert!(same_observations(a.referee().log(side).events(), b.referee().log(side).events()));
+                }
+                assert_eq!(a.outcome(), b.outcome());
+                assert_eq!(a.style(), b.style());
+                assert_eq!(a.contact_ply(), b.contact_ply());
+                assert_eq!(a.fouls_precontact(), b.fouls_precontact());
+                assert_eq!(b.forced_stats(), [ForcedStats::default(); 2]);
+            }
+        }
+    }
+
+    #[test]
+    fn 接触で両者とも強制をやめる() {
+        // 先手だけ強制。後手（方策の代わりにテストが指す）の 8七歩成で先手の駒が取られる
+        let line = ["7g7f", "6g6f", "2h6h", "5i4h", "4h3h", "3i4h"];
+        let mut game = EnvGame::with_forced(None, None, 0, [Some(plan(&line, 6)), None]);
+        for usi in ["8c8d", "8d8e", "8e8f"] {
+            assert_eq!(game.to_move(), Color::Gote);
+            game.step(act(&game, usi)).unwrap();
+        }
+        assert_eq!(game.contact_ply(), None);
+        game.step(act(&game, "8f8g+")).unwrap();
+        assert_eq!(game.contact_ply(), Some(8));
+        // 先手は4手強制したところで接触したので、その手番から方策が指す
+        assert_eq!(game.to_move(), Color::Sente);
+        assert_eq!(game.forced_stats()[0].moves, 4);
+        assert_eq!(game.forced_stats()[0].stop, Some("contact"));
+        assert_eq!(game.forced_stats()[1], ForcedStats::default());
+
+        // 両者とも強制し、強制した手どうしがぶつかる（後手の 2五歩が先手の歩を取る）
+        let s = ["2g2f", "2f2e", "7g7f", "6g6f"];
+        let g = ["8g8f", "8f8e", "8e8d"]; // 後手から見ると 2c2d 2d2e 2e2f
+        let game = EnvGame::with_forced(None, None, 1, [Some(plan(&s, 4)), Some(plan(&g, 3))]);
+        assert_eq!(game.contact_ply(), Some(4));
+        let stats = game.forced_stats();
+        assert_eq!((stats[0].moves, stats[1].moves), (2, 2));
+        assert_eq!(game.to_move(), Color::Sente);
+        assert_eq!(stats[0].stop, Some("contact"));
+        // 後手の次の手番はまだ来ていない（来ればそこで "contact" でやめる）
+        assert_eq!(stats[1].stop, Some("active"));
+
+        // 予定を指し終えた後に接触しても、やめた理由は "length"（指し終えた時点で決まる）
+        let rush = ["2g2f", "2f2e", "2e2d"];
+        let mut game = EnvGame::with_forced(None, None, 2, [Some(plan(&rush, 3)), None]);
+        game.step(act(&game, "9c9d")).unwrap();
+        assert_eq!(game.forced_stats()[0].stop, Some("active"));
+        game.step(act(&game, "9d9e")).unwrap(); // ここで先手が3手目を強制で指し終える
+        assert_eq!(game.forced_stats()[0].stop, Some("length"));
+        game.step(act(&game, "2c2d")).unwrap(); // 後手が先手の 2四の歩を取る（接触）
+        assert_eq!(game.contact_ply(), Some(6));
+        assert_eq!(game.forced_stats()[0], ForcedStats { line: Some(7), moves: 3, stop: Some("length") });
+    }
+
+    #[test]
+    fn 強制した手が反則ならその側の強制をやめて同じ手番を方策に渡す() {
+        // 先手の 4四角は 5五の後手の歩に遮られて反則になる（先手からは見えない）
+        let line = ["7g7f", "9g9f", "8h4d", "5i4h"];
+        let mut game = EnvGame::with_forced(None, None, 0, [Some(plan(&line, 4)), None]);
+        game.step(act(&game, "5c5d")).unwrap();
+        game.step(act(&game, "5d5e")).unwrap();
+        assert_eq!(game.to_move(), Color::Sente);
+        assert_eq!(game.referee().fouls(Color::Sente), 1);
+        assert_eq!(game.fouls_precontact(), [1, 0]);
+        assert!(game.referee().foul_tried(Color::Sente).contains("8h4d"));
+        assert!(!game.mask()[act(&game, "8h4d")], "反則済みの手はマスクから落ちる");
+        assert_eq!(game.forced_stats()[0].moves, 2);
+        assert_eq!(game.forced_stats()[0].stop, Some("foul"));
+        // 後手にも反則の数は見えている（反則は観測に入る）
+        assert!(game.referee().log(Color::Gote).events().iter().any(|e| matches!(
+            e,
+            crate::observation::Observation::OpponentFoul { count: 1 }
+        )));
+    }
+
+    #[test]
+    fn 序盤の反則は各側の受理手が既定の手数に届くまで数える() {
+        // 先手は 4四角で反則（5五の後手の歩に遮られる）。後手の受理手は数に入らない
+        let mut game = EnvGame::selfplay(None, 0);
+        for usi in ["7g7f", "5c5d", "9g9f", "5d5e"] {
+            game.step(act(&game, usi)).unwrap();
+        }
+        game.step(act(&game, "8h4d")).unwrap();
+        assert_eq!((game.fouls_early(), game.fouls_precontact()), ([1, 0], [1, 0]));
+        // 受理手が EARLY_MOVES に届いた後の反則は数えない（接触の前なので fouls_precontact には入る）
+        let mut game = EnvGame::selfplay(None, 1);
+        let mut sente = vec!["7g7f"];
+        let mut gote = vec!["5c5d", "5d5e"];
+        while sente.len() < EARLY_MOVES as usize {
+            sente.push(if sente.len() % 2 == 1 { "2h3h" } else { "3h2h" });
+        }
+        while gote.len() < sente.len() {
+            gote.push(if gote.len() % 2 == 0 { "8b7b" } else { "7b8b" });
+        }
+        for (s, g) in sente.iter().zip(&gote) {
+            game.step(act(&game, s)).unwrap();
+            game.step(act(&game, g)).unwrap();
+        }
+        game.step(act(&game, "8h4d")).unwrap();
+        assert_eq!(game.referee().fouls(Color::Sente), 1);
+        assert_eq!((game.fouls_early(), game.fouls_precontact()), ([0, 0], [1, 0]));
+    }
+
+    #[test]
+    fn 予定の手数でやめ_評価モードの相手側も強制できる() {
+        let line = ["7g7f", "6g6f", "2h6h", "5i4h"];
+        let mut game = EnvGame::with_forced(None, None, 0, [Some(plan(&line, 2)), None]);
+        game.step(act(&game, "3c3d")).unwrap();
+        game.step(act(&game, "4c4d")).unwrap();
+        assert_eq!(game.to_move(), Color::Sente);
+        assert_eq!(attempts(&game, Color::Sente), ["7g7f", "6g6f"]);
+        assert_eq!(game.forced_stats()[0].stop, Some("length"));
+
+        // 評価モード: 学習側が先手、相手（heuristic）の後手を強制する。相手の最初の手はラインどおり
+        let opp = crate::strategy::make("heuristic").unwrap();
+        let mut game = EnvGame::with_forced(Some(Color::Sente), Some(opp), 0, [None, Some(plan(&line, 4))]);
+        let mut rng = StdRng::seed_from_u64(12);
+        for _ in 0..4 {
+            assert_eq!(game.to_move(), Color::Sente);
+            let a = random_action(game.mask(), rng.random()).unwrap();
+            game.step(a).unwrap();
+        }
+        let got = attempts(&game, Color::Gote);
+        if game.contact_ply().is_none() {
+            assert_eq!(got[..4], ["3c3d", "4c4d", "8b4b", "5a6b"]);
+        }
+        assert!(got.len() >= 4);
+    }
+
+    #[test]
+    fn 強制しない局はこれまでと同じ() {
+        for g in 0..6 {
+            let mut a = EnvGame::selfplay(None, g);
+            let mut b = EnvGame::with_forced(None, None, g, [None, None]);
+            let (mut ra, mut rb) = (StdRng::seed_from_u64(g.into()), StdRng::seed_from_u64(g.into()));
+            let (oa, ob) = (play_random(&mut a, &mut ra), play_random(&mut b, &mut rb));
+            assert_eq!(oa, ob);
+            for side in [Color::Sente, Color::Gote] {
+                assert!(crate::rl::records::same_observations(
+                    a.referee().log(side).events(),
+                    b.referee().log(side).events()
+                ));
+            }
+            assert_eq!(a.forced_stats(), [ForcedStats::default(); 2]);
+        }
     }
 
     #[test]

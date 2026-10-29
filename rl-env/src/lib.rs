@@ -13,11 +13,13 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use rayon::prelude::*;
+use std::sync::Arc;
 
 use tsuitate_bot::protocol::Color;
 use tsuitate_bot::rl::action::NUM_ACTIONS;
 use tsuitate_bot::rl::encode::{NUM_PLANES, NUM_PLANES_DEDUCED, OBS_LEN, obs_len};
-use tsuitate_bot::rl::env::{EnvGame, GUARD_RADII, Outcome, SpeedSum, StyleStats};
+use tsuitate_bot::rl::env::{EnvGame, ForcedStats, GUARD_RADII, Outcome, SpeedSum, StyleStats};
+use tsuitate_bot::rl::forced::{ForcedBook, ForcedSides};
 use tsuitate_bot::selfplay::{GameResult, MAX_PLIES, mix};
 use tsuitate_bot::strategy::{self, Strategy};
 
@@ -36,6 +38,14 @@ struct Finished {
     opponent: Option<String>,
     outcome: Outcome,
     style: StyleStats,
+    /// 序盤の強制の記録 [先手, 後手]
+    forced: [ForcedStats; 2],
+    /// 最初の接触（駒取り・王手）の受理手の数
+    contact_ply: Option<u32>,
+    /// 最初の接触より前の反則 [先手, 後手]
+    fouls_precontact: [u32; 2],
+    /// 各側の受理手が `EARLY_MOVES` に届くまでの反則 [先手, 後手]
+    fouls_early: [u32; 2],
 }
 
 /// 新しい局を作るのに要る設定（`VecEnv` 本体は Sync でないので、並列に作るときはこれだけ渡す）
@@ -56,6 +66,17 @@ struct GameSpec {
     speed_horizon: u32,
     /// 速攻ボーナスの配り方（勝った側だけ / 零和）
     speed_sum: SpeedSum,
+    /// 序盤の強制（None = しない。`tsuitate_bot::rl::forced`）
+    opening: Option<Arc<ForcedBook>>,
+}
+
+/// 序盤の強制の乱数列（`VecEnv::set_opening_seed`）と、その列の中の通し番号の起点
+/// （`reset` のたびに起点を今の局番号へ移す: 学習の再開で局番号が 0 から数え直しても、
+/// 同じ乱数列なら同じ局に同じ予定が付く）
+#[derive(Clone, Copy)]
+struct OpeningCtx {
+    seed: u64,
+    base: u32,
 }
 
 impl GameSpec {
@@ -94,16 +115,27 @@ impl GameSpec {
             opponent: self.opponent(game.game_no()).cloned(),
             outcome: game.outcome().expect("終局した局だけを記録する"),
             style: *game.style(),
+            forced: game.forced_stats(),
+            contact_ply: game.contact_ply(),
+            fouls_precontact: game.fouls_precontact(),
+            fouls_early: game.fouls_early(),
         }
     }
 
-    fn build(&self, game_no: u32) -> EnvGame {
-        match self.opponent(game_no) {
-            None => EnvGame::selfplay(None, game_no),
-            Some(name) => {
-                let opp = make_opponent(name, mix(self.seed ^ mix(u64::from(game_no))))
-                    .expect("相手の名前は new で検査済み");
-                EnvGame::versus(None, learner_of(game_no), opp, game_no)
+    fn build(&self, game_no: u32, open: OpeningCtx) -> EnvGame {
+        let opp = self.opponent(game_no).map(|name| {
+            make_opponent(name, mix(self.seed ^ mix(u64::from(game_no)))).expect("相手の名前は new で検査済み")
+        });
+        let learner = opp.as_ref().map(|_| learner_of(game_no));
+        match &self.opening {
+            // 強制しない env はこれまでと同じ経路で作る
+            None => match opp {
+                None => EnvGame::selfplay(None, game_no),
+                Some(opp) => EnvGame::versus(None, learner_of(game_no), opp, game_no),
+            },
+            Some(book) => {
+                let plans = book.plans(open.seed, u64::from(game_no - open.base), learner);
+                EnvGame::with_forced(learner, opp, game_no, plans)
             }
         }
     }
@@ -118,6 +150,8 @@ struct VecEnv {
     /// 終局した局を step の中で新しい局へ差し替えるか
     auto_reset: bool,    /// 観測のプレーン数（エンコーダの版。`rl::encode::obs_len`）
     planes: usize,
+    /// 序盤の強制の乱数列（強制しない env では使わない）
+    opening: OpeningCtx,
 }
 
 fn color_code(c: Color) -> i8 {
@@ -190,6 +224,7 @@ fn build_fresh(
     next_game_no: &mut u32,
     finished: &mut Vec<Finished>,
     count: usize,
+    open: OpeningCtx,
 ) -> Vec<EnvGame> {
     let mut out = Vec::with_capacity(count);
     while out.len() < count {
@@ -198,7 +233,7 @@ fn build_fresh(
         *next_game_no += need as u32;
         let built: Vec<EnvGame> = (first..first + need as u32)
             .into_par_iter()
-            .map(|g| spec.build(g))
+            .map(|g| spec.build(g, open))
             .collect();
         for game in built {
             if game.outcome().is_none() {
@@ -214,7 +249,7 @@ fn build_fresh(
 #[pymethods]
 impl VecEnv {
     #[new]
-    #[pyo3(signature = (n, opponent=None, seed=0, auto_reset=true, guard_bonus=0.0, guard_radius=1, opponents=None, speed_bonus=0.0, speed_horizon=MAX_PLIES, speed_sum="own", planes=NUM_PLANES))]
+    #[pyo3(signature = (n, opponent=None, seed=0, auto_reset=true, guard_bonus=0.0, guard_radius=1, opponents=None, speed_bonus=0.0, speed_horizon=MAX_PLIES, speed_sum="own", planes=NUM_PLANES, openings=None, opening_weights=None, opening_prob=0.0, opening_len=None, opening_sides="both", opening_seed=None))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -229,6 +264,12 @@ impl VecEnv {
         speed_horizon: u32,
         speed_sum: &str,
         planes: usize,
+        openings: Option<Vec<Vec<String>>>,
+        opening_weights: Option<Vec<f64>>,
+        opening_prob: f64,
+        opening_len: Option<(u32, u32)>,
+        opening_sides: &str,
+        opening_seed: Option<u64>,
     ) -> PyResult<Self> {
         if n == 0 {
             return Err(PyValueError::new_err("n は 1 以上"));
@@ -277,6 +318,40 @@ impl VecEnv {
                 return Err(PyValueError::new_err(format!("未知の戦略: {name}")));
             }
         }
+        // 序盤の強制（docs/rl-opening-diversity.md）。先後それぞれ独立に確率 opening_prob で、
+        // その側の最初の数手を openings（先手視点の USI の並び。後手は点対称にミラー）から指させる
+        let Some(sides) = ForcedSides::parse(opening_sides) else {
+            return Err(PyValueError::new_err(format!(
+                "opening_sides は both / sente / gote / learner / opponent（{opening_sides}）"
+            )));
+        };
+        let opening = match openings {
+            None => {
+                if opening_prob != 0.0 || opening_weights.is_some() || opening_len.is_some() {
+                    return Err(PyValueError::new_err(
+                        "opening_prob / opening_weights / opening_len は openings と一緒に渡す",
+                    ));
+                }
+                None
+            }
+            Some(lines) => {
+                let book = ForcedBook::new(&lines, opening_weights.as_deref(), opening_prob, opening_len, sides)
+                    .map_err(PyValueError::new_err)?;
+                if sides.needs_learner() && opponents.is_empty() {
+                    return Err(PyValueError::new_err(
+                        "opening_sides の learner / opponent は評価モード（opponent / opponents）でだけ使える",
+                    ));
+                }
+                if opening_prob > 0.0 && (guard_bonus != 0.0 || speed_bonus != 0.0) {
+                    // 強制した手で囲った形・延びた手数がボーナスに入ってしまう
+                    return Err(PyValueError::new_err(
+                        "序盤の強制は guard_bonus / speed_bonus と一緒に使えない",
+                    ));
+                }
+                // p = 0 は強制しない env と同じ経路にする（ビット単位で同じことを保つ）
+                (opening_prob > 0.0).then(|| Arc::new(book))
+            }
+        };
         let spec = GameSpec {
             opponents,
             seed,
@@ -285,10 +360,12 @@ impl VecEnv {
             speed_bonus,
             speed_horizon,
             speed_sum,
+            opening,
         };
         let mut next_game_no = 0;
         let mut finished = vec![];
-        let games = py.detach(|| build_fresh(&spec, &mut next_game_no, &mut finished, n));
+        let open = OpeningCtx { seed: opening_seed.unwrap_or(seed), base: 0 };
+        let games = py.detach(|| build_fresh(&spec, &mut next_game_no, &mut finished, n, open));
         Ok(VecEnv {
             games,
             spec,
@@ -296,20 +373,41 @@ impl VecEnv {
             finished,
             auto_reset,
             planes,
+            opening: open,
         })
     }
 
-    /// 全局を新しい局にする（途中の局は記録せずに捨てる）
+    /// 全局を新しい局にする（途中の局は記録せずに捨てる）。序盤の強制の通し番号はここから数え直す
     fn reset(&mut self, py: Python<'_>) {
         let n = self.games.len();
+        self.opening.base = self.next_game_no;
         let VecEnv {
             games,
             spec,
             next_game_no,
             finished,
+            opening,
             ..
         } = self;
-        *games = py.detach(|| build_fresh(spec, next_game_no, finished, n));
+        let open = *opening;
+        *games = py.detach(|| build_fresh(spec, next_game_no, finished, n, open));
+    }
+
+    /// 序盤の強制の乱数列を替える（**次に作る局から**効く。今の局は変えない）。
+    /// 学習は更新ごとに `seed*1_000_003 + step` のような値を渡してから `reset` する
+    /// （同じ step から再開すれば同じ局に同じ予定が付く）
+    fn set_opening_seed(&mut self, seed: u64) {
+        self.opening.seed = seed;
+    }
+
+    /// 各局の序盤の強制の手数 `[n, 2]`（[先手, 後手]、今の局。診断用で方策の入力には使わない）
+    fn forced_moves<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<i32>>> {
+        let v: Vec<i32> = self
+            .games
+            .iter()
+            .flat_map(|g| g.forced_stats().map(|f| f.moves as i32))
+            .collect();
+        PyArray1::from_vec(py, v).reshape([self.games.len(), 2])
     }
 
     /// 各局がまだ終局していないか（`auto_reset=False` で止まった局は False）
@@ -447,9 +545,11 @@ impl VecEnv {
             next_game_no,
             finished,
             auto_reset,
+            opening,
             ..
         } = self;
         let auto_reset = *auto_reset;
+        let open = *opening;
         let (rewards, done, internal) = py.detach(|| {
             let results: Vec<_> = games
                 .par_iter_mut()
@@ -480,7 +580,7 @@ impl VecEnv {
                 finished.push(spec.finished(&games[i]));
             }
             if auto_reset {
-                let fresh = build_fresh(spec, next_game_no, finished, ended.len());
+                let fresh = build_fresh(spec, next_game_no, finished, ended.len(), open);
                 for (i, game) in ended.into_iter().zip(fresh) {
                     games[i] = game;
                 }
@@ -543,6 +643,16 @@ impl VecEnv {
             d.set_item("near_drops", f.style.near_drops.to_vec())?;
             d.set_item("near_drop_fouls", f.style.near_drop_fouls.to_vec())?;
             d.set_item("near_captures", f.style.near_captures.to_vec())?;
+            // 序盤の強制（[先手, 後手]。強制しない側は line / stop が None、moves が 0）と、
+            // 最初の接触（どちらかの駒取り・王手）の受理手の数・それより前の反則
+            d.set_item("forced_moves", f.forced.map(|x| x.moves).to_vec())?;
+            d.set_item("forced_line", f.forced.map(|x| x.line).to_vec())?;
+            d.set_item("forced_stop", f.forced.map(|x| x.stop).to_vec())?;
+            d.set_item("contact_ply", f.contact_ply)?;
+            d.set_item("fouls_precontact", f.fouls_precontact.to_vec())?;
+            // 各側の受理手が EARLY_MOVES（12）に届くまでの反則。速攻どうしは7〜8手目でぶつかるので
+            // fouls_precontact はほぼ 0 になる。相手の序盤が変わったときの反則はこちらで見る
+            d.set_item("fouls_early", f.fouls_early.to_vec())?;
             out.push(d);
         }
         Ok(out)

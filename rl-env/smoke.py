@@ -256,6 +256,38 @@ def check_speed_bonus() -> None:
     print(f"速攻ボーナス: 報酬の加算が手数と一致（ランダム方策 {wins}/{n} 局が決着、平均 {plies:.1f} 手）")
 
 
+def check_forced_openings() -> None:
+    """序盤の強制（openings / opening_prob）: p = 0 はブックなしと同じ局、p = 1 で両者が定跡で指し始め、
+    強制した手は observe に現れない（docs/rl-opening-diversity.md）"""
+    lines = [["2g2f", "2f2e", "2e2d", "2d2c+"], ["7g7f", "6g6f", "2h6h", "5i4h"], ["5g5f", "2h5h", "5f5e"]]
+    n = 16
+    plain = tsuitate_rl.VecEnv(n, seed=5, auto_reset=False)
+    zero = tsuitate_rl.VecEnv(n, seed=5, auto_reset=False, openings=lines, opening_prob=0.0)
+    rng = np.random.default_rng(5)
+    while plain.alive().any():
+        obs, mask, pl = plain.observe()
+        obs_b, mask_b, pl_b = zero.observe()
+        assert (obs == obs_b).all() and (mask == mask_b).all() and (pl == pl_b).all(), "p = 0 は従来と同じ局"
+        actions = random_actions(mask, rng)
+        actions[~plain.alive()] = -1
+        plain.step(actions)
+        zero.step(actions)
+    env = tsuitate_rl.VecEnv(n, seed=5, auto_reset=False, openings=lines, opening_prob=1.0)
+    assert (env.forced_moves() >= 1).all(), "p = 1 なら作った時点で両者とも1手以上を定跡で指している"
+    while env.alive().any():
+        _, mask, _ = env.observe()
+        actions = random_actions(mask, rng)
+        actions[~env.alive()] = -1
+        env.step(actions)
+    fin = env.pop_finished()
+    assert len(fin) == n and all(None not in f["forced_line"] for f in fin)
+    stops = collections.Counter(s for f in fin for s in f["forced_stop"])
+    moves = np.mean([m for f in fin for m in f["forced_moves"]])
+    # 切った後の長さは 3・4・3 手（居飛車速攻は 2三歩成の手前）
+    assert max(m for f in fin for m in f["forced_moves"]) <= 4
+    print(f"序盤の強制: p = 0 は従来と同じ局・p = 1 で両者とも強制（平均 {moves:.1f} 手、止めた理由 {dict(stops)}）")
+
+
 def bench(n: int, steps: int) -> None:
     env = tsuitate_rl.VecEnv(n, seed=3)
     rng = np.random.default_rng(3)
@@ -287,6 +319,7 @@ if __name__ == "__main__":
     check_opponents_list()
     check_guard_bonus()
     check_speed_bonus()
+    check_forced_openings()
     print("不正行動の一括拒否・seed つき相手の再現性・相手の混在: OK")
     for n in (64, 256, 1024):
         bench(n, 100)
