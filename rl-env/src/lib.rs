@@ -44,6 +44,8 @@ struct Finished {
     contact_ply: Option<u32>,
     /// 最初の接触より前の反則 [先手, 後手]
     fouls_precontact: [u32; 2],
+    /// 各側の受理手が `EARLY_MOVES` に届くまでの反則 [先手, 後手]
+    fouls_early: [u32; 2],
 }
 
 /// 新しい局を作るのに要る設定（`VecEnv` 本体は Sync でないので、並列に作るときはこれだけ渡す）
@@ -116,6 +118,7 @@ impl GameSpec {
             forced: game.forced_stats(),
             contact_ply: game.contact_ply(),
             fouls_precontact: game.fouls_precontact(),
+            fouls_early: game.fouls_early(),
         }
     }
 
@@ -647,6 +650,9 @@ impl VecEnv {
             d.set_item("forced_stop", f.forced.map(|x| x.stop).to_vec())?;
             d.set_item("contact_ply", f.contact_ply)?;
             d.set_item("fouls_precontact", f.fouls_precontact.to_vec())?;
+            // 各側の受理手が EARLY_MOVES（12）に届くまでの反則。速攻どうしは7〜8手目でぶつかるので
+            // fouls_precontact はほぼ 0 になる。相手の序盤が変わったときの反則はこちらで見る
+            d.set_item("fouls_early", f.fouls_early.to_vec())?;
             out.push(d);
         }
         Ok(out)

@@ -186,6 +186,11 @@ pub enum EnvError {
     GameOver,
 }
 
+/// 序盤の反則を数える手数（各側の受理手。`EnvGame::fouls_early`）。速攻どうしでは駒が7〜8手目でぶつかるので、
+/// 接触の前の反則（`fouls_precontact`）はほぼ 0 になる。相手の序盤が変わったときの「いつもの形を前提にした手」の
+/// 反則はこちらで見る
+pub const EARLY_MOVES: u32 = 12;
+
 /// 1つの側の序盤の強制の状態（`rl::forced`）
 #[derive(Debug, Clone, Default)]
 struct ForcedState {
@@ -203,9 +208,10 @@ pub struct ForcedStats {
     pub line: Option<u32>,
     /// 強制して受理された手の数
     pub moves: u32,
-    /// やめた理由: "contact"（どちらかの駒取り・王手）/ "length"（予定の手数を指し終えた）/
+    /// やめた理由: "contact"（どちらかの駒取り・王手）/ "length"（予定の手数を指し終えた。指し終えた時点で決まる）/
     /// "foul"（強制した手が反則）/ "not_in_mask"（マスクに無い。検査済みのラインでは起きない）/
-    /// "game_end"（その側の次の手番が来る前に終局した）。強制しない側は None
+    /// "game_end"（予定の途中で、その側の次の手番が来る前に終局した）/ "active"（対局中でまだ強制している）。
+    /// 強制しない側は None
     pub stop: Option<&'static str>,
 }
 
@@ -227,6 +233,9 @@ pub struct EnvGame {
     contact_ply: Option<u32>,
     /// 最初の接触より前の反則の数 [先手, 後手]
     fouls_precontact: [u32; 2],
+    /// 各側の受理手の数と、受理手が `EARLY_MOVES` に届くまでの反則の数 [先手, 後手]
+    own_moves: [u32; 2],
+    fouls_early: [u32; 2],
 }
 
 impl EnvGame {
@@ -278,6 +287,8 @@ impl EnvGame {
             forced: [ForcedState { plan: s, ..Default::default() }, ForcedState { plan: g, ..Default::default() }],
             contact_ply: None,
             fouls_precontact: [0, 0],
+            own_moves: [0, 0],
+            fouls_early: [0, 0],
         };
         game.style.sample(&game.referee);
         game.settle();
@@ -313,10 +324,11 @@ impl EnvGame {
 
     /// 序盤の強制の記録 [先手, 後手]（終局後も読める）
     pub fn forced_stats(&self) -> [ForcedStats; 2] {
+        let running = if self.outcome.is_none() { "active" } else { "game_end" };
         self.forced.each_ref().map(|f| ForcedStats {
             line: f.plan.as_ref().map(|p| p.line_id),
             moves: f.played,
-            stop: f.plan.as_ref().map(|_| f.stop.unwrap_or("game_end")),
+            stop: f.plan.as_ref().map(|_| f.stop.unwrap_or(running)),
         })
     }
 
@@ -328,6 +340,11 @@ impl EnvGame {
     /// 最初の接触より前の反則の数 [先手, 後手]
     pub fn fouls_precontact(&self) -> [u32; 2] {
         self.fouls_precontact
+    }
+
+    /// 各側の受理手が `EARLY_MOVES` に届くまでの反則の数 [先手, 後手]
+    pub fn fouls_early(&self) -> [u32; 2] {
+        self.fouls_early
     }
 
     /// 審判へ1手渡し、玉の周りの集計を更新する（学習側・相手側の両方の手がここを通る）
@@ -365,11 +382,18 @@ impl EnvGame {
         if accepted {
             self.style.sample(&self.referee);
         }
+        let fouled = matches!(result, StepResult::Foul | StepResult::Ended { move_accepted: false, .. });
+        if fouled && self.own_moves[i] < EARLY_MOVES {
+            self.fouls_early[i] += 1;
+        }
+        if accepted {
+            self.own_moves[i] += 1;
+        }
         if self.contact_ply.is_none() {
             // 接触 = 駒取りか王手（どちらも両者の観測に入る）。打ちが受理されたなら行き先は空いていた
             if accepted && (hits_opponent || self.referee.position().in_check(self.referee.to_move())) {
                 self.contact_ply = Some(self.referee.plies());
-            } else if matches!(result, StepResult::Foul | StepResult::Ended { move_accepted: false, .. }) {
+            } else if fouled {
                 self.fouls_precontact[i] += 1;
             }
         }
@@ -438,19 +462,20 @@ impl EnvGame {
         if state.stop.is_some() {
             return None;
         }
+        // 予定の手数を指し終えたら、その時点で "length" にしている（settle）。ここでの "length" は
+        // 手で作った予定がラインより長いとき
         let stop = if self.contact_ply.is_some() {
             Some("contact")
-        } else if state.played >= plan.limit {
-            Some("length")
-        } else {
-            let a = plan.line[state.played as usize];
+        } else if let Some(&a) = plan.line.get(state.played as usize).filter(|_| state.played < plan.limit) {
             let view = self.referee.view(side, clocks(), self.game_no);
             let mask = legal_mask(&view, self.referee.log(side), self.referee.foul_tried(side));
-            if mask[a] {
+            if mask.get(a).copied().unwrap_or(false) {
                 return decode_usi(a, side);
             }
             // 自駒だけの盤で検査したラインで、接触も反則もまだ無いなら起きない
             Some("not_in_mask")
+        } else {
+            Some("length")
         };
         self.forced[i].stop = stop;
         None
@@ -468,17 +493,21 @@ impl EnvGame {
             // （両者の観測・反則済みの手・集計が、その側が自分でその手を選んだときと同じになる）
             if let Some(usi) = self.forced_move(side) {
                 let i = usize::from(side == Color::Gote);
-                match self.play(&usi) {
-                    StepResult::Accepted => self.forced[i].played += 1,
-                    // 見えない相手の駒に遮られた等。反則は数え、同じ手番を方策（相手）に渡す
-                    StepResult::Foul => self.forced[i].stop = Some("foul"),
-                    StepResult::Ended { result, reason, move_accepted } => {
-                        if move_accepted {
-                            self.forced[i].played += 1;
+                let result = self.play(&usi);
+                let f = &mut self.forced[i];
+                match result {
+                    StepResult::Accepted | StepResult::Ended { move_accepted: true, .. } => {
+                        f.played += 1;
+                        if f.plan.as_ref().is_some_and(|p| f.played >= p.limit) {
+                            f.stop = Some("length");
                         }
-                        self.finish(result, reason);
-                        return;
                     }
+                    // 見えない相手の駒に遮られた等。反則は数え、同じ手番を方策（相手）に渡す
+                    StepResult::Foul | StepResult::Ended { move_accepted: false, .. } => f.stop = Some("foul"),
+                }
+                if let StepResult::Ended { result, reason, .. } = result {
+                    self.finish(result, reason);
+                    return;
                 }
                 continue;
             }
@@ -813,7 +842,18 @@ mod tests {
         assert_eq!(game.to_move(), Color::Sente);
         assert_eq!(stats[0].stop, Some("contact"));
         // 後手の次の手番はまだ来ていない（来ればそこで "contact" でやめる）
-        assert_eq!(stats[1].stop, Some("game_end"));
+        assert_eq!(stats[1].stop, Some("active"));
+
+        // 予定を指し終えた後に接触しても、やめた理由は "length"（指し終えた時点で決まる）
+        let rush = ["2g2f", "2f2e", "2e2d"];
+        let mut game = EnvGame::with_forced(None, None, 2, [Some(plan(&rush, 3)), None]);
+        game.step(act(&game, "9c9d")).unwrap();
+        assert_eq!(game.forced_stats()[0].stop, Some("active"));
+        game.step(act(&game, "9d9e")).unwrap(); // ここで先手が3手目を強制で指し終える
+        assert_eq!(game.forced_stats()[0].stop, Some("length"));
+        game.step(act(&game, "2c2d")).unwrap(); // 後手が先手の 2四の歩を取る（接触）
+        assert_eq!(game.contact_ply(), Some(6));
+        assert_eq!(game.forced_stats()[0], ForcedStats { line: Some(7), moves: 3, stop: Some("length") });
     }
 
     #[test]
@@ -835,6 +875,34 @@ mod tests {
             e,
             crate::observation::Observation::OpponentFoul { count: 1 }
         )));
+    }
+
+    #[test]
+    fn 序盤の反則は各側の受理手が既定の手数に届くまで数える() {
+        // 先手は 4四角で反則（5五の後手の歩に遮られる）。後手の受理手は数に入らない
+        let mut game = EnvGame::selfplay(None, 0);
+        for usi in ["7g7f", "5c5d", "9g9f", "5d5e"] {
+            game.step(act(&game, usi)).unwrap();
+        }
+        game.step(act(&game, "8h4d")).unwrap();
+        assert_eq!((game.fouls_early(), game.fouls_precontact()), ([1, 0], [1, 0]));
+        // 受理手が EARLY_MOVES に届いた後の反則は数えない（接触の前なので fouls_precontact には入る）
+        let mut game = EnvGame::selfplay(None, 1);
+        let mut sente = vec!["7g7f"];
+        let mut gote = vec!["5c5d", "5d5e"];
+        while sente.len() < EARLY_MOVES as usize {
+            sente.push(if sente.len() % 2 == 1 { "2h3h" } else { "3h2h" });
+        }
+        while gote.len() < sente.len() {
+            gote.push(if gote.len() % 2 == 0 { "8b7b" } else { "7b8b" });
+        }
+        for (s, g) in sente.iter().zip(&gote) {
+            game.step(act(&game, s)).unwrap();
+            game.step(act(&game, g)).unwrap();
+        }
+        game.step(act(&game, "8h4d")).unwrap();
+        assert_eq!(game.referee().fouls(Color::Sente), 1);
+        assert_eq!((game.fouls_early(), game.fouls_precontact()), ([0, 0], [1, 0]));
     }
 
     #[test]
