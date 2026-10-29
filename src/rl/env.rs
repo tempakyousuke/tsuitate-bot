@@ -498,7 +498,7 @@ impl EnvGame {
                 match result {
                     StepResult::Accepted | StepResult::Ended { move_accepted: true, .. } => {
                         f.played += 1;
-                        if f.plan.as_ref().is_some_and(|p| f.played >= p.limit) {
+                        if f.plan.as_ref().is_some_and(|p| f.played >= p.limit.min(p.line.len() as u32)) {
                             f.stop = Some("length");
                         }
                     }
