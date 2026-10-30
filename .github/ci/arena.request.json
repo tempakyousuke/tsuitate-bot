@@ -1,7 +1,7 @@
 {
-  "games": 100,
-  "candidate": "rl_search:models/rl_mmd_v4.bin,eta=0",
-  "baselines": "rl_mmd_v4 rl_mmdv3branch_v1 rl_guard_v1 estimator_v14",
+  "games": 200,
+  "candidate": "rl_deduce_v10",
+  "baselines": "rl_deduce_v10 rl_deduce_v9 rl_guard_v1 estimator_v14",
   "match_seed": 20261030,
   "shards": 4,
   "oracle": "",
