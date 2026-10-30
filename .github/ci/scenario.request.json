@@ -2,5 +2,6 @@
   "trials": 20,
   "strategy": "estimator",
   "scenarios": "",
-  "env": ""
+  "env": "",
+  "_note": "opp_move NN を学び直した後（候補）"
 }
