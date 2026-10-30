@@ -6,7 +6,7 @@
   "shards": 8,
   "oracle": "",
   "clock": "",
-  "env": "TSUITATE_OPP_MOVE_TEMP=1.5",
+  "env": "TSUITATE_OPP_MOVE_TEMP=2",
   "cand_env": "",
   "pair_with": "",
   "games_from_run_id": "",
