@@ -87,7 +87,7 @@ mod tests {
     /// パースしてforwardをnumpyで再計算）で行う
     #[test]
     fn matches_numpy_cross_check() {
-        // 期待値の再生成: scratchpad の crosscheck.py 相当（このファイルの
+        // 期待値の再生成: tsuitate-nn の `scripts/opp_move_crosscheck.py`（このファイルの
         // 定数を numpy で読み直して forward を再計算）。方策ネット13系統＋
         // estimator_v14 の各160局・estimator×13 の重み付き学習（2026-10-30、
         // seed3）で再生成した
