@@ -57,7 +57,7 @@ on:
         required: false
         default: "2"
       max_checks:
-        description: "同上限（ソルバーの手数切れの予算も兼ねる）"
+        description: "同上限（ソルバーが攻め方の王手を何回先まで読むかも兼ねる。ルール上の上限ではない）"
         required: false
         default: "5"
       max_fouls:
