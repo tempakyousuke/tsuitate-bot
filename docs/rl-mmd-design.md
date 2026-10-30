@@ -1314,6 +1314,9 @@ cp -p out_rnad/deduce_s10000/checkpoint.pt out_rnad/ab_base_108000.pt
     - η の正則化報酬が入らなくなる。
     - rl_search の η=30 は、今の価値の縮みで較正されている（`tsuitate-bot/docs/rl-deepnash-design.md:1338-1339`）。
     - 採用するなら η を測り直す（6.3 では3点から選ぶ）。
+    - 【実測、2026-10-30】rl_mmd_v4 では η を振っても自分自身との対局で探索の上積みがない（η=3 / 10 / 30 で 46 / 48 / 51.5%）。
+      原因は η より手前で、MMD どうしの対局で推定器の粒子が崩れることと、MMD の価値ヘッドが自己対局の分布の外で候補を見分けないこと
+      （`tsuitate-bot/docs/rl-deepnash-design.md` の「探索が MMD の版で伸びない理由」）。
 11. **入口の違い**:
     - `.bin` と `checkpoint.pt` を混ぜると、Adam の幾何が違う。
     - R-NaD の Adam の状態を持ち込むと、実効の学習率が何千更新も下がる。
