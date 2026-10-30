@@ -6,15 +6,18 @@
 //! 粒子は観測と整合する手をこのモデルからサンプルして相手の駒を動かすので、ここが低い対局ほど
 //! 粒子が真の局面を追いにくい（`docs/rl-deepnash-design.md` の「探索が MMD の版で伸びない理由」）。
 //!
+//! `--opponent-only` を付けると、記録した側（`match` 行の `your_color`）の相手の手だけを数える
+//! （人間との対局記録なら人間の手、arena の記録なら基準側の手）。
+//!
 //! ```sh
-//! cargo run --release --bin opp_model_fit -- records_a/ [records_b/ ...]
+//! cargo run --release --bin opp_model_fit -- [--opponent-only] records_a/ [records_b/ ...]
 //! ```
 
 use std::collections::BTreeMap;
 
 use tsuitate_bot::estimator::opp_reply_weights;
 use tsuitate_bot::shogi::{Position, parse_usi};
-use tsuitate_bot::truth_replay::load_end;
+use tsuitate_bot::truth_replay::parse_bot_and_end;
 
 #[derive(Default)]
 struct Acc {
@@ -63,7 +66,9 @@ fn band(ply: usize) -> &'static str {
 }
 
 fn main() {
-    let dirs: Vec<String> = std::env::args().skip(1).collect();
+    let mut dirs: Vec<String> = std::env::args().skip(1).collect();
+    let opponent_only = dirs.iter().any(|a| a == "--opponent-only");
+    dirs.retain(|a| a != "--opponent-only");
     assert!(!dirs.is_empty(), "記録のディレクトリ（arena の ARENA_RECORD_DIR）を渡す");
     for dir in dirs {
         let mut all = Acc::default();
@@ -72,11 +77,19 @@ fn main() {
         let mut paths: Vec<_> = std::fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).map(|e| e.path()).collect();
         paths.sort();
         for path in paths {
-            let Some(end) = load_end(path.to_str().unwrap()) else { continue };
+            let Ok(content) = std::fs::read_to_string(&path) else { continue };
+            let Some((recorder, end)) = parse_bot_and_end(&content) else { continue };
             games += 1;
             let mut pos = Position::initial();
             for (i, m) in end.moves.iter().enumerate() {
                 let Some(mv) = parse_usi(&m.usi) else { break };
+                if opponent_only && m.by_color == recorder {
+                    if !pos.is_legal(&mv) {
+                        break;
+                    }
+                    pos.play_unchecked(&mv);
+                    continue;
+                }
                 // 指した側 = 相手。`my_color` はその反対側
                 let weights = opp_reply_weights(&pos, m.by_color.other(), &[], &[], 0);
                 let total: f64 = weights.iter().map(|x| x.1).sum();
