@@ -1,0 +1,322 @@
+name: Mine escape
+
+# 自己対局の棋譜から「ついたて詰み逃れ」（サイト tsuitate の /escape）の問題を掘り、
+# 取り込みJSONを artifact として出す。採掘本体は bin/mine_escape、判定は
+# tsuitate-solver の `--escape`（受け方が反則 N 回以内に逃れられるか）。
+#
+# 今は**手動実行のみ**（schedule なし）。取り込みは artifact の escape-puzzles.json を
+# サイトの /admin/escape に貼り付ける。品質を見てから日次化する
+# （日次化するときはサイト側の取り込み cron も足すこと。mine-tsume.yml と同じ形）。
+#
+# 入力は mine-tsume.yml と同じく2通り:
+#   1. arena_run_id を指定 … 既存の Arena 実行の `arena-records-*` を使う（対局コストゼロ）
+#   2. arena_run_id が空 … このワークフローが自分で自己対局してから掘る
+#
+# 手元実測（2026-10-30、records/ の59局・4並列・timeout 20秒）: 候補2269局面 →
+# 逃れ1043 / 捕まり1221 / 不明5 → 1対局1受け方に間引いて106問、所要5分。
+#
+# solver_ref は `--escape` を持つ tsuitate-solver の ref を指すこと
+# （main へ入る前に試すときはブランチ名を渡す）。
+on:
+  workflow_dispatch:
+    inputs:
+      arena_run_id:
+        description: "既存 Arena 実行のID（空ならこのワークフローが自己対局する）"
+        required: false
+        default: ""
+      games:
+        description: "自己対局する場合の対局数（全シャード合計）"
+        required: false
+        default: "800"
+      candidate:
+        description: "自己対局の候補戦略"
+        required: false
+        default: "rl_v22"
+      baseline:
+        description: "自己対局の基準戦略"
+        required: false
+        default: "rl_v20"
+      clock:
+        description: "自己対局の時計（初期秒+加算秒）。既定は本番相当"
+        required: false
+        default: "300+3"
+      selfplay_shards:
+        description: "自己対局の分割数"
+        required: false
+        default: "2"
+      mine_shards:
+        description: "採掘の分割数（棋譜ファイルをこの数に分けて並列に解く）"
+        required: false
+        default: "16"
+      skip_plies:
+        description: "この手数までの局面は無視する"
+        required: false
+        default: "20"
+      min_checks:
+        description: "採用する「逃れるまでの攻め方の王手の回数」の下限"
+        required: false
+        default: "2"
+      max_checks:
+        description: "同上限（ソルバーの手数切れの予算も兼ねる）"
+        required: false
+        default: "5"
+      max_fouls:
+        description: "調べる反則回数の上限（問題の反則回数は逃れに要る最少の回数）"
+        required: false
+        default: "3"
+      timeout_secs:
+        description: "ソルバーの1問あたりのタイムアウト（秒）"
+        required: false
+        default: "30"
+      max_candidates:
+        description: "シャードごとにソルバーへ投げる候補数の上限（0=無制限）"
+        required: false
+        default: "0"
+      source:
+        description: "取り込み元識別子（サイトの upsert キー。変えると別問題として登録される）"
+        required: false
+        default: "selfplay"
+      solver_ref:
+        description: "tsuitate-solver の ref"
+        required: false
+        default: "main"
+
+# 実効値はここで1か所に決める（mine-tsume.yml と同じ形。将来 schedule を足したときに
+# workflow_dispatch の default: が効かず inputs.* が空文字になるのに備える）
+env:
+  GAMES: ${{ inputs.games || '800' }}
+  CANDIDATE: ${{ inputs.candidate || 'rl_v22' }}
+  BASELINE: ${{ inputs.baseline || 'rl_v20' }}
+  CLOCK: ${{ inputs.clock || '300+3' }}
+  SELFPLAY_SHARDS: ${{ inputs.selfplay_shards || '2' }}
+  MINE_SHARDS: ${{ inputs.mine_shards || '16' }}
+  SKIP_PLIES: ${{ inputs.skip_plies || '20' }}
+  MIN_CHECKS: ${{ inputs.min_checks || '2' }}
+  MAX_CHECKS: ${{ inputs.max_checks || '5' }}
+  MAX_FOULS: ${{ inputs.max_fouls || '3' }}
+  TIMEOUT_SECS: ${{ inputs.timeout_secs || '30' }}
+  MAX_CANDIDATES: ${{ inputs.max_candidates || '0' }}
+  SOURCE: ${{ inputs.source || 'selfplay' }}
+  SOLVER_REF: ${{ inputs.solver_ref || 'main' }}
+
+permissions:
+  contents: read
+  # 別の実行の artifact を落とすのに必要
+  actions: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      selfplay_shards: ${{ steps.split.outputs.selfplay_shards }}
+      mine_shards: ${{ steps.split.outputs.mine_shards }}
+      games_per_shard: ${{ steps.split.outputs.games_per_shard }}
+    steps:
+      - id: split
+        env:
+          GAMES: ${{ env.GAMES }}
+          SELFPLAY_SHARDS: ${{ env.SELFPLAY_SHARDS }}
+          MINE_SHARDS: ${{ env.MINE_SHARDS }}
+        run: |
+          set -euo pipefail
+          per=$(( (GAMES + SELFPLAY_SHARDS - 1) / SELFPLAY_SHARDS ))
+          per=$(( per + per % 2 ))   # 先後を揃えるため偶数化
+          {
+            echo "selfplay_shards=$(jq -n -c "[range(0; ${SELFPLAY_SHARDS})]")"
+            echo "mine_shards=$(jq -n -c "[range(0; ${MINE_SHARDS})]")"
+            echo "games_per_shard=${per}"
+          } >> "$GITHUB_OUTPUT"
+
+  # arena_run_id が空のときだけ自分で対局する
+  selfplay:
+    needs: plan
+    if: inputs.arena_run_id == ''
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.selfplay_shards) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run selfplay shard
+        env:
+          ARENA_RECORD_DIR: arena-records
+          ARENA_CLOCK: ${{ env.CLOCK }}
+        run: |
+          set -euo pipefail
+          case "$ARENA_CLOCK" in
+            [0-9]*+[0-9]*)
+              export ARENA_FISCHER_INITIAL_MS=$(( ${ARENA_CLOCK%%+*} * 1000 ))
+              export ARENA_FISCHER_INCREMENT_MS=$(( ${ARENA_CLOCK##*+} * 1000 ))
+              ;;
+            *) echo "無視（初期秒+加算秒 の形式のみ）: ${ARENA_CLOCK}" ;;
+          esac
+          cargo run --release --bin arena -- \
+            "${{ needs.plan.outputs.games_per_shard }}" \
+            "${{ env.CANDIDATE }}" \
+            "${{ env.BASELINE }}"
+
+      # arena.yml と同じ名前にしておく（採掘側はどちらの出どころでも同じ扱いで拾える）
+      - name: Upload game records
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: arena-records-mine-escape-s${{ matrix.shard }}
+          path: arena-records/
+          if-no-files-found: ignore
+
+  mine:
+    needs: [plan, selfplay]
+    # selfplay は arena_run_id 指定時にスキップされるので always() で判定する
+    if: always() && needs.plan.result == 'success' && needs.selfplay.result != 'failure'
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: ${{ fromJSON(needs.plan.outputs.mine_shards) }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Checkout solver
+        uses: actions/checkout@v5
+        with:
+          repository: tempakyousuke/tsuitate-solver
+          ref: ${{ env.SOLVER_REF }}
+          path: solver
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # bot 本体とソルバーは別ワークスペース。両方キャッシュする
+          workspaces: |
+            .
+            solver/src-tauri
+
+      - name: Download records (this run)
+        if: inputs.arena_run_id == ''
+        uses: actions/download-artifact@v7
+        with:
+          # merge-multiple は使わない: 記録のファイル名は「時刻-arena-連番」なので
+          # シャードをまたぐと衝突し得る。artifact ごとのサブディレクトリに分ける
+          # （v5 以降は一致が1件だけだと path 直下へ展開されるが、その場合は
+          #  そもそも衝突しない。採掘側は records-in/**/*.jsonl で両方拾う）
+          pattern: arena-records-*
+          path: records-in
+
+      - name: Download records (existing arena run)
+        if: inputs.arena_run_id != ''
+        uses: actions/download-artifact@v7
+        with:
+          pattern: arena-records-*
+          path: records-in
+          run-id: ${{ inputs.arena_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          cargo build --release --bin mine_escape
+          # GUI 依存（webkit2gtk 等）を避けて CLI だけ作る
+          cargo build --release --bin tsuitate-solver-cli --no-default-features \
+            --manifest-path solver/src-tauri/Cargo.toml
+
+      - name: Mine shard
+        env:
+          SHARD: ${{ matrix.shard }}
+          MINE_SHARDS: ${{ env.MINE_SHARDS }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob globstar
+          files=(records-in/**/*.jsonl)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "棋譜が1件もありません（オラクル有効の Arena 実行は記録を出しません）" >&2
+            echo '{"source":"${{ env.SOURCE }}","puzzles":[]}' > escape-shard.json
+            exit 0
+          fi
+          # パスでソートしてから N 個おきに取る（シャード間で重複しない決定的な分割）
+          mapfile -t sorted < <(printf '%s\n' "${files[@]}" | sort)
+          mine=()
+          for i in "${!sorted[@]}"; do
+            if [ $(( i % MINE_SHARDS )) -eq "$SHARD" ]; then mine+=("${sorted[$i]}"); fi
+          done
+          echo "このシャードの棋譜: ${#mine[@]} / ${#sorted[@]} 局"
+          if [ ${#mine[@]} -eq 0 ]; then
+            echo '{"source":"${{ env.SOURCE }}","puzzles":[]}' > escape-shard.json
+            exit 0
+          fi
+          ./target/release/mine_escape "${mine[@]}" \
+            --solver solver/src-tauri/target/release/tsuitate-solver-cli \
+            --source "${{ env.SOURCE }}" \
+            --skip-plies "${{ env.SKIP_PLIES }}" \
+            --min-checks "${{ env.MIN_CHECKS }}" \
+            --max-checks "${{ env.MAX_CHECKS }}" \
+            --max-fouls "${{ env.MAX_FOULS }}" \
+            --timeout-secs "${{ env.TIMEOUT_SECS }}" \
+            --max-candidates "${{ env.MAX_CANDIDATES }}" \
+            --jobs "$(nproc)" \
+            --out escape-shard.json
+
+      - name: Upload shard puzzles
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: escape-shard-${{ matrix.shard }}
+          path: escape-shard.json
+          if-no-files-found: ignore
+
+  collect:
+    needs: [plan, mine]
+    # 一部のシャードが落ちても、取れたぶんだけで取り込みJSONを作る
+    if: always() && needs.mine.result != 'skipped'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: escape-shard-*
+          path: shards
+          # 落ちたシャードがあっても続ける
+          merge-multiple: false
+
+      - name: Merge shards
+        run: |
+          set -euo pipefail
+          # 1件だけ一致すると path 直下へ展開される（mine-tsume.yml と同じ）。両方の配置を拾う
+          shopt -s nullglob globstar
+          parts=(shards/**/escape-shard.json)
+          if [ ${#parts[@]} -eq 0 ]; then
+            echo "採掘結果の artifact が1つもありません" >&2
+            echo '{"source":"${{ env.SOURCE }}","puzzles":[]}' > escape-puzzles.json
+            echo "## 採掘結果: 0問（シャードの出力なし）" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          # シャードをまたぐ重複は sourceId（盤面の署名）で落とす
+          jq -s --arg source "${{ env.SOURCE }}" '
+            { source: $source,
+              puzzles: (map(.puzzles) | add | unique_by(.sourceId)) }
+          ' "${parts[@]}" > escape-puzzles.json
+
+          total=$(jq '.puzzles | length' escape-puzzles.json)
+          {
+            echo "## 採掘結果: **${total}問**"
+            echo ""
+            if [ "$total" -gt 0 ]; then
+              echo "| 手数 | 許される反則 | 問題数 |"
+              echo "|---|---|---|"
+              jq -r '
+                .puzzles | group_by([.depth, .fouls]) | sort_by(.[0].depth, .[0].fouls)[] |
+                "| \(.[0].depth)手 | \(.[0].fouls)回 | \(length) |"
+              ' escape-puzzles.json
+            fi
+            echo ""
+            echo "artifact \`escape-puzzles\` の escape-puzzles.json をサイトの \`/admin/escape\` に貼り付けて取り込みます。"
+          } >> "$GITHUB_STEP_SUMMARY"
+          cat "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload puzzles
+        uses: actions/upload-artifact@v6
+        with:
+          name: escape-puzzles
+          path: escape-puzzles.json
