@@ -324,8 +324,14 @@ fn main() {
                 search.prewarm(&view, log);
                 if referee.plies() >= args.skip && rng.random::<f64>() < args.rate {
                     let t0 = std::time::Instant::now();
-                    let mut rec = probe(&args, &net, &opp, alt.as_deref(), &mut search, &referee, &hist, &view, log, tried, &mut rng);
+                    // 計測の中の乱数は決定点ごとに固定する（ノブ違いの run どうしで、同じ局・同じ決定点を同じ乱数で比べるため。
+                    // 抜き出す決定点を決める `rng` を計測が消費すると、以後の抜き出しがずれる）
+                    let mut probe_rng = StdRng::seed_from_u64(
+                        gseed ^ (u64::from(referee.plies()) << 32) ^ (tried.len() as u64) << 48,
+                    );
+                    let mut rec = probe(&args, &net, &opp, alt.as_deref(), &mut search, &referee, &hist, &view, log, tried, &mut probe_rng);
                     rec["game"] = g.into();
+                    rec["opp_move_temp"] = std::env::var("TSUITATE_OPP_MOVE_TEMP").unwrap_or_else(|_| "1".into()).into();
                     rec["probe_ms"] = (t0.elapsed().as_millis() as u64).into();
                     writeln!(out, "{rec}").unwrap();
                     out.flush().unwrap();
