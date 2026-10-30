@@ -377,6 +377,11 @@ fn accept(args: &Args, result: &Value) -> bool {
     if checks < args.min_checks || checks > args.max_checks {
         return false;
     }
+    // サイトは終局後に正解（逃れ方の木）を見せるので、正解を出せなかった問題
+    // （木が大きすぎた・打ち切り）は採らない
+    if !result["solution"].is_object() {
+        return false;
+    }
     if !args.allow_trivial {
         // 初手の統計が取れない（打ち切り）ものは難しさが分からないので捨てる
         let (Some(tries), Some(solutions)) = (result["rootTries"].as_u64(), result["rootSolutions"].as_u64())
@@ -529,6 +534,8 @@ fn main() {
                 "rootSolutions": result["rootSolutions"],
                 "nodes": result["nodes"],
             },
+            // 正解（受け方の逃れ方）の木。審判の声ごとに枝分かれする（ソルバーの --escape の出力のまま）
+            "solution": result["solution"],
         }));
         if args.limit > 0 && puzzles.len() >= args.limit {
             break;
@@ -627,9 +634,14 @@ mod tests {
     fn accept_requires_escape_range_and_a_losing_first_move() {
         let args = default_args();
         let ok = json!({
-            "verdict": "escape", "checks": 3, "minFouls": 1, "rootTries": 6, "rootSolutions": 2
+            "verdict": "escape", "checks": 3, "minFouls": 1, "rootTries": 6, "rootSolutions": 2,
+            "solution": { "checks": [] }
         });
         assert!(accept(&args, &ok));
+        // 正解の木を出せなかった問題は捨てる
+        let mut v = ok.clone();
+        v["solution"] = json!(null);
+        assert!(!accept(&args, &v));
         let mut v = ok.clone();
         v["verdict"] = json!("caught");
         assert!(!accept(&args, &v));
