@@ -1,9 +1,9 @@
 {
   "games": 200,
-  "candidate": "rl_deduce_v10",
+  "candidate": "rl_search:models/rl_deduce_v10.bin,eta=30",
   "baselines": "rl_deduce_v10 rl_deduce_v9 rl_guard_v1 estimator_v14",
   "match_seed": 20261030,
-  "shards": 4,
+  "shards": 8,
   "oracle": "",
   "clock": "",
   "env": "",
