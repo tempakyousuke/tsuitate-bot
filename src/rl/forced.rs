@@ -367,21 +367,46 @@ mod tests {
         assert!(none.plans(3, 0, None).iter().all(Option::is_none));
     }
 
-    #[test]
-    fn 定跡ファイルの全ラインが通る() {
-        let v: serde_json::Value =
-            serde_json::from_str(include_str!("../../joseki.json")).expect("joseki.json は JSON");
-        let lines: Vec<Vec<String>> = v["lines"]
+    fn book_lines(name: &str, json: &str) -> Vec<Vec<String>> {
+        let v: serde_json::Value = serde_json::from_str(json).unwrap_or_else(|e| panic!("{name} は JSON: {e}"));
+        v["lines"]
             .as_array()
-            .unwrap()
+            .unwrap_or_else(|| panic!("{name} に lines が無い"))
             .iter()
             .map(|l| l["moves"].as_array().unwrap().iter().map(|m| m.as_str().unwrap().to_string()).collect())
-            .collect();
+            .collect()
+    }
+
+    #[test]
+    fn 定跡ファイルの全ラインが通る() {
+        let lines = book_lines("joseki.json", include_str!("../../joseki.json"));
         assert_eq!(lines.len(), 34);
         let book = ForcedBook::new(&lines, None, 1.0, None, ForcedSides::Both).unwrap();
         let lens = book.line_lengths();
         // 居飛車速攻（ライン 1）は 2三歩成の手前の3手
         assert_eq!(lens[1], 3);
         assert!(lens.iter().all(|&n| (1..=16).contains(&n)), "{lens:?}");
+    }
+
+    /// 学習用のブック（`rl_openings.json`。`train_rnad.py --open-book` に渡す）。joseki.json と違って
+    /// 凍結版の pin ではないので自由に足してよいが、足したラインが env で拒まれないことはここで守る
+    #[test]
+    fn 学習用の定跡ファイルの全ラインが通る() {
+        let json = include_str!("../../rl_openings.json");
+        let lines = book_lines("rl_openings.json", json);
+        assert!(!lines.is_empty());
+        let book = ForcedBook::new(&lines, None, 1.0, None, ForcedSides::Both).unwrap();
+        let lens = book.line_lengths();
+        assert!(lens.iter().all(|&n| n >= 1), "接触の手前で 0 手になるライン: {lens:?}");
+        // 系統ごとの重み（train_rnad.py の既定 --open-weight category）に使うので、系統と名前は必ず書く
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        for (i, l) in v["lines"].as_array().unwrap().iter().enumerate() {
+            for key in ["name", "category"] {
+                assert!(l[key].as_str().is_some_and(|s| !s.is_empty()), "ライン {i} に {key} が無い");
+            }
+            if let Some(w) = l.get("weight") {
+                assert!(w.as_f64().is_some_and(|w| w.is_finite() && w >= 0.0), "ライン {i} の weight: {w}");
+            }
+        }
     }
 }

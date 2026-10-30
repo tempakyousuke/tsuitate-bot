@@ -5,7 +5,8 @@
 
 - 本体: `src/rl/forced.rs`（ブックと予定）・`src/rl/env.rs`（`EnvGame` の中で指す）・
   `rl-env/`（`VecEnv` の `openings` / `opening_prob` ほか。`rl-env/README.md`）
-- 学習: tsuitate-nn の `train_rnad.py --open-book --open-p --open-len --open-weight`（`rnad/openings.py`）
+- 学習: tsuitate-nn の `train_rnad.py --open-book --open-p --open-len --open-weight`（`rnad/openings.py`）。
+  ブックは学習用の `rl_openings.json`（4節）
 - 測る道具: tsuitate-nn の `rnad/opening_eval.py`（`entropy` = 序盤の分布、`robust` = 序盤を強制した対局）
 
 ## 1. 何が起きているか
@@ -170,7 +171,7 @@ rl_deduce_v9 50.8%、MMD r2 128,000 52.9%。
   強制される側のラインと手数は同じ。学習は更新ごとに `set_opening_seed(seed·1,000,003 + 29 + step)` してから
   `reset` するので、再開しても同じ局に同じ定跡が付く
 - `opening.rs` と `joseki.json` は凍結版の共有 pin（`frozen::SHARED_MODEL_PINS`）なので触らない。
-  ラインは学習側が `joseki.json` を読んで渡す（ほかのラインを使うときは同じ形式の別ファイルを作る）
+  ラインは学習側がブックを読んで渡す（学習用の別ファイル `rl_openings.json` を作った。4節）
 
 **変わらないもの**:
 
@@ -184,14 +185,32 @@ rl_deduce_v9 50.8%、MMD r2 128,000 52.9%。
 
 ```sh
 # 学習（tsuitate-nn）。p は側ごとの確率（両者とも強制される局は p²、どちらも強制されない局は (1−p)²）
-python rnad/train_rnad.py ... --open-book ~/Develop/tsuitate-bot/joseki.json --open-p 0.25
+python rnad/train_rnad.py ... --open-book ~/Develop/tsuitate-bot/rl_openings.json --open-p 0.25
 #   --open-len 1:6        強制する手数を局ごとに一様に引く（既定はラインを切った後の最後まで）
 #   --open-weight line    ラインごとに一様（既定 category = 系統ごとに同じ確率）
 
 # 測る（CPU でよい）
 python rnad/opening_eval.py entropy rl_deduce_v9=~/Develop/tsuitate-bot/models/rl_deduce_v9.bin --games 256
-python rnad/opening_eval.py robust --cand a.bin [--ref b.bin] --book ~/Develop/tsuitate-bot/joseki.json --games 512
+python rnad/opening_eval.py robust --cand a.bin [--ref b.bin] --book ~/Develop/tsuitate-bot/rl_openings.json --games 512
 ```
+
+### 学習用のブック（`rl_openings.json`）
+
+学習で強制するラインは **`rl_openings.json`** に置く（2026-10-31〜）。`joseki.json` は estimator の凍結版
+（v12〜v14）が本番の序盤に読む共有 pin なので、書き換えると `frozen::SHARED_MODEL_PINS` のテストが落ちる。
+`rl_openings.json` は pin ではないので、学習用の序盤は凍結版に影響させずに自由に足せる。
+
+- 作った時点では `joseki.json` と**バイト単位で同じ**（9系統・34ライン）。sha256 も同じなので、それまでの
+  `--open-book joseki.json` の run を `rl_openings.json` に向けて再開しても設定の差にならない
+- 形式は `joseki.json` と同じ（`{"lines": [{"name", "moves", "category", "features"}]}`。手は先手視点の USI、
+  後手は env が点対称にミラーする）。ラインごとに `"weight"`（0 以上、既定 1）を付けると重みに掛かる
+- `name` と `category` は必ず書く（`cargo test 学習用の定跡ファイルの全ラインが通る` が検査する。
+  同じテストが、全ラインが env の検査を通り、接触の手前で 0 手にならないことも確かめる）
+- 既定の `--open-weight category` は**系統ごとに同じ確率**なので、既存の系統にラインを足すとその系統の中で
+  分け合い、新しい系統を足すと系統の数で割り直す（既存の系統の割合が下がる）
+- ラインは初期配置の相手の駒に触れる手の手前で切られるので、駒がぶつかった後の手を書いても強制されない
+- 学習は起動時に一度だけ読む。**走っている run には効かず、次の起動から**。checkpoint にブックの sha256 と
+  ライン数が残るので、中身を変えて再開すると「設定が違う」で止まる（意図した変更なら `--override-config`）
 
 - 使えない組み合わせ（起動時に止める）: `--league`・`--guard`・`--speed`・`--nyugyoku`（強制した手の形・手数・
   玉の前進がボーナスに入る）、`--c-ply`（collect の行の番号で数えるので、強制した手のぶん手数がずれる）、`--mmd-lambda-unit turn`（「同じ側が続けて指す」を反則とみなすので、相手の強制した手を
