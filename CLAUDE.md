@@ -229,6 +229,10 @@
     アリーナ 104局×2 でも suite でも原理的に判定できない）
   - 信念の質（重い・少数の記録に対してだけ）: `belief_probe` / `king_probe` /
     `export_belief_data`
+  - 探索（rl_search）の手番ごとの効き（重い）: `search_probe` ＋
+    `scripts/search_probe/report.py`。真の局面からの指し継ぎを正解の代わりにして、
+    探索の情報が粒子・相手モデル・価値ヘッドのどの段で落ちるかを分ける。
+    相手モデル（opp_move NN）の当てはまりは `opp_model_fit`（粒子不要で一瞬）
   - **元 Arena 実行の実験条件は `scripts/ci/verify_arena_provenance.sh` で
     機械的に検査してから解析する**（ワークフローごとに書くと片方だけ緩くなる）。
     **シャードが欠けたら判定を出さない**

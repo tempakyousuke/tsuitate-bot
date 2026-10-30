@@ -174,6 +174,11 @@ impl RlSearch {
         })
     }
 
+    /// 推定器（診断用。`bin/search_probe` が粒子の偏りを測るのに使う。まだ一度も指していなければ None）
+    pub fn estimator_ref(&self) -> Option<&Estimator> {
+        self.est.as_ref()
+    }
+
     fn estimator(&mut self, color: Color) -> &mut Estimator {
         let (seed, scale) = (self.seed, self.params.scale);
         self.est
@@ -266,7 +271,7 @@ fn terminal_value(pos: &Position, me: Color) -> Option<f32> {
 
 /// 1候補 × 1粒子の遷移の行き先
 #[derive(Debug)]
-pub(crate) enum Leaf {
+pub enum Leaf {
     /// 終局（自分から見た価値）
     Terminal(f32),
     /// 次の自分の決定点（反則なら同じ手番、受理なら相手の応手の後）
@@ -280,7 +285,7 @@ pub(crate) enum Leaf {
 /// 粒子 `pos`（自分の手番）で候補 `mv` を指し、受理なら `reply` が返す相手の応手を1手進めて、
 /// 次の自分の決定点（または終局）まで観測を積む。観測の作り方は `Referee` と同じ
 /// （反則は手番維持、王手宣言は受理手の後、終局判定は詰み > 手数上限）
-pub(crate) fn step_leaf(
+pub fn step_leaf(
     view: &PlayerView,
     log: &ObservationLog,
     foul_tried: &HashSet<String>,
