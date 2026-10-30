@@ -1,0 +1,14 @@
+{
+  "games": 200,
+  "candidate": "rl_search:models/rl_v25.bin,eta=30",
+  "baselines": "rl_v25 rl_deduce_v10 rl_guard_v1 estimator_v14",
+  "match_seed": 20261030,
+  "shards": 8,
+  "oracle": "",
+  "clock": "",
+  "env": "",
+  "cand_env": "",
+  "pair_with": "",
+  "games_from_run_id": "",
+  "balance_manifest": ""
+}
