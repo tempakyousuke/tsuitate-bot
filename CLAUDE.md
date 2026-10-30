@@ -314,9 +314,11 @@
     打ち切り）は採らない**。ソルバーが古い（`solution` を出さない）と1問も採れないので、ソルバーと一緒に更新すること
   - 実測（2026-10-30、`records/` の59局・4並列・timeout 20秒）: 候補2269局面 → 逃れ1043 /
     捕まり1221 / 不明5 → 間引いて**106問**、所要5分
-  - CI は `.github/workflows/mine-escape.yml`（**手動実行のみ**。mine-tsume.yml と同じ3段構成で、
-    成果物は artifact `escape-puzzles`）。サイトの `/admin/escape` に貼って取り込む。品質を見てから
-    日次化する（そのときはサイト側の取り込み cron も足す）
+  - CI は `.github/workflows/mine-escape.yml`（mine-tsume.yml と同じ3段構成で、成果物は artifact
+    `escape-puzzles`）。**毎日 09:00 UTC（18:00 JST）に自動実行**（2026-10-31〜）し、本番サーバーの
+    日次 cron（tsuitate の `scripts/server/fetch-tsume.py --kind escape`、20:00 JST）が取り込む。
+    **最初は採掘数を少なめ**にしてある（既定 20局/日 ≒ 約35問/日、mine_shards 4）。品質と遊ばれ方を
+    見てから `games` を増やす
 - `cargo build` / `cargo run --release` — 実行には環境変数が必要:
   - `TSUITATE_BOT_TOKEN`（必須）: サイトのマイページ「bot管理」で発行する `tsb_...` トークン
   - `TSUITATE_URL`（既定 `http://localhost:5173`）

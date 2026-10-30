@@ -4,9 +4,14 @@ name: Mine escape
 # 取り込みJSONを artifact として出す。採掘本体は bin/mine_escape、判定は
 # tsuitate-solver の `--escape`（受け方が反則 N 回以内に逃れられるか）。
 #
-# 今は**手動実行のみ**（schedule なし）。取り込みは artifact の escape-puzzles.json を
-# サイトの /admin/escape に貼り付ける。品質を見てから日次化する
-# （日次化するときはサイト側の取り込み cron も足すこと。mine-tsume.yml と同じ形）。
+# 毎日 09:00 UTC（18:00 JST）に自動実行される（2026-10-31〜。mine-tsume.yml と同じ時刻）。
+# **取り込みはサイト側の日次 cron が artifact を取りにくる**（tsuitate の
+# scripts/server/fetch-tsume.py --kind escape。docs/operations.md）ので、ここは artifact を置くだけ。
+# 手で確認したいときは artifact の escape-puzzles.json をサイトの /admin/escape に貼ってもよい
+# （cron と同じ関数を通る）。
+#
+# **最初は採掘数を少なめにしてある**（既定 20局/日。手元実測で約1.8問/局なので約35問/日）。
+# 問題の品質と遊ばれ方を見てから games を増やす。
 #
 # 入力は mine-tsume.yml と同じく2通り:
 #   1. arena_run_id を指定 … 既存の Arena 実行の `arena-records-*` を使う（対局コストゼロ）
@@ -18,6 +23,10 @@ name: Mine escape
 # solver_ref は `--escape` を持つ tsuitate-solver の ref を指すこと
 # （main へ入る前に試すときはブランチ名を渡す）。
 on:
+  # 毎日の自動採掘。成果物は artifact に置くだけで、本番への取り込みは
+  # サーバー側の日次 cron（20:00 JST）が拾う
+  schedule:
+    - cron: "0 9 * * *" # 09:00 UTC = 18:00 JST
   workflow_dispatch:
     inputs:
       arena_run_id:
@@ -27,7 +36,7 @@ on:
       games:
         description: "自己対局する場合の対局数（全シャード合計）"
         required: false
-        default: "800"
+        default: "20"
       candidate:
         description: "自己対局の候補戦略"
         required: false
@@ -47,7 +56,7 @@ on:
       mine_shards:
         description: "採掘の分割数（棋譜ファイルをこの数に分けて並列に解く）"
         required: false
-        default: "16"
+        default: "4"
       skip_plies:
         description: "この手数までの局面は無視する"
         required: false
@@ -81,15 +90,16 @@ on:
         required: false
         default: "main"
 
-# 実効値はここで1か所に決める（mine-tsume.yml と同じ形。将来 schedule を足したときに
-# workflow_dispatch の default: が効かず inputs.* が空文字になるのに備える）
+# schedule では workflow_dispatch の default: が効かず inputs.* は空文字になる。
+# 実効値をここで1か所に決め、以降のジョブは env.* を読む（mine-tsume.yml と同じ形。
+# パラメータを足すときは inputs と env の両方に足すこと）
 env:
-  GAMES: ${{ inputs.games || '800' }}
+  GAMES: ${{ inputs.games || '20' }}
   CANDIDATE: ${{ inputs.candidate || 'rl_v22' }}
   BASELINE: ${{ inputs.baseline || 'rl_v20' }}
   CLOCK: ${{ inputs.clock || '300+3' }}
   SELFPLAY_SHARDS: ${{ inputs.selfplay_shards || '2' }}
-  MINE_SHARDS: ${{ inputs.mine_shards || '16' }}
+  MINE_SHARDS: ${{ inputs.mine_shards || '4' }}
   SKIP_PLIES: ${{ inputs.skip_plies || '20' }}
   MIN_CHECKS: ${{ inputs.min_checks || '2' }}
   MAX_CHECKS: ${{ inputs.max_checks || '5' }}
@@ -311,7 +321,7 @@ jobs:
               ' escape-puzzles.json
             fi
             echo ""
-            echo "artifact \`escape-puzzles\` の escape-puzzles.json をサイトの \`/admin/escape\` に貼り付けて取り込みます。"
+            echo "本番へはサイト側の日次 cron（20:00 JST）が取り込みます。手で入れるときは artifact \`escape-puzzles\` の escape-puzzles.json をサイトの \`/admin/escape\` に貼り付けます。"
           } >> "$GITHUB_STEP_SUMMARY"
           cat "$GITHUB_STEP_SUMMARY"
 
