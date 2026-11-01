@@ -284,8 +284,11 @@
     を checkout して `--no-default-features`（GUI 依存なし）でビルドする。
     成果物は artifact `tsume-puzzles` の `tsume-puzzles.json`。
     **毎日 09:00 UTC（18:00 JST）に自動実行される**（既定は**方策ネット同士**
-    rl_v22 vs rl_v20 の自己対局800局・採掘16シャード。2026-10-02 に estimator 同士の
-    160局から切り替えた。方策ネットは50局が約30秒なので対局はほぼ無料で、律速は
+    rl_mmdopen_v3 同士の自己対局800局・採掘16シャードで、**各側の序盤を確率 0.75 で
+    `rl_openings.json` の定跡から指させる**（`ARENA_OPEN_BOOK` / `ARENA_OPEN_P`、2026-11-01〜。
+    強制なしの rl_mmdopen_v3 同士40局は最初の8手が全局同じだった＝似た局面の問題が並ぶ。
+    p=0.5 で28通り。mine-escape.yml も同じ）。それまでは rl_v22 vs rl_v20、
+    2026-10-02 に estimator 同士の160局から切り替えた。方策ネットは50局が約30秒なので対局はほぼ無料で、律速は
     採掘側。手元実測 0.5問/局 = 概ね400問/日の見込み。estimator 同士は1対局1問の
     制限後で約0.3問/局だった）。取り込みは**サイト側の日次 cron が artifact を
     取りにくる**（tsuitate の `docs/operations.md`「詰めチャレ問題の日次取り込み」）

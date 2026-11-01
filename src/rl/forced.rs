@@ -195,6 +195,129 @@ impl ForcedBook {
     }
 }
 
+/// 定跡ファイル（`rl_openings.json` / `joseki.json` の形 = `{"lines":[{"moves":[..],"category"?,"weight"?}]}`）を
+/// 読んでブックを作る。重みは学習（`train_rnad.py --open-weight category`）の既定と同じく
+/// **系統（category）ごとに同じ確率**で、系統の中はラインの `weight`（無ければ 1）に比例させる。
+/// category の無いラインはそれぞれ1系統として数える
+pub fn book_from_json(json: &str, prob: f64, len: Option<(u32, u32)>, sides: ForcedSides) -> Result<ForcedBook, String> {
+    let v: serde_json::Value = serde_json::from_str(json).map_err(|e| format!("定跡ファイルが JSON でない: {e}"))?;
+    let entries = v["lines"].as_array().ok_or("定跡ファイルに lines が無い")?;
+    let mut lines = Vec::with_capacity(entries.len());
+    let mut cats = Vec::with_capacity(entries.len());
+    let mut raw = Vec::with_capacity(entries.len());
+    for (i, l) in entries.iter().enumerate() {
+        let moves = l["moves"]
+            .as_array()
+            .ok_or_else(|| format!("ライン {i} に moves が無い"))?
+            .iter()
+            .map(|m| m.as_str().map(str::to_string).ok_or_else(|| format!("ライン {i} の手が文字列でない")))
+            .collect::<Result<Vec<_>, _>>()?;
+        lines.push(moves);
+        cats.push(l["category"].as_str().map_or_else(|| format!("#{i}"), str::to_string));
+        raw.push(l.get("weight").and_then(serde_json::Value::as_f64).unwrap_or(1.0));
+    }
+    let mut cat_total: std::collections::HashMap<&str, f64> = std::collections::HashMap::new();
+    for (c, w) in cats.iter().zip(&raw) {
+        *cat_total.entry(c).or_default() += w;
+    }
+    let weights: Vec<f64> = cats
+        .iter()
+        .zip(&raw)
+        .map(|(c, w)| {
+            let t = cat_total[c.as_str()];
+            if t > 0.0 { w / t } else { 0.0 }
+        })
+        .collect();
+    ForcedBook::new(&lines, Some(&weights), prob, len, sides)
+}
+
+/// **序盤を強制する戦略の包み**（arena の自己対局用。`selfplay` が `ARENA_OPEN_BOOK` のときに使う）。
+///
+/// 予定（`ForcedPlan`）がある間はラインの手を返し、`EnvGame::forced_move` と同じ条件でやめて以後は
+/// 中の戦略に任せる: どちらかの駒取り・王手（自分の観測に入る接触）、自分の反則、予定の手数を指し終えた。
+/// 判定に使うのは自分の `PlayerView` と観測ログだけ（相手の強制の有無は分からない = 学習と同じ情報条件）。
+/// 中の戦略は強制した手番では呼ばれないが、推定器は観測ログを差分で食うので後から追いつく
+pub struct ForcedOpening {
+    inner: Box<dyn crate::strategy::Strategy>,
+    plan: ForcedPlan,
+    stopped: bool,
+    /// 直前の choose が強制の手だったか（`debug_state` を中の戦略の古い値にしないため）
+    last_forced: bool,
+}
+
+impl ForcedOpening {
+    pub fn new(inner: Box<dyn crate::strategy::Strategy>, plan: ForcedPlan) -> Self {
+        Self { inner, plan, stopped: false, last_forced: false }
+    }
+
+    fn forced_move(
+        &mut self,
+        view: &crate::protocol::PlayerView,
+        log: &crate::observation::ObservationLog,
+        foul_tried: &std::collections::HashSet<String>,
+    ) -> Option<String> {
+        use crate::observation::Observation;
+        if self.stopped {
+            return None;
+        }
+        let mut played = 0u32;
+        for e in log.events() {
+            match e {
+                Observation::MyMove { captured: None, .. } => played += 1,
+                Observation::MyMove { captured: Some(_), .. }
+                | Observation::OpponentMoved { captured_my_piece_at: Some(_), .. }
+                | Observation::Check { .. }
+                | Observation::MyFoul { .. } => {
+                    self.stopped = true;
+                    return None;
+                }
+                Observation::OpponentMoved { .. } | Observation::OpponentFoul { .. } => {}
+            }
+        }
+        let color = view.your_color;
+        let next = self
+            .plan
+            .line
+            .get(played as usize)
+            .filter(|_| played < self.plan.limit)
+            .copied()
+            .filter(|&a| crate::rl::action::legal_mask(view, log, foul_tried).get(a).copied().unwrap_or(false))
+            .and_then(|a| decode_usi(a, color));
+        if next.is_none() {
+            self.stopped = true;
+        }
+        next
+    }
+}
+
+impl crate::strategy::Strategy for ForcedOpening {
+    fn choose(
+        &mut self,
+        view: &crate::protocol::PlayerView,
+        log: &crate::observation::ObservationLog,
+        foul_tried: &std::collections::HashSet<String>,
+    ) -> Option<String> {
+        if let Some(usi) = self.forced_move(view, log, foul_tried) {
+            self.last_forced = true;
+            return Some(usi);
+        }
+        self.last_forced = false;
+        self.inner.choose(view, log, foul_tried)
+    }
+
+    fn name(&self) -> &'static str {
+        self.inner.name()
+    }
+
+    fn debug_state(&self) -> Option<serde_json::Value> {
+        if self.last_forced { None } else { self.inner.debug_state() }
+    }
+
+    fn prewarm(&mut self, view: &crate::protocol::PlayerView, log: &crate::observation::ObservationLog) {
+        self.inner.prewarm(view, log);
+    }
+}
+
 /// 先手視点のラインを自駒だけの盤で指し進めて検査し、**初期配置の後手の駒に触れる手**
 /// （行き先か、飛び駒の通り道に後手の初期配置の駒がある手 = 相手が動いていなければ駒取りか
 /// 反則になる手）の手前で切る。
@@ -365,6 +488,73 @@ mod tests {
         assert_eq!(only(ForcedSides::Learner, None), [false, false]);
         let none = ForcedBook::new(&lines, None, 0.0, None, ForcedSides::Both).unwrap();
         assert!(none.plans(3, 0, None).iter().all(Option::is_none));
+    }
+
+    /// 中の戦略: 呼ばれた回数を数え、決めた手を順に返す
+    struct Scripted {
+        moves: Vec<&'static str>,
+        calls: std::rc::Rc<std::cell::Cell<u32>>,
+    }
+    impl crate::strategy::Strategy for Scripted {
+        fn choose(
+            &mut self,
+            _view: &crate::protocol::PlayerView,
+            _log: &crate::observation::ObservationLog,
+            _foul_tried: &std::collections::HashSet<String>,
+        ) -> Option<String> {
+            let i = self.calls.get();
+            self.calls.set(i + 1);
+            self.moves.get(i as usize).map(|s| s.to_string())
+        }
+        fn name(&self) -> &'static str {
+            "scripted"
+        }
+    }
+
+    #[test]
+    fn 包みは接触までラインを指し_以後は中の戦略に任せる() {
+        use crate::referee::Referee;
+        use crate::strategy::Strategy;
+        // 先手は居飛車速攻（2四歩まで強制）、後手は強制なしで 8四歩→8五歩→2四同歩（接触）
+        let book = ForcedBook::new(&[line(&["2g2f", "2f2e", "2e2d", "2d2c+"])], None, 1.0, None, ForcedSides::Sente).unwrap();
+        let [Some(plan), None] = book.plans(0, 0, None) else { panic!("先手だけ強制") };
+        let s_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let g_calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let mut sente = ForcedOpening::new(Box::new(Scripted { moves: vec!["5i4h"], calls: s_calls.clone() }), plan);
+        let mut gote = Scripted { moves: vec!["8c8d", "8d8e", "2c2d"], calls: g_calls.clone() };
+        let mut referee = Referee::new();
+        let mut played = vec![];
+        for _ in 0..7 {
+            let side = referee.to_move();
+            let view = referee.view(side, [0, 0], 0);
+            let mover: &mut dyn Strategy = if side == Color::Sente { &mut sente } else { &mut gote };
+            let usi = mover.choose(&view, referee.log(side), referee.foul_tried(side)).unwrap();
+            referee.step(&usi, 0);
+            played.push(usi);
+        }
+        assert_eq!(played, line(&["2g2f", "8c8d", "2f2e", "8d8e", "2e2d", "2c2d", "5i4h"]));
+        assert_eq!(s_calls.get(), 1, "先手の中の戦略は接触の後の1回だけ呼ばれる");
+        assert_eq!(g_calls.get(), 3);
+        assert_eq!(sente.name(), "scripted");
+    }
+
+    #[test]
+    fn 定跡ファイルから系統ごとに同じ確率で引く() {
+        let json = r#"{"lines":[
+            {"moves":["7g7f"],"category":"a"},
+            {"moves":["2g2f"],"category":"a"},
+            {"moves":["5g5f"],"category":"b"}]}"#;
+        let book = book_from_json(json, 1.0, None, ForcedSides::Both).unwrap();
+        let mut n = [0u32; 3];
+        for k in 0..4000u64 {
+            for p in book.plans(5, k, None).into_iter().flatten() {
+                n[p.line_id as usize] += 1;
+            }
+        }
+        // 8000 側のうち b は約半分、a の2本は約1/4ずつ
+        assert!((3700..4300).contains(&n[2]), "{n:?}");
+        assert!((1800..2200).contains(&n[0]) && (1800..2200).contains(&n[1]), "{n:?}");
+        assert!(book_from_json(include_str!("../../rl_openings.json"), 0.5, None, ForcedSides::Both).is_ok());
     }
 
     fn book_lines(name: &str, json: &str) -> Vec<Vec<String>> {

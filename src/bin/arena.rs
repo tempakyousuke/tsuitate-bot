@@ -541,6 +541,15 @@ fn main() {
     // manifest の照合は candidate の実効設定（名前・ノブ・予算）が要るのでここで
     let manifest_fp = balance_manifest_fingerprint(&candidate);
 
+    // 序盤の強制（局面の多様化用。不正な設定はここで止める）
+    if let Some(book) = tsuitate_bot::selfplay::forced_book_from_env() {
+        println!(
+            "序盤の強制: 有効（ARENA_OPEN_BOOK、ライン {} 本、各側 p={}）。強さの比較には使わないこと",
+            book.line_lengths().len(),
+            std::env::var("ARENA_OPEN_P").unwrap_or_else(|_| "0.25".into()),
+        );
+    }
+
     let mut results: Vec<(String, MatchStats)> = vec![];
     for (opp_idx, opp) in opponents.iter().enumerate() {
         println!(
