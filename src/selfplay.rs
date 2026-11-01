@@ -557,6 +557,39 @@ pub enum OracleMode {
     CheckNoFoul,
 }
 
+/// **序盤の強制**（`ARENA_OPEN_BOOK`、既定オフ）。指定すると局ごと・先後それぞれ独立に確率
+/// `ARENA_OPEN_P`（既定 0.25）で、その側の最初の数手を定跡ファイルのラインから指させる
+/// （`rl::forced`。学習の `--open-book` と同じ規約・同じ止め方）。予定は `(match_seed, game_no)` で決まる。
+/// `ARENA_OPEN_LEN=lo:hi` で強制する手数を局ごとに一様に引く（既定はラインを接触の手前まで）。
+///
+/// 用途は**局面の多様化**（問題の採掘 = mine-tsume.yml / mine-escape.yml）。強さの比較の arena では
+/// 使わない（定跡の手が対局者の手として記録に入るので、強制した対局の記録は NN の教師データに混ぜない）。
+/// 審判側の設定なので名前は `ARENA_`（戦略が読む `TSUITATE_*` と混ぜない）。
+/// 設定が不正なら起動時に止める（数百局回した後で気づかないように）
+pub fn forced_book_from_env() -> Option<&'static crate::rl::forced::ForcedBook> {
+    static V: OnceLock<Option<crate::rl::forced::ForcedBook>> = OnceLock::new();
+    V.get_or_init(|| {
+        let path = std::env::var("ARENA_OPEN_BOOK").ok().filter(|s| !s.trim().is_empty())?;
+        let fail = |msg: String| -> ! {
+            eprintln!("ARENA_OPEN_BOOK: {msg}");
+            std::process::exit(1);
+        };
+        let json = std::fs::read_to_string(&path).unwrap_or_else(|e| fail(format!("{path} を読めません: {e}")));
+        let prob = match std::env::var("ARENA_OPEN_P").ok().filter(|s| !s.trim().is_empty()) {
+            None => 0.25,
+            Some(s) => s.trim().parse::<f64>().unwrap_or_else(|_| fail(format!("ARENA_OPEN_P が数でない: {s}"))),
+        };
+        let len = std::env::var("ARENA_OPEN_LEN").ok().filter(|s| !s.trim().is_empty()).map(|s| {
+            let parsed = s.trim().split_once(':').and_then(|(lo, hi)| Some((lo.parse().ok()?, hi.parse().ok()?)));
+            parsed.unwrap_or_else(|| fail(format!("ARENA_OPEN_LEN は lo:hi の形: {s}")))
+        });
+        let book = crate::rl::forced::book_from_json(&json, prob, len, crate::rl::forced::ForcedSides::Both)
+            .unwrap_or_else(|e| fail(format!("{path}: {e}")));
+        Some(book)
+    })
+    .as_ref()
+}
+
 fn oracle_from_env() -> Option<OracleMode> {
     match std::env::var("ARENA_ORACLE_A").as_deref() {
         Ok("nofoul") => Some(OracleMode::NoFoul),
@@ -644,6 +677,7 @@ where
         .filter(|s| !s.is_empty())
         .filter(|_| oracle_a.is_none());
     let record_dir = record_dir.as_deref();
+    let forced_book = forced_book_from_env();
     let mut stats = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
@@ -664,11 +698,20 @@ where
                             game_no,
                             seed: player_seed(match_seed, game_no, false),
                         };
-                        let (sente, gote) = if a_is_sente {
+                        let (mut sente, mut gote) = if a_is_sente {
                             (make_a(seeds_a), make_b(seeds_b))
                         } else {
                             (make_b(seeds_b), make_a(seeds_a))
                         };
+                        if let Some(book) = forced_book {
+                            let [ps, pg] = book.plans(match_seed, u64::from(game_no), None);
+                            if let Some(plan) = ps {
+                                sente = Box::new(crate::rl::forced::ForcedOpening::new(sente, plan));
+                            }
+                            if let Some(plan) = pg {
+                                gote = Box::new(crate::rl::forced::ForcedOpening::new(gote, plan));
+                            }
+                        }
                         let mut players = [new_player(sente), new_player(gote)];
                         let oracle = if a_is_sente {
                             [oracle_a, None]

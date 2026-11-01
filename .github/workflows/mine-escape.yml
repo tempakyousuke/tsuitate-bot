@@ -13,6 +13,9 @@ name: Mine escape
 # **最初は採掘数を少なめにしてある**（既定 20局/日。手元実測で約1.8問/局なので約35問/日）。
 # 問題の品質と遊ばれ方を見てから games を増やす。
 #
+# 自己対局は rl_mmdopen_v3 同士で、各側の序盤を確率 0.75 で定跡から指させる（mine-tsume.yml と同じ。
+# 局面の多様化のため。2026-11-01〜）。
+#
 # 入力は mine-tsume.yml と同じく2通り:
 #   1. arena_run_id を指定 … 既存の Arena 実行の `arena-records-*` を使う（対局コストゼロ）
 #   2. arena_run_id が空 … このワークフローが自分で自己対局してから掘る
@@ -40,11 +43,19 @@ on:
       candidate:
         description: "自己対局の候補戦略"
         required: false
-        default: "rl_v22"
+        default: "rl_mmdopen_v3"
       baseline:
         description: "自己対局の基準戦略"
         required: false
-        default: "rl_v20"
+        default: "rl_mmdopen_v3"
+      open_book:
+        description: "序盤を強制する定跡ファイル（ARENA_OPEN_BOOK。局面の多様化用）"
+        required: false
+        default: "rl_openings.json"
+      open_p:
+        description: "各側の序盤を定跡で強制する確率（0 で強制なし）"
+        required: false
+        default: "0.75"
       clock:
         description: "自己対局の時計（初期秒+加算秒）。既定は本番相当"
         required: false
@@ -95,8 +106,10 @@ on:
 # パラメータを足すときは inputs と env の両方に足すこと）
 env:
   GAMES: ${{ inputs.games || '20' }}
-  CANDIDATE: ${{ inputs.candidate || 'rl_v22' }}
-  BASELINE: ${{ inputs.baseline || 'rl_v20' }}
+  CANDIDATE: ${{ inputs.candidate || 'rl_mmdopen_v3' }}
+  BASELINE: ${{ inputs.baseline || 'rl_mmdopen_v3' }}
+  OPEN_BOOK: ${{ inputs.open_book || 'rl_openings.json' }}
+  OPEN_P: ${{ inputs.open_p || '0.75' }}
   CLOCK: ${{ inputs.clock || '300+3' }}
   SELFPLAY_SHARDS: ${{ inputs.selfplay_shards || '2' }}
   MINE_SHARDS: ${{ inputs.mine_shards || '4' }}
@@ -155,6 +168,8 @@ jobs:
         env:
           ARENA_RECORD_DIR: arena-records
           ARENA_CLOCK: ${{ env.CLOCK }}
+          ARENA_OPEN_BOOK: ${{ env.OPEN_BOOK }}
+          ARENA_OPEN_P: ${{ env.OPEN_P }}
         run: |
           set -euo pipefail
           case "$ARENA_CLOCK" in

@@ -244,6 +244,8 @@ python rnad/opening_eval.py robust --cand a.bin [--ref b.bin] --book ~/Develop/t
   ノイズでは説明できないが、どの系統が本当に弱いかの順位は確かでない
 - 人間の序盤のデータは手元に 81側（73局）しかなく、うち 73側は所有者（引き角の系統が多く、定跡ファイルとも重なる）。
   サイトの `games.moves` の書き出しがあれば、人間の序盤のブックを同じ形式で作れる
-- arena（Rust の `bin/arena`）にはまだ序盤の強制が無い。CI で測るなら `ARENA_FORCE_OPENING` のような指定と、
-  記録の形式（`games.jsonl` の版）・`arena-var` の組み合わせの検査を足す
+- arena（Rust の `bin/arena`）には 2026-11-01 に序盤の強制を入れた（`ARENA_OPEN_BOOK` / `ARENA_OPEN_P` /
+  `ARENA_OPEN_LEN`。`selfplay::forced_book_from_env` と `rl::forced::ForcedOpening`。止め方は env と同じで、
+  重みは系統ごとに同じ確率）。**用途は問題の採掘の局面の多様化だけ**（mine-tsume.yml / mine-escape.yml）。
+  強さの比較で使うなら、記録の形式（`games.jsonl` の版）・`arena-var` の組み合わせの検査を足す必要がある
 - 強制した対局の記録は、模倣学習や NN の教師データに混ぜない（定跡の手がネットの手として入る）

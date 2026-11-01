@@ -7,7 +7,11 @@ name: Mine tsume
 # 自己対局800局からの採掘。**取り込みはサイト側の日次 cron が artifact を
 # 取りにくる**（tsuitate の docs/operations.md）ので、ここは artifact を置くだけ。
 #
-# 自己対局の既定は rl_v22（最新の凍結版）vs rl_v20（本番 bot）。2026-10-02 に
+# 自己対局の既定は rl_mmdopen_v3 同士で、**各側の序盤を確率 0.75 で定跡から指させる**
+# （ARENA_OPEN_BOOK = rl_openings.json。2026-11-01〜。それまでは rl_v22 vs rl_v20 で強制なし）。
+# 方策ネットの序盤はほぼ1本に固まっていて、強制なしの rl_mmdopen_v3 同士40局は最初の8手が
+# 全局同じだった（強制 p=0.5 で28通り）。似た局面から同じような問題が並ぶのを避けるため。
+# 旧: rl_v22（最新の凍結版）vs rl_v20（本番 bot）。2026-10-02 に
 # estimator vs estimator_v14（160局）から切り替えた。方策ネットは1手 約20ms で
 # 50局が約30秒（estimator は1シャード20局に約25分）なので対局はほぼ無料になり、
 # 律速は採掘（ソルバー）側へ移った。採掘の1シャードあたりの局数を従来並み
@@ -53,11 +57,19 @@ on:
       candidate:
         description: "自己対局の候補戦略"
         required: false
-        default: "rl_v22"
+        default: "rl_mmdopen_v3"
       baseline:
         description: "自己対局の基準戦略"
         required: false
-        default: "rl_v20"
+        default: "rl_mmdopen_v3"
+      open_book:
+        description: "序盤を強制する定跡ファイル（ARENA_OPEN_BOOK。局面の多様化用）"
+        required: false
+        default: "rl_openings.json"
+      open_p:
+        description: "各側の序盤を定跡で強制する確率（0 で強制なし）"
+        required: false
+        default: "0.75"
       clock:
         description: "自己対局の時計（初期秒+加算秒）。既定は本番相当"
         required: false
@@ -113,8 +125,10 @@ on:
 #  schedule では空＝自己対局、という意図どおりの分岐になる）。
 env:
   GAMES: ${{ inputs.games || '800' }}
-  CANDIDATE: ${{ inputs.candidate || 'rl_v22' }}
-  BASELINE: ${{ inputs.baseline || 'rl_v20' }}
+  CANDIDATE: ${{ inputs.candidate || 'rl_mmdopen_v3' }}
+  BASELINE: ${{ inputs.baseline || 'rl_mmdopen_v3' }}
+  OPEN_BOOK: ${{ inputs.open_book || 'rl_openings.json' }}
+  OPEN_P: ${{ inputs.open_p || '0.75' }}
   CLOCK: ${{ inputs.clock || '300+3' }}
   SELFPLAY_SHARDS: ${{ inputs.selfplay_shards || '2' }}
   MINE_SHARDS: ${{ inputs.mine_shards || '16' }}
@@ -174,6 +188,8 @@ jobs:
         env:
           ARENA_RECORD_DIR: arena-records
           ARENA_CLOCK: ${{ env.CLOCK }}
+          ARENA_OPEN_BOOK: ${{ env.OPEN_BOOK }}
+          ARENA_OPEN_P: ${{ env.OPEN_P }}
         run: |
           set -euo pipefail
           case "$ARENA_CLOCK" in
