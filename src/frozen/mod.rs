@@ -646,9 +646,11 @@ mod tests {
             };
             let name = format!("{prefix}{path}");
             // 突き合わせた試行数は3局の合計で見る（1局だけ反則負けや早い詰みで短く終わるのは正当。
-            // rl_deduce_v7 の局 0 は 20 試行で終わった）
+            // rl_deduce_v7 の局 0 は 20 試行で終わった）。3局で 60 試行に届かなければ局を足す
+            // （rl_mmdopen_v7 は3局がどれも早く終わり、ちょうど 60 試行だった。手は全部一致）
             let mut total = 0;
-            for game in 0..3u64 {
+            let mut game = 0u64;
+            while game < 3 || (total <= 60 && game < 10) {
                 let mut frozen = [
                     crate::strategy::make_seeded(version, game).unwrap(),
                     crate::strategy::make_seeded(version, game + 100).unwrap(),
@@ -673,8 +675,9 @@ mod tests {
                     steps += 1;
                 }
                 total += steps;
+                game += 1;
             }
-            assert!(total > 60, "{version} の3局が短すぎる（計 {total} 試行）");
+            assert!(total > 60, "{version} の {game} 局が短すぎる（計 {total} 試行）");
         }
     }
 }
