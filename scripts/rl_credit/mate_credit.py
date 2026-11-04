@@ -14,6 +14,7 @@
   attempt+check : 自分が王手をかけた手（受理されて相手が王手になった手）だけ λ=1
   turn+check    : 両方
 A の記録しか読まないので、自己対局（A と B が同じ方策）なら「負けた側」の代表になる。違う相手との対局なら A の負けだけを見ている。
+`--side mating` なら、A が詰ませて勝った局の A（詰ませた側）で同じ表を出す（10.8 の「なぜ受けでなく攻めが育ったか」）。
 """
 import argparse
 import json
@@ -74,6 +75,8 @@ def main():
     ap.add_argument("--lam", type=float, default=0.5, help="GAE の λ（MMD の既定 0.5）")
     ap.add_argument("--k", type=int, default=12, help="後ろから何手番まで表にするか")
     ap.add_argument("--tail", type=int, default=6, help="王手駒を取り返された割合を「最後の何手番」で分けるか")
+    ap.add_argument("--side", choices=["mated", "mating"], default="mated",
+                    help="表にする側: mated = A が詰まされた局 / mating = A が詰ませた局")
     args = ap.parse_args()
 
     files = sorted(p for d in args.dirs for p in Path(d).glob("*.jsonl"))
@@ -90,6 +93,7 @@ def main():
         a_won = (res == "sente_win" and color == "sente") or (res == "gote_win" and color == "gote")
         if a_lost and reason == "checkmate":
             n_mated += 1
+        if reason == "checkmate" and (a_lost if args.side == "mated" else a_won):
             if rows and rows[-1]["kind"] == "move":
                 lost.append(rows)
         if a_lost and reason == "foul_limit":
@@ -138,7 +142,9 @@ def main():
             checks[k].append(ch)
             inchk[k].append(ic)
 
-    print(f"\n詰まされた局 {len(lost)}局。受理された手を後ろから K 手番目（K=0 = 詰まされる直前の自分の手）へ届く終局の δ の係数"
+    what = "詰まされた局" if args.side == "mated" else "詰ませた局"
+    k0 = "詰まされる直前の自分の手" if args.side == "mated" else "詰ませた手"
+    print(f"\n{what} {len(lost)}局。受理された手を後ろから K 手番目（K=0 = {k0}）へ届く終局の δ の係数"
           f"（λ={args.lam}。平均、括弧は中央値）と、その手番の中身")
     print("| K | " + " | ".join(SCHEMES) + " | 王手をかけた | 王手されていた | 反則/手番 | 局数 |")
     print("|" + "---|" * (len(SCHEMES) + 5))
