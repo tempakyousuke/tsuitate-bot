@@ -14,7 +14,7 @@
 | 診断バイナリと P0 調査（#19/#24/#28/#31/#34/#36/#40）の判定 | `docs/diagnostics.md` |
 | `bin/analyze` の各集計セクションの定義と実測 | `docs/analyze-metrics.md` |
 | NN の段階①〜④の現状と再学習の手順 | `docs/nn-direction.md` |
-| R-NaD の学習方法どうしの速さの比べ方（固定パネル・代理・GPU の A/B）と実験の結果 | `docs/rl-learning-speed.md` |
+| R-NaD の学習方法どうしの速さの比べ方（固定パネル・代理・GPU の A/B）と実験の結果、MMD の本線をさらに速くする検討（11節） | `docs/rl-learning-speed.md` |
 | MMD 学習器（Ataraxos 型、`--algo mmd`）の設計 | `docs/rl-mmd-design.md`（結果と A/B の手順は `docs/rl-learning-speed.md` 10節） |
 | 序盤が速攻1本に固まったことの計測と、学習の自己対局で序盤を定跡から指させる仕組み（`--open-book`） | `docs/rl-opening-diversity.md` |
 
