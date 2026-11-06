@@ -37,6 +37,8 @@ pub struct Config {
     pub strategy_name: String,
     /// 対局記録（JSONL）の出力先ディレクトリ。None で記録しない
     pub record_dir: Option<String>,
+    /// 序盤の強制（`TSUITATE_OPEN_BOOK`。`rl::forced::bot_book_from_env`）。None でオフ
+    pub opening_book: Option<crate::rl::forced::ForcedBook>,
 }
 
 #[derive(Debug)]
@@ -337,7 +339,19 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
                 state.pending_move_number = None;
                 state.last_sent = None;
                 state.log.clear();
-                state.strategy = make_strategy();
+                // 序盤の強制は新しい対局のときだけ（復帰対局は観測ログを失っているので、
+                // ラインの何手目まで指したかを数えられない）
+                if let Some(plan) =
+                    config.opening_book.as_ref().and_then(|b| b.plan_for_game(&m.game_id, m.your_color))
+                {
+                    println!("序盤の強制: ライン #{} を最大 {} 手", plan.line_id, plan.limit);
+                }
+                state.strategy = crate::rl::forced::wrap_for_game(
+                    make_strategy(),
+                    config.opening_book.as_ref(),
+                    &m.game_id,
+                    m.your_color,
+                );
                 state.recorder = None; // 最初の sync で作る（復帰対局と共通の経路）
                 state.game_id = Some(m.game_id);
             }
