@@ -175,6 +175,13 @@ impl ForcedBook {
         self.sides
     }
 
+    /// ライン `line_id` を（切った後の）最後まで指す予定。確率・手数の引き方は見ない
+    /// （`open:<ライン>:<戦略名>` の相手が毎局同じラインを指すため）
+    pub fn fixed_plan(&self, line_id: usize) -> Option<ForcedPlan> {
+        let line = self.lines.get(line_id)?;
+        Some(ForcedPlan { line: Arc::clone(line), line_id: line_id as u32, limit: line.len() as u32 })
+    }
+
     /// 切った後の各ラインの手数（検査・表示用）
     pub fn line_lengths(&self) -> Vec<usize> {
         self.lines.iter().map(|l| l.len()).collect()
@@ -284,6 +291,37 @@ pub fn wrap_for_game(
         Some(plan) => Box::new(ForcedOpening::new(inner, plan)),
         None => inner,
     }
+}
+
+/// 定跡を固定した相手の戦略名の接頭辞（`open:<ライン>:<戦略名>`）
+pub const OPEN_PREFIX: &str = "open:";
+
+/// 学習用のブック（`rl_openings.json`）。`open:` の相手のラインはここの添字で指す
+fn training_book() -> &'static ForcedBook {
+    static B: std::sync::OnceLock<ForcedBook> = std::sync::OnceLock::new();
+    B.get_or_init(|| {
+        book_from_json(include_str!("../../rl_openings.json"), 1.0, None, ForcedSides::Both)
+            .expect("rl_openings.json は検査済み（学習用の定跡ファイルの全ラインが通る）")
+    })
+}
+
+/// **定跡を固定した相手**（arena の基準用、2026-11-07）。`open:<ライン>:<戦略名>` は、中の戦略に
+/// `rl_openings.json` のライン <ライン>（0 始まりの添字）を毎局・先後どちらでも指させる
+/// （後手は点対称に読む）。止め方は学習の強制と同じ（`ForcedOpening`。接触・王手・自分の反則で抜ける）。
+///
+/// 用途は「強制なしの方策が苦手な序盤」を探すこと（候補は強制なし、相手だけ固定）と、苦手だった
+/// ラインを固定の相手としてガントレットに混ぜて区切りごとの変化を見ること。ラインは添字で指すので、
+/// `rl_openings.json` にラインを足すときは**末尾に足す**（途中に挟むと過去の記録の名前とずれる）。
+/// 中の戦略名は凍結版などの名前（`rl_policy:release:...` は arena.yml の重みの取得が拾わない）。
+/// 読めない名前・範囲外のラインは None
+pub fn fixed_opening_from_name(name: &str, seed: Option<u64>) -> Option<Box<dyn crate::strategy::Strategy + Send>> {
+    let (line, inner) = name.strip_prefix(OPEN_PREFIX)?.split_once(':')?;
+    let plan = training_book().fixed_plan(line.parse().ok()?)?;
+    let inner = match seed {
+        Some(s) => crate::strategy::make_seeded(inner, s),
+        None => crate::strategy::make(inner),
+    }?;
+    Some(Box::new(ForcedOpening::new(inner, plan)))
 }
 
 /// **序盤を強制する戦略の包み**（arena の自己対局用。`selfplay` が `ARENA_OPEN_BOOK` のときに使う）。
@@ -630,6 +668,35 @@ mod tests {
         // 予定が無ければ包まない（名前も中の戦略のまま）
         let inner = crate::strategy::make("heuristic").unwrap();
         assert_eq!(wrap_for_game(inner, Some(&off), "game-abc", Color::Sente).name(), "heuristic");
+    }
+
+    #[test]
+    fn 定跡を固定した相手は先後どちらでもそのラインから指す() {
+        use crate::referee::Referee;
+        let lines = book_lines("rl_openings.json", include_str!("../../rl_openings.json"));
+        let k = lines.len() - 1;
+        let first = quiet_prefix(&lines[k]).unwrap()[0].clone();
+        let mirrored = decode_usi(encode_usi(&first, Color::Sente).unwrap(), Color::Gote).unwrap();
+        let name = format!("open:{k}:heuristic");
+        for seed in [Some(1), Some(2), None] {
+            let make = || match seed {
+                Some(s) => crate::strategy::make_seeded(&name, s),
+                None => crate::strategy::make(&name),
+            };
+            let mut referee = Referee::new();
+            let view = referee.view(Color::Sente, [0, 0], 0);
+            let sente = make().unwrap().choose(&view, referee.log(Color::Sente), referee.foul_tried(Color::Sente));
+            assert_eq!(sente.as_deref(), Some(first.as_str()), "先手は seed={seed:?} でもライン {k} の初手");
+            // 後手は同じラインを点対称に読む（先手の手は相手の駒に触れない端歩）
+            referee.step("9g9f", 0);
+            let view = referee.view(Color::Gote, [0, 0], 0);
+            let gote = make().unwrap().choose(&view, referee.log(Color::Gote), referee.foul_tried(Color::Gote));
+            assert_eq!(gote.as_deref(), Some(mirrored.as_str()));
+        }
+        assert_eq!(crate::strategy::make(&name).unwrap().name(), "heuristic", "記録上の名前は中の戦略のまま");
+        for bad in [format!("open:{}:heuristic", lines.len()), "open:x:heuristic".into(), "open:0:no_such".into(), "open:0".into()] {
+            assert!(crate::strategy::make(&bad).is_none(), "{bad} は作れない");
+        }
     }
 
     fn book_lines(name: &str, json: &str) -> Vec<Vec<String>> {
