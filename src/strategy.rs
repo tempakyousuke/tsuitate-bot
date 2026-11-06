@@ -261,6 +261,9 @@ pub fn make_seeded(name: &str, seed: u64) -> Option<Box<dyn Strategy + Send>> {
             crate::rl::search::RlSearch::from_name(name, Some(seed))
                 .map(|p| Box::new(p) as Box<dyn Strategy + Send>)
         }
+        _ if name.starts_with(crate::rl::forced::OPEN_PREFIX) => {
+            crate::rl::forced::fixed_opening_from_name(name, Some(seed))
+        }
         _ => make(name),
     }
 }
@@ -405,7 +408,11 @@ pub fn make(name: &str) -> Option<Box<dyn Strategy + Send>> {
         "rl_speed_v4" => Some(Box::new(crate::frozen::rl_speed_v4::RlSpeedV4::new())),
         "rl_guard_v1" => Some(Box::new(crate::frozen::rl_guard_v1::RlGuardV1::new())),
         // 方策ネット（DeepNash 路線）: `rl_policy:<重みのパス>` / `rl_policy_greedy:<パス>` /
-        // `rl_policy_basic:<パス>`（旧マスク）。`rl_search:<パス>[,k=..]` は粒子探索つき（実験）
+        // `rl_policy_basic:<パス>`（旧マスク）。`rl_search:<パス>[,k=..]` は粒子探索つき（実験）。
+        // `open:<ライン>:<戦略名>` は序盤を rl_openings.json のラインに固定した相手（arena の基準用）
+        _ if name.starts_with(crate::rl::forced::OPEN_PREFIX) => {
+            crate::rl::forced::fixed_opening_from_name(name, None)
+        }
         _ if name.starts_with(crate::rl::search::PREFIX) => {
             crate::rl::search::RlSearch::from_name(name, None)
                 .map(|p| Box::new(p) as Box<dyn Strategy + Send>)
