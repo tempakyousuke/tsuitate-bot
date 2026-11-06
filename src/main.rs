@@ -8,6 +8,8 @@
 //! - TSUITATE_STRATEGY: 戦略名（既定は strategy::DEFAULT_STRATEGY = estimator）
 //! - TSUITATE_QUEUE_RETRY_MS: キュー参加拒否（受付時間外）後の再試行間隔 ms（既定 60000）
 //! - TSUITATE_RECORD_DIR: 対局記録（JSONL）の出力先（既定 records。空文字で記録しない）
+//! - TSUITATE_OPEN_BOOK / TSUITATE_OPEN_P / TSUITATE_OPEN_LEN: 序盤の強制（既定オフ。
+//!   `rl::forced::bot_book_from_env`）
 
 use std::process::exit;
 
@@ -41,6 +43,17 @@ fn main() {
         Err(_) => Some("records".into()),
     };
 
+    let opening_book = match tsuitate_bot::rl::forced::bot_book_from_env() {
+        Ok(book) => book,
+        Err(e) => {
+            eprintln!("{e}");
+            exit(1);
+        }
+    };
+    if let Some(book) = &opening_book {
+        println!("序盤の強制: 有効（ライン {} 本）", book.line_lengths().len());
+    }
+
     let config = client::Config {
         url,
         token,
@@ -49,6 +62,7 @@ fn main() {
         queue_retry_ms,
         strategy_name,
         record_dir,
+        opening_book,
     };
 
     if let Err(e) = client::run(config) {

@@ -145,10 +145,15 @@ struct GameSession {
 }
 
 impl GameSession {
+    #[cfg(test)]
     fn new(strategy_name: &str, my_color: Color) -> Option<Self> {
-        Some(GameSession {
+        Some(Self::with_strategy(strategy::make(strategy_name)?, my_color))
+    }
+
+    fn with_strategy(strategy: Box<dyn Strategy + Send>, my_color: Color) -> Self {
+        GameSession {
             my_color,
-            strategy: strategy::make(strategy_name)?,
+            strategy,
             model: GameModel::new(my_color),
             log: ObservationLog::default(),
             next_move_number: 1,
@@ -157,7 +162,7 @@ impl GameSession {
             persisted_events: 0,
             request_cache: HashMap::new(),
             request_cache_order: VecDeque::new(),
-        })
+        }
     }
 
     /// 永続化ファイルから復元した観測イベントを1件適用する。
@@ -188,6 +193,7 @@ pub struct SessionStore {
     /// （プロセス再起動・TTL掃除）にそこから復元する。差分プロトコルでは
     /// リクエストから全履歴を再構成できないため、これが唯一の復旧経路
     session_dir: Option<PathBuf>,
+    opening_book: Option<crate::rl::forced::ForcedBook>,
 }
 
 impl SessionStore {
@@ -196,12 +202,29 @@ impl SessionStore {
             strategy_name,
             games: Mutex::new(HashMap::new()),
             session_dir: None,
+            opening_book: None,
         }
     }
 
     pub fn with_session_dir(mut self, dir: Option<PathBuf>) -> Self {
         self.session_dir = dir;
         self
+    }
+
+    /// 序盤の強制（`TSUITATE_OPEN_BOOK`）。予定は対局IDで決まるので、キャッシュ喪失からの
+    /// 復元・作り直しでも同じラインになり、何手目まで指したかは観測ログから数え直す
+    pub fn with_opening_book(mut self, book: Option<crate::rl::forced::ForcedBook>) -> Self {
+        self.opening_book = book;
+        self
+    }
+
+    /// 対局ごとのセッションを作る（序盤の強制があれば戦略を包む）
+    fn new_session(&self, game_id: &str, my_color: Color) -> Result<GameSession, SessionError> {
+        let inner = strategy::make(&self.strategy_name)
+            .ok_or_else(|| SessionError::UnknownStrategy(self.strategy_name.clone()))?;
+        let wrapped =
+            crate::rl::forced::wrap_for_game(inner, self.opening_book.as_ref(), game_id, my_color);
+        Ok(GameSession::with_strategy(wrapped, my_color))
     }
 
     fn session_file(&self, game_id: &str) -> Option<PathBuf> {
@@ -253,8 +276,7 @@ impl SessionStore {
         };
         let fresh = match session {
             Some(s) => s,
-            None => GameSession::new(&self.strategy_name, my_color)
-                .ok_or_else(|| SessionError::UnknownStrategy(self.strategy_name.clone()))?,
+            None => self.new_session(game_id, my_color)?,
         };
         let arc = Arc::new(Mutex::new(fresh));
         games.insert(game_id.to_string(), (now, arc.clone()));
@@ -267,7 +289,7 @@ impl SessionStore {
     fn restore_session(&self, game_id: &str, my_color: Color) -> Option<GameSession> {
         let path = self.session_file(game_id)?;
         let data = fs::read_to_string(&path).ok()?;
-        let mut session = GameSession::new(&self.strategy_name, my_color)?;
+        let mut session = self.new_session(game_id, my_color).ok()?;
         for line in data.lines().filter(|l| !l.trim().is_empty()) {
             let parsed: PersistedChunk = serde_json::from_str(line).ok()?;
             if parse_bw_color(&parsed.color) != Some(my_color) {
@@ -411,8 +433,7 @@ pub fn choose_move(store: &SessionStore, req: &BotTurnRequest) -> Result<String,
         }
         // 想定外の食い違い（プロセス再起動直後でキャッシュが空、ply欠落等）は
         // セッションを作り直して0手目からやり直す
-        *session = GameSession::new(&store.strategy_name, my_color)
-            .ok_or_else(|| SessionError::UnknownStrategy(store.strategy_name.clone()))?;
+        *session = store.new_session(&req.game_id, my_color)?;
         if let Some(path) = store.session_file(&req.game_id) {
             let _ = fs::remove_file(path);
         }
@@ -974,6 +995,23 @@ mod tests {
         req.game.as_mut().unwrap().required_players = RequiredPlayers { b: 2, w: 1 };
         let err = choose_move(&store, &req).unwrap_err();
         assert!(matches!(err, SessionError::UnsupportedPlayers));
+    }
+
+    #[test]
+    fn opening_book_forces_the_first_move() {
+        let book = crate::rl::forced::book_from_json(
+            r#"{"lines":[{"moves":["5g5f","2h5h"],"category":"nakabisha"}]}"#,
+            1.0,
+            None,
+            crate::rl::forced::ForcedSides::Both,
+        )
+        .unwrap();
+        let store = SessionStore::new("heuristic".into()).with_opening_book(Some(book));
+        for id in ["g1", "g2", "g3"] {
+            let mut positions = HashMap::new();
+            positions.insert("0".to_string(), initial_entry());
+            assert_eq!(choose_move(&store, &request(id, "b", 0, positions)).unwrap(), "+5756FU");
+        }
     }
 
     #[test]

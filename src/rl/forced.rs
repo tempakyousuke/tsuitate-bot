@@ -27,6 +27,8 @@ use crate::shogi::{Position, ShogiMove, parse_usi, promote_role};
 
 /// 序盤の乱数列の塩（相手戦略の seed `mix(seed ^ mix(game_no))` と混ざらないように）
 const OPENING_SALT: u64 = 0x6f70_656e_696e_6721;
+/// 本番bot で対局ID から乱数列を作るときの初期値
+const GAME_ID_SALT: u64 = 0x6761_6d65_5f69_6421;
 
 /// どの側を強制の対象にするか
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +160,17 @@ impl ForcedBook {
         Ok(Self { lines: encoded, cdf, prob, len, sides })
     }
 
+    /// **本番bot用**: 対局ID から自分の側の予定を引く（同じ対局IDなら何度呼んでも同じ予定 =
+    /// webhook のセッション復元・作り直しでも同じラインを指し続ける）
+    pub fn plan_for_game(&self, game_id: &str, color: Color) -> Option<ForcedPlan> {
+        let seed = game_id.bytes().fold(GAME_ID_SALT, |h, b| mix(h ^ u64::from(b)));
+        let [sente, gote] = self.plans(seed, 0, None);
+        match color {
+            Color::Sente => sente,
+            Color::Gote => gote,
+        }
+    }
+
     pub fn sides(&self) -> ForcedSides {
         self.sides
     }
@@ -231,22 +244,67 @@ pub fn book_from_json(json: &str, prob: f64, len: Option<(u32, u32)>, sides: For
     ForcedBook::new(&lines, Some(&weights), prob, len, sides)
 }
 
+/// **本番bot の序盤の強制**（`main.rs` と `bin/webhook_bot.rs` が起動時に1回読む）。
+///
+/// - `TSUITATE_OPEN_BOOK`: 定跡ファイルのパス（未設定・空ならオフ = Ok(None)）
+/// - `TSUITATE_OPEN_P`: 1局で自分の側を強制する確率（既定 1.0）
+/// - `TSUITATE_OPEN_LEN`: `lo:hi` で強制する手数を局ごとに一様に引く（既定はラインを接触の手前まで）
+///
+/// ラインは対局ID から決める（`ForcedBook::plan_for_game`）。止め方は学習・arena と同じ（`ForcedOpening`）。
+/// 戦略の強さのノブ（`config::STRATEGY_ENV_KEYS`）ではなく bot の運用設定なので config.rs は通さない
+pub fn bot_book_from_env() -> Result<Option<ForcedBook>, String> {
+    let Some(path) = std::env::var("TSUITATE_OPEN_BOOK").ok().filter(|s| !s.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let json = std::fs::read_to_string(&path).map_err(|e| format!("TSUITATE_OPEN_BOOK: {path} を読めません: {e}"))?;
+    let prob = match std::env::var("TSUITATE_OPEN_P").ok().filter(|s| !s.trim().is_empty()) {
+        None => 1.0,
+        Some(s) => s.trim().parse::<f64>().map_err(|_| format!("TSUITATE_OPEN_P が数でない: {s}"))?,
+    };
+    let len = match std::env::var("TSUITATE_OPEN_LEN").ok().filter(|s| !s.trim().is_empty()) {
+        None => None,
+        Some(s) => Some(
+            s.trim()
+                .split_once(':')
+                .and_then(|(lo, hi)| Some((lo.parse().ok()?, hi.parse().ok()?)))
+                .ok_or_else(|| format!("TSUITATE_OPEN_LEN は lo:hi の形: {s}"))?,
+        ),
+    };
+    book_from_json(&json, prob, len, ForcedSides::Both).map(Some).map_err(|e| format!("TSUITATE_OPEN_BOOK: {path}: {e}"))
+}
+
+/// 本番bot の対局ごとの戦略を、予定があれば `ForcedOpening` で包む（予定が無ければそのまま返す）
+pub fn wrap_for_game(
+    inner: Box<dyn crate::strategy::Strategy + Send>,
+    book: Option<&ForcedBook>,
+    game_id: &str,
+    color: Color,
+) -> Box<dyn crate::strategy::Strategy + Send> {
+    match book.and_then(|b| b.plan_for_game(game_id, color)) {
+        Some(plan) => Box::new(ForcedOpening::new(inner, plan)),
+        None => inner,
+    }
+}
+
 /// **序盤を強制する戦略の包み**（arena の自己対局用。`selfplay` が `ARENA_OPEN_BOOK` のときに使う）。
 ///
 /// 予定（`ForcedPlan`）がある間はラインの手を返し、`EnvGame::forced_move` と同じ条件でやめて以後は
 /// 中の戦略に任せる: どちらかの駒取り・王手（自分の観測に入る接触）、自分の反則、予定の手数を指し終えた。
 /// 判定に使うのは自分の `PlayerView` と観測ログだけ（相手の強制の有無は分からない = 学習と同じ情報条件）。
 /// 中の戦略は強制した手番では呼ばれないが、推定器は観測ログを差分で食うので後から追いつく
-pub struct ForcedOpening {
-    inner: Box<dyn crate::strategy::Strategy>,
+///
+/// 中の戦略の型は引数にしてある（arena は `dyn Strategy`、本番bot は webhook のスレッドをまたぐので
+/// `dyn Strategy + Send`）
+pub struct ForcedOpening<S: crate::strategy::Strategy + ?Sized = dyn crate::strategy::Strategy> {
+    inner: Box<S>,
     plan: ForcedPlan,
     stopped: bool,
     /// 直前の choose が強制の手だったか（`debug_state` を中の戦略の古い値にしないため）
     last_forced: bool,
 }
 
-impl ForcedOpening {
-    pub fn new(inner: Box<dyn crate::strategy::Strategy>, plan: ForcedPlan) -> Self {
+impl<S: crate::strategy::Strategy + ?Sized> ForcedOpening<S> {
+    pub fn new(inner: Box<S>, plan: ForcedPlan) -> Self {
         Self { inner, plan, stopped: false, last_forced: false }
     }
 
@@ -290,7 +348,7 @@ impl ForcedOpening {
     }
 }
 
-impl crate::strategy::Strategy for ForcedOpening {
+impl<S: crate::strategy::Strategy + ?Sized> crate::strategy::Strategy for ForcedOpening<S> {
     fn choose(
         &mut self,
         view: &crate::protocol::PlayerView,
@@ -555,6 +613,23 @@ mod tests {
         assert!((3700..4300).contains(&n[2]), "{n:?}");
         assert!((1800..2200).contains(&n[0]) && (1800..2200).contains(&n[1]), "{n:?}");
         assert!(book_from_json(include_str!("../../rl_openings.json"), 0.5, None, ForcedSides::Both).is_ok());
+    }
+
+    #[test]
+    fn 本番botの予定は対局のidで決まる() {
+        let json = include_str!("../../rl_openings.json");
+        let book = book_from_json(json, 1.0, None, ForcedSides::Both).unwrap();
+        let key = |id: &str, c| book.plan_for_game(id, c).map(|p| (p.line_id, p.limit));
+        assert!(key("game-abc", Color::Sente).is_some(), "p=1 なら必ず強制");
+        assert_eq!(key("game-abc", Color::Sente), key("game-abc", Color::Sente), "同じ対局IDなら同じ予定");
+        let ids: std::collections::HashSet<u32> =
+            (0..200).filter_map(|i| key(&format!("g{i}"), Color::Gote)).map(|(id, _)| id).collect();
+        assert!(ids.len() > 5, "対局IDが違えばラインが散る: {ids:?}");
+        let off = book_from_json(json, 0.0, None, ForcedSides::Both).unwrap();
+        assert!(off.plan_for_game("game-abc", Color::Sente).is_none());
+        // 予定が無ければ包まない（名前も中の戦略のまま）
+        let inner = crate::strategy::make("heuristic").unwrap();
+        assert_eq!(wrap_for_game(inner, Some(&off), "game-abc", Color::Sente).name(), "heuristic");
     }
 
     fn book_lines(name: &str, json: &str) -> Vec<Vec<String>> {

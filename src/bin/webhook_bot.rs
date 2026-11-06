@@ -16,6 +16,8 @@
 //!   観測イベント列を `<dir>/<gameId>.jsonl` へ追記し、プロセス再起動後も
 //!   そこからセッションを復元する。差分プロトコル（2026-08 改訂）では
 //!   リクエストから全履歴を再構成できないため、本番運用では設定を強く推奨
+//! - TSUITATE_OPEN_BOOK / TSUITATE_OPEN_P / TSUITATE_OPEN_LEN: 序盤の強制（既定オフ。
+//!   `rl::forced::bot_book_from_env`。ラインは gameId から決まる）
 //! - TSUITATE_WEBHOOK_LOG_DIR（既定 未設定＝無効）: 設定すると、検証済みリクエストの
 //!   生payload・応答・所要時間を `<dir>/<gameId>.jsonl` に1行1リクエストで追記する
 //!   （本体の TSUITATE_RECORD_DIR と同じ「対局ごとに1ファイル」の思想。
@@ -85,7 +87,22 @@ fn main() {
     };
     println!("webhook_bot listening on http://{bind}{path} (strategy={strategy_name})");
 
-    let store = Arc::new(SessionStore::new(strategy_name).with_session_dir(session_dir));
+    let opening_book = match tsuitate_bot::rl::forced::bot_book_from_env() {
+        Ok(book) => book,
+        Err(e) => {
+            eprintln!("{e}");
+            exit(1);
+        }
+    };
+    if let Some(book) = &opening_book {
+        println!("序盤の強制: 有効（ライン {} 本）", book.line_lengths().len());
+    }
+
+    let store = Arc::new(
+        SessionStore::new(strategy_name)
+            .with_session_dir(session_dir)
+            .with_opening_book(opening_book),
+    );
     let secret = Arc::new(secret);
     let path = Arc::new(path);
     let log_dir = Arc::new(log_dir);

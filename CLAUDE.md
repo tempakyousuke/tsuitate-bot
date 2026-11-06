@@ -360,6 +360,13 @@
     1対局1ファイルで、botの観測イベント全量・選択した手と思考時間・終局結果を記録する
     （`src/record.rs`）。相手の実際の手は含まれない。ローカルdevサーバー対局なら
     サーバーDBの `games.moves` に全手順（真実）が残るので、分析にはDBダンプと突き合わせる
+  - `TSUITATE_OPEN_BOOK`（既定 未設定＝オフ）/ `TSUITATE_OPEN_P`（既定 1.0）/ `TSUITATE_OPEN_LEN`（`lo:hi`）:
+    **本番botの序盤の強制**（2026-11-06〜。Socket.IO 版と webhook 版の両方）。自分の側の最初の数手を
+    定跡ファイル（`rl_openings.json`）のラインから指し、駒取り・王手・自分の反則・ラインの終わりで
+    方策に戻る（学習の `--open-book`・arena の `ARENA_OPEN_BOOK` と同じ `rl::forced` の止め方）。
+    ラインは**対局IDから決まる**ので、webhook のセッション復元でも同じラインを続ける。
+    Socket.IO 版の再起動後の復帰対局は観測ログが無いので強制しない。
+    戦略の強さのノブではなく運用設定なので `config.rs` は通さない
 
 ## アーキテクチャ
 
