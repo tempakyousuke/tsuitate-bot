@@ -431,7 +431,7 @@
   マスクは自駒視点の候補に加えて**観測から反則が確定する手**（王手を解消し得ない手・反則手の
   成/不成の片割れ・直前に取られたマスへの打ち）を落とす（`MASK_VERSION` 2、2026-10-02〜。
   rl_v22 以前の凍結版は旧マスク = `rl_policy_basic:`。詳細は設計 doc の「行動マスク」）、
-  `encode.rs` = 観測 → 86×9×9 のテンソル。**入力は `Strategy::choose` と同じ
+  `encode.rs` = 観測 → 86×9×9 のテンソル（v2 = 確定事実つき 91枚、v3 = 相手の持ち駒の上界と相手の反則の時系列も足した 101枚。v3 でどの組を使うかは学習のフラグで選ぶ。設計 doc の「エンコーダ v3」）。**入力は `Strategy::choose` と同じ
   `(PlayerView, ObservationLog, foul_tried)` だけ**にしてあり、学習環境と推論が同じ関数を通る。
   `env.rs` = RL 環境の1局（自己対局・Rust 戦略を相手にする評価モード）。
   Python からは別 crate の `rl-env/`（PyO3、`tsuitate_rl.VecEnv`）で n 局を並列に回す。
