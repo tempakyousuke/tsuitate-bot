@@ -92,9 +92,25 @@ const D_PAWN: usize = D_KING + 1; // 動けないと確定した相手の歩（d
 /// エンコーダ v2 のプレーン数（v1 + 確定事実 5枚）
 pub const NUM_PLANES_DEDUCED: usize = D_PAWN + 1;
 
+// エンコーダ v3（2026-11-08。docs/rl-deepnash-design.md の「エンコーダ v3」）。v2 の後ろに、観測と自分側の
+// 情報だけで決まる事実を2組足す。**並びは固定**で、学習でどの組を使うかはネットの側が持つ（tsuitate-nn の
+// `--opp-hand-planes` / `--opp-foul-planes`。使わない組は stem の重みの列が 0 に固定されるので、ここで書いた値は
+// 出力に効かない）。並びを固定にしておくと、組の選び方が違うネットどうし（錨・リーグ）が同じ観測を読める
+const E_HAND: usize = NUM_PLANES_DEDUCED; // 7: 相手の持ち駒の上界（駒種別。全面に放送）
+const E_FOUL: usize = E_HAND + 7; // 3: 相手の反則の時系列（全面に放送）
+const EF_LAST: usize = 0; // 相手の直前の手番の反則数
+const EF_CHECKED: usize = 1; // 王手を受けていた相手の手番の反則数（鮮度つきの合計）
+const EF_FREE: usize = 2; // 王手を受けていない相手の手番の反則数（鮮度つきの合計）
+/// エンコーダ v3 のプレーン数（v2 + 相手の持ち駒の上界 7枚 + 相手の反則の時系列 3枚）
+pub const NUM_PLANES_V3: usize = E_FOUL + 3;
+/// v3 で足したプレーンの組（名前, 先頭のプレーン, 枚数）。tsuitate-nn の `model.EXTRA_PLANES` と同じ
+pub const EXTRA_PLANE_GROUPS: [(&str, usize, usize); 2] = [("opp_hand", E_HAND, 7), ("opp_fouls", E_FOUL, 3)];
+
 /// プレーン数 → 観測の長さ。対応するエンコーダが無いプレーン数は None
 pub fn obs_len(planes: usize) -> Option<usize> {
-    (planes == NUM_PLANES || planes == NUM_PLANES_DEDUCED).then_some(planes * 81)
+    [NUM_PLANES, NUM_PLANES_DEDUCED, NUM_PLANES_V3]
+        .contains(&planes)
+        .then_some(planes * 81)
 }
 
 /// 反則1件を1組のプレーンへ書く（`base` は `P_FOUL` か `P_PAST_FOUL`）
@@ -202,7 +218,8 @@ impl DeducedCache {
 }
 
 /// 観測をテンソルへ書く。`out` の長さでエンコーダの版を選ぶ: `OBS_LEN` は v1、
-/// `NUM_PLANES_DEDUCED * 81` は v2（v1 の後ろに確定事実のプレーン）
+/// `NUM_PLANES_DEDUCED * 81` は v2（v1 の後ろに確定事実のプレーン）、`NUM_PLANES_V3 * 81` は v3
+/// （v2 の後ろに相手の持ち駒の上界と相手の反則の時系列）
 pub fn encode_into(
     view: &PlayerView,
     log: &ObservationLog,
@@ -222,10 +239,11 @@ pub fn encode_into_cached(
     cache: &mut DeducedCache,
 ) {
     assert!(
-        out.len() == OBS_LEN || out.len() == NUM_PLANES_DEDUCED * 81,
+        out.len() % 81 == 0 && obs_len(out.len() / 81).is_some(),
         "観測の長さ {} に対応するエンコーダが無い",
         out.len()
     );
+    let v3 = out.len() == NUM_PLANES_V3 * 81;
     out.fill(0.0);
     if out.len() > OBS_LEN {
         encode_deduced(view, log, foul_tried, out, cache);
@@ -256,6 +274,11 @@ pub fn encode_into_cached(
         .filter_map(|v| parse_usi_square(&v.square))
         .collect();
     let mut unmoved = initial.clone();
+    // 相手の反則（v3）。反則は手番を変えないので、相手の手番の反則は `OpponentMoved` の手前に並ぶ。
+    // 相手が王手を受けていた手番か = その手番の前の自分の手が王手（`gave_check_last`）
+    let mut opp_fouls_pending = 0u32;
+    let mut opp_fouls_last = 0u32;
+    let (mut opp_fouls_checked, mut opp_fouls_free) = (0.0f32, 0.0f32);
     for event in log.events() {
         match event {
             Observation::MyMove {
@@ -288,6 +311,15 @@ pub fn encode_into_cached(
                     p.add(P_LOST_COUNT, c, 1.0 / 3.0);
                     unmoved.remove(&c);
                 }
+                // 相手の手番がここで閉じる
+                let w = opp_fouls_pending as f32 * fresh(*move_number);
+                if gave_check_last {
+                    opp_fouls_checked += w;
+                } else {
+                    opp_fouls_free += w;
+                }
+                opp_fouls_last = opp_fouls_pending;
+                opp_fouls_pending = 0;
             }
             Observation::MyFoul { move_number, usi } => {
                 // 今の手番の反則は下で foul_tried から載せる（反則は手番を変えないので
@@ -314,7 +346,8 @@ pub fn encode_into_cached(
                     gave_check_last = true;
                 }
             }
-            Observation::OpponentFoul { .. } => {}
+            // 相手のまだ閉じていない手番の反則（手番側の観測を書くときは無い）は数えない
+            Observation::OpponentFoul { .. } => opp_fouls_pending += 1,
         }
         model.apply(event);
     }
@@ -354,17 +387,39 @@ pub fn encode_into_cached(
             mine[i] += 1;
         }
     }
+    let mut hold = [0u32; 7];
     for (i, role) in HAND_ROLES.iter().enumerate() {
         let n = view.your_hand.get(role).copied().unwrap_or(0);
         let total = ROLE_TOTAL[i] as f32;
         p.fill(P_HAND + i, n as f32 / total);
-        let hold = ROLE_TOTAL[i].saturating_sub(mine[i] + n) as f32;
-        p.fill(P_OPP_HOLD + i, hold / total);
+        hold[i] = ROLE_TOTAL[i].saturating_sub(mine[i] + n);
+        p.fill(P_OPP_HOLD + i, hold[i] as f32 / total);
     }
     let history_broken = !history_consistent(&model, view);
+    let max_fouls = MAX_FOULS as f32;
+
+    if v3 {
+        // 相手の持ち駒の上界。相手の持ち駒は取った自駒からしか増えないので、取られた自駒の駒種別の数
+        // （成りは戻す）が上界になる。相手の打ちは見えないので減らせない（上界は増える一方）。
+        // 相手の保有数（盤上＋持ち駒）でも抑える。着手履歴が欠けているときは取られた駒を数え漏らしうるので、
+        // 保有数だけを使う（これも上界）
+        let mut lost = [0u32; 7];
+        for &(_, role) in model.lost_pieces() {
+            if let Some(i) = hand_index(unpromote_role(role)) {
+                lost[i] += 1;
+            }
+        }
+        for i in 0..7 {
+            let bound = if history_broken { hold[i] } else { lost[i].min(hold[i]) };
+            p.fill(E_HAND + i, bound as f32 / ROLE_TOTAL[i] as f32);
+        }
+        // 相手の反則の時系列（鮮度は相手の手番を閉じた `OpponentMoved` の手数で測る。P_LOST と同じ）
+        p.fill(E_FOUL + EF_LAST, opp_fouls_last as f32 / max_fouls);
+        p.fill(E_FOUL + EF_CHECKED, opp_fouls_checked / max_fouls);
+        p.fill(E_FOUL + EF_FREE, opp_fouls_free / max_fouls);
+    }
 
     // スカラー
-    let max_fouls = MAX_FOULS as f32;
     let scalars = [
         (S_MY_FOULS, view.fouls.you as f32 / max_fouls),
         (S_OPP_FOULS, view.fouls.opponent as f32 / max_fouls),
@@ -423,7 +478,7 @@ pub fn encode(view: &PlayerView, log: &ObservationLog, foul_tried: &HashSet<Stri
     encode_planes(NUM_PLANES, view, log, foul_tried)
 }
 
-/// プレーン数 `planes`（`NUM_PLANES` か `NUM_PLANES_DEDUCED`）の観測。重みのヘッダのプレーン数を渡す
+/// プレーン数 `planes`（`NUM_PLANES` / `NUM_PLANES_DEDUCED` / `NUM_PLANES_V3`）の観測。重みのヘッダのプレーン数を渡す
 pub fn encode_planes(
     planes: usize,
     view: &PlayerView,
@@ -600,8 +655,9 @@ mod tests {
     fn 確定事実の途中状態を使い回しても同じ観測になる() {
         let mut rng = StdRng::seed_from_u64(12);
         let mut caches = [DeducedCache::default(), DeducedCache::default()];
-        let mut fresh = vec![0.0; NUM_PLANES_DEDUCED * 81];
-        let mut cached = vec![0.0; NUM_PLANES_DEDUCED * 81];
+        // v3 は v2 を含むので、確定事実の途中状態も v3 の足したプレーンもまとめて検査する
+        let mut fresh = vec![0.0; NUM_PLANES_V3 * 81];
+        let mut cached = vec![0.0; NUM_PLANES_V3 * 81];
         let mut n = 0;
         for game in 0..12 {
             let mut referee = Referee::new();
@@ -640,11 +696,14 @@ mod tests {
         let mut elapsed = std::time::Duration::ZERO;
         let mut elapsed_v2 = std::time::Duration::ZERO;
         let mut elapsed_v2_cached = std::time::Duration::ZERO;
+        let mut elapsed_v3_cached = std::time::Duration::ZERO;
         let mut buf = vec![0.0; OBS_LEN];
         let mut buf_v2 = vec![0.0; NUM_PLANES_DEDUCED * 81];
+        let mut buf_v3 = vec![0.0; NUM_PLANES_V3 * 81];
         for game in 0..20 {
             let mut referee = Referee::new();
             let mut caches = [DeducedCache::default(), DeducedCache::default()];
+            let mut caches_v3 = [DeducedCache::default(), DeducedCache::default()];
             loop {
                 let side = referee.to_move();
                 let view = referee.view(side, [0, 0], game);
@@ -659,6 +718,10 @@ mod tests {
                 let t = std::time::Instant::now();
                 encode_into_cached(&view, referee.log(side), referee.foul_tried(side), &mut buf_v2, cache);
                 elapsed_v2_cached += t.elapsed();
+                let cache = &mut caches_v3[(side == Color::Gote) as usize];
+                let t = std::time::Instant::now();
+                encode_into_cached(&view, referee.log(side), referee.foul_tried(side), &mut buf_v3, cache);
+                elapsed_v3_cached += t.elapsed();
                 n += 1;
                 let actions: Vec<usize> = (0..NUM_ACTIONS).filter(|&a| mask[a]).collect();
                 if actions.is_empty() {
@@ -672,10 +735,11 @@ mod tests {
         }
         println!(
             "{n} 決定点、v1 のエンコード＋マスク 平均 {:.1}µs/決定点、v2 のエンコード 平均 {:.1}µs/決定点\
-             （途中状態を使い回すと {:.1}µs/決定点）",
+             （途中状態を使い回すと {:.1}µs/決定点。v3 は使い回して {:.1}µs/決定点）",
             elapsed.as_secs_f64() * 1e6 / n as f64,
             elapsed_v2.as_secs_f64() * 1e6 / n as f64,
-            elapsed_v2_cached.as_secs_f64() * 1e6 / n as f64
+            elapsed_v2_cached.as_secs_f64() * 1e6 / n as f64,
+            elapsed_v3_cached.as_secs_f64() * 1e6 / n as f64
         );
     }
 
@@ -745,6 +809,105 @@ mod tests {
         }
         println!("{n} 決定点: 占有 {n_occ} / 遮り {n_block} / 王手 {n_check} / 動けない歩 {n_pawn}");
         assert!(n_occ > 0 && n_block > 0 && n_check > 0, "検査が空振りしている");
+    }
+
+    /// エンコーダ v3 の前半は v2 と同じで、足した2組は審判の真実から数え直した値と一致する:
+    /// - 相手の持ち駒の上界 = min(相手が取った自駒の数, 相手の保有数)。取った数は「相手の本当の持ち駒＋相手が打った数」
+    ///   なので、上界は本当の持ち駒を下回らない
+    /// - 相手の反則の時系列 = 相手の手番ごとの反則数（王手を受けていたかで分ける。鮮度は手番を閉じた手数で測る）
+    #[test]
+    fn v3の足したプレーンは真実から数え直した値と一致する() {
+        #[derive(Default)]
+        struct Turn {
+            in_check: bool,
+            fouls: u32,
+        }
+        let mut rng = StdRng::seed_from_u64(13);
+        let (mut n, mut n_hand, mut n_tight, mut n_fouls, mut n_checked) = (0, 0, 0, 0, 0);
+        for game in 0..12 {
+            let mut referee = Referee::new();
+            // 確定事実はログを先頭からたどり直すと長い局ほど重いので、途中状態を使い回す（結果は同じ）
+            let mut caches = [DeducedCache::default(), DeducedCache::default()];
+            // 側ごとの閉じた手番（反則数と、手番の頭で王手を受けていたか。手番を閉じた手数つき）と、打った駒の数
+            let mut turns: [Vec<(Turn, u32)>; 2] = [vec![], vec![]];
+            let mut dropped = [[0u32; 7]; 2];
+            let mut cur = Turn::default();
+            loop {
+                let side = referee.to_move();
+                let (me, opp) = (side as usize, side.other() as usize);
+                let view = referee.view(side, [0, 0], game);
+                let (log, tried) = (referee.log(side), referee.foul_tried(side));
+                if tried.is_empty() {
+                    cur = Turn { in_check: referee.position().in_check(side), fouls: 0 };
+                }
+                let mut v2 = vec![0.0; NUM_PLANES_DEDUCED * 81];
+                let mut v3 = vec![0.0; NUM_PLANES_V3 * 81];
+                encode_into_cached(&view, log, tried, &mut v2, &mut caches[me]);
+                encode_into_cached(&view, log, tried, &mut v3, &mut caches[me]);
+                assert_eq!(&v3[..v2.len()], &v2[..], "v3 の前半は v2 と同じ");
+                assert!(v3.iter().all(|v| v.is_finite() && (0.0..=3.0).contains(v)));
+                let pos = referee.position();
+                for (i, &role) in HAND_ROLES.iter().enumerate() {
+                    let got = plane(&v3, E_HAND + i)[0] * ROLE_TOTAL[i] as f32;
+                    assert!(plane(&v3, E_HAND + i).iter().all(|&v| v == plane(&v3, E_HAND + i)[0]), "全面に放送");
+                    let hand = pos.hand_count(side.other(), role) as u32;
+                    let hold = hand
+                        + pos
+                            .pieces()
+                            .filter(|(_, p)| p.color != side && unpromote_role(p.role) == role)
+                            .count() as u32;
+                    let want = (hand + dropped[opp][i]).min(hold);
+                    assert!(
+                        (got - want as f32).abs() < 1e-4,
+                        "game {game} {side:?} {role:?}: 上界 {got} / 真実から {want}（持ち駒 {hand}、打った {}）",
+                        dropped[opp][i]
+                    );
+                    assert!(got + 1e-4 >= hand as f32, "上界が本当の持ち駒を下回る");
+                    n_tight += (want == hand) as u32;
+                    n_hand += 1;
+                }
+                let now = view.move_number;
+                let fresh = |mn: u32| DECAY.powi(now.saturating_sub(mn) as i32);
+                let last = turns[opp].last().map_or(0, |(t, _)| t.fouls);
+                let sum = |checked: bool| -> f32 {
+                    turns[opp]
+                        .iter()
+                        .filter(|(t, _)| t.in_check == checked)
+                        .map(|(t, mn)| t.fouls as f32 * fresh(*mn))
+                        .sum()
+                };
+                let foul = |k: usize| plane(&v3, E_FOUL + k)[0] * MAX_FOULS as f32;
+                assert!((foul(EF_LAST) - last as f32).abs() < 1e-4, "game {game}: 直前の手番の反則");
+                assert!((foul(EF_CHECKED) - sum(true)).abs() < 1e-4, "game {game}: 王手を受けていた手番の反則");
+                assert!((foul(EF_FREE) - sum(false)).abs() < 1e-4, "game {game}: 王手を受けていない手番の反則");
+                n_fouls += (last > 0) as u32;
+                n_checked += (sum(true) > 0.0) as u32;
+                n += 1;
+
+                let mask = legal_mask(&view, log, tried);
+                let actions: Vec<usize> = (0..NUM_ACTIONS).filter(|&a| mask[a]).collect();
+                if actions.is_empty() {
+                    break;
+                }
+                let usi = decode_usi(actions[rng.random_range(0..actions.len())], side).unwrap();
+                match referee.step(&usi, 0) {
+                    StepResult::Ended { .. } => break,
+                    StepResult::Foul => cur.fouls += 1,
+                    _ => {
+                        if let Some(ShogiMove::Drop { role, .. }) = parse_usi(&usi) {
+                            dropped[me][hand_index(role).unwrap()] += 1;
+                        }
+                        let mn = referee.position().move_number();
+                        turns[me].push((std::mem::take(&mut cur), mn));
+                    }
+                }
+            }
+        }
+        println!(
+            "{n} 決定点: 上界が本当の持ち駒と一致 {n_tight}/{n_hand}、直前の手番に相手の反則 {n_fouls}、\
+             王手を受けた手番の反則あり {n_checked}"
+        );
+        assert!(n_fouls > 0 && n_checked > 0 && n_tight < n_hand, "検査が空振りしている");
     }
 
     /// ランダム対局の全局面で値域が壊れない（NaN・無限大・負値が出ない）
