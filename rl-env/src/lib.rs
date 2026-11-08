@@ -17,7 +17,9 @@ use std::sync::Arc;
 
 use tsuitate_bot::protocol::Color;
 use tsuitate_bot::rl::action::NUM_ACTIONS;
-use tsuitate_bot::rl::encode::{EXTRA_PLANE_GROUPS, NUM_PLANES, NUM_PLANES_DEDUCED, NUM_PLANES_V3, OBS_LEN, obs_len};
+use tsuitate_bot::rl::encode::{
+    EXTRA_PLANE_GROUPS, NUM_PLANES, NUM_PLANES_DEDUCED, NUM_PLANES_V3, NUM_PLANES_V4, OBS_LEN, obs_len,
+};
 use tsuitate_bot::rl::env::{EnvGame, ForcedStats, GUARD_RADII, Outcome, SpeedSum, StyleStats};
 use tsuitate_bot::rl::forced::{ForcedBook, ForcedSides};
 use tsuitate_bot::selfplay::{GameResult, MAX_PLIES, mix};
@@ -277,7 +279,8 @@ impl VecEnv {
         if obs_len(planes).is_none() {
             return Err(PyValueError::new_err(format!(
                 "planes は {NUM_PLANES}（v1）・{NUM_PLANES_DEDUCED}（v2 = 確定事実のプレーンつき）・\
-                 {NUM_PLANES_V3}（v3 = v2 ＋相手の持ち駒の上界と相手の反則の時系列）のどれか（{planes}）"
+                 {NUM_PLANES_V3}（v3 = v2 ＋相手の持ち駒の上界と相手の反則の時系列）・\
+                 {NUM_PLANES_V4}（v4 = v3 ＋玉の移動で反則したマス）のどれか（{planes}）"
             )));
         }
         if !guard_bonus.is_finite() {
@@ -892,7 +895,8 @@ fn tsuitate_rl(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("NUM_PLANES", NUM_PLANES)?;
     m.add("NUM_PLANES_DEDUCED", NUM_PLANES_DEDUCED)?;
     m.add("NUM_PLANES_V3", NUM_PLANES_V3)?;
-    // v3 で足したプレーンの組 {名前: (先頭, 枚数)}。tsuitate-nn の model.EXTRA_PLANES との照合用
+    m.add("NUM_PLANES_V4", NUM_PLANES_V4)?;
+    // v3 / v4 で足したプレーンの組 {名前: (先頭, 枚数)}。tsuitate-nn の model.EXTRA_PLANES との照合用
     let groups = PyDict::new(m.py());
     for (name, start, len) in EXTRA_PLANE_GROUPS {
         groups.set_item(name, (start, len))?;

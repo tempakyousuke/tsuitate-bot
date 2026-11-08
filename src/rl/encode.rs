@@ -103,12 +103,22 @@ const EF_CHECKED: usize = 1; // 王手を受けていた相手の手番の反則
 const EF_FREE: usize = 2; // 王手を受けていない相手の手番の反則数（鮮度つきの合計）
 /// エンコーダ v3 のプレーン数（v2 + 相手の持ち駒の上界 7枚 + 相手の反則の時系列 3枚）
 pub const NUM_PLANES_V3: usize = E_FOUL + 3;
-/// v3 で足したプレーンの組（名前, 先頭のプレーン, 枚数）。tsuitate-nn の `model.EXTRA_PLANES` と同じ
-pub const EXTRA_PLANE_GROUPS: [(&str, usize, usize); 2] = [("opp_hand", E_HAND, 7), ("opp_fouls", E_FOUL, 3)];
+// エンコーダ v4（2026-11-08。設計 doc の「エンコーダ v3」の節の v4）。v3 の後ろに1枚足すだけなので、v3 の重みは
+// v4 の観測の先頭を読めばよい（v3 の実験の checkpoint をそのまま使える）。組の扱いは v3 と同じ（tsuitate-nn の
+// `--king-foul-planes`）
+const E_KING_FOUL: usize = NUM_PLANES_V3; // 1: 自玉の移動で反則したマス（鮮度は反則した手数から）
+/// エンコーダ v4 のプレーン数（v3 + 玉の移動で反則したマス 1枚）
+pub const NUM_PLANES_V4: usize = E_KING_FOUL + 1;
+/// v3 / v4 で足したプレーンの組（名前, 先頭のプレーン, 枚数）。tsuitate-nn の `model.EXTRA_PLANES` と同じ
+pub const EXTRA_PLANE_GROUPS: [(&str, usize, usize); 3] = [
+    ("opp_hand", E_HAND, 7),
+    ("opp_fouls", E_FOUL, 3),
+    ("king_fouls", E_KING_FOUL, 1),
+];
 
 /// プレーン数 → 観測の長さ。対応するエンコーダが無いプレーン数は None
 pub fn obs_len(planes: usize) -> Option<usize> {
-    [NUM_PLANES, NUM_PLANES_DEDUCED, NUM_PLANES_V3]
+    [NUM_PLANES, NUM_PLANES_DEDUCED, NUM_PLANES_V3, NUM_PLANES_V4]
         .contains(&planes)
         .then_some(planes * 81)
 }
@@ -219,7 +229,7 @@ impl DeducedCache {
 
 /// 観測をテンソルへ書く。`out` の長さでエンコーダの版を選ぶ: `OBS_LEN` は v1、
 /// `NUM_PLANES_DEDUCED * 81` は v2（v1 の後ろに確定事実のプレーン）、`NUM_PLANES_V3 * 81` は v3
-/// （v2 の後ろに相手の持ち駒の上界と相手の反則の時系列）
+/// （v2 の後ろに相手の持ち駒の上界と相手の反則の時系列）、`NUM_PLANES_V4 * 81` は v4（v3 の後ろに玉の移動で反則したマス）
 pub fn encode_into(
     view: &PlayerView,
     log: &ObservationLog,
@@ -243,7 +253,8 @@ pub fn encode_into_cached(
         "観測の長さ {} に対応するエンコーダが無い",
         out.len()
     );
-    let v3 = out.len() == NUM_PLANES_V3 * 81;
+    let v3 = out.len() >= NUM_PLANES_V3 * 81;
+    let v4 = out.len() == NUM_PLANES_V4 * 81;
     out.fill(0.0);
     if out.len() > OBS_LEN {
         encode_deduced(view, log, foul_tried, out, cache);
@@ -279,6 +290,11 @@ pub fn encode_into_cached(
     let mut opp_fouls_pending = 0u32;
     let mut opp_fouls_last = 0u32;
     let (mut opp_fouls_checked, mut opp_fouls_free) = (0.0f32, 0.0f32);
+    // 自玉の移動で反則したマス（v4）→ 最後に反則した手数。玉の手が反則になるのは「移動先に相手の利きがある」
+    // ときだけ（自駒のマスへの手は候補に無い）なので、反則した時点でそのマスに相手の利きがあったことが確定する。
+    // その後に玉がそのマスへ移動できたら（受理されたら）消す
+    let mut king_sq = Position::initial().king_square(color);
+    let mut king_fouls: Vec<(Coord, u32)> = vec![];
     for event in log.events() {
         match event {
             Observation::MyMove {
@@ -292,6 +308,10 @@ pub fn encode_into_cached(
                 if let Some((from, to)) = move_squares(usi) {
                     if let Some(from) = from {
                         unmoved.remove(&from);
+                        if Some(from) == king_sq {
+                            king_sq = Some(to);
+                            king_fouls.retain(|&(c, _)| c != to);
+                        }
                     }
                     if let Some(role) = captured {
                         p.max(P_CAP, to, fresh(*move_number));
@@ -322,6 +342,12 @@ pub fn encode_into_cached(
                 opp_fouls_pending = 0;
             }
             Observation::MyFoul { move_number, usi } => {
+                if let Some((Some(from), to)) = move_squares(usi) {
+                    if Some(from) == king_sq {
+                        king_fouls.retain(|&(c, _)| c != to);
+                        king_fouls.push((to, *move_number));
+                    }
+                }
                 // 今の手番の反則は下で foul_tried から載せる（反則は手番を変えないので
                 // move_number が今と同じものが今の手番）
                 if *move_number != now {
@@ -418,6 +444,12 @@ pub fn encode_into_cached(
         p.fill(E_FOUL + EF_CHECKED, opp_fouls_checked / max_fouls);
         p.fill(E_FOUL + EF_FREE, opp_fouls_free / max_fouls);
     }
+    // 着手履歴が欠けていると自玉の位置を追えないので書かない（違うマスを確定事実として載せない）
+    if v4 && !history_broken {
+        for &(c, mn) in &king_fouls {
+            p.set(E_KING_FOUL, c, fresh(mn));
+        }
+    }
 
     // スカラー
     let scalars = [
@@ -478,7 +510,8 @@ pub fn encode(view: &PlayerView, log: &ObservationLog, foul_tried: &HashSet<Stri
     encode_planes(NUM_PLANES, view, log, foul_tried)
 }
 
-/// プレーン数 `planes`（`NUM_PLANES` / `NUM_PLANES_DEDUCED` / `NUM_PLANES_V3`）の観測。重みのヘッダのプレーン数を渡す
+/// プレーン数 `planes`（`NUM_PLANES` / `NUM_PLANES_DEDUCED` / `NUM_PLANES_V3` / `NUM_PLANES_V4`）の観測。
+/// 重みのヘッダのプレーン数を渡す
 pub fn encode_planes(
     planes: usize,
     view: &PlayerView,
@@ -646,6 +679,23 @@ mod tests {
         // 角: 総数2 − 盤上の馬1 − 持ち駒1 = 0、歩: 18 − 0 − 0 = 18
         assert_eq!(plane(&obs, P_OPP_HOLD + 5)[0], 0.0);
         assert_eq!(plane(&obs, P_OPP_HOLD)[0], 1.0);
+
+        // 履歴が欠けていると自玉の位置を追えないので、玉の移動で反則したマス（v4）は書かない。
+        // ログには初期位置の玉（5九）の反則が残っているが、本当の自玉がそこにいたとは限らない
+        let mut log = ObservationLog::default();
+        log.record(Observation::MyFoul { move_number: 59, usi: "5i5h".into() });
+        let view = referee.view(Color::Sente, [0, 0], 0);
+        let v4 = encode_planes(NUM_PLANES_V4, &view, &log, &HashSet::new());
+        assert_eq!(plane(&v4, P_SCALAR + S_HISTORY_BROKEN)[0], 1.0);
+        assert!(plane(&v4, E_KING_FOUL).iter().all(|&v| v == 0.0), "履歴が欠けた局で玉の反則マスを書いた");
+        // 同じ反則でも履歴が揃っていれば書く（初期局面から玉が 5八 へ行こうとして反則）
+        let fresh_ref = Referee::new();
+        let view = fresh_ref.view(Color::Sente, [0, 0], 0);
+        let mut log = ObservationLog::default();
+        log.record(Observation::MyFoul { move_number: 1, usi: "5i5h".into() });
+        let v4 = encode_planes(NUM_PLANES_V4, &view, &log, &HashSet::new());
+        assert_eq!(plane(&v4, P_SCALAR + S_HISTORY_BROKEN)[0], 0.0);
+        assert_eq!(plane(&v4, E_KING_FOUL)[square_index(normalize(sq("5h"), Color::Sente))], 1.0);
     }
 
     /// 確定事実の途中状態を使い回しても（`encode_into_cached`）、毎回たどり直すのと同じ観測になる。
@@ -655,9 +705,9 @@ mod tests {
     fn 確定事実の途中状態を使い回しても同じ観測になる() {
         let mut rng = StdRng::seed_from_u64(12);
         let mut caches = [DeducedCache::default(), DeducedCache::default()];
-        // v3 は v2 を含むので、確定事実の途中状態も v3 の足したプレーンもまとめて検査する
-        let mut fresh = vec![0.0; NUM_PLANES_V3 * 81];
-        let mut cached = vec![0.0; NUM_PLANES_V3 * 81];
+        // v4 は v2・v3 を含むので、確定事実の途中状態も v3・v4 の足したプレーンもまとめて検査する
+        let mut fresh = vec![0.0; NUM_PLANES_V4 * 81];
+        let mut cached = vec![0.0; NUM_PLANES_V4 * 81];
         let mut n = 0;
         for game in 0..12 {
             let mut referee = Referee::new();
@@ -696,14 +746,14 @@ mod tests {
         let mut elapsed = std::time::Duration::ZERO;
         let mut elapsed_v2 = std::time::Duration::ZERO;
         let mut elapsed_v2_cached = std::time::Duration::ZERO;
-        let mut elapsed_v3_cached = std::time::Duration::ZERO;
+        let mut elapsed_v4_cached = std::time::Duration::ZERO;
         let mut buf = vec![0.0; OBS_LEN];
         let mut buf_v2 = vec![0.0; NUM_PLANES_DEDUCED * 81];
-        let mut buf_v3 = vec![0.0; NUM_PLANES_V3 * 81];
+        let mut buf_v4 = vec![0.0; NUM_PLANES_V4 * 81];
         for game in 0..20 {
             let mut referee = Referee::new();
             let mut caches = [DeducedCache::default(), DeducedCache::default()];
-            let mut caches_v3 = [DeducedCache::default(), DeducedCache::default()];
+            let mut caches_v4 = [DeducedCache::default(), DeducedCache::default()];
             loop {
                 let side = referee.to_move();
                 let view = referee.view(side, [0, 0], game);
@@ -718,10 +768,10 @@ mod tests {
                 let t = std::time::Instant::now();
                 encode_into_cached(&view, referee.log(side), referee.foul_tried(side), &mut buf_v2, cache);
                 elapsed_v2_cached += t.elapsed();
-                let cache = &mut caches_v3[(side == Color::Gote) as usize];
+                let cache = &mut caches_v4[(side == Color::Gote) as usize];
                 let t = std::time::Instant::now();
-                encode_into_cached(&view, referee.log(side), referee.foul_tried(side), &mut buf_v3, cache);
-                elapsed_v3_cached += t.elapsed();
+                encode_into_cached(&view, referee.log(side), referee.foul_tried(side), &mut buf_v4, cache);
+                elapsed_v4_cached += t.elapsed();
                 n += 1;
                 let actions: Vec<usize> = (0..NUM_ACTIONS).filter(|&a| mask[a]).collect();
                 if actions.is_empty() {
@@ -735,11 +785,11 @@ mod tests {
         }
         println!(
             "{n} 決定点、v1 のエンコード＋マスク 平均 {:.1}µs/決定点、v2 のエンコード 平均 {:.1}µs/決定点\
-             （途中状態を使い回すと {:.1}µs/決定点。v3 は使い回して {:.1}µs/決定点）",
+             （途中状態を使い回すと {:.1}µs/決定点。v4 は使い回して {:.1}µs/決定点）",
             elapsed.as_secs_f64() * 1e6 / n as f64,
             elapsed_v2.as_secs_f64() * 1e6 / n as f64,
             elapsed_v2_cached.as_secs_f64() * 1e6 / n as f64,
-            elapsed_v3_cached.as_secs_f64() * 1e6 / n as f64
+            elapsed_v4_cached.as_secs_f64() * 1e6 / n as f64
         );
     }
 
@@ -811,10 +861,12 @@ mod tests {
         assert!(n_occ > 0 && n_block > 0 && n_check > 0, "検査が空振りしている");
     }
 
-    /// エンコーダ v3 の前半は v2 と同じで、足した2組は審判の真実から数え直した値と一致する:
+    /// エンコーダ v3 の前半は v2 と同じ・v4 の前半は v3 と同じで、足した組は審判の真実から数え直した値と一致する:
     /// - 相手の持ち駒の上界 = min(相手が取った自駒の数, 相手の保有数)。取った数は「相手の本当の持ち駒＋相手が打った数」
     ///   なので、上界は本当の持ち駒を下回らない
     /// - 相手の反則の時系列 = 相手の手番ごとの反則数（王手を受けていたかで分ける。鮮度は手番を閉じた手数で測る）
+    /// - 玉の移動で反則したマス（v4）= 審判で反則になった自玉の手の移動先（その後に玉がそこへ移動できたものは除く）。
+    ///   反則した時点で、自玉を除いた盤でそのマスに相手の利きがある
     #[test]
     fn v3の足したプレーンは真実から数え直した値と一致する() {
         #[derive(Default)]
@@ -823,7 +875,7 @@ mod tests {
             fouls: u32,
         }
         let mut rng = StdRng::seed_from_u64(13);
-        let (mut n, mut n_hand, mut n_tight, mut n_fouls, mut n_checked) = (0, 0, 0, 0, 0);
+        let (mut n, mut n_hand, mut n_tight, mut n_fouls, mut n_checked, mut n_king) = (0, 0, 0, 0, 0, 0);
         for game in 0..12 {
             let mut referee = Referee::new();
             // 確定事実はログを先頭からたどり直すと長い局ほど重いので、途中状態を使い回す（結果は同じ）
@@ -831,6 +883,8 @@ mod tests {
             // 側ごとの閉じた手番（反則数と、手番の頭で王手を受けていたか。手番を閉じた手数つき）と、打った駒の数
             let mut turns: [Vec<(Turn, u32)>; 2] = [vec![], vec![]];
             let mut dropped = [[0u32; 7]; 2];
+            // 側ごとの、自玉の移動で反則したマスと反則した手数
+            let mut king_fouls: [Vec<(Coord, u32)>; 2] = [vec![], vec![]];
             let mut cur = Turn::default();
             loop {
                 let side = referee.to_move();
@@ -842,10 +896,13 @@ mod tests {
                 }
                 let mut v2 = vec![0.0; NUM_PLANES_DEDUCED * 81];
                 let mut v3 = vec![0.0; NUM_PLANES_V3 * 81];
+                let mut v4 = vec![0.0; NUM_PLANES_V4 * 81];
                 encode_into_cached(&view, log, tried, &mut v2, &mut caches[me]);
                 encode_into_cached(&view, log, tried, &mut v3, &mut caches[me]);
+                encode_into_cached(&view, log, tried, &mut v4, &mut caches[me]);
                 assert_eq!(&v3[..v2.len()], &v2[..], "v3 の前半は v2 と同じ");
-                assert!(v3.iter().all(|v| v.is_finite() && (0.0..=3.0).contains(v)));
+                assert_eq!(&v4[..v3.len()], &v3[..], "v4 の前半は v3 と同じ");
+                assert!(v4.iter().all(|v| v.is_finite() && (0.0..=3.0).contains(v)));
                 let pos = referee.position();
                 for (i, &role) in HAND_ROLES.iter().enumerate() {
                     let got = plane(&v3, E_HAND + i)[0] * ROLE_TOTAL[i] as f32;
@@ -882,6 +939,17 @@ mod tests {
                 assert!((foul(EF_FREE) - sum(false)).abs() < 1e-4, "game {game}: 王手を受けていない手番の反則");
                 n_fouls += (last > 0) as u32;
                 n_checked += (sum(true) > 0.0) as u32;
+                let mut want = vec![0.0f32; 81];
+                for &(c, mn) in &king_fouls[me] {
+                    want[square_index(normalize(c, side))] = fresh(mn);
+                }
+                let got = plane(&v4, E_KING_FOUL);
+                assert!(
+                    got.iter().zip(&want).all(|(a, b)| (a - b).abs() < 1e-6),
+                    "game {game} {side:?}: 玉の反則マス {:?}",
+                    king_fouls[me]
+                );
+                n_king += (!king_fouls[me].is_empty()) as u32;
                 n += 1;
 
                 let mask = legal_mask(&view, log, tried);
@@ -890,10 +958,31 @@ mod tests {
                     break;
                 }
                 let usi = decode_usi(actions[rng.random_range(0..actions.len())], side).unwrap();
+                let mn_before = referee.position().move_number();
+                let king_to = match parse_usi(&usi) {
+                    Some(ShogiMove::Board { from, to, .. })
+                        if referee.position().piece_at(from).is_some_and(|p| p.role == Role::King) =>
+                    {
+                        Some((from, to))
+                    }
+                    _ => None,
+                };
                 match referee.step(&usi, 0) {
                     StepResult::Ended { .. } => break,
-                    StepResult::Foul => cur.fouls += 1,
+                    StepResult::Foul => {
+                        cur.fouls += 1;
+                        if let Some((from, to)) = king_to {
+                            let mut wk = referee.position().clone();
+                            wk.set(from, None);
+                            assert!(wk.is_attacked(to, side.other()), "玉の反則なのに移動先に相手の利きが無い");
+                            king_fouls[me].retain(|&(c, _)| c != to);
+                            king_fouls[me].push((to, mn_before));
+                        }
+                    }
                     _ => {
+                        if let Some((_, to)) = king_to {
+                            king_fouls[me].retain(|&(c, _)| c != to);
+                        }
                         if let Some(ShogiMove::Drop { role, .. }) = parse_usi(&usi) {
                             dropped[me][hand_index(role).unwrap()] += 1;
                         }
@@ -905,9 +994,9 @@ mod tests {
         }
         println!(
             "{n} 決定点: 上界が本当の持ち駒と一致 {n_tight}/{n_hand}、直前の手番に相手の反則 {n_fouls}、\
-             王手を受けた手番の反則あり {n_checked}"
+             王手を受けた手番の反則あり {n_checked}、玉の反則マスあり {n_king}"
         );
-        assert!(n_fouls > 0 && n_checked > 0 && n_tight < n_hand, "検査が空振りしている");
+        assert!(n_fouls > 0 && n_checked > 0 && n_king > 0 && n_tight < n_hand, "検査が空振りしている");
     }
 
     /// ランダム対局の全局面で値域が壊れない（NaN・無限大・負値が出ない）
