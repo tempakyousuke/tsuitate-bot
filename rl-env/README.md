@@ -96,6 +96,9 @@ env.signals()                      # 局の信号 [n, 2, K] f32（[先手, 後�
   0 は本物）を学習の相手と進み具合の物差しに使う。雑音の手は合法手なので反則にはならない（弱さは悪手として出る）。
   乱数は `seed`・局番号・相手の手番の通し番号で決まる。`@` の後ろが 0〜1 の数でなければ全体を名前として読む。
   `pop_finished()` の `opponent` は `<名前>@<ε>` のまま、`noise_moves` は雑音で指した手の数。序盤の強制とは一緒に使えない
+- **`random_legal_actions(u)`**: 各局の今の手番について、真実の盤面の合法手から一様に選んだ行動番号 `[n]`（`u` は局ごとの
+  一様乱数 [0, 1)。負の値の局と終局した局は −1）。相手のネットに学習側の env の上で指させる形（tsuitate-nn の
+  `collect(opponents=...)` = `--league-device gpu`）で、同じハンデ（合法手の乱数手）を作るのに使う。返す行動はマスクの中にある
 - **`signals()`**: 各局の**局の信号** `[n, 2, K]`（[先手, 後手] × `tsuitate_rl.SIGNAL_NAMES`。`src/rl/signals.rs`）。
   累積の信号（`moves` 受理手 / `fouls` 反則 / `fouls_in_check` 王手を受けている手番の反則 / `captures` 取った駒の数 /
   `capture_value` 取った駒の価値〔歩 = 1。成駒は盤上と持ち駒の価値の平均〕/ `promotions` 成り / `checks` かけた王手 /

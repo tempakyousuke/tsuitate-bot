@@ -17,6 +17,7 @@
 | R-NaD の学習方法どうしの速さの比べ方（固定パネル・代理・GPU の A/B）と実験の結果 | `docs/rl-learning-speed.md` |
 | MMD 学習器（Ataraxos 型、`--algo mmd`）の設計 | `docs/rl-mmd-design.md`（結果と A/B の手順は `docs/rl-learning-speed.md` 10節） |
 | 序盤が速攻1本に固まったことの計測と、学習の自己対局で序盤を定跡から指させる仕組み（`--open-book`） | `docs/rl-opening-diversity.md` |
+| 既存のモデルを相手にゼロから学習する実験（報酬の整形 `--shape`・負けるまでの長さ・ハンデつきの相手 `<名前>@<ε>`・局の信号） | `docs/rl-fixed-opponent.md` |
 
 ## コマンド
 
