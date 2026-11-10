@@ -8,7 +8,7 @@
 //! `auto_reset=False` なら終局した局はそのまま止まり（行動は -1 を渡す）、`reset()` で
 //! まとめて新しい局にする（R-NaD のように1局を丸ごと集める学習用）。
 
-use numpy::{PyArray1, PyArray2, PyArray4, PyArrayMethods, PyReadonlyArray1};
+use numpy::{PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray1};
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -18,8 +18,9 @@ use std::sync::Arc;
 use tsuitate_bot::protocol::Color;
 use tsuitate_bot::rl::action::NUM_ACTIONS;
 use tsuitate_bot::rl::encode::{EXTRA_PLANE_GROUPS, NUM_PLANES, NUM_PLANES_DEDUCED, NUM_PLANES_V3, OBS_LEN, obs_len};
-use tsuitate_bot::rl::env::{EnvGame, ForcedStats, GUARD_RADII, Outcome, SpeedSum, StyleStats};
+use tsuitate_bot::rl::env::{EnvGame, ForcedStats, GUARD_RADII, OppNoise, Outcome, SpeedSum, StyleStats};
 use tsuitate_bot::rl::forced::{ForcedBook, ForcedSides};
+use tsuitate_bot::rl::signals::{NUM_SIGNALS, SIGNAL_NAMES};
 use tsuitate_bot::selfplay::{GameResult, MAX_PLIES, mix};
 use tsuitate_bot::strategy::{self, Strategy};
 
@@ -34,8 +35,10 @@ type StepOut<'py> = (Bound<'py, PyArray2<f32>>, Bound<'py, PyArray1<bool>>);
 struct Finished {
     game_no: u32,
     learner: Option<Color>,
-    /// 評価モードの相手の名前（自己対局は None）
+    /// 評価モードの相手の名前（自己対局は None。ハンデつきは `<名前>@<ε>` のまま）
     opponent: Option<String>,
+    /// ハンデの雑音で指した相手の手の数
+    noise_moves: u32,
     outcome: Outcome,
     style: StyleStats,
     /// 序盤の強制の記録 [先手, 後手]
@@ -113,6 +116,7 @@ impl GameSpec {
             game_no: game.game_no(),
             learner: self.learner(game.game_no()),
             opponent: self.opponent(game.game_no()).cloned(),
+            noise_moves: game.noise_moves(),
             outcome: game.outcome().expect("終局した局だけを記録する"),
             style: *game.style(),
             forced: game.forced_stats(),
@@ -123,14 +127,21 @@ impl GameSpec {
     }
 
     fn build(&self, game_no: u32, open: OpeningCtx) -> EnvGame {
+        let game_seed = mix(self.seed ^ mix(u64::from(game_no)));
+        let eps = self.opponent(game_no).map_or(0.0, |spec| split_noise(spec).1);
         let opp = self.opponent(game_no).map(|name| {
-            make_opponent(name, mix(self.seed ^ mix(u64::from(game_no)))).expect("相手の名前は new で検査済み")
+            make_opponent(name, game_seed).expect("相手の名前は new で検査済み")
         });
         let learner = opp.as_ref().map(|_| learner_of(game_no));
         match &self.opening {
             // 強制しない env はこれまでと同じ経路で作る
             None => match opp {
                 None => EnvGame::selfplay(None, game_no),
+                Some(opp) if eps > 0.0 => {
+                    // ハンデ（相手の手の雑音）。乱数は局の seed から別の列を作る
+                    let noise = OppNoise { eps, seed: mix(game_seed ^ 0x6e6f_6973_65) };
+                    EnvGame::versus_noisy(learner_of(game_no), opp, game_no, noise)
+                }
                 Some(opp) => EnvGame::versus(None, learner_of(game_no), opp, game_no),
             },
             Some(book) => {
@@ -212,7 +223,22 @@ fn learner_of(game_no: u32) -> Color {
     }
 }
 
-fn make_opponent(name: &str, seed: u64) -> Option<Box<dyn Strategy + Send>> {
+/// 相手の指定 `<名前>` か `<名前>@<ε>`（**ハンデ**: 相手の手番ごとに確率 ε で、相手の戦略の手の代わりに
+/// 真実の盤面の合法手から一様に選んだ手を指させる。`EnvGame::versus_noisy`）を (名前, ε) に分ける。
+/// 末尾の `@` の後ろが 0〜1 の数でなければ、全体を名前として扱う（重みのパスに `@` があってもよい）
+fn split_noise(spec: &str) -> (&str, f32) {
+    if let Some((name, eps)) = spec.rsplit_once('@') {
+        if let Ok(e) = eps.parse::<f32>() {
+            if (0.0..=1.0).contains(&e) {
+                return (name, e);
+            }
+        }
+    }
+    (spec, 0.0)
+}
+
+fn make_opponent(spec: &str, seed: u64) -> Option<Box<dyn Strategy + Send>> {
+    let (name, _) = split_noise(spec);
     strategy::make_seeded(name, seed).or_else(|| strategy::make(name))
 }
 
@@ -336,6 +362,11 @@ impl VecEnv {
                 None
             }
             Some(lines) => {
+                if opening_prob > 0.0 && opponents.iter().any(|o| split_noise(o).1 > 0.0) {
+                    return Err(PyValueError::new_err(
+                        "序盤の強制はハンデつきの相手（<名前>@<ε>）と一緒に使えない",
+                    ));
+                }
                 let book = ForcedBook::new(&lines, opening_weights.as_deref(), opening_prob, opening_len, sides)
                     .map_err(PyValueError::new_err)?;
                 if sides.needs_learner() && opponents.is_empty() {
@@ -609,6 +640,56 @@ impl VecEnv {
         PyArray1::from_vec(py, out).reshape([n, 81])
     }
 
+    /// 各局の**局の信号** `[n, 2, NUM_SIGNALS]`（f32。[先手, 後手] × `SIGNAL_NAMES` の並び。
+    /// `rl::signals`）。累積の信号（受理手・反則・駒取り・王手など）と、今の真実の盤面から計算する状態の信号
+    /// （駒の価値の合計・相手玉の周りへの利き・自玉の周りの自駒など）。終局して止まっている局は終局時の値。
+    ///
+    /// **報酬の整形・監視専用**（真実の盤面を読む信号を含むので、方策の入力には使わない）。
+    /// 学習側は連続する2時点の差に重みを掛けて報酬にする（tsuitate-nn の `rnad/shaping.py`）
+    fn signals<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray3<f32>>> {
+        let n = self.games.len();
+        let mut out = vec![0.0f32; n * 2 * NUM_SIGNALS];
+        for (o, g) in out.chunks_mut(2 * NUM_SIGNALS).zip(&self.games) {
+            g.signals_into(o);
+        }
+        PyArray1::from_vec(py, out).reshape([n, 2, NUM_SIGNALS])
+    }
+
+    /// 各局の今の手番について、**真実の盤面の合法手**から一様に選んだ行動番号 `[n]`（i64）。`u` は局ごとの
+    /// 一様乱数 [0, 1)（Python 側で引く）で、**負の値の局は選ばずに −1 を返す**（終局した局も −1）。
+    /// 相手のネットに指させる形（tsuitate-nn の `collect(opponents=...)`）でハンデつきの相手 `<名前>@<ε>` の
+    /// 雑音の手を作るのに使う（`EnvGame::random_legal_action`。評価モードの `<名前>@<ε>` と同じ「合法手の乱数手」）。
+    /// 返す行動はマスクの中にあるので、そのまま `step` に渡せる。方策の入力には使わない
+    // &mut なのは rayon で局を分けるため（observe と同じ）
+    fn random_legal_actions<'py>(
+        &mut self,
+        py: Python<'py>,
+        u: PyReadonlyArray1<'py, f64>,
+    ) -> PyResult<Bound<'py, PyArray1<i64>>> {
+        let u = u.as_slice()?;
+        if u.len() != self.games.len() {
+            return Err(PyValueError::new_err(format!(
+                "u の長さ {} が局数 {} と違う",
+                u.len(),
+                self.games.len()
+            )));
+        }
+        let games = &mut self.games;
+        let out: Vec<i64> = py.detach(|| {
+            games
+                .par_iter_mut()
+                .zip(u.par_iter())
+                .map(|(g, &x): (&mut EnvGame, &f64)| {
+                    if x < 0.0 {
+                        return -1;
+                    }
+                    g.random_legal_action(x).map_or(-1, |a| a as i64)
+                })
+                .collect()
+        });
+        Ok(PyArray1::from_vec(py, out))
+    }
+
     /// 評価モードで各局の学習側の色（0=先手 1=後手）。自己対局では -1。
     /// **今の局の色**なので、`step` が返す報酬の列を選ぶには step の前に取っておくこと
     fn learner_colors<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i8>> {
@@ -636,6 +717,7 @@ impl VecEnv {
             d.set_item("fouls", f.outcome.fouls.to_vec())?;
             d.set_item("learner", f.learner.map(color_code))?;
             d.set_item("opponent", f.opponent)?;
+            d.set_item("noise_moves", f.noise_moves)?;
             // 玉の周りを固める戦法の集計（[先手, 後手]）。guard_r1 / guard_r2 は半径1（8近傍）/
             // 半径2 の占有率の対局平均、near_* は自玉から距離2以内の打ち・打ちの反則・駒取りの回数
             for (r, &radius) in GUARD_RADII.iter().enumerate() {
@@ -898,5 +980,7 @@ fn tsuitate_rl(m: &Bound<'_, PyModule>) -> PyResult<()> {
         groups.set_item(name, (start, len))?;
     }
     m.add("EXTRA_PLANE_GROUPS", groups)?;
+    // 局の信号の名前（`VecEnv.signals()` の最後の軸の並び。tsuitate-nn の rnad/shaping.py が名前で引く）
+    m.add("SIGNAL_NAMES", SIGNAL_NAMES.to_vec())?;
     Ok(())
 }

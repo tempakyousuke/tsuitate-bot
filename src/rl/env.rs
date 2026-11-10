@@ -12,10 +12,11 @@
 use crate::board::Coord;
 use crate::protocol::{Color, Role};
 use crate::referee::{Referee, StepResult};
-use crate::rl::action::{NUM_ACTIONS, decode_usi, index_square, legal_mask, normalize};
+use crate::rl::action::{NUM_ACTIONS, decode_usi, encode_usi, index_square, legal_mask, normalize};
 use crate::rl::encode::{DeducedCache, encode_into_cached};
 use crate::rl::forced::ForcedPlan;
-use crate::selfplay::{GameResult, StartState, fischer_initial_ms};
+use crate::rl::signals::{EventCounts, MoveEvent, NUM_SIGNALS, signals_into};
+use crate::selfplay::{GameResult, StartState, fischer_initial_ms, mix};
 use crate::shogi::{ShogiMove, parse_usi};
 use crate::strategy::Strategy;
 
@@ -215,6 +216,19 @@ pub struct ForcedStats {
     pub stop: Option<&'static str>,
 }
 
+/// **相手の手を弱める雑音**（評価モード。docs/rl-fixed-opponent.md の「ハンデ」）: 相手の手番ごとに確率 `eps` で、
+/// 相手の戦略の手の代わりに**真実の盤面の合法手から一様に選んだ手**を指させる。
+///
+/// 強い相手にゼロから当たると1局も勝てず、勝敗の信号が届かない。同じ相手を雑音で弱めた版なら勝ちが出るので、
+/// 雑音の段（例 0.5 → 0.3 → 0.1 → 0）が「同じ相手へ向かう梯子」になる（学習の相手にも、進み具合の物差しにも使う）。
+/// 雑音の手は合法手なので反則にはならない（相手の反則負けで勝たせる形にしない。弱さは悪手として出る）。
+/// 乱数は `seed` と相手の手番の通し番号だけで決まる（同じ seed・同じ行動列 → 同じ局）
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct OppNoise {
+    pub eps: f32,
+    pub seed: u64,
+}
+
 pub struct EnvGame {
     referee: Referee,
     /// 評価モードで学習側が持つ色（None = 自己対局。両者とも学習側）
@@ -236,12 +250,19 @@ pub struct EnvGame {
     /// 各側の受理手の数と、受理手が `EARLY_MOVES` に届くまでの反則の数 [先手, 後手]
     own_moves: [u32; 2],
     fouls_early: [u32; 2],
+    /// 局の信号のうち累積のもの（報酬の整形・監視用。`rl::signals`）
+    events: EventCounts,
+    /// 相手の手を弱める雑音（評価モードだけ。eps = 0 なら使わない = 従来と同じ局）
+    noise: OppNoise,
+    /// 相手の手番の通し番号（雑音の乱数の鍵）と、雑音で指した手の数
+    opp_turns: u64,
+    noise_moves: u32,
 }
 
 impl EnvGame {
     /// 自己対局の1局。`start` が None なら初期局面から
     pub fn selfplay(start: Option<StartState>, game_no: u32) -> Self {
-        Self::build(start, None, None, game_no, [None, None])
+        Self::build(start, None, None, game_no, [None, None], OppNoise::default())
     }
 
     /// 序盤を強制する1局（初期局面から。`plans` は [先手, 後手]、`rl::forced`）。
@@ -253,7 +274,7 @@ impl EnvGame {
         plans: [Option<ForcedPlan>; 2],
     ) -> Self {
         assert_eq!(learner.is_some(), opponent.is_some(), "評価モードは学習側の色と相手の両方を持つ");
-        Self::build(None, learner, opponent, game_no, plans)
+        Self::build(None, learner, opponent, game_no, plans, OppNoise::default())
     }
 
     /// 評価モードの1局。`opponent` が `learner` の相手側を指す
@@ -263,7 +284,23 @@ impl EnvGame {
         opponent: Box<dyn Strategy + Send>,
         game_no: u32,
     ) -> Self {
-        Self::build(start, Some(learner), Some(opponent), game_no, [None, None])
+        Self::build(start, Some(learner), Some(opponent), game_no, [None, None], OppNoise::default())
+    }
+
+    /// 評価モードの1局で、相手の手を雑音で弱める（`OppNoise`。eps = 0 なら `versus` と同じ局）
+    pub fn versus_noisy(
+        learner: Color,
+        opponent: Box<dyn Strategy + Send>,
+        game_no: u32,
+        noise: OppNoise,
+    ) -> Self {
+        assert!((0.0..=1.0).contains(&noise.eps), "雑音の確率は 0〜1");
+        Self::build(None, Some(learner), Some(opponent), game_no, [None, None], noise)
+    }
+
+    /// 雑音で指した相手の手の数（終局後も読める）
+    pub fn noise_moves(&self) -> u32 {
+        self.noise_moves
     }
 
     fn build(
@@ -272,6 +309,7 @@ impl EnvGame {
         opponent: Option<Box<dyn Strategy + Send>>,
         game_no: u32,
         plans: [Option<ForcedPlan>; 2],
+        noise: OppNoise,
     ) -> Self {
         let referee = start.map_or_else(Referee::new, Referee::from_start);
         let [s, g] = plans;
@@ -289,6 +327,10 @@ impl EnvGame {
             fouls_precontact: [0, 0],
             own_moves: [0, 0],
             fouls_early: [0, 0],
+            events: EventCounts::default(),
+            noise,
+            opp_turns: 0,
+            noise_moves: 0,
         };
         game.style.sample(&game.referee);
         game.settle();
@@ -347,6 +389,15 @@ impl EnvGame {
         self.fouls_early
     }
 
+    /// 両者の**局の信号**を書く（`out` は長さ `2 * NUM_SIGNALS`、[先手の信号…, 後手の信号…]。
+    /// 並びは `rl::signals::SIGNAL_NAMES`）。終局後も読める（終局時の盤面の値）。
+    ///
+    /// **報酬の整形・監視専用**（真実の盤面を読む信号を含むので、方策の入力には使わない）
+    pub fn signals_into(&self, out: &mut [f32]) {
+        debug_assert_eq!(out.len(), 2 * NUM_SIGNALS);
+        signals_into(self.referee.position(), &self.events, out);
+    }
+
     /// 審判へ1手渡し、玉の周りの集計を更新する（学習側・相手側の両方の手がここを通る）
     fn play(&mut self, usi: &str) -> StepResult {
         let side = self.referee.to_move();
@@ -354,6 +405,13 @@ impl EnvGame {
         let pos = self.referee.position();
         let king = pos.king_square(side);
         let mv = parse_usi(usi);
+        let was_in_check = pos.in_check(side);
+        // 取る駒（盤上での駒種）。打ちは駒を取れない
+        let capture = match mv {
+            Some(ShogiMove::Board { to, .. }) => pos.piece_at(to).filter(|p| p.color != side).map(|p| p.role),
+            _ => None,
+        };
+        let promoted = matches!(mv, Some(ShogiMove::Board { promote: true, .. }));
         let target = match mv {
             Some(ShogiMove::Board { to, .. }) | Some(ShogiMove::Drop { to, .. }) => Some(to),
             None => None,
@@ -383,6 +441,20 @@ impl EnvGame {
             self.style.sample(&self.referee);
         }
         let fouled = matches!(result, StepResult::Foul | StepResult::Ended { move_accepted: false, .. });
+        if accepted || fouled {
+            self.events.record(
+                side,
+                MoveEvent {
+                    accepted,
+                    was_in_check,
+                    drop: is_drop,
+                    promoted,
+                    captured: capture,
+                    // 受理された手の後の手番は相手。相手玉に王手がかかっていれば王手をかけた手
+                    gave_check: accepted && self.referee.position().in_check(side.other()),
+                },
+            );
+        }
         if fouled && self.own_moves[i] < EARLY_MOVES {
             self.fouls_early[i] += 1;
         }
@@ -426,6 +498,22 @@ impl EnvGame {
                 Some(p) => TRUTH_ROLES.iter().position(|&r| r == p.role).map_or(0, |k| k as i8 + 1),
             };
         }
+    }
+
+    /// 今の手番の**真実の盤面の合法手**から、`u` ∈ [0, 1) で一様に選んだ1手の行動番号（終局済みなら None）。
+    /// 相手のネットに学習側の env の上で指させる形（tsuitate-nn の `collect(opponents=...)`）で、相手の手を
+    /// ハンデの雑音（`OppNoise` と同じ「合法手の乱数手」）に差し替えるためのもの。真の合法手はマスクに含まれる
+    /// （`rl::action` が常時検査している）ので、返す行動はそのまま `step` に渡せる。**方策の入力には使わない**
+    pub fn random_legal_action(&self, u: f64) -> Option<usize> {
+        if self.outcome.is_some() {
+            return None;
+        }
+        let moves = self.referee.position().legal_moves();
+        if moves.is_empty() {
+            return None;
+        }
+        let k = ((u.clamp(0.0, 1.0) * moves.len() as f64) as usize).min(moves.len() - 1);
+        encode_usi(&moves[k].to_usi(), self.referee.to_move()).filter(|&a| self.mask.get(a).copied().unwrap_or(false))
     }
 
     /// 行動が今の手番で受け付けられるか（状態は変えない）。並列環境はバッチ全体を
@@ -521,9 +609,14 @@ impl EnvGame {
                 }
                 return;
             }
-            let view = self.referee.view(side, clocks(), self.game_no);
-            let opponent = self.opponent.as_mut().expect("評価モードには相手がいる");
-            let choice = opponent.choose(&view, self.referee.log(side), self.referee.foul_tried(side));
+            let choice = match self.noise_move() {
+                Some(usi) => Some(usi),
+                None => {
+                    let view = self.referee.view(side, clocks(), self.game_no);
+                    let opponent = self.opponent.as_mut().expect("評価モードには相手がいる");
+                    opponent.choose(&view, self.referee.log(side), self.referee.foul_tried(side))
+                }
+            };
             let Some(usi) = choice else {
                 self.finish(GameResult::Win(side.other()), "resign");
                 return;
@@ -533,6 +626,27 @@ impl EnvGame {
                 return;
             }
         }
+    }
+
+    /// 相手の手番の雑音: 確率 eps で、真実の盤面の合法手から一様に選んだ手（雑音なし・外れなら None）。
+    /// 相手の手番（反則の指し直しを含む）ごとに通し番号を進め、乱数はその番号と seed だけで決める
+    fn noise_move(&mut self) -> Option<String> {
+        if self.noise.eps <= 0.0 {
+            return None;
+        }
+        let k = self.opp_turns;
+        self.opp_turns += 1;
+        let seed = self.noise.seed;
+        let u = |salt: u64| (mix(seed ^ mix(2 * k + salt)) >> 11) as f64 / (1u64 << 53) as f64;
+        if u(0) >= f64::from(self.noise.eps) {
+            return None;
+        }
+        let moves = self.referee.position().legal_moves();
+        if moves.is_empty() {
+            return None; // 詰み・ステイルメイトは審判が先に終局させるので起きない
+        }
+        self.noise_moves += 1;
+        Some(moves[((u(1) * moves.len() as f64) as usize).min(moves.len() - 1)].to_usi())
     }
 
     fn finish(&mut self, result: GameResult, reason: &'static str) {
@@ -604,6 +718,122 @@ mod tests {
             }
             let a = random_action(game.mask(), rng.random()).expect("未終局ならマスクは空でない");
             game.step(a).unwrap();
+        }
+    }
+
+    #[test]
+    fn 局の信号は駒取りと成りを指した側に数える() {
+        use crate::rl::signals::{NUM_SIGNALS, SIGNAL_NAMES};
+        let k = |name: &str| SIGNAL_NAMES.iter().position(|&n| n == name).unwrap();
+        let mut g = EnvGame::selfplay(None, 0);
+        let play = |g: &mut EnvGame, usi: &str| {
+            let side = g.to_move();
+            let a = (0..NUM_ACTIONS)
+                .find(|&a| g.mask()[a] && decode_usi(a, side).as_deref() == Some(usi))
+                .unwrap_or_else(|| panic!("{usi} がマスクに無い"));
+            g.step(a).unwrap();
+        };
+        // 角交換（先手が 2二の角を取って成る）
+        for usi in ["7g7f", "3c3d", "8h2b+"] {
+            play(&mut g, usi);
+        }
+        let mut out = [0.0f32; 2 * NUM_SIGNALS];
+        g.signals_into(&mut out);
+        let (s, t) = out.split_at(NUM_SIGNALS);
+        assert_eq!(s[k("moves")], 2.0);
+        assert_eq!(t[k("moves")], 1.0);
+        assert_eq!(s[k("captures")], 1.0);
+        assert_eq!(s[k("capture_value")], 8.0);
+        assert_eq!(s[k("promotions")], 1.0);
+        assert_eq!(s[k("checks")], 0.0);
+        assert_eq!(t[k("captures")], 0.0);
+        // 先手: 角を持ち駒に得て（+8）、盤上の角が馬になる（+2）。後手: 角を失う
+        assert!((s[k("material")] - 70.5).abs() < 1e-5);
+        assert!((t[k("material")] - 52.5).abs() < 1e-5);
+        assert_eq!(s[k("hand_value")], 8.0);
+        // 2二の馬は敵陣にいて、後手玉（5一）の8近傍には利かない
+        assert_eq!(s[k("camp_pieces")], 1.0);
+        assert_eq!(s[k("king_attack")], 0.0);
+        // 後手が同銀と取り返す（3一の銀で 2二の馬を取る）
+        play(&mut g, "3a2b");
+        g.signals_into(&mut out);
+        let (s, t) = out.split_at(NUM_SIGNALS);
+        assert_eq!(t[k("captures")], 1.0);
+        // 馬を取る価値 =（馬 10 + 角 8）/ 2
+        assert_eq!(t[k("capture_value")], 9.0);
+        assert!((s[k("material")] - 60.5).abs() < 1e-5);
+        assert!((t[k("material")] - 60.5).abs() < 1e-5);
+        // 反則は指した側の fouls に数える（持ち駒の角を、見えない相手の飛車がいる 8二へ打つ）
+        play(&mut g, "B*8b");
+        g.signals_into(&mut out);
+        let (s, t) = out.split_at(NUM_SIGNALS);
+        assert_eq!(s[k("fouls")], 1.0);
+        assert_eq!(t[k("fouls")], 0.0);
+        assert_eq!(s[k("moves")], 2.0);
+        assert_eq!(s[k("drops")], 0.0);
+    }
+
+    #[test]
+    fn 相手の雑音は合法手だけを指し_0なら元の局と同じ() {
+        // 相手の乱数は seed で固定する（seed なしの heuristic は呼ぶたびに違う手を指す）
+        fn opponent() -> Box<dyn Strategy + Send> {
+            crate::strategy::make_seeded("heuristic", 7).unwrap()
+        }
+        fn run(eps: f32, seed: u64) -> (Outcome, u32, Vec<usize>) {
+            let mut rng = StdRng::seed_from_u64(9);
+            let opp = opponent();
+            let mut game = EnvGame::versus_noisy(Color::Gote, opp, 1, OppNoise { eps, seed });
+            let mut actions = vec![];
+            while game.outcome().is_none() {
+                let a = random_action(game.mask(), rng.random()).unwrap();
+                actions.push(a);
+                game.step(a).unwrap();
+            }
+            (game.outcome().unwrap(), game.noise_moves(), actions)
+        }
+        // eps = 0 は versus と同じ局（乱数も引かない）
+        let mut rng = StdRng::seed_from_u64(9);
+        let mut plain = EnvGame::versus(None, Color::Gote, opponent(), 1);
+        let mut plain_actions = vec![];
+        while plain.outcome().is_none() {
+            let a = random_action(plain.mask(), rng.random()).unwrap();
+            plain_actions.push(a);
+            plain.step(a).unwrap();
+        }
+        let (o0, n0, a0) = run(0.0, 5);
+        assert_eq!((o0, n0, &a0), (plain.outcome().unwrap(), 0, &plain_actions));
+        // eps = 1 は相手の手が全部雑音 = 合法手だけなので、相手（先手）は1回も反則しない
+        let (o1, n1, _) = run(1.0, 5);
+        assert!(n1 > 0);
+        assert_eq!(o1.fouls[0], 0, "雑音の手は反則にならない");
+        // 同じ seed は同じ局、違う seed は違う局
+        assert_eq!(run(0.5, 5), run(0.5, 5));
+        assert_ne!(run(0.5, 5).2, run(0.5, 6).2);
+        let (_, n5, _) = run(0.5, 5);
+        assert!(n5 > 0);
+    }
+
+    #[test]
+    fn 合法手の乱数手はマスクの中にあり反則にならない() {
+        let mut rng = StdRng::seed_from_u64(11);
+        for g in 0..6 {
+            let mut game = EnvGame::selfplay(None, g);
+            let mut turn = 0u32;
+            while game.outcome().is_none() {
+                // 先手は合法手の乱数手、後手はマスクの中の乱数手（反則も指す）
+                let a = if game.to_move() == Color::Sente {
+                    let a = game.random_legal_action(rng.random()).expect("未終局なら合法手がある");
+                    assert!(game.mask()[a]);
+                    a
+                } else {
+                    random_action(game.mask(), rng.random()).unwrap()
+                };
+                game.step(a).unwrap();
+                turn += 1;
+                assert!(turn < 2000);
+            }
+            assert_eq!(game.outcome().unwrap().fouls[0], 0, "合法手だけを指した側は反則しない");
+            assert_eq!(game.random_legal_action(0.3), None);
         }
     }
 
