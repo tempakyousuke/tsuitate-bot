@@ -798,3 +798,19 @@ X=rl_mmdopen_v15
     --arm mat_katk_ofoul_kf='--shape d_capture_value=0.02,king_attack=0.03,opp_fouls=0.05 --shape-cap 1.0 --king-foul-planes'
 .venv/bin/python rnad/takeoff.py report out_rnad/tk1 out_rnad/tk2 --horizon 400
 ```
+
+## 9. CI で搾取モデルを作る（`.github/workflows/exploiter.yml`、2026-11-12）
+
+本線の学習のリーグの相手に使う搾取モデルを、学習している PC を使わずに作るためのワークフロー。手動起動だけ。
+
+```sh
+gh workflow run exploiter.yml -f target="rl_policy:release:<タグ>/policy.bin" -f release_tag="rlx-<名前>"
+```
+
+- 1ランナー = 4 seed（1本 1スレッド）。既定は 3ランナー = 12本、打ち切り 450更新（2.9万局）、離陸してから 150更新続ける
+- 学習側は tsuitate-nn（公開）の `rnad/takeoff.py`。既定の報酬の整形は 8.5節の組み合わせ（駒得＋相手玉の周りへの利き＋相手の反則）
+- 相手の入力が v3（101枚。rl_mmdhand 系）なら学習側も `--opp-hand-planes` が要る（`extra_args` の既定）。v2 の相手なら空にする
+- 集計は `scripts/ci/exploiter_summary.py`: run ごとに最後に書き出した重み（`current_<更新>.bin`）と、その更新までの
+  直近 30更新の勝率（学習中の対局）を表にする。`min_wr`（既定 0.5）以上の重みを artifact `exploiter-keep` と、
+  `release_tag` を付ければその Release（prerelease）に置く
+- 置いた重みは `rl_policy:release:<タグ>/<腕>_s<seed>.bin` でアリーナに、手元へ落とせば `--league rl_policy:<パス>` で学習に使える
