@@ -124,6 +124,10 @@ env.signals()                      # 局の信号 [n, 2, K] f32（[先手, 後�
   - `set_opening_seed(s)`: 乱数列を替える（**次に作る局から**効く）。予定は乱数列と「直前の `reset` からの
     通し番号」で決まるので、学習は更新ごとに `set_opening_seed` してから `reset` すれば、再開しても同じ局に
     同じ予定が付く。`forced_moves()` は今の局の強制した手数 `[n, 2]`
+  - **`opening_index_learner=True`**（自己対局モード・`auto_reset=False` のとき）: `opening_sides` の `learner` / `opponent` を、
+    env の中の並びの偶奇で読む（**偶数番目の局は先手が学習側**）。相手の手を Python 側のネットが指す学習
+    （tsuitate-nn の `--league-device gpu`）で、相手の側だけを定跡から指させるためのもの（`--league-open-p`。
+    `docs/rl-fixed-opponent.md` 9節）。`reset` をはさんでも並びで決まる
   - `opening_prob=0` は `openings` を渡さないのと同じ経路（ビット単位で同じ局）。`guard_bonus` / `speed_bonus`
     とは一緒に使えない（強制した手の形や手数がボーナスに入るため）
   - `pop_finished()` に `forced_moves` / `forced_line`（ラインの添字。名前は一意でないので添字）/
