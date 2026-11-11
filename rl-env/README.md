@@ -102,9 +102,10 @@ env.signals()                      # 局の信号 [n, 2, K] f32（[先手, 後�
 - **`signals()`**: 各局の**局の信号** `[n, 2, K]`（[先手, 後手] × `tsuitate_rl.SIGNAL_NAMES`。`src/rl/signals.rs`）。
   累積の信号（`moves` 受理手 / `fouls` 反則 / `fouls_in_check` 王手を受けている手番の反則 / `captures` 取った駒の数 /
   `capture_value` 取った駒の価値〔歩 = 1。成駒は盤上と持ち駒の価値の平均〕/ `promotions` 成り / `checks` かけた王手 /
-  `drops` 打ち）と、今の真実の盤面から計算する状態の信号（`material` 駒の価値の合計 / `hand_value` 持ち駒の価値 /
-  `king_attack` 相手玉のマスと8近傍への利きの数の合計 / `king_guard` 自玉の8近傍の自駒の割合 / `king_advance` 玉の前進段数 /
-  `camp_pieces` 敵陣の自駒の数）。終局して止まっている局は終局時の値。**報酬の整形と監視専用**（真実の盤面を読む信号を
+  `drops` 打ち / `evasions` 王手を外した回数）と、今の真実の盤面から計算する状態の信号（`material` 駒の価値の合計 /
+  `hand_value` 持ち駒の価値 / `king_attack` 相手玉のマスと8近傍への利きの数の合計 / `king_guard` 自玉の8近傍の自駒の割合 /
+  `king_advance` 玉の前進段数 / `camp_pieces` 敵陣の自駒の数 / `king_escape` 自玉の逃げ場〔8近傍のうち自駒がおらず相手の
+  利きも無いマスの数〕/ `mate_threat` 一手詰めがあるか〔自分の手番なら全合法手の一手詰め、相手の手番なら打ちの詰めろ〕）。終局して止まっている局は終局時の値。**報酬の整形と監視専用**（真実の盤面を読む信号を
   含むので方策の入力には使わない）。学習側は連続する2時点の差に重みを掛けて報酬にする（tsuitate-nn の `rnad/shaping.py`）。
   信号を足すのは `signals.rs` の名前と計算だけで、報酬の式は学習側の引数で振れる
 - **`openings=[[USI, ...], ...]`・`opening_prob=p`**（既定 None・0 = 強制しない）: **序盤の強制**

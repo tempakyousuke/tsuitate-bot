@@ -5,20 +5,20 @@
 //! 信号を1つ足すのに要るのはここの1行と計算だけで、報酬の式は Python の引数で振れる。
 //!
 //! 信号は2種類ある:
-//! - **累積**（`moves`〜`drops`）: 局の頭からの出来事の数。`EnvGame::play` が数える
-//! - **状態**（`material`〜`camp_pieces`）: 今の真実の盤面から計算する量
+//! - **累積**（`moves`〜`evasions`）: 局の頭からの出来事の数。`EnvGame::play` が数える
+//! - **状態**（`material`〜`mate_threat`）: 今の真実の盤面から計算する量
 //!
 //! どちらも「その時点の局の状態の関数」なので、学習側は連続する2時点の差を報酬にできる
 //! （終局で累計を差し戻せばポテンシャル型の整形になり、最適方策を変えない）。
 //!
-//! **真実の盤面を読む信号がある**（`king_attack` は相手玉の位置を使う）。報酬と監視は学習時にしか
+//! **真実の盤面を読む信号がある**（`king_attack` は相手玉の位置を、`mate_threat` は相手の全部の駒を使う）。報酬と監視は学習時にしか
 //! 使わないので情報は漏れないが、**方策の入力には使わないこと**（`EnvGame::truth_into` と同じ扱い）。
 
 use crate::board::{Coord, on_board};
 use crate::protocol::{Color, Role};
 use crate::shogi::{HAND_ROLES, Position, piece_value, unpromote_role};
 
-pub const NUM_SIGNALS: usize = 14;
+pub const NUM_SIGNALS: usize = 17;
 
 /// 信号の名前（`signals_into` の並び）。学習側は名前で引く（`tsuitate_rl.SIGNAL_NAMES`）
 pub const SIGNAL_NAMES: [&str; NUM_SIGNALS] = [
@@ -31,6 +31,7 @@ pub const SIGNAL_NAMES: [&str; NUM_SIGNALS] = [
     "promotions",     // 成った回数
     "checks",         // 王手をかけた回数
     "drops",          // 打った回数
+    "evasions",       // 王手を受けている手番で受理された手（= 王手を外した回数）
     // ---- 状態（今の真実の盤面）
     "material",     // 自分の駒の価値の合計（盤上は成りを含む価値、持ち駒は元の駒の価値。玉は 0）
     "hand_value",   // 持ち駒の価値の合計
@@ -38,6 +39,8 @@ pub const SIGNAL_NAMES: [&str; NUM_SIGNALS] = [
     "king_guard",   // 自玉の8近傍のうち自駒がいる割合（`env::guard_fraction` の半径1）
     "king_advance", // 自玉の前進段数（0〜8）
     "camp_pieces",  // 敵陣（相手側の3段）にいる玉以外の自駒の数
+    "king_escape",  // 自玉の8近傍のうち、自駒がおらず相手の利きも無いマスの数（玉の逃げ場）
+    "mate_threat",  // 一手詰めがあるか（0 / 1。自分の手番なら全合法手の一手詰め、相手の手番なら打ちの詰めろ。`mate_threat`）
 ];
 
 const MOVES: usize = 0;
@@ -48,13 +51,16 @@ const CAPTURE_VALUE: usize = 4;
 const PROMOTIONS: usize = 5;
 const CHECKS: usize = 6;
 const DROPS: usize = 7;
-const NUM_EVENTS: usize = 8;
-const MATERIAL: usize = 8;
-const HAND_VALUE: usize = 9;
-const KING_ATTACK: usize = 10;
-const KING_GUARD: usize = 11;
-const KING_ADVANCE: usize = 12;
-const CAMP_PIECES: usize = 13;
+const EVASIONS: usize = 8;
+const NUM_EVENTS: usize = 9;
+const MATERIAL: usize = 9;
+const HAND_VALUE: usize = 10;
+const KING_ATTACK: usize = 11;
+const KING_GUARD: usize = 12;
+const KING_ADVANCE: usize = 13;
+const CAMP_PIECES: usize = 14;
+const KING_ESCAPE: usize = 15;
+const MATE_THREAT: usize = 16;
 
 /// 駒を1枚取ったときの価値 =（盤上での価値 + 持ち駒としての価値）÷ 2。
 /// 取られた側は盤上の価値を失い、取った側は元の駒を持ち駒に得るので、その平均を1回の駒取りの大きさにする
@@ -95,6 +101,9 @@ impl EventCounts {
             return;
         }
         c[MOVES] += 1.0;
+        if e.was_in_check {
+            c[EVASIONS] += 1.0;
+        }
         if e.drop {
             c[DROPS] += 1.0;
         }
@@ -162,7 +171,7 @@ fn side_signals(pos: &Position, events: &EventCounts, color: Color, out: &mut [f
     }
     out[KING_ATTACK] = attack as f32;
 
-    let (mut squares, mut own) = (0u32, 0u32);
+    let (mut squares, mut own, mut escape) = (0u32, 0u32, 0u32);
     let mut king_adv = 0i8;
     if let Some(k) = pos.king_square(color) {
         king_adv = advance(k, color);
@@ -175,12 +184,34 @@ fn side_signals(pos: &Position, events: &EventCounts, color: Color, out: &mut [f
                 squares += 1;
                 if pos.piece_at(c).is_some_and(|p| p.color == color) {
                     own += 1;
+                } else if !pos.is_attacked(c, color.other()) {
+                    // 玉の逃げ場（玉自身が遮っている利きは数えない近似。相手の駒がいるマスは「取って逃げる」先に数える）
+                    escape += 1;
                 }
             }
         }
     }
     out[KING_GUARD] = if squares == 0 { 0.0 } else { own as f32 / squares as f32 };
     out[KING_ADVANCE] = f32::from(king_adv);
+    out[KING_ESCAPE] = escape as f32;
+    out[MATE_THREAT] = if mate_threat(pos, color) { 1.0 } else { 0.0 };
+}
+
+/// `color` に**一手詰めがあるか**（詰みへの近さの信号）。
+///
+/// - `color` の手番: 全合法手の一手詰め（`mate::has_mate_in_1_fast`）
+/// - 相手の手番: 相手が王手を受けていなければ、**持ち駒の打ちの詰めろ**（相手が何も受けなければ次に
+///   打ちで詰む。`mate::drop_mate`）。相手が王手を受けている間は 0（もう1手続けて指せる前提の詰みは数えない）
+///
+/// 報酬にするときは状態の差分（かけた時に +、消えた時に −）なので、詰めろを保ったまま指さずに稼ぐことはできない
+pub fn mate_threat(pos: &Position, color: Color) -> bool {
+    if pos.turn() == color {
+        crate::mate::has_mate_in_1_fast(pos)
+    } else if pos.in_check(pos.turn()) {
+        false
+    } else {
+        crate::mate::drop_mate(pos, color).is_some()
+    }
 }
 
 /// 両者の信号を `out`（長さ `2 * NUM_SIGNALS`、[先手の信号…, 後手の信号…]）へ書く
@@ -210,12 +241,15 @@ mod tests {
             ("promotions", PROMOTIONS),
             ("checks", CHECKS),
             ("drops", DROPS),
+            ("evasions", EVASIONS),
             ("material", MATERIAL),
             ("hand_value", HAND_VALUE),
             ("king_attack", KING_ATTACK),
             ("king_guard", KING_GUARD),
             ("king_advance", KING_ADVANCE),
             ("camp_pieces", CAMP_PIECES),
+            ("king_escape", KING_ESCAPE),
+            ("mate_threat", MATE_THREAT),
         ] {
             assert_eq!(index(name), k, "{name}");
         }
@@ -242,6 +276,9 @@ mod tests {
         assert_eq!(s[CAMP_PIECES], 0.0);
         // 5九玉の8近傍のうち盤上は5マス、自駒は 4九金・6九金の2枚（4八・5八・6八は空き）
         assert!((s[KING_GUARD] - 0.4).abs() < 1e-6);
+        // 空いている3マス（4八・5八・6八）に相手の利きは無い
+        assert_eq!(s[KING_ESCAPE], 3.0);
+        assert_eq!(s[MATE_THREAT], 0.0);
         assert!(s[..NUM_EVENTS].iter().all(|&v| v == 0.0));
     }
 
@@ -260,7 +297,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        e.record(Color::Gote, MoveEvent { accepted: true, drop: true, ..Default::default() });
+        e.record(Color::Gote, MoveEvent { accepted: true, drop: true, was_in_check: true, ..Default::default() });
         assert_eq!(e.get(Color::Sente, "fouls"), Some(2.0));
         assert_eq!(e.get(Color::Sente, "fouls_in_check"), Some(1.0));
         assert_eq!(e.get(Color::Sente, "moves"), Some(0.0));
@@ -270,8 +307,40 @@ mod tests {
         assert_eq!(e.get(Color::Gote, "promotions"), Some(1.0));
         assert_eq!(e.get(Color::Gote, "checks"), Some(1.0));
         assert_eq!(e.get(Color::Gote, "drops"), Some(1.0));
+        // 王手を受けている手番で受理された手だけが「王手を外した」（反則した試行は数えない）
+        assert_eq!(e.get(Color::Gote, "evasions"), Some(1.0));
+        assert_eq!(e.get(Color::Sente, "evasions"), Some(0.0));
         assert_eq!(e.get(Color::Gote, "fouls"), Some(0.0));
         assert_eq!(e.get(Color::Gote, "material"), None);
+    }
+
+    #[test]
+    fn 一手詰めの信号は手番と王手で分ける() {
+        use crate::shogi::parse_usi;
+        // 頭金: 後手玉 5一、先手の歩 5三（金の支え）、先手の持ち駒に金。先手番
+        let mut pos = Position::empty(Color::Sente);
+        let put = |pos: &mut Position, sq: &str, color, role| {
+            pos.set(crate::board::parse_usi_square(sq).unwrap(), Some(crate::shogi::Piece { color, role }));
+        };
+        put(&mut pos, "5a", Color::Gote, Role::King);
+        put(&mut pos, "5c", Color::Sente, Role::Pawn);
+        put(&mut pos, "5i", Color::Sente, Role::King);
+        pos.set_hand(Color::Sente, Role::Gold, 1);
+        pos.set_turn(Color::Sente);
+        assert!(mate_threat(&pos, Color::Sente), "先手番: G*5b の一手詰め");
+        assert!(!mate_threat(&pos, Color::Gote));
+        // 後手番にしても、後手が何も受けなければ打ちで詰む（詰めろ）
+        pos.set_turn(Color::Gote);
+        assert!(mate_threat(&pos, Color::Sente), "後手番: 打ちの詰めろ");
+        // 詰ませた後（後手玉が王手を受けている）は 0
+        pos.set_turn(Color::Sente);
+        pos.play_unchecked(&parse_usi("G*5b").unwrap());
+        assert!(pos.in_check(Color::Gote));
+        assert!(!mate_threat(&pos, Color::Sente));
+        let mut out = [0.0f32; 2 * NUM_SIGNALS];
+        signals_into(&pos, &EventCounts::default(), &mut out);
+        // 後手玉 5一の逃げ場: 4一・6一は金の利き、4二・6二も金の利き、5二は金（歩の支えで取れない）= 0
+        assert_eq!(out[NUM_SIGNALS + KING_ESCAPE], 0.0);
     }
 
     #[test]
