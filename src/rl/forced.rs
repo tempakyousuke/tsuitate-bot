@@ -314,9 +314,21 @@ fn training_book() -> &'static ForcedBook {
 /// `rl_openings.json` にラインを足すときは**末尾に足す**（途中に挟むと過去の記録の名前とずれる）。
 /// 中の戦略名は凍結版などの名前（`rl_policy:release:...` は arena.yml の重みの取得が拾わない）。
 /// 読めない名前・範囲外のラインは None
+///
+/// **`open:book:<戦略名>`**（2026-11-12）は、ラインを固定せずに**局ごとにブックから1本引く**相手
+/// （系統ごとに同じ確率 = 本番bot の `TSUITATE_OPEN_BOOK`・p = 1 と同じ引き方）。「定跡に従う相手」を
+/// 1つの基準として測る用で、ラインは局の seed から決まる（seed なしはエントロピー）
 pub fn fixed_opening_from_name(name: &str, seed: Option<u64>) -> Option<Box<dyn crate::strategy::Strategy + Send>> {
     let (line, inner) = name.strip_prefix(OPEN_PREFIX)?.split_once(':')?;
-    let plan = training_book().fixed_plan(line.parse().ok()?)?;
+    let plan = if line == "book" {
+        use rand::Rng;
+        let s = seed.unwrap_or_else(|| rand::rng().random());
+        // p = 1・両側が対象のブックなので必ず予定が付く。ラインは先手視点の並びで、後手は点対称に読む
+        let [plan, _] = training_book().plans(mix(s ^ OPENING_SALT), 0, None);
+        plan?
+    } else {
+        training_book().fixed_plan(line.parse().ok()?)?
+    };
     let inner = match seed {
         Some(s) => crate::strategy::make_seeded(inner, s),
         None => crate::strategy::make(inner),
@@ -697,6 +709,33 @@ mod tests {
         for bad in [format!("open:{}:heuristic", lines.len()), "open:x:heuristic".into(), "open:0:no_such".into(), "open:0".into()] {
             assert!(crate::strategy::make(&bad).is_none(), "{bad} は作れない");
         }
+    }
+
+    #[test]
+    fn ブックから引く相手は局ごとにラインが変わり同じseedなら同じライン() {
+        use crate::referee::Referee;
+        let lines = book_lines("rl_openings.json", include_str!("../../rl_openings.json"));
+        let firsts: std::collections::HashSet<String> =
+            lines.iter().map(|l| quiet_prefix(l).unwrap()[0].clone()).collect();
+        let first_move = |seed: Option<u64>| {
+            let referee = Referee::new();
+            let view = referee.view(Color::Sente, [0, 0], 0);
+            let mut s = match seed {
+                Some(x) => crate::strategy::make_seeded("open:book:heuristic", x),
+                None => crate::strategy::make("open:book:heuristic"),
+            }
+            .unwrap();
+            s.choose(&view, referee.log(Color::Sente), referee.foul_tried(Color::Sente)).unwrap()
+        };
+        let seen: std::collections::HashSet<String> = (0..200).map(|s| first_move(Some(s))).collect();
+        assert!(seen.is_subset(&firsts), "初手はどれかのラインの初手");
+        assert!(seen.len() >= 4, "局（seed）ごとにラインが変わる（初手 {} 通り）", seen.len());
+        for s in [3, 17, 99] {
+            assert_eq!(first_move(Some(s)), first_move(Some(s)), "同じ seed なら同じライン");
+        }
+        assert!(firsts.contains(&first_move(None)), "seed なしでも作れる");
+        assert_eq!(crate::strategy::make("open:book:heuristic").unwrap().name(), "heuristic");
+        assert!(crate::strategy::make("open:book:no_such").is_none());
     }
 
     fn book_lines(name: &str, json: &str) -> Vec<Vec<String>> {

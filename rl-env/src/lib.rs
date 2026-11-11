@@ -73,6 +73,9 @@ struct GameSpec {
     speed_sum: SpeedSum,
     /// 序盤の強制（None = しない。`tsuitate_bot::rl::forced`）
     opening: Option<Arc<ForcedBook>>,
+    /// 自己対局モードの env で、`opening_sides` の learner / opponent を「env の中の並びの偶奇」で読む
+    /// （偶数番目の局は先手が学習側。`VecEnv::new` の `opening_index_learner`）
+    opening_index_learner: bool,
 }
 
 /// 序盤の強制の乱数列（`VecEnv::set_opening_seed`）と、その列の中の通し番号の起点
@@ -147,7 +150,12 @@ impl GameSpec {
                 Some(opp) => EnvGame::versus(None, learner_of(game_no), opp, game_no),
             },
             Some(book) => {
-                let plans = book.plans(open.seed, u64::from(game_no - open.base), learner);
+                // 強制の対象を決めるための学習側の色。評価モードは局番号の偶奇（`learner_of`）、
+                // 自己対局モードで opening_index_learner なら env の中の並びの偶奇（相手の手を Python 側の
+                // ネットが指す学習 = tsuitate-nn の `--league-device gpu` が、局を先後交互に並べる）
+                let k = game_no - open.base;
+                let plan_learner = learner.or_else(|| self.opening_index_learner.then(|| learner_of(k)));
+                let plans = book.plans(open.seed, u64::from(k), plan_learner);
                 EnvGame::with_forced(learner, opp, game_no, plans)
             }
         }
@@ -277,7 +285,7 @@ fn build_fresh(
 #[pymethods]
 impl VecEnv {
     #[new]
-    #[pyo3(signature = (n, opponent=None, seed=0, auto_reset=true, guard_bonus=0.0, guard_radius=1, opponents=None, speed_bonus=0.0, speed_horizon=MAX_PLIES, speed_sum="own", planes=NUM_PLANES, openings=None, opening_weights=None, opening_prob=0.0, opening_len=None, opening_sides="both", opening_seed=None))]
+    #[pyo3(signature = (n, opponent=None, seed=0, auto_reset=true, guard_bonus=0.0, guard_radius=1, opponents=None, speed_bonus=0.0, speed_horizon=MAX_PLIES, speed_sum="own", planes=NUM_PLANES, openings=None, opening_weights=None, opening_prob=0.0, opening_len=None, opening_sides="both", opening_seed=None, opening_index_learner=false))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -298,6 +306,7 @@ impl VecEnv {
         opening_len: Option<(u32, u32)>,
         opening_sides: &str,
         opening_seed: Option<u64>,
+        opening_index_learner: bool,
     ) -> PyResult<Self> {
         if n == 0 {
             return Err(PyValueError::new_err("n は 1 以上"));
@@ -372,9 +381,17 @@ impl VecEnv {
                 }
                 let book = ForcedBook::new(&lines, opening_weights.as_deref(), opening_prob, opening_len, sides)
                     .map_err(PyValueError::new_err)?;
-                if sides.needs_learner() && opponents.is_empty() {
+                if sides.needs_learner() && opponents.is_empty() && !opening_index_learner {
                     return Err(PyValueError::new_err(
-                        "opening_sides の learner / opponent は評価モード（opponent / opponents）でだけ使える",
+                        "opening_sides の learner / opponent は評価モード（opponent / opponents）か、\
+                         自己対局モードの opening_index_learner=True でだけ使える",
+                    ));
+                }
+                if opening_index_learner && (!opponents.is_empty() || auto_reset || !sides.needs_learner()) {
+                    // 並びの偶奇で学習側を決めるので、局を途中で差し替える auto_reset とは使えない
+                    return Err(PyValueError::new_err(
+                        "opening_index_learner は自己対局モード・auto_reset=False・opening_sides が \
+                         learner / opponent のときだけ使える",
                     ));
                 }
                 if opening_prob > 0.0 && (guard_bonus != 0.0 || speed_bonus != 0.0) {
@@ -396,6 +413,7 @@ impl VecEnv {
             speed_horizon,
             speed_sum,
             opening,
+            opening_index_learner,
         };
         let mut next_game_no = 0;
         let mut finished = vec![];
