@@ -127,7 +127,7 @@ env.signals()                      # 局の信号 [n, 2, K] f32（[先手, 後�
   - **`opening_index_learner=True`**（自己対局モード・`auto_reset=False` のとき）: `opening_sides` の `learner` / `opponent` を、
     env の中の並びの偶奇で読む（**偶数番目の局は先手が学習側**）。相手の手を Python 側のネットが指す学習
     （tsuitate-nn の `--league-device gpu`）で、相手の側だけを定跡から指させるためのもの（`--league-open-p`。
-    `docs/rl-fixed-opponent.md` 9節）。`reset` をはさんでも並びで決まる
+    `docs/rl-fixed-opponent.md` 10節）。`reset` をはさんでも並びで決まる
   - `opening_prob=0` は `openings` を渡さないのと同じ経路（ビット単位で同じ局）。`guard_bonus` / `speed_bonus`
     とは一緒に使えない（強制した手の形や手数がボーナスに入るため）
   - `pop_finished()` に `forced_moves` / `forced_line`（ラインの添字。名前は一意でないので添字）/
