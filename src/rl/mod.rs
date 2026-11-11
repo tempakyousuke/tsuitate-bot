@@ -4,6 +4,7 @@
 //! - `encode`: 観測 → 入力テンソル
 //! - `env`: RL 環境の1局（自己対局・Rust 戦略を相手にする評価モード）。
 //!   並列化と numpy 変換は PyO3 側の `rl-env/` crate
+//! - `signals`: 局の信号（駒得・反則・王手など。報酬の整形と監視の材料。方策の入力には使わない）
 //!
 //! どちらも入力は `Strategy::choose` と同じ `(PlayerView, ObservationLog, foul_tried)` で、
 //! 学習環境（Python 経由）と arena・本番の方策 Strategy が同じ関数を通る。
@@ -16,3 +17,4 @@ pub mod policy;
 pub mod policy_net;
 pub mod records;
 pub mod search;
+pub mod signals;

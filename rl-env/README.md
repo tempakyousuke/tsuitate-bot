@@ -45,6 +45,9 @@ env = tsuitate_rl.VecEnv(64, opponent="rl_policy:<重み>", guard_bonus=0.5, gua
                                    # 玉の周りの固めのボーナス（下記）
 env = tsuitate_rl.VecEnv(256, speed_bonus=2.0, speed_horizon=200, speed_sum="own")
                                    # 速攻ボーナス（下記）
+env = tsuitate_rl.VecEnv(64, opponents=["rl_mmdhand_v1@0.5"] * 32 + ["rl_mmdhand_v1"] * 32)
+                                   # ハンデつきの相手 <名前>@<ε>（下記）
+env.signals()                      # 局の信号 [n, 2, K] f32（[先手, 後手] × tsuitate_rl.SIGNAL_NAMES。下記）
 ```
 
 - 終局した局は `step` の中で新しい局へ差し替わる（`done` の局の次の `observe` は新しい局）。
@@ -87,6 +90,24 @@ env = tsuitate_rl.VecEnv(256, speed_bonus=2.0, speed_horizon=200, speed_sum="own
   学習側の色は局番号の偶奇で決まるので、相手ごとに**偶数個ずつ**並べると先後がそろう。
   作った直後に終局した局（相手の即投了など）は局番号を進めて作り直すので、その後ろの局の相手はずれうる。
   どの相手と指した局かは `pop_finished()` の `opponent` で分かる
+- **ハンデつきの相手 `<名前>@<ε>`**（`opponent` / `opponents` の名前の末尾。0 ≤ ε ≤ 1。docs/rl-fixed-opponent.md）:
+  相手の手番ごとに確率 ε で、相手の戦略の手の代わりに**真実の盤面の合法手から一様に選んだ手**を指させる
+  （`EnvGame::versus_noisy`）。強い相手にゼロから当たると1局も勝てないので、同じ相手を弱めた段（ε = 1 は全部が乱数手、
+  0 は本物）を学習の相手と進み具合の物差しに使う。雑音の手は合法手なので反則にはならない（弱さは悪手として出る）。
+  乱数は `seed`・局番号・相手の手番の通し番号で決まる。`@` の後ろが 0〜1 の数でなければ全体を名前として読む。
+  `pop_finished()` の `opponent` は `<名前>@<ε>` のまま、`noise_moves` は雑音で指した手の数。序盤の強制とは一緒に使えない
+- **`random_legal_actions(u)`**: 各局の今の手番について、真実の盤面の合法手から一様に選んだ行動番号 `[n]`（`u` は局ごとの
+  一様乱数 [0, 1)。負の値の局と終局した局は −1）。相手のネットに学習側の env の上で指させる形（tsuitate-nn の
+  `collect(opponents=...)` = `--league-device gpu`）で、同じハンデ（合法手の乱数手）を作るのに使う。返す行動はマスクの中にある
+- **`signals()`**: 各局の**局の信号** `[n, 2, K]`（[先手, 後手] × `tsuitate_rl.SIGNAL_NAMES`。`src/rl/signals.rs`）。
+  累積の信号（`moves` 受理手 / `fouls` 反則 / `fouls_in_check` 王手を受けている手番の反則 / `captures` 取った駒の数 /
+  `capture_value` 取った駒の価値〔歩 = 1。成駒は盤上と持ち駒の価値の平均〕/ `promotions` 成り / `checks` かけた王手 /
+  `drops` 打ち / `evasions` 王手を外した回数）と、今の真実の盤面から計算する状態の信号（`material` 駒の価値の合計 /
+  `hand_value` 持ち駒の価値 / `king_attack` 相手玉のマスと8近傍への利きの数の合計 / `king_guard` 自玉の8近傍の自駒の割合 /
+  `king_advance` 玉の前進段数 / `camp_pieces` 敵陣の自駒の数 / `king_escape` 自玉の逃げ場〔8近傍のうち自駒がおらず相手の
+  利きも無いマスの数〕/ `mate_threat` 一手詰めがあるか〔自分の手番なら全合法手の一手詰め、相手の手番なら打ちの詰めろ〕）。終局して止まっている局は終局時の値。**報酬の整形と監視専用**（真実の盤面を読む信号を
+  含むので方策の入力には使わない）。学習側は連続する2時点の差に重みを掛けて報酬にする（tsuitate-nn の `rnad/shaping.py`）。
+  信号を足すのは `signals.rs` の名前と計算だけで、報酬の式は学習側の引数で振れる
 - **`openings=[[USI, ...], ...]`・`opening_prob=p`**（既定 None・0 = 強制しない）: **序盤の強制**
   （docs/rl-opening-diversity.md）。局ごと・**先後それぞれ独立に**確率 p で、その側の最初の数手を
   ライン（先手視点の USI の並び。`joseki.json` の `moves`。後手は点対称にミラー）から指させる。
