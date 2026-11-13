@@ -6,6 +6,8 @@
 > - V5（盤上減価）は w に単調悪化で不採用
 > - `tokin_probe_w` は 2026-07-30 に削除し、一般項 `promo_potential_w` へ置換
 > - 思考予算は 2000ms で飽和（900ms へ絞ると −14.5pt。もう強さの調整ノブではない）
+> - V1〜V4 の項を方策ネット（搾取役）の学習の報酬にする比較は 2026-11-12 に実施（`docs/rl-fixed-opponent.md` 11節。
+>   ネットは形を学習するが勝ちに変わらず、学習は速くならなかった）
 > 現行のノブ採否は `CLAUDE.md`、実行計画の当時版は `docs/improvement-plan-2026-07-26-yaneuraou.md`。
 
 調査対象: https://github.com/yaneurao/YaneuraOu

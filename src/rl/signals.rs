@@ -6,7 +6,7 @@
 //!
 //! 信号は2種類ある:
 //! - **累積**（`moves`〜`evasions`）: 局の頭からの出来事の数。`EnvGame::play` が数える
-//! - **状態**（`material`〜`mate_threat`）: 今の真実の盤面から計算する量
+//! - **状態**（`material`〜`king_holes`）: 今の真実の盤面から計算する量
 //!
 //! どちらも「その時点の局の状態の関数」なので、学習側は連続する2時点の差を報酬にできる
 //! （終局で累計を差し戻せばポテンシャル型の整形になり、最適方策を変えない）。
@@ -18,7 +18,7 @@ use crate::board::{Coord, on_board};
 use crate::protocol::{Color, Role};
 use crate::shogi::{HAND_ROLES, Position, piece_value, unpromote_role};
 
-pub const NUM_SIGNALS: usize = 17;
+pub const NUM_SIGNALS: usize = 23;
 
 /// 信号の名前（`signals_into` の並び）。学習側は名前で引く（`tsuitate_rl.SIGNAL_NAMES`）
 pub const SIGNAL_NAMES: [&str; NUM_SIGNALS] = [
@@ -41,6 +41,14 @@ pub const SIGNAL_NAMES: [&str; NUM_SIGNALS] = [
     "camp_pieces",  // 敵陣（相手側の3段）にいる玉以外の自駒の数
     "king_escape",  // 自玉の8近傍のうち、自駒がおらず相手の利きも無いマスの数（玉の逃げ場）
     "mate_threat",  // 一手詰めがあるか（0 / 1。自分の手番なら全合法手の一手詰め、相手の手番なら打ちの詰めろ。`mate_threat`）
+    // ---- 状態: やねうら王の手作り評価の項（docs/yaneuraou-lessons.md の V1〜V4。2026-11-12）。
+    // estimator では相手玉の位置と相手の利きが信念でしか分からなかったが、ここは真実の盤面から数える
+    "effect_attack",  // 自駒の利きを**相手玉からの距離**で重み付けた総和（V2 の攻め側。利きの数は逓減 = V1）
+    "effect_guard",   // 自駒の利きを**自玉からの距離**で重み付けた総和（V2 の守り側）
+    "tied_value",     // 紐のついた（自駒の利きがある）玉以外の自駒の価値の合計（V3 の紐）
+    "attacked_value", // 相手の利きがある玉以外の自駒の価値の合計（V3 の質）
+    "hanging_value",  // そのうち紐のついていない自駒の価値の合計（ただ取られる形）
+    "king_holes",     // 自玉の8近傍のうち、自駒がおらず、玉以外の自駒の利きも無いマスの数（V4 の穴）
 ];
 
 const MOVES: usize = 0;
@@ -61,6 +69,49 @@ const KING_ADVANCE: usize = 13;
 const CAMP_PIECES: usize = 14;
 const KING_ESCAPE: usize = 15;
 const MATE_THREAT: usize = 16;
+const EFFECT_ATTACK: usize = 17;
+const EFFECT_GUARD: usize = 18;
+const TIED_VALUE: usize = 19;
+const ATTACKED_VALUE: usize = 20;
+const HANGING_VALUE: usize = 21;
+const KING_HOLES: usize = 22;
+
+/// 盤の全マスへの利きの数（[先手の利き, 後手の利き]。添字は `sq_index`）
+type AttackMap = [[u8; 81]; 2];
+
+fn sq_index(c: Coord) -> usize {
+    (c.file as usize - 1) * 9 + (c.rank as usize - 1)
+}
+
+fn all_squares() -> impl Iterator<Item = Coord> {
+    (1..=9).flat_map(|file| (1..=9).map(move |rank| Coord { file, rank }))
+}
+
+fn attack_map(pos: &Position) -> AttackMap {
+    let mut map = [[0u8; 81]; 2];
+    for c in all_squares() {
+        map[0][sq_index(c)] = pos.attack_count(c, Color::Sente);
+        map[1][sq_index(c)] = pos.attack_count(c, Color::Gote);
+    }
+    map
+}
+
+/// 1マスに利きが `m` 本あるときの価値（1本 = 1）。やねうら王の連載の Lv4 の実測の式
+/// `6365 − 0.8525^(m−1) × 5341`（1本目 1024）をそのまま使う: 2本で 1.77、3本で 2.43 と逓減するが飽和はしない
+fn effect_multiplicity(m: u8) -> f64 {
+    if m == 0 {
+        0.0
+    } else {
+        (6365.0 - 0.8525f64.powi(i32::from(m) - 1) * 5341.0) / 1024.0
+    }
+}
+
+/// 玉からの距離（チェビシェフ）での利きの重み。やねうら王の Lv3 の実測（1024, 496, 297, …）に近い
+/// `1 / (1 + d)`（`strategy::king_dist_weight` と同じ式）
+fn king_dist_weight(a: Coord, king: Coord) -> f64 {
+    let d = (a.file - king.file).abs().max((a.rank - king.rank).abs());
+    1.0 / (1.0 + f64::from(d))
+}
 
 /// 駒を1枚取ったときの価値 =（盤上での価値 + 持ち駒としての価値）÷ 2。
 /// 取られた側は盤上の価値を失い、取った側は元の駒を持ち駒に得るので、その平均を1回の駒取りの大きさにする
@@ -134,7 +185,7 @@ fn advance(c: Coord, color: Color) -> i8 {
 }
 
 /// `color` の信号を `out`（長さ `NUM_SIGNALS`）へ書く
-fn side_signals(pos: &Position, events: &EventCounts, color: Color, out: &mut [f32]) {
+fn side_signals(pos: &Position, events: &EventCounts, attacks: &AttackMap, color: Color, out: &mut [f32]) {
     debug_assert_eq!(out.len(), NUM_SIGNALS);
     out[..NUM_EVENTS].copy_from_slice(&events.0[usize::from(color == Color::Gote)]);
 
@@ -195,6 +246,67 @@ fn side_signals(pos: &Position, events: &EventCounts, color: Color, out: &mut [f
     out[KING_ADVANCE] = f32::from(king_adv);
     out[KING_ESCAPE] = escape as f32;
     out[MATE_THREAT] = if mate_threat(pos, color) { 1.0 } else { 0.0 };
+
+    // やねうら王の手作り評価の項（V1〜V4）。利きの数は盤の全マスぶんを `attacks` に持っている
+    let (own_att, opp_att) = match color {
+        Color::Sente => (&attacks[0], &attacks[1]),
+        Color::Gote => (&attacks[1], &attacks[0]),
+    };
+    let own_king = pos.king_square(color);
+    let opp_king = pos.king_square(color.other());
+    let (mut effect_attack, mut effect_guard) = (0.0f64, 0.0f64);
+    for c in all_squares() {
+        let v = effect_multiplicity(own_att[sq_index(c)]);
+        if v == 0.0 {
+            continue;
+        }
+        if let Some(k) = opp_king {
+            effect_attack += v * king_dist_weight(c, k);
+        }
+        if let Some(k) = own_king {
+            effect_guard += v * king_dist_weight(c, k);
+        }
+    }
+    let (mut tied, mut attacked, mut hanging) = (0.0f64, 0.0f64, 0.0f64);
+    for (c, p) in pos.pieces() {
+        if p.color != color || p.role == Role::King {
+            continue;
+        }
+        let v = piece_value(p.role);
+        let i = sq_index(c);
+        if own_att[i] > 0 {
+            tied += v;
+        }
+        if opp_att[i] > 0 {
+            attacked += v;
+            if own_att[i] == 0 {
+                hanging += v;
+            }
+        }
+    }
+    // 穴: 玉自身の利きは支えに数えない（玉の隣のマスには必ず玉の利きが1本あるので、それを引く）。
+    // 自駒が乗っているマスは壁として働くので穴に数えない（`strategy` の king_holes と同じ決め方）
+    let mut holes = 0u32;
+    if let Some(k) = own_king {
+        for df in -1..=1 {
+            for dr in -1..=1 {
+                let c = Coord { file: k.file + df, rank: k.rank + dr };
+                if (df, dr) == (0, 0) || !on_board(c) {
+                    continue;
+                }
+                let own_piece = pos.piece_at(c).is_some_and(|p| p.color == color);
+                if !own_piece && own_att[sq_index(c)] <= 1 {
+                    holes += 1;
+                }
+            }
+        }
+    }
+    out[EFFECT_ATTACK] = effect_attack as f32;
+    out[EFFECT_GUARD] = effect_guard as f32;
+    out[TIED_VALUE] = tied as f32;
+    out[ATTACKED_VALUE] = attacked as f32;
+    out[HANGING_VALUE] = hanging as f32;
+    out[KING_HOLES] = holes as f32;
 }
 
 /// `color` に**一手詰めがあるか**（詰みへの近さの信号）。
@@ -218,8 +330,9 @@ pub fn mate_threat(pos: &Position, color: Color) -> bool {
 pub fn signals_into(pos: &Position, events: &EventCounts, out: &mut [f32]) {
     debug_assert_eq!(out.len(), 2 * NUM_SIGNALS);
     let (s, g) = out.split_at_mut(NUM_SIGNALS);
-    side_signals(pos, events, Color::Sente, s);
-    side_signals(pos, events, Color::Gote, g);
+    let attacks = attack_map(pos);
+    side_signals(pos, events, &attacks, Color::Sente, s);
+    side_signals(pos, events, &attacks, Color::Gote, g);
 }
 
 #[cfg(test)]
@@ -250,6 +363,12 @@ mod tests {
             ("camp_pieces", CAMP_PIECES),
             ("king_escape", KING_ESCAPE),
             ("mate_threat", MATE_THREAT),
+            ("effect_attack", EFFECT_ATTACK),
+            ("effect_guard", EFFECT_GUARD),
+            ("tied_value", TIED_VALUE),
+            ("attacked_value", ATTACKED_VALUE),
+            ("hanging_value", HANGING_VALUE),
+            ("king_holes", KING_HOLES),
         ] {
             assert_eq!(index(name), k, "{name}");
         }
@@ -280,6 +399,66 @@ mod tests {
         assert_eq!(s[KING_ESCAPE], 3.0);
         assert_eq!(s[MATE_THREAT], 0.0);
         assert!(s[..NUM_EVENTS].iter().all(|&v| v == 0.0));
+        // やねうら王の項: 初期局面は相手の利きが自駒に届かず、玉の隣の空きマス（4八・5八・6八）には金銀飛の利きがある
+        assert_eq!(s[ATTACKED_VALUE], 0.0);
+        assert_eq!(s[HANGING_VALUE], 0.0);
+        assert_eq!(s[KING_HOLES], 0.0);
+        assert!(s[TIED_VALUE] > 0.0 && s[TIED_VALUE] < s[MATERIAL]);
+        assert!(s[EFFECT_GUARD] > s[EFFECT_ATTACK] && s[EFFECT_ATTACK] > 0.0, "利きは自玉の近くに集まっている");
+    }
+
+    #[test]
+    fn やねうら王の項は真実の盤面の利きから数える() {
+        let put = |pos: &mut Position, sq: &str, color, role| {
+            pos.set(crate::board::parse_usi_square(sq).unwrap(), Some(crate::shogi::Piece { color, role }));
+        };
+        let signals = |pos: &Position| {
+            let mut out = [0.0f32; 2 * NUM_SIGNALS];
+            signals_into(pos, &EventCounts::default(), &mut out);
+            out
+        };
+        let gold = piece_value(Role::Gold) as f32;
+        // 先手: 玉 5九・金 4八・歩 7七。後手: 玉 5一・飛 4二（4筋を通して 4八の金に当たっている）
+        let mut pos = Position::empty(Color::Sente);
+        put(&mut pos, "5i", Color::Sente, Role::King);
+        put(&mut pos, "4h", Color::Sente, Role::Gold);
+        put(&mut pos, "7g", Color::Sente, Role::Pawn);
+        put(&mut pos, "5a", Color::Gote, Role::King);
+        put(&mut pos, "4b", Color::Gote, Role::Rook);
+        let out = signals(&pos);
+        let s = &out[..NUM_SIGNALS];
+        // 金は飛に当てられているが玉の紐がある。歩は当たっておらず紐も無い
+        assert_eq!(s[ATTACKED_VALUE], gold);
+        assert_eq!(s[TIED_VALUE], gold);
+        assert_eq!(s[HANGING_VALUE], 0.0);
+        // 玉の隣（4九・6九・4八・5八・6八）: 4八は自駒、4九・5八は金の利きがある。6九・6八は玉しか利いていない = 穴
+        assert_eq!(s[KING_HOLES], 2.0);
+        // 後手の飛には先手の利きが無く、後手玉の紐がある
+        let g = &out[NUM_SIGNALS..];
+        assert_eq!(g[ATTACKED_VALUE], 0.0);
+        assert_eq!(g[TIED_VALUE], piece_value(Role::Rook) as f32);
+
+        // 玉が離れると金はただ取られる形になる
+        let mut far = pos.clone();
+        far.set(crate::board::parse_usi_square("5i").unwrap(), None);
+        put(&mut far, "9i", Color::Sente, Role::King);
+        let out = signals(&far);
+        assert_eq!(out[HANGING_VALUE], gold);
+        assert_eq!(out[TIED_VALUE], 0.0);
+
+        // 相手玉の近くに利きを作ると effect_attack が増える（同じ金でも遠くに置くより大きい）
+        let base = signals(&pos)[EFFECT_ATTACK];
+        let mut near = pos.clone();
+        put(&mut near, "5c", Color::Sente, Role::Gold);
+        let mut away = pos.clone();
+        put(&mut away, "9g", Color::Sente, Role::Gold);
+        let (near, away) = (signals(&near)[EFFECT_ATTACK], signals(&away)[EFFECT_ATTACK]);
+        assert!(near > away && away > base, "{near} {away} {base}");
+        // 利きの数は逓減する
+        assert_eq!(effect_multiplicity(0), 0.0);
+        assert!((effect_multiplicity(1) - 1.0).abs() < 1e-12);
+        let (m2, m3) = (effect_multiplicity(2), effect_multiplicity(3));
+        assert!((m2 - 1.769).abs() < 0.01 && m3 > m2 && m3 - m2 < m2 - 1.0, "{m2} {m3}");
     }
 
     #[test]
