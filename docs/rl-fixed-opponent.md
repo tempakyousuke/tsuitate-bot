@@ -856,6 +856,24 @@ gh workflow run exploiter.yml -f target="rl_policy:release:<タグ>/policy.bin" 
   `release_tag` を付ければその Release（prerelease）に置く
 - 置いた重みは `rl_policy:release:<タグ>/<腕>_s<seed>.bin` でアリーナに、手元へ落とせば `--league rl_policy:<パス>` で学習に使える
 
+### 9.1 続きから育てる（`init_from`、2026-11-12）
+
+区切りごとに毎回ゼロから作り直すと、最初の勝ちが出るまで（離陸）の 100〜300更新を毎回払う。前の回の搾取モデルを
+新しい相手に当て直して続きから育てると、その部分が要らない。
+
+```sh
+gh workflow run exploiter.yml -f target="rl_policy:release:<新しい相手のタグ>/policy.bin" \
+    -f init_from="<前の回の搾取モデルの Release>" -f init_top=6 -f steps=200 -f after=100000 -f release_tag="rlxc-<名前>"
+```
+
+- Release には重み（`.bin`）に加えて学習状態（`.pt`）と、勝率の高い順の一覧（`order.txt`）を置く。`init_from` は
+  その一覧の上から `init_top` 本を取り、`--init <.pt> --init-which net` で今の相手に当てて続ける（1本 = 腕 `c<順位>`）。
+  2026-11-12 より前に作った Release には `.pt` が無いので使えない
+- 表の「元の搾取モデル」に、どれから続けたかが出る
+- **ゼロからの回と併用する**: 続きから育てると同じ手口の変形に留まりやすい（手口は seed ごとに違い、合わせて広く覆う。
+  10節）。続きからは「同じ穴が本当に塞がったか」を突く役、ゼロからは新しい穴を探す役
+- 手元の確認: hand の 308,000 に 93% 勝っていた搾取モデルの学習状態から始めると、最初の更新から 64局中 62勝
+
 ## 10. 定跡に従う相手を搾取する搾取役（2026-11-11）
 
 8節までの搾取役は、相手（rl_mmdopen_v15）がいつも同じ序盤（飛車先の歩の速攻）を指すことに頼っていた。本番bot や
