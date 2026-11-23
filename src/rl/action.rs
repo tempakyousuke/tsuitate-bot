@@ -427,17 +427,26 @@ impl Deduction {
             })
             .collect();
 
-        // 直前の相手の手（自分の最後の受理手より後にあるもの）が取ったマス
+        // 直前の相手の手（自分の最後の受理手より後にあるもの）が取ったマス。
+        // ログの末尾の相手の手が本当に直前の手かを、手数で確かめる: 今の手数 `now` に対して、直前の相手の手に付く
+        // 手数は適用後の規約（審判・サーバー）で `now`、適用前の規約（〜2026-11-24 の webhook のセッション）で
+        // `now − 1`。1つ前の相手の手は `now − 2` / `now − 3` なので取り違えない。再接続で通知を取りこぼすと
+        // （自分の手の受理と相手の応手の両方が欠けると）末尾の相手の手は2手前のもので、取ったマスの駒はもう動いたか、
+        // 自分が取ったかもしれない。そのまま使うと占有と王手駒の候補を誤り、真の合法手を落とす（その形の決定点の
+        // 7%。2026-11-23 の計測）。合わなければ「直前の相手の手は分からない」として扱う（王手駒の候補は広いほうへ戻る）
+        let now = view.move_number;
         let mut known_opponent = None;
         let mut opponent_moved = false;
         for event in log.events().iter().rev() {
             match event {
                 Observation::OpponentMoved {
+                    move_number,
                     captured_my_piece_at,
-                    ..
                 } => {
-                    opponent_moved = true;
-                    known_opponent = captured_my_piece_at.as_deref().and_then(parse_usi_square);
+                    if *move_number == now || move_number.checked_add(1) == Some(now) {
+                        opponent_moved = true;
+                        known_opponent = captured_my_piece_at.as_deref().and_then(parse_usi_square);
+                    }
                     break;
                 }
                 Observation::MyMove { .. } => break,
@@ -1150,11 +1159,13 @@ mod tests {
 
     #[test]
     fn 駒を取った桂の王手でも直前の王手が残る升に玉を戻せない() {
-        let view = view_from_sfen(
+        let mut view = view_from_sfen(
             "l2g4l/1ks2+Ps2/pp2+Np1p1/2Np4p/1N2B4/1PP1n4/PK1P+bPSPP/3+r1g3/L1SG4L",
             Color::Gote,
             &[(Role::Pawn, 1)],
         );
+        // ログの末尾の相手の手（手数 60）が直前の手だと分かるように、視界の手数をそろえる
+        view.move_number = 60;
         let mut log = ObservationLog::default();
         log.record(Observation::OpponentMoved { move_number: 58, captured_my_piece_at: None });
         log.record(Observation::Check { in_check: Color::Gote });
@@ -1262,6 +1273,7 @@ mod tests {
             &[(Role::Rook, 1), (Role::Bishop, 1), (Role::Silver, 1), (Role::Pawn, 1)],
         );
         view.you_in_check = false;
+        view.move_number = 57;
         let mut log = ObservationLog::default();
         log.record(Observation::OpponentMoved { move_number: 57, captured_my_piece_at: None });
         let tried = ["B*2b".to_string(), "P*2c".to_string()].into();
@@ -1361,5 +1373,40 @@ mod tests {
         let tried = HashSet::new();
         assert!(!allowed(&view, &log, &tried, "P*3e"));
         assert!(allowed(&view, &log, &tried, "P*3f"));
+    }
+
+    /// 再接続で自分の手の受理と相手の応手を取りこぼすと、ログの末尾の相手の手は2手前のものになる。
+    /// その手が取ったマスを「直前に取られたマス」として使わない（そこの駒はもう動いたかもしれない）
+    #[test]
+    fn 末尾の相手の手が直前の手でなければ取られたマスを使わない() {
+        let mut referee = Referee::new();
+        // 先手 7六歩・後手 3四歩・先手 2二角成・後手 同銀（2二で先手の馬を取る）・先手 7八金・後手 3三銀（2二が空く）
+        for usi in ["7g7f", "3c3d", "8h2b+", "3a2b", "6i7h", "2b3c"] {
+            assert!(matches!(referee.step(usi, 0), StepResult::Accepted), "{usi}");
+        }
+        let side = Color::Sente;
+        let view = referee.view(side, [0, 0], 0);
+        let tried = HashSet::new();
+        let full = referee.log(side);
+        assert!(allowed(&view, full, &tried, "B*2b"), "2二は空いている");
+        // 7八金の受理と 3三銀の通知が欠けたログ: 末尾は 2二で駒を取った相手の手（手数 5。今の手数は 7）
+        let n = full.events().len();
+        let mut broken = ObservationLog::default();
+        for e in &full.events()[..n - 2] {
+            broken.record(e.clone());
+        }
+        assert!(matches!(
+            broken.events().last(),
+            Some(Observation::OpponentMoved { move_number: 5, captured_my_piece_at: Some(sq) }) if sq == "2b"
+        ));
+        assert_eq!(view.move_number, 7);
+        assert!(allowed(&view, &broken, &tried, "B*2b"), "2手前に取られたマスを占有と決めつけた");
+        assert!(deduced_facts(&view, &broken, &tried).occupied.is_empty());
+        // 相手の直前の手だけが欠けたログ（末尾は自分の手）と、欠けていないログでは従来どおり
+        let mut one = ObservationLog::default();
+        for e in &full.events()[..n - 1] {
+            one.record(e.clone());
+        }
+        assert!(allowed(&view, &one, &tried, "B*2b"));
     }
 }
