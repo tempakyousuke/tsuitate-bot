@@ -1374,7 +1374,10 @@ mod tests {
                         .len()
                 });
                 let check_mn = pos.move_number();
-                let mask = legal_mask(&view, referee.log(side), referee.foul_tried(side));
+                // 入力の検査に使う局面列は、現行マスクの更新で変わらないよう v3 で作る。
+                let mask = crate::rl::action::legal_mask_with_version(
+                    &view, referee.log(side), referee.foul_tried(side), 3,
+                );
                 let actions: Vec<usize> = (0..NUM_ACTIONS).filter(|&a| mask[a]).collect();
                 if actions.is_empty() {
                     break;

@@ -686,12 +686,17 @@ mod tests {
         assert!(rl_versions.iter().any(|(n, _)| *n == "rl_v29"), "rl_v29 が無い");
         for (version, src) in rl_versions {
             let path = format!("{}/models/{version}.bin", env!("CARGO_MANIFEST_DIR"));
-            // 観測からの確定反則を落とすマスク（`action::MASK_VERSION` 2）より前に凍結した版は
-            // 旧マスクと比べる
-            let prefix = if src.contains("pub const MASK_VERSION") {
-                crate::rl::policy::PREFIX_SAMPLE
-            } else {
+            // 凍結時点と同じマスクで比較する。定数のない版は基本マスクを使う。
+            let mask_version = src.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix("pub const MASK_VERSION: u32 = ")
+                    .and_then(|value| value.strip_suffix(';'))
+                    .map(|value| value.parse::<u32>().expect("凍結版のマスクの版"))
+            }).unwrap_or(1);
+            let prefix = if mask_version == 1 {
                 crate::rl::policy::PREFIX_BASIC
+            } else {
+                crate::rl::policy::PREFIX_SAMPLE
             };
             let name = format!("{prefix}{path}");
             // 序盤の定跡を内蔵した版: 埋め込んだ定跡の固定コピーを読み、元の重みを同じ予定で包む
@@ -701,12 +706,8 @@ mod tests {
                 crate::rl::forced::book_from_json(&json, 1.0, None, crate::rl::forced::ForcedSides::Both).unwrap()
             });
             let make_orig = |seed: u64| -> Box<dyn Strategy> {
-                let policy = crate::rl::policy::RlPolicy::from_name(&name, Some(seed)).unwrap();
-                let policy = if src.contains("pub const MASK_VERSION: u32 = 2;") {
-                    policy.with_mask_v2()
-                } else {
-                    policy
-                };
+                let policy = crate::rl::policy::RlPolicy::from_name(&name, Some(seed)).unwrap()
+                    .with_mask_version(mask_version);
                 let inner: Box<dyn Strategy> = Box::new(policy);
                 match &book {
                     Some(b) => Box::new(crate::rl::forced::ForcedOpening::new(

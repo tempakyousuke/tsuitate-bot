@@ -21,7 +21,7 @@ use rand::{Rng, SeedableRng, rngs::StdRng};
 
 use crate::observation::ObservationLog;
 use crate::protocol::PlayerView;
-use crate::rl::action::{MASK_VERSION, basic_legal_mask, decode_usi, legal_mask, legal_mask_with_capture_paths};
+use crate::rl::action::{MASK_VERSION, basic_legal_mask, decode_usi, legal_mask_with_version};
 use crate::rl::encode::encode_planes;
 use crate::rl::policy_net::PolicyNet;
 use crate::strategy::Strategy;
@@ -103,8 +103,8 @@ impl RlPolicy {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_mask_v2(mut self) -> Self {
-        self.mask_version = 2;
+    pub(crate) fn with_mask_version(mut self, version: u32) -> Self {
+        self.mask_version = version;
         self
     }
 }
@@ -118,8 +118,7 @@ impl Strategy for RlPolicy {
     ) -> Option<String> {
         let mask = match self.mask_version {
             1 => basic_legal_mask(view, foul_tried),
-            2 => legal_mask_with_capture_paths(view, log, foul_tried, false),
-            _ => legal_mask(view, log, foul_tried),
+            version => legal_mask_with_version(view, log, foul_tried, version),
         };
         let legal: Vec<usize> = (0..mask.len()).filter(|&a| mask[a]).collect();
         if legal.is_empty() {
@@ -175,6 +174,7 @@ impl Strategy for RlPolicy {
 
 #[cfg(test)]
 mod tests {
+    use crate::rl::action::legal_mask;
     use super::*;
     use crate::referee::{Referee, StepResult};
 
