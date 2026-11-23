@@ -32,6 +32,7 @@ mod play;
 const ENGINES: &[&str] = &[
     "estimator",
     "rl_scratch5_v2",
+    "rl_scratch5free_v1",
     "rl_v16",
     "rl_v15",
     "estimator_v14",
