@@ -86,6 +86,9 @@ pub const HAND_ROLES: [Role; 7] = [
     Role::Rook,
 ];
 
+/// 平手の各駒種の総数（両者合計。成りは元の駒種で数える。`HAND_ROLES` 順）
+pub const HAND_ROLE_TOTAL: [u32; 7] = [18, 4, 4, 4, 4, 2, 2];
+
 pub fn hand_index(role: Role) -> Option<usize> {
     HAND_ROLES.iter().position(|&r| r == role)
 }

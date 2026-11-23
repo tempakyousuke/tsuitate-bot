@@ -21,14 +21,15 @@
 
 use std::collections::HashSet;
 
-use super::encode::ROLE_TOTAL;
 use crate::board::{
     Coord, Promotion, drop_targets, make_usi_drop, make_usi_move, move_targets, orient,
     parse_usi_square, promotion_choice, rays, steps,
 };
 use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{Color, PlayerView, Role};
-use crate::shogi::{HAND_ROLES, ShogiMove, hand_index, parse_usi, promote_role, unpromote_role};
+use crate::shogi::{
+    HAND_ROLE_TOTAL, HAND_ROLES, ShogiMove, hand_index, parse_usi, promote_role, unpromote_role,
+};
 
 /// マスクの版。1 = 自駒視点だけ、2 = 観測からの確定反則も除く、
 /// 3 = 開き王手の仮説を自駒の遮りで絞る、4 = 相手に残り得る駒種とその動きも見る。
@@ -375,7 +376,7 @@ fn possible_opponent_roles(view: &PlayerView) -> Vec<Role> {
     let mut roles = vec![Role::King];
     for (i, role) in HAND_ROLES.into_iter().enumerate() {
         let hand = view.your_hand.get(&role).copied().unwrap_or(0);
-        if own[i].saturating_add(hand) < ROLE_TOTAL[i] {
+        if own[i].saturating_add(hand) < HAND_ROLE_TOTAL[i] {
             roles.push(role);
             roles.extend(promote_role(role));
         }
@@ -473,6 +474,10 @@ impl Deduction {
             };
             for usi in foul_tried.iter().filter(|u| candidates.contains(*u)) {
                 match parse_usi(usi) {
+                    // 歩（マスクv6〜）: `pawn_drop_cannot_mate` は「自駒が利いているマスに相手玉はいない」を使う。
+                    // これは自分の手番で相手玉に王手がかかっていない（相手が自玉を王手に晒したまま指していない）
+                    // ことが前提なので、`opponent_in_check` で確かめる。正規の対局の自分の手番では常に偽で、
+                    // 効くのは手で組んだ局面・シナリオの開始局面のような、正規でない局面だけ
                     Some(ShogiMove::Drop { role, to })
                         if role != Role::Pawn
                             || (mask_version >= 6 && opponent_moved && !view.opponent_in_check
