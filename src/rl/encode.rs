@@ -41,7 +41,7 @@ pub const HISTORY_MOVES: usize = 8;
 /// 鮮度の減衰（1手 = 1 move_number あたり）
 const DECAY: f32 = 0.95;
 /// 各駒種の総数（両者合計。`HAND_ROLES` 順）。相手の保有数の算出と正規化に使う
-pub(crate) const ROLE_TOTAL: [u32; 7] = [18, 4, 4, 4, 4, 2, 2];
+pub(crate) const ROLE_TOTAL: [u32; 7] = crate::shogi::HAND_ROLE_TOTAL;
 
 // プレーンの配置
 pub(crate) const P_OWN: usize = 0; // 14
