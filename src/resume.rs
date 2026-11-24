@@ -15,6 +15,11 @@
 //! だったかが分からない、など）は埋めずにエラーを返す。王手宣言の有無は相手玉の候補の推論（`deduce`）が事実として
 //! 使うので、当て推量で埋めると真の玉を落としうる。
 //!
+//! **見分けられない欠けが1つある**: 自分の手の受理は受け取ったが直後の相手への王手宣言だけを落とし、さらに相手の
+//! 1手が欠けた場合。ログの末尾が自分の手の受理なので「相手の1手だけが欠けた」形と区別できず、王手宣言なしのまま
+//! 埋まる。サーバーは受理と王手宣言を同じ tick で送る（`game-room.ts` の `handleMove`）ので、起きるのは2つの観測を
+//! 処理する間にプロセスが落ちたときだけ。
+//!
 //! 履歴を失った側は、その局の勝率が 12〜17pt 下がる（docs/rl-deepnash-design.md の「入力と行動マスクの点検」）。
 
 use std::collections::BTreeMap;
@@ -104,11 +109,9 @@ pub fn reconcile(
         .you
         .checked_sub(model.my_fouls())
         .ok_or("視界の自分の反則数が観測ログより少ない")?;
-    let opp_fouls = view
-        .fouls
-        .opponent
-        .checked_sub(model.opponent_fouls())
-        .ok_or("視界の相手の反則数が観測ログより少ない")?;
+    if view.fouls.opponent < model.opponent_fouls() {
+        return Err("視界の相手の反則数が観測ログより少ない".into());
+    }
     let push_opp_fouls = |out: &mut Vec<Observation>| {
         for count in model.opponent_fouls() + 1..=view.fouls.opponent {
             out.push(Observation::OpponentFoul { count });
@@ -140,8 +143,10 @@ pub fn reconcile(
                 }
                 n => return Err(format!("自分の反則が {n} 個多い")),
             }
-            // 相手の反則の取りこぼし（相手の手番は閉じている）は埋めない: 末尾に足すと次の相手の手番の反則に
-            // 見える。累計数は視界から入るので、失うのは時系列の1点だけ
+            // 相手の反則の取りこぼし（相手の手番は閉じている。前の作り直しに失敗したときだけ起きる）も末尾へ足す。
+            // 時系列では次の相手の手番の反則に見えるが、ここで足さなくても、次に相手の手番で作り直すときに同じ
+            // 位置へ入る。足しておけば累計が視界とそろい、以後の照合でズレの警告が出続けない
+            push_opp_fouls(&mut out);
         }
         0 => {
             // 相手の手番。自分の手の直後の王手宣言と、相手のこの手番の反則を取りこぼすことがある
@@ -216,9 +221,8 @@ pub fn reconcile(
         }
         n => return Err(format!("受理手が {n} 個欠けている")),
     }
-    let _ = opp_fouls;
 
-    // 検算: 足した観測を適用した自分側が視界と一致する
+    // 検算: 足した観測を適用した自分側と、相手の反則の累計が視界と一致する
     let mut after = model;
     for e in &out {
         after.apply(e);
@@ -227,6 +231,7 @@ pub fn reconcile(
         || piece_map(&after.my_pieces()) != piece_map(&view.your_pieces)
         || hand_counts(&after.my_hand()) != hand_counts(&view.your_hand)
         || after.my_fouls() != view.fouls.you
+        || after.opponent_fouls() != view.fouls.opponent
     {
         return Err("欠けを埋めても、自駒・持ち駒・反則数が視界と合わない".into());
     }
@@ -381,6 +386,25 @@ mod tests {
             loaded.your_color, end.result, end.reason, got.len(), want.len()
         );
         assert!(got.len().abs_diff(want.len()) <= 1, "観測の数が合わない");
+    }
+
+    /// 相手の手の通知は入っているのに、その手番の相手の反則だけが欠けたログ: 累計を視界にそろえる
+    #[test]
+    fn 閉じた手番の相手の反則の取りこぼしは末尾へ足す() {
+        let mut referee = Referee::new();
+        assert!(matches!(referee.step("7g7f", 0), StepResult::Accepted));
+        // 後手: 1一香→1九 は反則
+        assert!(matches!(referee.step("1a1i", 0), StepResult::Foul));
+        assert!(matches!(referee.step("3c3d", 0), StepResult::Accepted));
+        let full = referee.log(Color::Sente);
+        let mut short = ObservationLog::default();
+        for e in full.events().iter().filter(|e| !matches!(e, Observation::OpponentFoul { .. })) {
+            short.record(e.clone());
+        }
+        assert_eq!(short.events().len() + 1, full.events().len());
+        let view = referee.view(Color::Sente, [0, 0], 0);
+        let got = reconcile(Color::Sente, &short, None, &view).unwrap();
+        assert_eq!(json(&got), json(&[Observation::OpponentFoul { count: 1 }]));
     }
 
     #[test]

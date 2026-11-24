@@ -477,6 +477,8 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
                             move_number: state.last_move_number,
                             usi,
                         });
+                    } else {
+                        println!("反則 {usi} は記録済みなので、観測へは足しません");
                     }
                     let _ = tx.send(Msg::ThinkTrigger);
                 } else if !ack.ok {
@@ -500,25 +502,25 @@ const DEFAULT_RESUME_PREWARM_MS: u64 = 2_500;
 /// 読み直し、止まっていた間の欠け（高々相手の1手と、送った手の結果）を視界から作り直す。
 /// 履歴を失うと、その局の勝率が 12〜17pt 下がる（docs/rl-deepnash-design.md の「入力と行動マスクの点検」）。
 /// 読み直せない・今の局面とつながらないときは、従来どおり空のログで続ける
-fn restore_from_record(state: &mut BotState, view: &PlayerView, config: &Config) {
+fn restore_from_record(state: &mut BotState, view: &PlayerView, config: &Config) -> bool {
     let Some(dir) = config.record_dir.as_deref() else {
         println!("復帰: 対局記録を取っていないので、履歴なしで続けます");
-        return;
+        return false;
     };
     let Some(path) = record::find_record(dir, &view.game_id) else {
         println!("復帰: 対局記録が見つからないので、履歴なしで続けます");
-        return;
+        return false;
     };
     let loaded = match record::load_record(&path) {
         Ok(l) => l,
         Err(e) => {
             eprintln!("復帰: 対局記録を読めないので、履歴なしで続けます: {e}");
-            return;
+            return false;
         }
     };
     if loaded.finished || loaded.game_id != view.game_id || loaded.your_color != view.your_color {
         eprintln!("復帰: 対局記録 {} はこの対局の続きではないので、履歴なしで続けます", path.display());
-        return;
+        return false;
     }
     let mut log = ObservationLog::default();
     for e in &loaded.events {
@@ -532,7 +534,7 @@ fn restore_from_record(state: &mut BotState, view: &PlayerView, config: &Config)
                 "復帰: 対局記録の観測 {} 件が今の局面とつながらないので、履歴なしで続けます（{why}）",
                 loaded.events.len()
             );
-            return;
+            return false;
         }
     };
     // 続きは同じファイルへ追記する（1対局 = 1ファイル）。開けなければ、後で新しいファイルを作る
@@ -576,6 +578,55 @@ fn restore_from_record(state: &mut BotState, view: &PlayerView, config: &Config)
         loaded.events.len(),
         repaired
     );
+    true
+}
+
+/// 対局記録から読み直せなかった復帰対局: 履歴なしで始め直す。同じプロセスが `match:found` を取りこぼして
+/// `game:active` で新しい対局を知った場合、メモリには前の対局のログと戦略が残っているので、必ず作り直す。
+/// そのうえで空のログを視界とつなげるか試す（1手目・相手の初手の直後ならつながる = 対局の頭から観測が
+/// そろっているので、序盤の強制も付けられる）。つながらなければ従来どおり、空のログ・強制なしで続ける
+fn start_without_history(state: &mut BotState, view: &PlayerView, config: &Config) {
+    state.log.clear();
+    state.foul_tried.clear();
+    state.last_move_number = 0;
+    state.last_sent = None;
+    state.awaiting = None;
+    state.recorder = None;
+    let inner = strategy::make(&config.strategy_name).expect("main で検証済みの戦略名");
+    match crate::resume::reconcile(view.your_color, &state.log, None, view) {
+        Ok(repairs) => {
+            state.strategy = crate::rl::forced::wrap_for_game(
+                inner,
+                config.opening_book.as_ref(),
+                &view.game_id,
+                view.your_color,
+            );
+            // 作り直した観測も記録へ残す（次の復帰で読み直せるように、記録ファイルを先に作る）
+            ensure_recorder(state, view, config.record_dir.as_deref());
+            if !repairs.is_empty() {
+                println!("復帰: 対局の頭からの観測 {} 件を視界から作り直しました", repairs.len());
+            }
+            for e in repairs {
+                state.observe(e);
+            }
+        }
+        Err(_) => state.strategy = inner,
+    }
+}
+
+/// 対局ごとの記録ファイルを、まだ無ければ作る
+fn ensure_recorder(state: &mut BotState, view: &PlayerView, record_dir: Option<&str>) {
+    if state.recorder.is_some() {
+        return;
+    }
+    let Some(dir) = record_dir else { return };
+    match GameRecorder::create(dir, &view.game_id, view.your_color, state.strategy.name()) {
+        Ok(rec) => {
+            println!("対局記録: {}", rec.path().display());
+            state.recorder = Some(rec);
+        }
+        Err(e) => eprintln!("対局記録ファイルを作れませんでした: {e}"),
+    }
 }
 
 /// 対局中の再接続: 切断中に送られた通知は再送されないので、取りこぼした観測（高々相手の1手と、送った手の
@@ -619,7 +670,9 @@ fn handle_sync(
     if view.status == GameStatus::Playing {
         if std::mem::take(&mut state.restore_pending) {
             state.reconcile_pending = false;
-            restore_from_record(state, &view, config);
+            if !restore_from_record(state, &view, config) {
+                start_without_history(state, &view, config);
+            }
         } else if std::mem::take(&mut state.reconcile_pending) {
             reconcile_after_reconnect(state, &view);
         }
@@ -627,17 +680,8 @@ fn handle_sync(
 
     // 対局ごとの記録ファイルは最初の sync で作る（match:found 起点の新規対局と
     // game:active 起点の復帰対局の共通経路）
-    if view.status == GameStatus::Playing && state.recorder.is_none() {
-        if let Some(dir) = record_dir {
-            match GameRecorder::create(dir, &view.game_id, view.your_color, state.strategy.name())
-            {
-                Ok(rec) => {
-                    println!("対局記録: {}", rec.path().display());
-                    state.recorder = Some(rec);
-                }
-                Err(e) => eprintln!("対局記録ファイルを作れませんでした: {e}"),
-            }
-        }
+    if view.status == GameStatus::Playing {
+        ensure_recorder(state, &view, record_dir);
     }
 
     if view.status != GameStatus::Playing || view.turn != view.your_color {

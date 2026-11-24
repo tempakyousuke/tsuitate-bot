@@ -54,19 +54,21 @@ impl GameRecorder {
     }
 
     /// 既存の対局記録の続きへ追記する（再起動後の復帰対局。`load_record` で読み直したファイルを渡す）。
-    /// 1対局 = 1ファイルを保つために新しいファイルを作らない。途中まで書かれた最後の行が残っていても
-    /// 次の行と混ざらないよう、改行で終わっていなければ改行を足す
+    /// 1対局 = 1ファイルを保つために新しいファイルを作らない。途中まで書かれた最後の行（改行で終わって
+    /// いない末尾）は切り捨てる: 残すと読めない行がファイルの途中に入り、1行でも読めないと記録ごと捨てる
+    /// 読み手（`bin/analyze`・`truth_replay::parse_bot_and_end` など）がその対局を使えなくなる。
+    /// `load_record` もその行は読めずに捨てているので、失う情報は無い
     pub fn resume(path: &Path) -> std::io::Result<GameRecorder> {
-        let ends_with_newline = std::fs::read(path)?.last().is_none_or(|&b| b == b'\n');
+        let bytes = std::fs::read(path)?;
+        let keep = bytes.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        if keep < bytes.len() {
+            OpenOptions::new().write(true).open(path)?.set_len(keep as u64)?;
+        }
         let file = OpenOptions::new().append(true).open(path)?;
-        let mut rec = GameRecorder {
+        Ok(GameRecorder {
             writer: BufWriter::new(file),
             path: path.to_path_buf(),
-        };
-        if !ends_with_newline {
-            writeln!(rec.writer)?;
-        }
-        Ok(rec)
+        })
     }
 
     /// 復帰の印（読み直した観測の数と、視界から作り直して足した観測の数）
@@ -283,11 +285,14 @@ mod tests {
         assert_eq!(loaded.pending, Some((4, "2b3c".to_string())));
         assert_eq!(loaded.events.len(), obs.len());
 
-        // 続きの追記は途中まで書かれた行と混ざらない
+        // 続きの追記は途中まで書かれた行を切り捨ててから始める（読めない行がファイルの途中に残らない）
         let mut rec = GameRecorder::resume(&path).unwrap();
         rec.resumed(loaded.events.len(), 1);
         rec.observation(&Observation::MyMove { move_number: 5, usi: "2b3c".into(), captured: Some(Role::Pawn) });
         drop(rec);
+        for line in std::fs::read_to_string(&path).unwrap().lines() {
+            assert!(serde_json::from_str::<serde_json::Value>(line).is_ok(), "読めない行が残った: {line}");
+        }
         let loaded = load_record(&path).unwrap();
         assert_eq!(loaded.events.len(), obs.len() + 1);
         assert!(loaded.pending.is_none() && !loaded.finished);
