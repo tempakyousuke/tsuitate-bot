@@ -167,10 +167,14 @@ impl GameSession {
 
     /// 永続化ファイルから復元した観測イベントを1件適用する。
     /// `advance` が観測を記録するときの副作用（move_number・check_holder の
-    /// 更新規約）と一致させること
-    fn replay_event(&mut self, event: Observation) {
-        match &event {
-            Observation::MyMove { .. } | Observation::OpponentMoved { .. } => {
+    /// 更新規約）と一致させること。
+    /// 受理手の手数は適用後の値（`advance` と同じ）へ付け替える: 〜2026-11-24 の永続化ファイルは
+    /// 適用前の値で書いてあり、対局の途中で更新をまたぐと1つのファイルに両方の規約が混ざる。
+    /// 受理手の手数は直前までの受理手の数で決まるので、ファイルの値によらず再計算してよい
+    fn replay_event(&mut self, mut event: Observation) {
+        match &mut event {
+            Observation::MyMove { move_number, .. } | Observation::OpponentMoved { move_number, .. } => {
+                *move_number = self.next_move_number + 1;
                 self.next_move_number += 1;
                 self.check_holder = None;
             }
@@ -819,6 +823,9 @@ fn advance(
                     });
                 }
             };
+            // 手数の規約は審判・Socket.IO 版と同じ: 反則は今の手数、受理手は適用後の手数（初手が 2）。
+            // 〜2026-11-24 は受理手を適用前の手数（初手が 1）で付けていて、方策ネットの鮮度のプレーンが
+            // 学習（審判の規約）より1手ぶん古く出ていた。永続化した古いログは `replay_event` が付け替える
             if is_foul {
                 Observation::MyFoul {
                     move_number: session.next_move_number,
@@ -827,7 +834,7 @@ fn advance(
             } else {
                 let captured = entry.last_capture.as_deref().and_then(parse_capture_letter);
                 Observation::MyMove {
-                    move_number: session.next_move_number,
+                    move_number: session.next_move_number + 1,
                     usi,
                     captured,
                 }
@@ -846,7 +853,7 @@ fn advance(
                 }
             };
             Observation::OpponentMoved {
-                move_number: session.next_move_number,
+                move_number: session.next_move_number + 1,
                 captured_my_piece_at,
             }
         };
@@ -1737,8 +1744,8 @@ mod tests {
     }
 
     /// webhook のセッションが作る観測ログは、エンコーダ v6 から見て「履歴が欠けていない」ログになる
-    /// （欠けていると締めた相手玉の候補が上界へ戻る = 学習の自己対局と違う入力になる）。このセッションは受理手の
-    /// 手数を適用前の値（初手が 1）で記録し、審判・サーバーは適用後の値（初手が 2）で記録する
+    /// （欠けていると締めた相手玉の候補が上界へ戻る = 学習の自己対局と違う入力になる）。受理手の手数は審判・
+    /// サーバーと同じ適用後の値（初手が 2）。〜2026-11-24 は適用前の値（初手が 1）だった
     #[test]
     fn session_log_is_contiguous_for_the_encoder() {
         for (color, name) in [(Color::Sente, "b"), (Color::Gote, "w")] {
@@ -1754,6 +1761,89 @@ mod tests {
                 crate::rl::encode::moves_contiguous(&session.log, view.move_number),
                 "{color:?}: webhook のログが欠けていると判定された"
             );
+        }
+    }
+
+    /// webhook のセッションが作る観測ログは、同じ対局を審判で進めたときのログと一致する（手数の規約も同じ =
+    /// 受理手は適用後の手数）。違うと、方策ネットの鮮度のプレーンが学習（審判のログ）より1手ぶんずれる
+    #[test]
+    fn session_log_matches_referee_log() {
+        use crate::referee::{Referee, StepResult};
+        use crate::rl::encode::{NUM_PLANES_V6, encode_planes};
+        let plies = 41;
+        // synth_positions と同じ手順（各 ply で legal[ply % len]）を審判で進める
+        let mut referee = Referee::new();
+        for ply in 1..=plies {
+            let legal = referee.position().legal_moves();
+            if legal.is_empty() {
+                break;
+            }
+            let usi = legal[ply % legal.len()].to_usi();
+            assert_eq!(referee.step(&usi, 0), StepResult::Accepted, "ply {ply}");
+        }
+        for (color, name) in [(Color::Sente, "b"), (Color::Gote, "w")] {
+            let positions = synth_positions(plies, color);
+            let mut session = GameSession::new("heuristic", color).unwrap();
+            advance(&mut session, &positions, plies as u32).unwrap();
+            assert_eq!(
+                serde_json::to_string(session.log.events()).unwrap(),
+                serde_json::to_string(referee.log(color).events()).unwrap(),
+                "{color:?}: 観測ログが審判と違う"
+            );
+            // 手番側（後手）はネットの入力まで審判と一致する
+            if color == referee.to_move() {
+                let req = request("g-referee", name, plies as u32, positions);
+                let view = build_player_view(&session, &req).unwrap();
+                let rv = referee.view(color, [0, 0], 0);
+                let none = HashSet::new();
+                assert_eq!(
+                    encode_planes(NUM_PLANES_V6, &view, &session.log, &none),
+                    encode_planes(NUM_PLANES_V6, &rv, referee.log(color), &none),
+                    "{color:?}: ネットの入力が審判と違う"
+                );
+            }
+        }
+    }
+
+    /// 〜2026-11-24 の永続化ファイル（受理手を適用前の手数で書いた）から復元しても、ログは今の規約（適用後）に
+    /// そろう。対局の途中で更新をまたいで、1つのファイルに両方の規約が混ざっていても同じ
+    #[test]
+    fn replay_normalizes_legacy_move_numbers() {
+        let color = Color::Sente;
+        let positions = synth_positions(30, color);
+        let mut session = GameSession::new("heuristic", color).unwrap();
+        advance(&mut session, &positions, 30).unwrap();
+        let events = session.log.events().to_vec();
+        let legacy = |e: &Observation| -> Observation {
+            match e.clone() {
+                Observation::MyMove { move_number, usi, captured } => {
+                    Observation::MyMove { move_number: move_number - 1, usi, captured }
+                }
+                Observation::OpponentMoved { move_number, captured_my_piece_at } => {
+                    Observation::OpponentMoved { move_number: move_number - 1, captured_my_piece_at }
+                }
+                other => other,
+            }
+        };
+        let half = events.len() / 2;
+        for (name, file) in [
+            ("全部が古い規約", events.iter().map(legacy).collect::<Vec<_>>()),
+            (
+                "途中から今の規約",
+                events[..half].iter().map(legacy).chain(events[half..].iter().cloned()).collect(),
+            ),
+            ("全部が今の規約", events.clone()),
+        ] {
+            let mut restored = GameSession::new("heuristic", color).unwrap();
+            for e in file {
+                restored.replay_event(e);
+            }
+            assert_eq!(
+                serde_json::to_string(restored.log.events()).unwrap(),
+                serde_json::to_string(&events).unwrap(),
+                "{name}"
+            );
+            assert_eq!(restored.next_move_number, session.next_move_number, "{name}");
         }
     }
 

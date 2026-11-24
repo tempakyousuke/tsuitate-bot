@@ -22,16 +22,20 @@
 use std::collections::HashSet;
 
 use crate::board::{
-    Coord, Promotion, drop_targets, make_usi_drop, make_usi_move, move_targets,
-    parse_usi_square, promotion_choice,
+    Coord, Promotion, drop_targets, make_usi_drop, make_usi_move, move_targets, orient,
+    parse_usi_square, promotion_choice, rays, steps,
 };
 use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{Color, PlayerView, Role};
-use crate::shogi::{HAND_ROLES, ShogiMove, hand_index, parse_usi};
+use crate::shogi::{
+    HAND_ROLE_TOTAL, HAND_ROLES, ShogiMove, hand_index, parse_usi, promote_role, unpromote_role,
+};
 
 /// マスクの版。1 = 自駒視点だけ、2 = 観測からの確定反則も除く、
-/// 3 = 捕獲を伴う開き王手の仮説を自駒による遮りで絞る。
-pub const MASK_VERSION: u32 = 3;
+/// 3 = 開き王手の仮説を自駒の遮りで絞る、4 = 相手に残り得る駒種とその動きも見る。
+/// 5 = 直前に王手で逃げた升への戻りを、王手が残ると確認できる場合に除く。
+/// 6 = 打ち歩詰めを否定できる歩打ちの反則からも占有を推定する。
+pub const MASK_VERSION: u32 = 6;
 
 pub const NUM_SQUARES: usize = 81;
 /// 方向×距離 64 ＋ 桂 2
@@ -203,17 +207,17 @@ pub fn basic_legal_mask(view: &PlayerView, foul_tried: &HashSet<String>) -> Vec<
 /// 除外で候補が尽きたときは旧マスクへ戻す（推論が健全なら、真の局面に合法手がある限り
 /// 尽きることはない。尽きる＝推論の前提が崩れているので、指せなくなるより安全側に倒す）
 pub fn legal_mask(view: &PlayerView, log: &ObservationLog, foul_tried: &HashSet<String>) -> Vec<bool> {
-    legal_mask_with_capture_paths(view, log, foul_tried, true)
+    legal_mask_with_version(view, log, foul_tried, MASK_VERSION)
 }
 
-pub(super) fn legal_mask_with_capture_paths(
+pub(super) fn legal_mask_with_version(
     view: &PlayerView,
     log: &ObservationLog,
     foul_tried: &HashSet<String>,
-    check_capture_paths: bool,
+    mask_version: u32,
 ) -> Vec<bool> {
     let candidates = candidate_usis(view);
-    let deduction = Deduction::new(view, log, foul_tried, &candidates.iter().cloned().collect(), check_capture_paths);
+    let deduction = Deduction::new(view, log, foul_tried, &candidates.iter().cloned().collect(), mask_version);
     let mut mask = vec![false; NUM_ACTIONS];
     let mut basic = vec![false; NUM_ACTIONS];
     let mut any = false;
@@ -248,8 +252,8 @@ pub struct DeducedFacts {
 
 pub fn deduced_facts(view: &PlayerView, log: &ObservationLog, foul_tried: &HashSet<String>) -> DeducedFacts {
     let candidates: HashSet<String> = candidate_usis(view).into_iter().collect();
-    // 学習済み方策への観測入力は従来どおり。経路の検査は行動マスクにだけ使う。
-    let d = Deduction::new(view, log, foul_tried, &candidates, false);
+    // 学習済み方策への観測入力はマスクv2の時点の推論で固定する。
+    let d = Deduction::new(view, log, foul_tried, &candidates, 2);
     let mut occupied: Vec<Coord> = d.occupied.into_iter().collect();
     occupied.sort_by_key(|c| (c.file, c.rank));
     let blocked = d
@@ -285,9 +289,8 @@ struct CheckerHyp {
 ///    （= 合法か）は盤上の占有にしか依らない。行き所の有無は候補生成が自駒視点で落とし済み
 /// 2. **相手の駒がいると確定したマス**（`occupied`）への打ちと、そこを飛び越える移動。確定の根拠は
 ///    - 直前に相手が駒を取ったマス（相手の着手駒がいまそこにいる）
-///    - 王手中でないときの**歩以外の打ちの反則**: 打ちで自玉が危なくなることは無く、二歩・
-///      行き所は候補生成が落とし済みなので、原因は「打ち先に相手の駒がいる」しかない
-///      （歩は打ち歩詰めがありうるので使わない）
+///    - 王手中でないときの**打ちの反則**: 打ちで自玉が危なくなることは無く、二歩・
+///      行き所は候補生成が落とし済み。歩は打ち歩詰めを否定できるときだけ占有を推定する
 ///    - 王手中でないときの**間が1マスの飛び越え反則**（下の 3 で原因が遮りと確定したもの）:
 ///      遮っている駒は間の1マスにしかいられない
 /// 3. **飛び越え反則の先**（`blocked_beyond`）: 王手中でないときに2マス以上の直線移動 F→T が
@@ -301,8 +304,8 @@ struct CheckerHyp {
 ///    - 駒を取っていれば（取られたマス X）: 直前の自分の手は合法だった＝相手の手の前は王手が
 ///      無かったので、王手駒は「X に来た着手駒」か「着手駒の元のマス O が空いて通った
 ///      飛び駒（開き王手）」しかない。O は玉の筋の上の空きマスで、その先に飛び駒が入る余地が
-///      あり、X へ1手で行ける位置（マスクv3では自駒に遮られない直線か桂跳び）に限られる。開き王手の飛び駒は O の先の
-///      筋の上のマス
+///      あり、X へ1手で行ける位置に限られる。マスクv3から自駒の遮り、v4から相手に残り得る
+///      駒種ごとの動きも調べる。開き王手の飛び駒は O の先の筋の上のマス
 ///
 ///    仮説 h に対して手が王手を解消し得ない条件:
 ///    - 玉以外の手: 着地点が h（駒取り。打ちは除く）でも、玉と h の間（合駒）でもない
@@ -316,6 +319,7 @@ struct Deduction {
     /// 飛び越え反則した (元のマス, 方向, 距離)。同じ元・方向でこれより遠い手は遮られる
     blocked_beyond: Vec<(Coord, (i8, i8), i8)>,
     check: Option<(Coord, Vec<CheckerHyp>)>,
+    king_return: Option<Coord>,
 }
 
 const ALL_DIRS: [(i8, i8); 8] = [
@@ -360,6 +364,51 @@ fn reachable(o: Coord, x: Coord) -> bool {
     df == 0 || dr == 0 || df.abs() == dr.abs() || (df.abs() == 1 && dr.abs() == 2)
 }
 
+/// 自分の盤上駒と持駒で総数を使い切った駒種は、相手の着手駒になれない。
+/// それ以外は失われた駒や相手の持駒かもしれないので、成り・不成とも候補に残す。
+fn possible_opponent_roles(view: &PlayerView) -> Vec<Role> {
+    let mut own = [0u32; HAND_ROLES.len()];
+    for piece in &view.your_pieces {
+        if let Some(i) = hand_index(unpromote_role(piece.role)) {
+            own[i] += 1;
+        }
+    }
+    let mut roles = vec![Role::King];
+    for (i, role) in HAND_ROLES.into_iter().enumerate() {
+        let hand = view.your_hand.get(&role).copied().unwrap_or(0);
+        if own[i].saturating_add(hand) < HAND_ROLE_TOTAL[i] {
+            roles.push(role);
+            roles.extend(promote_role(role));
+        }
+    }
+    roles
+}
+
+/// 着手前の駒種の利きで到達できるか。途中の遮りは呼び出し側で調べる。
+fn role_reaches(role: Role, color: Color, from: Coord, to: Coord) -> bool {
+    let (df, dr) = (to.file - from.file, to.rank - from.rank);
+    let distance = df.abs().max(dr.abs());
+    steps(role).iter().any(|&d| orient(d, color) == (df, dr))
+        || (distance > 0 && rays(role).iter().any(|&d| step(from, orient(d, color), distance) == to))
+}
+
+/// 打ち先が空だと仮定して、歩が王手できる升に相手玉がいないと証明する。
+/// 飛び駒の途中がある場合は、空と仮定した打ち先だけを通る利きに限る。
+fn pawn_drop_cannot_mate(view: &PlayerView, to: Coord) -> bool {
+    let target = step(to, orient((0, -1), view.your_color), 1);
+    view.your_pieces.iter().any(|piece| {
+        let Some(from) = parse_usi_square(&piece.square) else { return false };
+        let oriented = |d| orient(d, view.your_color);
+        from == target
+            || steps(piece.role).iter().any(|&d| step(from, oriented(d), 1) == target)
+            || rays(piece.role).iter().any(|&d| {
+                let d = oriented(d);
+                let next = step(from, d, 1);
+                next == target || (next == to && step(from, d, 2) == target)
+            })
+    })
+}
+
 impl Deduction {
     /// `candidates` は自駒視点の候補手（`candidate_usis`）。反則から推論するのは候補手の反則だけ
     /// （候補外の反則は原因が成りの選択や行き所でありうるので、占有・遮りの根拠にしない）
@@ -368,7 +417,7 @@ impl Deduction {
         log: &ObservationLog,
         foul_tried: &HashSet<String>,
         candidates: &HashSet<String>,
-        check_capture_paths: bool,
+        mask_version: u32,
     ) -> Self {
         let twins = foul_tried
             .iter()
@@ -378,15 +427,26 @@ impl Deduction {
             })
             .collect();
 
-        // 直前の相手の手（自分の最後の受理手より後にあるもの）が取ったマス
+        // 直前の相手の手（自分の最後の受理手より後にあるもの）が取ったマス。
+        // ログの末尾の相手の手が本当に直前の手かを、手数で確かめる: 今の手数 `now` に対して、直前の相手の手に付く
+        // 手数は適用後の規約（審判・サーバー）で `now`、適用前の規約（〜2026-11-24 の webhook のセッション）で
+        // `now − 1`。1つ前の相手の手は `now − 2` / `now − 3` なので取り違えない。再接続で通知を取りこぼすと
+        // （自分の手の受理と相手の応手の両方が欠けると）末尾の相手の手は2手前のもので、取ったマスの駒はもう動いたか、
+        // 自分が取ったかもしれない。そのまま使うと占有と王手駒の候補を誤り、真の合法手を落とす（その形の決定点の
+        // 7%。2026-11-23 の計測）。合わなければ「直前の相手の手は分からない」として扱う（王手駒の候補は広いほうへ戻る）
+        let now = view.move_number;
         let mut known_opponent = None;
+        let mut opponent_moved = false;
         for event in log.events().iter().rev() {
             match event {
                 Observation::OpponentMoved {
+                    move_number,
                     captured_my_piece_at,
-                    ..
                 } => {
-                    known_opponent = captured_my_piece_at.as_deref().and_then(parse_usi_square);
+                    if *move_number == now || move_number.checked_add(1) == Some(now) {
+                        opponent_moved = true;
+                        known_opponent = captured_my_piece_at.as_deref().and_then(parse_usi_square);
+                    }
                     break;
                 }
                 Observation::MyMove { .. } => break,
@@ -423,7 +483,15 @@ impl Deduction {
             };
             for usi in foul_tried.iter().filter(|u| candidates.contains(*u)) {
                 match parse_usi(usi) {
-                    Some(ShogiMove::Drop { role, to }) if role != Role::Pawn => {
+                    // 歩（マスクv6〜）: `pawn_drop_cannot_mate` は「自駒が利いているマスに相手玉はいない」を使う。
+                    // これは自分の手番で相手玉に王手がかかっていない（相手が自玉を王手に晒したまま指していない）
+                    // ことが前提なので、`opponent_in_check` で確かめる。正規の対局の自分の手番では常に偽で、
+                    // 効くのは手で組んだ局面・シナリオの開始局面のような、正規でない局面だけ
+                    Some(ShogiMove::Drop { role, to })
+                        if role != Role::Pawn
+                            || (mask_version >= 6 && opponent_moved && !view.opponent_in_check
+                                && pawn_drop_cannot_mate(view, to)) =>
+                    {
                         occupied.insert(to);
                     }
                     Some(ShogiMove::Board { from, to, .. }) if king.is_some() => {
@@ -449,7 +517,20 @@ impl Deduction {
         }
 
         let check = if view.you_in_check {
-            Self::checker_hyps(view, known_opponent, check_capture_paths)
+            Self::checker_hyps(view, known_opponent, mask_version)
+        } else {
+            None
+        };
+        let king_return = if mask_version >= 5 {
+            check.as_ref().and_then(|(king, hyps)| {
+                let [hyp] = hyps.as_slice() else { return None };
+                // 取った駒自身の桂王手だけが残る。開き王手の可能性があれば使わない。
+                if hyp.dir.is_none() && known_opponent == Some(hyp.square) {
+                    Self::checked_king_origin(log, view.your_color, *king, hyp.square)
+                } else {
+                    None
+                }
+            })
         } else {
             None
         };
@@ -458,14 +539,48 @@ impl Deduction {
             occupied,
             blocked_beyond,
             check,
+            king_return,
         }
+    }
+
+    fn checked_king_origin(log: &ObservationLog, color: Color, king: Coord, captured_at: Coord) -> Option<Coord> {
+        let mut events = log.events().iter().rev();
+        let accepted = |event: &&Observation| {
+            matches!(event, Observation::MyMove { .. } | Observation::OpponentMoved { .. })
+        };
+        let Observation::OpponentMoved { move_number: capture_ply, .. } = events.find(accepted)? else {
+            return None;
+        };
+        let Observation::MyMove { move_number: escape_ply, usi, captured: None } =
+            events.find(accepted)? else {
+                return None;
+            };
+        let ShogiMove::Board { from, to, promote: false } = parse_usi(usi)? else { return None };
+        if to != king || from.rank == captured_at.rank || escape_ply.checked_add(1) != Some(*capture_ply) {
+            return None;
+        }
+
+        // 戻る升と桂の捕獲先は段が違うので、その桂は前の王手駒ではない。
+        // 捕獲先はもともと自駒で塞がっていたので、桂の到着で前の王手筋も遮れない。
+        let mut was_checked = false;
+        for event in events {
+            match event {
+                Observation::Check { in_check } if *in_check == color => was_checked = true,
+                Observation::OpponentMoved { move_number, .. } => {
+                    return (was_checked && move_number.checked_add(1) == Some(*escape_ply)).then_some(from);
+                }
+                Observation::MyMove { .. } => break,
+                _ => {}
+            }
+        }
+        None
     }
 
     /// 王手駒がいうるマスの集合（上の doc の H）。前提が崩れている（空になる）ときは None
     fn checker_hyps(
         view: &PlayerView,
         captured_at: Option<Coord>,
-        check_capture_paths: bool,
+        mask_version: u32,
     ) -> Option<(Coord, Vec<CheckerHyp>)> {
         let own: HashSet<Coord> = view
             .your_pieces
@@ -477,7 +592,11 @@ impl Deduction {
             .iter()
             .find(|p| p.role == Role::King)
             .and_then(|p| parse_usi_square(&p.square))?;
-        let hyps = checker_hyps_on(&own, king, view.your_color, captured_at, check_capture_paths);
+        let opponent_roles = (mask_version >= 4 && captured_at.is_some())
+            .then(|| possible_opponent_roles(view));
+        let hyps = checker_hyps_on(
+            &own, king, view.your_color, captured_at, mask_version >= 3, opponent_roles.as_deref(),
+        );
         if hyps.is_empty() { None } else { Some((king, hyps)) }
     }
 
@@ -507,6 +626,9 @@ impl Deduction {
             ShogiMove::Board { from, to, .. } => (to, from == *king, false),
             ShogiMove::Drop { to, .. } => (to, false, true),
         };
+        if is_king && self.king_return == Some(to) {
+            return true;
+        }
         hyps.iter().all(|h| {
             if is_king {
                 if to == h.square {
@@ -528,13 +650,14 @@ impl Deduction {
 }
 
 /// 王手駒がいうるマスの仮説（`Deduction` の doc の H）。自駒のマス `own`・自玉 `king`・王手した相手の手が取ったマス
-/// `captured_at` だけで決まる（反則の観測は使わない）。空なら前提が崩れている
+/// `captured_at` を使う。行動マスクv4以降では `opponent_roles` で移動元を絞る。空なら前提が崩れている。
 fn checker_hyps_on(
     own: &HashSet<Coord>,
     king: Coord,
     color: Color,
     captured_at: Option<Coord>,
     check_capture_paths: bool,
+    opponent_roles: Option<&[Role]>,
 ) -> Vec<CheckerHyp> {
     // 8方向の「最初の自駒の手前まで」
     let rays: Vec<((i8, i8), Vec<Coord>)> = ALL_DIRS
@@ -600,6 +723,9 @@ fn checker_hyps_on(
                             && reachable(o, x)
                             && (!check_capture_paths
                                 || !own.iter().any(|&piece| passes_through(o, x, piece)))
+                            && opponent_roles.is_none_or(|roles| {
+                                roles.iter().any(|&role| role_reaches(role, color.other(), o, x))
+                            })
                     });
                 if let Some((oi, _)) = opens {
                     hyps.extend(
@@ -624,7 +750,7 @@ pub(crate) fn checker_squares_at(
     color: Color,
     captured_at: Option<Coord>,
 ) -> Vec<Coord> {
-    let mut out: Vec<Coord> = checker_hyps_on(own, king, color, captured_at, true)
+    let mut out: Vec<Coord> = checker_hyps_on(own, king, color, captured_at, true, None)
         .into_iter()
         .map(|h| h.square)
         .collect();
@@ -640,7 +766,7 @@ mod tests {
     use rand::{Rng, SeedableRng, rngs::StdRng};
 
     fn deduce(view: &PlayerView, log: &ObservationLog, tried: &HashSet<String>) -> Deduction {
-        Deduction::new(view, log, tried, &candidate_usis(view).into_iter().collect(), true)
+        Deduction::new(view, log, tried, &candidate_usis(view).into_iter().collect(), MASK_VERSION)
     }
 
     #[test]
@@ -957,12 +1083,131 @@ mod tests {
         let action = encode_usi(escape, Color::Gote).unwrap();
 
         // 8四→4四は7四歩・6四歩を越せない。5三は4四から6二への王手線上。
-        assert!(legal_mask_with_capture_paths(&view, &log, &tried, false)[action]);
+        assert!(legal_mask_with_version(&view, &log, &tried, 2)[action]);
         assert!(!allowed(&view, &log, &tried, escape));
 
         // 8四飛→4四で9五角の王手が通る場合は、5三玉で逃げられる。
         view.your_pieces.retain(|piece| !matches!(piece.square.as_str(), "7d" | "6d"));
         assert!(allowed(&view, &log, &tried, escape));
+    }
+
+    #[test]
+    fn 相手に飛車がないと分かるとき横へ飛ぶ開き王手の仮説を除く() {
+        let log = check_log(Some("1c"), Color::Sente);
+        let tried = HashSet::new();
+        let view = view_from_sfen(
+            "2g4n1/5Rs2/2pp2pkl/4Pp3/1ns1gbS2/6PpK/+l1PP1+l2P/R1G3g2/1N1+b2S1L",
+            Color::Sente,
+            &[(Role::Pawn, 1)],
+        );
+        let escape = "1f1e";
+        let action = encode_usi(escape, Color::Sente).unwrap();
+        // 第7局の104試行目。4三→1三へ横に走れる飛車は先手の4二と9八にある。
+        assert!(legal_mask_with_version(&view, &log, &tried, 3)[action]);
+        assert!(!allowed(&view, &log, &tried, escape));
+        assert!(allowed(&view, &log, &tried, "1f2f"));
+
+        // #165 の入力用王手候補は v3 のまま。除外器v4の仮説とはここで異なる。
+        let own = view.your_pieces.iter().filter_map(|p| parse_usi_square(&p.square)).collect();
+        let king = parse_usi_square("1f").unwrap();
+        let captured_at = parse_usi_square("1c");
+        let checker = parse_usi_square("5b").unwrap();
+        let input_squares = checker_squares_at(&own, king, Color::Sente, captured_at);
+        assert!(input_squares.contains(&checker));
+        assert!(!Deduction::checker_hyps(&view, captured_at, 4).unwrap().1
+            .iter().any(|hyp| hyp.square == checker));
+
+        // 後手飛車が4三から1三へ取り、5二角の開き王手。1四の後手桂が飛車筋を遮る。
+        let view = view_from_sfen(
+            "k8/4bR3/8r/8n/9/6P1K/8P/9/9",
+            Color::Sente,
+            &[],
+        );
+        assert!(allowed(&view, &log, &tried, escape));
+    }
+
+    #[test]
+    fn 盤上の馬と持駒の角で総数が尽きれば斜めに飛ぶ開き王手の仮説を除く() {
+        let log = check_log(Some("1b"), Color::Sente);
+        let tried = HashSet::new();
+        let mut view = view_from_sfen(
+            "1k7/5R2l/9/9/9/6P1K/8P/R8/1+B7",
+            Color::Sente,
+            &[(Role::Bishop, 1)],
+        );
+        let escape = "1f1e";
+        let action = encode_usi(escape, Color::Sente).unwrap();
+        // 3四→1二の斜め移動には角か馬が要る。両方とも先手の保有駒。
+        assert!(legal_mask_with_version(&view, &log, &tried, 3)[action]);
+        assert!(!allowed(&view, &log, &tried, escape));
+
+        // 3四角→1二で4三角の筋が開いた局面では、1五玉が成立する。
+        view = view_from_sfen("1k7/5R2b/5b3/9/9/6P1K/8P/R8/9", Color::Sente, &[]);
+        assert!(allowed(&view, &log, &tried, escape));
+    }
+
+    #[test]
+    fn 捕獲元の到達判定は成駒の利きと先後の向きを使う() {
+        let from = parse_usi_square("5e").unwrap();
+        let down = parse_usi_square("4g").unwrap();
+        assert!(role_reaches(Role::Knight, Color::Gote, from, down));
+        assert!(!role_reaches(Role::Knight, Color::Sente, from, down));
+        let diagonal = parse_usi_square("4d").unwrap();
+        assert!(role_reaches(Role::Dragon, Color::Sente, from, diagonal));
+        assert!(!role_reaches(Role::Rook, Color::Sente, from, diagonal));
+    }
+
+    #[test]
+    fn 駒を取った桂の王手でも直前の王手が残る升に玉を戻せない() {
+        let mut view = view_from_sfen(
+            "l2g4l/1ks2+Ps2/pp2+Np1p1/2Np4p/1N2B4/1PP1n4/PK1P+bPSPP/3+r1g3/L1SG4L",
+            Color::Gote,
+            &[(Role::Pawn, 1)],
+        );
+        // ログの末尾の相手の手（手数 60）が直前の手だと分かるように、視界の手数をそろえる
+        view.move_number = 60;
+        let mut log = ObservationLog::default();
+        log.record(Observation::OpponentMoved { move_number: 58, captured_my_piece_at: None });
+        log.record(Observation::Check { in_check: Color::Gote });
+        log.record(Observation::MyMove { move_number: 59, usi: "7c8b".into(), captured: None });
+        log.record(Observation::OpponentMoved {
+            move_number: 60, captured_my_piece_at: Some("7d".into()),
+        });
+        log.record(Observation::Check { in_check: Color::Gote });
+        let tried = HashSet::new();
+        let action = encode_usi("8b7c", Color::Gote).unwrap();
+        // 第17局67試行目。旧マスクの候補に残った△7三玉だけがこの規則に当たる。
+        assert!(legal_mask_with_version(&view, &log, &tried, 4)[action]);
+        assert!(!allowed(&view, &log, &tried, "8b7c"));
+        assert!(allowed(&view, &log, &tried, "8b9b"));
+    }
+
+    #[test]
+    fn 前の王手駒が移動して合法になった升には玉を戻せる() {
+        use crate::selfplay::StartState;
+        use crate::shogi::{Piece, Position};
+
+        let mut pos = Position::empty(Color::Sente);
+        for (square, color, role) in [
+            ("1i", Color::Sente, Role::King),
+            ("6e", Color::Sente, Role::Rook),
+            ("7c", Color::Gote, Role::King),
+            ("8e", Color::Gote, Role::Pawn),
+        ] {
+            pos.set(parse_usi_square(square).unwrap(), Some(Piece { color, role }));
+        }
+        let mut referee = Referee::from_start(StartState {
+            pos, logs: Default::default(), fouls: [0, 0], plies: 0,
+        });
+        // 7五飛で7三玉に王手、8二玉に逃げた後、同じ飛車が8五へ移って再び王手。
+        for usi in ["6e7e", "7c8b", "7e8e"] {
+            assert!(matches!(referee.step(usi, 0), StepResult::Accepted), "{usi}");
+        }
+        let side = Color::Gote;
+        let view = referee.view(side, [0, 0], 0);
+        assert!(view.you_in_check);
+        assert!(referee.position().is_legal(&parse_usi("8b7c").unwrap()));
+        assert!(allowed(&view, referee.log(side), referee.foul_tried(side), "8b7c"));
     }
 
     /// webhook の実戦（2026-10-02、gameId 8b91eec3…）: 39手目に 3九の金を取られて 7九の玉に王手。
@@ -1018,6 +1263,57 @@ mod tests {
         // 歩の打ちの反則は打ち歩詰めがありうるので根拠にしない
         let tried_pawn: HashSet<String> = ["P*5e".to_string()].into();
         assert!(allowed(&view, &log, &tried_pawn, "S*5e"));
+    }
+
+    #[test]
+    fn 打ち歩詰めを否定できる反則から飛車の途中の占有を確定する() {
+        let mut view = view_from_sfen(
+            "ln1g1g1nl/2s4k1/ppp1pp1pp/5bpR1/8P/3PPP3/PPP2KP2/3G2+n2/LN6L",
+            Color::Sente,
+            &[(Role::Rook, 1), (Role::Bishop, 1), (Role::Silver, 1), (Role::Pawn, 1)],
+        );
+        view.you_in_check = false;
+        view.move_number = 57;
+        let mut log = ObservationLog::default();
+        log.record(Observation::OpponentMoved { move_number: 57, captured_my_piece_at: None });
+        let tried = ["B*2b".to_string(), "P*2c".to_string()].into();
+        let action = encode_usi("2d2b", Color::Sente).unwrap();
+
+        // 第7局63試行目。2三が空なら2四飛は2二に利くので、2三歩打は詰みになり得ない。
+        assert!(legal_mask_with_version(&view, &log, &tried, 5)[action]);
+        assert!(!allowed(&view, &log, &tried, "2d2b"));
+        assert!(!allowed(&view, &log, &tried, "S*2c"));
+        assert!(allowed(&view, &log, &tried, "2d2c+"));
+        assert!(allowed(&view, &log, &tried, "2d2e"));
+    }
+
+    #[test]
+    fn 打ち歩詰めの反則で空の打ち先を占有扱いしない() {
+        use crate::selfplay::StartState;
+        use crate::shogi::{Piece, Position};
+
+        let mut pos = Position::empty(Color::Gote);
+        for (square, color, role) in [
+            ("1a", Color::Gote, Role::King),
+            ("8c", Color::Gote, Role::Pawn),
+            ("1c", Color::Sente, Role::Gold),
+            ("2i", Color::Sente, Role::Rook),
+            ("5i", Color::Sente, Role::King),
+        ] {
+            pos.set(parse_usi_square(square).unwrap(), Some(Piece { color, role }));
+        }
+        pos.set_hand(Color::Sente, Role::Pawn, 1);
+        pos.set_hand(Color::Sente, Role::Lance, 1);
+        let mut referee = Referee::from_start(StartState {
+            pos, logs: Default::default(), fouls: [0, 0], plies: 0,
+        });
+        assert!(matches!(referee.step("8c8d", 0), StepResult::Accepted));
+        assert!(matches!(referee.step("P*1b", 0), StepResult::Foul));
+        assert!(referee.position().is_pseudo_legal(&parse_usi("P*1b").unwrap()));
+        let side = Color::Sente;
+        let view = referee.view(side, [0, 0], 0);
+        assert!(referee.position().is_legal(&parse_usi("L*1b").unwrap()));
+        assert!(allowed(&view, referee.log(side), referee.foul_tried(side), "L*1b"));
     }
 
     /// 飛び越え反則（ピンされえない駒）→ 同じ方向でそれより先は遮られる。間が1マスなら
@@ -1077,5 +1373,40 @@ mod tests {
         let tried = HashSet::new();
         assert!(!allowed(&view, &log, &tried, "P*3e"));
         assert!(allowed(&view, &log, &tried, "P*3f"));
+    }
+
+    /// 再接続で自分の手の受理と相手の応手を取りこぼすと、ログの末尾の相手の手は2手前のものになる。
+    /// その手が取ったマスを「直前に取られたマス」として使わない（そこの駒はもう動いたかもしれない）
+    #[test]
+    fn 末尾の相手の手が直前の手でなければ取られたマスを使わない() {
+        let mut referee = Referee::new();
+        // 先手 7六歩・後手 3四歩・先手 2二角成・後手 同銀（2二で先手の馬を取る）・先手 7八金・後手 3三銀（2二が空く）
+        for usi in ["7g7f", "3c3d", "8h2b+", "3a2b", "6i7h", "2b3c"] {
+            assert!(matches!(referee.step(usi, 0), StepResult::Accepted), "{usi}");
+        }
+        let side = Color::Sente;
+        let view = referee.view(side, [0, 0], 0);
+        let tried = HashSet::new();
+        let full = referee.log(side);
+        assert!(allowed(&view, full, &tried, "B*2b"), "2二は空いている");
+        // 7八金の受理と 3三銀の通知が欠けたログ: 末尾は 2二で駒を取った相手の手（手数 5。今の手数は 7）
+        let n = full.events().len();
+        let mut broken = ObservationLog::default();
+        for e in &full.events()[..n - 2] {
+            broken.record(e.clone());
+        }
+        assert!(matches!(
+            broken.events().last(),
+            Some(Observation::OpponentMoved { move_number: 5, captured_my_piece_at: Some(sq) }) if sq == "2b"
+        ));
+        assert_eq!(view.move_number, 7);
+        assert!(allowed(&view, &broken, &tried, "B*2b"), "2手前に取られたマスを占有と決めつけた");
+        assert!(deduced_facts(&view, &broken, &tried).occupied.is_empty());
+        // 相手の直前の手だけが欠けたログ（末尾は自分の手）と、欠けていないログでは従来どおり
+        let mut one = ObservationLog::default();
+        for e in &full.events()[..n - 1] {
+            one.record(e.clone());
+        }
+        assert!(allowed(&view, &one, &tried, "B*2b"));
     }
 }

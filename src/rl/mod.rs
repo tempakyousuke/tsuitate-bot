@@ -20,3 +20,6 @@ pub mod policy_net;
 pub mod records;
 pub mod search;
 pub mod signals;
+
+#[cfg(test)]
+mod audit_fuzz;

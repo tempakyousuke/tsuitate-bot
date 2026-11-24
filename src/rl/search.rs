@@ -256,6 +256,22 @@ fn copy_log(log: &ObservationLog) -> ObservationLog {
     out
 }
 
+/// ログの受理手（自分の着手・相手の着手）に付いた手数の規約。適用前の値（webhook のセッション。初手が 1）なら 1、
+/// 適用後の値（審判・Socket.IO 版。初手が 2）なら 0 を返す。今の手数 `now` は、最後の受理手が適用後なら `now`、
+/// 適用前なら `now − 1`（`encode::moves_contiguous` と同じ）。受理手が無ければ審判と同じ 0。
+/// 探索で継ぎ足す受理手をこの規約にそろえないと、境目で手数が飛んで履歴が欠けた扱いになる
+/// （締めた相手玉の候補・相手の持ち駒の上界が上界へ戻る）
+fn accepted_offset(log: &ObservationLog, now: u32) -> u32 {
+    let last = log.events().iter().rev().find_map(|e| match e {
+        Observation::MyMove { move_number, .. } | Observation::OpponentMoved { move_number, .. } => Some(*move_number),
+        _ => None,
+    });
+    match last {
+        Some(last) if last + 1 == now => 1,
+        _ => 0,
+    }
+}
+
 /// 受理手の直後の終局判定（`Referee::accept` と同じ順: 詰み・ステイルメイト > 手数上限）。
 /// 自分から見た価値を返す（勝ち 1・負け −1・引き分け 0）
 fn terminal_value(pos: &Position, me: Color) -> Option<f32> {
@@ -316,11 +332,13 @@ pub fn step_leaf(
             foul_tried: tried,
         };
     }
+    // 受理手の手数は元のログの規約にそろえる（反則の手数はどちらの規約でも今の手数）
+    let offset = accepted_offset(log, pos.move_number());
     let mut p = pos.clone();
     let captured = p.play_unchecked(mv);
     let mut log2 = copy_log(log);
     log2.record(Observation::MyMove {
-        move_number: p.move_number(),
+        move_number: p.move_number() - offset,
         usi,
         captured: captured.map(unpromote_role),
     });
@@ -342,7 +360,7 @@ pub fn step_leaf(
     };
     p.play_unchecked(&r);
     log2.record(Observation::OpponentMoved {
-        move_number: p.move_number(),
+        move_number: p.move_number() - offset,
         captured_my_piece_at: lost_at,
     });
     if p.in_check(me) {
@@ -757,5 +775,70 @@ mod tests {
         assert!(hit_foul, "反則の遷移を通っていない");
         assert!(hit_foul_limit, "反則負けの境界を通っていない");
         assert!(hit_draw_mine && hit_draw_reply, "200手の境界（自分の手 {hit_draw_mine} / 応手 {hit_draw_reply}）を通っていない");
+    }
+
+    /// 受理手の手数を適用前の値で付けたログ（webhook のセッション）でも、探索が継ぎ足す受理手は同じ規約にそろい、
+    /// 末端のログは欠けていない扱いになる（締めた相手玉の候補・相手の持ち駒の上界が上界へ戻らない）。
+    /// どちらの規約でも、末端は審判で同じだけ進めたログを同じ規約で付け替えたものと一致する
+    #[test]
+    fn 適用前の手数のログでも探索の末端は履歴が欠けない() {
+        use crate::rl::encode::{E_HAND, E_KING_TIGHT, NUM_PLANES_V6, moves_contiguous};
+        let shift = |log: &ObservationLog| -> ObservationLog {
+            let mut out = ObservationLog::default();
+            for e in log.events() {
+                out.record(match e.clone() {
+                    Observation::MyMove { move_number, usi, captured } => {
+                        Observation::MyMove { move_number: move_number - 1, usi, captured }
+                    }
+                    Observation::OpponentMoved { move_number, captured_my_piece_at } => {
+                        Observation::OpponentMoved { move_number: move_number - 1, captured_my_piece_at }
+                    }
+                    other => other,
+                });
+            }
+            out
+        };
+        // 後手が先手の歩を取り、先手が取り返して飛を戻した局面（後手は歩を1枚持つ）。先手が歩を打ち直し、後手が応じる
+        let hist: Vec<String> =
+            ["2g2f", "2c2d", "2f2e", "2d2e", "2h2e", "5a5b", "2e2h", "5b5a"].iter().map(|s| s.to_string()).collect();
+        let me = Color::Sente;
+        let cand = crate::shogi::parse_usi("P*2g").unwrap();
+        let reply = crate::shogi::parse_usi("5a5b").unwrap();
+        // 今の手番に反則が無い局と、1回ある局（飛が2二の角に遮られる。反則の手数はどちらの規約でも今の手数）
+        for foul in [None, Some("2h2a")] {
+            let mut referee = replay(&hist);
+            let mut b = replay(&hist);
+            if let Some(f) = foul {
+                assert_eq!(referee.step(f, 0), StepResult::Foul);
+                b.step(f, 0);
+            }
+            let view = referee.view(me, [0, 0], 0);
+            let pos = referee.position().clone();
+            let tried = referee.foul_tried(me).clone();
+            assert_eq!(b.step("P*2g", 0), StepResult::Accepted);
+            assert_eq!(b.step("5a5b", 0), StepResult::Accepted);
+            let bv = b.view(me, [0, 0], 0);
+            let want = encode_planes(NUM_PLANES_V6, &bv, b.log(me), b.foul_tried(me));
+            for (name, log, expect) in [
+                ("適用後", copy_log(referee.log(me)), copy_log(b.log(me))),
+                ("適用前", shift(referee.log(me)), shift(b.log(me))),
+            ] {
+                assert!(moves_contiguous(&log, view.move_number), "{name}");
+                let leaf = step_leaf(&view, &log, &tried, &pos, &cand, |_| Some(reply));
+                let Leaf::Decision { view: v2, log: l2, foul_tried: t2 } = leaf else {
+                    panic!("{name} {foul:?}: 次の自分の決定点になるはず");
+                };
+                assert_eq!(events_json(&l2), events_json(&expect), "{name} {foul:?}: 継ぎ足した受理手の手数");
+                assert!(moves_contiguous(&l2, v2.move_number), "{name} {foul:?}: 末端のログが欠けた扱い");
+                let got = encode_planes(NUM_PLANES_V6, &v2, &l2, &t2);
+                assert_eq!(got, encode_planes(NUM_PLANES_V6, &bv, &expect, b.foul_tried(me)), "{name} {foul:?}: ネットの入力");
+                // 相手の持ち駒の上界（歩を1枚 = 取られた数を使う）と締めた相手玉の候補は、規約によらず審判と同じ
+                // （鮮度のプレーンは手数そのものから測るので、適用前の規約では1手ぶん古く出る。ここでは比べない）
+                let planes = |v: &[f32], at: usize, n: usize| v[at * 81..(at + n) * 81].to_vec();
+                for (at, n) in [(E_HAND, 7), (E_KING_TIGHT, 1)] {
+                    assert_eq!(planes(&got, at, n), planes(&want, at, n), "{name} {foul:?}: プレーン {at}");
+                }
+            }
+        }
     }
 }

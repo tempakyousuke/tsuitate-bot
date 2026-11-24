@@ -41,7 +41,7 @@ pub const HISTORY_MOVES: usize = 8;
 /// 鮮度の減衰（1手 = 1 move_number あたり）
 const DECAY: f32 = 0.95;
 /// 各駒種の総数（両者合計。`HAND_ROLES` 順）。相手の保有数の算出と正規化に使う
-pub(crate) const ROLE_TOTAL: [u32; 7] = [18, 4, 4, 4, 4, 2, 2];
+pub(crate) const ROLE_TOTAL: [u32; 7] = crate::shogi::HAND_ROLE_TOTAL;
 
 // プレーンの配置
 pub(crate) const P_OWN: usize = 0; // 14
@@ -231,10 +231,11 @@ fn history_consistent(model: &GameModel, view: &PlayerView) -> bool {
 }
 
 /// 受理手（自分の着手・相手の着手）が1つも欠けずに、今の手数 `now` まで並んでいるか。手数は初期局面で 1、受理の
-/// たびに +1 なので、欠けていなければ受理手の数は `now − 1`。受理手に付く手数は、記録する側で規約が2つある:
-/// 審判・サーバー（Socket.IO 版）は適用後の値（初手が 2、最後が `now`）、webhook のセッション
-/// （`webhook_session.rs`）は適用前の値（初手が 1、最後が `now − 1`）。どちらの規約でも、手数が 1 ずつ増えていて
-/// 数が合えば欠けていない（片方の規約だけを受け付けると、もう片方では常に欠けている扱いになる）
+/// たびに +1 なので、欠けていなければ受理手の数は `now − 1`。受理手に付く手数の規約は2つある:
+/// 適用後の値（初手が 2、最後が `now`。審判・サーバー・Socket.IO 版、2026-11-24 からは webhook のセッションも）と、
+/// 適用前の値（初手が 1、最後が `now − 1`。〜2026-11-24 の webhook のセッション）。どちらの規約でも、手数が 1 ずつ
+/// 増えていて数が合えば欠けていない（片方の規約だけを受け付けると、もう片方では常に欠けている扱いになる）。
+/// なお鮮度のプレーンは手数そのものから測るので、適用前の規約のログでは1手ぶん古く出る
 pub(crate) fn moves_contiguous(log: &ObservationLog, now: u32) -> bool {
     let mut prev: Option<u32> = None;
     let mut count = 0u32;
@@ -651,9 +652,13 @@ pub fn encode_into_cached(
 
     if v3 {
         // 相手の持ち駒の上界。相手の持ち駒は取った自駒からしか増えないので、取られた自駒の駒種別の数
-        // （成りは戻す）が上界になる。相手の打ちは見えないので減らせない（上界は増える一方）。
-        // 相手の保有数（盤上＋持ち駒）でも抑える。着手履歴が欠けているときは取られた駒を数え漏らしうるので、
-        // 保有数だけを使う（これも上界）
+        // （成りは戻す）が上界になる。相手の打ちは見えないので取った数からは減らせない。
+        // 相手の保有数（盤上＋持ち駒）でも抑える（こちらが相手の駒を取れば下がる）。着手履歴が欠けているときは
+        // 取られた駒を数え漏らしうるので、保有数だけを使う（これも上界）。
+        // 欠けの判定は自駒の配置の照合（`history_broken`）だけでは足りない: 取られた自駒を取り返して打ち直すと、
+        // 欠けた区間の後でも自駒の配置と持ち駒が視界と一致する（再起動後の空ログで、相手は歩を1枚持つのに
+        // 上界が0になる）。受理手の手数が欠けずに今の手数まで並んでいることも確かめる
+        let lost_counted = !history_broken && moves_contiguous(log, now);
         let mut lost = [0u32; 7];
         for &(_, role) in model.lost_pieces() {
             if let Some(i) = hand_index(unpromote_role(role)) {
@@ -661,7 +666,7 @@ pub fn encode_into_cached(
             }
         }
         for i in 0..7 {
-            let bound = if history_broken { hold[i] } else { lost[i].min(hold[i]) };
+            let bound = if lost_counted { lost[i].min(hold[i]) } else { hold[i] };
             p.fill(E_HAND + i, bound as f32 / ROLE_TOTAL[i] as f32);
         }
         // 相手の反則の時系列（鮮度は相手の手番を閉じた `OpponentMoved` の手数で測る。P_LOST と同じ）
@@ -1369,7 +1374,10 @@ mod tests {
                         .len()
                 });
                 let check_mn = pos.move_number();
-                let mask = legal_mask(&view, referee.log(side), referee.foul_tried(side));
+                // 入力の検査に使う局面列は、現行マスクの更新で変わらないよう v3 で作る。
+                let mask = crate::rl::action::legal_mask_with_version(
+                    &view, referee.log(side), referee.foul_tried(side), 3,
+                );
                 let actions: Vec<usize> = (0..NUM_ACTIONS).filter(|&a| mask[a]).collect();
                 if actions.is_empty() {
                     break;
@@ -1502,7 +1510,7 @@ mod tests {
             assert_eq!(at_king(&t), 1.0, "{name}: 真の相手玉が候補に無い");
             assert_eq!(t, upper, "{name}: 上界へ戻る");
         }
-        // 受理手の手数を適用前の値（初手が 1。webhook のセッションの規約）で付けたログは、欠けていない:
+        // 受理手の手数を適用前の値（初手が 1。〜2026-11-24 の webhook のセッションの規約）で付けたログは、欠けていない:
         // 締めた候補は審判の規約のログと同じ。途中が欠ければ、この規約でも上界へ戻る
         let renumber = |log: &ObservationLog| -> ObservationLog {
             let mut out = ObservationLog::default();
@@ -1548,6 +1556,81 @@ mod tests {
                 assert!(!moves_contiguous(&cut, view.move_number), "受理手 {skip} が欠けたログ");
             }
         }
+    }
+
+    /// 履歴が欠けたログでは、相手の持ち駒の上界は取られた自駒の数を使わず保有数へ戻る。自駒の配置と持ち駒が
+    /// 視界と一致していても（取られた自駒を取り返して打ち直すと、欠けた区間の後でも一致する）欠けは欠け
+    #[test]
+    fn 履歴が欠けると相手の持ち駒の上界は保有数へ戻る() {
+        let mut referee = Referee::new();
+        // 後手が先手の歩を2五で取り、先手が飛で取り返して飛を戻し、歩を2七へ打ち直す。先手の盤上と持ち駒は
+        // 初期局面と同じだが、後手は歩を1枚持っている
+        for usi in ["2g2f", "2c2d", "2f2e", "2d2e", "2h2e", "5a5b", "2e2h", "5b5a", "P*2g", "5a5b"] {
+            assert!(matches!(referee.step(usi, 0), StepResult::Accepted), "{usi}");
+        }
+        let side = Color::Sente;
+        let view = referee.view(side, [0, 0], 0);
+        let pawn = hand_index(Role::Pawn).unwrap();
+        assert_eq!(referee.position().hand_count(Color::Gote, Role::Pawn), 1);
+        let full = referee.log(side);
+        let bound_of = |log: &ObservationLog, planes: usize| -> (f32, f32) {
+            let obs = encode_planes(planes, &view, log, &HashSet::new());
+            (plane(&obs, E_HAND + pawn)[0], plane(&obs, P_SCALAR + S_HISTORY_BROKEN)[0])
+        };
+        let total = ROLE_TOTAL[pawn] as f32;
+        let hold = 9.0 / total; // 歩の総数 18 − 先手の盤上 9 − 先手の持ち駒 0
+        // 欠けていないログ: 取られた歩の数（1枚）が上界で、本当の持ち駒と一致する
+        assert!(moves_contiguous(full, view.move_number));
+        for planes in [NUM_PLANES_V3, NUM_PLANES_V6] {
+            assert_eq!(bound_of(full, planes), (1.0 / total, 0.0));
+        }
+
+        // 再起動後の空ログ: 自駒の配置は初期局面から作ったモデルと一致する（欠けの印は立たない）が、上界は保有数
+        let empty = ObservationLog::default();
+        assert!(!moves_contiguous(&empty, view.move_number));
+        let (bound, broken) = bound_of(&empty, NUM_PLANES_V3);
+        assert_eq!(broken, 0.0, "自駒の配置の照合だけでは欠けが分からない例になっている");
+        assert_eq!(bound, hold, "空ログで上界が本当の持ち駒（1枚）を下回った");
+
+        // 途中の欠け: 後手が歩を取った手（2d2e）だけを取りこぼしたログ。両方の手数の規約で保有数へ戻る
+        let renumber = |log: &ObservationLog, shift: u32| -> ObservationLog {
+            let mut out = ObservationLog::default();
+            for e in log.events() {
+                out.record(match e.clone() {
+                    Observation::MyMove { move_number, usi, captured } => {
+                        Observation::MyMove { move_number: move_number - shift, usi, captured }
+                    }
+                    Observation::OpponentMoved { move_number, captured_my_piece_at } => {
+                        Observation::OpponentMoved { move_number: move_number - shift, captured_my_piece_at }
+                    }
+                    other => other,
+                });
+            }
+            out
+        };
+        for shift in [0, 1] {
+            let log = renumber(full, shift);
+            assert!(moves_contiguous(&log, view.move_number), "shift {shift}");
+            assert_eq!(bound_of(&log, NUM_PLANES_V3).0, 1.0 / total, "shift {shift}: 欠けていない");
+            let mut gap = ObservationLog::default();
+            let mut skipped = false;
+            for e in log.events() {
+                if !skipped && matches!(e, Observation::OpponentMoved { captured_my_piece_at: Some(_), .. }) {
+                    skipped = true;
+                    continue;
+                }
+                gap.record(e.clone());
+            }
+            assert!(skipped);
+            assert!(!moves_contiguous(&gap, view.move_number), "shift {shift}");
+            assert_eq!(bound_of(&gap, NUM_PLANES_V3).0, hold, "shift {shift}: 途中の欠けで上界が保有数へ戻らない");
+        }
+
+        // 反則は受理手に数えない: 欠けていないログに今の手番の反則が付いても、取られた歩の数を使う
+        let mut with_foul = renumber(full, 0);
+        with_foul.record(Observation::MyFoul { move_number: view.move_number, usi: "2g2e".into() });
+        assert!(moves_contiguous(&with_foul, view.move_number));
+        assert_eq!(bound_of(&with_foul, NUM_PLANES_V3).0, 1.0 / total);
     }
 
     /// エンコーダ v3 の前半は v2 と同じ・v4 の前半は v3 と同じで、足した組は審判の真実から数え直した値と一致する:
