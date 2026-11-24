@@ -107,6 +107,21 @@ pub fn classify(
     foul_tried: &HashSet<String>,
     usi: &str,
 ) -> Option<MoveClass> {
+    classify_with(view, log, foul_tried, usi, &mut || {
+        opp_king_candidates_tight(view.your_color, log)
+    })
+}
+
+/// `classify` と同じだが、相手玉の候補（`opp_king_candidates_tight` と同じ値）を呼び出し側から渡す。
+/// 候補は局の頭からログを読み直すので重い（ランダム対局で1手番 約0.8ms）。RL 環境は局ごとの途中状態
+/// （`encode::DeducedCache`）から渡す。要るときだけ呼ぶ
+pub fn classify_with(
+    view: &PlayerView,
+    log: &ObservationLog,
+    foul_tried: &HashSet<String>,
+    usi: &str,
+    king_candidates: &mut dyn FnMut() -> BTreeSet<Coord>,
+) -> Option<MoveClass> {
     let mv = parse_usi(usi)?;
     let color = view.your_color;
     let pieces = &view.your_pieces;
@@ -165,7 +180,7 @@ pub fn classify(
         .iter()
         .filter_map(|p| parse_usi_square(&p.square))
         .collect();
-    let cands = opp_king_candidates_tight(color, log);
+    let cands = king_candidates();
     let aim_king = cands.len() <= KING_TARGET_MAX;
     if aim_king && cands.iter().any(|c| new_att.contains(c)) {
         return Some(MoveClass::AimCheck);
@@ -203,10 +218,13 @@ fn pieces_after(
 ) -> Vec<VisiblePiece> {
     match *mv {
         ShogiMove::Board { from, to, promote } => {
-            let role = moving.map_or(
-                Role::Pawn,
-                |p| if promote { promote_role(p.role).unwrap_or(p.role) } else { p.role },
-            );
+            let role = moving.map_or(Role::Pawn, |p| {
+                if promote {
+                    promote_role(p.role).unwrap_or(p.role)
+                } else {
+                    p.role
+                }
+            });
             pieces
                 .iter()
                 .filter(|p| parse_usi_square(&p.square) != Some(from))
@@ -415,10 +433,9 @@ mod tests {
                     counts[c as usize] += 1;
                 }
                 let a = random_action(env.mask(), next()).unwrap();
-                assert_eq!(
-                    env.move_class(a),
-                    classify(&view, log, foul, &decode_usi(a, side).unwrap())
-                );
+                let want = classify(&view, log, foul, &decode_usi(a, side).unwrap());
+                // 環境は局ごとの途中状態から相手玉の候補を作る（作り直したものと同じ区分になる）
+                assert_eq!(env.move_class(a), want);
                 env.step(a).unwrap();
             }
         }
