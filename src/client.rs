@@ -15,7 +15,7 @@ use serde_json::json;
 
 use crate::model::GameModel;
 use crate::observation::{Observation, ObservationLog};
-use crate::record::GameRecorder;
+use crate::record::{self, GameRecorder};
 use crate::protocol::{
     Ack, Color, GameEndPayload, GameStatus, MatchFoundPayload, MoveAck, MoveAcceptedPayload,
     OpponentMovedPayload, PlayerView, SyncAck,
@@ -185,6 +185,13 @@ struct BotState {
     queue_retry_due: Option<Instant>,
     /// 直近に送った手（moveAccepted の記録用）
     last_sent: Option<String>,
+    /// 送ったが結果（受理か反則）をまだ受け取っていない手（選んだ時点の手数, USI）。
+    /// 再接続のとき、取りこぼした結果を視界から作り直すのに使う（`resume::reconcile`）
+    awaiting: Option<(u32, String)>,
+    /// プロセス再起動後の復帰対局: 次の sync で対局記録から観測ログを読み直す
+    restore_pending: bool,
+    /// 対局中の再接続: 次の sync で、切断中に取りこぼした観測を視界から作り直す
+    reconcile_pending: bool,
     log: ObservationLog,
     /// 対局ごとに作り直す（推定系の戦略は対局内の内部状態を持つ）
     strategy: Box<dyn Strategy>,
@@ -231,6 +238,9 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
         in_queue: false,
         queue_retry_due: None,
         last_sent: None,
+        awaiting: None,
+        restore_pending: false,
+        reconcile_pending: false,
         log: ObservationLog::default(),
         strategy: make_strategy(),
         recorder: None,
@@ -278,7 +288,9 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
                 println!("接続しました: {}", config.url);
                 state.pending_move_number = None;
                 if let Some(game_id) = state.game_id.clone() {
-                    // 再接続: 対局中なら状態を取り直す
+                    // 再接続: 対局中なら状態を取り直す。切断中の通知は再送されないので、
+                    // 取りこぼした観測は次の sync の視界から作り直す
+                    state.reconcile_pending = true;
                     request_sync(&socket, &tx, &game_id);
                 } else {
                     state.in_queue = false;
@@ -338,9 +350,12 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
                 state.last_move_number = 0;
                 state.pending_move_number = None;
                 state.last_sent = None;
+                state.awaiting = None;
+                state.restore_pending = false;
+                state.reconcile_pending = false;
                 state.log.clear();
-                // 序盤の強制は新しい対局のときだけ（復帰対局は観測ログを失っているので、
-                // ラインの何手目まで指したかを数えられない）
+                // 序盤の強制は、新しい対局と、対局記録から観測ログを読み直せた復帰対局で付ける
+                // （`restore_from_record`。読み直せなかった復帰対局は、ラインの何手目まで指したかを数えられない）
                 if let Some(plan) =
                     config.opening_book.as_ref().and_then(|b| b.plan_for_game(&m.game_id, m.your_color))
                 {
@@ -358,10 +373,13 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
             Msg::ActiveGame(Some(game_id)) => {
                 if state.game_id.is_none() {
                     // プロセス再起動などで対局IDを失った状態からの復帰。
-                    // それまでの観測は失われている（sync とのズレ警告が出る）
+                    // それまでの観測は、次の sync で対局記録から読み直す（`restore_from_record`。
+                    // 読み直せなければ空のログのまま続き、sync とのズレ警告が出る）
                     println!("進行中の対局に復帰します: {game_id}");
                     state.in_queue = false;
                     state.queue_retry_due = None;
+                    state.restore_pending = true;
+                    state.reconcile_pending = false;
                     state.game_id = Some(game_id.clone());
                     request_sync(&socket, &tx, &game_id);
                 }
@@ -373,9 +391,7 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
                     request_sync(&socket, &tx, &game_id);
                 }
             }
-            Msg::Sync(Some(view)) => {
-                handle_sync(&socket, &tx, &mut state, view, config.record_dir.as_deref())
-            }
+            Msg::Sync(Some(view)) => handle_sync(&socket, &tx, &mut state, view, &config),
             Msg::Sync(None) => {
                 // 対局中のはずなのにサーバーが対局を知らない
                 // → サーバー再起動などで対局が消えた。キューへ戻る
@@ -389,10 +405,14 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
                     state.in_queue = false;
                     state.queue_retry_due = None;
                     state.last_sent = None;
+                    state.awaiting = None;
+                    state.restore_pending = false;
+                    state.reconcile_pending = false;
                     schedule_retry_once(&mut state, &tx, config.requeue_delay_ms);
                 }
             }
             Msg::MoveAccepted(p) => {
+                state.awaiting = None;
                 if let Some(usi) = state.last_sent.take() {
                     if let Some(role) = p.captured {
                         println!("着手 {usi} で {role:?} を取りました");
@@ -433,22 +453,31 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
                 }
                 state.game_id = None;
                 state.foul_tried.clear();
+                state.awaiting = None;
+                state.restore_pending = false;
+                state.reconcile_pending = false;
                 state.in_queue = false;
                 state.queue_retry_due = None;
                 schedule_retry_once(&mut state, &tx, config.requeue_delay_ms);
             }
             Msg::MoveResult { usi, ack } => {
+                if !ack.ok {
+                    state.awaiting = None;
+                }
                 if !ack.ok && ack.reason.as_deref() == Some("foul") {
                     println!(
                         "反則: {usi}（{}回目）→ 指し直し",
                         ack.foul_count.unwrap_or(0)
                     );
-                    state.foul_tried.insert(usi.clone());
+                    // 再接続で視界から作り直した反則（`reconcile_after_reconnect`）は二重に記録しない
+                    let fresh = state.foul_tried.insert(usi.clone());
                     state.pending_move_number = None; // 同じ手番を指し直す
-                    state.observe(Observation::MyFoul {
-                        move_number: state.last_move_number,
-                        usi,
-                    });
+                    if fresh {
+                        state.observe(Observation::MyFoul {
+                            move_number: state.last_move_number,
+                            usi,
+                        });
+                    }
                     let _ = tx.send(Msg::ThinkTrigger);
                 } else if !ack.ok {
                     eprintln!("着手エラー: {:?}", ack.error);
@@ -463,15 +492,137 @@ pub fn run(config: Config) -> Result<(), rust_socketio::Error> {
     Ok(())
 }
 
+/// 復帰対局で、読み直した履歴を戦略へ食わせる時間の上限の既定（webhook 版のコールドスタートと同じ
+/// `TSUITATE_COLD_START_PREWARM_MS`）。残りは次の choose が通常の更新で処理する
+const DEFAULT_RESUME_PREWARM_MS: u64 = 2_500;
+
+/// プロセス再起動後の復帰対局: 対局記録（`TSUITATE_RECORD_DIR` の `<時刻>-<対局ID>.jsonl`）から観測ログを
+/// 読み直し、止まっていた間の欠け（高々相手の1手と、送った手の結果）を視界から作り直す。
+/// 履歴を失うと、その局の勝率が 12〜17pt 下がる（docs/rl-deepnash-design.md の「入力と行動マスクの点検」）。
+/// 読み直せない・今の局面とつながらないときは、従来どおり空のログで続ける
+fn restore_from_record(state: &mut BotState, view: &PlayerView, config: &Config) {
+    let Some(dir) = config.record_dir.as_deref() else {
+        println!("復帰: 対局記録を取っていないので、履歴なしで続けます");
+        return;
+    };
+    let Some(path) = record::find_record(dir, &view.game_id) else {
+        println!("復帰: 対局記録が見つからないので、履歴なしで続けます");
+        return;
+    };
+    let loaded = match record::load_record(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("復帰: 対局記録を読めないので、履歴なしで続けます: {e}");
+            return;
+        }
+    };
+    if loaded.finished || loaded.game_id != view.game_id || loaded.your_color != view.your_color {
+        eprintln!("復帰: 対局記録 {} はこの対局の続きではないので、履歴なしで続けます", path.display());
+        return;
+    }
+    let mut log = ObservationLog::default();
+    for e in &loaded.events {
+        log.record(e.clone());
+    }
+    let pending = loaded.pending.as_ref().map(|(n, usi)| (*n, usi.as_str()));
+    let repairs = match crate::resume::reconcile(view.your_color, &log, pending, view) {
+        Ok(r) => r,
+        Err(why) => {
+            eprintln!(
+                "復帰: 対局記録の観測 {} 件が今の局面とつながらないので、履歴なしで続けます（{why}）",
+                loaded.events.len()
+            );
+            return;
+        }
+    };
+    // 続きは同じファイルへ追記する（1対局 = 1ファイル）。開けなければ、後で新しいファイルを作る
+    match GameRecorder::resume(&path) {
+        Ok(mut rec) => {
+            rec.resumed(loaded.events.len(), repairs.len());
+            state.recorder = Some(rec);
+        }
+        Err(e) => eprintln!("復帰: 対局記録へ追記できません: {e}"),
+    }
+    state.log = log;
+    let repaired = repairs.len();
+    for e in repairs {
+        state.observe(e);
+    }
+    state.foul_tried = if view.turn == view.your_color {
+        crate::resume::fouls_this_turn(&state.log, view.move_number)
+    } else {
+        HashSet::new()
+    };
+    state.last_move_number = view.move_number;
+    // 戦略は作り直して（序盤の強制は観測ログから何手目かを数え直す）、読み直した履歴を食わせる
+    state.strategy = crate::rl::forced::wrap_for_game(
+        strategy::make(&config.strategy_name).expect("main で検証済みの戦略名"),
+        config.opening_book.as_ref(),
+        &view.game_id,
+        view.your_color,
+    );
+    let budget_ms = std::env::var("TSUITATE_COLD_START_PREWARM_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(DEFAULT_RESUME_PREWARM_MS);
+    strategy::prewarm_strategy_with_budget(
+        &mut *state.strategy,
+        view,
+        &state.log,
+        Some(Duration::from_millis(budget_ms)),
+    );
+    println!(
+        "復帰: 対局記録から観測 {} 件を読み直しました（止まっていた間のぶんを視界から {} 件作り直しました）",
+        loaded.events.len(),
+        repaired
+    );
+}
+
+/// 対局中の再接続: 切断中に送られた通知は再送されないので、取りこぼした観測（高々相手の1手と、送った手の
+/// 結果）を視界から作り直してログへ足す。作り直せない欠けはそのまま残る（sync とのズレ警告が出る）
+fn reconcile_after_reconnect(state: &mut BotState, view: &PlayerView) {
+    let pending = state.awaiting.as_ref().map(|(n, usi)| (*n, usi.as_str()));
+    match crate::resume::reconcile(view.your_color, &state.log, pending, view) {
+        Ok(repairs) if repairs.is_empty() => {}
+        Ok(repairs) => {
+            println!("再接続: 取りこぼした観測 {} 件を視界から作り直しました", repairs.len());
+            for e in repairs {
+                match &e {
+                    Observation::MyFoul { usi, .. } => {
+                        state.foul_tried.insert(usi.clone());
+                    }
+                    Observation::MyMove { .. } => state.last_sent = None,
+                    _ => {}
+                }
+                state.observe(e);
+            }
+            state.awaiting = None;
+        }
+        Err(why) => eprintln!("再接続: 取りこぼした観測を作り直せませんでした（{why}）"),
+    }
+}
+
 fn handle_sync(
     socket: &Client,
     tx: &Sender<Msg>,
     state: &mut BotState,
     view: PlayerView,
-    record_dir: Option<&str>,
+    config: &Config,
 ) {
     if state.game_id.as_deref() != Some(view.game_id.as_str()) {
         return;
+    }
+    let record_dir = config.record_dir.as_deref();
+
+    // 復帰・再接続の直後の最初の sync で、観測ログを今の局面までつなぐ（手番でなくても行う。
+    // 以後の通知がつながった続きとして積まれるように）
+    if view.status == GameStatus::Playing {
+        if std::mem::take(&mut state.restore_pending) {
+            state.reconcile_pending = false;
+            restore_from_record(state, &view, config);
+        } else if std::mem::take(&mut state.reconcile_pending) {
+            reconcile_after_reconnect(state, &view);
+        }
     }
 
     // 対局ごとの記録ファイルは最初の sync で作る（match:found 起点の新規対局と
@@ -525,6 +676,7 @@ fn handle_sync(
             }
             state.pending_move_number = Some(view.move_number);
             state.last_sent = Some(usi.clone());
+            state.awaiting = Some((view.move_number, usi.clone()));
             let tx = tx.clone();
             let sent = usi.clone();
             let result = socket.emit_with_ack(

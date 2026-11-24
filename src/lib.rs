@@ -42,6 +42,7 @@ pub mod opp_move_nn_v25;
 pub mod protocol;
 pub mod record;
 pub mod referee;
+pub mod resume;
 pub mod rl;
 pub mod scenario_core;
 pub mod selfplay;

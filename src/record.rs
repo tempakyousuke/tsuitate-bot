@@ -6,7 +6,7 @@
 //! ここには入らない
 //! （ローカルdevサーバー対局ならサーバーDBの games.moves に全手順が残る）。
 
-use std::fs::{File, create_dir_all};
+use std::fs::{File, OpenOptions, create_dir_all};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -51,6 +51,32 @@ impl GameRecorder {
             "strategy": strategy,
         }));
         Ok(rec)
+    }
+
+    /// 既存の対局記録の続きへ追記する（再起動後の復帰対局。`load_record` で読み直したファイルを渡す）。
+    /// 1対局 = 1ファイルを保つために新しいファイルを作らない。途中まで書かれた最後の行が残っていても
+    /// 次の行と混ざらないよう、改行で終わっていなければ改行を足す
+    pub fn resume(path: &Path) -> std::io::Result<GameRecorder> {
+        let ends_with_newline = std::fs::read(path)?.last().is_none_or(|&b| b == b'\n');
+        let file = OpenOptions::new().append(true).open(path)?;
+        let mut rec = GameRecorder {
+            writer: BufWriter::new(file),
+            path: path.to_path_buf(),
+        };
+        if !ends_with_newline {
+            writeln!(rec.writer)?;
+        }
+        Ok(rec)
+    }
+
+    /// 復帰の印（読み直した観測の数と、視界から作り直して足した観測の数）
+    pub fn resumed(&mut self, restored: usize, repaired: usize) {
+        self.write_line(&json!({
+            "type": "resumed",
+            "ts": now_ms(),
+            "restored": restored,
+            "repaired": repaired,
+        }));
     }
 
     pub fn path(&self) -> &Path {
@@ -133,12 +159,140 @@ impl GameRecorder {
     }
 }
 
+/// 読み直した対局記録（再起動後の復帰対局で、観測ログを作り直すのに使う）
+#[derive(Debug)]
+pub struct LoadedRecord {
+    pub path: PathBuf,
+    pub game_id: String,
+    pub your_color: Color,
+    /// 記録された観測（時系列順）
+    pub events: Vec<Observation>,
+    /// 最後に選んだ手で、受理・反則の観測がまだ無いもの（選んだ時点の手数, USI）。
+    /// 送った直後（結果を受け取る前）に落ちた場合だけ残る
+    pub pending: Option<(u32, String)>,
+    /// 終局・中断・投了の行がある（もう続きは無い）
+    pub finished: bool,
+}
+
+/// `dir` の中から対局 `game_id` の記録（`<時刻>-<対局ID>.jsonl`）を探す。複数あればいちばん新しいもの
+pub fn find_record(dir: &str, game_id: &str) -> Option<PathBuf> {
+    let suffix = format!("-{game_id}.jsonl");
+    let mut best: Option<(u64, PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let name = entry.file_name();
+        let Some(ts) = name.to_str().and_then(|n| n.strip_suffix(&suffix)).and_then(|p| p.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(b, _)| ts > *b) {
+            best = Some((ts, entry.path()));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// 対局記録を読み直す。読めない行（落ちる瞬間に途中まで書かれた最後の行）は捨てる。
+/// ヘッダ（`match` の行）が無い・壊れているファイルは Err
+pub fn load_record(path: &Path) -> std::io::Result<LoadedRecord> {
+    let bad = |why: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}: {why}", path.display()));
+    let text = std::fs::read_to_string(path)?;
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let header: serde_json::Value =
+        lines.next().and_then(|l| serde_json::from_str(l).ok()).ok_or_else(|| bad("ヘッダが読めない"))?;
+    if header["type"] != "match" {
+        return Err(bad("先頭が match の行でない"));
+    }
+    let game_id = header["game_id"].as_str().ok_or_else(|| bad("game_id が無い"))?.to_string();
+    let your_color: Color =
+        serde_json::from_value(header["your_color"].clone()).map_err(|_| bad("your_color が読めない"))?;
+    let mut rec = LoadedRecord { path: path.to_path_buf(), game_id, your_color, events: vec![], pending: None, finished: false };
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match v["type"].as_str() {
+            Some("obs") => {
+                let Ok(event) = serde_json::from_value::<Observation>(v["event"].clone()) else {
+                    continue;
+                };
+                // 選んだ手の結果（受理か反則）が届いた
+                if matches!(event, Observation::MyMove { .. } | Observation::MyFoul { .. }) {
+                    rec.pending = None;
+                }
+                rec.events.push(event);
+            }
+            Some("chose") => {
+                if let (Some(n), Some(usi)) = (v["move_number"].as_u64(), v["usi"].as_str()) {
+                    rec.pending = Some((n as u32, usi.to_string()));
+                }
+            }
+            Some("end") | Some("aborted") | Some("resign") => rec.finished = true,
+            _ => {}
+        }
+    }
+    Ok(rec)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::protocol::{
         FoulRecord, MoveRecord, OpponentInfo, RatingChange, RatingChangePair, Role,
     };
+
+    /// 書いた記録を読み直すと同じ観測が戻り、結果がまだ届いていない手だけが `pending` に残る。
+    /// 続きは同じファイルへ追記され、途中まで書かれた行は捨てる
+    #[test]
+    fn 記録を読み直して続きを追記する() {
+        let dir = std::env::temp_dir().join(format!("tsuitate-bot-record-resume-{}-{}", std::process::id(), now_ms()));
+        let dir_str = dir.to_str().unwrap().to_string();
+        let mut rec = GameRecorder::create(&dir_str, "ab-c_D", Color::Gote, "rl_policy@x").unwrap();
+        let path = rec.path().to_path_buf();
+        let obs = [
+            Observation::OpponentMoved { move_number: 2, captured_my_piece_at: None },
+            Observation::MyFoul { move_number: 2, usi: "5a5b".into() },
+            Observation::MyMove { move_number: 3, usi: "3c3d".into(), captured: None },
+            Observation::Check { in_check: Color::Sente },
+            Observation::OpponentFoul { count: 1 },
+            Observation::OpponentMoved { move_number: 4, captured_my_piece_at: Some("3d".into()) },
+        ];
+        rec.chosen(2, "5a5b", 5, None);
+        rec.observation(&obs[0]);
+        rec.observation(&obs[1]);
+        rec.chosen(2, "3c3d", 5, None);
+        for o in &obs[2..] {
+            rec.observation(o);
+        }
+        drop(rec);
+        assert_eq!(find_record(&dir_str, "ab-c_D"), Some(path.clone()));
+        assert_eq!(find_record(&dir_str, "c_D"), None, "対局IDの一部が同じだけの記録は拾わない");
+        let loaded = load_record(&path).unwrap();
+        assert_eq!((loaded.game_id.as_str(), loaded.your_color, loaded.finished), ("ab-c_D", Color::Gote, false));
+        assert!(loaded.pending.is_none(), "結果が届いた手は残らない");
+        let json = |e: &[Observation]| e.iter().map(|x| serde_json::to_string(x).unwrap()).collect::<Vec<_>>();
+        assert_eq!(json(&loaded.events), json(&obs));
+
+        // 手を選んで送った直後に落ちた: 記録の最後は chose の行と、途中まで書かれた行
+        let mut rec = GameRecorder::resume(&path).unwrap();
+        rec.chosen(4, "2b3c", 7, None);
+        drop(rec);
+        let mut raw = std::fs::read_to_string(&path).unwrap();
+        raw.push_str("{\"type\":\"obs\",\"event\":{\"kind\":\"my_mo");
+        std::fs::write(&path, raw).unwrap();
+        let loaded = load_record(&path).unwrap();
+        assert_eq!(loaded.pending, Some((4, "2b3c".to_string())));
+        assert_eq!(loaded.events.len(), obs.len());
+
+        // 続きの追記は途中まで書かれた行と混ざらない
+        let mut rec = GameRecorder::resume(&path).unwrap();
+        rec.resumed(loaded.events.len(), 1);
+        rec.observation(&Observation::MyMove { move_number: 5, usi: "2b3c".into(), captured: Some(Role::Pawn) });
+        drop(rec);
+        let loaded = load_record(&path).unwrap();
+        assert_eq!(loaded.events.len(), obs.len() + 1);
+        assert!(loaded.pending.is_none() && !loaded.finished);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn writes_jsonl_lines() {
