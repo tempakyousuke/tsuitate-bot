@@ -20,6 +20,9 @@
 //! | 6 当たりをかける | 相手の駒がいると確定したマスか、相手の初期配置のマスで自分の駒がまだ通っていないマスに、新しく利きが届く |
 //! | 7 その他 | 残り全部 |
 //!
+//! 順番が効く例: 玉の隣にいると確定した相手の駒を取り、その結果として穴が減る手は、2 ではなく 1（守りを固める）になる。
+//! 2 に入るのは、取っても自玉の周りの穴が減らない手だけ。
+//!
 //! 王手されている手番は既存の王手中の区分（`check_economy::CheckMoveKind` と同じ分け方）:
 //! 8 玉の手 / 9 王手駒の候補のマスを取りに行く盤上の手 / 10 その他の盤上の手（移動合など）/ 11 打ち（合駒打ち）。
 //! 王手駒の候補はマスクの推論（`deduced_facts().checkers`）を使う。
@@ -34,7 +37,7 @@ use crate::deduce_king::opp_king_candidates_tight;
 use crate::observation::{Observation, ObservationLog};
 use crate::protocol::{Color, PlayerView, Role, VisiblePiece};
 use crate::rl::action::deduced_facts;
-use crate::shogi::{Position, ShogiMove, parse_usi};
+use crate::shogi::{Position, ShogiMove, parse_usi, promote_role};
 
 /// 区分の数（平時 8 + 王手中 4）
 pub const NUM_MOVE_CLASSES: usize = 12;
@@ -202,7 +205,7 @@ fn pieces_after(
         ShogiMove::Board { from, to, promote } => {
             let role = moving.map_or(
                 Role::Pawn,
-                |p| if promote { promoted(p.role) } else { p.role },
+                |p| if promote { promote_role(p.role).unwrap_or(p.role) } else { p.role },
             );
             pieces
                 .iter()
@@ -222,18 +225,6 @@ fn pieces_after(
                 role,
             }))
             .collect(),
-    }
-}
-
-fn promoted(role: Role) -> Role {
-    match role {
-        Role::Pawn => Role::Tokin,
-        Role::Lance => Role::Promotedlance,
-        Role::Knight => Role::Promotedknight,
-        Role::Silver => Role::Promotedsilver,
-        Role::Bishop => Role::Horse,
-        Role::Rook => Role::Dragon,
-        r => r,
     }
 }
 
