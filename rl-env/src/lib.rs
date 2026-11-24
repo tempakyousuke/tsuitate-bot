@@ -23,6 +23,7 @@ use tsuitate_bot::rl::encode::{
 };
 use tsuitate_bot::rl::env::{EnvGame, ForcedStats, GUARD_RADII, OppNoise, Outcome, SpeedSum, StyleStats};
 use tsuitate_bot::rl::forced::{ForcedBook, ForcedSides};
+use tsuitate_bot::rl::move_class::MOVE_CLASS_NAMES;
 use tsuitate_bot::rl::signals::{NUM_SIGNALS, SIGNAL_NAMES};
 use tsuitate_bot::selfplay::{GameResult, MAX_PLIES, mix};
 use tsuitate_bot::strategy::{self, Strategy};
@@ -665,6 +666,36 @@ impl VecEnv {
         PyArray1::from_vec(py, out).reshape([n, 81])
     }
 
+    /// 各局の今の手番で行動 `actions[i]` を指したときの**手の区分** `[n]`（int8。`MOVE_CLASS_NAMES` の添字。
+    /// `rl::move_class`。手番側の観測だけで決まる）。負の行動・終局した局・マスク外の行動は −1。
+    /// 状態は変えないので `step` の前に呼ぶ。**補助損失のラベル専用**で、方策の入力には使わない
+    // &mut なのは rayon で局を分けるため（observe と同じ）
+    fn move_classes<'py>(
+        &mut self,
+        py: Python<'py>,
+        actions: PyReadonlyArray1<'py, i64>,
+    ) -> PyResult<Bound<'py, PyArray1<i8>>> {
+        let raw = actions.as_slice()?;
+        if raw.len() != self.games.len() {
+            return Err(PyValueError::new_err(format!(
+                "actions の長さ {} が局数 {} と違う",
+                raw.len(),
+                self.games.len()
+            )));
+        }
+        let games = &mut self.games;
+        let out: Vec<i8> = py.detach(|| {
+            games
+                .par_iter_mut()
+                .zip(raw.par_iter())
+                .map(|(g, &a): (&mut EnvGame, &i64)| {
+                    usize::try_from(a).ok().and_then(|a| g.move_class(a)).map_or(-1, |c| c as i8)
+                })
+                .collect()
+        });
+        Ok(PyArray1::from_vec(py, out))
+    }
+
     /// 各局の**局の信号** `[n, 2, NUM_SIGNALS]`（f32。[先手, 後手] × `SIGNAL_NAMES` の並び。
     /// `rl::signals`）。累積の信号（受理手・反則・駒取り・王手など）と、今の真実の盤面から計算する状態の信号
     /// （駒の価値の合計・相手玉の周りへの利き・自玉の周りの自駒など）。終局して止まっている局は終局時の値。
@@ -1018,5 +1049,6 @@ fn tsuitate_rl(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("EXTRA_PLANE_GROUPS", groups)?;
     // 局の信号の名前（`VecEnv.signals()` の最後の軸の並び。tsuitate-nn の rnad/shaping.py が名前で引く）
     m.add("SIGNAL_NAMES", SIGNAL_NAMES.to_vec())?;
+    m.add("MOVE_CLASS_NAMES", MOVE_CLASS_NAMES.to_vec())?;
     Ok(())
 }

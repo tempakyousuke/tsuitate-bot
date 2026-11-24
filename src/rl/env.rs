@@ -15,6 +15,7 @@ use crate::referee::{Referee, StepResult};
 use crate::rl::action::{NUM_ACTIONS, decode_usi, encode_usi, index_square, legal_mask, normalize};
 use crate::rl::encode::{DeducedCache, encode_into_cached};
 use crate::rl::forced::ForcedPlan;
+use crate::rl::move_class::{MoveClass, classify};
 use crate::rl::signals::{EventCounts, MoveEvent, NUM_SIGNALS, signals_into};
 use crate::selfplay::{GameResult, StartState, fischer_initial_ms, mix};
 use crate::shogi::{ShogiMove, parse_usi};
@@ -498,6 +499,17 @@ impl EnvGame {
                 Some(p) => TRUTH_ROLES.iter().position(|&r| r == p.role).map_or(0, |k| k as i8 + 1),
             };
         }
+    }
+
+    /// 今の手番で行動 `action` を指したときの**手の区分**（`rl::move_class`。手番側の観測だけで決まる）。
+    /// 終局済み・マスク外・読めない行動なら None。状態は変えないので `step` の前に呼ぶ。
+    /// **補助損失のラベル専用**（方策の入力には使わない）
+    pub fn move_class(&self, action: usize) -> Option<MoveClass> {
+        self.check_action(action).ok()?;
+        let side = self.referee.to_move();
+        let usi = decode_usi(action, side)?;
+        let view = self.referee.view(side, clocks(), self.game_no);
+        classify(&view, self.referee.log(side), self.referee.foul_tried(side), &usi)
     }
 
     /// 今の手番の**真実の盤面の合法手**から、`u` ∈ [0, 1) で一様に選んだ1手の行動番号（終局済みなら None）。

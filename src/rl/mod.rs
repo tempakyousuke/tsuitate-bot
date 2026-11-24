@@ -14,6 +14,7 @@ pub mod action;
 pub mod encode;
 pub mod env;
 pub mod forced;
+pub mod move_class;
 pub mod plane_view;
 pub mod policy;
 pub mod policy_net;
