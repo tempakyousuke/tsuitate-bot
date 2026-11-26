@@ -314,7 +314,7 @@ impl DeducedCache {
     }
 
     /// `log` の時点の、締めた相手玉の候補（`deduce_king::opp_king_candidates_tight` と同じ。動けない歩のマスも除く）
-    fn tight_candidates(&mut self, color: Color, log: &ObservationLog) -> std::collections::BTreeSet<Coord> {
+    pub(crate) fn tight_candidates(&mut self, color: Color, log: &ObservationLog) -> std::collections::BTreeSet<Coord> {
         let locked = self.advance(color, log).1.result();
         let tight = self.tight.get_or_insert_with(|| KingCandidatesTight::new(color));
         tight.advance(log);
