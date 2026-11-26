@@ -1058,3 +1058,38 @@ R-NaD は段階ごとに前の版との差が縮み（selfplay 系統で 62.5% �
   **凍結版のマスクは 6**（学習環境と同じ）。エンコーダの固定コピーは v6 で、共有の `src/deduce_king.rs` を呼ぶ（pin は rl_scratch5free_v1 の凍結で足した）。
   同一性確認: `frozen::tests::rl凍結版は元の重みと同じ手を指す`（定跡を内蔵した版の比べ方は rl_scratch_v1 と同じ）と、`rl_scratch6_v1` vs
   `open:book:rl_policy:release:…/policy_26500.bin` が 48.0%±6.9（96-104-0、200局、`match_seed=20261125`、run 45590771190。基準の 50%±10 の内。同じ run で rl_scratch5_v1 に 54.0%〔108-92-0〕、rl_mmdhandex_v2 に 79.5%〔159-41-0〕）。
+- `rl_scratch6w_v1` = **エンコーダ v6（142枚）のまま、ネットを 128ch×6ブロック（約3.5倍）にして乱数初期化から育てた 25,000更新**（scratch6w_open100 の run の途中。通し番号 85、2026-11-27 凍結。ユーザー依頼）。
+  自己対局だけ・序盤の定跡強制 100%・MMD〔一様な磁石・温度 0.01・学習率 3e-4〕・整形 `d_capture_value=0.02,d_king_attack=0.03` を 4,000〜7,000 で切る・
+  行動マスク `MASK_VERSION` 6 は rl_scratch6 と同じ。**ただしネットの大きさ以外にも、MMD の回し方が rl_scratch6 の run と5か所違う**
+  （docs から設定を組み立てたときに外した。ネットの大きさだけを変えた比較ではない）:
+
+  | 項目 | rl_scratch6 の run（64ch） | この run（128ch） |
+  | --- | --- | --- |
+  | 1更新の局数 `--batch` | 768 | 256 |
+  | 方策に使う行 `--mmd-filter` | `pps:1,floor=0.05`（全部の行） | 既定の `pps:0.5,floor=0.05`（半分） |
+  | 1更新の Adam の歩数 | 既定の 4歩 × 1周 | `--mmd-steps 8 --mmd-epochs 2` = 16歩 |
+  | 勾配のクリップ `--mmd-max-grad-norm` | 0.5 | 既定の 0.267 |
+  | 学習率の立ち上げ `--lr-warmup` | 100 | なし |
+
+  = **更新数が同じでも局数は 1/3**（25,000更新 = 640万局。rl_scratch6_v1 の 26,500更新は約 2,000万局）。
+  学習は GCE の `tsuitate-rl3`（g2-standard-8 ＋ L4、asia-southeast1-c。tsuitate-bot 92268af の tsuitate_rl、tsuitate-nn c506c3e）で、1更新 約4.0秒
+  （自己対局 約1.2秒＋更新 約2.8秒）・手数 72〜75手。引数の全体:
+  `--algo mmd --init none --anchor none --eval-every 0 --planes 91 <v6 の組のフラグ14個> --channels 128 --blocks 6 --batch 256 --seed 0 --compact-legal --pipeline --fast-collect rust --device-batch --mmd-magnet uniform --mmd-temp 0.01,0,0.01,0.01 --mmd-lr 3e-4,0,3e-4,3e-4 --mmd-steps 8 --mmd-epochs 2 --mmd-adv-norm 0.001 --open-book ../tsuitate-bot/rl_openings.json --open-p 1.0 --shape d_capture_value=0.02,d_king_attack=0.03 --shape-cap 1.0 --shape-decay 4000:7000 --export-every 500 --export-current --checkpoint-every 50 --steps 50000`。
+  系列名はネットの大きさと学習の回し方が違うので分けた（w = 幅を広げた版）。定跡の内蔵（`models/rl_scratch6w_v1.openings.json`。中身は rl_scratch6_v1 のものと同じ）は rl_scratch5_v1 と同じ。
+  重みの原本は Release `rlw-scratch6w-open100-s25000-20261127/policy_25000.bin`（target）。
+  **成績**（候補の側だけ `open:book:`、各 3,700局、`match_seed=20261116`。Release は `rlw-scratch6w-open100-s<更新数>-…`。10,000 = run 45663535943〔rl_scratch6_v1〕と
+  45663460466〔rl_scratch5_v2〕/ 15,000 = run 45716266883 / 20,000 = run 45757514229 / 25,000 = run 45796694098。± は前の区切りとの局ごとのペア差）:
+
+  | 相手 | 10,000 | 15,000 | 20,000 | 25,000 |
+  | --- | --- | --- | --- | --- |
+  | rl_scratch6_v1 | 40.2%（1486-2214-0） | 44.9%（1663-2037-0。+4.8pt±2.2） | 46.6%（1722-1978-0。+1.6pt±2.2） | **52.4%±1.6**（1937-1763-0。+5.8pt±2.3） |
+  | rl_scratch5_v2 | 36.7%（1359-2341-0） | 41.4%（1530-2170-0。+4.6pt±2.2） | 44.7%（1653-2047-0。+3.3pt±2.2） | **48.4%±1.6**（1792-1908-0。+3.8pt±2.2） |
+
+  = **ほぼ同じ更新数（局数は約 1/3）の 64ch の版に 52.4% でわずかに有意な勝ち越し**。rl_scratch5_v2 への 48.4% は、64ch の run の 26,500更新（44.9%）より +3.5pt。
+  20,000更新で伸びが一度鈍ったが 25,000 で戻っていて、25,000更新の時点で頭打ちは見えていない（run は 50,000更新まで続ける）。
+  **ネットの大きさと MMD の回し方の両方が違うので、差がどちらの効きかはこの比較では分けられない**。前の版が無い系列なので、凍結の基準①②は当てはまらない。
+  方策のエントロピー（学習ログの値）は 10,000 で 0.49、25,000 で 0.47 とほぼ横ばい（64ch の run は 10,000 で約 0.3、25,000 で 0.20。1歩に使う行数とクリップが違うので並べて読めない）。
+  推論は 1手 約37ms（CI の arena の平均。64ch の版の約3.7倍。凍結ファイルの冒頭の「約10ms」は生成スクリプトの決まり文句）。
+  **凍結版のマスクは 6**（学習環境と同じ）。エンコーダの固定コピーは v6。
+  同一性確認: `frozen::tests::rl凍結版は元の重みと同じ手を指す`（定跡を内蔵した版の比べ方は rl_scratch_v1 と同じ）と、`rl_scratch6w_v1` vs
+  `open:book:rl_policy:release:…/policy_25000.bin` が 47.0%±6.9（94-106-0、200局、`match_seed=20261127`、run 45808928714。基準の 50%±10 の内。同じ run で rl_scratch6_v1 に 49.5%〔99-101-0〕、rl_scratch5_v2 に 48.5%〔97-103-0〕）。
