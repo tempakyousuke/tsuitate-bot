@@ -1088,4 +1088,4 @@ R-NaD は段階ごとに前の版との差が縮み（selfplay 系統で 62.5% �
   方策のエントロピー（5,000更新ごとの平均）は 25,000〜30,000 で 0.21 → 30,000〜35,000 で 0.18 → 最後は 0.16〜0.17（v5 の run の最後は 0.17）。
   50,000 の checkpoint は `out_rnad/scratch6_open100/keep/` に写しを残した（17,400・20,000・26,500 も。補助ヘッドの実験の起点の候補）。
   同一性確認: `frozen::tests::rl凍結版は元の重みと同じ手を指す`（定跡を内蔵した版の比べ方は rl_scratch_v1 と同じ）と、`rl_scratch6_v2` vs
-  `open:book:rl_policy:release:…/policy_50000.bin` が IDENTITY_PLACEHOLDER。
+  `open:book:rl_policy:release:…/policy_50000.bin` が 50.5%±6.9（101-99-0、200局、`match_seed=20261126`、run 45810515936。基準の 50%±10 の内。同じ run で rl_scratch6_v1 に 62.0%〔124-76-0〕、rl_mmdhandex_v2 に 89.0%〔178-22-0〕）。
