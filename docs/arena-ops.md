@@ -400,13 +400,17 @@ gh workflow run arena.yml -f games=3700 -f match_seed=<数>   -f candidate="open
 
 DeepNash 路線の自己対局学習（`docs/rl-deepnash-design.md`）は別の GPU VM で回す。
 
-- **VM**: `tsuitate-rl2`（`tsuitate-solver` / `asia-northeast1-c` / `g2-standard-8` ＋ NVIDIA L4 1枚 /
-  **通常料金（オンデマンド）** / イメージ `common-cu129-ubuntu-2404-nvidia-580`）。
-  2026-09-28 の単価で **通常 約 $1.10/時**、Spot なら約 $0.66/時（L4 $0.430 ＋ 8vCPU・32GB $0.226）。
-  最初は Spot の `tsuitate-rl`（asia-northeast1-b）で回したが、**Tokyo の3ゾーンすべてで L4 の Spot が
-  在庫切れになり起動できなくなった**（通常料金でも b と a は在庫切れ、c だけ空いていた）ので、
-  ディスクのスナップショットから c に通常料金で作り直した（旧 VM は 2026-09-29 に削除）。
-  プロジェクトの `GPUS_ALL_REGIONS` は 2026-09-28 に 0 → 1 へ申請・承認済み（2枚目を使うなら再申請）
+- **VM**: `tsuitate-rl3`（`tsuitate-solver` / `asia-southeast1-c`〔シンガポール〕/ `g2-standard-8` ＋ NVIDIA L4 1枚 /
+  **通常料金（オンデマンド）** / イメージ `common-cu129-ubuntu-2404-nvidia-580` / 100GB の pd-balanced。2026-11-25 作成）。
+  2026-11-25 の定価で **約 $1.05/時**（L4 $0.691 ＋ 8vCPU $0.247 ＋ 32GB $0.116。ディスクは別に月 $11）。東京は約 $1.10/時、
+  Spot なら約 $0.66/時（2026-09-28 の単価。L4 $0.430 ＋ 8vCPU・32GB $0.226）。
+  経緯: 最初は Spot の `tsuitate-rl`（asia-northeast1-b）で回したが、**Tokyo の3ゾーンすべてで L4 の Spot が
+  在庫切れになり起動できなくなった**ので、通常料金の `tsuitate-rl2`（asia-northeast1-c）に作り直した。その `tsuitate-rl2` も
+  2026-11-25 に通常料金で在庫切れになり起動できず、**東京・ソウル・台湾・シンガポールの10ゾーンを順に試して
+  asia-southeast1-c だけ作れた**ので、新しく `tsuitate-rl3` を作った（`tsuitate-rl2` は中身を確かめて 2026-11-25 に削除。
+  9〜10月の run の出力は手元の `~/Develop/tsuitate-nn/out_rnad/` にある）。
+  プロジェクトの `GPUS_ALL_REGIONS` は 2026-09-28 に 0 → 1 へ申請・承認済み（2枚目を使うなら再申請。**枠が1枚なので、
+  1台が動いている間はもう1台を起動できない**）
 - **コード転送**: `tsuitate-bot` の tar（上と同じ作り方。`rl-env/target` も除く）と、
   `tar czf /tmp/tsuitate-nn-rnad.tar.gz -C ~/Develop/tsuitate-nn --exclude __pycache__ rnad out_rnad/bc/checkpoint.pt`
   を `scripts/gce/setup-rnad.sh` と一緒に `/tmp/` へ送り、
@@ -422,6 +426,9 @@ DeepNash 路線の自己対局学習（`docs/rl-deepnash-design.md`）は別の 
   → `sudo modprobe nvidia` で直る。以後は `apt-mark hold linux-image-gcp linux-headers-gcp linux-gcp
   linux-modules-nvidia-580-server-open-gcp` でカーネルを固定してある（上げるときは hold を外して
   モジュールと一緒に上げる）
+- **自動更新が学習のサービスを再起動する**: unattended-upgrade がパッケージを更新すると、サービスの再起動が走ることがある
+  （2026-11-25 に起動の約50分後に1回。翌日にも数更新ぶんの巻き戻りが1回あったが、原因は確かめていない）。学習は checkpoint から自動で再開するので、失うのは `--checkpoint-every` の
+  間隔ぶん（50更新なら約3分）だけ。気になるなら自動更新を止める
 - **完走したら VM が自分で停止する**（`AUTO_POWEROFF=1` が既定。GPU の課金を放置で積まない）。
   完了の印は学習の引数ごとに残るので、回収のために起動しても学習は再実行されない。
   続きを回すときは `--steps` を増やした引数で setup をやり直す（新しい印になるので走り、
@@ -429,7 +436,7 @@ DeepNash 路線の自己対局学習（`docs/rl-deepnash-design.md`）は別の 
 - **L4 の在庫切れ**: G2 は L4 を外せず機種も変えられないので、起動できないときは VM のディスクに
   触れない。回収だけならスナップショット → ディスク → 一時 VM に読み取り専用でつなぐ。
   別ゾーンで回すならスナップショットから `--create-disk boot=yes,source-snapshot=...` で作り直す
-- **進捗確認**: `gcloud compute ssh tsuitate-rl2 --zone asia-northeast1-c --command "journalctl -u rnad --no-pager -o cat | tail"`
+- **進捗確認**: `gcloud compute ssh tsuitate-rl3 --zone asia-southeast1-c --command "journalctl -u rnad --no-pager -o cat | tail"`
 - **回収**: `gcloud compute scp` で `~/tsuitate-nn/out_rnad/<out>/`（`log.jsonl`・`checkpoint.pt`・
   `policy_<step>.bin`）を手元へ。重みを arena で測るときは Release に置く（`rl_policy:release:...`）
 - **実測**（2026-09-28、256局/更新）: 自己対局 約3秒＋学習 約4.5秒 = 1更新 約7.5秒・約4,000標本/秒
