@@ -297,7 +297,7 @@ fn load_kifu(path: String) -> Result<KifuData, String> {
 // ---------- kifu_planes（棋譜の再生に合わせた入力プレーン） ----------
 
 /// 棋譜を `ply` 手まで再生し、その手番で `fouls_done` 回反則した後の、`side` の席の入力プレーン
-/// （方策ネットのエンコーダ v6）。`fouls_done` は次の手の前に棋譜に残っている反則試行のうち先頭から何回ぶんを
+/// （方策ネットのエンコーダ v7）。`fouls_done` は次の手の前に棋譜に残っている反則試行のうち先頭から何回ぶんを
 /// 済ませたことにするか（0 = 手番の頭）。最後の局面（`ply` = 全手数）では終局行の後の反則試行を数える。
 /// 観測は `replay`（審判と同じ規約）が作るので、対局中にその席が受け取っていた入力と同じになる
 fn kifu_planes_of(kifu: &Kifu, ply: usize, fouls_done: usize, side: Color) -> play::PlanesOut {

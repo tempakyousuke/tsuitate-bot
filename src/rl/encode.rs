@@ -157,8 +157,20 @@ pub(crate) const E_EXPOSED: usize = E_OPP_COUNT + 4; // 2: 駒を取ったまま
 /// エンコーダ v6 のプレーン数（v5 + 締めた相手玉の候補 1枚 + 王手からの手数 6枚 + 逃げた王手駒の候補 1枚 +
 /// 自駒の利き 2枚 + 自玉の筋 2枚 + 相手の手数の合計 4枚 + 相手に位置が伝わっている自駒 2枚）
 pub const NUM_PLANES_V6: usize = E_EXPOSED + 2;
+// エンコーダ v7（2026-11-27）。v6 の後ろに「飛び駒の線の先の確定駒」を1組。方策の行動は「移動元のマス × 方向・距離」で、
+// 取る先のマスの情報は畳み込みで移動元まで運ばないと使えない。3×3 畳み込み13層の幹は理論上は盤全体に届くが、
+// 実測では信号が1マスごとに4〜5割ずつ減り、確定した相手駒の印に対して取る手のロジットが飛車で6〜7マス、角で4〜5マスより
+// 先ではまったく動かなかった（rl_scratch5_v2 / rl_scratch6_v2 / 128ch の rl_scratch6w_v1 でも同じ。設計 doc の v7）。
+// そこで答えを移動元のマスに直接置く: 自分の飛び駒（飛・角・香・竜・馬）のマスに、正規化した8方向ごとに、その線を
+// 自駒の手前まで辿って最初に当たる「相手の駒がいると確定したマス」（`D_OCC` と同じ集合）までの距離を書く。
+// 値は (9 − 距離) / 8（隣 = 1、8マス先 = 1/8。当たらなければ 0）。方向の並びは `action` の行動の方向と同じ
+// （正規化後の前・左前・左・左後ろ・後ろ・右後ろ・右・右前。手番側から見た向きで、筋の番号が増えるのが左）。間のマスに見えない相手の駒がいて取れないことはありうる
+// （その見積もりはネットの領分）。組の扱いは v3〜v6 と同じ（tsuitate-nn の `--ray-hit-planes`）
+pub(crate) const E_RAY_HIT: usize = NUM_PLANES_V6; // 8: 飛び駒の線の先の確定駒（方向ごと、移動元のマスに距離）
+/// エンコーダ v7 のプレーン数（v6 + 飛び駒の線の先の確定駒 8枚）
+pub const NUM_PLANES_V7: usize = E_RAY_HIT + 8;
 /// v3 以降で足したプレーンの組（名前, 先頭のプレーン, 枚数）。tsuitate-nn の `model.EXTRA_PLANES` と同じ
-pub const EXTRA_PLANE_GROUPS: [(&str, usize, usize); 14] = [
+pub const EXTRA_PLANE_GROUPS: [(&str, usize, usize); 15] = [
     ("opp_hand", E_HAND, 7),
     ("opp_fouls", E_FOUL, 3),
     ("king_fouls", E_KING_FOUL, 1),
@@ -173,11 +185,12 @@ pub const EXTRA_PLANE_GROUPS: [(&str, usize, usize); 14] = [
     ("king_lines", E_KING_LINE, 2),
     ("opp_counts", E_OPP_COUNT, 4),
     ("exposed", E_EXPOSED, 2),
+    ("ray_hits", E_RAY_HIT, 8),
 ];
 
 /// プレーン数 → 観測の長さ。対応するエンコーダが無いプレーン数は None
 pub fn obs_len(planes: usize) -> Option<usize> {
-    [NUM_PLANES, NUM_PLANES_DEDUCED, NUM_PLANES_V3, NUM_PLANES_V4, NUM_PLANES_V5, NUM_PLANES_V6]
+    [NUM_PLANES, NUM_PLANES_DEDUCED, NUM_PLANES_V3, NUM_PLANES_V4, NUM_PLANES_V5, NUM_PLANES_V6, NUM_PLANES_V7]
         .contains(&planes)
         .then_some(planes * 81)
 }
@@ -347,7 +360,7 @@ const LINE_DIRS: [(i8, i8); 8] = [(0, -1), (0, 1), (-1, 0), (1, 0), (-1, -1), (1
 /// （v2 の後ろに相手の持ち駒の上界と相手の反則の時系列）、`NUM_PLANES_V4 * 81` は v4（v3 の後ろに玉の移動で反則したマス）、
 /// `NUM_PLANES_V5 * 81` は v5（v4 の後ろに取った駒・取られた駒の一覧）、`NUM_PLANES_V6 * 81` は v6
 /// （v5 の後ろに、締めた相手玉の候補・王手からの手数・逃げた王手駒の候補・自駒の利き・自玉の筋・相手の手数の合計・
-/// 相手に位置が伝わっている自駒）
+/// 相手に位置が伝わっている自駒）、`NUM_PLANES_V7 * 81` は v7（v6 の後ろに飛び駒の線の先の確定駒）
 pub fn encode_into(
     view: &PlayerView,
     log: &ObservationLog,
@@ -374,11 +387,14 @@ pub fn encode_into_cached(
     let v3 = out.len() >= NUM_PLANES_V3 * 81;
     let v4 = out.len() >= NUM_PLANES_V4 * 81;
     let v5 = out.len() >= NUM_PLANES_V5 * 81;
-    let v6 = out.len() == NUM_PLANES_V6 * 81;
+    let v6 = out.len() >= NUM_PLANES_V6 * 81;
+    let v7 = out.len() == NUM_PLANES_V7 * 81;
     out.fill(0.0);
-    if out.len() > OBS_LEN {
-        encode_deduced(view, log, foul_tried, out, cache);
-    }
+    let occupied = if out.len() > OBS_LEN {
+        encode_deduced(view, log, foul_tried, out, cache)
+    } else {
+        vec![]
+    };
     let color = view.your_color;
     let now = view.move_number;
     let fresh = |mn: u32| DECAY.powi(now.saturating_sub(mn) as i32);
@@ -795,6 +811,25 @@ pub fn encode_into_cached(
                 }
             }
         }
+        // 飛び駒の線の先の確定駒（v7）。確定駒の集合は `D_OCC` と同じなので、履歴の欠けの扱いもそちらに従う
+        if v7 && !occupied.is_empty() {
+            for &from in &own {
+                let role = board.piece_at(from).expect("自駒のマス").role;
+                for &d in rays(role) {
+                    let (df, dr) = orient(d, color);
+                    let mut c = Coord { file: from.file + df, rank: from.rank + dr };
+                    let mut dist = 1;
+                    while on_board(c) && board.piece_at(c).is_none() {
+                        if occupied.contains(&c) {
+                            p.set(E_RAY_HIT + ray_dir_index(d), from, (9 - dist) as f32 / 8.0);
+                            break;
+                        }
+                        c = Coord { file: c.file + df, rank: c.rank + dr };
+                        dist += 1;
+                    }
+                }
+            }
+        }
     }
 
     // スカラー
@@ -814,14 +849,22 @@ pub fn encode_into_cached(
     }
 }
 
-/// 確定事実のプレーン（v2 の後ろ5枚）を書く。`out` は 0 で埋めてあること
+/// 先手向きの方向（`board::rays` の向き = 正規化後の方向）→ v7 のプレーンの番号（`action` の行動の方向と同じ並び）
+fn ray_dir_index(d: (i8, i8)) -> usize {
+    RAY_DIRS.iter().position(|&x| x == d).expect("8方向のどれか")
+}
+/// 正規化後の8方向（`action::DIRS` と同じ並び: 前・左前・左・左後ろ・後ろ・右後ろ・右・右前。段が減るのが前、筋が増えるのが左）
+pub(crate) const RAY_DIRS: [(i8, i8); 8] = [(0, -1), (1, -1), (1, 0), (1, 1), (0, 1), (-1, 1), (-1, 0), (-1, -1)];
+
+/// 確定事実のプレーン（v2 の後ろ5枚）を書く。`out` は 0 で埋めてあること。相手の駒がいると確定したマス
+/// （`D_OCC` に書いたもの）を返す（v7 が使う）
 fn encode_deduced(
     view: &PlayerView,
     log: &ObservationLog,
     foul_tried: &HashSet<String>,
     out: &mut [f32],
     cache: &mut DeducedCache,
-) {
+) -> Vec<Coord> {
     let color = view.your_color;
     let facts = deduced_facts(view, log, foul_tried);
     let mut p = Planes { buf: out, color };
@@ -849,6 +892,7 @@ fn encode_deduced(
     for c in locked {
         p.set(D_PAWN, c, 1.0);
     }
+    facts.occupied
 }
 
 /// v1 の観測（長さ `OBS_LEN`）
@@ -857,7 +901,7 @@ pub fn encode(view: &PlayerView, log: &ObservationLog, foul_tried: &HashSet<Stri
 }
 
 /// プレーン数 `planes`（`NUM_PLANES` / `NUM_PLANES_DEDUCED` / `NUM_PLANES_V3` / `NUM_PLANES_V4` / `NUM_PLANES_V5` /
-/// `NUM_PLANES_V6`）の観測。
+/// `NUM_PLANES_V6` / `NUM_PLANES_V7`）の観測。
 /// 重みのヘッダのプレーン数を渡す
 pub fn encode_planes(
     planes: usize,
@@ -1097,15 +1141,18 @@ mod tests {
         let mut elapsed_v2_cached = std::time::Duration::ZERO;
         let mut elapsed_v5_cached = std::time::Duration::ZERO;
         let mut elapsed_v6_cached = std::time::Duration::ZERO;
+        let mut elapsed_v7_cached = std::time::Duration::ZERO;
         let mut buf = vec![0.0; OBS_LEN];
         let mut buf_v2 = vec![0.0; NUM_PLANES_DEDUCED * 81];
         let mut buf_v5 = vec![0.0; NUM_PLANES_V5 * 81];
         let mut buf_v6 = vec![0.0; NUM_PLANES_V6 * 81];
+        let mut buf_v7 = vec![0.0; NUM_PLANES_V7 * 81];
         for game in 0..20 {
             let mut referee = Referee::new();
             let mut caches = [DeducedCache::default(), DeducedCache::default()];
             let mut caches_v4 = [DeducedCache::default(), DeducedCache::default()];
             let mut caches_v6 = [DeducedCache::default(), DeducedCache::default()];
+            let mut caches_v7 = [DeducedCache::default(), DeducedCache::default()];
             loop {
                 let side = referee.to_move();
                 let view = referee.view(side, [0, 0], game);
@@ -1128,6 +1175,10 @@ mod tests {
                 let t = std::time::Instant::now();
                 encode_into_cached(&view, referee.log(side), referee.foul_tried(side), &mut buf_v6, cache);
                 elapsed_v6_cached += t.elapsed();
+                let cache = &mut caches_v7[(side == Color::Gote) as usize];
+                let t = std::time::Instant::now();
+                encode_into_cached(&view, referee.log(side), referee.foul_tried(side), &mut buf_v7, cache);
+                elapsed_v7_cached += t.elapsed();
                 n += 1;
                 let actions: Vec<usize> = (0..NUM_ACTIONS).filter(|&a| mask[a]).collect();
                 if actions.is_empty() {
@@ -1141,12 +1192,13 @@ mod tests {
         }
         println!(
             "{n} 決定点、v1 のエンコード＋マスク 平均 {:.1}µs/決定点、v2 のエンコード 平均 {:.1}µs/決定点\
-             （途中状態を使い回すと {:.1}µs/決定点。v5 は使い回して {:.1}µs/決定点、v6 は {:.1}µs/決定点）",
+             （途中状態を使い回すと {:.1}µs/決定点。v5 は使い回して {:.1}µs/決定点、v6 は {:.1}µs/決定点、v7 は {:.1}µs/決定点）",
             elapsed.as_secs_f64() * 1e6 / n as f64,
             elapsed_v2.as_secs_f64() * 1e6 / n as f64,
             elapsed_v2_cached.as_secs_f64() * 1e6 / n as f64,
             elapsed_v5_cached.as_secs_f64() * 1e6 / n as f64,
-            elapsed_v6_cached.as_secs_f64() * 1e6 / n as f64
+            elapsed_v6_cached.as_secs_f64() * 1e6 / n as f64,
+            elapsed_v7_cached.as_secs_f64() * 1e6 / n as f64
         );
     }
 
@@ -1462,6 +1514,74 @@ mod tests {
         assert!(n_exposed.iter().all(|&x| x > 0), "伝わっている自駒の検査が空振りしている");
         println!("自駒の利きの枚数ごとのマス数（0, 1, 2, 3以上）: 確実 {:?} / 遮られうる {:?}", n_attack[0], n_attack[1]);
         assert!(n_attack.iter().all(|k| k.iter().all(|&x| x > 0)), "利きの枚数の検査が空振りしている");
+    }
+
+    /// v7: 飛び駒の線の先の確定駒。v7 の前半は v6 と同じで、足した 8枚は「自駒だけの盤で、自分の飛び駒から各方向へ
+    /// 自駒の手前まで辿って最初に当たる `D_OCC` のマスまでの距離」を移動元のマスに (9 − 距離) / 8 で持つ
+    /// （v7 の値を `D_OCC` のプレーンと真の盤から数え直す）。値のあるマスでは、真の盤でもその先に相手の駒がいる
+    #[test]
+    fn v7の飛び駒の線の先の確定駒は移動元に距離が載る() {
+        let mut rng = StdRng::seed_from_u64(17);
+        let (mut v6, mut v7) = (vec![0.0; NUM_PLANES_V6 * 81], vec![0.0; NUM_PLANES_V7 * 81]);
+        // 距離ごとの印の数・そのうち真の盤で取る手が合法だった数
+        let (mut hits, mut legal) = ([0u32; 9], [0u32; 9]);
+        let mut n = 0u32;
+        for game in 0..40 {
+            let mut referee = Referee::new();
+            loop {
+                let side = referee.to_move();
+                let pos = referee.position().clone();
+                for s in [Color::Sente, Color::Gote] {
+                    let view = referee.view(s, [0, 0], game);
+                    let (log, tried) = (referee.log(s), referee.foul_tried(s));
+                    encode_into(&view, log, tried, &mut v6);
+                    encode_into(&view, log, tried, &mut v7);
+                    assert_eq!(&v7[..NUM_PLANES_V6 * 81], &v6[..], "v7 の前半は v6 と同じ");
+                    let at = |k: usize, c: Coord| v7[k * 81 + square_index(normalize(c, s))];
+                    let mine = |c: Coord| pos.piece_at(c).is_some_and(|pc| pc.color == s);
+                    let mut want = vec![0.0f32; 8 * 81];
+                    for (from, pc) in pos.pieces().filter(|(_, pc)| pc.color == s) {
+                        for &d in rays(pc.role) {
+                            let (df, dr) = orient(d, s);
+                            let k = RAY_DIRS.iter().position(|&x| x == d).unwrap();
+                            for dist in 1..=8i8 {
+                                let c = Coord { file: from.file + df * dist, rank: from.rank + dr * dist };
+                                if !on_board(c) || mine(c) {
+                                    break;
+                                }
+                                if at(D_OCC, c) == 1.0 {
+                                    want[k * 81 + square_index(normalize(from, s))] = (9 - dist) as f32 / 8.0;
+                                    assert!(
+                                        pos.piece_at(c).is_some_and(|pc| pc.color != s),
+                                        "game {game} {s:?}: 確定駒 {c:?} に相手の駒がいない"
+                                    );
+                                    hits[dist as usize] += 1;
+                                    let usi = crate::board::make_usi_move(from, c, false);
+                                    legal[dist as usize] += parse_usi(&usi).is_some_and(|m| pos.is_legal(&m)) as u32;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    assert_eq!(&v7[E_RAY_HIT * 81..], &want[..], "game {game} {s:?}: 線の先の確定駒");
+                    n += 1;
+                }
+                let view = referee.view(side, [0, 0], game);
+                let mask = crate::rl::action::legal_mask_with_version(
+                    &view, referee.log(side), referee.foul_tried(side), 3,
+                );
+                let actions: Vec<usize> = (0..NUM_ACTIONS).filter(|&a| mask[a]).collect();
+                if actions.is_empty() {
+                    break;
+                }
+                let usi = decode_usi(actions[rng.random_range(0..actions.len())], side).unwrap();
+                if let StepResult::Ended { .. } = referee.step(&usi, 0) {
+                    break;
+                }
+            }
+        }
+        println!("{n} 観測: 距離ごとの印 {:?} / うち真の盤で取れた {:?}", &hits[1..], &legal[1..]);
+        assert!(hits[1] > 0 && hits[2..].iter().sum::<u32>() > 0, "v7 の検査が空振りしている");
     }
 
     /// 履歴が欠けたログ（再起動後の復帰対局の空ログ・途中の相手の手の取りこぼし）では、締めた相手玉の候補は

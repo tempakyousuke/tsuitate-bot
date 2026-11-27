@@ -19,7 +19,7 @@ use tsuitate_bot::protocol::Color;
 use tsuitate_bot::rl::action::NUM_ACTIONS;
 use tsuitate_bot::rl::encode::{
     EXTRA_PLANE_GROUPS, NUM_PLANES, NUM_PLANES_DEDUCED, NUM_PLANES_V3, NUM_PLANES_V4, NUM_PLANES_V5, NUM_PLANES_V6,
-    OBS_LEN, obs_len,
+    NUM_PLANES_V7, OBS_LEN, obs_len,
 };
 use tsuitate_bot::rl::env::{EnvGame, ForcedStats, GUARD_RADII, OppNoise, Outcome, SpeedSum, StyleStats};
 use tsuitate_bot::rl::forced::{ForcedBook, ForcedSides};
@@ -319,7 +319,8 @@ impl VecEnv {
                  {NUM_PLANES_V3}（v3 = v2 ＋相手の持ち駒の上界と相手の反則の時系列）・\
                  {NUM_PLANES_V4}（v4 = v3 ＋玉の移動で反則したマス）・\
                  {NUM_PLANES_V5}（v5 = v4 ＋取った駒・取られた駒の一覧）・\
-                 {NUM_PLANES_V6}（v6 = v5 ＋締めた相手玉の候補・王手からの手数・逃げた王手駒の候補・自駒の利き・自玉の筋・相手の手数の合計・相手に位置が伝わっている自駒）\
+                 {NUM_PLANES_V6}（v6 = v5 ＋締めた相手玉の候補・王手からの手数・逃げた王手駒の候補・自駒の利き・自玉の筋・相手の手数の合計・相手に位置が伝わっている自駒）・\
+                 {NUM_PLANES_V7}（v7 = v6 ＋飛び駒の線の先の確定駒）\
                  のどれか（{planes}）"
             )));
         }
@@ -1041,6 +1042,7 @@ fn tsuitate_rl(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("NUM_PLANES_V4", NUM_PLANES_V4)?;
     m.add("NUM_PLANES_V5", NUM_PLANES_V5)?;
     m.add("NUM_PLANES_V6", NUM_PLANES_V6)?;
+    m.add("NUM_PLANES_V7", NUM_PLANES_V7)?;
     // v3 以降で足したプレーンの組 {名前: (先頭, 枚数)}。tsuitate-nn の model.EXTRA_PLANES との照合用
     let groups = PyDict::new(m.py());
     for (name, start, len) in EXTRA_PLANE_GROUPS {
