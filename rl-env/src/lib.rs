@@ -21,7 +21,7 @@ use tsuitate_bot::rl::encode::{
     EXTRA_PLANE_GROUPS, NUM_PLANES, NUM_PLANES_DEDUCED, NUM_PLANES_V3, NUM_PLANES_V4, NUM_PLANES_V5, NUM_PLANES_V6,
     OBS_LEN, obs_len,
 };
-use tsuitate_bot::rl::env::{EnvGame, ForcedStats, GUARD_RADII, OppNoise, Outcome, SpeedSum, StyleStats};
+use tsuitate_bot::rl::env::{EnvGame, ForcedStats, GUARD_RADII, KING_ESCAPE_NAMES, OppNoise, Outcome, SpeedSum, StyleStats};
 use tsuitate_bot::rl::forced::{ForcedBook, ForcedSides};
 use tsuitate_bot::rl::move_class::MOVE_CLASS_NAMES;
 use tsuitate_bot::rl::signals::{NUM_SIGNALS, SIGNAL_NAMES};
@@ -666,6 +666,18 @@ impl VecEnv {
         PyArray1::from_vec(py, out).reshape([n, 81])
     }
 
+    /// 各局の今の手番の**自玉の逃げ場のラベル** `[n, 8]`（int8。並びは `KING_ESCAPE_NAMES` = 手番側から見た
+    /// 前左・前・前右・左・右・後左・後・後右。−1 = 数えない〔盤外・自駒・終局した局〕、0 = 真実の盤面で玉が
+    /// そこへ動けない、1 = 動ける。`EnvGame::king_escape_into`）。**補助損失のラベル専用**で、方策の入力には使わない
+    fn king_escape<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<i8>>> {
+        let n = self.games.len();
+        let mut out = vec![-1i8; n * 8];
+        for (o, g) in out.chunks_mut(8).zip(&self.games) {
+            g.king_escape_into(o);
+        }
+        PyArray1::from_vec(py, out).reshape([n, 8])
+    }
+
     /// 各局の今の手番で行動 `actions[i]` を指したときの**手の区分** `[n]`（int8。`MOVE_CLASS_NAMES` の添字。
     /// `rl::move_class`。手番側の観測だけで決まる）。負の行動・終局した局・マスク外の行動は −1。
     /// 状態は変えないので `step` の前に呼ぶ。**補助損失のラベル専用**で、方策の入力には使わない
@@ -1050,5 +1062,7 @@ fn tsuitate_rl(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // 局の信号の名前（`VecEnv.signals()` の最後の軸の並び。tsuitate-nn の rnad/shaping.py が名前で引く）
     m.add("SIGNAL_NAMES", SIGNAL_NAMES.to_vec())?;
     m.add("MOVE_CLASS_NAMES", MOVE_CLASS_NAMES.to_vec())?;
+    // 玉の逃げ場のラベル（`VecEnv.king_escape()` の最後の軸の並び）
+    m.add("KING_ESCAPE_NAMES", KING_ESCAPE_NAMES.to_vec())?;
     Ok(())
 }
