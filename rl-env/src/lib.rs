@@ -474,6 +474,13 @@ impl VecEnv {
         PyArray1::from_vec(py, v)
     }
 
+    /// 各局のここまでの受理手の数 `[n]`（int32。`Referee::plies`。反則では増えない。終局した局は終局時の値）。
+    /// 補助ヘッドの手数帯別の集計など、学習の記録・診断用
+    fn plies<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<i32>> {
+        let v: Vec<i32> = self.games.iter().map(|g| g.referee().plies() as i32).collect();
+        PyArray1::from_vec(py, v)
+    }
+
     #[getter]
     fn num_envs(&self) -> usize {
         self.games.len()
