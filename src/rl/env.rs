@@ -39,7 +39,6 @@ pub const TRUTH_ROLES: [Role; 14] = [
     Role::Dragon,
 ];
 
-/// 玉の周りの集計の半径（チェビシェフ距離。1 = 8近傍、2 = 距離2以内の24マス）
 /// `EnvGame::king_escape_into` の玉の周り8マスの並び（手番側を先手向きに正規化した座標の (筋の差, 段の差)。
 /// 段の差 −1 が前）。前左・前・前右・左・右・後左・後・後右
 pub const KING_ESCAPE_DIRS: [(i8, i8); 8] = [(1, -1), (0, -1), (-1, -1), (1, 0), (-1, 0), (1, 1), (0, 1), (-1, 1)];
@@ -48,6 +47,7 @@ pub const KING_ESCAPE_DIRS: [(i8, i8); 8] = [(1, -1), (0, -1), (-1, -1), (1, 0),
 pub const KING_ESCAPE_NAMES: [&str; 8] =
     ["front_left", "front", "front_right", "left", "right", "back_left", "back", "back_right"];
 
+/// 玉の周りの集計の半径（チェビシェフ距離。1 = 8近傍、2 = 距離2以内の24マス）
 pub const GUARD_RADII: [i8; 2] = [1, 2];
 
 /// **玉の周りを固める戦法**の集計（docs/rl-deepnash-design.md の「防御特化（玉の周りの固め）」）。
@@ -786,12 +786,20 @@ mod tests {
                 dests.dedup();
                 g.king_escape_into(&mut e);
                 assert_eq!(e.iter().filter(|&&v| v == 1).count(), dests.len());
-                let k = normalize(king, side);
-                for (&v, &(df, dr)) in e.iter().zip(&KING_ESCAPE_DIRS) {
-                    let c = normalize(Coord { file: k.file + df, rank: k.rank + dr }, side);
-                    if v == 1 {
-                        assert!(dests.contains(&c));
-                    }
+                // 向きは正規化を通さずに書く: 先手は筋が大きいほうが左・段が小さいほうが前、後手はその逆
+                // （`KING_ESCAPE_DIRS` の左右・前後の取り違えと、後手番の向きの誤りを拾う）
+                let s: i8 = if side == Color::Sente { 1 } else { -1 };
+                let want_dirs: [(i8, i8); 8] =
+                    [(s, -s), (0, -s), (-s, -s), (s, 0), (-s, 0), (s, s), (0, s), (-s, s)];
+                for (i, (&v, &(df, dr))) in e.iter().zip(&want_dirs).enumerate() {
+                    let c = Coord { file: king.file + df, rank: king.rank + dr };
+                    let on_board = (1..=9).contains(&c.file) && (1..=9).contains(&c.rank);
+                    let want = if !on_board || pos.piece_at(c).is_some_and(|p| p.color == side) {
+                        -1
+                    } else {
+                        dests.contains(&c) as i8
+                    };
+                    assert_eq!(v, want, "局 {n} {side:?} {}", KING_ESCAPE_NAMES[i]);
                 }
                 checked += 1;
                 let a = g.random_legal_action(rng.random()).unwrap();
