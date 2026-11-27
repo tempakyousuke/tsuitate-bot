@@ -39,6 +39,14 @@ pub const TRUTH_ROLES: [Role; 14] = [
     Role::Dragon,
 ];
 
+/// `EnvGame::king_escape_into` の玉の周り8マスの並び（手番側を先手向きに正規化した座標の (筋の差, 段の差)。
+/// 段の差 −1 が前）。前左・前・前右・左・右・後左・後・後右
+pub const KING_ESCAPE_DIRS: [(i8, i8); 8] = [(1, -1), (0, -1), (-1, -1), (1, 0), (-1, 0), (1, 1), (0, 1), (-1, 1)];
+
+/// `KING_ESCAPE_DIRS` の名前（学習側は `tsuitate_rl.KING_ESCAPE_NAMES` で引く）
+pub const KING_ESCAPE_NAMES: [&str; 8] =
+    ["front_left", "front", "front_right", "left", "right", "back_left", "back", "back_right"];
+
 /// 玉の周りの集計の半径（チェビシェフ距離。1 = 8近傍、2 = 距離2以内の24マス）
 pub const GUARD_RADII: [i8; 2] = [1, 2];
 
@@ -501,6 +509,34 @@ impl EnvGame {
         }
     }
 
+    /// 今の手番の**自玉の逃げ場のラベル**を書く（`out` は長さ 8、並びは `KING_ESCAPE_DIRS`）。値は
+    /// −1 = 数えない（盤外・自駒がいる = 観測で既知・終局済み）、0 = 真実の盤面で玉がそのマスへ動けない
+    /// （相手の利きがある・王手を外せない）、1 = 動ける（相手の駒を取る手を含む。`Position::is_legal` と同じ基準）。
+    ///
+    /// **学習の補助損失・診断専用**（相手駒の利きは観測に無い情報なので、方策の入力には使わない）
+    pub fn king_escape_into(&self, out: &mut [i8]) {
+        debug_assert_eq!(out.len(), 8);
+        out.fill(-1);
+        if self.outcome.is_some() {
+            return;
+        }
+        let side = self.referee.to_move();
+        let pos = self.referee.position();
+        let Some(king) = pos.king_square(side) else { return };
+        let k = normalize(king, side);
+        for (o, &(df, dr)) in out.iter_mut().zip(&KING_ESCAPE_DIRS) {
+            let c = Coord { file: k.file + df, rank: k.rank + dr };
+            if !(1..=9).contains(&c.file) || !(1..=9).contains(&c.rank) {
+                continue;
+            }
+            let to = normalize(c, side);
+            if pos.piece_at(to).is_some_and(|p| p.color == side) {
+                continue;
+            }
+            *o = pos.is_legal(&ShogiMove::Board { from: king, to, promote: false }) as i8;
+        }
+    }
+
     /// 今の手番で行動 `action` を指したときの**手の区分**（`rl::move_class`。手番側の観測だけで決まる）。
     /// 終局済み・マスク外・読めない行動なら None。状態は変えないので `step` の前に呼ぶ。
     /// **補助損失のラベル専用**（方策の入力には使わない）
@@ -722,6 +758,57 @@ mod tests {
                 g.step(a).unwrap();
             }
         }
+    }
+
+    #[test]
+    fn 玉の逃げ場のラベルは真実の盤面の玉の合法手と一致する() {
+        use rand::{Rng, SeedableRng, rngs::StdRng};
+        // 初期局面: 先手・後手とも玉の周りは 前左・前・前右 が空き（4八・5八・6八 は金銀の間で 5八 だけ空き）
+        let g = EnvGame::selfplay(None, 0);
+        let mut e = [0i8; 8];
+        g.king_escape_into(&mut e);
+        // 前左 = 6八（空き）、前 = 5八（空き）、前右 = 4八（空き）、左右 = 金、後ろ = 盤外
+        assert_eq!(e, [1, 1, 1, -1, -1, -1, -1, -1]);
+        // 乱数の対局で、ラベルの 1 の数が玉の合法手の行き先の数と一致し、-1 以外のマスは盤内で自駒がいない
+        let mut rng = StdRng::seed_from_u64(7);
+        let mut checked = 0;
+        for n in 0..20 {
+            let mut g = EnvGame::selfplay(None, n);
+            while g.outcome().is_none() {
+                let side = g.to_move();
+                let pos = g.referee.position().clone();
+                let king = pos.king_square(side).unwrap();
+                let mut dests: Vec<Coord> = pos.legal_moves().into_iter().filter_map(|m| match m {
+                    ShogiMove::Board { from, to, .. } if from == king => Some(to),
+                    _ => None,
+                }).collect();
+                dests.sort_by_key(|c| (c.file, c.rank));
+                dests.dedup();
+                g.king_escape_into(&mut e);
+                assert_eq!(e.iter().filter(|&&v| v == 1).count(), dests.len());
+                // 向きは正規化を通さずに書く: 先手は筋が大きいほうが左・段が小さいほうが前、後手はその逆
+                // （`KING_ESCAPE_DIRS` の左右・前後の取り違えと、後手番の向きの誤りを拾う）
+                let s: i8 = if side == Color::Sente { 1 } else { -1 };
+                let want_dirs: [(i8, i8); 8] =
+                    [(s, -s), (0, -s), (-s, -s), (s, 0), (-s, 0), (s, s), (0, s), (-s, s)];
+                for (i, (&v, &(df, dr))) in e.iter().zip(&want_dirs).enumerate() {
+                    let c = Coord { file: king.file + df, rank: king.rank + dr };
+                    let on_board = (1..=9).contains(&c.file) && (1..=9).contains(&c.rank);
+                    let want = if !on_board || pos.piece_at(c).is_some_and(|p| p.color == side) {
+                        -1
+                    } else {
+                        dests.contains(&c) as i8
+                    };
+                    assert_eq!(v, want, "局 {n} {side:?} {}", KING_ESCAPE_NAMES[i]);
+                }
+                checked += 1;
+                let a = g.random_legal_action(rng.random()).unwrap();
+                g.step(a).unwrap();
+            }
+            g.king_escape_into(&mut e);
+            assert_eq!(e, [-1; 8]);
+        }
+        assert!(checked > 100);
     }
 
     use super::*;
