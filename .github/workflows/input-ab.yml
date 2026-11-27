@@ -13,7 +13,7 @@ on:
   workflow_dispatch:
     inputs:
       arms:
-        description: "入力の版（v1〜v6。スペース区切り）"
+        description: "入力の版（v1〜v7。スペース区切り）"
         required: false
         default: "v4 v5"
       extra_arms:

@@ -730,7 +730,7 @@ pub async fn play_view(state: State<'_, PlayState>) -> Result<PlayView, String> 
     .await
 }
 
-/// `side` の席の観測から作った入力プレーン（方策ネットのエンコーダ v6 の全プレーン）。
+/// `side` の席の観測から作った入力プレーン（方策ネットのエンコーダ v7 の全プレーン）。
 /// 対人モードで bot 側を指定すると相手の駒の位置が見える（「真実を表示」と同じデバッグ用途）
 #[tauri::command]
 pub async fn play_planes(state: State<'_, PlayState>, side: Color) -> Result<PlanesOut, String> {

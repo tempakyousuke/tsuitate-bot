@@ -61,13 +61,14 @@ impl PolicyNet {
         .map_err(|e| e.to_string())?;
         if obs_len(header.planes).is_none() {
             return Err(format!(
-                "入力プレーン数 {} に対応するエンコーダが無い（v1 = {NUM_PLANES}、v2 = {}、v3 = {}、v4 = {}、v5 = {}、v6 = {}）",
+                "入力プレーン数 {} に対応するエンコーダが無い（v1 = {NUM_PLANES}、v2 = {}、v3 = {}、v4 = {}、v5 = {}、v6 = {}、v7 = {}）",
                 header.planes,
                 crate::rl::encode::NUM_PLANES_DEDUCED,
                 crate::rl::encode::NUM_PLANES_V3,
                 crate::rl::encode::NUM_PLANES_V4,
                 crate::rl::encode::NUM_PLANES_V5,
-                crate::rl::encode::NUM_PLANES_V6
+                crate::rl::encode::NUM_PLANES_V6,
+                crate::rl::encode::NUM_PLANES_V7
             ));
         }
         let mut off = 12 + hlen;
@@ -263,14 +264,16 @@ mod tests {
     /// v3（v2 の後ろに相手の持ち駒の上界と相手の反則）・v4（v3 の後ろに玉の移動で反則したマス）も同じ
     /// （学習で使わない組は stem の列が 0 のまま書き出される）
     fn v2の重みは足したプレーンが0なら_v1と同じ出力になる() {
-        use crate::rl::encode::{NUM_PLANES_DEDUCED, NUM_PLANES_V3, NUM_PLANES_V4, NUM_PLANES_V5, NUM_PLANES_V6};
+        use crate::rl::encode::{
+            NUM_PLANES_DEDUCED, NUM_PLANES_V3, NUM_PLANES_V4, NUM_PLANES_V5, NUM_PLANES_V6, NUM_PLANES_V7,
+        };
         let bytes = std::fs::read(format!("{FIXTURE}.bin")).unwrap();
         let v1 = PolicyNet::from_bytes(&bytes).unwrap();
         assert_eq!(v1.planes(), NUM_PLANES);
         let tv: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(format!("{FIXTURE}.test.json")).unwrap())
                 .unwrap();
-        for planes in [NUM_PLANES_DEDUCED, NUM_PLANES_V3, NUM_PLANES_V4, NUM_PLANES_V5, NUM_PLANES_V6] {
+        for planes in [NUM_PLANES_DEDUCED, NUM_PLANES_V3, NUM_PLANES_V4, NUM_PLANES_V5, NUM_PLANES_V6, NUM_PLANES_V7] {
             let wide = PolicyNet::from_bytes(&widen_stem(&bytes, planes)).unwrap();
             assert_eq!(wide.planes(), planes);
             for input in tv["input"].as_array().unwrap() {

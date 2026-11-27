@@ -14,6 +14,7 @@ use crate::protocol::PlayerView;
 use crate::rl::action::{index_square, normalize};
 use crate::rl::encode::{
     self as e, HISTORY_MOVES, NUM_PLANES, NUM_PLANES_DEDUCED, NUM_PLANES_V3, NUM_PLANES_V4, NUM_PLANES_V5, NUM_PLANES_V6,
+    NUM_PLANES_V7,
 };
 use crate::selfplay::{MAX_FOULS, MAX_PLIES};
 
@@ -31,7 +32,7 @@ pub struct PlaneView {
     /// 組の見出し
     pub group: &'static str,
     pub label: String,
-    /// 足したエンコーダの版（"v1"〜"v6"）
+    /// 足したエンコーダの版（"v1"〜"v7"）
     pub version: &'static str,
     /// 全面に同じ値を入れるプレーンなら、その値
     pub scalar: Option<f32>,
@@ -143,6 +144,10 @@ fn layout() -> Vec<Spec> {
     add(e::E_OWN_ATTACK + 1, G_REACH, "自駒の遮られうる利き（飛び駒の2マス目以降。枚数×1/3）".into(), Unit::Board);
     add(e::E_KING_LINE, G_REACH, "自玉の筋（最初の自駒の手前まで）".into(), Unit::Board);
     add(e::E_KING_LINE + 1, G_REACH, "ピンされうる自駒（自玉の筋の最初の自駒）".into(), Unit::Board);
+    // 飛び駒の線の先の確定駒（方向は手番側から見た向き。値 = (9 − 距離) / 8）
+    for (i, dir) in ["前", "左前", "左", "左後ろ", "後ろ", "右後ろ", "右", "右前"].iter().enumerate() {
+        add(e::E_RAY_HIT + i, G_REACH, format!("飛び駒の線の先の確定駒: {dir}（移動元に (9−距離)/8）"), Unit::Board);
+    }
     // 持ち駒と相手の駒数
     for (i, k) in KANJI[..7].iter().enumerate() {
         add(e::P_HAND + i, G_COUNT, format!("自分の持ち駒 {k}"), Unit::Pieces(e::ROLE_TOTAL[i]));
@@ -192,7 +197,8 @@ fn version_of(index: usize) -> &'static str {
         i if i < NUM_PLANES_V3 => "v3",
         i if i < NUM_PLANES_V4 => "v4",
         i if i < NUM_PLANES_V5 => "v5",
-        _ => "v6",
+        i if i < NUM_PLANES_V6 => "v6",
+        _ => "v7",
     }
 }
 
@@ -216,10 +222,10 @@ fn note_of(unit: Unit, v: f32) -> Option<String> {
     }
 }
 
-/// `view` の側の観測から作った入力（エンコーダ v6 の全プレーン）を、表示する順に返す
+/// `view` の側の観測から作った入力（エンコーダ v7 の全プレーン）を、表示する順に返す
 pub fn plane_views(view: &PlayerView, log: &ObservationLog, foul_tried: &HashSet<String>) -> Vec<PlaneView> {
     let color = view.your_color;
-    let buf = e::encode_planes(NUM_PLANES_V6, view, log, foul_tried);
+    let buf = e::encode_planes(NUM_PLANES_V7, view, log, foul_tried);
     // マス番号（正規化済み）→ 実際のマス。`normalize` は自分自身が逆変換
     let square = |i: usize| make_usi_square(normalize(index_square(i), color));
     layout()
@@ -262,13 +268,14 @@ mod tests {
     fn 見出しは全部のプレーンをちょうど1回ずつ覆う() {
         let mut seen: Vec<usize> = layout().iter().map(|s| s.index).collect();
         seen.sort();
-        assert_eq!(seen, (0..NUM_PLANES_V6).collect::<Vec<_>>());
+        assert_eq!(seen, (0..NUM_PLANES_V7).collect::<Vec<_>>());
         // 版の境目は v3 以降の組の並びと合う
         for (name, start, n) in EXTRA_PLANE_GROUPS {
             let want = match name {
                 "opp_hand" | "opp_fouls" => "v3",
                 "king_fouls" => "v4",
                 "lost_fresh" | "lost_roles" | "cap_roles" | "pawn_files" => "v5",
+                "ray_hits" => "v7",
                 _ => "v6",
             };
             for i in start..start + n {
@@ -292,7 +299,7 @@ mod tests {
             for me in [Color::Sente, Color::Gote] {
                 let view = make_view(&rep.pos, me, &rep.fouls);
                 let log = &rep.logs[side_idx(me)];
-                let buf = e::encode_planes(NUM_PLANES_V6, &view, log, &none);
+                let buf = e::encode_planes(NUM_PLANES_V7, &view, log, &none);
                 for spec in &specs {
                     let plane = &buf[spec.index * 81..(spec.index + 1) * 81];
                     if !matches!(spec.unit, Unit::Board) {
@@ -305,7 +312,7 @@ mod tests {
                     }
                 }
                 let views = plane_views(&view, log, &none);
-                assert_eq!(views.len(), NUM_PLANES_V6);
+                assert_eq!(views.len(), NUM_PLANES_V7);
                 let at = |index: usize| views.iter().find(|v| v.index == Some(index)).unwrap();
                 // 自玉のプレーンは自玉のマス1つだけ
                 let king_role = e::ROLES.iter().position(|r| *r == Role::King).unwrap();
