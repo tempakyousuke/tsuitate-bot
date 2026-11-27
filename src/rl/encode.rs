@@ -1528,14 +1528,18 @@ mod tests {
         let mut n = 0u32;
         for game in 0..40 {
             let mut referee = Referee::new();
+            // 途中状態は席 × 版ごとに使い回す（毎回ログを先頭からたどると debug の CI で10分かかる。
+            // 使い回しても同じ観測になることは `確定事実の途中状態を使い回しても同じ観測になる` が見る）
+            let mut caches: [[DeducedCache; 2]; 2] = Default::default();
             loop {
                 let side = referee.to_move();
                 let pos = referee.position().clone();
                 for s in [Color::Sente, Color::Gote] {
                     let view = referee.view(s, [0, 0], game);
                     let (log, tried) = (referee.log(s), referee.foul_tried(s));
-                    encode_into(&view, log, tried, &mut v6);
-                    encode_into(&view, log, tried, &mut v7);
+                    let [c6, c7] = &mut caches[(s == Color::Gote) as usize];
+                    encode_into_cached(&view, log, tried, &mut v6, c6);
+                    encode_into_cached(&view, log, tried, &mut v7, c7);
                     assert_eq!(&v7[..NUM_PLANES_V6 * 81], &v6[..], "v7 の前半は v6 と同じ");
                     let at = |k: usize, c: Coord| v7[k * 81 + square_index(normalize(c, s))];
                     let mine = |c: Coord| pos.piece_at(c).is_some_and(|pc| pc.color == s);
@@ -1557,6 +1561,13 @@ mod tests {
                                     );
                                     hits[dist as usize] += 1;
                                     let usi = crate::board::make_usi_move(from, c, false);
+                                    // プレーンの番号と値は、その確定駒を取る手の行動番号（`action` の符号化。この表とは
+                                    // 別に方向を決める）と合う: 種類 = 方向 × 8 + 距離 − 1、マス = 移動元
+                                    assert_eq!(
+                                        crate::rl::action::encode_usi(&usi, s),
+                                        Some((k * 8 + dist as usize - 1) * 81 + square_index(normalize(from, s))),
+                                        "game {game} {s:?}: {usi} の行動番号とプレーン {k}・距離 {dist}"
+                                    );
                                     legal[dist as usize] += parse_usi(&usi).is_some_and(|m| pos.is_legal(&m)) as u32;
                                     break;
                                 }
