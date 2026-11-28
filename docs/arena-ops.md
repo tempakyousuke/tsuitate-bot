@@ -400,7 +400,11 @@ gh workflow run arena.yml -f games=3700 -f match_seed=<数>   -f candidate="open
 
 DeepNash 路線の自己対局学習（`docs/rl-deepnash-design.md`）は別の GPU VM で回す。
 
-- **VM**: `tsuitate-rl3`（`tsuitate-solver` / `asia-southeast1-c`〔シンガポール〕/ `g2-standard-8` ＋ NVIDIA L4 1枚 /
+**今は RL 用の VM は無い**（2026-11-28。`tsuitate-rl3` は scratch6w_open100 の run が 50,000更新で完走した後、ユーザー依頼で
+ディスクごと削除した。checkpoint・学習ログ・500更新ごとの `current_*.bin` は手元の `~/Develop/tsuitate-nn/out_rnad/scratch6w_open100/` に
+退避してある。`policy_*.bin` は測った区切りのものだけ Release にある）。次に回すときは、下の構成で作り直す。
+
+- **VM**（削除した最後の構成）: `tsuitate-rl3`（`tsuitate-solver` / `asia-southeast1-c`〔シンガポール〕/ `g2-standard-8` ＋ NVIDIA L4 1枚 /
   **通常料金（オンデマンド）** / イメージ `common-cu129-ubuntu-2404-nvidia-580` / 100GB の pd-balanced。2026-11-25 作成）。
   2026-11-25 の定価で **約 $1.05/時**（L4 $0.691 ＋ 8vCPU $0.247 ＋ 32GB $0.116。ディスクは別に月 $11）。東京は約 $1.10/時、
   Spot なら約 $0.66/時（2026-09-28 の単価。L4 $0.430 ＋ 8vCPU・32GB $0.226）。
