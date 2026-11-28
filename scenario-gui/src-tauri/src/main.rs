@@ -38,6 +38,7 @@ const ENGINES: &[&str] = &[
     "rl_scratch6w_v1",
     "rl_scratch6w_v2",
     "rl_scratch7w_v1",
+    "rl_scratch7wb8_v1",
     "rl_v16",
     "rl_v15",
     "estimator_v14",
